@@ -302,6 +302,7 @@ impl ThinkingMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnthropicOptions {
     pub version: String,
+    pub(crate) version_pinned: bool,
     pub thinking: ThinkingMode,
     pub thinking_budget_tokens: u64,
     /// Whether an `output_config.effort` hint is sent. Implied by
@@ -313,6 +314,7 @@ impl Default for AnthropicOptions {
     fn default() -> Self {
         Self {
             version: "2023-06-01".to_owned(),
+            version_pinned: false,
             thinking: ThinkingMode::Off,
             thinking_budget_tokens: 4096,
             effort: false,
@@ -323,7 +325,11 @@ impl Default for AnthropicOptions {
 impl AnthropicOptions {
     /// API versions from 2026-10-21 remove `temperature`, `top_p` and `top_k`.
     pub fn rejects_sampling(&self) -> bool {
-        self.version.as_str() >= "2026-10-21"
+        Self::version_rejects_sampling(&self.version)
+    }
+
+    pub(crate) fn version_rejects_sampling(version: &str) -> bool {
+        version >= "2026-10-21"
     }
 
     /// `output_config.effort` is only sent when explicitly requested, because
@@ -456,31 +462,54 @@ impl Vendor {
         Some(SecretKey::new(key))
     }
 
-    /// Scheme-specific auth headers. The Responses and Chat Completions wires
-    /// use `Authorization: Bearer`; Anthropic Messages uses `x-api-key` plus the
-    /// configured version header. No header is ever sent for another wire.
+    /// Build authentication for the selected upstream. The documented hosted
+    /// Messages gateways use bearer auth; other Messages providers use x-api-key.
     pub fn auth_headers(&self, key: &SecretKey) -> Result<HeaderMap, RelayError> {
         let mut headers = HeaderMap::new();
-        let mut value = match self.wire {
-            Wire::AnthropicMessages => HeaderValue::from_str(key.expose())?,
-            Wire::Responses | Wire::ChatCompletions => {
-                HeaderValue::from_str(&format!("Bearer {}", key.expose()))?
-            }
+        let bearer = self.wire != Wire::AnthropicMessages || self.hosted_messages_uses_bearer();
+        let (name, mut value) = if bearer {
+            (
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", key.expose()))?,
+            )
+        } else {
+            (
+                HeaderName::from_static("x-api-key"),
+                HeaderValue::from_str(key.expose())?,
+            )
         };
         value.set_sensitive(true);
-        match self.wire {
-            Wire::AnthropicMessages => {
-                headers.insert(HeaderName::from_static("x-api-key"), value);
-                headers.insert(
-                    HeaderName::from_static("anthropic-version"),
-                    HeaderValue::from_str(&self.anthropic.version)?,
-                );
-            }
-            Wire::Responses | Wire::ChatCompletions => {
-                headers.insert(AUTHORIZATION, value);
-            }
+        headers.insert(name, value);
+        if self.wire == Wire::AnthropicMessages {
+            headers.insert(
+                HeaderName::from_static("anthropic-version"),
+                HeaderValue::from_str(&self.anthropic.version)?,
+            );
         }
         Ok(headers)
+    }
+
+    fn hosted_messages_uses_bearer(&self) -> bool {
+        self.base_url.scheme() == "https"
+            && self.base_url.port_or_known_default() == Some(443)
+            && matches!(
+                (
+                    self.base_url.host_str(),
+                    self.base_url.path().trim_end_matches('/')
+                ),
+                (Some("openrouter.ai"), "/api/v1")
+                    | (
+                        Some("opencode.ai"),
+                        "/inference/anthropic/v1" | "/inference/go/anthropic/v1"
+                    )
+            )
+    }
+
+    pub(crate) fn is_direct_anthropic(&self) -> bool {
+        self.wire == Wire::AnthropicMessages
+            && self.base_url.scheme() == "https"
+            && self.base_url.host_str() == Some("api.anthropic.com")
+            && self.base_url.port_or_known_default() == Some(443)
     }
 
     /// Attach an origin-scoped routing identifier for OpenCode Go. Derive it
@@ -824,6 +853,7 @@ fn parse_anthropic_options(
             );
         }
         options.version = version;
+        options.version_pinned = true;
     }
     options.thinking = ThinkingMode::parse(opt_str(table, "anthropic_thinking")?.as_deref())?;
     if let Some(budget) = opt_integer(table, "anthropic_thinking_budget_tokens")? {
@@ -878,7 +908,7 @@ fn parse_chat_options(
     Ok(options)
 }
 
-fn valid_api_version(value: &str) -> bool {
+pub(crate) fn valid_api_version(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 10
         && bytes[4] == b'-'
@@ -1533,6 +1563,28 @@ include_stream_usage = false
         let headers = beta.auth_headers(&key).unwrap();
         assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer chat-secret");
         assert!(headers.get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn hosted_messages_bearer_auth_is_scoped_to_documented_endpoints() {
+        for (base_url, bearer) in [
+            ("https://openrouter.ai/api/v1", true),
+            ("https://opencode.ai/inference/go/anthropic/v1", true),
+            ("https://api.anthropic.com/v1", false),
+            ("https://openrouter.ai:8443/api/v1", false),
+            ("https://openrouter.ai.example/api/v1", false),
+        ] {
+            let config = CodeoxConfig::load_from_str(&format!(
+                "[providers.fixture]\nbase_url = {base_url:?}\nwire_api = \"anthropic_messages\"\n"
+            ))
+            .unwrap();
+            let headers = config.vendors[0]
+                .auth_headers(&SecretKey::new("fixture-key".into()))
+                .unwrap();
+            assert_eq!(headers.contains_key(AUTHORIZATION), bearer, "{base_url}");
+            assert_eq!(headers.contains_key("x-api-key"), !bearer, "{base_url}");
+            assert_eq!(headers["anthropic-version"], "2023-06-01");
+        }
     }
 
     #[test]

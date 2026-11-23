@@ -47,16 +47,18 @@ model to the API configured for its provider.
 | --- | --- |
 | Messages and authentication | `POST /v1/messages` accepts Claude Code's `?beta=true` request. Authenticate to ox with a bearer token or `x-api-key`. The provider uses its own configured API credential. |
 | Native Anthropic streaming | Streams the upstream event sequence directly, including pings, partial tool arguments, signed thinking and safeguards. Fine-grained tool streaming is a [client opt-in](configuration.md#fine-grained-tool-streaming). |
-| Native Anthropic request fields | Preserves system block order, cache markers and beta body fields. Uses the route's configured `anthropic_version` and applies its sampling rules. Forwards valid `anthropic-beta` values, including repeated headers. |
+| Native Anthropic request fields | Preserves system block order, cache markers and beta body fields. Forwards bounded `anthropic-*` capability headers, including repeated beta values. A configured `anthropic_version` wins over the client's version. With no pin, ox uses a valid client version or the `2023-06-01` default. |
 | Retries and limits | Native Messages preserves standard bounded error envelopes and retry or usage-limit metadata when those values contain no configured credential. A synthesized error can lack the details Claude Code uses for automatic feature recovery. |
 | Model discovery | Authenticated `GET /v1/models` reports the aliases and any known context limits. Claude Code's automatic discovery filters IDs to names containing `claude` or `anthropic`. Use ox's [starred lineup and context settings](configuration.md#model-names-and-discovery) for other models. |
-| Translated streaming | Delivers translated text, tool events and terminal status. It does not generate idle pings or Anthropic server-side safety verdicts. [Set up Claude Code's classifier](configuration.md#claude-code-auto-mode) for these routes. |
-| Optional endpoints | Claude Code estimates usage locally because `/v1/messages/count_tokens` is unavailable. The `HEAD /api/hello` warm-up is unsupported. |
+| Translated streaming | Delivers text, tool events and terminal status. After 15 seconds without a downstream event, ox sends a ping while waiting for the next upstream event. The upstream read timeout still applies. Use [Claude Code's classifier](configuration.md#claude-code-auto-mode) for safety review. |
+| Token counting | `POST /v1/messages/count_tokens` uses the selected provider's counting endpoint. The Responses adapter translates the prompt and tools for `/responses/input_tokens`. If counting is unavailable, including on Chat Completions routes, Claude Code can estimate usage locally. |
+| Connection warm-up | `HEAD /api/hello` returns `204` locally. It uses no credentials and makes no provider request. |
 | Other connection methods | Bedrock InvokeModel, Vertex `rawPredict`, AWS workspace headers and Claude apps gateway sign-in are outside this implementation. Stock subscription sign-ins run in their native clients. |
 
-ox authenticates upstream with the provider credential. Its native relay drops
-client auth headers and currently only passes `anthropic-beta` from the
-`anthropic-*` request headers. For older Claude models behind custom aliases,
+ox authenticates upstream with the provider credential. It filters client auth,
+workspace, and hop-by-hop headers before forwarding API capability headers.
+Only direct Anthropic requests carry the client's `beta=true` query flag.
+For older Claude models behind custom aliases,
 you can set `modelOverrides` in Claude Code to give the alias the upstream
 model's capabilities. Claude Code's fast-mode availability check and WebFetch
 domain check use its own direct connection to `api.anthropic.com`.
@@ -67,7 +69,7 @@ domain check use its own direct connection to `api.anthropic.com`.
 - **Native paths.** Codex to a Responses provider streams the upstream response directly.
   Claude Code to Anthropic preserves Messages features the selected upstream supports,
   including signed thinking, cache markers, and Auto mode safeguards. The relay applies
-  the upstream model ID and configured Anthropic API version, including its sampling rules.
+  the upstream model ID and the effective Anthropic API version's sampling rules.
 - **Client tools.** Coding tools run in the CLI. For translated Codex requests, ox maps
   functions, namespaced calls such as `web.run`, and freeform `apply_patch` into the
   upstream tool format. Code-mode `additional_tools` and arbitrary provider-hosted
@@ -89,8 +91,7 @@ domain check use its own direct connection to `api.anthropic.com`.
 - **Claude Code translation.** Responses and Chat Completions cannot supply Anthropic
   signed thinking or server-side Auto mode verdicts. Use [Claude Code’s classifier](configuration.md#claude-code-auto-mode)
   for translated models. Anthropic cache-control markers and provider-hosted containers
-  have no equivalent in these routes. `/v1/messages/count_tokens` is unavailable.
-  The stock client can estimate context without it.
+  have no equivalent in these routes.
 - **Streaming.** If a vendor promises a streaming API but sends a JSON body for a
   streaming request, translated inference can fail. A translated stream failure is
   surfaced to the client. A native Responses stream can end with a transport error.

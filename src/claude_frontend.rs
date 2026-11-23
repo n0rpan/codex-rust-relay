@@ -59,11 +59,7 @@ impl App {
             .filter_map(|entry| {
                 let alias = entry["slug"].as_str()?;
                 let (route, state, _) = resolve_model(vendors, routes, alias).ok()?;
-                if route.wire != Wire::AnthropicMessages
-                    || state.vendor.base_url.scheme() != "https"
-                    || state.vendor.base_url.host_str() != Some("api.anthropic.com")
-                    || state.vendor.base_url.port_or_known_default() != Some(443)
-                {
+                if !state.vendor.is_direct_anthropic() {
                     return None;
                 }
                 let priority = model_preference
@@ -82,7 +78,7 @@ impl App {
         else {
             return None;
         };
-        let (target, _, _) = resolve_model(vendors, routes, model).ok()?;
+        let (target, state, _) = resolve_model(vendors, routes, model).ok()?;
         let context_window = self.visible_models().find_map(|entry| {
             let window = entry["context_window"].as_u64()?;
             let Resolution::Route(route) = routes.resolve(entry["slug"].as_str()?) else {
@@ -92,7 +88,7 @@ impl App {
                 .then_some(window)
         });
         Some(crate::clients::ClaudeModelInfo {
-            wire: target.wire,
+            can_request_server_review: state.vendor.is_direct_anthropic(),
             context_window,
         })
     }
@@ -102,6 +98,9 @@ impl App {
         request: Request<Incoming>,
         bearer_matches: bool,
     ) -> Response<RelayBody> {
+        if request.method() == Method::HEAD && request.uri().path() == "/api/hello" {
+            return bytes_response(StatusCode::NO_CONTENT, Bytes::new(), "text/plain");
+        }
         let key_matches = request.headers().get("x-api-key").is_some_and(|key| {
             self.local_auth
                 .as_bytes()
@@ -139,7 +138,9 @@ impl App {
                     }),
                 )
             }
-            (&Method::POST, "/v1/messages") => self.messages_inference(request).await,
+            (&Method::POST, "/v1/messages" | "/v1/messages/count_tokens") => {
+                self.messages_inference(request).await
+            }
             _ => messages_error(StatusCode::NOT_FOUND, "Unknown relay endpoint"),
         }
     }
@@ -155,6 +156,7 @@ impl App {
             );
         };
         let (parts, body) = request.into_parts();
+        let count_tokens = parts.uri.path() == "/v1/messages/count_tokens";
         let bytes = match read_bounded(body, self.max_request_bytes).await {
             Ok(bytes) => bytes,
             Err(response) => {
@@ -177,25 +179,31 @@ impl App {
             Ok(target) => target,
             Err((status, message)) => return messages_error(status, &message),
         };
-        if let Some(result) = claude_search::try_handle(&payload, self.search.as_ref()).await {
+        if !count_tokens
+            && let Some(result) = claude_search::try_handle(&payload, self.search.as_ref()).await
+        {
             let reply = claude_search::reply_or_error(result);
             let status =
                 StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             return bytes_response(status, Bytes::from(reply.body), reply.content_type);
         }
-        claude_gateway::infer(
-            &self.client,
-            upstream::Translation {
-                vendor: &state.vendor,
-                key: auth,
-                incoming: Some(&parts.headers),
-                upstream_model: &route.upstream_model,
-                requested_model: &requested,
-                secrets: Arc::clone(&self.secrets),
-            },
-            payload,
-        )
-        .await
+        let context = upstream::Translation {
+            vendor: &state.vendor,
+            key: auth,
+            incoming: Some(&parts.headers),
+            upstream_model: &route.upstream_model,
+            requested_model: &requested,
+            secrets: Arc::clone(&self.secrets),
+        };
+        let beta = parts
+            .uri
+            .query()
+            .is_some_and(|query| query.split('&').any(|item| item == "beta=true"));
+        if count_tokens {
+            claude_gateway::count_tokens(&self.client, context, payload, beta).await
+        } else {
+            claude_gateway::infer(&self.client, context, payload, beta).await
+        }
     }
 }
 

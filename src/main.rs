@@ -583,7 +583,11 @@ impl App {
             .get(AUTHORIZATION)
             .is_some_and(|auth| auth.as_bytes().ct_eq(self.local_auth.as_bytes()).into());
         if matches!(self.client_kind, ClientKind::Claude)
-            || self.persistent && matches!(request.uri().path(), "/v1/messages" | "/v1/models")
+            || self.persistent
+                && matches!(
+                    request.uri().path(),
+                    "/v1/messages" | "/v1/messages/count_tokens" | "/v1/models" | "/api/hello"
+                )
         {
             return self.handle_messages_client(request, bearer_matches).await;
         }

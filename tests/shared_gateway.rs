@@ -97,6 +97,14 @@ async fn mock(home: &Home) -> (Arc<Mutex<Vec<Hit>>>, tokio::task::JoinHandle<()>
                                 "application/json",
                                 r#"{"error":{"message":"bad key responses-vendor-fixture"}}"#,
                             )
+                        } else if parts.uri.path() == "/v1/messages/count_tokens" {
+                            (200, "application/json", r#"{"input_tokens":17}"#)
+                        } else if parts.uri.path() == "/v1/responses/input_tokens" {
+                            (
+                                200,
+                                "application/json",
+                                r#"{"object":"response.input_tokens","input_tokens":21}"#,
+                            )
                         } else {
                             let stream = match parts.uri.path() {
                                 "/v1/responses" => RESPONSES_SSE,
@@ -246,6 +254,114 @@ async fn a_fixed_endpoint_serves_both_client_protocols_and_survives_restart() {
     assert_eq!(hits[1].headers["x-api-key"], "messages-vendor-fixture");
     assert!(!hits[1].headers.contains_key("authorization"));
     assert_eq!(hits[1].body["model"], "claude-model");
+}
+
+#[tokio::test]
+async fn token_counts_follow_the_selected_inference_route() {
+    let home = Home::new();
+    let (hits, mock) = mock(&home).await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    let port = loopback_port().await;
+    let mut child = start_gateway(&home, port, &client).await;
+    let base = format!("http://127.0.0.1:{port}");
+    let endpoint = format!("{base}/v1/messages/count_tokens?beta=true");
+    let warmup = client
+        .head(format!("{base}/api/hello"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(warmup.status(), 204);
+
+    let mut payload = json!({
+        "model": "claude/claude-model",
+        "system": [{"type":"text","text":"fixture"}],
+        "messages": [{"role":"user","content":"hello"}],
+    });
+    let rejected = client.post(&endpoint).json(&payload).send().await.unwrap();
+    assert_eq!(rejected.status(), 401);
+
+    let response = client
+        .post(&endpoint)
+        .bearer_auth(GATEWAY_KEY)
+        .header("x-api-key", "caller-credential")
+        .header("anthropic-version", "2026-10-21")
+        .header("anthropic-beta", "context-1m-2025-08-07")
+        .header("anthropic-fixture-feature", "future-capability")
+        .header("anthropic-auth-token", "caller-credential")
+        .header("anthropic-workspace-id", "caller-workspace")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"input_tokens":17})
+    );
+
+    payload["model"] = json!("responses/responses-model");
+    let response = client
+        .post(&endpoint)
+        .bearer_auth(GATEWAY_KEY)
+        .header("anthropic-beta", "context-1m-2025-08-07")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"input_tokens":21})
+    );
+
+    payload["model"] = json!("chat/chat-model");
+    let translated = client
+        .post(&endpoint)
+        .header("x-api-key", GATEWAY_KEY)
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(translated.status(), 404);
+    child.kill().await.unwrap();
+    mock.abort();
+
+    let hits = hits.lock().unwrap();
+    assert_eq!(hits.len(), 2);
+    let hit = &hits[0];
+    assert_eq!(hit.path, "/v1/messages/count_tokens");
+    assert_eq!(hit.headers["x-api-key"], "messages-vendor-fixture");
+    assert!(!hit.headers.contains_key("authorization"));
+    assert!(!hit.headers.contains_key("anthropic-auth-token"));
+    assert!(!hit.headers.contains_key("anthropic-workspace-id"));
+    assert_eq!(hit.headers["anthropic-beta"], "context-1m-2025-08-07");
+    assert_eq!(hit.headers["anthropic-version"], "2026-10-21");
+    assert_eq!(
+        hit.headers["anthropic-fixture-feature"],
+        "future-capability"
+    );
+    payload["model"] = json!("claude-model");
+    assert_eq!(hit.body, payload, "counting needs no inference-only fields");
+
+    let hit = &hits[1];
+    assert_eq!(hit.path, "/v1/responses/input_tokens");
+    assert_eq!(
+        hit.headers["authorization"],
+        "Bearer responses-vendor-fixture"
+    );
+    assert!(!hit.headers.contains_key("anthropic-beta"));
+    assert_eq!(
+        hit.body,
+        json!({
+            "model": "responses-model",
+            "instructions": "fixture",
+            "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],
+        })
+    );
 }
 
 #[tokio::test]

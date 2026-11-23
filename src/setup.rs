@@ -263,7 +263,14 @@ pub(crate) fn guided_provider(home: &Path) -> Result<(), RelayError> {
         if id == "anthropic" {
             args.extend(["--anthropic-version", "2026-10-21"].map(OsString::from));
         }
-        if id == "opencode-go" {
+        if url.scheme() == "https"
+            && url.host_str() == Some("opencode.ai")
+            && url.port_or_known_default() == Some(443)
+            && matches!(
+                url.path(),
+                "/inference/go/openai/v1" | "/inference/go/anthropic/v1"
+            )
+        {
             args.extend(
                 ["--models-url", "https://opencode.ai/inference/go/v1/models"].map(OsString::from),
             );
@@ -334,6 +341,7 @@ fn infer_connection(raw: &str, default_wire: WireKind) -> Result<(reqwest::Url, 
     } else if url.host_str() == Some("api.anthropic.com")
         || path.ends_with("/apps/anthropic")
         || path.ends_with("/apps/anthropic/v1")
+        || path == "/inference/go/anthropic/v1" && url.host_str() == Some("opencode.ai")
     {
         (path, WireKind::AnthropicMessages)
     } else if path.ends_with("/compatible-mode/v1")

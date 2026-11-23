@@ -180,6 +180,33 @@ HTTP 405 with a coding-agent restriction in a live relay check. If you see
 this error, confirm the URL against the plan attached to your key.
 [Alibaba Cloud Token Plan troubleshooting](https://www.alibabacloud.com/help/en/model-studio/token-plan-faq)
 
+### Choose a Messages route for Claude Code
+
+Choose a Messages endpoint to avoid translating Claude Code requests inside ox.
+The provider determines which models, tools, and counting endpoints work on that route.
+Keep the two protocols under separate provider names when you want both.
+
+| Setup preset | Messages option |
+| --- | --- |
+| Anthropic | Already uses `https://api.anthropic.com/v1`. [Anthropic Messages](https://platform.claude.com/docs/en/api/messages) |
+| OpenRouter | `https://openrouter.ai/api/v1`, with `wire_api = "anthropic_messages"`. ox uses bearer auth. [OpenRouter's Claude Code guide](https://openrouter.ai/docs/guides/coding-agents/claude-code-integration) |
+| OpenCode Go | `https://opencode.ai/inference/go/anthropic/v1`, with `wire_api = "anthropic_messages"`. ox uses bearer auth and keeps its Go session routing. OpenCode may translate internally for some models. [Go endpoints](https://opencode.ai/docs/console/harnesses/#base-urls) |
+| Alibaba Cloud | Paste the Anthropic-compatible URL for your account, ending in `/apps/anthropic` or `/apps/anthropic/v1`. Configure model IDs explicitly because that API has no `/models` catalog. [Model Studio Messages](https://www.alibabacloud.com/help/en/model-studio/anthropic-api-messages) |
+| OpenAI | Use Responses. ox translates the request and uses `/responses/input_tokens` for a provider-backed count. [OpenAI token counting](https://developers.openai.com/api/docs/guides/token-counting) |
+
+To add an alternate route through guided setup, choose **Other or self-hosted**
+and paste its full URL ending in `/messages`. If you add routes manually and
+both use the same vendor key, give each route a distinct `env_key` reference.
+This lets ox keep any saved key scoped to that route's base URL. For example,
+with `OPENCODE_MESSAGES_API_KEY` available in your shell:
+
+```sh
+ox provider add opencode-go-messages \
+  --base-url https://opencode.ai/inference/go/anthropic/v1 \
+  --models-url https://opencode.ai/inference/go/v1/models \
+  --wire anthropic_messages --env-key OPENCODE_MESSAGES_API_KEY
+```
+
 ### Check the live connection
 
 ```sh
@@ -376,7 +403,7 @@ streamed `safeguard_results`, and tool-use IDs. Check the **Auto mode server** r
 in Claude Code's `/status` to see whether server review is active.
 [Claude Code classifier billing](https://code.claude.com/docs/en/auto-mode-classifier-billing#make-the-session-eligible)
 
-When a session starts on a translated model, ox defaults
+When a session starts outside the direct Anthropic API, ox defaults
 `CLAUDE_CODE_AUTO_MODE_SERVER` to `0`. Claude Code handles the review through
 separate classifier requests, which can count toward API usage. To use a configured
 Anthropic model for those requests, add `--client-classifier auto`:
@@ -393,7 +420,9 @@ as `--client-classifier anthropic/claude-sonnet-4-6`. That route receives the
 action context needed for review. Model selection for classifier requests
 requires Claude Code 2.1.302 or later. Claude Code can deny checked actions if
 the classifier is unavailable. The server setting applies for the launch.
-Start a new session on a native model to use its server checks.
+Start a new session on an eligible direct Anthropic route to use its server checks.
+If another endpoint supports Anthropic server checks, set
+`CLAUDE_CODE_AUTO_MODE_SERVER` to `1` for that launch.
 [Claude Code classifier model selection](https://code.claude.com/docs/en/permission-modes#choose-the-classifier-model)
 
 The [CLI settings example](../examples/claude-code-auto.settings.json) keeps

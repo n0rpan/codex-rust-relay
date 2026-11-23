@@ -271,7 +271,7 @@ pub(crate) struct ClaudeLaunchOptions<'a> {
 }
 
 pub(crate) struct ClaudeModelInfo {
-    pub wire: crate::provider::Wire,
+    pub can_request_server_review: bool,
     pub context_window: Option<u64>,
 }
 
@@ -455,16 +455,12 @@ pub(crate) fn claude_command(
             );
             command.env(CLASSIFIER_MODEL_ENV, classifier);
         }
-    } else if model_info.is_some_and(|model| {
-        matches!(
-            model.wire,
-            crate::provider::Wire::Responses | crate::provider::Wire::ChatCompletions
-        )
-    }) && !env_refs.contains(SERVER_REVIEW_ENV)
+    } else if model_info.is_some_and(|model| !model.can_request_server_review)
+        && !env_refs.contains(SERVER_REVIEW_ENV)
         && std::env::var_os(SERVER_REVIEW_ENV).is_none()
     {
-        // Neither translated API can return a server-side tool verdict.
-        // Keep Claude Code's own classifier active on these routes.
+        // Matching the Messages format alone does not provide server review.
+        // Keep Claude Code's own classifier active on other routes by default.
         command.env(SERVER_REVIEW_ENV, "0");
     }
     let (args, settings) = inject_settings(args, overlay_env, options.starred)?;
