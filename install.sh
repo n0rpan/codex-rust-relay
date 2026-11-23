@@ -1,0 +1,364 @@
+#!/bin/sh
+# Install ox, the local model gateway for stock Codex and Claude Code.
+#
+#   curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh -s -- --dev
+#
+# Options (flags win over environment variables):
+#   --stable                 Install the latest stable release (default)
+#   --dev                    Install the rolling development pre-release
+#   OX_CHANNEL=dev|stable    Same as the flags
+#   OX_INSTALL_DIR=DIR       Install directory (default: $HOME/.local/bin)
+#   OX_INSTALL_BASE_URL=URL  Download ox-<target>.tar.gz from URL instead of GitHub
+#   OX_INSTALL_SKIP_GLIBC_CHECK=1  Skip the Linux glibc version check
+#
+# The script is wrapped in main() and called on the last line, so a download
+# that is cut off part-way never runs a half-received script.
+
+set -eu
+
+REPOSITORY="n0rpan/ox"
+MIN_GLIBC_MINOR=39
+
+bold=""
+dim=""
+red=""
+green=""
+yellow=""
+reset=""
+work=""
+
+setup_colours() {
+    if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
+        bold="$(printf '\033[1m')"
+        dim="$(printf '\033[2m')"
+        red="$(printf '\033[31m')"
+        green="$(printf '\033[32m')"
+        yellow="$(printf '\033[33m')"
+        reset="$(printf '\033[0m')"
+    fi
+}
+
+info() {
+    printf '%s\n' "$*"
+}
+
+step() {
+    printf '%s==>%s %s\n' "$bold" "$reset" "$*"
+}
+
+warn() {
+    printf '%swarning:%s %s\n' "$yellow" "$reset" "$*" >&2
+}
+
+die() {
+    printf '%serror:%s %s\n' "$red" "$reset" "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    if [ -n "$work" ]; then
+        rm -rf "$work"
+    fi
+}
+
+usage() {
+    cat <<'EOF'
+Install ox on macOS or Linux.
+
+Usage: install.sh [--stable|--dev]
+
+  --stable   Install the latest stable release (default)
+  --dev      Install the rolling development pre-release
+
+Environment:
+  OX_CHANNEL=stable|dev    Same as the flags
+  OX_INSTALL_DIR=DIR       Install directory (default: $HOME/.local/bin)
+  OX_INSTALL_BASE_URL=URL  Download ox-<target>.tar.gz from URL instead of GitHub
+EOF
+}
+
+source_hint() {
+    info "Build from source instead:" >&2
+    info "  cargo install --locked --git https://github.com/${REPOSITORY}" >&2
+}
+
+detect_target() {
+    os="$(uname -s)"
+    arch="$(uname -m)"
+    case "$os" in
+        Linux) os_part="unknown-linux-gnu" ;;
+        Darwin) os_part="apple-darwin" ;;
+        *) die "ox supports macOS and Linux; this system is ${os}." ;;
+    esac
+    case "$arch" in
+        x86_64 | amd64) arch_part="x86_64" ;;
+        aarch64 | arm64) arch_part="aarch64" ;;
+        *) die "ox supports x86-64 and ARM64; this machine is ${arch}." ;;
+    esac
+    # A Rosetta shell on Apple silicon reports x86_64. Install the native build.
+    if [ "$os" = "Darwin" ] && [ "$arch_part" = "x86_64" ] &&
+        [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = "1" ]; then
+        arch_part="aarch64"
+    fi
+    target="${arch_part}-${os_part}"
+}
+
+check_glibc() {
+    case "$target" in
+        *-linux-gnu) ;;
+        *) return 0 ;;
+    esac
+    if [ -n "${OX_INSTALL_SKIP_GLIBC_CHECK:-}" ]; then
+        return 0
+    fi
+    found="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+    case "$found" in
+        "glibc "*) found="${found#glibc }" ;;
+        *)
+            if ldd --version 2>&1 | grep -qi musl; then
+                printf '%serror:%s %s\n' "$red" "$reset" \
+                    "the ox release binaries need glibc 2.${MIN_GLIBC_MINOR} or newer; this system uses musl." >&2
+                source_hint
+                exit 1
+            fi
+            warn "could not detect the glibc version; ox needs glibc 2.${MIN_GLIBC_MINOR} or newer."
+            return 0
+            ;;
+    esac
+    major="${found%%.*}"
+    rest="${found#*.}"
+    minor="${rest%%.*}"
+    case "${major}${minor}" in
+        "" | *[!0-9]*)
+            warn "could not read the glibc version '${found}'; ox needs glibc 2.${MIN_GLIBC_MINOR} or newer."
+            return 0
+            ;;
+    esac
+    if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt "$MIN_GLIBC_MINOR" ]; }; then
+        printf '%serror:%s %s\n' "$red" "$reset" \
+            "the ox release binaries need glibc 2.${MIN_GLIBC_MINOR} or newer; this system has glibc ${found}." >&2
+        source_hint
+        exit 1
+    fi
+}
+
+pick_tools() {
+    if command -v curl >/dev/null 2>&1; then
+        fetcher="curl"
+    elif command -v wget >/dev/null 2>&1; then
+        fetcher="wget"
+    else
+        die "install curl or wget, then run this installer again."
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        hasher="sha256sum"
+    elif command -v shasum >/dev/null 2>&1; then
+        hasher="shasum"
+    else
+        die "install sha256sum or shasum, then run this installer again."
+    fi
+    command -v tar >/dev/null 2>&1 || die "install tar, then run this installer again."
+}
+
+# fetch URL FILE: returns 0 on success, 44 when the server says the file does
+# not exist, and 1 for every other failure.
+fetch() {
+    status=0
+    if [ "$fetcher" = "curl" ]; then
+        curl --fail --silent --show-error --location --retry 2 \
+            --connect-timeout 15 --output "$2" "$1" 2>"$work/fetch.err" || status=$?
+        # curl exits 22 for an HTTP status of 400 or above.
+        if [ "$status" -eq 22 ]; then
+            return 44
+        fi
+    else
+        wget --quiet --tries=3 --timeout=15 --output-document="$2" "$1" 2>"$work/fetch.err" || status=$?
+        # wget exits 8 when the server answers with an error status.
+        if [ "$status" -eq 8 ]; then
+            return 44
+        fi
+    fi
+    if [ "$status" -ne 0 ]; then
+        return 1
+    fi
+    return 0
+}
+
+# download BASE: fetch the archive and its checksum from BASE. Same return
+# codes as fetch.
+download() {
+    fetch "$1/${asset}" "$work/${asset}" || return $?
+    fetch "$1/${asset}.sha256" "$work/${asset}.sha256" || return $?
+    return 0
+}
+
+file_sha256() {
+    if [ "$hasher" = "sha256sum" ]; then
+        sha256sum "$1" | cut -c 1-64
+    else
+        shasum -a 256 "$1" | cut -c 1-64
+    fi
+}
+
+path_hint() {
+    case ":${PATH}:" in
+        *":${install_dir}:"*) return 0 ;;
+    esac
+    info ""
+    info "${yellow}${install_dir} is not on your PATH.${reset} Add it with:"
+    info ""
+    case "$(basename "${SHELL:-sh}")" in
+        zsh)
+            info "  echo 'export PATH=\"${install_dir}:\$PATH\"' >> ~/.zshrc"
+            info "  source ~/.zshrc"
+            ;;
+        bash)
+            if [ "$(uname -s)" = "Darwin" ]; then
+                profile="$HOME/.bash_profile"
+            else
+                profile="$HOME/.bashrc"
+            fi
+            info "  echo 'export PATH=\"${install_dir}:\$PATH\"' >> ${profile}"
+            info "  source ${profile}"
+            ;;
+        fish)
+            info "  fish_add_path ${install_dir}"
+            ;;
+        *)
+            info "  echo 'export PATH=\"${install_dir}:\$PATH\"' >> ~/.profile"
+            info "  . ~/.profile"
+            ;;
+    esac
+}
+
+main() {
+    setup_colours
+    channel="${OX_CHANNEL:-}"
+    for argument in "$@"; do
+        case "$argument" in
+            --dev) channel="dev" ;;
+            --stable) channel="stable" ;;
+            -h | --help)
+                usage
+                exit 0
+                ;;
+            *)
+                usage >&2
+                die "unknown option: ${argument}"
+                ;;
+        esac
+    done
+    explicit_channel="$channel"
+    case "$channel" in
+        "") channel="stable" ;;
+        stable | dev) ;;
+        *) die "OX_CHANNEL must be stable or dev, not '${channel}'." ;;
+    esac
+
+    [ -n "${HOME:-}" ] || [ -n "${OX_INSTALL_DIR:-}" ] || die "set HOME or OX_INSTALL_DIR."
+    install_dir="${OX_INSTALL_DIR:-$HOME/.local/bin}"
+    case "$install_dir" in
+        /*) ;;
+        *) die "OX_INSTALL_DIR must be an absolute path, not '${install_dir}'." ;;
+    esac
+
+    detect_target
+    check_glibc
+    pick_tools
+    asset="ox-${target}.tar.gz"
+
+    work="$(mktemp -d "${TMPDIR:-/tmp}/ox-install.XXXXXX")" || die "could not create a temporary directory."
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    stable_base="https://github.com/${REPOSITORY}/releases/latest/download"
+    dev_base="https://github.com/${REPOSITORY}/releases/download/dev"
+    result=0
+    if [ -n "${OX_INSTALL_BASE_URL:-}" ]; then
+        base="${OX_INSTALL_BASE_URL%/}"
+        source_name="$base"
+        step "Downloading ox for ${target} from ${base}"
+        download "$base" || result=$?
+    elif [ "$channel" = "dev" ]; then
+        source_name="the dev pre-release"
+        step "Downloading the ox dev build for ${target}"
+        download "$dev_base" || result=$?
+    else
+        source_name="the latest stable release"
+        step "Downloading ox for ${target}"
+        download "$stable_base" || result=$?
+        if [ "$result" -eq 44 ] && [ -z "$explicit_channel" ]; then
+            info "${yellow}No stable ox release is published yet. Installing the dev build instead.${reset}"
+            channel="dev"
+            source_name="the dev pre-release"
+            result=0
+            download "$dev_base" || result=$?
+        fi
+    fi
+    if [ "$result" -eq 44 ]; then
+        if [ -z "${OX_INSTALL_BASE_URL:-}" ] && [ "$channel" = "stable" ]; then
+            die "no stable ox release for ${target} is published yet. Run this installer again with --dev."
+        fi
+        die "${source_name} has no ox build for ${target}. See https://github.com/${REPOSITORY}/releases"
+    elif [ "$result" -ne 0 ]; then
+        if [ -s "$work/fetch.err" ]; then
+            cat "$work/fetch.err" >&2
+        fi
+        die "could not download ox from ${source_name}. Check your connection and try again."
+    fi
+
+    step "Verifying the SHA-256 checksum"
+    expected="$(sed -n '1s/^\([0-9a-fA-F]\{64\}\).*$/\1/p' "$work/${asset}.sha256" | tr 'A-F' 'a-f')"
+    [ -n "$expected" ] || die "the published checksum for ${asset} is not a SHA-256 digest."
+    actual="$(file_sha256 "$work/${asset}")"
+    if [ "$expected" != "$actual" ]; then
+        die "checksum mismatch for ${asset} (expected ${expected}, got ${actual}). Nothing was installed."
+    fi
+
+    mkdir "$work/unpacked"
+    tar -xzf "$work/${asset}" -C "$work/unpacked" || die "could not unpack ${asset}."
+    [ -f "$work/unpacked/ox" ] || die "${asset} does not contain the ox binary."
+    chmod 755 "$work/unpacked/ox"
+
+    step "Installing to ${install_dir}/ox"
+    mkdir -p "$install_dir" || die "could not create ${install_dir}."
+    if [ -d "${install_dir}/ox" ]; then
+        die "${install_dir}/ox is a directory. Remove it or set OX_INSTALL_DIR."
+    fi
+    # Stage inside the destination directory so the final rename is atomic and
+    # a running ox keeps its old file until it exits.
+    staged="${install_dir}/.ox-install.$$"
+    cp "$work/unpacked/ox" "$staged" || die "could not write to ${install_dir}. Set OX_INSTALL_DIR to a directory you own."
+    chmod 755 "$staged"
+    if ! mv -f "$staged" "${install_dir}/ox"; then
+        rm -f "$staged"
+        die "could not replace ${install_dir}/ox."
+    fi
+    if [ "$(uname -s)" = "Darwin" ] && command -v xattr >/dev/null 2>&1; then
+        xattr -d com.apple.quarantine "${install_dir}/ox" 2>/dev/null || true
+    fi
+
+    if ! installed="$("${install_dir}/ox" --version 2>&1)"; then
+        printf '%serror:%s %s\n' "$red" "$reset" \
+            "${install_dir}/ox was installed but does not run on this system:" >&2
+        info "  ${installed}" >&2
+        source_hint
+        exit 1
+    fi
+
+    info ""
+    info "${green}Installed ${installed}${reset} ${dim}(${install_dir}/ox)${reset}"
+    path_hint
+    info ""
+    info "Next step:"
+    info ""
+    info "  ${bold}ox setup${reset}"
+    info ""
+    if [ "$channel" = "dev" ] && [ -z "${OX_INSTALL_BASE_URL:-}" ]; then
+        info "${dim}This is a development build. ox update keeps it on the dev channel.${reset}"
+    fi
+}
+
+main "$@"

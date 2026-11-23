@@ -26,7 +26,7 @@ Commands
   ox doctor --live --provider NAME
                              Test one live API request
   ox serve [--port PORT]     Run a persistent loopback gateway
-  ox update [--check]        Install or check for the latest stable version
+  ox update [--check]        Install or check for the newest ox release
   ox help [install|setup|desktop|share|t3|subscriptions]
                              Show help for a task
   ox --version               Print the installed ox version
@@ -176,14 +176,18 @@ key from the OpenAI or Claude organization where you claimed those credits.";
 const INSTALL: &str = "\
 Install or update ox on macOS and Linux
 
-Download your platform binary and its .sha256 file from GitHub Releases.
-Use shasum -a 256 -c on macOS or sha256sum -c on Linux, then install the
-binary as ~/.local/bin/ox. Preview builds are available from GitHub Actions.
-Platform filenames and copyable steps are in docs/configuration.md.
+  curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh
 
-Releases: https://github.com/n0rpan/codex-rust-relay/releases
-Run ox update --check to check for a newer stable release.
-Run ox update to verify and install it over the running ox executable.";
+The installer picks the build for this machine, verifies its SHA-256
+checksum and installs it as ~/.local/bin/ox. To install the development
+build made from every commit on main, end the command with: sh -s -- --dev
+
+Run ox update --check to look for a newer release.
+Run ox update to verify and install it over the running ox executable.
+Run ox update --dev or ox update --stable to switch channels.
+
+Releases: https://github.com/n0rpan/ox/releases
+Manual download steps and platform filenames are in docs/configuration.md.";
 
 const TOPICS: &str = "Usage: ox help [install|setup|desktop|share|t3|subscriptions]";
 

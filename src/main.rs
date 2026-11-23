@@ -100,6 +100,14 @@ struct VendorState {
     auth: Option<SecretKey>,
 }
 
+/// The version this binary reports. Release builds set `OX_BUILD_VERSION`
+/// at compile time (for example `0.1.1-dev.38`); every other build uses the
+/// version in Cargo.toml.
+pub(crate) const VERSION: &str = match option_env!("OX_BUILD_VERSION") {
+    Some(version) if !version.is_empty() => version,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     match launch(std::env::args_os().skip(1)).await {
@@ -131,7 +139,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         .first()
         .is_some_and(|arg| arg == "--version" || arg == "-V")
     {
-        println!("ox {}", env!("CARGO_PKG_VERSION"));
+        println!("ox {VERSION}");
         return Ok(0);
     }
     if let Some(result) = help::dispatch(&args) {

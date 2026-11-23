@@ -134,9 +134,14 @@ fn version_is_available_without_a_home_or_stock_client() {
         .output()
         .expect("run ox --version");
     assert!(output.status.success());
+    // Release builds compile in OX_BUILD_VERSION; see VERSION in src/main.rs.
+    let version = match option_env!("OX_BUILD_VERSION") {
+        Some(version) if !version.is_empty() => version,
+        _ => env!("CARGO_PKG_VERSION"),
+    };
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        concat!("ox ", env!("CARGO_PKG_VERSION"))
+        format!("ox {version}")
     );
 }
 

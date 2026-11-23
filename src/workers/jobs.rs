@@ -447,7 +447,7 @@ async fn run_goal(
         &mut lines,
         1,
         "initialize",
-        json!({"clientInfo":{"name":"ox-worker","version": env!("CARGO_PKG_VERSION")}}),
+        json!({"clientInfo":{"name":"ox-worker","version": crate::VERSION}}),
     )
     .await?;
     write_rpc(&mut input, json!({"method":"initialized"})).await?;
