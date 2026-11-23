@@ -4,7 +4,8 @@
 
 ## Install options
 
-Pick the GitHub Actions artifact that matches `uname -sm`. The runner builds the archive,
+Pick the GitHub Actions artifact that matches `uname -sm` from a run with
+**Release binaries** jobs. The runner builds the archive,
 checks its SHA-256, extracts it, and runs the copy inside. Sign in to GitHub to download
 artifacts while they are retained (30 days). [Download instructions](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/download-workflow-artifacts)
 

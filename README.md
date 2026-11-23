@@ -12,9 +12,10 @@ launch. CI runs the [compatibility tests](docs/verification.md#client-updates)
 against the latest official clients. [Install Codex](https://developers.openai.com/codex/cli/) ·
 [Install Claude Code](https://code.claude.com/docs/en/quickstart)
 
-Download the archive for your machine from a successful [GitHub Actions run](https://github.com/n0rpan/codex-rust-relay/actions/workflows/ci.yml).
-Sign in to GitHub and open **Artifacts** at the bottom of the run. Unzip the downloaded
-artifact, then run these commands from the folder containing the `.tar.gz` and its checksum:
+Sign in to GitHub and open a successful [CI run](https://github.com/n0rpan/codex-rust-relay/actions/workflows/ci.yml)
+with **Release binaries** jobs. Download your platform's artifact from **Artifacts** at the
+bottom of the run. Unzip it, then run these commands from the folder containing the `.tar.gz`
+and its checksum:
 
 ```sh
 # Run this in the folder for a single platform artifact.
