@@ -123,7 +123,47 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         record(self.server_tag, self)
-        self.reply(404, b'{"error":"fixture"}')
+        if self.server_tag == "inference_tls" and self.path == "/backend-api/codex/responses":
+            self.inference_reply("gpt-5.1-codex", "native fixture reply")
+        elif self.server_tag == "vendor" and self.path == "/v1/responses":
+            self.inference_reply("fixture-model", "vendor fixture reply")
+        else:
+            self.reply(404, b'{"error":"fixture"}')
+
+    def inference_reply(self, model, text):
+        item = {
+            "id": "msg_shared_home",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }
+        response = {
+            "id": "resp_shared_home",
+            "object": "response",
+            "created_at": 1700000000,
+            "status": "completed",
+            "model": model,
+            "output": [item],
+            "usage": {
+                "input_tokens": 3, "output_tokens": 2, "total_tokens": 5,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens_details": {"reasoning_tokens": 0},
+            },
+        }
+        events = [
+            {"type": "response.output_item.done", "output_index": 0, "item": item},
+            {"type": "response.completed", "response": response},
+        ]
+        body = "".join(
+            "event: " + event["type"] + "\ndata: " + json.dumps(event) + "\n\n"
+            for event in events
+        ).encode()
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 class Server(ThreadingHTTPServer):
@@ -246,6 +286,11 @@ fn stock_codex_keeps_native_auth_and_codeox_uses_the_vendor_key_on_the_same_home
         .args([
             "codex",
             "--chatgpt",
+            "--no-daemon",
+            "--disable",
+            "plugins",
+            "--disable",
+            "hooks",
             "exec",
             "--skip-git-repo-check",
             "--json",
@@ -270,18 +315,9 @@ fn stock_codex_keeps_native_auth_and_codeox_uses_the_vendor_key_on_the_same_home
     environment.push(("SSL_CERT_FILE".to_owned(), ca_cert.display().to_string()));
     apply_env(&mut direct, &environment);
     let mut direct = spawn_logged(direct, &phase1_log);
-    wait_for_request(
-        &mut direct,
-        &tree.path,
-        &phase1_log,
-        "stock codex (native auth)",
-        Duration::from_secs(90),
-        |request| {
-            request.server == "inference_tls"
-                && request.method == "POST"
-                && request.path == INFERENCE_ROUTE
-        },
-    );
+    // Let Codex finish the native turn and let ox reap it before starting
+    // phase two. Killing only ox here leaves Codex free to retry in the background.
+    wait_for_turn(&mut direct, &phase1_log, "native fixture reply");
 
     let requests = read_requests(&tree.path);
     let discovery = find_request(&requests, "discovery", "GET", DISCOVERY_ROUTE)
@@ -361,26 +397,15 @@ fn stock_codex_keeps_native_auth_and_codeox_uses_the_vendor_key_on_the_same_home
     environment.push(("VENDOR_KEY".to_owned(), VENDOR_KEY.to_owned()));
     apply_env(&mut codeox, &environment);
     let mut codeox = spawn_logged(codeox, &phase2_log);
-    wait_for_request(
-        &mut codeox,
-        &tree.path,
-        &phase2_log,
-        "codeox (vendor key)",
-        Duration::from_secs(90),
-        |request| {
-            request.server == "vendor"
-                && request.method == "POST"
-                && request.path == "/v1/responses"
-        },
-    );
+    wait_for_turn(&mut codeox, &phase2_log, "vendor fixture reply");
 
     let requests = read_requests(&tree.path);
-    let phase2 = &requests[phase2_start.min(requests.len())..];
+    let phase2 = &requests[phase2_start..];
     assert!(
         !phase2.iter().any(|request| request.path == INFERENCE_ROUTE),
         "codeox must not send model traffic to the native ChatGPT backend"
     );
-    let vendor = find_request(&requests, "vendor", "POST", "/v1/responses")
+    let vendor = find_request(phase2, "vendor", "POST", "/v1/responses")
         .unwrap_or_else(|| panic!("missing vendor request; captured {requests:#?}"));
     assert_header(vendor, "authorization", &format!("Bearer {VENDOR_KEY}"));
     assert!(
@@ -786,38 +811,38 @@ fn wait_for_ports(state: &Path, fixture: &mut Child) -> Ports {
     }
 }
 
-fn wait_for_request(
-    child: &mut Child,
-    state: &Path,
-    log: &Path,
-    label: &str,
-    timeout: Duration,
-    predicate: impl Fn(&Recorded) -> bool,
-) {
-    let start = Instant::now();
+fn wait_for_turn(child: &mut Child, log: &Path, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(90);
     loop {
-        if read_requests(state).iter().any(&predicate) {
-            stop(child);
-            return;
+        if let Some(status) = child.try_wait().expect("wait for ox") {
+            assert!(status.success(), "ox exited with {status}:\n{}", tail(log));
+            break;
         }
-        if let Some(status) = child.try_wait().expect("wait for child") {
-            if read_requests(state).iter().any(&predicate) {
-                return;
-            }
-            panic!(
-                "{label} exited with {status} before the expected request; log:\n{}",
-                tail(log)
-            );
-        }
-        if start.elapsed() > timeout {
+        if Instant::now() >= deadline {
             stop(child);
             panic!(
-                "{label} produced no matching request within {timeout:?}; log:\n{}",
+                "ox did not finish the turn within 90 seconds:\n{}",
                 tail(log)
             );
         }
         thread::sleep(Duration::from_millis(50));
     }
+
+    let raw = fs::read_to_string(log).expect("read Codex output");
+    let events: Vec<Value> = raw
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert!(
+        events.iter().any(|event| event["type"] == "turn.completed")
+            && events.iter().any(|event| {
+                event["type"] == "item.completed"
+                    && event["item"]["type"] == "agent_message"
+                    && event["item"]["text"] == expected
+            }),
+        "expected a completed Codex turn with {expected:?}:\n{}",
+        tail(log)
+    );
 }
 
 #[derive(Debug, Clone)]
