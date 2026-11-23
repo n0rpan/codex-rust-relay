@@ -30,6 +30,11 @@ Cargo installs into `${CARGO_HOME:-$HOME/.cargo}/bin` by default. Add the instal
 
 ## Add a provider
 
+Start with `ox setup` in a terminal. Choose `openrouter`, `anthropic`, or `openai`
+for connection defaults. For another provider, use the URL and API format from its
+documentation. Setup asks for the **name** of your API key variable. Load the value
+in the shell that will run ox, then use `ox doctor` to check the configuration.
+
 Choose the API format your **provider** expects, regardless of which CLI you use.
 Use a model that supports streaming and tool calls for the coding workflows in the
 [compatibility matrix](compatibility.md#verified-client-and-api-combinations).
@@ -63,8 +68,8 @@ Use `--anthropic-version 2023-06-01` for an endpoint using the legacy Anthropic 
 give it a separate provider name such as `anthropic-legacy` to keep both routes. See the
 [example with both API versions](../examples/claude-providers.toml).
 
-`ox provider add --help` lists all flags. Running `ox provider add` without arguments in
-a terminal prompts for the fields. The command creates `codeox.toml` or appends a provider,
+`ox setup --help` lists all flags. `ox provider add` accepts the same prompts and flags
+for adding more providers. Setup creates `codeox.toml` or appends a provider,
 preserving existing settings. To change an existing entry, edit the file and relaunch.
 For static models, setup prints their aliases and launch commands. `ox doctor --strict`
 also treats warnings as errors.

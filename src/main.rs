@@ -14,6 +14,7 @@ mod claude_search;
 mod clients;
 mod daemon;
 mod diagnostics;
+mod help;
 mod provider;
 mod search;
 mod setup;
@@ -24,6 +25,7 @@ mod upstream;
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::io::IsTerminal;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -128,19 +130,8 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         println!("ox {}", env!("CARGO_PKG_VERSION"));
         return Ok(0);
     }
-    if args
-        .first()
-        .is_some_and(|arg| arg == "--help" || arg == "-h")
-    {
-        println!(
-            "ox codex [args...]  Launch Codex with the gateway\n\
-             ox claude [args...] Launch Claude Code with the gateway\n\
-             ox serve           Run a persistent loopback gateway\n\
-             ox provider add    Configure a provider\n\
-             ox doctor          Check provider configuration\n\
-             ox --version       Print the installed ox version"
-        );
-        return Ok(0);
+    if let Some(result) = help::dispatch(&args) {
+        return result;
     }
     let codex_home = std::env::var_os("CODEX_HOME")
         .filter(|path| !path.is_empty())
@@ -157,6 +148,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
     if let Some(result) = setup::dispatch(&args, &codex_home) {
         return result;
     }
+    let bare = args.is_empty();
     let (client_kind, args) = clients::select(args);
     let env: &Env<'_> = &|name: &str| provider::process_env(name);
 
@@ -166,13 +158,17 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
             warn_about_static_catalog(&codex_home);
         }
         LaunchConfig::Codeox(CodeoxConfig::load(&config_path)?)
+    } else if matches!(client_kind, ClientKind::Codex)
+        && let Some(provider) = provider::Provider::load_if_configured(&codex_home, env)?
+    {
+        LaunchConfig::Legacy(provider)
+    } else if args.is_empty() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        return setup::run_setup(&[], &codex_home);
+    } else if bare {
+        help::overview();
+        return Ok(0);
     } else {
-        if matches!(client_kind, ClientKind::Claude) {
-            return Err(
-                "configure a provider with ox provider add before launching Claude Code".into(),
-            );
-        }
-        LaunchConfig::Legacy(provider::Provider::load(&codex_home, env)?)
+        return Err("no ox provider configured. Run `ox setup` to get started".into());
     };
     let mut env_refs = config.env_refs();
     env_refs.insert(daemon::KEY_ENV.to_owned());
@@ -261,10 +257,22 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         command.env(name, format!("{existing},127.0.0.1,localhost"));
     }
 
-    let mut child = command.spawn()?;
+    let mut child = command.spawn().map_err(|error| {
+        let client = command.as_std().get_program().to_string_lossy();
+        client_launch_error(&client, error)
+    })?;
     tokio::select! {
         status = child.wait() => Ok(status?.code().unwrap_or(1) as u8),
         result = serve(listener, Arc::new(app)) => Err(result.unwrap_err().into()),
+    }
+}
+
+fn client_launch_error(client: &str, error: std::io::Error) -> RelayError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        format!("could not find `{client}` on PATH. Install it and check `{client} --version`")
+            .into()
+    } else {
+        error.into()
     }
 }
 
@@ -313,6 +321,12 @@ impl App {
             let auth = vendor.api_key(env);
             if let Some(key) = &auth {
                 secrets.push(key.expose().to_owned());
+            } else {
+                eprintln!(
+                    "ox: provider {:?}: {}. Run `ox doctor` to check setup.",
+                    vendor.key,
+                    vendor.unavailable_reason()
+                );
             }
             let discovered = if !vendor.discovery {
                 None
@@ -328,11 +342,6 @@ impl App {
                     }
                 }
             } else {
-                eprintln!(
-                    "codeox: provider {:?}: {}; using configured models only",
-                    vendor.key,
-                    vendor.unavailable_reason()
-                );
                 None
             };
             let specs = catalog::merge_models(discovered, &vendor.models);
@@ -952,7 +961,10 @@ async fn bundled_catalog(
     for name in strip {
         command.env_remove(name);
     }
-    let output = command.output().await?;
+    let output = command
+        .output()
+        .await
+        .map_err(|error| client_launch_error("codex", error))?;
     if !output.status.success() {
         return Err("could not read the bundled Codex model catalog".into());
     }

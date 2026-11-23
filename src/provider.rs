@@ -911,25 +911,41 @@ pub struct Provider {
 
 impl Provider {
     pub fn load(codex_home: &Path, env: &Env<'_>) -> Result<Self, RelayError> {
-        let raw = std::fs::read_to_string(codex_home.join("config.toml"))?;
+        Self::load_if_configured(codex_home, env)?
+            .ok_or_else(|| "no custom provider selected in config.toml".into())
+    }
+
+    pub fn load_if_configured(
+        codex_home: &Path,
+        env: &Env<'_>,
+    ) -> Result<Option<Self>, RelayError> {
+        let raw = match std::fs::read_to_string(codex_home.join("config.toml")) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         let config = Document::parse(raw).map_err(|_| "could not parse Codex config.toml")?;
+        let Some(id) = config.get("model_provider").and_then(Item::as_str) else {
+            return Ok(None);
+        };
+        let Some(provider) = config
+            .get("model_providers")
+            .and_then(|table| table.get(id))
+        else {
+            return Ok(None);
+        };
         if config.get("model_catalog_json").is_some() {
             return Err("remove model_catalog_json to enable live model discovery".into());
         }
-        let id = config
-            .get("model_provider")
-            .and_then(Item::as_str)
-            .filter(|id| {
-                !id.is_empty()
-                    && id
-                        .bytes()
-                        .all(|ch| ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'-')
-            })
-            .ok_or("set model_provider to a provider ID using letters, numbers, _ or -")?;
-        let provider = config
-            .get("model_providers")
-            .and_then(|table| table.get(id))
-            .ok_or("the selected model_provider is missing from model_providers")?;
+        if id.is_empty()
+            || !id
+                .bytes()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == b'_' || ch == b'-')
+        {
+            return Err(
+                "set model_provider to a provider ID using letters, numbers, _ or -".into(),
+            );
+        }
         let setting = |name: &str| provider.get(name).and_then(Item::as_str);
         let raw_base = setting("base_url").ok_or("the selected provider needs a base_url")?;
         let base = parse_provider_url(raw_base)?;
@@ -952,14 +968,14 @@ impl Provider {
             .ok_or("set env_key to the name of the provider API key environment variable")?;
         let upstream_auth = bearer_from_env(env, env_key)
             .ok_or_else(|| format!("set a valid API key in {env_key}"))?;
-        Ok(Self {
+        Ok(Some(Self {
             id: id.to_owned(),
             name: setting("name").unwrap_or(id).to_owned(),
             env_key: env_key.to_owned(),
             upstream_auth,
             models_url,
             inference_url,
-        })
+        }))
     }
 
     pub fn responses_url(&self, path: &str, query: Option<&str>) -> Url {

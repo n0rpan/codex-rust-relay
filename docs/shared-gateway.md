@@ -6,6 +6,10 @@
 by default. One server keeps the model registry and vendor keys. Devices connect
 using a separate gateway key and run their own clients, tools and sessions.
 
+Run `ox help share`, `ox help desktop`, or `ox help t3` for the steps in your
+terminal. For a single host, start with loopback. For clients on another device,
+use the HTTPS address from [Tailscale Serve](#2-publish-it-inside-your-tailnet).
+
 ## 1. Configure and start ox
 
 Install ox on the server, then create its config and add providers using the same
@@ -87,7 +91,10 @@ HTTP 401. Use the HTTPS origin from Serve for Claude and the same origin plus
 ### Codex Desktop
 
 Open **Settings → Model Providers & Gateways**. If custom gateways are available,
-add an ox gateway with the API base URL including `/v1`. For manual setup, merge
+choose **Add → Gateway or custom provider**. Name it **ox**, use the API base URL
+including `/v1` and choose **Environment variable** authentication with
+`OX_GATEWAY_KEY` as the variable name. If available, select **Set as current
+provider**. For manual setup, merge
 [the Codex configuration example](../examples/codex-gateway.toml) into the
 execution host’s user-level Codex `config.toml`. Replace the URL and alias. Keep the
 catalog URL at `/v1/catalog`. Supply `OX_GATEWAY_KEY` to the app process through
@@ -137,8 +144,10 @@ reach the tailnet URL.
   backed by its own Codex home, the [Codex config example](../examples/codex-gateway.toml)
   also sets the native catalog URL. Keep the ordinary ChatGPT instance for
   ChatGPT-backed sessions. [T3 Code Codex provider settings](https://github.com/pingdotgg/t3code/blob/main/docs/user/providers-codex.md)
-- **Claude instance.** Give it a separate Claude config directory and keep the
-  stock `claude` binary. Set `ANTHROPIC_BASE_URL` to the HTTPS origin,
+- **Claude instance.** T3 Code runs the Claude Agent SDK with its configured
+  Claude runtime. Use a separate Claude config directory if you also sign in
+  with Claude on this host. In the instance's **Environment variables**, set
+  `ANTHROPIC_BASE_URL` to the HTTPS origin,
   `ANTHROPIC_AUTH_TOKEN` to the gateway key as a sensitive value, and
   `ANTHROPIC_API_KEY` to an explicitly empty value. Add your exact model alias
   as a custom model in T3 Code. For the standalone Claude Code CLI pointed at the
@@ -147,7 +156,8 @@ reach the tailnet URL.
 
 T3 Code manages which instance, secret and aliases a thread uses. Add or update
 vendor routes in the server’s `codeox.toml`. Sessions and tool execution stay in
-the selected client environment.
+the selected client environment. Enable the new instance for your project and
+select it and its custom model when you start a thread.
 
 ## Verification boundary
 
@@ -156,6 +166,10 @@ isolation and reuse of the same port and key after a restart. The opt-in stock
 fixture sends a Codex App Server turn and a Claude Code CLI turn to the same
 daemon using disposable homes and loopback vendor fixtures. It verifies Codex's
 catalog lookup and Claude Code's discovery of Claude aliases across providers.
+The Claude Agent SDK was also tested over all three provider protocols with
+loopback fixtures, including a local file read on a native Anthropic route.
+T3 Code 0.1.11 completed a turn with each of its Codex and Claude provider
+instances through one gateway, using an isolated T3 server and dummy keys.
 Desktop UI workflows and a real cross-device tailnet connection require the
 corresponding installations and device access.
 

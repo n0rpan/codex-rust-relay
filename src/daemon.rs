@@ -21,6 +21,7 @@ pub(crate) async fn run(args: &[OsString], home: &Path) -> Result<u8, RelayError
             println!("Usage: ox serve [--port PORT]");
             println!("Listens on 127.0.0.1 (default port {DEFAULT_PORT}).");
             println!("Set {KEY_ENV} to a private, randomly generated gateway key.");
+            println!("Run ox help share for server setup, or ox help desktop for client setup.");
             return Ok(0);
         }
         [flag, port] if flag == "--port" => port
@@ -37,7 +38,7 @@ pub(crate) async fn run(args: &[OsString], home: &Path) -> Result<u8, RelayError
         )?;
     let path = CodeoxConfig::path(home);
     if !path.is_file() {
-        return Err("ox serve needs codeox.toml. Add a provider first with ox provider add".into());
+        return Err("no ox provider configured. Run `ox setup` before starting `ox serve`".into());
     }
     let config = CodeoxConfig::load(&path)?;
     if config.env_refs().contains(KEY_ENV) {

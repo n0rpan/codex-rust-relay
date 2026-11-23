@@ -1,8 +1,6 @@
-//! Interactive and scriptable `ox provider add`, plus offline `ox doctor`.
+//! Interactive and scriptable provider setup, plus offline `ox doctor`.
 //!
-//! The relay itself never writes to `$CODEX_HOME`. These two subcommands are the
-//! only ox code that edits `codeox.toml`, and they deliberately keep the
-//! edit narrow:
+//! `ox setup` and `ox provider add` edit `codeox.toml` with a narrow scope:
 //!
 //! * only `[providers.<key>]` and its `[[providers.<key>.models]]` tables are
 //!   added; every existing byte, comment and top-level key is preserved;
@@ -15,21 +13,6 @@
 //! `doctor` is offline: it reads `codeox.toml` and `config.toml`, checks the
 //! environment for credential references, and makes no network requests. It
 //! never opens `auth.json`.
-//!
-//! The other worker owns `provider.rs`, `catalog.rs`, the adapters and
-//! `main.rs`. This module therefore depends only on the current public surface
-//! of [`provider`] (`CodeoxConfig`, `alias_for`, the file-name/limits
-//! constants and `RelayError`) and leaves dispatch wiring to `main.rs`:
-//!
-//! ```ignore
-//! mod setup;
-//! // ... after resolving codex_home:
-//! let args: Vec<OsString> = args.collect();
-//! if let Some(result) = setup::dispatch(&args, &codex_home) {
-//!     return result;
-//! }
-//! // ... then pass the same args to the Codex child as before.
-//! ```
 //!
 //! `wire_api = "chat_completions"` and `"anthropic_messages"` are written when
 //! requested, and the whole candidate is validated by the provider module's
@@ -58,6 +41,7 @@ use crate::provider::{
 pub fn dispatch(args: &[OsString], codex_home: &Path) -> Option<Result<u8, RelayError>> {
     let command = args.first()?.to_str()?;
     match command {
+        "setup" => Some(run_setup(&args[1..], codex_home)),
         "provider" => Some(provider_command(&args[1..], codex_home)),
         "doctor" => Some(doctor_command(&args[1..], codex_home)),
         _ => None,
@@ -65,22 +49,12 @@ pub fn dispatch(args: &[OsString], codex_home: &Path) -> Option<Result<u8, Relay
 }
 
 fn provider_command(args: &[OsString], codex_home: &Path) -> Result<u8, RelayError> {
-    let stdin = std::io::stdin();
-    let interactive = stdin.is_terminal();
-    let mut input = stdin.lock();
-    let stdout = std::io::stdout();
-    let mut output = stdout.lock();
-    let env = |name: &str| crate::provider::process_env(name);
+    if args.first().is_some_and(|arg| arg == "add") {
+        return provider_add_command(&args[1..], codex_home, false);
+    }
 
+    let mut output = std::io::stdout().lock();
     match args.first().and_then(|arg| arg.to_str()) {
-        Some("add") => run_provider_add(
-            &args[1..],
-            codex_home,
-            &mut input,
-            &mut output,
-            interactive,
-            &env,
-        ),
         Some("-h" | "--help") => {
             write_provider_usage(&mut output)?;
             Ok(0)
@@ -96,6 +70,48 @@ fn provider_command(args: &[OsString], codex_home: &Path) -> Result<u8, RelayErr
             Ok(2)
         }
     }
+}
+
+pub(crate) fn run_setup(args: &[OsString], codex_home: &Path) -> Result<u8, RelayError> {
+    provider_add_command(args, codex_home, true)
+}
+
+fn provider_add_command(
+    args: &[OsString],
+    codex_home: &Path,
+    setup: bool,
+) -> Result<u8, RelayError> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let interactive = stdin.is_terminal() && (!setup || stdout.is_terminal());
+    let mut output = stdout.lock();
+    if setup && args.is_empty() {
+        if !interactive {
+            write_add_usage(&mut output)?;
+            return Ok(0);
+        }
+        writeln!(output, "Set up a provider for Codex or Claude Code.")?;
+        writeln!(
+            output,
+            "Try openrouter, anthropic, or openai, or enter your own provider name."
+        )?;
+        writeln!(
+            output,
+            "Keep your API key in an environment variable. Enter only its name here.\n"
+        )?;
+        writeln!(
+            output,
+            "For desktop apps or a shared gateway, see ox help desktop or ox help share.\n"
+        )?;
+    }
+    run_provider_add(
+        args,
+        codex_home,
+        &mut stdin.lock(),
+        &mut output,
+        interactive,
+        &crate::provider::process_env,
+    )
 }
 
 fn doctor_command(args: &[OsString], codex_home: &Path) -> Result<u8, RelayError> {
@@ -535,16 +551,22 @@ impl Prompt<'_> {
     fn ask_required_with<T>(
         &mut self,
         label: &str,
+        default: Option<&str>,
         mut validate: impl FnMut(&str) -> Result<T, String>,
     ) -> Result<T, RelayError> {
         loop {
-            self.write_prompt(label, None)?;
+            self.write_prompt(label, default)?;
             let line = self.read_line()?;
-            if line.is_empty() {
+            let value = if line.is_empty() {
+                default.unwrap_or("")
+            } else {
+                &line
+            };
+            if value.is_empty() {
                 writeln!(self.output, "  error: a value is required")?;
                 continue;
             }
-            match validate(&line) {
+            match validate(value) {
                 Ok(value) => return Ok(value),
                 Err(message) => writeln!(self.output, "  error: {message}")?,
             }
@@ -633,7 +655,9 @@ pub(crate) fn run_provider_add(
             Ok(key) => key,
             Err(message) => return usage_error(prompt.output, &message),
         },
-        None if interactive => prompt.ask_required_with("Provider key", validate_provider_key)?,
+        None if interactive => {
+            prompt.ask_required_with("Provider key", None, validate_provider_key)?
+        }
         None => {
             return usage_error(
                 prompt.output,
@@ -655,9 +679,17 @@ pub(crate) fn run_provider_add(
         None => None,
     };
 
+    let suggested_url = match key.as_str() {
+        "openrouter" => Some("https://openrouter.ai/api/v1"),
+        "anthropic" => Some("https://api.anthropic.com/v1"),
+        "openai" => Some("https://api.openai.com/v1"),
+        _ => None,
+    };
     let base_url = match parsed.base_url.take() {
         Some(base_url) => base_url,
-        None if interactive => prompt.ask_required_with("Base URL", validate_base_url)?,
+        None if interactive => {
+            prompt.ask_required_with("Base URL", suggested_url, validate_base_url)?
+        }
         None => {
             return usage_error(
                 prompt.output,
@@ -668,7 +700,14 @@ pub(crate) fn run_provider_add(
 
     let wire = match parsed.wire {
         Some(wire) => wire,
-        None if interactive => prompt.ask_wire(WireKind::Responses)?,
+        None if interactive => {
+            let default = if key == "anthropic" && suggested_url == Some(base_url.as_str()) {
+                WireKind::AnthropicMessages
+            } else {
+                WireKind::Responses
+            };
+            prompt.ask_wire(default)?
+        }
         None => WireKind::Responses,
     };
 
@@ -712,6 +751,7 @@ pub(crate) fn run_provider_add(
             while models.is_empty() {
                 let model = prompt.ask_required_with(
                     "Static model id (required when discovery is off)",
+                    None,
                     |raw| {
                         validate_model_id(raw).map(|id| ModelForm {
                             id,
@@ -906,7 +946,11 @@ pub(crate) fn run_provider_add(
     } else {
         writeln!(
             prompt.output,
-            "Next: run `ox doctor`, then launch with a model alias in the form {}/<upstream-model-id>.",
+            "Next: run `ox doctor`, then run `ox codex` or `ox claude` from your project."
+        )?;
+        writeln!(
+            prompt.output,
+            "Use /model to choose a discovered model, or pass --model '{}/<upstream-model-id>'.",
             form.key
         )?;
     }
@@ -928,8 +972,14 @@ fn write_provider_usage(output: &mut dyn Write) -> Result<(), RelayError> {
     Ok(())
 }
 
+pub(crate) fn print_setup_help() -> Result<u8, RelayError> {
+    write_add_usage(&mut std::io::stdout().lock())?;
+    Ok(0)
+}
+
 fn write_add_usage(output: &mut dyn Write) -> Result<(), RelayError> {
     writeln!(output, "Usage:")?;
+    writeln!(output, "  ox setup [KEY] [options]")?;
     writeln!(output, "  ox provider add [KEY] [options]")?;
     writeln!(output)?;
     writeln!(
@@ -1040,13 +1090,12 @@ fn write_add_usage(output: &mut dyn Write) -> Result<(), RelayError> {
     writeln!(output)?;
     writeln!(
         output,
-        "With a terminal and no required flags, provider add prompts for the key,"
+        "Run `ox setup` in a terminal for guided setup. For OpenRouter, Anthropic,"
     )?;
     writeln!(
         output,
-        "name, URL, wire, credential variable and discovery; it never prompts for"
+        "and OpenAI, enter openrouter, anthropic, or openai to get connection defaults."
     )?;
-    writeln!(output, "a credential value.")?;
     Ok(())
 }
 
@@ -1977,9 +2026,10 @@ fn doctor_legacy(report: &mut DoctorReport, home: &Path, env: &crate::provider::
     let text = match read_optional_text_limited(&path, "config.toml") {
         Ok(Some(text)) => text,
         Ok(None) => {
+            report.mode = "not configured".to_owned();
             report.error(
                 None,
-                "neither codeox.toml nor config.toml exists; run `ox provider add` or configure Codex first",
+                "neither codeox.toml nor config.toml exists. Run `ox setup` to add a provider",
             );
             return;
         }
@@ -1998,37 +2048,34 @@ fn doctor_legacy(report: &mut DoctorReport, home: &Path, env: &crate::provider::
             return;
         }
     };
-    report.info(
-        scope.clone(),
-        "legacy relay mode: the provider selected by model_provider is relayed",
-    );
-    if document.get("model_catalog_json").is_some() {
-        report.error(
-            scope.clone(),
-            "model_catalog_json is set; legacy mode refuses to start. Remove it to enable live model discovery.",
-        );
-    }
-
     let Some(id) = document.get("model_provider").and_then(Item::as_str) else {
+        report.mode = "not configured".to_owned();
         report.error(
             scope,
-            "set model_provider to a provider ID using letters, numbers, _ or -",
+            "No ox provider configured. Run `ox setup` to get started.",
         );
         return;
     };
-    report.info(scope.clone(), format!("selected provider: {id}"));
 
     let Some(provider) = document
         .get("model_providers")
         .and_then(|providers| providers.get(id))
         .and_then(Item::as_table)
     else {
+        report.mode = "not configured".to_owned();
         report.error(
             scope,
-            format!("the selected model_provider {id:?} is missing from model_providers"),
+            format!("Codex provider {id:?} has no custom provider settings. Run `ox setup` to add a provider for ox."),
         );
         return;
     };
+    report.info(scope.clone(), format!("selected provider: {id}"));
+    if document.get("model_catalog_json").is_some() {
+        report.error(
+            scope.clone(),
+            "model_catalog_json is set; legacy mode refuses to start. Remove it to enable live model discovery.",
+        );
+    }
 
     if let Some(name) = provider.get("name").and_then(Item::as_str) {
         report.info(scope.clone(), format!("name: {name}"));

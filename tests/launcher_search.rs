@@ -137,7 +137,7 @@ fn version_is_available_without_a_home_or_stock_client() {
 }
 
 #[test]
-fn provider_add_creates_the_shared_home_without_a_client_installed() {
+fn setup_creates_the_shared_home_without_a_client_installed() {
     let home = TempDir::new("launcher-subcommands");
     let config_home = home.0.join("new-home");
     // Empty PATH to verify setup works without either client installed.
@@ -147,8 +147,7 @@ fn provider_add_creates_the_shared_home_without_a_client_installed() {
     let add = add
         .env("PATH", &empty_path.0)
         .args([
-            "provider",
-            "add",
+            "setup",
             "acme",
             "--base-url",
             "https://api.example.com/v1",
@@ -160,7 +159,7 @@ fn provider_add_creates_the_shared_home_without_a_client_installed() {
         .unwrap();
     assert!(
         add.status.success(),
-        "provider add failed: {}",
+        "setup failed: {}",
         String::from_utf8_lossy(&add.stderr)
     );
     let config = read(&config_home.join("codeox.toml"));
@@ -187,6 +186,65 @@ fn provider_add_creates_the_shared_home_without_a_client_installed() {
     let report = String::from_utf8_lossy(&doctor.stdout);
     assert!(report.contains("acme"), "{report}");
     assert!(report.contains("ACME_API_KEY"), "{report}");
+}
+
+#[test]
+fn first_run_and_help_work_with_only_native_codex_settings() {
+    let home = TempDir::new("launcher-first-run");
+    let empty_path = TempDir::new("launcher-no-clients");
+    let native_config = home.0.join("config.toml");
+    let original = "model_provider = \"openai\"\n";
+    fs::write(&native_config, original).unwrap();
+
+    let run = |args: &[&str]| {
+        Command::new(binary())
+            .env_clear()
+            .env("HOME", &home.0)
+            .env("CODEX_HOME", &home.0)
+            .env("PATH", &empty_path.0)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let help = run(&["--help"]);
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Get started"));
+    let bare = run(&[]);
+    assert!(bare.status.success());
+    assert_eq!(bare.stdout, help.stdout);
+
+    for command in ["setup", "codex", "claude"] {
+        let output = run(&[command, "--help"]);
+        assert!(output.status.success(), "{command} --help");
+        let usage = format!("ox {command}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains(&usage));
+    }
+    let setup = run(&["setup"]);
+    assert!(setup.status.success());
+    assert!(String::from_utf8_lossy(&setup.stdout).contains("--env-key"));
+    for (topic, text) in [
+        ("setup", "--env-key"),
+        ("desktop", "Model Providers & Gateways"),
+        ("share", "tailscale serve --bg"),
+        ("t3", "Claude Agent SDK"),
+    ] {
+        let output = Command::new(binary())
+            .env_clear()
+            .args(["help", topic])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "ox help {topic}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains(text));
+    }
+
+    for command in ["codex", "claude"] {
+        let missing_provider = run(&[command]);
+        assert!(!missing_provider.status.success());
+        assert!(String::from_utf8_lossy(&missing_provider.stderr).contains("Run `ox setup`"));
+    }
+    assert!(String::from_utf8_lossy(&run(&["doctor"]).stdout).contains("Run `ox setup`"));
+    assert!(!home.0.join("codeox.toml").exists());
+    assert_eq!(read(&native_config), original);
 }
 
 #[test]

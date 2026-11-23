@@ -4,6 +4,12 @@ Use Codex or Claude Code with your own model API keys. One provider setup works 
 CLIs. Run `ox codex` or `ox claude` to start a local relay that exits with the client. Run
 `codex` or `claude` directly for your usual sign-in.
 
+**Already installed?** Run `ox setup` to add your first provider, or `ox --help` to
+see the commands. Typing just `ox` in a terminal opens setup on first use.
+
+Use `ox help desktop` for Codex and Claude Desktop, `ox help share` to connect
+other devices, or `ox help t3` for T3 Code.
+
 ## 1. Install
 
 Install or update the CLI you want to use and make sure `codex --version` or
@@ -40,13 +46,13 @@ If a new terminal cannot find `ox`, add that directory to your shell's startup
 
 ## 2. Add a provider
 
-Already have an Anthropic key or a different API provider? Start with
-[the provider setup guide](docs/configuration.md#add-a-provider). If `openrouter`
-is already configured, use its existing model alias and skip adding it again.
+Run `ox setup` and follow the prompts. Enter `openrouter`, `anthropic`, or `openai`
+to get connection defaults. When asked for an environment variable, enter its name,
+such as `OPENROUTER_API_KEY`. Load the API key into your shell, then run `ox doctor`.
 
-This example uses an **OpenRouter API key** and a model tested with both clients. Load
-`OPENROUTER_API_KEY` from your secret manager, or paste the key at a hidden Bash or
-Zsh prompt for this terminal session:
+For repeatable setup with **OpenRouter**, the commands below use a model tested with
+both clients. Load `OPENROUTER_API_KEY` from your secret manager or use this hidden
+Bash or Zsh prompt for the current terminal:
 
 ```sh
 printf 'OpenRouter API key (input hidden): '
@@ -55,10 +61,8 @@ printf '\n'
 export OPENROUTER_API_KEY
 ```
 
-Enter only the **variable name** in ox.
-
 ```sh
-ox provider add openrouter \
+ox setup openrouter \
   --base-url https://openrouter.ai/api/v1 \
   --wire responses \
   --env-key OPENROUTER_API_KEY \
@@ -68,14 +72,13 @@ ox doctor
 ```
 
 Look for **0 error(s)**. `doctor` shows where to find `codeox.toml` on its `home:` line,
-lists static model aliases, and checks credential references offline. The next step tests
-the live connection. Run
-`ox provider add` without arguments if you prefer prompts.
+lists static model aliases, and checks credential references offline. If you already
+have a provider configured, use its existing alias. [Other providers and setup options](docs/configuration.md#add-a-provider)
 
 ## 3. Try a session
 
-From your project directory, run the command for your client with the alias shown by
-`ox provider add`:
+From your project directory, run `ox codex` or `ox claude`, then open `/model`
+to choose a model. To select an alias directly:
 
 ```sh
 ox codex --model openrouter/openai/gpt-5.4-mini
