@@ -410,7 +410,7 @@ jobs:
           file "${binary}" | grep -F -- "${{ matrix.file_type }}"
           # --help prints usage and exits before reading any configuration, so
           # this probes that the executable starts without network or secrets.
-          "${binary}" --help | grep -F 'ox codex [args...]'
+          "${binary}" --help | grep -F 'Open Codex and pick a model'
           test "$("${binary}" --version)" = "ox ${OX_BUILD_VERSION}"
 
       - name: Test atomic updates on this platform
@@ -458,7 +458,7 @@ jobs:
           mkdir -p "${unpacked}"
           tar --extract --gzip --file "dist/${archive}" --directory "${unpacked}"
           test -x "${unpacked}/ox"
-          "${unpacked}/ox" --help | grep -F 'ox codex [args...]'
+          "${unpacked}/ox" --help | grep -F 'Open Codex and pick a model'
           test "$("${unpacked}/ox" --version)" = "ox ${version}"
           cmp "${unpacked}/ox" "dist/${executable}"
           "dist/${executable}" update --help | grep -F 'Usage: ox update'
