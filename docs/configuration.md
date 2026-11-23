@@ -89,9 +89,14 @@ Use a model that supports streaming and tool calls for the coding workflows in t
 | OpenAI-compatible Chat Completions | `chat_completions` | `/chat/completions` | `http://127.0.0.1:11434/v1` for a local OpenAI-compatible server |
 
 Use the provider's base URL ending at the API prefix, commonly `/v1`. Export the key under
-the variable name you pass to `--env-key`. The direct OpenAI URL needs an eligible API account.
-For a loopback server that ignores bearer auth, point `--env-key` to a variable holding a
-dummy value such as `local-only`. ox currently requires a value to enable a route.
+the variable name you pass to `--env-key`. For a loopback server that ignores bearer auth,
+point `--env-key` to a variable holding a dummy value such as `local-only`. ox currently
+requires a value to enable a route.
+
+On the direct OpenAI endpoint, a key that passes `ox doctor --live` can still receive an
+organization access error in Codex. If OpenAI says Codex API access is disabled for the
+organization, ask the OpenAI API organization owner to check the setting for that key.
+[Codex authentication](https://developers.openai.com/codex/auth)
 
 For example, add Anthropic Messages using a current API version verified with Anthropic:
 

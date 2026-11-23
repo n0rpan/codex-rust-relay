@@ -54,10 +54,24 @@ The Linux ARM64 build returned a short, exact reply through both gateway
 frontends with OpenAI Responses, Anthropic Messages (`2026-10-21`), OpenRouter
 Responses, OpenCode Go Chat Completions and Alibaba Cloud Token Plan Chat
 Completions. See [provider setup](configuration.md#add-a-provider) for endpoint
-details. A live Brave key also returned citations through Codex’s standalone
-search endpoint and Claude Code’s dedicated WebSearch bridge. These checks
-used private credentials in a temporary local relay. CI uses loopback vendors
-and Brave fixtures.
+details.
+
+A separate tmux walkthrough ran the installed Codex CLI 0.171.0 and Claude Code
+2.1.330 through `ox codex` and `ox claude`. Both clients completed live turns
+with Alibaba Token Plan, Anthropic, OpenCode Go, and OpenRouter. Claude Code
+also completed a turn with OpenAI. The same OpenAI key received an organization
+access error from the OpenAI API when used through Codex.
+
+Both interactive clients replied with the selected Alibaba alias. Codex's
+`/model` picker listed all five configured models. Claude Code showed a subset
+in its stock picker, and a qualified `--model` alias selected the other routes.
+A separate turn in each client read a disposable README through its file tools,
+returned the marker text, and left the file intact.
+
+Both clients used live Brave search and returned the official Rust Book link.
+Codex used the Alibaba route and Claude Code used the Anthropic route. These
+checks ran with disposable client homes and private local credentials. CI
+uses loopback vendors and Brave fixtures.
 
 ## Client updates
 
