@@ -90,14 +90,19 @@ HTTP 401. Use the HTTPS origin from Serve for Claude and the same origin plus
 
 ### Codex Desktop
 
+The desktop app stores gateway settings you apply. Adding a provider and
+selecting it as current changes that app's saved settings. For a manual
+configuration with separate settings and history, put the example in
+`config.toml` under a dedicated `CODEX_HOME` and launch the client with that
+environment variable.
+
 Open **Settings → Model Providers & Gateways**. If custom gateways are available,
 choose **Add → Gateway or custom provider**. Name it **ox**, use the API base URL
 including `/v1` and choose **Environment variable** authentication with
 `OX_GATEWAY_KEY` as the variable name. If available, select **Set as current
-provider**. For manual setup, merge
-[the Codex configuration example](../examples/codex-gateway.toml) into the
-execution host’s user-level Codex `config.toml`. Replace the URL and alias. Keep the
-catalog URL at `/v1/catalog`. Supply `OX_GATEWAY_KEY` to the app process through
+provider**. For manual setup, replace the URL and alias in
+[the Codex configuration example](../examples/codex-gateway.toml) and keep the
+catalog path at `/v1/catalog`. Supply `OX_GATEWAY_KEY` to the app process through
 your normal desktop secret delivery, then restart the app. A variable exported in
 a terminal is available only to processes launched from it.
 
@@ -185,9 +190,10 @@ reach the tailnet URL.
   also sets the native catalog URL. Keep the ordinary ChatGPT instance for
   ChatGPT-backed sessions. [T3 Code Codex provider settings](https://github.com/pingdotgg/t3code/blob/main/docs/user/providers-codex.md)
 - **Claude instance.** T3 Code runs the Claude Agent SDK with its configured
-  Claude runtime. Use a separate Claude config directory if you also sign in
-  with Claude on this host. In the instance's **Environment variables**, set
-  `ANTHROPIC_BASE_URL` to the HTTPS origin,
+  Claude runtime. In the instance's **Environment variables**, set
+  `CLAUDE_CONFIG_DIR` to a dedicated directory on the execution host to keep
+  its settings and history separate from your usual Claude Code profile.
+  Set `ANTHROPIC_BASE_URL` to the HTTPS origin,
   `ANTHROPIC_AUTH_TOKEN` to the gateway key as a sensitive value, and
   `ANTHROPIC_API_KEY` to an explicitly empty value. Add your exact model alias
   as a custom model in T3 Code. For the standalone Claude Code CLI pointed at the

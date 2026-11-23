@@ -245,7 +245,7 @@ jobs:
             --ignored --exact --nocapture \
             translated_tests::stock_codex_emits_web_run_and_calls_the_alpha_search_endpoint
 
-      - name: Verify native and relayed Codex authentication in one home
+      - name: Verify native Codex auth and relay profile isolation
         timeout-minutes: 5
         run: |
           set -euo pipefail

@@ -281,9 +281,10 @@ configured provider's prefix. Keep your alias stable for resume. A known provide
 can route to an upstream model ID even when discovery omits it, but the model must exist
 for that provider. A bare model ID is accepted only if routing can resolve it unambiguously.
 
-If Codex shows a stale picker, check for `model_catalog_json` in `$CODEX_HOME/config.toml`.
-It takes precedence over the live catalog. Pass an explicit alias on the first Codex
-launch if Codex already has a different default model.
+If Codex shows a stale picker, check for `model_catalog_json` in
+`$CODEX_HOME/ox-clients/codex/config.toml`. It takes precedence over the live
+catalog and may have been copied from your native settings on first launch.
+Pass an explicit alias if the relay profile already has a different default model.
 
 Run `ox codex` or `ox claude` with no client arguments from a terminal to choose
 from the same list of configured and discovered aliases with usable keys.
@@ -465,24 +466,33 @@ and `ox claude` show that client's subscription at the top of the picker
 when signed in, alongside the API models. Choosing the subscription opens a native session
 with its own `/model` list. With no API providers, ox can start the signed-in
 stock client directly. Bare `ox` prefers Codex and uses Claude Code
-if only Claude is signed in. With no API provider, `ox doctor` asks the stock
-clients for sign-in status and reports which subscription launches are ready.
-`ox help subscriptions` lists the explicit native launch commands.
+if only Claude has a saved account. With no API provider, `ox doctor` checks for
+saved accounts without launching either client. Each client validates its own
+credentials when you open a subscription session. If Codex uses its keyring,
+ox reports the configured store and leaves the account check to Codex.
+`ox help subscriptions` lists the sign-in commands.
 
-API-backed launches keep their settings, model choices, and new sessions under
-`$CODEX_HOME/ox-clients/codex` or `$CODEX_HOME/ox-clients/claude`.
-ox seeds the new profiles with the client's user settings on first launch.
-Project and managed settings still apply. Use the relay profile for separate
-user-level settings, plugins, and MCP registrations. Sessions recorded before
-profiles were separated are in the original client history.
+| Launch | Where the client saves its settings and history |
+| --- | --- |
+| `codex`, `claude`, or a subscription selected in ox | Your usual client profile |
+| `ox codex` with an API model | `$CODEX_HOME/ox-clients/codex` |
+| `ox claude` with an API model | `$CODEX_HOME/ox-clients/claude` |
+
+`$CODEX_HOME` defaults to `~/.codex`. The first API-backed launch seeds the
+new profile with user settings. Login files and old sessions stay with your
+usual client. Change API-session defaults, including `/model` preferences and
+user-level MCP registrations, in the relay profile. ox keeps Codex’s SQLite
+state and logs in that profile by default. Project and managed settings still apply.
+Signing in or changing preferences after choosing a **subscription** in ox uses
+the same profile as the plain command.
 
 If an older ox launch left its alias selected as the native default, open plain
 `codex` or `claude`, use `/model` to choose a model from that client's subscription,
 and start a new session.
 
 - **ChatGPT plan in Codex.** Run `ox login chatgpt` if you need to sign in.
-  Codex manages its normal credentials. `ox login chatgpt status` checks whether
-  a ChatGPT sign-in is present. Native Codex sign-in works without registering
+  Codex manages its normal credentials. `ox login chatgpt status` reports a
+  saved sign-in or configured keyring. Native Codex sign-in works without registering
   ox as a third-party integration. Use `ox codex --chatgpt` for that account or
   `ox codex` for API-backed sessions. In the project, use `ox codex resume` to pick
   a thread from the relay profile. Use a fresh thread and a reviewed summary to move between

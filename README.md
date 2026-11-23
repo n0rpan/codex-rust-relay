@@ -104,6 +104,13 @@ lists your stars first. In Claude Code it shows your starred lineup when you
 have one. Use the ox launch picker to browse the full catalog.
 [Catalog and client behavior](docs/configuration.md#model-names-and-discovery)
 
+API-backed launches keep their model defaults and new sessions in separate ox
+profiles. Plain `codex` and `claude` continue using your usual settings and sign-in.
+Use `ox codex resume` or `ox claude --resume <session-id>` for a relay session.
+Choosing a subscription in ox opens your usual client profile, so its sign-in
+and settings changes are shared with the plain command.
+[Profiles and session recovery](docs/configuration.md#sessions-and-sign-in)
+
 ## Common tasks
 
 | I want to… | Where to go |
@@ -124,6 +131,7 @@ have one. Use the ox launch picker to browse the full catalog.
 | Client missing, or Codex’s bundled model catalog fails to load | Run `codex --version` or `claude --version` from the same terminal. For Codex also try `codex debug models --bundled`. If the problem began after an update, check the latest-client CI job. |
 | `provider … is unavailable` | Run `ox doctor`. Add the missing key in `ox setup` or export the variable it names. |
 | `unknown model`, or an empty picker | Pass the full alias from setup. Check the vendor model ID, or pin it with a [static model entry](docs/configuration.md#model-names-and-discovery). |
+| Plain `codex` or `claude` opens on an ox alias saved by an older build | Use `/model` in the plain client to choose a subscription model, then start a fresh session. [Profiles and session recovery](docs/configuration.md#sessions-and-sign-in) |
 | Authentication error after a clean `doctor` | Run `ox doctor --live --provider <name>` to check the key, model and streaming with one small API request. |
 | Provider returns `404` or rejects the request format | Check that the [base URL and wire format](docs/configuration.md#add-a-provider) match the endpoint. Leave the request path, such as `/chat/completions`, off the base URL. |
 | Provider returns `429` | Check that provider’s quota and rate limits, or choose another configured model. |

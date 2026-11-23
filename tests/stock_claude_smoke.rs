@@ -67,6 +67,8 @@
 
 #[path = "../src/catalog.rs"]
 mod catalog;
+#[path = "common/profile_snapshot.rs"]
+mod profile_snapshot;
 #[path = "../src/provider.rs"]
 mod provider;
 
@@ -372,6 +374,24 @@ fn run_scenario(endpoint: Endpoint) {
     })
     .to_string();
     fs::write(&settings_path, &client_settings).expect("write conflicting client settings");
+    fs::write(
+        claude_home.join(".claude.json"),
+        r#"{"oauthAccount":{"accountUuid":"fixture-account"}}"#,
+    )
+    .expect("write disposable Claude account marker");
+    let native_before = profile_snapshot::snapshot(&claude_home, None);
+    let home_before = profile_snapshot::snapshot(&home, None);
+    let environment = scenario_env(&isolation.path, &home, &claude_home, &codex_home, &tmp);
+    let mut doctor = Command::new(&relay);
+    let report = doctor
+        .env_clear()
+        .envs(environment.iter().map(|(name, value)| (name, value)))
+        .current_dir(&project)
+        .arg("doctor")
+        .output()
+        .expect("check the saved account before configuring an API provider");
+    assert!(report.status.success());
+    assert!(String::from_utf8_lossy(&report.stdout).contains("saved Claude account found"));
 
     let fixture = spawn_fixture(FixtureSpec {
         wire: endpoint.wire,
@@ -389,8 +409,6 @@ fn run_scenario(endpoint: Endpoint) {
     .expect("write codeox.toml");
     let fixture_file = project.join("fixture.txt");
     fs::write(&fixture_file, "broken\n").expect("write disposable fixture");
-
-    let environment = scenario_env(&isolation.path, &home, &claude_home, &codex_home, &tmp);
 
     let initial = run_claude(
         &relay,
@@ -458,6 +476,11 @@ fn run_scenario(endpoint: Endpoint) {
     );
     assert_final_result(&resumed_events, RESUME_TEXT);
     assert_eq!(fs::read_to_string(settings_path).unwrap(), client_settings);
+    assert_eq!(
+        profile_snapshot::snapshot(&claude_home, None),
+        native_before
+    );
+    assert_eq!(profile_snapshot::snapshot(&home, None), home_before);
     assert!(
         !fs::read_dir(&tmp).unwrap().any(|entry| {
             entry

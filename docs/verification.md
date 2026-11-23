@@ -34,8 +34,12 @@ CODEOX_TEST_CODEX_BIN=/path/to/codex-0.171.0 \
 
 The setup selector check uses a POSIX pseudoterminal and Python 3.
 It runs the release binary and checks which stock client command each choice
-would invoke, including reuse of an existing ChatGPT sign-in. The shared-home
-check needs Python 3 and OpenSSL for a throwaway HTTPS fixture.
+would invoke, including reuse of existing native sign-ins. The Codex auth
+fixture needs Python 3 and OpenSSL for a throwaway HTTPS server. It compares the
+native profile before and after a relay turn, including logs and databases
+whose paths are set in the native config. The stock Claude Code fixture
+compares its native profile before and after account detection, a relay turn,
+and a resume.
 The coding fixtures need working stock-client sandbox support and permission to bind
 loopback sockets. See the [Codex fixtures](../tests/fixtures/stock_codex/README.md)
 and [Claude Code fixtures](../tests/fixtures/stock_claude/README.md) for details.

@@ -21,7 +21,7 @@ Commands
   ox claude [args...]        Choose an API model or use your native Claude sign-in
   ox login chatgpt|claude    Open the installed client's native sign-in
   ox provider add [PROVIDER] Add another API provider
-  ox doctor                  Check API setup or native sign-in status
+  ox doctor                  Check API setup or find saved native accounts
   ox doctor --live --provider NAME
                              Test one live API request
   ox serve [--port PORT]     Run a persistent loopback gateway
@@ -32,7 +32,8 @@ Commands
   ox --help                  Show this help
 
 Run ox setup --help for options and copyable examples.
-Run ox setup if you have neither an ox API provider nor a native sign-in.";
+Run ox setup if you have neither an ox API provider nor a native sign-in.
+API sessions save settings and history in a separate ox client profile.";
 
 const DESKTOP: &str = "\
 Connect a desktop app to ox
@@ -49,8 +50,9 @@ Codex Desktop
   Choose Environment variable auth and enter OX_GATEWAY_KEY for the gateway key.
   Load that variable into the app process. A terminal export reaches programs
   launched from that terminal.
-  For manual setup, merge the example below into your user config.toml
-  (normally ~/.codex/config.toml). It uses /v1/catalog for model discovery.
+  Add ox as a separate provider in the app. For manual setup, use the Codex
+  example in docs/shared-gateway.md with a separate CODEX_HOME. It uses
+  /v1/catalog for model discovery.
 
 Claude Desktop on 3P
   Open Developer > Configure Third-Party Inference. Choose Gateway,
@@ -144,7 +146,7 @@ Use your own plan in the native client
 ChatGPT plan in Codex
   ox login chatgpt                    Open Codex's native sign-in
   ox login chatgpt --device-auth      Use device-code sign-in on a supported account
-  ox login chatgpt status             Check the existing sign-in
+  ox login chatgpt status             Check for a saved sign-in or configured keyring
   ox codex --chatgpt [args...]        Start a native ChatGPT-backed Codex session
 
 ChatGPT API credits exclude Codex usage authenticated with an API key.
@@ -154,8 +156,10 @@ Claude subscription in Claude Code
   ox login claude                     Open Claude Code's native sign-in
   ox claude --native [args...]         Start Claude Code with its own settings
 
-The installed clients own their sign-in and credentials. For Claude subscription
-use, keep API and gateway overrides out of that instance's configuration and
+Subscription sessions use your usual client profile. The installed clients manage
+sign-in and settings changes there. API sessions started by ox use separate
+profiles. For Claude subscription use, keep API and gateway overrides out of
+that instance's configuration and
 environment. For T3 Code, select a native provider on the signed-in execution host.
 
 For API vendors, desktop gateways, and sharing, add provider API keys with

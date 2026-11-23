@@ -41,6 +41,14 @@ def run(
         native_claude = '{"model":"claude-sonnet-5","permissions":{"deny":["Bash"]}}\n'
         if persist_model:
             (home / "settings.json").write_text(native_claude)
+        if signed_in:
+            (home / "auth.json").write_text(
+                '{"auth_mode":"chatgpt","tokens":{"access_token":"fixture-token"}}\n'
+            )
+        if claude_signed_in:
+            (home / ".claude.json").write_text(
+                '{"oauthAccount":{"accountUuid":"fixture-account"}}\n'
+            )
         if config is not None:
             (home / "codeox.toml").write_text(config)
         if favorites is not None:
@@ -53,17 +61,11 @@ if [ "$1" = debug ] && [ "$2" = models ]; then
     exit 0
 fi
 if [ "$1" = auth ] && [ "$2" = status ]; then
-    if [ "$FIXTURE_CLAUDE_SIGNED_IN" = yes ]; then
-        printf '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}'
-        exit 0
-    fi
+    touch "$CLAUDE_CONFIG_DIR/unexpected-auth-probe"
     exit 1
 fi
 if [ "$3" = login ] && [ "$4" = status ]; then
-    if [ "$FIXTURE_SIGNED_IN" = yes ]; then
-        printf '%s\\n' 'Logged in using ChatGPT' >&2
-        exit 0
-    fi
+    touch "$CODEX_HOME/unexpected-auth-probe"
     exit 1
 fi
 if env | grep -q '^CUSTOM_.*_API_KEY='; then
@@ -101,9 +103,7 @@ fi
             "TERM": "xterm-256color", "FIXTURE_CONTEXT": str(context_trace),
             "FIXTURE_CLASSIFIER": str(classifier_trace),
             "FIXTURE_PYTHON": sys.executable, "FIXTURE_LINEUP": str(lineup_trace),
-            "FIXTURE_SIGNED_IN": "yes" if signed_in else "no",
             "FIXTURE_PERSIST_MODEL": "yes" if persist_model else "no",
-            "FIXTURE_CLAUDE_SIGNED_IN": "yes" if claude_signed_in else "no",
             "OPENROUTER_API_KEY": "dummy-fixture-credential",
             "ANTHROPIC_API_KEY": "dummy-anthropic-credential",
             "ALIBABA_API_KEY": "dummy-alibaba-credential",
@@ -216,6 +216,7 @@ fi
             if expected_classifier is not None:
                 classifier = classifier_trace.read_text().splitlines()
                 assert classifier == list(expected_classifier), (classifier, expected_classifier)
+            assert not (home / "unexpected-auth-probe").exists()
             return text, trace.read_text().splitlines() if trace.exists() else [], registry
         finally:
             if proc.poll() is None:
@@ -407,14 +408,14 @@ for args, sign_in, expected in (
 print("plain commands: launch signed-in stock clients without reopening setup")
 
 text, argv, registry = run(["setup"], b"1\n2\n5\n", signed_in=True, claude_signed_in=True)
-assert "already signed in with Claude" in text and "already signed in with ChatGPT" in text
+assert "has a saved Claude account" in text and "has a saved ChatGPT sign-in" in text
 assert argv == [] and registry is None
 print("setup: checks both existing native sign-ins in one pass")
 
 text, argv, registry = run(["doctor"], signed_in=True, claude_signed_in=True)
-assert "API gateway providers: 0" in text and "signed in with ChatGPT" in text and "signed in with Claude" in text
+assert "API gateway providers: 0" in text and "saved ChatGPT sign-in found" in text and "saved Claude account found" in text
 assert argv == [] and registry is None
-print("doctor: zero API providers and two working native sign-ins")
+print("doctor: zero API providers and both native accounts detected")
 
 shared = """
 [providers.anthropic]

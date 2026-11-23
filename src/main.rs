@@ -160,7 +160,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
                     provider::Provider::load_if_configured(&codex_home, &provider::process_env),
                     Ok(None)
                 )
-                && native::report_signed_in(&codex_home).await? =>
+                && native::report_saved_accounts(&codex_home) =>
         {
             return Ok(0);
         }
@@ -180,9 +180,6 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
 
     let config_path = CodeoxConfig::path(&codex_home);
     let config = if config_path.exists() {
-        if matches!(client_kind, ClientKind::Codex) {
-            warn_about_static_catalog(&codex_home);
-        }
         LaunchConfig::Codeox(CodeoxConfig::load(&config_path)?)
     } else if matches!(client_kind, ClientKind::Codex)
         && let Some(provider) =
@@ -222,11 +219,20 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
     env_refs.insert(daemon::KEY_ENV.to_owned());
     let client = upstream_client()?;
 
-    let (search, search_launch) = match (&config, &client_kind) {
-        (LaunchConfig::Codeox(config), ClientKind::Codex) => {
-            resolve_search(config.search.as_ref(), env, &args, &codex_home)
+    let codex_profile = if matches!(client_kind, ClientKind::Codex) {
+        let home = clients::relay_client_home(&codex_home, ClientKind::Codex)?;
+        if matches!(&config, LaunchConfig::Codeox(_)) {
+            warn_about_static_catalog(&home);
         }
-        (LaunchConfig::Codeox(config), ClientKind::Claude) => (
+        Some(home)
+    } else {
+        None
+    };
+    let (search, search_launch) = match (&config, &codex_profile) {
+        (LaunchConfig::Codeox(config), Some(home)) => {
+            resolve_search(config.search.as_ref(), env, &args, home)
+        }
+        (LaunchConfig::Codeox(config), None) => (
             config
                 .search
                 .as_ref()
@@ -236,9 +242,9 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         (LaunchConfig::Legacy(_), _) => (None, SearchLaunch::Disabled),
     };
 
-    let bundled = match client_kind {
-        ClientKind::Codex => bundled_catalog(&codex_home, &env_refs).await?,
-        ClientKind::Claude => BundledModels::default(),
+    let bundled = match &codex_profile {
+        Some(home) => bundled_catalog(home, &env_refs).await?,
+        None => BundledModels::default(),
     };
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let origin = format!("http://{}", listener.local_addr()?);
@@ -274,7 +280,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         .map(|mode| app.client_classifier(mode))
         .transpose()?;
     if interactive && args.is_empty() && matches!(&app.mode, Mode::Codeox { .. }) {
-        let signed_in = classifier.is_none() && native::signed_in(client_kind, &codex_home).await?;
+        let signed_in = classifier.is_none() && native::has_saved_account(client_kind, &codex_home);
         let models = app.launch_models();
         match picker::choose_model(client_kind, &models, signed_in, &codex_home)? {
             Some(picker::LaunchChoice::Model(alias)) => {
@@ -291,23 +297,21 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         catalog::prioritize_favorites(catalog, &favorites);
     }
     app.client_kind = client_kind;
-    let client_home = clients::relay_client_home(&codex_home, client_kind)?;
-    let (mut command, _claude_settings) = match app.client_kind {
-        ClientKind::Codex => {
-            let mut command = Command::new("codex");
+    let (mut command, _claude_settings) = match codex_profile {
+        Some(home) => {
+            let mut command = codex_relay_command(&home)?;
             for name in &env_refs {
                 command.env_remove(name);
             }
-            command
-                .env("CODEX_HOME", &client_home)
-                .env(TOKEN_ENV, &token);
+            command.env(TOKEN_ENV, &token);
             for entry in &overrides {
                 command.arg("-c").arg(entry);
             }
             command.args(args);
             (command, None)
         }
-        ClientKind::Claude => {
+        None => {
+            let client_home = clients::relay_client_home(&codex_home, ClientKind::Claude)?;
             if let Some(classifier) = &classifier {
                 match classifier {
                     Some(alias) => eprintln!(
@@ -1147,6 +1151,7 @@ async fn bundled_catalog(
     let mut command = Command::new("codex");
     command
         .env("CODEX_HOME", codex_home)
+        .env_remove("CODEX_SQLITE_HOME")
         .args(["debug", "models", "--bundled"]);
     for name in strip {
         command.env_remove(name);
@@ -1159,6 +1164,23 @@ async fn bundled_catalog(
         return Err("could not read the bundled Codex model catalog".into());
     }
     Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn codex_relay_command(home: &Path) -> Result<Command, RelayError> {
+    let mut command = Command::new("codex");
+    let state = home.to_str().ok_or("Codex profile path must be UTF-8")?;
+    let logs = home.join("log");
+    let logs = logs.to_str().ok_or("Codex log path must be UTF-8")?;
+    // A copied config or an inherited env var can otherwise point Codex
+    // back to the native databases and logs despite a separate CODEX_HOME.
+    command
+        .env("CODEX_HOME", home)
+        .env_remove("CODEX_SQLITE_HOME")
+        .arg("-c")
+        .arg(format!("sqlite_home={}", json!(state)))
+        .arg("-c")
+        .arg(format!("log_dir={}", json!(logs)));
+    Ok(command)
 }
 
 fn random_token() -> Result<String, RelayError> {

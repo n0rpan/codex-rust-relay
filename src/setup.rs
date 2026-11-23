@@ -2059,7 +2059,13 @@ fn doctor_multi_vendor(
     cross_provider_checks(report, &diagnoses);
     let config = parse_config_for_validation(&text);
     let search_configured = config.as_ref().is_ok_and(|config| config.search.is_some());
-    doctor_codex_config(report, home, &vendor_keys, search_configured);
+    let relay_home = home.join("ox-clients/codex");
+    let codex_settings = if relay_home.join(".initialized").is_file() {
+        &relay_home
+    } else {
+        home
+    };
+    doctor_codex_config(report, codex_settings, &vendor_keys, search_configured);
 
     let errors_before = report.count(Level::Error);
     match config {

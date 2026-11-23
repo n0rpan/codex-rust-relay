@@ -15,8 +15,8 @@
 //!    `model_provider=codeox` and `CODEOX_TOKEN`, so the model request goes to
 //!    the relay. The relay forwards to the fixture vendor with only that
 //!    vendor's fake key. The ChatGPT access token never reaches the vendor.
-//! 3. `auth.json`, `config.toml` and `codeox.toml` are byte-identical before
-//!    and after the codeox launch.
+//! 3. The native profile tree is byte-identical before and after the ox
+//!    launch, even when the native config pins its SQLite and log paths.
 //!
 //! The fixture is deliberately awkward because stock Codex 0.171.0 requires
 //! it: workspace routing discovery must return an **HTTPS origin**, so the
@@ -34,6 +34,9 @@
 //!   cargo test --test shared_codex_home -- --ignored --nocapture
 //! ```
 #![cfg(unix)]
+
+#[path = "common/profile_snapshot.rs"]
+mod profile_snapshot;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -272,8 +275,12 @@ fn stock_codex_uses_native_credentials_and_an_isolated_relay_profile() {
             "model = \"gpt-5.1-codex\"\n\
              chatgpt_base_url = \"http://127.0.0.1:{}/backend-api\"\n\
              approval_policy = \"never\"\n\
-             sandbox_mode = \"read-only\"\n",
-            ports.discovery
+             sandbox_mode = \"read-only\"\n\
+             sqlite_home = {}\n\
+             log_dir = {}\n",
+            ports.discovery,
+            json!(codex_home.join("native-state")),
+            json!(codex_home.join("native-logs"))
         ),
     )
     .expect("write config.toml");
@@ -342,7 +349,7 @@ fn stock_codex_uses_native_credentials_and_an_isolated_relay_profile() {
         "native ChatGPT auth must not be downgraded to an API key"
     );
 
-    // ---- 2. Same CODEX_HOME through codeox --------------------------------
+    // ---- 2. Same ox configuration, separate runtime profile --------------
     let codeox_toml = codex_home.join("codeox.toml");
     fs::write(
         &codeox_toml,
@@ -366,9 +373,21 @@ fn stock_codex_uses_native_credentials_and_an_isolated_relay_profile() {
     .expect("write codeox.toml");
 
     let phase2_start = read_requests(&tree.path).len();
-    let auth_before = fs::read(&auth_path).expect("read auth before codeox");
-    let config_before = fs::read(&config_path).expect("read config before codeox");
-    let codeox_before = fs::read(&codeox_toml).expect("read codeox.toml before launch");
+    let native_before = profile_snapshot::snapshot(&codex_home, Some("ox-clients"));
+
+    let mut status = Command::new(env!("CARGO_BIN_EXE_ox"));
+    status
+        .args(["login", "chatgpt", "status"])
+        .current_dir(&project)
+        .stdin(Stdio::null());
+    apply_env(&mut status, &environment);
+    let status = status.output().expect("run Codex account check");
+    assert!(status.status.success());
+    assert_eq!(
+        profile_snapshot::snapshot(&codex_home, Some("ox-clients")),
+        native_before,
+        "checking for an existing Codex sign-in must leave its profile untouched"
+    );
 
     let phase2_log = tree.path.join("phase2.log");
     let mut codeox = Command::new(env!("CARGO_BIN_EXE_ox"));
@@ -395,6 +414,10 @@ fn stock_codex_uses_native_credentials_and_an_isolated_relay_profile() {
         &format!("{}:/usr/bin:/bin", bin.display()),
     );
     environment.push(("VENDOR_KEY".to_owned(), VENDOR_KEY.to_owned()));
+    environment.push((
+        "CODEX_SQLITE_HOME".to_owned(),
+        codex_home.join("inherited-state").display().to_string(),
+    ));
     apply_env(&mut codeox, &environment);
     let mut codeox = spawn_logged(codeox, &phase2_log);
     wait_for_turn(&mut codeox, &phase2_log, "vendor fixture reply");
@@ -428,19 +451,9 @@ fn stock_codex_uses_native_credentials_and_an_isolated_relay_profile() {
     );
 
     assert_eq!(
-        fs::read(&auth_path).expect("read auth after codeox"),
-        auth_before,
-        "codeox must not change auth.json"
-    );
-    assert_eq!(
-        fs::read(&config_path).expect("read config after codeox"),
-        config_before,
-        "codeox must not change config.toml"
-    );
-    assert_eq!(
-        fs::read(&codeox_toml).expect("read codeox.toml after launch"),
-        codeox_before,
-        "codeox must not change its own codeox.toml"
+        profile_snapshot::snapshot(&codex_home, Some("ox-clients")),
+        native_before,
+        "relay must leave the native Codex profile and ox provider registry untouched"
     );
     let relay_profile = codex_home.join("ox-clients/codex");
     assert!(relay_profile.join("config.toml").is_file());

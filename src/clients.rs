@@ -271,6 +271,12 @@ pub(crate) struct ClaudeLaunchOptions<'a> {
     pub client_classifier: Option<Option<&'a str>>,
 }
 
+pub(crate) fn claude_config_override() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
 /// Stock clients can save `/model` selections back into their user files.
 /// Give each relay client a persistent home so model changes and resumes stay
 /// in that profile even if ox or its child is interrupted.
@@ -291,12 +297,9 @@ pub(crate) fn relay_client_home(
         ),
         ClientKind::Claude => (
             "claude",
-            std::env::var_os("CLAUDE_CONFIG_DIR")
-                .filter(|path| !path.is_empty())
-                .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude"))
-                }),
+            claude_config_override().or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude"))
+            }),
             &["settings.json", "CLAUDE.md"],
         ),
     };

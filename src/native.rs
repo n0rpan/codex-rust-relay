@@ -1,7 +1,7 @@
 //! Run the installed clients' native sign-in and sessions without a relay.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -29,41 +29,46 @@ pub(crate) async fn launch_if_signed_in(
     client: ClientKind,
     home: &Path,
 ) -> Result<Option<u8>, RelayError> {
-    if !signed_in(client, home).await? {
-        return Ok(None);
+    match client {
+        ClientKind::Codex if matches!(saved_chatgpt_account(home), Some(ChatGptAccount::File)) => {}
+        ClientKind::Claude if has_saved_claude_account() => {}
+        _ => return Ok(None),
     }
     launch_subscription(client, home).await.map(Some)
 }
 
 pub(crate) async fn launch_subscription(client: ClientKind, home: &Path) -> Result<u8, RelayError> {
-    let command = match client {
-        ClientKind::Codex => codex_command(home)?,
-        ClientKind::Claude => claude_account_command(home)?,
-    };
-    launch(command).await
+    match client {
+        ClientKind::Codex => launch_chatgpt(&[], home).await,
+        ClientKind::Claude => launch(claude_account_command(home)?).await,
+    }
 }
 
-pub(crate) async fn report_signed_in(home: &Path) -> Result<bool, RelayError> {
-    let (codex, claude) = tokio::try_join!(
-        signed_in(ClientKind::Codex, home),
-        signed_in(ClientKind::Claude, home),
-    )?;
-    if !codex && !claude {
-        return Ok(false);
+pub(crate) fn report_saved_accounts(home: &Path) -> bool {
+    let codex = saved_chatgpt_account(home);
+    let claude = has_saved_claude_account();
+    if codex.is_none() && !claude {
+        return false;
     }
     println!("ox doctor (native client status)");
     println!("home: {}", home.display());
     println!("API gateway providers: 0");
-    if codex {
-        println!("Codex: signed in with ChatGPT. Start with `ox codex`.");
+    match codex {
+        Some(ChatGptAccount::File) => {
+            println!("Codex: saved ChatGPT sign-in found. Start with `ox codex`.")
+        }
+        Some(ChatGptAccount::Keyring) => println!(
+            "Codex: keyring auth configured. Open `ox codex --chatgpt` to check the account."
+        ),
+        None => {}
     }
     if claude {
-        println!("Claude Code: signed in with Claude. Start with `ox claude`.");
+        println!("Claude Code: saved Claude account found. Start with `ox claude`.");
     }
     println!(
         "To share API models between both clients, choose Add an API key provider in `ox setup`."
     );
-    Ok(true)
+    true
 }
 
 pub(crate) async fn setup_subscription(account: &str, home: &Path) -> Result<u8, RelayError> {
@@ -77,13 +82,12 @@ pub(crate) async fn setup_subscription(account: &str, home: &Path) -> Result<u8,
             "ox claude",
         )
     };
-    if signed_in(client, home).await? {
-        let plan = if account == "chatgpt" {
-            "ChatGPT"
+    if has_saved_account(client, home) {
+        if account == "chatgpt" {
+            print_chatgpt_status(home);
         } else {
-            "Claude"
-        };
-        println!("{name} is already signed in with {plan}.");
+            println!("{name} has a saved Claude account. Run `ox login claude` to sign in again.");
+        }
     } else {
         let code = login(Some(account), &[], home).await?;
         if code != 0 {
@@ -98,8 +102,7 @@ pub(crate) async fn setup_subscription(account: &str, home: &Path) -> Result<u8,
 async fn login(account: Option<&str>, args: &[OsString], home: &Path) -> Result<u8, RelayError> {
     match (account, args) {
         (Some("chatgpt"), [status]) if status == "status" => {
-            if signed_in(ClientKind::Codex, home).await? {
-                println!("Codex is signed in with ChatGPT.");
+            if print_chatgpt_status(home) {
                 Ok(0)
             } else {
                 eprintln!("ox: run ox login chatgpt to sign in with your ChatGPT account");
@@ -123,12 +126,34 @@ async fn login(account: Option<&str>, args: &[OsString], home: &Path) -> Result<
 }
 
 async fn launch_chatgpt(args: &[OsString], home: &Path) -> Result<u8, RelayError> {
-    if !signed_in(ClientKind::Codex, home).await? {
+    let ready = match saved_chatgpt_account(home) {
+        Some(ChatGptAccount::File) => true,
+        Some(ChatGptAccount::Keyring) => check_chatgpt_keyring(home).await?,
+        None => false,
+    };
+    if !ready {
         return Err("no ChatGPT sign-in found. Run ox login chatgpt first".into());
     }
     let mut command = codex_command(home)?;
     command.args(args);
     launch(command).await
+}
+
+async fn check_chatgpt_keyring(home: &Path) -> Result<bool, RelayError> {
+    // The user chose a native session. Let Codex resolve its own keyring
+    // credential and confirm that it is a subscription before inference.
+    let mut command = codex_command(home)?;
+    command.args(["login", "status"]).stdin(Stdio::null());
+    let Ok(Ok(output)) = tokio::time::timeout(Duration::from_secs(5), command.output()).await
+    else {
+        return Ok(false);
+    };
+    Ok(output.status.success()
+        && [&output.stdout, &output.stderr].iter().any(|stream| {
+            String::from_utf8_lossy(stream)
+                .lines()
+                .any(|line| line.trim() == "Logged in using ChatGPT")
+        }))
 }
 
 async fn launch_claude(args: &[OsString], home: &Path) -> Result<u8, RelayError> {
@@ -155,44 +180,79 @@ async fn launch_claude(args: &[OsString], home: &Path) -> Result<u8, RelayError>
     launch(command).await
 }
 
-pub(crate) async fn signed_in(client: ClientKind, home: &Path) -> Result<bool, RelayError> {
-    // Let the stock client access its own auth store. Consume status only.
-    let mut command = match client {
-        ClientKind::Codex => {
-            let mut command = codex_command(home)?;
-            command.args(["login", "status"]);
-            command
+pub(crate) fn has_saved_account(client: ClientKind, home: &Path) -> bool {
+    match client {
+        ClientKind::Codex => saved_chatgpt_account(home).is_some(),
+        ClientKind::Claude => has_saved_claude_account(),
+    }
+}
+
+enum ChatGptAccount {
+    File,
+    Keyring,
+}
+
+fn saved_chatgpt_account(home: &Path) -> Option<ChatGptAccount> {
+    // Stock status commands can initialize or update files in the native
+    // profile. Read only local markers and let the native client validate
+    // credentials when the user chooses a subscription.
+    let store = crate::setup::read_optional_text_limited(&home.join("config.toml"), "config.toml")
+        .ok()
+        .flatten()
+        .and_then(|text| {
+            let document = toml_edit::Document::parse(&text).ok()?;
+            document
+                .get("cli_auth_credentials_store")
+                .and_then(toml_edit::Item::as_str)
+                .map(str::to_owned)
+        });
+    match store.as_deref() {
+        Some("keyring" | "auto") => return Some(ChatGptAccount::Keyring),
+        Some("ephemeral") => return None,
+        _ => {}
+    }
+    let auth = read_account_json(&home.join("auth.json"), "auth.json")?;
+    let chatgpt = matches!(
+        auth["auth_mode"].as_str(),
+        None | Some("chatgpt" | "chatgptAuthTokens")
+    );
+    (chatgpt
+        && auth["OPENAI_API_KEY"].is_null()
+        && auth["tokens"]["access_token"]
+            .as_str()
+            .is_some_and(|token| !token.is_empty()))
+    .then_some(ChatGptAccount::File)
+}
+
+fn print_chatgpt_status(home: &Path) -> bool {
+    match saved_chatgpt_account(home) {
+        Some(ChatGptAccount::File) => println!("Codex has a saved ChatGPT sign-in."),
+        Some(ChatGptAccount::Keyring) => {
+            println!("Codex uses keyring auth. Run `ox codex --chatgpt` to check the account.");
         }
-        ClientKind::Claude => {
-            let mut command = claude_account_command(home)?;
-            command.args(["auth", "status", "--json"]);
-            command
-        }
-    };
-    let output = match tokio::time::timeout(
-        Duration::from_secs(5),
-        command.stdin(Stdio::null()).output(),
-    )
-    .await
-    {
-        Ok(Ok(output)) if output.status.success() => output,
-        Ok(Ok(_)) | Err(_) => return Ok(false),
-        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Ok(Err(error)) => return Err(error.into()),
-    };
-    Ok(match client {
-        ClientKind::Codex => [&output.stdout, &output.stderr].iter().any(|stream| {
-            String::from_utf8_lossy(stream)
-                .lines()
-                .any(|line| line.trim() == "Logged in using ChatGPT")
-        }),
-        ClientKind::Claude => serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            .is_ok_and(|status| {
-                status["loggedIn"] == true
-                    && status["authMethod"] == "claude.ai"
-                    && status["apiProvider"] == "firstParty"
-            }),
-    })
+        None => return false,
+    }
+    true
+}
+
+fn has_saved_claude_account() -> bool {
+    // Even `claude auth status` writes its global config. Use the account
+    // marker as a hint for the picker, leaving OAuth and expiry to Claude.
+    crate::clients::claude_config_override()
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .and_then(|dir| read_account_json(&dir.join(".claude.json"), ".claude.json"))
+        .is_some_and(|config| {
+            config["oauthAccount"]["accountUuid"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        })
+}
+
+fn read_account_json(path: &Path, file_name: &str) -> Option<serde_json::Value> {
+    let text = crate::setup::read_optional_text_limited(path, file_name)
+        .ok()
+        .flatten()?;
+    serde_json::from_str(&text).ok()
 }
 
 fn claude_account_command(home: &Path) -> Result<Command, RelayError> {
