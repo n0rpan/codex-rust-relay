@@ -1683,7 +1683,7 @@ fn read_existing_codeox(path: &Path) -> Result<Option<String>, RelayError> {
     }
 }
 
-fn lock_config(codex_home: &Path) -> Result<File, RelayError> {
+pub(crate) fn lock_config(codex_home: &Path) -> Result<File, RelayError> {
     let mut directories = fs::DirBuilder::new();
     directories.recursive(true);
     #[cfg(unix)]
@@ -1706,7 +1706,7 @@ fn lock_config(codex_home: &Path) -> Result<File, RelayError> {
     Ok(lock)
 }
 
-fn write_config_atomic(path: &Path, contents: &str) -> Result<(), RelayError> {
+pub(crate) fn write_config_atomic(path: &Path, contents: &str) -> Result<(), RelayError> {
     let parent = path.parent().ok_or("codeox.toml has no parent directory")?;
     let file_name = path
         .file_name()
@@ -2611,7 +2611,10 @@ enum CredentialState {
 // Doctor: shared file and TOML helpers
 // ---------------------------------------------------------------------------
 
-fn read_optional_text_limited(path: &Path, label: &str) -> Result<Option<String>, String> {
+pub(crate) fn read_optional_text_limited(
+    path: &Path,
+    label: &str,
+) -> Result<Option<String>, String> {
     match fs::metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(format!("could not read {label}")),

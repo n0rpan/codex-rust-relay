@@ -251,9 +251,15 @@ It takes precedence over the live catalog. Pass an explicit alias on the first C
 launch if Codex already has a different default model.
 
 Run `ox codex` or `ox claude` with no client arguments from a terminal to choose
-from the same list of configured and discovered aliases with usable keys. Filter
-by model or provider, or pass `--model <alias>` to select one directly. An API key
-configured in ox for Anthropic can power either client.
+from the same list of configured and discovered aliases with usable keys.
+Type a model or provider name to filter immediately. Use the arrow keys to move,
+**Tab** to toggle a star and move to the next match, and **Enter** to launch.
+Use **Ctrl+F** to toggle the starred-only view and **Ctrl+U** to clear the search.
+**Esc** closes the picker and keeps any stars you changed.
+
+Stars are saved by model alias in `$CODEX_HOME/ox-favorites.json` and appear
+at the top of the API model list in both launchers. Pass `--model <alias>`
+to launch directly. An Anthropic API key configured in ox can power either client.
 
 `ox claude` enables gateway model discovery for its Claude Code process. Open
 `/model` to see additional Claude aliases from the configured providers. To opt out
@@ -368,8 +374,8 @@ and adapt the [Desktop web-tools overlay](../examples/claude-desktop-web-tools.j
 
 Use `ox setup` to add API providers, enable Brave or open either stock client's
 sign-in. The menu returns after each action. Select **Done** when finished. Plain `ox codex`
-and `ox claude` show the API models alongside option **0** for that client's
-subscription when signed in. Choosing the subscription opens a native session
+and `ox claude` show that client's subscription at the top of the picker
+when signed in, alongside the API models. Choosing the subscription opens a native session
 with its own `/model` list. With no API providers, ox can start the signed-in
 stock client directly. Bare `ox` prefers Codex and uses Claude Code
 if only Claude is signed in. With no API provider, `ox doctor` asks the stock

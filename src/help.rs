@@ -202,7 +202,8 @@ pub(crate) fn dispatch(args: &[OsString]) -> Option<Result<u8, RelayError>> {
             Some(client @ ("codex" | "claude")) => println!(
                 "Usage: ox {client} [client arguments]\n\
                  Run from your project. With API providers configured, the bare command\n\
-                 opens the shared model picker. Without providers it uses your native sign-in.\n\
+                 opens the shared model picker. Type to search and press Tab to star models.\n\
+                 Without providers it uses your native sign-in.\n\
                  Example: ox {client} --model provider/model-id\n\
                  Run {client} --help for arguments accepted by the stock client."
             ),

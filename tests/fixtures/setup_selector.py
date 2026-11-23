@@ -1,6 +1,7 @@
 """Exercise the release binary's terminal-only setup entry point with stub clients."""
 
 import errno
+import fcntl
 import http.server
 import json
 import os
@@ -8,8 +9,10 @@ import pathlib
 import pty
 import select
 import socket
+import struct
 import subprocess
 import tempfile
+import termios
 import threading
 import time
 import urllib.request
@@ -20,6 +23,7 @@ binary = pathlib.Path(os.environ.get("OX_TEST_BINARY", "target/release/ox")).res
 def run(
     args, choices=None, signed_in=False, claude_signed_in=False,
     config=None, prompt="Choose 1–5".encode(), saved=None, model=None,
+    favorites=None, expected_favorites=None,
 ):
     with tempfile.TemporaryDirectory(prefix="ox-selector-") as tmp:
         home = pathlib.Path(tmp)
@@ -30,6 +34,8 @@ def run(
         (home / "config.toml").write_text(original)
         if config is not None:
             (home / "codeox.toml").write_text(config)
+        if favorites is not None:
+            (home / "ox-favorites.json").write_text(json.dumps(favorites))
         for client in ("codex", "claude"):
             fake = bindir / client
             fake.write_text('''#!/bin/sh
@@ -60,6 +66,7 @@ printf '%s\\n' "$(basename "$0")" "$@" > "$FIXTURE_TRACE"
         env = {
             "HOME": tmp, "CODEX_HOME": tmp, "CLAUDE_CONFIG_DIR": tmp,
             "PATH": f"{bindir}:/usr/bin:/bin", "FIXTURE_TRACE": str(trace),
+            "TERM": "xterm-256color",
             "FIXTURE_SIGNED_IN": "yes" if signed_in else "no",
             "FIXTURE_CLAUDE_SIGNED_IN": "yes" if claude_signed_in else "no",
             "OPENROUTER_API_KEY": "dummy-fixture-credential",
@@ -67,6 +74,7 @@ printf '%s\\n' "$(basename "$0")" "$@" > "$FIXTURE_TRACE"
             "ALIBABA_API_KEY": "dummy-alibaba-credential",
         }
         master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
         proc = subprocess.Popen([binary, *args], env=env, stdin=slave, stdout=slave, stderr=slave)
         os.close(slave)
         capture = bytearray()
@@ -151,6 +159,9 @@ printf '%s\\n' "$(basename "$0")" "$@" > "$FIXTURE_TRACE"
                     [binary, "doctor"], env=env, capture_output=True, text=True, timeout=5,
                 )
                 assert doctor.returncode != 0 and "is not set" in doctor.stdout
+            if expected_favorites is not None:
+                persisted = json.loads((home / "ox-favorites.json").read_text())
+                assert sorted(persisted) == sorted(expected_favorites)
             return text, trace.read_text().splitlines() if trace.exists() else [], registry
         finally:
             if proc.poll() is None:
@@ -338,23 +349,52 @@ discovery = false
 
 """ + "\n".join(f'[[providers.openrouter.models]]\nid = "model-{i}"\n' for i in range(14))
 
+search_prompt = b"Search as you type"
 for client, search, expected in (
     ("codex", "anthropic", "anthropic/claude-fixture"),
     ("claude", "alibaba", "alibaba/qwen-fixture"),
 ):
     text, argv, registry = run(
-        [client], f"{search}\n1\n".encode(), config=shared,
-        signed_in=True, claude_signed_in=True, prompt=b"Model number or search",
+        [client], [
+            (search_prompt, search.encode()),
+            (f"Search as you type  {search}▏".encode(), b"\r"),
+        ], config=shared, signed_in=True, claude_signed_in=True,
     )
     assert registry == shared and argv[0] == client and argv[-2:] == ["--model", expected], argv
-    assert "Providers: alibaba, anthropic, openrouter" in text
-    assert "[alibaba]" in text and "[anthropic]" in text
-    assert "dummy-anthropic-credential" not in text and "dummy-alibaba-credential" not in text
-print("shared model picker: both clients show API providers and launch the selected alias")
+    assert "All models · 1 matching" in text
+    assert ">   " + expected in text
+print("live picker: both clients narrow the list while typing and Enter launches the highlight")
 
-text, argv, registry = run(["claude"], b":n\n:q\n", config=shared, prompt=b"Model number or search")
-assert "Showing 13–16 of 16" in text and argv == [] and registry == shared
-print("shared model picker: page through a large catalog and cancel without launching")
+text, argv, registry = run(
+    ["claude"], [
+        (search_prompt, b"\x1b[6~"),
+        (b">   openrouter/model-10", b"\x1b"),
+    ], config=shared,
+)
+assert "\x1b[?1049l" in text and argv == [] and registry == shared
+print("live picker: page through a large catalog and restore the terminal when canceled")
+
+favorites = ["openrouter/model-1", "openrouter/model-10"]
+text, argv, registry = run(
+    ["claude"], [
+        (search_prompt, b"model-1"),
+        ("Search as you type  model-1▏".encode(), b"\t\t"),
+        (b"2 starred", b"\x06"),
+        ("Starred only · 2 matching".encode(), b"\x1b"),
+    ], config=shared, expected_favorites=favorites,
+)
+assert all(f"★ {alias}" in text for alias in favorites)
+assert argv == [] and registry == shared
+
+text, argv, registry = run(
+    ["codex"], [
+        ("> ★ openrouter/model-1".encode(), b"\x06"),
+        ("Starred only · 2 matching".encode(), b"\t"),
+        ("Starred only · 1 matching".encode(), b"\r"),
+    ], config=shared, favorites=favorites, expected_favorites=favorites[1:],
+)
+assert argv[-2:] == ["--model", favorites[1]] and registry == shared
+print("live picker: stars persist, appear first in Codex, and can be removed in the starred view")
 
 
 previous = shared + '\n[search]\nenabled = false # manual opt-out\nenv_key = "CUSTOM_BRAVE_KEY"\nmax_results = 3\n'
@@ -369,10 +409,12 @@ for client, plan, expected in (
     ("claude", "Claude", ["claude"]),
 ):
     text, argv, registry = run(
-        [client], b"0\n", config=shared,
-        signed_in=True, claude_signed_in=True, prompt=b"Model number or search",
+        [client], [
+            (search_prompt, b"\x1b[A"),
+            (f">   {plan} subscription  [native]".encode(), b"\r"),
+        ], config=shared, signed_in=True, claude_signed_in=True,
     )
-    assert f"0. {plan} subscription  [native]" in text
+    assert f"{plan} subscription  [native]" in text
     assert "anthropic/claude-fixture" in text
     assert argv == expected and registry == shared, argv
-print("shared model picker: option 0 launches the matching subscription alongside API choices")
+print("shared model picker: arrows select the matching subscription alongside API choices")

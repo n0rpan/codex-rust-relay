@@ -264,13 +264,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
     if interactive && args.is_empty() && matches!(&app.mode, Mode::Codeox { .. }) {
         let signed_in = native::signed_in(client_kind, &codex_home).await?;
         let models = app.launch_models();
-        match picker::choose_model(
-            client_kind,
-            &models,
-            signed_in,
-            &mut std::io::stdin().lock(),
-            &mut std::io::stdout().lock(),
-        )? {
+        match picker::choose_model(client_kind, &models, signed_in, &codex_home)? {
             Some(picker::LaunchChoice::Model(alias)) => {
                 args.extend([OsString::from("--model"), OsString::from(alias)]);
             }

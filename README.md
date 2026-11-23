@@ -1,9 +1,9 @@
 # ox
 
 Run `ox codex` or `ox claude` from your project. Both commands use the same API
-provider setup and model picker. When you’re signed in, choose **0** in the picker
-to start a native subscription session for that client. An Anthropic API key lets
-either client use Claude models through the gateway.
+provider setup and model picker. When you’re signed in, the picker also lists that
+client’s native subscription. An Anthropic API key lets either client use Claude
+models through the gateway.
 
 Without an API provider configured, plain `ox codex` and `ox claude` use the
 corresponding client's existing subscription sign-in. Bare `ox` prefers Codex
@@ -80,8 +80,14 @@ have a provider configured, use its existing alias. [Other providers and setup o
 ## 3. Try a session
 
 From your project directory, run `ox codex` or `ox claude` and choose from all
-available ox API aliases. Type part of the provider or model name to filter.
-When just one model is available, ox selects it for you. To skip the picker:
+available ox API aliases. Search updates as you type. Use **↑/↓** to move,
+**Tab** to star or unstar, and **Enter** to launch the highlighted model.
+You can star several models before starting a session. They stay at the
+top in both launchers. Press **Ctrl+F** to see just your stars and **Esc**
+to close the picker.
+
+If one API model is available and you have no native subscription, ox selects
+it for you. To skip the picker:
 
 ```sh
 ox codex --model openrouter/openai/gpt-5.4-mini
