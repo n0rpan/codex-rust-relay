@@ -345,6 +345,11 @@ pub(crate) fn claude_command(
         command.env_remove(name);
     }
 
+    const MODEL_DISCOVERY_ENV: &str = "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY";
+    if !env_refs.contains(MODEL_DISCOVERY_ENV) && std::env::var_os(MODEL_DISCOVERY_ENV).is_none() {
+        command.env(MODEL_DISCOVERY_ENV, "1");
+    }
+
     command
         .env("ANTHROPIC_BASE_URL", &base_url)
         .env("ANTHROPIC_AUTH_TOKEN", token)

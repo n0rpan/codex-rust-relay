@@ -133,13 +133,16 @@ If Codex shows a stale picker, check for `model_catalog_json` in `$CODEX_HOME/co
 It takes precedence over the live catalog. Pass an explicit alias on the first Codex
 launch if Codex already has a different default model.
 
-Claude Code's `/model` uses the built-in tier slots and one custom slot by default.
-To discover additional Claude models across providers, start the client with discovery
-enabled and open `/model`:
+`ox claude` enables gateway model discovery for its Claude Code process. Open
+`/model` to see additional Claude aliases from the configured providers. To opt out
+for a launch, run:
 
 ```sh
-CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 ox claude
+CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0 ox claude
 ```
+
+If you launch `claude` directly against a shared `ox serve` daemon, set
+`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` in the client's environment.
 
 ox lists configured aliases in `GET /v1/models`. Claude Code adds discovered aliases
 whose IDs contain `claude` or `anthropic`. Managed picker settings can further limit

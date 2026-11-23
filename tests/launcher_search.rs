@@ -1,10 +1,8 @@
-//! Launcher-level tests for the real `codeox` binary.
+//! Launcher-level tests for the real `ox` binary.
 //!
 //! `provider add` and `doctor` are codeox subcommands, so they must be
-//! dispatched before any Codex launch. The web-search tests use a fake `codex`
-//! on `PATH`: it records the arguments and environment of both child
-//! invocations (the bundled-catalog probe and the real launch) without running
-//! a model or touching a network.
+//! dispatched before any client launch. Stub clients on `PATH` record the
+//! arguments and environment without making upstream requests.
 
 use std::ffi::OsString;
 use std::fs;
@@ -12,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const BRAVE_KEY: &str = "brave-test-key-must-not-leak";
+const CLAUDE_DISCOVERY_ENV: &str = "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY";
 
 struct TempDir(PathBuf);
 
@@ -41,11 +40,12 @@ fn base_env(command: &mut Command, home: &Path) {
         .env("HOME", home)
         .env_remove("BRAVE_SEARCH_API_KEY")
         .env_remove("ALPHA_KEY")
-        .env_remove("CODEOX_TOKEN");
+        .env_remove("CODEOX_TOKEN")
+        .env_remove(CLAUDE_DISCOVERY_ENV);
 }
 
-fn write_fake_codex(dir: &Path) {
-    let script = dir.join("codex");
+fn write_fake_client(dir: &Path, client: &str) {
+    let script = dir.join(client);
     fs::write(
         &script,
         r#"#!/bin/sh
@@ -194,7 +194,7 @@ fn launcher_registers_search_only_when_opted_in_and_strips_the_key() {
     let home = TempDir::new("launcher-search-home");
     let capture = TempDir::new("launcher-search-capture");
     let fake_bin = TempDir::new("launcher-search-bin");
-    write_fake_codex(&fake_bin.0);
+    write_fake_client(&fake_bin.0, "codex");
     write_codeox_config(&home.0, true);
 
     let output = run_launcher(
@@ -262,7 +262,7 @@ fn launcher_never_widens_a_pinned_web_search_policy() {
     let home = TempDir::new("launcher-policy-home");
     let capture = TempDir::new("launcher-policy-capture");
     let fake_bin = TempDir::new("launcher-policy-bin");
-    write_fake_codex(&fake_bin.0);
+    write_fake_client(&fake_bin.0, "codex");
     write_codeox_config(&home.0, true);
     fs::write(home.0.join("config.toml"), "web_search = \"cached\"\n").unwrap();
 
@@ -289,11 +289,38 @@ fn launcher_never_widens_a_pinned_web_search_policy() {
 }
 
 #[test]
+fn claude_launcher_defaults_to_model_discovery_and_respects_opt_out() {
+    let home = TempDir::new("launcher-claude-home");
+    let capture = TempDir::new("launcher-claude-capture");
+    let fake_bin = TempDir::new("launcher-claude-bin");
+    write_fake_client(&fake_bin.0, "claude");
+    write_codeox_config(&home.0, false);
+
+    for (env, expected) in [
+        ([("ALPHA_KEY", "alpha-secret")].as_slice(), "1"),
+        (
+            [("ALPHA_KEY", "alpha-secret"), (CLAUDE_DISCOVERY_ENV, "0")].as_slice(),
+            "0",
+        ),
+    ] {
+        let output = run_launcher(&home.0, &capture.0, &fake_bin.0, env, &["claude"]);
+        assert!(
+            output.status.success(),
+            "launcher failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let env = read(&capture.0.join("run-env"));
+        let entry = format!("{CLAUDE_DISCOVERY_ENV}={expected}");
+        assert!(env.lines().any(|line| line == entry), "expected {entry}");
+    }
+}
+
+#[test]
 fn normal_codex_arguments_survive_unchanged() {
     let home = TempDir::new("launcher-args-home");
     let capture = TempDir::new("launcher-args-capture");
     let fake_bin = TempDir::new("launcher-args-bin");
-    write_fake_codex(&fake_bin.0);
+    write_fake_client(&fake_bin.0, "codex");
     write_codeox_config(&home.0, false);
 
     let expected: Vec<OsString> = vec![
