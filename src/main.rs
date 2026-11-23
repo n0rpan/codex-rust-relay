@@ -22,6 +22,7 @@ mod setup;
 mod sse;
 mod standalone_search;
 mod translate;
+mod update;
 mod upstream;
 
 use std::collections::BTreeSet;
@@ -133,6 +134,9 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
     }
     if let Some(result) = help::dispatch(&args) {
         return result;
+    }
+    if args.first().is_some_and(|arg| arg == "update") {
+        return update::run(&args[1..]).await;
     }
     let codex_home = std::env::var_os("CODEX_HOME")
         .filter(|path| !path.is_empty())
@@ -330,46 +334,72 @@ impl App {
         search: Option<BraveSearch>,
     ) -> Result<Self, RelayError> {
         let vendors = config.vendors;
-        let mut auths = Vec::with_capacity(vendors.len());
         let mut secrets = Vec::new();
-        let mut models_by_vendor = Vec::with_capacity(vendors.len());
-        for vendor in &vendors {
-            let auth = vendor.api_key(env);
-            if let Some(key) = &auth {
-                secrets.push(key.expose().to_owned());
-            } else {
-                eprintln!(
-                    "ox: provider {:?}: {}. Run `ox doctor` to check setup.",
-                    vendor.key,
-                    vendor.unavailable_reason()
-                );
-            }
-            let discovered = if !vendor.discovery {
-                None
-            } else if let Some(key) = &auth {
-                match discover(&client, vendor, key).await {
-                    Ok(models) => Some(models),
-                    Err(reason) => {
+        let auths: Vec<_> = vendors
+            .iter()
+            .map(|vendor| {
+                let auth = vendor.api_key(env);
+                if let Some(key) = &auth {
+                    secrets.push(key.expose().to_owned());
+                } else {
+                    eprintln!(
+                        "ox: provider {:?}: {}. Run `ox doctor` to check setup.",
+                        vendor.key,
+                        vendor.unavailable_reason()
+                    );
+                }
+                auth
+            })
+            .collect();
+
+        let mut discovered: Vec<_> = std::iter::repeat_with(|| None)
+            .take(vendors.len())
+            .collect();
+        {
+            let client = &client;
+            let mut requests =
+                futures_util::stream::iter(vendors.iter().zip(&auths).enumerate().filter_map(
+                    |(index, (vendor, auth))| {
+                        auth.as_ref()
+                            .filter(|_| vendor.discovery)
+                            .map(|key| async move { (index, discover(client, vendor, key).await) })
+                    },
+                ))
+                .buffer_unordered(4);
+
+            let deadline = tokio::time::Instant::now() + CATALOG_TIMEOUT;
+            loop {
+                match tokio::time::timeout_at(deadline, requests.next()).await {
+                    Ok(Some((index, Ok(models)))) => discovered[index] = Some(models),
+                    Ok(Some((index, Err(reason)))) => eprintln!(
+                        "ox: provider {:?}: model discovery failed: {reason}",
+                        vendors[index].key
+                    ),
+                    Ok(None) => break,
+                    Err(_) => {
                         eprintln!(
-                            "codeox: provider {:?}: model discovery failed: {reason}",
-                            vendor.key
+                            "ox: model discovery reached the startup deadline. Using configured models for remaining providers."
                         );
-                        None
+                        break;
                     }
                 }
-            } else {
-                None
-            };
-            let specs = catalog::merge_models(discovered, &vendor.models);
-            if specs.is_empty() {
-                eprintln!(
-                    "codeox: provider {:?}: no models are listed; requests for {:?} still route by prefix",
-                    vendor.key, vendor.key
-                );
             }
-            auths.push(auth);
-            models_by_vendor.push(specs);
         }
+
+        let models_by_vendor: Vec<_> = vendors
+            .iter()
+            .zip(discovered)
+            .map(|(vendor, models)| {
+                let specs = catalog::merge_models(models, &vendor.models);
+                if specs.is_empty() {
+                    eprintln!(
+                        "ox: provider {:?}: no models are listed; requests for {:?} still route by prefix",
+                        vendor.key, vendor.key
+                    );
+                }
+                specs
+            })
+            .collect();
 
         let routes = Routes::build(&vendors, &models_by_vendor)?;
         let mut entries = Vec::new();
@@ -576,6 +606,7 @@ impl App {
                         upstream::Translation {
                             vendor: &state.vendor,
                             key: auth,
+                            incoming: Some(&parts.headers),
                             upstream_model: &route.upstream_model,
                             requested_model: &requested,
                             secrets: Arc::clone(&self.secrets),
@@ -595,6 +626,16 @@ impl App {
                     }
                 };
                 drop(payload);
+                let vendor_headers =
+                    match state.vendor.inference_headers(auth, Some(&parts.headers)) {
+                        Ok(headers) => headers,
+                        Err(_) => {
+                            return error_response(
+                                StatusCode::BAD_GATEWAY,
+                                "could not build the upstream authentication header",
+                            );
+                        }
+                    };
                 let mut headers = if self.persistent {
                     // A shared listener can sit behind a proxy with its own
                     // identity headers. Only the relay's credentials and
@@ -610,20 +651,11 @@ impl App {
                 if !headers.contains_key(CONTENT_TYPE) {
                     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
                 }
-                let auth = match provider::bearer(auth.expose()) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        return error_response(
-                            StatusCode::BAD_GATEWAY,
-                            "could not build the upstream authentication header",
-                        );
-                    }
-                };
+                headers.extend(vendor_headers);
                 let upstream = self
                     .client
                     .post(state.vendor.responses_url(&path, query.as_deref()))
                     .headers(headers)
-                    .header(AUTHORIZATION, auth)
                     .body(body)
                     .send()
                     .await;
@@ -774,6 +806,8 @@ async fn serve(listener: TcpListener, relay: Arc<App>) -> std::io::Result<()> {
                 async move { Ok::<_, std::convert::Infallible>(relay.handle(request).await) }
             });
             let _ = http1::Builder::new()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(Duration::from_secs(10))
                 .serve_connection(TokioIo::new(socket), service)
                 .await;
         });
@@ -1017,19 +1051,24 @@ fn forward_headers(mut headers: HeaderMap) -> HeaderMap {
         "trailer",
         "transfer-encoding",
         "upgrade",
+        "x-opencode-session",
     ] {
         headers.remove(name);
     }
     headers
 }
 
-/// Relay one native Responses HTTP response. A success or redirect streams
-/// through unchanged; an HTTP failure is bounded and reduced to a redacted
-/// error that keeps the status and, on `429`, `Retry-After`.
+/// Stream successful native Responses requests and sanitize failures.
 async fn responses_response(
     response: reqwest::Response,
     secrets: &[String],
 ) -> Response<RelayBody> {
+    if response.status().is_redirection() {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "provider returned an unexpected redirect",
+        );
+    }
     if upstream::is_http_failure(&response) {
         return upstream::http_failure(response, secrets).await;
     }
@@ -1132,6 +1171,7 @@ mod tests {
 
     struct Behavior {
         models: Result<Value, u16>,
+        catalog_barrier: Option<tokio::sync::Barrier>,
         redirect: Option<String>,
         /// A canned native Responses HTTP failure, with headers to prove that
         /// arbitrary vendor headers are not relayed.
@@ -1145,6 +1185,7 @@ mod tests {
     async fn spawn_mock(models: Result<Value, u16>, redirect: Option<String>) -> MockVendor {
         spawn_mock_behavior(Behavior {
             models,
+            catalog_barrier: None,
             redirect,
             responses_error: None,
         })
@@ -1158,6 +1199,7 @@ mod tests {
     ) -> MockVendor {
         spawn_mock_behavior(Behavior {
             models: Ok(Value::Null),
+            catalog_barrier: None,
             redirect: None,
             responses_error: Some((status, body, headers.to_vec())),
         })
@@ -1228,6 +1270,9 @@ mod tests {
             return response;
         }
         if path == "/v1/models" {
+            if let Some(barrier) = &behavior.catalog_barrier {
+                barrier.wait().await;
+            }
             return match &behavior.models {
                 Ok(body) => json_response(StatusCode::OK, body.clone()),
                 Err(status) => error_response(
@@ -1507,6 +1552,31 @@ base_url = "{beta}"
 env_key = "BETA_KEY"
 "#
         )
+    }
+
+    #[tokio::test]
+    async fn discovery_runs_for_multiple_vendors_concurrently() {
+        let mock = spawn_mock_behavior(Behavior {
+            models: Ok(models_body(&["discovered"])),
+            catalog_barrier: Some(tokio::sync::Barrier::new(2)),
+            redirect: None,
+            responses_error: None,
+        })
+        .await;
+        let config = two_vendor_config(&mock.base, &mock.base);
+        let relay = tokio::time::timeout(
+            Duration::from_secs(5),
+            start_relay(
+                &config,
+                &[("ALPHA_KEY", "alpha-secret"), ("BETA_KEY", "beta-secret")],
+                1 << 20,
+            ),
+        )
+        .await
+        .expect("both discovery requests must reach the vendor before either can finish");
+        let slugs = listed_slugs(&get_models(&relay).await);
+        assert!(slugs.contains(&"alpha/discovered".to_owned()), "{slugs:?}");
+        assert!(slugs.contains(&"beta/discovered".to_owned()), "{slugs:?}");
     }
 
     #[tokio::test]
@@ -1877,11 +1947,8 @@ env_key = "BETA_KEY"
         .await;
 
         let response = post(&relay, json!({"model": "alpha/anything"})).await;
-        assert_eq!(response.status(), 302);
-        assert_eq!(
-            response.headers().get(LOCATION).unwrap(),
-            trap.base.as_str()
-        );
+        assert_eq!(response.status(), 502);
+        assert!(response.headers().get(LOCATION).is_none());
         assert_eq!(trap.hits_len(), 0, "redirects are never followed");
     }
 

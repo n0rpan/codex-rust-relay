@@ -92,7 +92,13 @@ async fn infer_native(
         .unwrap_or(false);
     let payload = prepare_native_body(payload, context.vendor, context.upstream_model);
 
-    let headers = match native_headers(context.vendor, context.key, beta, wants_stream) {
+    let headers = match native_headers(
+        context.vendor,
+        context.key,
+        context.incoming,
+        beta,
+        wants_stream,
+    ) {
         Ok(headers) => headers,
         Err(_) => {
             return messages_error(
@@ -203,6 +209,7 @@ async fn infer_translated(
                 Translation {
                     vendor: context.vendor,
                     key: context.key,
+                    incoming: context.incoming,
                     upstream_model: context.upstream_model,
                     requested_model: context.requested_model,
                     secrets: Arc::clone(&context.secrets),
@@ -231,7 +238,10 @@ async fn responses_upstream(
     context: &Translation<'_>,
     payload: Value,
 ) -> Response<crate::RelayBody> {
-    let mut headers = match context.vendor.auth_headers(context.key) {
+    let mut headers = match context
+        .vendor
+        .inference_headers(context.key, context.incoming)
+    {
         Ok(headers) => headers,
         Err(_) => {
             return messages_error(
@@ -577,10 +587,11 @@ fn prepare_native_body(mut payload: Value, vendor: &Vendor, upstream_model: &str
 fn native_headers(
     vendor: &Vendor,
     key: &SecretKey,
+    incoming: Option<&HeaderMap>,
     beta: Option<&str>,
     wants_stream: bool,
 ) -> Result<HeaderMap, RelayError> {
-    let mut headers = vendor.auth_headers(key)?;
+    let mut headers = vendor.inference_headers(key, incoming)?;
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     if wants_stream {
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
@@ -953,6 +964,7 @@ mod tests {
         Translation {
             vendor,
             key,
+            incoming: None,
             upstream_model: "upstream-model",
             requested_model: "vendor/upstream-model",
             secrets: Arc::clone(secrets),
@@ -1054,7 +1066,7 @@ mod tests {
     fn native_headers_never_copy_caller_authentication() {
         let vendor = vendor(Wire::AnthropicMessages);
         let key = SecretKey::new("sk-vendor-key".to_owned());
-        let headers = native_headers(&vendor, &key, Some("beta-1"), true).unwrap();
+        let headers = native_headers(&vendor, &key, None, Some("beta-1"), true).unwrap();
         assert_eq!(headers["x-api-key"], "sk-vendor-key");
         assert_eq!(headers["anthropic-version"], "2023-06-01");
         assert_eq!(headers[ANTHROPIC_BETA], "beta-1");
@@ -1359,6 +1371,7 @@ mod tests {
             Translation {
                 vendor: &vendor,
                 key: &key,
+                incoming: None,
                 upstream_model: "real-model",
                 requested_model: "vendor/upstream-model",
                 secrets: Arc::clone(&secrets),
@@ -1401,6 +1414,7 @@ mod tests {
             Translation {
                 vendor: &vendor,
                 key: &key,
+                incoming: None,
                 upstream_model: "real-model",
                 requested_model: "vendor/upstream-model",
                 secrets,
@@ -1436,6 +1450,7 @@ mod tests {
             Translation {
                 vendor: &vendor,
                 key: &key,
+                incoming: None,
                 upstream_model: "real-model",
                 requested_model: "vendor/upstream-model",
                 secrets: Arc::new(vec!["sk-vendor-key".to_owned()]),
@@ -1464,6 +1479,7 @@ mod tests {
             Translation {
                 vendor: &vendor,
                 key: &key,
+                incoming: None,
                 upstream_model: "real-model",
                 requested_model: "vendor/upstream-model",
                 secrets,

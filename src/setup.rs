@@ -30,7 +30,8 @@ use std::path::{Path, PathBuf};
 use toml_edit::{Document, Item, TableLike};
 
 use crate::provider::{
-    CodeoxConfig, MAX_CONFIG_BYTES, PROVIDER_ID, RelayError, alias_for, reserved_credential_env,
+    CodeoxConfig, MAX_CONFIG_BYTES, PROVIDER_ID, RelayError, alias_for, credential_env_error,
+    looks_like_credential,
 };
 
 /// Narrow integration seam for `main.rs`.
@@ -110,7 +111,7 @@ fn provider_add_command(
 ) -> Result<u8, RelayError> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    let interactive = stdin.is_terminal() && (!setup || stdout.is_terminal());
+    let interactive = stdin.is_terminal() && stdout.is_terminal();
     let mut output = stdout.lock();
     if setup && args.is_empty() {
         if !interactive {
@@ -401,7 +402,7 @@ fn parse_bool_flag(raw: &str) -> Result<bool, String> {
 // ---------------------------------------------------------------------------
 
 fn validate_provider_key(key: &str) -> Result<String, String> {
-    if looks_like_secret(key) {
+    if looks_like_credential(key) {
         return Err(
             "that looks like a credential. Enter a provider name such as openrouter or anthropic"
                 .to_owned(),
@@ -439,39 +440,10 @@ fn validate_model_id(id: &str) -> Result<String, String> {
 }
 
 fn validate_env_key_name(name: &str) -> Result<String, String> {
-    if name.is_empty() || name.len() > 128 {
-        return Err(
-            "pass the name of an environment variable (for example MY_PROVIDER_API_KEY), not a credential value"
-                .to_owned(),
-        );
+    match credential_env_error(name) {
+        Some(reason) => Err(reason.to_owned()),
+        None => Ok(name.to_owned()),
     }
-    let valid_name = name
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
-        && name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
-    if looks_like_secret(name) || !valid_name {
-        return Err(
-            "that does not look like an environment variable name; pass a name such as MY_PROVIDER_API_KEY, never the key itself"
-                .to_owned(),
-        );
-    }
-    if let Some(reason) = reserved_credential_env(name) {
-        return Err(reason.to_owned());
-    }
-    Ok(name.to_owned())
-}
-
-fn looks_like_secret(value: &str) -> bool {
-    ["sk-", "sk_", "xox", "ghp_", "github_pat_", "aiza"]
-        .iter()
-        .any(|prefix| {
-            value
-                .get(..prefix.len())
-                .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
-        })
 }
 
 fn validate_anthropic_version(value: &str) -> Result<String, String> {
@@ -680,6 +652,7 @@ pub(crate) fn run_provider_add(
         return usage_error(output, "--env-key and --no-env-key cannot both be set");
     }
 
+    let interactive = interactive && (parsed.key.is_none() || parsed.base_url.is_none());
     let mut prompt = Prompt { input, output };
 
     let key = match parsed.key.take() {
@@ -1018,6 +991,10 @@ fn write_add_usage(output: &mut dyn Write) -> Result<(), RelayError> {
     writeln!(
         output,
         "Run ox setup with no arguments to choose a subscription or API provider."
+    )?;
+    writeln!(
+        output,
+        "Supply the provider name and --base-url to add a provider without prompts."
     )?;
     writeln!(output)?;
     writeln!(
@@ -1705,7 +1682,7 @@ fn doctor_provider(
         match &env_key {
             Some(name) => {
                 doctor_credential(report, &scope, name, env);
-                valid &= reserved_credential_env(name).is_none();
+                valid &= credential_env_error(name).is_none();
             }
             None => report.warning(
                 Some(scope.clone()),
@@ -1966,7 +1943,7 @@ fn doctor_credential(
     name: &str,
     env: &crate::provider::Env<'_>,
 ) {
-    if let Some(reason) = reserved_credential_env(name) {
+    if let Some(reason) = credential_env_error(name) {
         report.error(Some(scope.to_owned()), reason);
         return;
     }

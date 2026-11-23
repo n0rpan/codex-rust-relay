@@ -6,12 +6,12 @@ name: CI
 #
 # A separate native matrix then builds the locked release binary on Linux
 # x86_64/ARM64 and macOS Intel/Apple silicon, runs it, and uploads one `ox`
-# archive plus SHA-256 checksum per platform. The matrix needs no publication
-# rights and no credentials: every job inherits the workflow's read-only token
-# and only publishes workflow artifacts.
+# archive, native updater binary, and checksums per platform. The matrix uses
+# the read-only token. Only the tag-triggered publication job can write Releases.
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
   schedule:
@@ -339,6 +339,10 @@ jobs:
           # this probes that the executable starts without network or secrets.
           "${binary}" --help | grep -F "Launch Codex with the gateway"
 
+      - name: Test atomic updates on this platform
+        timeout-minutes: 15
+        run: cargo test --release --locked --offline --target "${{ matrix.target }}" --bin ox update::tests
+
       - name: Package ox and SHA-256 checksum
         timeout-minutes: 5
         run: |
@@ -350,17 +354,23 @@ jobs:
             exit 1
           fi
           archive="ox-${version}-${target}.tar.gz"
+          executable="ox-${version}-${target}"
           mkdir -p dist
+          cp "target/${target}/release/ox" "dist/${executable}"
           tar --create --gzip --file "dist/${archive}" \
             --directory "target/${target}/release" ox
           (
             cd dist
             if command -v sha256sum >/dev/null 2>&1; then
               sha256sum --binary "${archive}" > "${archive}.sha256"
+              sha256sum --binary "${executable}" > "${executable}.sha256"
               sha256sum --check --strict "${archive}.sha256"
+              sha256sum --check --strict "${executable}.sha256"
             else
               shasum -a 256 "${archive}" > "${archive}.sha256"
+              shasum -a 256 "${executable}" > "${executable}.sha256"
               shasum -a 256 --check "${archive}.sha256"
+              shasum -a 256 --check "${executable}.sha256"
             fi
             cat "${archive}.sha256"
           )
@@ -373,15 +383,51 @@ jobs:
           tar --extract --gzip --file "dist/${archive}" --directory "${unpacked}"
           test -x "${unpacked}/ox"
           "${unpacked}/ox" --help | grep -F "Launch Codex with the gateway"
+          test "$("${unpacked}/ox" --version)" = "ox ${version}"
+          cmp "${unpacked}/ox" "dist/${executable}"
+          "dist/${executable}" update --help | grep -F 'Usage: ox update'
+          OX_TEST_BINARY="dist/${executable}" python3 tests/fixtures/setup_selector.py
 
       - name: Upload ox archive and SHA-256 checksum
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ox-${{ matrix.target }}
-          path: |
-            dist/ox-*.tar.gz
-            dist/ox-*.tar.gz.sha256
+          path: dist/ox-*
           if-no-files-found: error
           retention-days: 30
           # The archives are already gzip-compressed.
           compression-level: 0
+
+  publish:
+    name: Publish a tagged release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [verify, release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Publish the four checked platform builds
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::use a stable tag vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'ox-*' --dir dist
+          files=()
+          for platform in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            directory="dist/ox-${platform}"
+            executable="ox-${TAG#v}-${platform}"
+            (
+              cd "$directory"
+              sha256sum --check --strict "${executable}.sha256" "${executable}.tar.gz.sha256"
+            )
+            files+=("$directory/$executable" "$directory/$executable.sha256"
+                    "$directory/$executable.tar.gz" "$directory/$executable.tar.gz.sha256")
+          done
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --latest "${files[@]}"

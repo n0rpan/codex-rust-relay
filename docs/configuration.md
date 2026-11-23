@@ -4,17 +4,60 @@
 
 ## Install options
 
-Pick the GitHub Actions artifact that matches `uname -sm` from a run with
-**Release binaries** jobs. CI checks the archive's SHA-256, extracts it, and runs the
-copy inside. Sign in to GitHub to download
-artifacts while they are retained (30 days). [Download instructions](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/download-workflow-artifacts)
+Download the **binary and its matching `.sha256` file** from the latest stable
+release. Use `uname -sm` to choose the platform suffix. Use the filename without
+`.tar.gz` for the commands below. [GitHub Releases](https://github.com/n0rpan/codex-rust-relay/releases/latest)
 
-| Machine | Artifact name | Target requirements |
+| Machine | Binary filename suffix | Requirements |
 | --- | --- | --- |
-| Linux x86-64 | `ox-x86_64-unknown-linux-gnu` | glibc 2.39 or newer |
-| Linux ARM64 | `ox-aarch64-unknown-linux-gnu` | glibc 2.39 or newer |
-| macOS Apple silicon | `ox-aarch64-apple-darwin` | macOS 11 deployment target |
-| macOS Intel | `ox-x86_64-apple-darwin` | macOS 11 deployment target |
+| macOS Apple silicon (`Darwin arm64`) | `aarch64-apple-darwin` | macOS 11 or newer |
+| macOS Intel (`Darwin x86_64`) | `x86_64-apple-darwin` | macOS 11 or newer |
+| Linux x86-64 (`Linux x86_64`) | `x86_64-unknown-linux-gnu` | glibc 2.39 or newer |
+| Linux ARM64 (`Linux aarch64`) | `aarch64-unknown-linux-gnu` | glibc 2.39 or newer |
+
+**macOS.** In the directory containing both files, set `asset` to your exact
+downloaded filename:
+
+```sh
+asset='ox-0.1.0-aarch64-apple-darwin'
+shasum -a 256 -c "$asset.sha256" &&
+  mkdir -p "$HOME/.local/bin" &&
+  install -m 755 "$asset" "$HOME/.local/bin/ox"
+```
+
+**Linux.** Use the same steps with `sha256sum`:
+
+```sh
+asset='ox-0.1.0-x86_64-unknown-linux-gnu'
+sha256sum -c "$asset.sha256" &&
+  mkdir -p "$HOME/.local/bin" &&
+  install -m 755 "$asset" "$HOME/.local/bin/ox"
+```
+
+If `ox` is missing on PATH, run `export PATH="$HOME/.local/bin:$PATH"` in Bash or
+Zsh and add the same line to `~/.bashrc` or `~/.zshrc` for future terminals.
+Run `ox --version`, then `ox setup`. Install the stock `codex` or `claude` CLI
+separately if you want to launch it through ox.
+
+### Update an existing installation
+
+```sh
+ox update --check
+ox update
+```
+
+`ox update` verifies the binary against the SHA-256 digest published by GitHub,
+then replaces the running executable's file. Use an install directory writable
+by your own account. Restart any running `ox serve` or ox-launched sessions to
+use the new binary. The updater leaves provider settings and credentials alone.
+
+### Preview builds and source installation
+
+Before the first stable release, or to try an unreleased commit, use a successful
+CI run. Sign in to GitHub and download the `ox-<target>` artifact for your
+platform, then unzip it and use the same checksum and install steps above.
+Older CI artifacts contain only a `.tar.gz` and its checksum. Verify the archive,
+extract it, and install the extracted `ox` file. [GitHub Actions builds](https://github.com/n0rpan/codex-rust-relay/actions/workflows/ci.yml)
 
 To build on your own machine, check out this repository and run the following from its root.
 CI uses Rust 1.100.0. Build from source if the Linux artifact needs a newer glibc or
@@ -69,10 +112,51 @@ give it a separate provider name such as `anthropic-legacy` to keep both routes.
 [example with both API versions](../examples/claude-providers.toml).
 
 `ox setup --help` lists all flags. `ox provider add` accepts the same prompts and flags
-for adding more providers. Setup creates `codeox.toml` or appends a provider,
+for adding more providers. Supplying a provider name and `--base-url` uses the flags
+and defaults without prompting. Setup creates `codeox.toml` or appends a provider,
 preserving existing settings. To change an existing entry, edit the file and relaunch.
 For static models, setup prints their aliases and launch commands. `ox doctor --strict`
 also treats warnings as errors.
+
+### OpenCode Go and Alibaba Cloud
+
+For OpenCode Go, load your Console API key as `OPENCODE_API_KEY`, then add a
+model from your Go plan. This Chat Completions route works with both ox clients.
+[OpenCode Go endpoints and session routing](https://opencode.ai/docs/console/harnesses/#base-urls)
+
+```sh
+ox provider add opencode-go \
+  --base-url https://opencode.ai/inference/go/openai/v1 \
+  --wire chat_completions --env-key OPENCODE_API_KEY \
+  --no-discovery --model glm-5.3-flash
+ox doctor --live --provider opencode-go
+ox codex --model opencode-go/glm-5.3-flash
+```
+
+ox derives a stable OpenCode session identifier from the client session header
+when one is available. Clients without a session header get a fresh identifier
+per request.
+
+Alibaba Cloud Model Studio uses region- and plan-specific URLs. Start from
+the base URL in your working account or client configuration. Use Chat
+Completions with an OpenAI-compatible URL. [Alibaba Cloud endpoints by region and plan](https://www.alibabacloud.com/help/en/model-studio/base-url)
+
+For example, the Singapore **Token Plan** base URL worked with `qwen3.8-flash`
+through both ox frontends. Load the key from that Token Plan as `ALIBABA_API_KEY`.
+
+```sh
+ox provider add alibaba \
+  --base-url https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1 \
+  --wire chat_completions --env-key ALIBABA_API_KEY \
+  --no-discovery --model qwen3.8-flash
+ox doctor --live --provider alibaba
+ox claude --model alibaba/qwen3.8-flash
+```
+
+The international **Coding Plan** URL is a separate endpoint. It returned
+HTTP 405 with a coding-agent restriction in a live relay check. If you see
+this error, confirm the URL against the plan attached to your key.
+[Alibaba Cloud Token Plan troubleshooting](https://www.alibabacloud.com/help/en/model-studio/token-plan-faq)
 
 ### Check the live connection
 

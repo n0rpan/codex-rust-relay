@@ -106,14 +106,16 @@ apply their own tool permissions and shell sandbox rules. [Claude Desktop web to
 - The relay binds only to `127.0.0.1`. Local launches use a new 256-bit token.
   The persistent gateway uses the separately configured `OX_GATEWAY_KEY`.
   It attaches the configured upstream credential to that route, strips inbound
-  auth and hop-by-hop headers, and does not follow upstream redirects.
+  auth and hop-by-hop headers, and does not follow upstream redirects. Responses redirects return an error
+  with no redirect URL.
 - Claude Code starts with a private launch settings file that preserves unrelated
   settings and is removed on normal exit. Conflicting managed routing or
   credential rules can block launch.
-- Model discovery has a 20-second deadline and an 8 MiB response cap per vendor.
-  Failed discovery leaves static entries available. Only the selected provider
+- Model discovery runs up to four requests at a time, with a 20-second startup
+  budget and an 8 MiB response cap per vendor. Failed discovery leaves static entries available. Only the selected provider
   receives inference requests. If it fails, select another provider explicitly.
-- Routed request bodies are capped at 32 MiB. Translated streams are bounded to
+- The relay allows 10 seconds to read incoming HTTP headers. Routed request bodies
+  are capped at 32 MiB. Translated streams are bounded to
   1 MiB per SSE event and 32 MiB of upstream data. The inference read timeout is
   300 seconds between reads. An active stream can last longer.
 - Successful native Responses stream bytes are forwarded. Bounded native Messages

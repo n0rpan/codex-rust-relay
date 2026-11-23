@@ -267,6 +267,11 @@ fn native_sign_in_and_launch_use_stock_clients() {
             &[
                 ("FAKE_CODEX_LOGIN_STATUS", status),
                 ("OPENAI_API_KEY", "must-not-use-api-key"),
+                ("OPENAI_BASE_URL", "https://fixture-openai.invalid/v1"),
+                ("OPENAI_API_BASE", "https://fixture-openai.invalid/v1"),
+                ("ANTHROPIC_BASE_URL", "https://fixture-anthropic.invalid"),
+                ("ANTHROPIC_AUTH_TOKEN", "fixture-gateway-value"),
+                ("CLAUDE_CODE_USE_BEDROCK", "1"),
             ],
             args,
         )
@@ -293,6 +298,15 @@ fn native_sign_in_and_launch_use_stock_clients() {
         let output = run(args, "Logged in using ChatGPT");
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(read(&capture.0.join("run-args")), forwarded);
+        let env = read(&capture.0.join("run-env"));
+        if args == ["login", "claude"] {
+            assert!(!env.contains("ANTHROPIC_BASE_URL="));
+            assert!(!env.contains("ANTHROPIC_AUTH_TOKEN="));
+            assert!(!env.contains("CLAUDE_CODE_USE_BEDROCK="));
+        } else if args[0] == "codex" || args[1] == "chatgpt" {
+            assert!(!env.contains("OPENAI_BASE_URL="));
+            assert!(!env.contains("OPENAI_API_BASE="));
+        }
     }
     assert!(!capture.0.join("bundled-env").exists());
     assert!(!home.0.join("codeox.toml").exists());

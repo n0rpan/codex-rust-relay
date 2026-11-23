@@ -41,6 +41,7 @@ const MAX_ERROR_CHARS: usize = 400;
 pub struct Translation<'a> {
     pub vendor: &'a Vendor,
     pub key: &'a SecretKey,
+    pub incoming: Option<&'a reqwest::header::HeaderMap>,
     pub upstream_model: &'a str,
     pub requested_model: &'a str,
     pub secrets: Arc<Vec<String>>,
@@ -60,7 +61,7 @@ pub async fn translated(
     let (body, map) = prepared;
     drop(payload);
 
-    let mut headers = match vendor.auth_headers(translation.key) {
+    let mut headers = match vendor.inference_headers(translation.key, translation.incoming) {
         Ok(headers) => headers,
         Err(_) => return bad_gateway("could not build the upstream authentication header"),
     };

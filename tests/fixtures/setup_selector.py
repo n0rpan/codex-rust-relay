@@ -8,12 +8,11 @@ import select
 import subprocess
 import tempfile
 import time
-import tomllib
 
 binary = pathlib.Path(os.environ.get("OX_TEST_BINARY", "target/release/ox")).resolve()
 
 
-def run(args, choices, signed_in=False):
+def run(args, choices=None, signed_in=False):
     with tempfile.TemporaryDirectory(prefix="ox-selector-") as tmp:
         home = pathlib.Path(tmp)
         bindir = home / "bin"
@@ -48,7 +47,10 @@ printf '%s\\n' "$@" > "$FIXTURE_TRACE"
         def read():
             if select.select([master], [], [], .2)[0]:
                 try:
-                    capture.extend(os.read(master, 8192))
+                    chunk = os.read(master, 8192)
+                    if not chunk:
+                        return False
+                    capture.extend(chunk)
                 except OSError as error:
                     if error.errno != errno.EIO:
                         raise
@@ -56,10 +58,11 @@ printf '%s\\n' "$@" > "$FIXTURE_TRACE"
             return True
 
         try:
-            while b"Choose 1, 2, or 3:" not in capture and time.monotonic() < deadline:
-                assert read(), capture.decode()
-            assert b"Choose 1, 2, or 3:" in capture, capture.decode()
-            os.write(master, choices)
+            if choices is not None:
+                while b"Choose 1, 2, or 3:" not in capture and time.monotonic() < deadline:
+                    assert read(), capture.decode()
+                assert b"Choose 1, 2, or 3:" in capture, capture.decode()
+                os.write(master, choices)
             while time.monotonic() < deadline and read():
                 pass
             assert proc.wait(timeout=2) == 0, capture.decode()
@@ -95,9 +98,28 @@ assert "looks like a credential" in text
 assert "OX_GATEWAY_KEY is reserved for the shared gateway key" in text
 assert "Provider name (e.g. openrouter, anthropic, openai)" in text
 assert "API key variable name [OPENROUTER_API_KEY]" in text
-provider = tomllib.loads(registry)["providers"]["openrouter"]
-assert provider["base_url"] == "https://openrouter.ai/api/v1"
-assert provider["env_key"] == "OPENROUTER_API_KEY"
-assert provider["models"] == [{"id": "fixture-model"}]
+assert registry is not None
+for expected in (
+    "[providers.openrouter]",
+    'base_url = "https://openrouter.ai/api/v1"',
+    'env_key = "OPENROUTER_API_KEY"',
+    "[[providers.openrouter.models]]",
+    'id = "fixture-model"',
+):
+    assert expected in registry.splitlines(), registry
 assert argv == []
 print("bare ox -> API provider: retry on invalid choice, clear labels, expected registry")
+
+
+text, argv, registry = run([
+    "provider", "add", "openrouter",
+    "--base-url", "https://openrouter.ai/api/v1",
+    "--wire", "responses",
+    "--no-discovery", "--model", "fixture-model",
+])
+assert "Display name" not in text
+assert "API key variable name" not in text
+assert registry is not None
+assert 'env_key = "OPENROUTER_API_KEY"' in registry.splitlines()
+assert argv == []
+print("flag-driven ox provider add in a terminal: applied defaults without prompting")

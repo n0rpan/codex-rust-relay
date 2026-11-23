@@ -181,7 +181,7 @@ const SCRUBBED_ENV: &[&str] = &[
 /// cannot be routed and must fail. Model-selection variables are deliberately
 /// absent: a managed model still reaches the relay, which then reports an
 /// unserved model instead of the launcher refusing a valid alias mapping.
-const ROUTING_ENV: &[&str] = &[
+pub(crate) const ROUTING_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_AUTH_TOKEN",

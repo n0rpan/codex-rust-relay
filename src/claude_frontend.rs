@@ -136,6 +136,7 @@ impl App {
             upstream::Translation {
                 vendor: &state.vendor,
                 key: auth,
+                incoming: Some(&parts.headers),
                 upstream_model: &route.upstream_model,
                 requested_model: &requested,
                 secrets: Arc::clone(&self.secrets),

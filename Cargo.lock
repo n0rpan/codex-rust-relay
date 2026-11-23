@@ -521,6 +521,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "subtle",

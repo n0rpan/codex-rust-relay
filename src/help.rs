@@ -25,7 +25,8 @@ Commands
   ox doctor --live --provider NAME
                              Test one live API request
   ox serve [--port PORT]     Run a persistent loopback gateway
-  ox help [setup|desktop|share|t3|subscriptions]
+  ox update [--check]        Install or check for the latest stable version
+  ox help [install|setup|desktop|share|t3|subscriptions]
                              Show help for a task
   ox --version               Print the installed ox version
   ox --help                  Show this help
@@ -152,7 +153,19 @@ environment. For T3 Code, select a native provider on the signed-in execution ho
 For API vendors, desktop gateways, and sharing, use ox setup and ox serve. The
 shared gateway uses provider credentials configured for that service.";
 
-const TOPICS: &str = "Usage: ox help [setup|desktop|share|t3|subscriptions]";
+const INSTALL: &str = "\
+Install or update ox on macOS and Linux
+
+Download your platform binary and its .sha256 file from GitHub Releases.
+Use shasum -a 256 -c on macOS or sha256sum -c on Linux, then install the
+binary as ~/.local/bin/ox. Preview builds are available from GitHub Actions.
+Platform filenames and copyable steps are in docs/configuration.md.
+
+Releases: https://github.com/n0rpan/codex-rust-relay/releases
+Run ox update --check to check for a newer stable release.
+Run ox update to verify and install it over the running ox executable.";
+
+const TOPICS: &str = "Usage: ox help [install|setup|desktop|share|t3|subscriptions]";
 
 pub(crate) fn overview() {
     println!("{OVERVIEW}");
@@ -164,6 +177,7 @@ pub(crate) fn dispatch(args: &[OsString]) -> Option<Result<u8, RelayError>> {
         [command] if command == "help" => overview(),
         [command] if command == "login" => println!("{SUBSCRIPTIONS}"),
         [command, topic] if command == "help" => match topic.to_str() {
+            Some("install") => println!("{INSTALL}"),
             Some("setup") => return Some(crate::setup::print_setup_help()),
             Some("desktop") => println!(
                 "{DESKTOP}\n\nCodex manual configuration\n\

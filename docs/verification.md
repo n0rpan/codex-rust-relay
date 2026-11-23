@@ -32,7 +32,7 @@ CODEOX_TEST_CODEX_BIN=/path/to/codex-0.171.0 \
   cargo test --locked --offline --bin ox stock_codex_emits_web_run -- --ignored
 ```
 
-The setup selector check uses a POSIX pseudoterminal and Python 3.11 or later.
+The setup selector check uses a POSIX pseudoterminal and Python 3.
 It runs the release binary and checks which stock client command each choice
 would invoke, including reuse of an existing ChatGPT sign-in. The shared-home
 check needs Python 3 and OpenSSL for a throwaway HTTPS fixture.
@@ -41,7 +41,23 @@ loopback sockets. See the [Codex fixtures](../tests/fixtures/stock_codex/README.
 and [Claude Code fixtures](../tests/fixtures/stock_claude/README.md) for details.
 
 GitHub Actions runs the offline checks and packages native binaries for both
-architectures on Linux and macOS. See [install options](configuration.md#install-options).
+architectures on Linux and macOS. Each platform runs the setup selector from the
+packaged binary and tests updater downloads and atomic replacement over loopback. See [install options](configuration.md#install-options).
+For maintainers, pushing a stable tag matching the Cargo version (for example,
+`v0.1.0`) publishes the four platform binaries and their checksums after both
+stock-client tracks and all platform packaging checks pass. Ordinary CI runs
+keep their output as preview artifacts.
+
+## Live smoke checks
+
+The Linux ARM64 build returned a short, exact reply through both gateway
+frontends with OpenAI Responses, Anthropic Messages (`2026-10-21`), OpenRouter
+Responses, OpenCode Go Chat Completions and Alibaba Cloud Token Plan Chat
+Completions. See [provider setup](configuration.md#add-a-provider) for endpoint
+details. A live Brave key also returned citations through Codex’s standalone
+search endpoint and Claude Code’s dedicated WebSearch bridge. These checks
+used private credentials in a temporary local relay. CI uses loopback vendors
+and Brave fixtures.
 
 ## Client updates
 

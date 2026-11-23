@@ -38,14 +38,38 @@ pub const CONFIG_FILE: &str = "codeox.toml";
 /// Upper bound for reading the configuration file.
 pub const MAX_CONFIG_BYTES: u64 = 1 << 20;
 
-pub fn reserved_credential_env(name: &str) -> Option<&'static str> {
+pub fn credential_env_error(name: &str) -> Option<&'static str> {
     match name {
         TOKEN_ENV => Some("CODEOX_TOKEN is a reserved relay token variable"),
         GATEWAY_KEY_ENV => Some(
             "OX_GATEWAY_KEY is reserved for the shared gateway key. Use a vendor API key variable such as OPENROUTER_API_KEY",
         ),
+        _ if looks_like_credential(name)
+            || name.len() > 128
+            || !name
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_') =>
+        {
+            Some(
+                "expected an environment variable name such as OPENROUTER_API_KEY. Keep the secret value in your shell",
+            )
+        }
         _ => None,
     }
+}
+
+pub fn looks_like_credential(value: &str) -> bool {
+    ["sk-", "sk_", "oc_sk_", "xox", "ghp_", "github_pat_", "aiza"]
+        .iter()
+        .any(|prefix| {
+            value
+                .get(..prefix.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+        })
 }
 
 const MAX_PROVIDER_KEY_BYTES: usize = 64;
@@ -358,6 +382,42 @@ impl Vendor {
         Ok(headers)
     }
 
+    /// Attach an origin-scoped routing identifier for OpenCode Go. Derive it
+    /// from the client's session ID without sending the raw ID upstream.
+    pub(crate) fn inference_headers(
+        &self,
+        key: &SecretKey,
+        incoming: Option<&HeaderMap>,
+    ) -> Result<HeaderMap, RelayError> {
+        let mut headers = self.auth_headers(key)?;
+        if self.base_url.scheme() == "https"
+            && self.base_url.host_str() == Some("opencode.ai")
+            && self.base_url.port_or_known_default() == Some(443)
+            && self.base_url.path().starts_with("/inference/go/")
+        {
+            let session = incoming.and_then(opencode_session_hint);
+            let mut id = [0_u8; 16];
+            if let Some(session) = session {
+                let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key.expose().as_bytes());
+                let mut context = ring::hmac::Context::with_key(&key);
+                context.update(b"ox-opencode-session-v1\0");
+                context.update(self.key.as_bytes());
+                context.update(b"\0");
+                context.update(session.as_bytes());
+                let digest = context.sign();
+                id.copy_from_slice(&digest.as_ref()[..16]);
+            } else {
+                getrandom::fill(&mut id)
+                    .map_err(|_| "could not generate an OpenCode session ID")?;
+            }
+            headers.insert(
+                "x-opencode-session",
+                HeaderValue::from_str(&format!("ses_{}", hex::encode(id)))?,
+            );
+        }
+        Ok(headers)
+    }
+
     /// The one endpoint Codex requests are translated to for this vendor.
     pub fn endpoint(&self) -> Url {
         let suffix = match self.wire {
@@ -392,6 +452,23 @@ impl Vendor {
         url.set_query(query);
         url
     }
+}
+
+fn opencode_session_hint(headers: &HeaderMap) -> Option<&str> {
+    [
+        "x-opencode-session",
+        "session_id",
+        "x-session-id",
+        "x-claude-code-session-id",
+    ]
+    .iter()
+    .filter_map(|name| headers.get(*name)?.to_str().ok())
+    .find(|id| {
+        matches!(id.len(), 1..=128)
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    })
 }
 
 /// Default environment variable holding the Brave Search subscription token.
@@ -515,10 +592,7 @@ fn parse_search(item: &Item) -> Result<Option<SearchSettings>, RelayError> {
     }
     let mut settings = SearchSettings::default();
     if let Some(name) = opt_str(table, "env_key")? {
-        if name.trim().is_empty() || name != name.trim() || name.contains('=') {
-            return Err("search.env_key is not a valid variable name".into());
-        }
-        if let Some(reason) = reserved_credential_env(&name) {
+        if let Some(reason) = credential_env_error(&name) {
             return Err(format!("search.env_key: {reason}").into());
         }
         settings.env_key = name;
@@ -583,10 +657,7 @@ fn parse_vendor(key: &str, item: &Item) -> Result<Vendor, RelayError> {
     };
     let env_key = match opt_str(table, "env_key")? {
         Some(name) => {
-            if name.trim().is_empty() || name != name.trim() || name.contains('=') {
-                return Err(format!("providers.{key}.env_key is not a valid variable name").into());
-            }
-            if let Some(reason) = reserved_credential_env(&name) {
+            if let Some(reason) = credential_env_error(&name) {
                 return Err(format!("providers.{key}.env_key: {reason}").into());
             }
             Some(name)
@@ -972,7 +1043,7 @@ impl Provider {
         let env_key = setting("env_key")
             .filter(|name| !name.is_empty())
             .ok_or("set env_key to the name of the provider API key environment variable")?;
-        if let Some(reason) = reserved_credential_env(env_key) {
+        if let Some(reason) = credential_env_error(env_key) {
             return Err(reason.into());
         }
         let upstream_auth = bearer_from_env(env, env_key)
@@ -1361,6 +1432,45 @@ include_stream_usage = false
         let headers = beta.auth_headers(&key).unwrap();
         assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer chat-secret");
         assert!(headers.get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn opencode_session_is_stable_and_scoped_to_the_go_origin() {
+        let config = CodeoxConfig::load_from_str(
+            r#"
+[providers.go]
+base_url = "https://opencode.ai/inference/go/openai/v1"
+
+[providers.other]
+base_url = "https://other.example/inference/go/openai/v1"
+"#,
+        )
+        .unwrap();
+        let go = &config.vendors[0];
+        let key = SecretKey::new("vendor-credential-fixture".to_owned());
+        let mut incoming = HeaderMap::new();
+        incoming.insert("session_id", HeaderValue::from_static("private-thread-a"));
+        let header = "x-opencode-session";
+        let first = go.inference_headers(&key, Some(&incoming)).unwrap()[header].clone();
+        assert!(first.to_str().unwrap().starts_with("ses_"));
+        assert_eq!(first.as_bytes().len(), 36);
+        assert_ne!(first, incoming["session_id"]);
+        assert_eq!(
+            first,
+            go.inference_headers(&key, Some(&incoming)).unwrap()[header]
+        );
+        incoming.insert("session_id", HeaderValue::from_static("private-thread-b"));
+        assert_ne!(
+            first,
+            go.inference_headers(&key, Some(&incoming)).unwrap()[header]
+        );
+        assert!(!go.auth_headers(&key).unwrap().contains_key(header));
+        assert!(
+            !config.vendors[1]
+                .inference_headers(&key, Some(&incoming))
+                .unwrap()
+                .contains_key(header)
+        );
     }
 
     #[test]

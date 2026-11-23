@@ -422,6 +422,23 @@ fn gateway_and_launch_keys_are_rejected_as_provider_credentials() {
 }
 
 #[test]
+fn pasted_credential_values_are_rejected_without_echoing_them() {
+    let home = TempHome::new();
+    let secret = "sk-or-fixture-pasted-credential";
+    let base = "[providers.alpha]\nbase_url = \"https://alpha.example/v1\"\n";
+    for config in [
+        format!("{base}env_key = \"{secret}\"\n"),
+        format!("{base}\n[search]\nenv_key = \"{secret}\"\n"),
+    ] {
+        home.write("codeox.toml", &config);
+        let (code, output) = run_doctor(home.path(), &[], &[]);
+        assert_eq!(code, 1);
+        assert!(output.contains("environment variable name"), "{output}");
+        assert!(!output.contains(secret));
+    }
+}
+
+#[test]
 fn credential_shaped_provider_name_is_rejected_without_echoing_it() {
     let home = TempHome::new();
     let secret = "sk-or-fixture-lowercase";

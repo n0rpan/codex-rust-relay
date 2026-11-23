@@ -63,6 +63,9 @@ async fn login(account: Option<&str>, args: &[OsString], home: &Path) -> Result<
         }
         (Some("claude"), []) => {
             let mut command = command("claude", home)?;
+            for name in crate::clients::ROUTING_ENV {
+                command.env_remove(name);
+            }
             command.args(["auth", "login", "--claudeai"]);
             launch(command).await
         }
@@ -80,6 +83,24 @@ async fn launch_chatgpt(args: &[OsString], home: &Path) -> Result<u8, RelayError
 }
 
 async fn launch_claude(args: &[OsString], home: &Path) -> Result<u8, RelayError> {
+    if [
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_UNIX_SOCKET",
+    ]
+    .iter()
+    .chain(
+        crate::clients::ROUTING_ENV
+            .iter()
+            .filter(|name| name.starts_with("CLAUDE_CODE_USE_")),
+    )
+    .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+    {
+        eprintln!(
+            "ox: native Claude Code may use the API or gateway overrides in your shell. For subscription use, launch from a shell without those overrides."
+        );
+    }
     let mut command = command("claude", home)?;
     command.args(args);
     launch(command).await
@@ -108,6 +129,8 @@ fn codex_command(home: &Path) -> Result<Command, RelayError> {
         .env("CODEX_HOME", home)
         .env_remove("OPENAI_API_KEY")
         .env_remove("CODEX_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
+        .env_remove("OPENAI_API_BASE")
         .args(["-c", "model_provider=\"openai\""]);
     Ok(command)
 }

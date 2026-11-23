@@ -19,31 +19,19 @@ launch. CI runs the [compatibility tests](docs/verification.md#client-updates)
 against the latest official clients. [Install Codex](https://developers.openai.com/codex/cli/) ·
 [Install Claude Code](https://code.claude.com/docs/en/quickstart)
 
-Sign in to GitHub and open a successful [CI run](https://github.com/n0rpan/codex-rust-relay/actions/workflows/ci.yml)
-with **Release binaries** jobs on the branch you want to install. Published snapshots
-are retained for 30 days. The binaries target Linux with **glibc 2.39 or newer** (such as
-Ubuntu 24.04) and **macOS 11 or newer**. Download your platform’s artifact from **Artifacts**.
-Unzip it, then run these commands from the folder containing the `.tar.gz` and its checksum:
+On **macOS 11+** or **Linux with glibc 2.39+**, download the binary and checksum
+for your machine, verify them, and install to `~/.local/bin/ox`.
+[macOS and Linux install steps](docs/configuration.md#install-options)
+
+Once installed, run:
 
 ```sh
-# Run this in the folder for a single platform artifact.
-if command -v sha256sum >/dev/null 2>&1; then
-  sha256sum -c ox-*.tar.gz.sha256 && tar -xzf ox-*.tar.gz
-else
-  shasum -a 256 -c ox-*.tar.gz.sha256 && tar -xzf ox-*.tar.gz
-fi && ./ox --version
+ox --version
+ox setup
 ```
 
-Install it for your user account and make it available in this shell:
-
-```sh
-mkdir -p "$HOME/.local/bin"
-install -m 755 ox "$HOME/.local/bin/ox"
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-If a new terminal cannot find `ox`, add that directory to your shell's startup
-`PATH`. See [platform requirements and source installation](docs/configuration.md#install-options).
+Use `ox update --check` to check for a stable release and `ox update` to install it.
+For unreleased builds, follow the [preview or source install steps](docs/configuration.md#preview-builds-and-source-installation).
 
 ## 2. Add a provider
 

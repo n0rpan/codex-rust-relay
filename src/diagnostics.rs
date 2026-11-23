@@ -95,7 +95,7 @@ async fn probe(vendor: &Vendor, model: &str) -> Result<(), RelayError> {
         .post(url)
         .headers(
             vendor
-                .auth_headers(&key)
+                .inference_headers(&key, None)
                 .map_err(|_| "could not encode the configured provider credential")?,
         )
         .header(ACCEPT, "text/event-stream")
