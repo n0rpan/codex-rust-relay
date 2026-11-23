@@ -235,6 +235,12 @@ jobs:
           cargo test --locked --offline --features test-brave --test stock_claude_smoke -- \
             --ignored --nocapture --test-threads=1
 
+      - name: Run stock Codex App Server and Claude Code through a persistent gateway
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --test shared_gateway -- --ignored --nocapture
+
   release:
     if: github.event_name != 'schedule'
     name: Release binaries (${{ matrix.platform }})

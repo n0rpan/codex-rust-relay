@@ -12,6 +12,8 @@ mod claude_request;
 mod claude_response;
 mod claude_search;
 mod clients;
+mod daemon;
+mod diagnostics;
 mod provider;
 mod search;
 mod setup;
@@ -64,6 +66,7 @@ const MAX_ECHOED_MODEL_CHARS: usize = 120;
 struct App {
     mode: Mode,
     client_kind: ClientKind,
+    persistent: bool,
     client: Client,
     local_auth: HeaderValue,
     max_request_bytes: usize,
@@ -132,6 +135,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         println!(
             "ox codex [args...]  Launch Codex with the gateway\n\
              ox claude [args...] Launch Claude Code with the gateway\n\
+             ox serve           Run a persistent loopback gateway\n\
              ox provider add    Configure a provider\n\
              ox doctor          Check provider configuration\n\
              ox --version       Print the installed ox version"
@@ -143,6 +147,13 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
         .ok_or("set CODEX_HOME or HOME")?;
+    match args.first().and_then(|arg| arg.to_str()) {
+        Some("serve") => return daemon::run(&args[1..], &codex_home).await,
+        Some("doctor") if args.iter().any(|arg| arg == "--live") => {
+            return diagnostics::run(&args[1..], &codex_home).await;
+        }
+        _ => {}
+    }
     if let Some(result) = setup::dispatch(&args, &codex_home) {
         return result;
     }
@@ -163,12 +174,9 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         }
         LaunchConfig::Legacy(provider::Provider::load(&codex_home, env)?)
     };
-    let env_refs = config.env_refs();
-    let client = Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(Duration::from_secs(300))
-        .build()?;
+    let mut env_refs = config.env_refs();
+    env_refs.insert(daemon::KEY_ENV.to_owned());
+    let client = upstream_client()?;
 
     let (search, search_launch) = match (&config, &client_kind) {
         (LaunchConfig::Codeox(config), ClientKind::Codex) => {
@@ -279,6 +287,7 @@ impl App {
         Ok(Self {
             mode: Mode::Legacy { provider, bundled },
             client_kind: ClientKind::Codex,
+            persistent: false,
             client,
             local_auth: provider::bearer(token)?,
             max_request_bytes: MAX_REQUEST_BYTES,
@@ -370,6 +379,7 @@ impl App {
                 catalog,
             },
             client_kind: ClientKind::Codex,
+            persistent: false,
             client,
             local_auth: provider::bearer(token)?,
             max_request_bytes,
@@ -383,7 +393,9 @@ impl App {
             .headers()
             .get(AUTHORIZATION)
             .is_some_and(|auth| auth.as_bytes().ct_eq(self.local_auth.as_bytes()).into());
-        if matches!(self.client_kind, ClientKind::Claude) {
+        if matches!(self.client_kind, ClientKind::Claude)
+            || self.persistent && matches!(request.uri().path(), "/v1/messages" | "/v1/models")
+        {
             return self.handle_messages_client(request, bearer_matches).await;
         }
         if !bearer_matches {
@@ -392,6 +404,9 @@ impl App {
 
         match (request.method(), request.uri().path()) {
             (&Method::GET, "/v1/models") => self.models(request.into_parts().0.headers).await,
+            (&Method::GET, "/v1/catalog") if self.persistent => {
+                self.models(request.into_parts().0.headers).await
+            }
             (&Method::POST, "/v1/responses" | "/v1/responses/compact") => {
                 self.inference(request).await
             }
@@ -469,7 +484,11 @@ impl App {
             .strip_prefix("/v1")
             .unwrap_or("")
             .to_owned();
-        let query = parts.uri.query().map(str::to_owned);
+        let query = if self.persistent {
+            None
+        } else {
+            parts.uri.query().map(str::to_owned)
+        };
         match &self.mode {
             Mode::Legacy { provider, .. } => {
                 let upstream = self
@@ -551,7 +570,14 @@ impl App {
                     }
                 };
                 drop(payload);
-                let mut headers = forward_headers(parts.headers);
+                let mut headers = if self.persistent {
+                    // A shared listener can sit behind a proxy with its own
+                    // identity headers. Only the relay's credentials and
+                    // request headers belong on the provider request.
+                    HeaderMap::new()
+                } else {
+                    forward_headers(parts.headers)
+                };
                 // The body was re-encoded, so the client's framing headers no
                 // longer describe it; hyper derives them from the new body.
                 headers.remove(CONTENT_LENGTH);
@@ -583,6 +609,14 @@ impl App {
             }
         }
     }
+}
+
+fn upstream_client() -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(Duration::from_secs(300))
+        .build()
 }
 
 fn resolve_model<'a>(

@@ -69,6 +69,18 @@ preserving existing settings. To change an existing entry, edit the file and rel
 For static models, setup prints their aliases and launch commands. `ox doctor --strict`
 also treats warnings as errors.
 
+### Check the live connection
+
+```sh
+ox doctor --live --provider openrouter
+```
+
+This sends one small prompt to the first static model and checks for streamed text.
+It can incur API charges. With discovery-only providers or to test another model,
+add `--model <upstream-model-id>` using the provider's model ID. The probe uses the
+provider's endpoint and credentials. Tool calling, Brave search and a Desktop
+client session are separate checks. Plain `ox doctor` stays offline.
+
 ### Where settings and keys live
 
 Both clients read `codeox.toml` under `$CODEX_HOME`, which defaults to `~/.codex`. For
@@ -207,8 +219,8 @@ Manual mode if a model is ineligible. If an unfamiliar alias makes the client as
 larger context window than the endpoint supports, set `CLAUDE_CODE_MAX_CONTEXT_TOKENS`
 to the actual limit. [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes#auto-mode)
 
-Claude Desktop 3P users can adapt the [Desktop web-tools overlay](../examples/claude-desktop-web-tools.json)
-once they have a separate stable inference gateway. See [Desktop scope](compatibility.md#desktop-and-hosted-clients).
+Claude Desktop 3P users can also configure a stable [ox gateway](shared-gateway.md#claude-desktop-on-3p)
+and adapt the [Desktop web-tools overlay](../examples/claude-desktop-web-tools.json).
 
 ## Sessions and sign-in
 

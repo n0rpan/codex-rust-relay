@@ -122,7 +122,7 @@ async fn infer_native(
         }
     };
     if upstream::is_http_failure(&upstream) {
-        return messages_http_failure(upstream, &context.secrets).await;
+        return messages_http_failure(upstream, &context.secrets, true).await;
     }
 
     // Trust the response, not only the request flag: a vendor that does return
@@ -261,7 +261,7 @@ async fn responses_upstream(
         }
     };
     if upstream::is_http_failure(&upstream) {
-        return messages_http_failure(upstream, &context.secrets).await;
+        return messages_http_failure(upstream, &context.secrets, false).await;
     }
     if !is_event_stream(upstream.headers()) {
         let detail = read_upstream_detail(upstream, &context.secrets).await;
@@ -627,10 +627,12 @@ fn relay_body_stream(
     })
 }
 
-/// A native or Responses upstream failure, reduced to a Messages error.
+/// Preserve bounded native Messages errors that clients use to recognize
+/// conditions such as a full context window. Summarize other upstream errors.
 async fn messages_http_failure(
     response: reqwest::Response,
     secrets: &[String],
+    native: bool,
 ) -> Response<crate::RelayBody> {
     let status = response.status();
     let retry_after = response
@@ -639,10 +641,38 @@ async fn messages_http_failure(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u32>().ok());
     let body = read_upstream_error(response).await;
+    if native
+        && let Some(body) = &body
+        && body["type"] == "error"
+        && body["error"]["type"].is_string()
+        && body["error"]["message"].is_string()
+        && !contains_secret(body, secrets)
+    {
+        let mut downstream = crate::json_response(status, body.clone());
+        copy_retry_after(&mut downstream, status, retry_after, secrets);
+        return downstream;
+    }
     let message = upstream_error(status.as_u16(), body.as_ref(), secrets);
     let mut downstream = messages_error(status, kind_for_status(status), &message);
     copy_retry_after(&mut downstream, status, retry_after, secrets);
     downstream
+}
+
+fn contains_secret(value: &Value, secrets: &[String]) -> bool {
+    let matches = |text: &str| {
+        secrets
+            .iter()
+            .any(|key| !key.is_empty() && text.contains(key))
+    };
+    match value {
+        Value::String(text) => matches(text),
+        Value::Array(items) => items.iter().any(|item| contains_secret(item, secrets)),
+        Value::Object(fields) => fields
+            .iter()
+            .any(|(name, item)| matches(name) || contains_secret(item, secrets)),
+        Value::Number(number) => matches(&number.to_string()),
+        _ => false,
+    }
 }
 
 /// A translated-path failure already carries a safe Responses error body.
@@ -1393,6 +1423,30 @@ mod tests {
         assert_eq!(hit.body["model"], "real-model");
         assert_eq!(hit.body["stream"], Value::Null);
         assert!(!hit.headers.contains_key(ANTHROPIC_BETA));
+    }
+
+    #[tokio::test]
+    async fn native_wire_preserves_the_context_limit_error_envelope() {
+        const ERROR: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200001 tokens > 200000 maximum"},"request_id":"req_fixture"}"#;
+        let mock = MockUpstream::spawn(400, "application/json", ERROR);
+        let vendor = vendor_at(&mock.base, Wire::AnthropicMessages);
+        let key = SecretKey::new("sk-vendor-key".to_owned());
+        let response = infer(
+            &Client::new(),
+            Translation {
+                vendor: &vendor,
+                key: &key,
+                upstream_model: "real-model",
+                requested_model: "vendor/upstream-model",
+                secrets: Arc::new(vec!["sk-vendor-key".to_owned()]),
+            },
+            json!({"model": "vendor/upstream-model", "max_tokens": 10, "messages": []}),
+            None,
+        )
+        .await;
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, serde_json::from_str::<Value>(ERROR).unwrap());
     }
 
     #[tokio::test]

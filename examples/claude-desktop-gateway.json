@@ -1,0 +1,12 @@
+{
+  "inferenceProvider": "gateway",
+  "inferenceGatewayBaseUrl": "https://ox.example-tailnet.ts.net",
+  "inferenceGatewayAuthScheme": "bearer",
+  "inferenceGatewayApiKey": "REPLACE_WITH_THE_OX_GATEWAY_KEY",
+  "inferenceModels": [
+    {
+      "name": "anthropic/claude-sonnet-5",
+      "behavesAs": "claude-sonnet-5"
+    }
+  ]
+}

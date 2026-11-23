@@ -97,6 +97,7 @@ Use the same alias, **`provider/model-id`**, in either client. Add more provider
 | Connect Anthropic, OpenAI, a Chat Completions vendor, or a local server | [Provider setup](docs/configuration.md#add-a-provider) |
 | Add Brave citations or configure Claude Code Auto mode | [Search and Claude settings](docs/configuration.md#web-search-with-brave) |
 | Resume a session, switch models, or keep my usual ChatGPT sign-in | [Sessions and sign-in](docs/configuration.md#sessions-and-sign-in) |
+| Share one ox gateway on a tailnet or connect desktop clients and T3 Code | [Home-server setup](docs/shared-gateway.md) |
 | See supported clients, API versions, and feature boundaries | [Compatibility](docs/compatibility.md) |
 | Reproduce checks or measure the relay | [Verification and performance](docs/verification.md) |
 
@@ -109,7 +110,7 @@ Use the same alias, **`provider/model-id`**, in either client. Add more provider
 | Client missing, or Codex’s bundled model catalog fails to load | Run `codex --version` or `claude --version` from the same terminal. For Codex also try `codex debug models --bundled`. If the problem began after an update, check the latest-client CI job. |
 | `provider … is unavailable` | Run `ox doctor` and load the exact variable it names in the shell that launches ox. |
 | `unknown model`, or an empty picker | Pass the full alias from setup. Check the vendor model ID, or pin it with a [static model entry](docs/configuration.md#model-names-and-discovery). |
-| Authentication error after a clean `doctor` | The provider checks the key at runtime. Verify that it belongs to the configured endpoint and has model access. |
+| Authentication error after a clean `doctor` | Run `ox doctor --live --provider <name>` to check the key, model and streaming with one small API request. |
 | Provider returns `404` or rejects the request format | Check that the [base URL and wire format](docs/configuration.md#add-a-provider) match the endpoint. Leave the request path, such as `/chat/completions`, off the base URL. |
 | Provider returns `429` | Check that provider’s quota and rate limits, or choose another configured model. |
 | A direct OpenAI key returns `codex_byok_restricted_by_api_credit_promo` | That account’s API-credit plan rejected the Codex request in live testing. Use an eligible provider credential, or launch plain `codex` for your usual ChatGPT session. |

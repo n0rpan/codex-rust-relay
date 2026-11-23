@@ -1,0 +1,14 @@
+# Merge these settings into the execution host's user-level Codex config.toml.
+# Set OX_GATEWAY_KEY in the environment that starts the client.
+model_provider = "ox"
+model = "openrouter/openai/gpt-5.4-mini"
+web_search = "disabled"
+
+[model_providers.ox]
+name = "ox home gateway"
+base_url = "https://ox.example-tailnet.ts.net/v1"
+model_catalog_url = "https://ox.example-tailnet.ts.net/v1/catalog"
+wire_api = "responses"
+env_key = "OX_GATEWAY_KEY"
+requires_openai_auth = false
+supports_websockets = false

@@ -19,6 +19,9 @@ OX_TEST_CLAUDE_BIN=/path/to/claude-2.1.330 \
   cargo test --locked --offline --features test-brave --test stock_claude_smoke -- \
     --ignored --test-threads=1
 
+CODEOX_TEST_CODEX_BIN=/path/to/codex-0.171.0 OX_TEST_CLAUDE_BIN=/path/to/claude-2.1.330 \
+  cargo test --locked --offline --test shared_gateway -- --ignored --nocapture
+
 CODEOX_TEST_CODEX_BIN=/path/to/codex-0.171.0 \
   cargo test --locked --offline --test shared_codex_home -- \
     --ignored --test-threads=1

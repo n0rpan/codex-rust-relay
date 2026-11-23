@@ -2164,6 +2164,10 @@ pub(crate) fn run_doctor(
 fn write_doctor_usage(output: &mut dyn Write) -> Result<(), RelayError> {
     writeln!(output, "Usage:")?;
     writeln!(output, "  ox doctor [--strict]")?;
+    writeln!(
+        output,
+        "  ox doctor --live --provider NAME [--model UPSTREAM_MODEL_ID]"
+    )?;
     writeln!(output)?;
     writeln!(
         output,
@@ -2180,6 +2184,10 @@ fn write_doctor_usage(output: &mut dyn Write) -> Result<(), RelayError> {
     writeln!(
         output,
         "Credential values and auth.json are never read into the report."
+    )?;
+    writeln!(
+        output,
+        "With --live, sends one streamed inference probe to the selected vendor."
     )?;
     writeln!(output)?;
     writeln!(

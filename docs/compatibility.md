@@ -88,10 +88,11 @@ search may have separate costs. [Enable search](configuration.md#web-search-with
 
 ## Desktop and hosted clients
 
-The supported clients are the local Codex and Claude Code CLIs. The relay binds
-an ephemeral loopback address and exits with its client. Claude Desktop 3P requires
-a stable inference URL and credential, so it needs a separate gateway. Hosted
-clients cannot reach the launch-scoped loopback relay. [Claude Desktop gateway contract](https://claude.com/docs/third-party/claude-desktop/gateway)
+The local launchers bind an ephemeral loopback address and exit with their clients.
+`ox serve` supplies a stable endpoint and gateway key for external clients. The
+shared endpoint is tested against stock Codex App Server and Claude Code CLI.
+Desktop app UI flows, hosted sessions, Desktop compaction and cross-device tailnet
+access are outside the verified matrix. [Home-server setup](shared-gateway.md)
 
 The [Desktop web-tools overlay](../examples/claude-desktop-web-tools.json) is a
 configuration example for an existing Desktop 3P deployment. Set your allowed fetch hosts
@@ -102,7 +103,8 @@ apply their own tool permissions and shell sandbox rules. [Claude Desktop web to
 
 ## Runtime limits and credentials
 
-- The relay binds only to `127.0.0.1` and uses a new 256-bit token per launch.
+- The relay binds only to `127.0.0.1`. Local launches use a new 256-bit token.
+  The persistent gateway uses the separately configured `OX_GATEWAY_KEY`.
   It attaches the configured upstream credential to that route, strips inbound
   auth and hop-by-hop headers, and does not follow upstream redirects.
 - Claude Code starts with a private launch settings file that preserves unrelated
@@ -114,6 +116,7 @@ apply their own tool permissions and shell sandbox rules. [Claude Desktop web to
 - Routed request bodies are capped at 32 MiB. Translated streams are bounded to
   1 MiB per SSE event and 32 MiB of upstream data. The inference read timeout is
   300 seconds between reads. An active stream can last longer.
-- Successful native Responses stream bytes are forwarded. HTTP error details
-  are reduced and redacted. Numeric `Retry-After` is preserved on `429` where supported.
+- Successful native Responses stream bytes are forwarded. Bounded native Messages
+  error envelopes pass through when they contain no configured credentials.
+  Other HTTP error details are reduced and redacted. Numeric `Retry-After` is preserved on `429` where supported.
   Closing the client stream cancels the upstream request.
