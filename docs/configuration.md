@@ -30,7 +30,7 @@ Cargo installs into `${CARGO_HOME:-$HOME/.cargo}/bin` by default. Add the instal
 
 ## Add a provider
 
-Start with `ox setup` in a terminal. Choose `openrouter`, `anthropic`, or `openai`
+Start with `ox setup` in a terminal and choose **API key provider**. Enter `openrouter`, `anthropic`, or `openai`
 for connection defaults. For another provider, use the URL and API format from its
 documentation. Setup asks for the **name** of your API key variable. Load the value
 in the shell that will run ox, then use `ox doctor` to check the configuration.
@@ -247,11 +247,12 @@ and adapt the [Desktop web-tools overlay](../examples/claude-desktop-web-tools.j
 
 ## Sessions and sign-in
 
-Use `ox help subscriptions` to see the native sign-in commands.
+Choose a subscription in `ox setup`, or use `ox help subscriptions` to see the native sign-in commands.
 
 - **ChatGPT plan in Codex.** Run `ox login chatgpt` if you need to sign in.
   Codex manages its normal credentials. `ox login chatgpt status` checks whether
-  a ChatGPT sign-in is present. Use `ox codex --chatgpt` for that account or
+  a ChatGPT sign-in is present. Native Codex sign-in works without registering
+  ox as a third-party integration. Use `ox codex --chatgpt` for that account or
   `ox codex` for API-backed sessions. In the project, use `ox codex resume` to pick
   an API-backed thread. The picker contains threads from both launchers, so select one
   you started through ox. Use a fresh thread and a reviewed summary to move between

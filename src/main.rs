@@ -143,6 +143,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         return result;
     }
     match args.first().and_then(|arg| arg.to_str()) {
+        Some("setup") => return run_setup(&args[1..], &codex_home).await,
         Some("serve") => return daemon::run(&args[1..], &codex_home).await,
         Some("doctor") if args.iter().any(|arg| arg == "--live") => {
             return diagnostics::run(&args[1..], &codex_home).await;
@@ -167,7 +168,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
     {
         LaunchConfig::Legacy(provider)
     } else if args.is_empty() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        return setup::run_setup(&[], &codex_home);
+        return run_setup(&[], &codex_home).await;
     } else if bare {
         help::overview();
         return Ok(0);
@@ -269,6 +270,17 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         status = child.wait() => Ok(status?.code().unwrap_or(1) as u8),
         result = serve(listener, Arc::new(app)) => Err(result.unwrap_err().into()),
     }
+}
+
+async fn run_setup(args: &[OsString], codex_home: &Path) -> Result<u8, RelayError> {
+    if args.is_empty()
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && let Some(account) = setup::choose_subscription()?
+    {
+        return native::setup_subscription(account, codex_home).await;
+    }
+    setup::run_setup(args, codex_home)
 }
 
 fn client_launch_error(client: &str, error: std::io::Error) -> RelayError {

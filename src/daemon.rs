@@ -12,7 +12,7 @@ use crate::provider::{CodeoxConfig, RelayError, process_env};
 use crate::{App, MAX_REQUEST_BYTES, build_search, serve, upstream_client};
 
 const DEFAULT_PORT: u16 = 8787;
-pub(crate) const KEY_ENV: &str = "OX_GATEWAY_KEY";
+pub(crate) use crate::provider::GATEWAY_KEY_ENV as KEY_ENV;
 
 pub(crate) async fn run(args: &[OsString], home: &Path) -> Result<u8, RelayError> {
     let port = match args {
@@ -41,9 +41,6 @@ pub(crate) async fn run(args: &[OsString], home: &Path) -> Result<u8, RelayError
         return Err("no ox provider configured. Run `ox setup` before starting `ox serve`".into());
     }
     let config = CodeoxConfig::load(&path)?;
-    if config.env_refs().contains(KEY_ENV) {
-        return Err("OX_GATEWAY_KEY is reserved for inbound gateway authentication".into());
-    }
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     let search = config
         .search

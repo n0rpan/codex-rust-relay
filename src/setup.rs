@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use toml_edit::{Document, Item, TableLike};
 
 use crate::provider::{
-    CodeoxConfig, MAX_CONFIG_BYTES, PROVIDER_ID, RelayError, TOKEN_ENV, alias_for,
+    CodeoxConfig, MAX_CONFIG_BYTES, PROVIDER_ID, RelayError, alias_for, reserved_credential_env,
 };
 
 /// Narrow integration seam for `main.rs`.
@@ -41,7 +41,6 @@ use crate::provider::{
 pub fn dispatch(args: &[OsString], codex_home: &Path) -> Option<Result<u8, RelayError>> {
     let command = args.first()?.to_str()?;
     match command {
-        "setup" => Some(run_setup(&args[1..], codex_home)),
         "provider" => Some(provider_command(&args[1..], codex_home)),
         "doctor" => Some(doctor_command(&args[1..], codex_home)),
         _ => None,
@@ -76,6 +75,34 @@ pub(crate) fn run_setup(args: &[OsString], codex_home: &Path) -> Result<u8, Rela
     provider_add_command(args, codex_home, true)
 }
 
+pub(crate) fn choose_subscription() -> Result<Option<&'static str>, RelayError> {
+    let mut input = std::io::stdin().lock();
+    let mut output = std::io::stdout().lock();
+    writeln!(
+        output,
+        "\
+What would you like to use?
+  1. ChatGPT plan with Codex (Codex handles sign-in)
+  2. Claude subscription with Claude Code (Claude Code handles sign-in)
+  3. API key provider for the ox gateway
+
+Choose 3 to set up an ox host for desktop apps, Tailscale, or T3 Code.
+To connect to an existing gateway, see ox help desktop or ox help t3.
+
+Press Ctrl+C to exit."
+    )?;
+    Prompt {
+        input: &mut input,
+        output: &mut output,
+    }
+    .ask_required_with("Choose 1, 2, or 3", None, |choice| match choice {
+        "1" => Ok(Some("chatgpt")),
+        "2" => Ok(Some("claude")),
+        "3" => Ok(None),
+        _ => Err("enter 1, 2, or 3".to_owned()),
+    })
+}
+
 fn provider_add_command(
     args: &[OsString],
     codex_home: &Path,
@@ -90,22 +117,14 @@ fn provider_add_command(
             write_add_usage(&mut output)?;
             return Ok(0);
         }
-        writeln!(output, "Set up a provider for Codex or Claude Code.")?;
+        writeln!(output, "\nSet up an API provider for Codex or Claude Code.")?;
         writeln!(
             output,
-            "Try openrouter, anthropic, or openai, or enter your own provider name."
+            "The provider name becomes the first part of your model aliases, such as openrouter/model-id."
         )?;
         writeln!(
             output,
-            "Keep your API key in an environment variable. Enter only its name here.\n"
-        )?;
-        writeln!(
-            output,
-            "For desktop apps or a shared gateway, see ox help desktop or ox help share.\n"
-        )?;
-        writeln!(
-            output,
-            "For a personal subscription, see ox help subscriptions.\n"
+            "Keep the actual API key in your shell. Setup will ask for its variable name later.\n"
         )?;
     }
     run_provider_add(
@@ -280,7 +299,7 @@ fn parse_add_args(args: &[OsString]) -> Result<AddArgs, String> {
             "--provider-key" | "--provider_key" | "--id" => {
                 let key = value(flag)?;
                 if parsed.key.is_some() {
-                    return Err("provider key was given more than once".to_owned());
+                    return Err("provider name was given more than once".to_owned());
                 }
                 parsed.key = Some(key);
             }
@@ -382,6 +401,12 @@ fn parse_bool_flag(raw: &str) -> Result<bool, String> {
 // ---------------------------------------------------------------------------
 
 fn validate_provider_key(key: &str) -> Result<String, String> {
+    if looks_like_secret(key) {
+        return Err(
+            "that looks like a credential. Enter a provider name such as openrouter or anthropic"
+                .to_owned(),
+        );
+    }
     if key.is_empty()
         || key.len() > 64
         || key.starts_with(['-', '_'])
@@ -390,7 +415,7 @@ fn validate_provider_key(key: &str) -> Result<String, String> {
             .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == b'_' || ch == b'-')
     {
         return Err(
-            "provider keys use lowercase ASCII letters, digits, `_` or `-`, starting with a letter or digit"
+            "provider names use lowercase ASCII letters, digits, `_` or `-`, starting with a letter or digit"
                 .to_owned(),
         );
     }
@@ -420,11 +445,6 @@ fn validate_env_key_name(name: &str) -> Result<String, String> {
                 .to_owned(),
         );
     }
-    let looks_like_secret = name.starts_with("sk-")
-        || name.starts_with("sk_")
-        || name.starts_with("xox")
-        || name.starts_with("ghp_")
-        || name.starts_with("AIza");
     let valid_name = name
         .chars()
         .next()
@@ -432,18 +452,26 @@ fn validate_env_key_name(name: &str) -> Result<String, String> {
         && name
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
-    if looks_like_secret || !valid_name {
+    if looks_like_secret(name) || !valid_name {
         return Err(
             "that does not look like an environment variable name; pass a name such as MY_PROVIDER_API_KEY, never the key itself"
                 .to_owned(),
         );
     }
-    if name == TOKEN_ENV {
-        return Err(format!(
-            "{TOKEN_ENV} is reserved for the relay's launch token; choose another variable name"
-        ));
+    if let Some(reason) = reserved_credential_env(name) {
+        return Err(reason.to_owned());
     }
     Ok(name.to_owned())
+}
+
+fn looks_like_secret(value: &str) -> bool {
+    ["sk-", "sk_", "xox", "ghp_", "github_pat_", "aiza"]
+        .iter()
+        .any(|prefix| {
+            value
+                .get(..prefix.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+        })
 }
 
 fn validate_anthropic_version(value: &str) -> Result<String, String> {
@@ -594,7 +622,7 @@ impl Prompt<'_> {
     fn ask_wire(&mut self, default: WireKind) -> Result<WireKind, RelayError> {
         loop {
             let line = self.ask_default(
-                "Wire protocol (responses, chat_completions, anthropic_messages)",
+                "API format (responses, chat_completions, anthropic_messages)",
                 default.as_str(),
             )?;
             match WireKind::parse(&line) {
@@ -659,13 +687,15 @@ pub(crate) fn run_provider_add(
             Ok(key) => key,
             Err(message) => return usage_error(prompt.output, &message),
         },
-        None if interactive => {
-            prompt.ask_required_with("Provider key", None, validate_provider_key)?
-        }
+        None if interactive => prompt.ask_required_with(
+            "Provider name (e.g. openrouter, anthropic, openai)",
+            None,
+            validate_provider_key,
+        )?,
         None => {
             return usage_error(
                 prompt.output,
-                "provider key is required (for example: ox provider add openrouter --base-url https://openrouter.ai/api/v1 --wire responses)",
+                "provider name is required (for example: ox provider add openrouter --base-url https://openrouter.ai/api/v1 --wire responses)",
             );
         }
     };
@@ -678,7 +708,7 @@ pub(crate) fn run_provider_add(
             Some(name)
         }
         None if interactive => {
-            prompt.ask_optional(&format!("Display name (blank uses {key:?})"), None)?
+            prompt.ask_optional(&format!("Display name (optional, Enter for {key:?})"), None)?
         }
         None => None,
     };
@@ -724,11 +754,12 @@ pub(crate) fn run_provider_add(
         }
     } else if interactive {
         let default = default_env_key(&key);
+        writeln!(
+            prompt.output,
+            "\nEnter an environment variable name. Keep the secret value in your shell. Press Enter for {default}."
+        )?;
         loop {
-            let value = prompt.ask_default(
-                "Environment variable holding the API key (never the key itself)",
-                &default,
-            )?;
+            let value = prompt.ask_default("API key variable name", &default)?;
             match validate_env_key_name(&value) {
                 Ok(value) => break Some(value),
                 Err(message) => writeln!(prompt.output, "  error: {message}")?,
@@ -775,10 +806,8 @@ pub(crate) fn run_provider_add(
     if interactive && discovery && models.is_empty() {
         // Offer static entries, which also act as capability overrides.
         loop {
-            let Some(id) = prompt.ask_optional(
-                "Static model id (blank to rely on discovery; also useful as an override)",
-                None,
-            )?
+            let Some(id) =
+                prompt.ask_optional("Optional model ID (Enter to rely on discovery)", None)?
             else {
                 break;
             };
@@ -908,7 +937,7 @@ pub(crate) fn run_provider_add(
             } else {
                 writeln!(
                     prompt.output,
-                    "  warning: ${name} is not set in this environment; export it before launching"
+                    "  Load the vendor API key into ${name} in this shell before running ox doctor."
                 )?;
             }
         }
@@ -970,7 +999,7 @@ fn usage_error(output: &mut dyn Write, message: &str) -> Result<u8, RelayError> 
 
 fn write_provider_usage(output: &mut dyn Write) -> Result<(), RelayError> {
     writeln!(output, "Usage:")?;
-    writeln!(output, "  ox provider add [KEY] [options]")?;
+    writeln!(output, "  ox provider add [PROVIDER] [options]")?;
     writeln!(output)?;
     writeln!(output, "Run `ox provider add --help` for options.")?;
     Ok(())
@@ -983,8 +1012,13 @@ pub(crate) fn print_setup_help() -> Result<u8, RelayError> {
 
 fn write_add_usage(output: &mut dyn Write) -> Result<(), RelayError> {
     writeln!(output, "Usage:")?;
-    writeln!(output, "  ox setup [KEY] [options]")?;
-    writeln!(output, "  ox provider add [KEY] [options]")?;
+    writeln!(output, "  ox setup [PROVIDER] [options]")?;
+    writeln!(output, "  ox provider add [PROVIDER] [options]")?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Run ox setup with no arguments to choose a subscription or API provider."
+    )?;
     writeln!(output)?;
     writeln!(
         output,
@@ -1002,11 +1036,11 @@ fn write_add_usage(output: &mut dyn Write) -> Result<(), RelayError> {
     writeln!(output, "Options:")?;
     writeln!(
         output,
-        "  --provider-key KEY           Provider key (alternative to the positional KEY)"
+        "  --id PROVIDER                Alternative to the positional provider name"
     )?;
     writeln!(
         output,
-        "  --name NAME                  Display name (default: KEY)"
+        "  --name NAME                  Display name (defaults to the provider name)"
     )?;
     writeln!(
         output,
@@ -1022,7 +1056,7 @@ fn write_add_usage(output: &mut dyn Write) -> Result<(), RelayError> {
     )?;
     writeln!(
         output,
-        "                               (default: derived from KEY, e.g. KEY_API_KEY)"
+        "                               (e.g. OPENROUTER_API_KEY for openrouter)"
     )?;
     writeln!(
         output,
@@ -1669,7 +1703,10 @@ fn doctor_provider(
 
     if env_ok {
         match &env_key {
-            Some(name) => doctor_credential(report, &scope, name, env),
+            Some(name) => {
+                doctor_credential(report, &scope, name, env);
+                valid &= reserved_credential_env(name).is_none();
+            }
             None => report.warning(
                 Some(scope.clone()),
                 "no env_key is configured; this provider has no credential reference and requests will fail",
@@ -1929,6 +1966,10 @@ fn doctor_credential(
     name: &str,
     env: &crate::provider::Env<'_>,
 ) {
+    if let Some(reason) = reserved_credential_env(name) {
+        report.error(Some(scope.to_owned()), reason);
+        return;
+    }
     // The value is inspected only for presence/emptiness; it is never stored
     // or formatted into a diagnostic.
     match credential_state(env, name) {

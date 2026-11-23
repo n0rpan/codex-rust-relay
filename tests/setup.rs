@@ -393,21 +393,42 @@ fn credential_values_are_rejected_and_never_echoed() {
 }
 
 #[test]
-fn relay_token_variable_is_rejected() {
+fn gateway_and_launch_keys_are_rejected_as_provider_credentials() {
     let home = TempHome::new();
-    let (code, output) = add_ok(
-        home.path(),
-        &[
-            "alpha",
-            "--base-url",
-            "https://alpha.example/v1",
-            "--env-key",
-            "CODEOX_TOKEN",
-        ],
-        &[],
+    for key in ["CODEOX_TOKEN", "OX_GATEWAY_KEY"] {
+        let (code, output) = add_ok(
+            home.path(),
+            &[
+                "alpha",
+                "--base-url",
+                "https://alpha.example/v1",
+                "--env-key",
+                key,
+            ],
+            &[],
+        );
+        assert_eq!(code, 2);
+        assert!(output.contains("reserved"), "{output}");
+        assert!(!home.exists("codeox.toml"));
+    }
+    home.write(
+        "codeox.toml",
+        "[providers.alpha]\nbase_url = \"https://alpha.example/v1\"\nenv_key = \"OX_GATEWAY_KEY\"\n",
     );
+    let (code, output) = run_doctor(home.path(), &[], &[("OX_GATEWAY_KEY", "fixture-secret")]);
+    assert_eq!(code, 1);
+    assert!(output.contains("OX_GATEWAY_KEY is reserved for the shared gateway key"));
+    assert!(!output.contains("fixture-secret"));
+}
+
+#[test]
+fn credential_shaped_provider_name_is_rejected_without_echoing_it() {
+    let home = TempHome::new();
+    let secret = "sk-or-fixture-lowercase";
+    let (code, output) = add_ok(home.path(), &[secret], &[]);
     assert_eq!(code, 2);
-    assert!(output.contains("reserved"), "{output}");
+    assert!(output.contains("looks like a credential"));
+    assert!(!output.contains(secret));
     assert!(!home.exists("codeox.toml"));
 }
 
@@ -577,13 +598,16 @@ cli-model
 ";
     let (code, output) = run_add(home.path(), &[], input, true, &[]).unwrap();
     assert_eq!(code, 0, "{output}");
-    assert!(output.contains("Provider key:"), "{output}");
     assert!(
-        output.contains("Environment variable holding the API key"),
+        output.contains("Provider name (e.g. openrouter, anthropic, openai):"),
         "{output}"
     );
     assert!(
-        output.contains("never the key itself"),
+        output.contains("API key variable name [CLI_API_KEY]"),
+        "{output}"
+    );
+    assert!(
+        output.contains("Enter an environment variable name"),
         "the prompt makes the reference-only rule explicit: {output}"
     );
     assert!(!output.to_ascii_lowercase().contains("api key value:"));

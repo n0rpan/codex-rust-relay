@@ -23,6 +23,26 @@ pub(crate) async fn dispatch(args: &[OsString], home: &Path) -> Option<Result<u8
     }
 }
 
+pub(crate) async fn setup_subscription(account: &str, home: &Path) -> Result<u8, RelayError> {
+    let has_chatgpt_login = account == "chatgpt" && chatgpt_signed_in(home).await?;
+    if has_chatgpt_login {
+        println!("Codex is already signed in with ChatGPT.");
+    } else {
+        let code = login(Some(account), &[], home).await?;
+        if code != 0 {
+            return Ok(code);
+        }
+    }
+    let next = if account == "chatgpt" {
+        "ox codex --chatgpt"
+    } else {
+        "ox claude --native"
+    };
+    println!("To start a session, run {next} from your project.");
+    println!("Bare ox opens setup until you configure an API provider.");
+    Ok(0)
+}
+
 async fn login(account: Option<&str>, args: &[OsString], home: &Path) -> Result<u8, RelayError> {
     match (account, args) {
         (Some("chatgpt"), [status]) if status == "status" => {

@@ -31,10 +31,22 @@ pub type RelayError = Box<dyn Error + Send + Sync>;
 pub const PROVIDER_ID: &str = "codeox";
 /// Environment variable carrying the loopback token into the Codex child.
 pub const TOKEN_ENV: &str = "CODEOX_TOKEN";
+/// Environment variable carrying the key accepted by the persistent listener.
+pub const GATEWAY_KEY_ENV: &str = "OX_GATEWAY_KEY";
 /// Optional multi-vendor configuration file inside `$CODEX_HOME`.
 pub const CONFIG_FILE: &str = "codeox.toml";
 /// Upper bound for reading the configuration file.
 pub const MAX_CONFIG_BYTES: u64 = 1 << 20;
+
+pub fn reserved_credential_env(name: &str) -> Option<&'static str> {
+    match name {
+        TOKEN_ENV => Some("CODEOX_TOKEN is a reserved relay token variable"),
+        GATEWAY_KEY_ENV => Some(
+            "OX_GATEWAY_KEY is reserved for the shared gateway key. Use a vendor API key variable such as OPENROUTER_API_KEY",
+        ),
+        _ => None,
+    }
+}
 
 const MAX_PROVIDER_KEY_BYTES: usize = 64;
 const MAX_MODEL_ID_BYTES: usize = 200;
@@ -506,11 +518,8 @@ fn parse_search(item: &Item) -> Result<Option<SearchSettings>, RelayError> {
         if name.trim().is_empty() || name != name.trim() || name.contains('=') {
             return Err("search.env_key is not a valid variable name".into());
         }
-        if name == TOKEN_ENV {
-            return Err(format!(
-                "search.env_key must not use the reserved relay token variable {TOKEN_ENV}"
-            )
-            .into());
+        if let Some(reason) = reserved_credential_env(&name) {
+            return Err(format!("search.env_key: {reason}").into());
         }
         settings.env_key = name;
     }
@@ -577,11 +586,8 @@ fn parse_vendor(key: &str, item: &Item) -> Result<Vendor, RelayError> {
             if name.trim().is_empty() || name != name.trim() || name.contains('=') {
                 return Err(format!("providers.{key}.env_key is not a valid variable name").into());
             }
-            if name == TOKEN_ENV {
-                return Err(format!(
-                    "providers.{key}.env_key must not use the reserved relay token variable {TOKEN_ENV}"
-                )
-                .into());
+            if let Some(reason) = reserved_credential_env(&name) {
+                return Err(format!("providers.{key}.env_key: {reason}").into());
             }
             Some(name)
         }
@@ -964,8 +970,11 @@ impl Provider {
             None => Url::parse(&format!("{inference_url}/models"))?,
         };
         let env_key = setting("env_key")
-            .filter(|name| !name.is_empty() && *name != TOKEN_ENV)
+            .filter(|name| !name.is_empty())
             .ok_or("set env_key to the name of the provider API key environment variable")?;
+        if let Some(reason) = reserved_credential_env(env_key) {
+            return Err(reason.into());
+        }
         let upstream_auth = bearer_from_env(env, env_key)
             .ok_or_else(|| format!("set a valid API key in {env_key}"))?;
         Ok(Some(Self {

@@ -81,6 +81,10 @@ jobs:
           test -x target/release/ox
           file target/release/ox
 
+      - name: Exercise first-run setup in a terminal
+        timeout-minutes: 2
+        run: python3 tests/fixtures/setup_selector.py
+
       - name: Install stock Codex from the official release
         timeout-minutes: 10
         run: |

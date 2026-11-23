@@ -4,7 +4,7 @@ Use Codex or Claude Code with your own model API keys. One provider setup works 
 CLIs. Run `ox codex` or `ox claude` to start a local relay that exits with the client. Run
 `codex` or `claude` directly for your usual sign-in.
 
-**Already installed?** Run `ox setup` to add your first provider, or `ox --help` to
+**Already installed?** Run `ox setup` to choose a subscription or add an API provider, or `ox --help` to
 see the commands. Typing just `ox` in a terminal opens setup on first use.
 
 Use `ox help desktop` for Codex and Claude Desktop, `ox help share` to connect
@@ -47,7 +47,7 @@ If a new terminal cannot find `ox`, add that directory to your shell's startup
 
 ## 2. Add a provider
 
-Run `ox setup` and follow the prompts. Enter `openrouter`, `anthropic`, or `openai`
+Run `ox setup`, choose **API key provider**, and follow the prompts. Enter `openrouter`, `anthropic`, or `openai`
 to get connection defaults. When asked for an environment variable, enter its name,
 such as `OPENROUTER_API_KEY`. Load the API key into your shell, then run `ox doctor`.
 

@@ -10,6 +10,8 @@ dummy credentials and loopback vendor and Brave servers. They do not need API ke
 ```sh
 cargo fetch --locked
 cargo test --locked --offline
+cargo build --release --locked --offline
+python3 tests/fixtures/setup_selector.py
 
 CODEOX_TEST_CODEX_BIN=/path/to/codex-0.171.0 \
   cargo test --locked --offline --features test-brave --test stock_codex_smoke -- \
@@ -30,7 +32,10 @@ CODEOX_TEST_CODEX_BIN=/path/to/codex-0.171.0 \
   cargo test --locked --offline --bin ox stock_codex_emits_web_run -- --ignored
 ```
 
-The shared-home check needs Python 3 and OpenSSL for a throwaway HTTPS fixture.
+The setup selector check uses a POSIX pseudoterminal and Python 3.11 or later.
+It runs the release binary and checks which stock client command each choice
+would invoke, including reuse of an existing ChatGPT sign-in. The shared-home
+check needs Python 3 and OpenSSL for a throwaway HTTPS fixture.
 The coding fixtures need working stock-client sandbox support and permission to bind
 loopback sockets. See the [Codex fixtures](../tests/fixtures/stock_codex/README.md)
 and [Claude Code fixtures](../tests/fixtures/stock_claude/README.md) for details.

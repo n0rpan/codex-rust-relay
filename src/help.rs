@@ -6,7 +6,8 @@ const OVERVIEW: &str = "\
 ox connects Codex and Claude Code to your model API providers.
 
 Get started
-  Use a terminal client  Run ox setup, load your API key, then run ox doctor.
+  Use a terminal client  Run ox setup and choose API provider or subscription.
+                         For an API provider, load its key and run ox doctor.
                          Start ox codex or ox claude from your project.
   Use your subscription  Run ox help subscriptions for native client sign-in.
   Connect a desktop app  Run ox help desktop for Codex and Claude Desktop.
@@ -15,13 +16,13 @@ Get started
 
 Commands
   ox                         Open setup on first use, or launch Codex once configured
-  ox setup [KEY] [options]   Add a provider with prompts or flags
+  ox setup [PROVIDER] [opts] Choose a subscription or configure an API provider
   ox codex [args...]         Launch Codex with the gateway
   ox claude [args...]        Launch Claude Code with the gateway
   ox login chatgpt|claude    Open the installed client's native sign-in
-  ox provider add [KEY]      Add another provider
+  ox provider add [PROVIDER] Add another API provider
   ox doctor                  Check setup offline
-  ox doctor --live --provider KEY
+  ox doctor --live --provider NAME
                              Test one live API request
   ox serve [--port PORT]     Run a persistent loopback gateway
   ox help [setup|desktop|share|t3|subscriptions]
@@ -43,7 +44,8 @@ Connect a desktop app to ox
 Codex Desktop
   If your app allows adding gateways, open Settings > Model Providers & Gateways
   and choose Add > Gateway or custom provider. Name it ox. Set the base URL to
-  your gateway URL with /v1 appended. Set the API key variable to OX_GATEWAY_KEY.
+  http://127.0.0.1:8787/v1 on the ox host, or your Tailscale HTTPS URL plus /v1.
+  Choose Environment variable auth and enter OX_GATEWAY_KEY for the gateway key.
   Load that variable into the app process. A terminal export reaches programs
   launched from that terminal.
   For manual setup, merge the example below into your user config.toml
@@ -67,7 +69,8 @@ const SHARE: &str = r#"Share one ox gateway across devices
 
 1. On the host, add a provider with ox setup, load its API key, and run ox doctor.
 2. Generate a gateway key once with openssl rand -hex 32 and save it in your
-   password manager. Load the same key as OX_GATEWAY_KEY on each restart.
+   password manager. Load the same key as OX_GATEWAY_KEY on each restart, in
+   the shell that already has your vendor API keys.
    For Bash or Zsh, paste it at this hidden prompt:
 
      printf 'Gateway key (input hidden): '
@@ -110,14 +113,15 @@ T3 execution host is on another device.
 In T3 Code, open Settings > Providers and add an instance named ox.
 
 Codex
-  Use the stock Codex provider with a custom gateway. Use the gateway URL
-  ending in /v1 and its key. Add the ox model alias as a custom model.
+  Use the stock Codex provider with a custom gateway. Use
+  http://127.0.0.1:8787/v1 on the ox host, or your Tailscale HTTPS URL plus /v1.
+  Use the gateway key (OX_GATEWAY_KEY) and add the full ox alias as a custom model.
 
 Claude
   Use the Claude provider, which runs the Claude Agent SDK. Keep its usual
   runtime. Under Environment variables, set:
     ANTHROPIC_BASE_URL    Gateway origin, without /v1
-    ANTHROPIC_AUTH_TOKEN  Gateway key (mark it sensitive)
+    ANTHROPIC_AUTH_TOKEN  Same value as OX_GATEWAY_KEY (mark it sensitive)
     ANTHROPIC_API_KEY     Explicitly empty
   Add the ox model alias as a custom model. Use a separate Claude config
   directory if you also use Claude sign-in on this execution host.
