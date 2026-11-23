@@ -24,9 +24,12 @@ OX_TEST_CLAUDE_BIN=/path/to/claude-2.1.330 \
 CODEOX_TEST_CODEX_BIN=/path/to/codex-0.171.0 OX_TEST_CLAUDE_BIN=/path/to/claude-2.1.330 \
   cargo test --locked --offline --test shared_gateway -- --ignored --nocapture
 
-CODEOX_TEST_CODEX_BIN=/path/to/codex-0.171.0 \
+CODEOX_TEST_CODEX_BIN=/path/to/codex-0.171.0 OX_TEST_CLAUDE_BIN=/path/to/claude-2.1.330 \
   cargo test --locked --offline --test shared_codex_home -- \
     --ignored --test-threads=1
+
+CODEOX_TEST_CODEX_BIN=/path/to/codex-0.171.0 OX_TEST_CLAUDE_BIN=/path/to/claude-2.1.330 \
+  python3 tests/fixtures/background_workers.py
 
 CODEOX_TEST_CODEX_BIN=/path/to/codex-0.171.0 \
   cargo test --locked --offline --bin ox stock_codex_emits_web_run -- --ignored
@@ -40,6 +43,16 @@ native profile before and after a relay turn, including logs and databases
 whose paths are set in the native config. The stock Claude Code fixture
 compares its native profile before and after account detection, a relay turn,
 and a resume.
+
+The stock Codex and Claude Code worker fixtures each make a real MCP call from
+the stock client to an API provider fixture. They check that the worker receives
+only the delegated task and its provider credential, and that the reply reaches
+the main model over its original route. [API workers](configuration.md#subscription-main-session-with-api-workers)
+
+The background worker fixture starts a stock Codex goal and a stock Claude
+Code workflow through MCP, polls for results, exercises a workspace edit, and
+cancels a running job. Set `OX_TEST_WORKER_HOLD_SECONDS=95` to check a goal
+that takes longer than the short text tool's timeout.
 The coding fixtures need working stock-client sandbox support and permission to bind
 loopback sockets. See the [Codex fixtures](../tests/fixtures/stock_codex/README.md)
 and [Claude Code fixtures](../tests/fixtures/stock_claude/README.md) for details.

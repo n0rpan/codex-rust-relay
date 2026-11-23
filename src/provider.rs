@@ -78,7 +78,7 @@ const MAX_ALIAS_BYTES: usize = 256;
 const MAX_AMBIGUOUS_ALIASES: usize = 4;
 
 /// Reads a configuration value from the environment.
-pub type Env<'a> = dyn Fn(&str) -> Option<String> + 'a;
+pub type Env<'a> = dyn Fn(&str) -> Option<String> + Sync + 'a;
 
 pub fn process_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())

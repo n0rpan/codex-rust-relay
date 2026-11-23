@@ -6,6 +6,10 @@
 by default. One server keeps the model registry and vendor keys. Devices connect
 using a separate gateway key and run their own clients, tools and sessions.
 
+The worker MCP server runs inside an `ox codex` or `ox claude` subscription
+launch on the client machine. It serves that launch's jobs over loopback.
+[Run a background worker](configuration.md#subscription-main-session-with-api-workers)
+
 Run `ox help share`, `ox help desktop`, or `ox help t3` for the steps in your
 terminal. For a single host, start with loopback. For clients on another device,
 use the HTTPS address from [Tailscale Serve](#2-publish-it-inside-your-tailnet).

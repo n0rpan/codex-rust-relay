@@ -21,6 +21,10 @@ settings and history. The clients execute tools locally. [Client profiles](confi
 ox launches the client found on `PATH`. For the current verified versions, see the
 `Stock clients (latest)` job in the [latest CI run](https://github.com/n0rpan/codex-rust-relay/actions/workflows/ci.yml).
 
+Subscription sessions started through ox can delegate to API workers through
+MCP. The local fixtures cover a stock Codex goal, a stock Claude Code workflow,
+workspace edits, and cancellation. [Background workers](configuration.md#subscription-main-session-with-api-workers)
+
 ### Live provider checks
 
 These checks used live provider accounts. Auto mode was exercised in these runs.

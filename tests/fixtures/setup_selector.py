@@ -549,5 +549,7 @@ for client, plan, expected in (
     )
     assert f"{plan} subscription  [native]" in text
     assert "anthropic/claude-fixture" in text
-    assert argv == expected and registry == shared, argv
+    assert argv[:len(expected)] == expected and registry == shared, argv
+    assert "ox_workers" in " ".join(argv)
+    assert "API workers enabled" in text
 print("shared model picker: arrows select the matching subscription alongside API choices")

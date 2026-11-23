@@ -528,22 +528,56 @@ subscription credentials, including services built with the Agent SDK.
 
 ### Subscription main session with API workers
 
-Start the main session with `ox codex --chatgpt` or `ox claude --native`.
-The stock client's built-in subagents use that session's configured backend.
-For independent work on a different provider, start a separate ox worker and
-bring its result back to the main session. For example, from your project:
+1. Add an API provider in `ox setup` and check it with `ox doctor`.
+2. Run `ox codex` or `ox claude` and choose the subscription row. You can
+   also run `ox codex --chatgpt` or `ox claude --native`.
+3. Ask **“List my API models and subscription routes.”** ox lists API models
+   with their provider and your stars first. It includes the saved ChatGPT and
+   Claude subscription routes it detects. Use the full alias in a request such as **“Start a
+   Codex goal worker on `opencode-go/glm-5.3` to fix the failing tests in this
+   project. Let it edit files. Give me the job ID.”** Substitute your chosen alias.
 
-```sh
-ox codex exec --sandbox read-only --model 'opencode-go/glm-5.3' \
-  'Review the changes in this project and list any regressions. Leave files as they are.'
-```
+The `ox_workers` MCP server is available only for that launch. It uses an authenticated loopback
+connection and needs no `ox serve` process or saved MCP entry. Plain `codex`
+and `claude` keep their existing MCP setup. If the tools are missing, check
+`/mcp` in the subscription session and check any managed MCP policy.
+Approve the tool call when your client prompts.
 
-The native session uses your subscription. The worker uses the account behind
-its provider alias. Give the worker the files and task it needs. When both the
-main session and its subagents use the ox API relay, model aliases on that relay
-can route to different vendors under the same gateway configuration.
+| Ask for | What starts |
+| --- | --- |
+| Codex session on an API model | Stock Codex in the project with the selected ox alias |
+| Codex goal on an API model | A stock Codex app-server thread with Goal mode |
+| Claude Code session or workflow on an API model | Stock Claude Code in the project with the selected ox alias |
+| Claude Code session or workflow on your subscription | Stock Claude Code on the host's saved Claude account. Ask for a subscription worker and omit the API alias. |
+
+`start_ox_worker` returns a job ID. Ask for status or the result with
+`ox_worker_status`, or ask to stop it with `cancel_ox_worker`. Jobs run between
+tool calls and have no ox wall-clock limit. They stop when the parent ox launch
+exits. The status includes the stock client's session ID when available.
+Work already written to the project stays there if you cancel.
+
+Workers start with read access in the current project. Tell the main agent
+explicitly when a worker may edit files. Client permissions still apply,
+including to shell commands. Give concurrent writers separate working
+directories by starting their parent sessions there. The main session and
+its built-in subagents use your subscription. The worker bills the API provider
+you picked or the Claude subscription you requested.
+
+For a second opinion on a piece of text, ask for `delegate_to_ox_model`.
+That tool makes one model request with a 90-second timeout. For development,
+tests, and other multi-step tasks, ask for a background worker.
+
+In the client, `/model` shows the subscription's account-specific model choices.
+The worker catalog reports the detected subscription routes alongside the API
+models and identifies Claude as a supported subscription worker.
 [Codex subagent settings](https://learn.chatgpt.com/docs/agent-configuration/subagents) ·
 [Claude Code subagent model selection](https://code.claude.com/docs/en/sub-agents#choose-a-model)
+
+Goal and Workflow modes need support from the installed client and selected
+model. If a mode fails, check the job status. You can also run it directly in
+`ox codex --model <alias>` or `ox claude --model <alias>`.
+[Codex Goal mode](https://learn.chatgpt.com/docs/long-running-work) ·
+[Claude Code workflows](https://code.claude.com/docs/en/workflows)
 
 ### Upgrade from the original single-provider relay
 

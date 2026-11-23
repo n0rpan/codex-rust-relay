@@ -111,6 +111,14 @@ Choosing a subscription in ox opens your usual client profile, so its sign-in
 and settings changes are shared with the plain command.
 [Profiles and session recovery](docs/configuration.md#sessions-and-sign-in)
 
+**Use both in one session.** Pick your subscription in `ox codex` or
+`ox claude`, then ask **“List my API models and subscription routes.”**
+Pick an alias and ask **“Start a Codex goal worker on that model to
+fix the failing tests. Let it edit this project and tell me the job ID.”**
+The main conversation stays on your subscription, and ox runs the worker in
+the background using the selected API provider.
+[Delegate to an API worker](docs/configuration.md#subscription-main-session-with-api-workers)
+
 ## Common tasks
 
 | I want to… | Where to go |
@@ -118,6 +126,7 @@ and settings changes are shared with the plain command.
 | Connect Anthropic, OpenAI, a Chat Completions vendor, or a local server | [Provider setup](docs/configuration.md#add-a-provider) |
 | Add Brave citations or configure Claude Code Auto mode | [Search and Claude settings](docs/configuration.md#web-search-with-brave) |
 | Resume a session, switch models, or keep my usual ChatGPT sign-in | [Sessions and sign-in](docs/configuration.md#sessions-and-sign-in) |
+| Keep my subscription and delegate to an API model | [API workers](docs/configuration.md#subscription-main-session-with-api-workers) |
 | Share one ox gateway on a tailnet or connect desktop clients and T3 Code | [Home-server setup](docs/shared-gateway.md) |
 | See supported clients, API versions, and feature boundaries | [Compatibility](docs/compatibility.md) |
 | Reproduce checks or measure the relay | [Verification and performance](docs/verification.md) |

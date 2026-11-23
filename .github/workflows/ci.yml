@@ -245,12 +245,19 @@ jobs:
             --ignored --exact --nocapture \
             translated_tests::stock_codex_emits_web_run_and_calls_the_alpha_search_endpoint
 
-      - name: Verify native Codex auth and relay profile isolation
+      - name: Verify native client auth, profiles and API workers
         timeout-minutes: 5
         run: |
           set -euo pipefail
           cargo test --locked --offline --test shared_codex_home -- \
             --ignored --nocapture --test-threads=1
+
+      - name: Run background Codex goals and Claude Code workflows
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cargo build --locked --offline
+          OX_TEST_BINARY=target/debug/ox python3 -u tests/fixtures/background_workers.py
 
       - name: Run stock Claude Code loopback fixtures
         timeout-minutes: 10

@@ -25,6 +25,7 @@ mod standalone_search;
 mod translate;
 mod update;
 mod upstream;
+mod workers;
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -287,7 +288,8 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
                 args.extend([OsString::from("--model"), OsString::from(alias)]);
             }
             Some(picker::LaunchChoice::Subscription) => {
-                return native::launch_subscription(client_kind, &codex_home).await;
+                let relay = workers::Relay::new(listener, app, token);
+                return native::launch_subscription(client_kind, &codex_home, Some(relay)).await;
             }
             None => return Ok(0),
         }
@@ -345,6 +347,19 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         }
     };
     command.kill_on_drop(true);
+    exempt_loopback_proxy(&mut command);
+
+    let mut child = command.spawn().map_err(|error| {
+        let client = command.as_std().get_program().to_string_lossy();
+        client_launch_error(&client, error)
+    })?;
+    tokio::select! {
+        status = child.wait() => Ok(status?.code().unwrap_or(1) as u8),
+        result = serve(listener, Arc::new(app)) => Err(result.unwrap_err().into()),
+    }
+}
+
+fn exempt_loopback_proxy(command: &mut Command) {
     for name in ["NO_PROXY", "no_proxy"] {
         let existing = std::env::var(name)
             .or_else(|_| {
@@ -356,15 +371,6 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
             })
             .unwrap_or_default();
         command.env(name, format!("{existing},127.0.0.1,localhost"));
-    }
-
-    let mut child = command.spawn().map_err(|error| {
-        let client = command.as_std().get_program().to_string_lossy();
-        client_launch_error(&client, error)
-    })?;
-    tokio::select! {
-        status = child.wait() => Ok(status?.code().unwrap_or(1) as u8),
-        result = serve(listener, Arc::new(app)) => Err(result.unwrap_err().into()),
     }
 }
 
@@ -464,15 +470,16 @@ impl App {
             .collect();
         {
             let client = &client;
-            let mut requests =
-                futures_util::stream::iter(vendors.iter().zip(&auths).enumerate().filter_map(
-                    |(index, (vendor, auth))| {
-                        auth.as_ref()
-                            .filter(|_| vendor.discovery)
-                            .map(|key| async move { (index, discover(client, vendor, key).await) })
-                    },
-                ))
-                .buffer_unordered(4);
+            let requests: Vec<_> = vendors
+                .iter()
+                .zip(&auths)
+                .enumerate()
+                .filter_map(|(index, (vendor, auth))| {
+                    let key = auth.as_ref().filter(|_| vendor.discovery)?;
+                    Some(async move { (index, discover(client, vendor, key).await) })
+                })
+                .collect();
+            let mut requests = futures_util::stream::iter(requests).buffer_unordered(4);
 
             let deadline = tokio::time::Instant::now() + CATALOG_TIMEOUT;
             loop {
@@ -675,7 +682,11 @@ impl App {
         }
     }
 
-    async fn inference(&self, request: Request<Incoming>) -> Response<RelayBody> {
+    async fn inference<B>(&self, request: Request<B>) -> Response<RelayBody>
+    where
+        B: Body<Data = Bytes> + Send + Unpin + 'static,
+        B::Error: Into<RelayError>,
+    {
         let (parts, body) = request.into_parts();
         let path = parts
             .uri
@@ -903,7 +914,10 @@ async fn read_upstream(response: reqwest::Response, limit: usize) -> Result<Byte
     Ok(Bytes::from(buffer))
 }
 
-async fn read_bounded(body: Incoming, limit: usize) -> Result<Bytes, Response<RelayBody>> {
+async fn read_bounded(
+    body: impl Body<Data = Bytes> + Unpin,
+    limit: usize,
+) -> Result<Bytes, Response<RelayBody>> {
     if body
         .size_hint()
         .upper()
@@ -941,13 +955,25 @@ fn too_large(limit: usize) -> Response<RelayBody> {
 }
 
 async fn serve(listener: TcpListener, relay: Arc<App>) -> std::io::Result<()> {
+    serve_requests(listener, move |request| {
+        let relay = Arc::clone(&relay);
+        async move { relay.handle(request).await }
+    })
+    .await
+}
+
+async fn serve_requests<F, Fut>(listener: TcpListener, handle: F) -> std::io::Result<()>
+where
+    F: Fn(Request<Incoming>) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Response<RelayBody>> + Send + 'static,
+{
     loop {
         let (socket, _) = listener.accept().await?;
-        let relay = Arc::clone(&relay);
+        let handle = handle.clone();
         tokio::spawn(async move {
             let service = service_fn(move |request| {
-                let relay = Arc::clone(&relay);
-                async move { Ok::<_, std::convert::Infallible>(relay.handle(request).await) }
+                let response = handle(request);
+                async move { Ok::<_, std::convert::Infallible>(response.await) }
             });
             let _ = http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())

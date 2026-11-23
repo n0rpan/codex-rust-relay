@@ -16,7 +16,7 @@ pub(crate) async fn dispatch(args: &[OsString], home: &Path) -> Option<Result<u8
             Some(login(account.to_str(), rest, home).await)
         }
         [client, mode, rest @ ..] if client == "codex" && mode == "--chatgpt" => {
-            Some(launch_chatgpt(rest, home).await)
+            Some(launch_chatgpt(rest, home, None).await)
         }
         [client, mode, rest @ ..] if client == "claude" && mode == "--native" => {
             Some(launch_claude(rest, home).await)
@@ -34,13 +34,19 @@ pub(crate) async fn launch_if_signed_in(
         ClientKind::Claude if has_saved_claude_account() => {}
         _ => return Ok(None),
     }
-    launch_subscription(client, home).await.map(Some)
+    launch_subscription(client, home, None).await.map(Some)
 }
 
-pub(crate) async fn launch_subscription(client: ClientKind, home: &Path) -> Result<u8, RelayError> {
+pub(crate) async fn launch_subscription(
+    client: ClientKind,
+    home: &Path,
+    relay: Option<crate::workers::Relay>,
+) -> Result<u8, RelayError> {
     match client {
-        ClientKind::Codex => launch_chatgpt(&[], home).await,
-        ClientKind::Claude => launch(claude_account_command(home)?).await,
+        ClientKind::Codex => launch_chatgpt(&[], home, relay).await,
+        ClientKind::Claude => {
+            launch_session(claude_account_command(home)?, &[], home, client, relay).await
+        }
     }
 }
 
@@ -125,7 +131,11 @@ async fn login(account: Option<&str>, args: &[OsString], home: &Path) -> Result<
     }
 }
 
-async fn launch_chatgpt(args: &[OsString], home: &Path) -> Result<u8, RelayError> {
+async fn launch_chatgpt(
+    args: &[OsString],
+    home: &Path,
+    relay: Option<crate::workers::Relay>,
+) -> Result<u8, RelayError> {
     let ready = match saved_chatgpt_account(home) {
         Some(ChatGptAccount::File) => true,
         Some(ChatGptAccount::Keyring) => check_chatgpt_keyring(home).await?,
@@ -134,9 +144,7 @@ async fn launch_chatgpt(args: &[OsString], home: &Path) -> Result<u8, RelayError
     if !ready {
         return Err("no ChatGPT sign-in found. Run ox login chatgpt first".into());
     }
-    let mut command = codex_command(home)?;
-    command.args(args);
-    launch(command).await
+    launch_session(codex_command(home)?, args, home, ClientKind::Codex, relay).await
 }
 
 async fn check_chatgpt_keyring(home: &Path) -> Result<bool, RelayError> {
@@ -175,15 +183,47 @@ async fn launch_claude(args: &[OsString], home: &Path) -> Result<u8, RelayError>
             "ox: native Claude Code may use the API or gateway overrides in your shell. For subscription use, launch from a shell without those overrides."
         );
     }
-    let mut command = command("claude", home)?;
-    command.args(args);
-    launch(command).await
+    launch_session(
+        command("claude", home)?,
+        args,
+        home,
+        ClientKind::Claude,
+        None,
+    )
+    .await
+}
+
+async fn launch_session(
+    mut command: Command,
+    args: &[OsString],
+    home: &Path,
+    client: ClientKind,
+    relay: Option<crate::workers::Relay>,
+) -> Result<u8, RelayError> {
+    let relay = match relay {
+        Some(relay) => Some(relay),
+        None => crate::workers::Relay::load(home).await?,
+    };
+    match relay {
+        Some(relay) => relay.launch(command, args, home, client).await,
+        None => {
+            command.args(args);
+            launch(command).await
+        }
+    }
 }
 
 pub(crate) fn has_saved_account(client: ClientKind, home: &Path) -> bool {
+    saved_subscription(client, home).is_some()
+}
+
+pub(crate) fn saved_subscription(client: ClientKind, home: &Path) -> Option<&'static str> {
     match client {
-        ClientKind::Codex => saved_chatgpt_account(home).is_some(),
-        ClientKind::Claude => has_saved_claude_account(),
+        ClientKind::Codex => match saved_chatgpt_account(home)? {
+            ChatGptAccount::File => Some("saved_sign_in"),
+            ChatGptAccount::Keyring => Some("configured_keyring"),
+        },
+        ClientKind::Claude => has_saved_claude_account().then_some("saved_sign_in"),
     }
 }
 
@@ -255,7 +295,7 @@ fn read_account_json(path: &Path, file_name: &str) -> Option<serde_json::Value> 
     serde_json::from_str(&text).ok()
 }
 
-fn claude_account_command(home: &Path) -> Result<Command, RelayError> {
+pub(crate) fn claude_account_command(home: &Path) -> Result<Command, RelayError> {
     let mut command = command("claude", home)?;
     for name in crate::clients::ROUTING_ENV {
         command.env_remove(name);
@@ -290,7 +330,7 @@ fn command(client: &str, home: &Path) -> Result<Command, RelayError> {
     Ok(command)
 }
 
-async fn launch(mut command: Command) -> Result<u8, RelayError> {
+pub(crate) async fn launch(mut command: Command) -> Result<u8, RelayError> {
     let status = command.status().await.map_err(|error| {
         let client = command.as_std().get_program().to_string_lossy();
         crate::client_launch_error(&client, error)

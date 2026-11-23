@@ -93,6 +93,7 @@ def record(server, handler):
     with lock:
         with requests_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry) + "\n")
+    return body
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -125,16 +126,53 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(404, b'{"error":"fixture"}')
 
     def do_POST(self):
-        record(self.server_tag, self)
+        body = record(self.server_tag, self)
         if self.server_tag == "inference_tls" and self.path == "/backend-api/codex/responses":
-            self.inference_reply("gpt-5.1-codex", "native fixture reply")
+            if b"native worker fixture" not in body:
+                self.inference_reply("gpt-5.1-codex", "native fixture reply")
+            elif b"vendor fixture reply" in body:
+                self.inference_reply("gpt-5.1-codex", "native worker completed")
+            elif any(item.get("type") == "function_call_output" and item.get("call_id") == "call_worker_fixture"
+                     for item in json.loads(body).get("input", [])):
+                self.inference_reply("gpt-5.1-codex", "worker call failed")
+            else:
+                tools = json.loads(body).get("tools", [])
+                match = next(((t["name"], {}) for t in tools if t.get("name", "").endswith("delegate_to_ox_model")), None)
+                if match is None:
+                    match = next(((child["name"], {"namespace": t["name"]})
+                                  for t in tools for child in t.get("tools", [])
+                                  if child.get("name") == "delegate_to_ox_model"), None)
+                if match is None:
+                    names = [t.get("name", t.get("type", "")) for t in tools]
+                    self.inference_reply("gpt-5.1-codex", "worker tool missing: " + ", ".join(names))
+                else:
+                    name, namespace = match
+                    self.inference_reply("gpt-5.1-codex", "", {
+                        "id": "fc_worker_tool", "type": "function_call", "status": "completed",
+                        "call_id": "call_worker_fixture", "name": name,
+                        "arguments": json.dumps({"model": "vendor/fixture-model", "task": "delegated-only marker"}),
+                        **namespace,
+                    })
         elif self.server_tag == "vendor" and self.path == "/v1/responses":
             self.inference_reply("fixture-model", "vendor fixture reply")
+        elif self.server_tag == "vendor" and self.path == "/v1/chat/completions":
+            chunks = [
+                {"index": 0, "delta": {"role": "assistant", "content": "vendor fixture reply"}, "finish_reason": None},
+                {"index": 0, "delta": {}, "finish_reason": "stop"},
+            ]
+            events = [
+                {"id": "chat_fixture", "object": "chat.completion.chunk", "created": 1700000000,
+                 "model": "fixture-model", "choices": [chunk]} for chunk in chunks
+            ]
+            stream = "".join("data: " + json.dumps(event) + "\n\n" for event in events)
+            self.send_sse((stream + "data: [DONE]\n\n").encode())
+        elif self.server_tag == "claude" and self.path.split("?")[0] == "/v1/messages":
+            self.claude_reply(json.loads(body))
         else:
             self.reply(404, b'{"error":"fixture"}')
 
-    def inference_reply(self, model, text):
-        item = {
+    def inference_reply(self, model, text, item=None):
+        item = item or {
             "id": "msg_shared_home",
             "type": "message",
             "role": "assistant",
@@ -158,10 +196,53 @@ class Handler(BaseHTTPRequestHandler):
             {"type": "response.output_item.done", "output_index": 0, "item": item},
             {"type": "response.completed", "response": response},
         ]
+        self.send_events(events)
+
+    def claude_reply(self, request):
+        model = request.get("model", "claude-sonnet-5")
+        payload = json.dumps(request["messages"])
+        worker_tools = [t["name"] for t in request.get("tools", []) if t.get("name", "").startswith("mcp__ox_workers__")]
+        if "native worker fixture" in payload and "vendor fixture reply" not in payload and worker_tools:
+            if "toolu_list_worker_models" not in payload:
+                tool_id = "toolu_list_worker_models"
+                name = "mcp__ox_workers__list_ox_models"
+                arguments = {"query": "vendor"}
+            else:
+                assert "vendor/fixture-model" in payload, "catalog should contain the provider-qualified alias"
+                tool_id = "toolu_native_worker"
+                name = "mcp__ox_workers__delegate_to_ox_model"
+                arguments = {"model": "vendor/fixture-model", "task": "delegated-only marker"}
+            assert name in worker_tools
+            block = {"type": "tool_use", "id": tool_id, "name": name, "input": {}}
+            delta = {"type": "input_json_delta", "partial_json": json.dumps(arguments)}
+            stop = "tool_use"
+        else:
+            text = "native worker completed" if "vendor fixture reply" in payload else "worker tool missing"
+            block = {"type": "text", "text": ""}
+            delta = {"type": "text_delta", "text": text}
+            stop = "end_turn"
+        self.send_events([
+            {"type": "message_start", "message": {
+                "id": "msg_claude_fixture", "type": "message", "role": "assistant",
+                "model": model, "content": [], "stop_reason": None, "stop_sequence": None,
+                "usage": {"input_tokens": 3, "output_tokens": 0},
+            }},
+            {"type": "content_block_start", "index": 0, "content_block": block},
+            {"type": "content_block_delta", "index": 0, "delta": delta},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
+             "usage": {"output_tokens": 2}},
+            {"type": "message_stop"},
+        ])
+
+    def send_events(self, events):
         body = "".join(
             "event: " + event["type"] + "\ndata: " + json.dumps(event) + "\n\n"
             for event in events
         ).encode()
+        self.send_sse(body)
+
+    def send_sse(self, body):
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("content-length", str(len(body)))
@@ -187,14 +268,16 @@ inference.socket = context.wrap_socket(inference.socket, server_side=True)
 tls["port"] = inference.server_address[1]
 discovery = server("discovery")
 vendor = server("vendor")
+claude = server("claude")
 
-for item in (inference, discovery, vendor):
+for item in (inference, discovery, vendor, claude):
     threading.Thread(target=item.serve_forever, daemon=True).start()
 
 ports = {
     "discovery": discovery.server_address[1],
     "inference": inference.server_address[1],
     "vendor": vendor.server_address[1],
+    "claude": claude.server_address[1],
 }
 tmp = state / "ports.json.tmp"
 tmp.write_text(json.dumps(ports))
@@ -226,6 +309,119 @@ fn fixture_credentials_are_fabricated_and_loopback_only() {
     }
     assert!(PYTHON_FIXTURE.contains("127.0.0.1"));
     assert_eq!(VENDOR_ALIAS, "vendor/fixture-model");
+}
+
+#[test]
+#[ignore = "opt-in: set OX_TEST_CLAUDE_BIN to the stock Claude Code binary"]
+fn stock_claude_calls_api_worker_without_changing_its_main_route() {
+    let claude =
+        fs::canonicalize(env::var_os("OX_TEST_CLAUDE_BIN").expect("set OX_TEST_CLAUDE_BIN"))
+            .expect("find the stock Claude Code binary");
+    let tree = TempTree::new("claude-worker");
+    let home = tree.path.join("home");
+    let codex_home = tree.path.join("codex-home");
+    let project = tree.path.join("project");
+    let tmp = tree.path.join("tmp");
+    let bin = tree.path.join("bin");
+    let pki = tree.path.join("pki");
+    for directory in [&home, &codex_home, &project, &tmp, &bin, &pki] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    std::os::unix::fs::symlink(claude, bin.join("claude")).unwrap();
+    let (_, cert, key) = generate_pki(&pki);
+    let mut fixture = ChildGuard::new(start_fixture(&tree.path, &cert, &key));
+    let ports = wait_for_ports(&tree.path, fixture.child());
+    fs::write(
+        codex_home.join("codeox.toml"),
+        format!(
+            r#"
+[providers.vendor]
+base_url = "http://127.0.0.1:{}/v1"
+env_key = "VENDOR_KEY"
+wire_api = "chat_completions"
+discovery = false
+[[providers.vendor.models]]
+id = "fixture-model"
+"#,
+            ports.vendor
+        ),
+    )
+    .unwrap();
+
+    let mut worker = Command::new(env!("CARGO_BIN_EXE_ox"));
+    worker.current_dir(&project).stdin(Stdio::null()).args([
+        "claude",
+        "--native",
+        "native worker fixture",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--allowedTools",
+        "mcp__ox_workers__list_ox_models,mcp__ox_workers__delegate_to_ox_model",
+    ]);
+    apply_env(
+        &mut worker,
+        &loopback_env(
+            &home,
+            &codex_home,
+            &tmp,
+            &format!("{}:/usr/bin:/bin", bin.display()),
+        ),
+    );
+    worker
+        .env(
+            "ANTHROPIC_BASE_URL",
+            format!("http://127.0.0.1:{}", ports.claude),
+        )
+        .env("ANTHROPIC_AUTH_TOKEN", "fixture-main-claude-key")
+        .env("ANTHROPIC_MODEL", "claude-sonnet-5")
+        .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+        .env("ENABLE_TOOL_SEARCH", "false")
+        .env("DISABLE_AUTOUPDATER", "1")
+        .env("VENDOR_KEY", VENDOR_KEY);
+    let log = tree.path.join("claude-worker.log");
+    let mut worker = spawn_logged(worker, &log);
+    wait_for_exit(&mut worker, &log);
+    let output = fs::read_to_string(&log).unwrap();
+    assert!(
+        output
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|event| event["type"] == "result" && event["result"] == "native worker completed"),
+        "Claude Code must return the MCP worker's answer to its main model:\n{}",
+        tail(&log)
+    );
+    let requests = read_requests(&tree.path);
+    let delegated = find_request(&requests, "vendor", "POST", "/v1/chat/completions").unwrap();
+    assert_header(delegated, "authorization", &format!("Bearer {VENDOR_KEY}"));
+    assert!(delegated.body_text.contains("delegated-only marker"));
+    assert!(!delegated.body_text.contains("native worker fixture"));
+    assert!(!delegated.body_text.contains("fixture-main-claude-key"));
+    let returned = requests
+        .iter()
+        .find(|request| {
+            request.server == "claude"
+                && request.method == "POST"
+                && request.body_text.contains("vendor fixture reply")
+        })
+        .unwrap();
+    assert_header(returned, "authorization", "Bearer fixture-main-claude-key");
+    assert!(!returned.body_text.contains(VENDOR_KEY));
+    let mut plain = Command::new(bin.join("claude"));
+    plain.args(["mcp", "list"]).current_dir(&project);
+    apply_env(
+        &mut plain,
+        &loopback_env(
+            &home,
+            &codex_home,
+            &tmp,
+            &format!("{}:/usr/bin:/bin", bin.display()),
+        ),
+    );
+    let plain = plain.output().unwrap();
+    assert!(plain.status.success());
+    assert!(!String::from_utf8_lossy(&plain.stdout).contains("ox_workers"));
 }
 
 #[test]
@@ -458,6 +654,73 @@ fn stock_codex_uses_native_credentials_and_an_isolated_relay_profile() {
     let relay_profile = codex_home.join("ox-clients/codex");
     assert!(relay_profile.join("config.toml").is_file());
     assert!(!relay_profile.join("auth.json").exists());
+
+    // ---- 3. Real native Codex calls the launch-scoped MCP worker ----------
+    let phase3_start = requests.len();
+    let phase3_log = tree.path.join("phase3.log");
+    let mut worker = Command::new(env!("CARGO_BIN_EXE_ox"));
+    worker
+        .args([
+            "codex",
+            "--chatgpt",
+            "-c",
+            "mcp_servers.ox_workers.tools.delegate_to_ox_model.approval_mode=\"approve\"",
+            "--no-daemon",
+            "--disable",
+            "enable_request_compression",
+            "--disable",
+            "tool_search",
+            "--disable",
+            "plugins",
+            "--disable",
+            "hooks",
+            "exec",
+            "--skip-git-repo-check",
+            "--json",
+            "native worker fixture",
+        ])
+        .current_dir(&project)
+        .stdin(Stdio::null());
+    environment.push((
+        "CODEX_CA_CERTIFICATE".to_owned(),
+        ca_cert.display().to_string(),
+    ));
+    environment.push(("SSL_CERT_FILE".to_owned(), ca_cert.display().to_string()));
+    apply_env(&mut worker, &environment);
+    let mut worker = spawn_logged(worker, &phase3_log);
+    wait_for_turn(&mut worker, &phase3_log, "native worker completed");
+    let requests = read_requests(&tree.path);
+    let phase3 = &requests[phase3_start..];
+    let worker_call = find_request(phase3, "vendor", "POST", "/v1/responses")
+        .expect("native Codex should call the ox worker");
+    assert_header(
+        worker_call,
+        "authorization",
+        &format!("Bearer {VENDOR_KEY}"),
+    );
+    assert!(worker_call.body_text.contains("delegated-only marker"));
+    assert!(!worker_call.body_text.contains("native worker fixture"));
+    assert!(!worker_call.body_text.contains(&access_token));
+    assert!(worker_call.headers.get("chatgpt-account-id").is_none());
+    let returned = phase3
+        .iter()
+        .find(|request| {
+            request.path == INFERENCE_ROUTE && request.body_text.contains("vendor fixture reply")
+        })
+        .expect("worker answer should return to the native model");
+    assert_header(returned, "authorization", &format!("Bearer {access_token}"));
+    assert!(!returned.body_text.contains(VENDOR_KEY));
+    assert!(
+        !fs::read_to_string(config_path)
+            .unwrap()
+            .contains("ox_workers")
+    );
+    let mut plain = Command::new(&codex);
+    plain.args(["mcp", "list", "--json"]).current_dir(&project);
+    apply_env(&mut plain, &environment);
+    let plain = plain.output().unwrap();
+    assert!(plain.status.success());
+    assert!(!String::from_utf8_lossy(&plain.stdout).contains("ox_workers"));
 }
 
 // ---------------------------------------------------------------------------
@@ -539,6 +802,7 @@ fn write_auth(path: &Path, id_token: &str, access_token: &str) {
 struct Ports {
     discovery: u16,
     vendor: u16,
+    claude: u16,
 }
 
 struct TempTree {
@@ -802,12 +1066,16 @@ fn wait_for_ports(state: &Path, fixture: &mut Child) -> Ports {
     loop {
         if let Ok(raw) = fs::read_to_string(&path)
             && let Ok(document) = serde_json::from_str::<Value>(&raw)
-            && let (Some(discovery), Some(vendor)) =
-                (document["discovery"].as_u64(), document["vendor"].as_u64())
+            && let (Some(discovery), Some(vendor), Some(claude)) = (
+                document["discovery"].as_u64(),
+                document["vendor"].as_u64(),
+                document["claude"].as_u64(),
+            )
         {
             return Ports {
                 discovery: discovery as u16,
                 vendor: vendor as u16,
+                claude: claude as u16,
             };
         }
         if let Some(status) = fixture.try_wait().expect("wait for fixture") {
@@ -827,7 +1095,7 @@ fn wait_for_ports(state: &Path, fixture: &mut Child) -> Ports {
     }
 }
 
-fn wait_for_turn(child: &mut Child, log: &Path, expected: &str) {
+fn wait_for_exit(child: &mut Child, log: &Path) {
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         if let Some(status) = child.try_wait().expect("wait for ox") {
@@ -843,7 +1111,10 @@ fn wait_for_turn(child: &mut Child, log: &Path, expected: &str) {
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
 
+fn wait_for_turn(child: &mut Child, log: &Path, expected: &str) {
+    wait_for_exit(child, log);
     let raw = fs::read_to_string(log).expect("read Codex output");
     let events: Vec<Value> = raw
         .lines()

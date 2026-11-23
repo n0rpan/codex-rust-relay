@@ -10,6 +10,7 @@ Get started
                          For an API provider, load its key and run ox doctor.
                          Start ox codex or ox claude from your project.
   Use your subscription  Run ox help subscriptions for native client sign-in.
+                         API workers are available in ox subscription sessions.
   Connect a desktop app  Run ox help desktop for Codex and Claude Desktop.
   Share across devices   Run ox help share for a home server and Tailscale.
   Use T3 Code            Run ox help t3 for Codex and Claude Agent SDK setup.
@@ -161,6 +162,12 @@ sign-in and settings changes there. API sessions started by ox use separate
 profiles. For Claude subscription use, keep API and gateway overrides out of
 that instance's configuration and
 environment. For T3 Code, select a native provider on the signed-in execution host.
+
+With API providers configured, an ox subscription session adds ox_workers
+for that launch. Ask to list your ox API models or start a background worker.
+You can ask for a Codex goal on an API alias, or a Claude Code workflow with
+an API model or your Claude subscription. Use the job ID to check or cancel it.
+Plain codex and claude use their own tools.
 
 For API vendors, desktop gateways, and sharing, add provider API keys with
 ox setup and run ox serve on the host. For included API credits, use an API

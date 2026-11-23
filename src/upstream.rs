@@ -487,7 +487,7 @@ fn extract_error_message(value: &Value) -> Option<&str> {
     (!message.trim().is_empty()).then_some(message)
 }
 
-fn redact<'a>(text: &'a str, secrets: &[String]) -> Cow<'a, str> {
+pub(crate) fn redact<'a>(text: &'a str, secrets: &[String]) -> Cow<'a, str> {
     let mut output = Cow::Borrowed(text);
     for secret in secrets {
         if secret.len() >= 4 && output.contains(secret) {
