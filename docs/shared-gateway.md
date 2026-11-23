@@ -114,24 +114,53 @@ calls the gateway at `/v1/alpha/search`. [Brave setup](configuration.md#web-sear
 
 ### Claude Desktop on 3P
 
-Use **Configure Third-Party Inference** on a supported desktop installation or use
-your managed profile. Set the inference provider to **Gateway**. Use the HTTPS
-origin, bearer auth and the gateway key. [Claude Desktop profile example](../examples/claude-desktop-gateway.json)
+1. Open **Developer → Configure Third-Party Inference…** in Claude Desktop on a
+   supported device. Under **Connection**, pick **Gateway** and **Static API key**.
+   Enter the Tailscale HTTPS origin, the `OX_GATEWAY_KEY` value, and **Bearer**.
+   **x-api-key** also works with ox. The gateway key grants access to the shared
+   ox server. Keep the completed profile private.
+2. Pick a native Anthropic model for the first test. The example profile uses
+   `anthropic/claude-sonnet-5`. Change `inferenceModels[].name` to the exact ID
+   returned by the gateway's `/v1/models`. Set `behavesAs` to the underlying
+   Claude model ID. Without an explicit list, Desktop filters discovery to IDs
+   it recognizes as Claude. ox advertises known model limits and Claude family
+   tiers for native Messages routes.
+3. Apply the settings and choose **Save & Restart**. Start a new Chat or Code
+   session. Confirm that the selected model replies and that a Code session can
+   read a file in a disposable project. Use the in-app export for a managed
+   deployment. [Example profile](../examples/claude-desktop-gateway.json) · [Anthropic setup](https://claude.com/docs/third-party/claude-desktop/gateway#configure-the-app)
 
-Start with a native Anthropic route and set `inferenceModels` to the exact route
-aliases. In the example, the server needs an `anthropic` provider with model ID
-`claude-sonnet-5`. The `behavesAs` field tells Desktop which Anthropic model the
-alias represents. Use supported model values matching your provider.
-[Claude Desktop gateway configuration](https://claude.com/docs/third-party/claude-desktop/gateway)
+**Context and caching.** Set `modelPrefer1mContext` for discovery, or `supports1m`
+on a matching `inferenceModels` entry, when the selected route supports 1M. ox
+advertises `supports_1m` when it knows the model has at least 1M input tokens.
+For unrecognized aliases with a different window, Desktop can use
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` in Claude Code managed settings. Choose the
+smallest supported limit among the aliases that share that setting.
+On native routes ox retains 1-hour `cache_control` markers, cache creation and
+read usage, signed thinking, SSE pings, and the provider's compaction error
+wording. The provider determines which features it accepts. Check cache reads on
+subsequent turns and run `/compact` in a long test session on the Mac. Keep
+buffering off and use a proxy timeout long enough for compaction streams.
+[Context and compaction](https://claude.com/docs/third-party/claude-desktop/gateway#context-window-and-compaction)
 
-Native Anthropic routes preserve successful Messages streams, usage and signed
-thinking, and forward bounded native error responses when they contain no
-configured credentials. Desktop-specific session recovery, compaction and Auto
-mode need end-to-end testing on the installed app. Translated routes lack
-Anthropic-only features such as signed thinking and server-side review. The
-relay's Brave bridge handles Claude Code’s dedicated search call. For Desktop’s
-provider-side search, use a native Anthropic route that supports it or configure
-[Desktop’s bundled web tools](../examples/claude-desktop-web-tools.json) separately.
+**Auto mode and MCP tool search.** Server-side Auto mode works only with an
+upstream that returns real verdicts. Test each model in a new local Code session,
+then look for `cli_api_auto_mode_server_check` with state `verdict` under
+**Help → Troubleshooting → Generate Diagnostic Report**. For a translated or
+otherwise incompatible route, set `inferenceGatewayAutoModeServerChecks` to
+`false` on the same Desktop profile to select the built-in check while it is
+available. `toolSearchEnabled` is a separate opt-in. Turn it on only for routes
+that accept the tool-search beta, `defer_loading`, and `tool_reference`.
+[Auto mode diagnostics](https://claude.com/docs/third-party/claude-desktop/gateway#test-auto-mode-checks-on-one-device)
+
+The `ox serve` tests cover the API contract with loopback providers. A live
+Sonnet 5 probe through ox cached 2,926 tokens on a 1-hour breakpoint and read the
+same 2,926 tokens on the next request. The Desktop picker, actual compaction, and
+Auto mode verdicts still need the Mac app check. A provider's native `402` billing
+error is preserved. ox serves a
+static gateway key and does not issue per-user budgets or validate enterprise
+OIDC tokens. For Desktop search, use an upstream that supports it or configure
+[Desktop’s bundled web tools](../examples/claude-desktop-web-tools.json).
 
 ### T3 Code
 

@@ -806,7 +806,12 @@ async fn messages_http_failure(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u32>().ok());
     let metadata = native.then(|| native_response_metadata(response.headers(), secrets));
-    let body = read_upstream_error(response).await;
+    let bytes = crate::read_upstream(response, MAX_UPSTREAM_ERROR_BYTES)
+        .await
+        .ok();
+    let body = bytes
+        .as_deref()
+        .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
     let mut downstream = if native
         && let Some(body) = &body
         && body["type"] == "error"
@@ -814,7 +819,20 @@ async fn messages_http_failure(
         && body["error"]["message"].is_string()
         && !contains_secret(body, secrets)
     {
-        crate::json_response(status, body.clone())
+        // Preserve the original envelope when raw and decoded representations
+        // can both be screened. Reserializing escaped JSON also drops duplicate
+        // fields that a Value-level scan cannot see.
+        match bytes.filter(|bytes| {
+            std::str::from_utf8(bytes).is_ok_and(|text| {
+                !text.contains('\\')
+                    && !secrets
+                        .iter()
+                        .any(|key| !key.is_empty() && text.contains(key))
+            })
+        }) {
+            Some(bytes) => crate::bytes_response(status, bytes, "application/json"),
+            None => crate::json_response(status, body.clone()),
+        }
     } else {
         let message = upstream_error(status.as_u16(), body.as_ref(), secrets);
         messages_error(status, kind_for_status(status), &message)
@@ -842,6 +860,11 @@ fn native_response_metadata(headers: &HeaderMap, secrets: &[String]) -> HeaderMa
                     && text.parse::<u32>().is_ok()
             }
             "x-should-retry" => matches!(text, "true" | "false"),
+            "request-id" => {
+                !text.is_empty()
+                    && text.len() <= 256
+                    && text.bytes().all(|byte| byte.is_ascii_graphic())
+            }
             name => name.starts_with("anthropic-ratelimit-unified-") && text.len() <= 1024,
         };
         if supported
@@ -909,6 +932,7 @@ fn kind_for_status(status: StatusCode) -> &'static str {
     match status.as_u16() {
         400 | 422 => "invalid_request_error",
         401 => "authentication_error",
+        402 => "billing_error",
         403 => "permission_error",
         404 => "not_found_error",
         413 => "request_too_large",
@@ -1803,6 +1827,32 @@ mod tests {
         let message = body["error"]["message"].as_str().unwrap();
         assert!(message.contains("[redacted]"));
         assert!(!message.contains("sk-vendor-key"));
+    }
+
+    #[tokio::test]
+    async fn native_errors_do_not_relay_credentials_hidden_in_duplicate_json_fields() {
+        let mock = MockUpstream::spawn(
+            400,
+            "application/json",
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"too long"},"detail":"\u0073k-vendor-key","detail":"safe"}"#,
+        );
+        let vendor = vendor_at(&mock.base, Wire::AnthropicMessages);
+        let key = SecretKey::new("sk-vendor-key".to_owned());
+        let secrets = Arc::new(vec!["sk-vendor-key".to_owned()]);
+        let response = infer(
+            &Client::new(),
+            context(&vendor, &key, &secrets),
+            json!({"model":"vendor/upstream-model","messages":[]}),
+            false,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(!String::from_utf8_lossy(&body).contains("vendor-key"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["detail"],
+            "safe"
+        );
     }
 
     #[tokio::test]

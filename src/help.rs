@@ -53,9 +53,12 @@ Codex Desktop
   (normally ~/.codex/config.toml). It uses /v1/catalog for model discovery.
 
 Claude Desktop on 3P
-  Open Configure Third-Party Inference. Choose Gateway with Bearer auth.
+  Open Developer > Configure Third-Party Inference. Choose Gateway,
+  Static API key, and Bearer auth.
   Use the HTTPS gateway origin with no /v1 suffix. Enter the gateway key.
   Start with a native Anthropic route and use its exact ox model alias.
+  Apply Changes and choose Save & Restart. The shared gateway guide shows
+  how to check caching, compaction, and Auto mode on the Mac.
 
 Try it
   Start a fresh local task using ox. Ask it to read a small file in a test

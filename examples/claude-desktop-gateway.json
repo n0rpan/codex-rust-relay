@@ -1,6 +1,7 @@
 {
   "inferenceProvider": "gateway",
   "inferenceGatewayBaseUrl": "https://ox.example-tailnet.ts.net",
+  "inferenceCredentialKind": "static",
   "inferenceGatewayAuthScheme": "bearer",
   "inferenceGatewayApiKey": "REPLACE_WITH_THE_OX_GATEWAY_KEY",
   "inferenceModels": [

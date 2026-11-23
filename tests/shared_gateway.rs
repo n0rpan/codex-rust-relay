@@ -20,6 +20,9 @@ use tokio::process::{Child, Command};
 const GATEWAY_KEY: &str = "fixture-gateway-key-used-only-for-local-requests";
 const RESPONSES_SSE: &str = include_str!("fixtures/shared_gateway/responses.sse");
 const MESSAGES_SSE: &str = include_str!("fixtures/shared_gateway/messages.sse");
+const DESKTOP_MESSAGES_SSE: &str = include_str!("fixtures/shared_gateway/desktop_messages.sse");
+const CONTEXT_ERROR: &str = r#"{ "type": "error", "error": { "type": "invalid_request_error", "message": "prompt is too long: 1000001 tokens > 1000000 maximum" } }"#;
+const BILLING_ERROR: &str = r#"{ "type": "error", "error": { "type": "billing_error", "message": "Request blocked by the provider budget." } }"#;
 const CHAT_SSE: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"}}]}\n\n";
 
 struct Home(PathBuf);
@@ -77,6 +80,9 @@ async fn mock(home: &Home) -> (Arc<Mutex<Vec<Hit>>>, tokio::task::JoinHandle<()>
     config.push_str(
         "\n[[providers.responses.models]]\nid = \"claude-alternate\"\nname = \"Claude via Responses\"\n",
     );
+    config.push_str(
+        "\n[[providers.claude.models]]\nid = \"claude-sonnet-5\"\ncontext_window = 1000000\n",
+    );
     std::fs::write(home.0.join("codeox.toml"), config).unwrap();
 
     let hits = Arc::new(Mutex::new(Vec::new()));
@@ -105,6 +111,16 @@ async fn mock(home: &Home) -> (Arc<Mutex<Vec<Hit>>>, tokio::task::JoinHandle<()>
                                 "application/json",
                                 r#"{"object":"response.input_tokens","input_tokens":21}"#,
                             )
+                        } else if parts.uri.path() == "/v1/messages"
+                            && body["model"] == "claude-sonnet-5"
+                        {
+                            match body["metadata"]["user_id"].as_str() {
+                                Some("fixture-context-limit") => {
+                                    (400, "application/json", CONTEXT_ERROR)
+                                }
+                                Some("fixture-budget") => (402, "application/json", BILLING_ERROR),
+                                _ => (200, "text/event-stream", DESKTOP_MESSAGES_SSE),
+                            }
                         } else {
                             let stream = match parts.uri.path() {
                                 "/v1/responses" => RESPONSES_SSE,
@@ -123,6 +139,7 @@ async fn mock(home: &Home) -> (Arc<Mutex<Vec<Hit>>>, tokio::task::JoinHandle<()>
                             Response::builder()
                                 .status(status)
                                 .header("content-type", content_type)
+                                .header("request-id", "req_fixture_desktop")
                                 .body(Full::new(Bytes::from_static(fixture.as_bytes())))
                                 .unwrap(),
                         )
@@ -362,6 +379,97 @@ async fn token_counts_follow_the_selected_inference_route() {
             "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],
         })
     );
+}
+
+#[tokio::test]
+async fn desktop_gateway_preserves_cache_tool_review_and_recovery_contracts() {
+    let home = Home::new();
+    let (hits, mock) = mock(&home).await;
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    let port = loopback_port().await;
+    let mut child = start_gateway(&home, port, &client).await;
+    let base = format!("http://127.0.0.1:{port}/v1");
+
+    let models: Value = client
+        .get(format!("{base}/models"))
+        .bearer_auth(GATEWAY_KEY)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let model = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["id"] == "claude/claude-sonnet-5")
+        .unwrap();
+    assert_eq!(model["anthropic_family_tier"], "sonnet");
+    assert_eq!(model["max_input_tokens"], 1_000_000);
+    assert_eq!(model["supports_1m"], true);
+
+    let mut payload = json!({
+        "model":"claude/claude-sonnet-5", "max_tokens":1024, "stream":true,
+        "system":[
+            {"type":"text","text":"x-anthropic-billing-header: fixture"},
+            {"type":"text","text":"Desktop task context", "cache_control":{"type":"ephemeral","ttl":"1h"}}
+        ],
+        "tools":[{"name":"read_fixture","input_schema":{"type":"object"},"defer_loading":true}],
+        "messages":[
+            {"role":"user","content":"Read the fixture"},
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"fixture reasoning","signature":"fixture-signature"},
+                {"type":"tool_use","id":"toolu_previous","name":"read_fixture","input":{}}
+            ]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_previous","content":[
+                {"type":"tool_reference","tool_name":"read_fixture"}
+            ]}]}
+        ],
+        "safeguards":{"fixture":"review this action"}
+    });
+    let send = |payload: &Value| {
+        client
+            .post(format!("{base}/messages?beta=true"))
+            .bearer_auth(GATEWAY_KEY)
+            .header(
+                "anthropic-beta",
+                "context-1m-2025-08-07,tool-search-tool-2025-10-19,dangerous-tool-use-2026-09-03",
+            )
+            .json(payload)
+    };
+
+    let response = send(&payload).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    assert_eq!(response.text().await.unwrap(), DESKTOP_MESSAGES_SSE);
+
+    for (status, scenario, body) in [
+        (400, "fixture-context-limit", CONTEXT_ERROR),
+        (402, "fixture-budget", BILLING_ERROR),
+    ] {
+        payload["metadata"] = json!({"user_id": scenario});
+        let response = send(&payload).send().await.unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(response.headers()["request-id"], "req_fixture_desktop");
+        assert_eq!(response.text().await.unwrap(), body);
+    }
+    child.kill().await.unwrap();
+    mock.abort();
+    let hits = hits.lock().unwrap();
+    assert_eq!(hits.len(), 3);
+    assert_eq!(hits[0].headers["x-api-key"], "messages-vendor-fixture");
+    assert_eq!(
+        hits[0].headers["anthropic-beta"],
+        "context-1m-2025-08-07,tool-search-tool-2025-10-19,dangerous-tool-use-2026-09-03"
+    );
+    payload["model"] = json!("claude-sonnet-5");
+    payload.as_object_mut().unwrap().remove("metadata");
+    assert_eq!(hits[0].body, payload);
 }
 
 #[tokio::test]

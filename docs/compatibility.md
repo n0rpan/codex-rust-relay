@@ -118,8 +118,11 @@ search may have separate costs. [Enable search](configuration.md#web-search-with
 The local launchers bind an ephemeral loopback address and exit with their clients.
 `ox serve` supplies a stable endpoint and gateway key for external clients. The
 shared endpoint is tested against stock Codex App Server and Claude Code CLI.
-Desktop app UI flows, hosted sessions, Desktop compaction and cross-device tailnet
-access are outside the verified matrix. [Home-server setup](shared-gateway.md)
+The Claude Desktop 3P API fixture checks model capability metadata, 1-hour
+caching fields, streaming tool IDs and verdicts, and native context-limit and
+billing errors. Desktop app UI flows, hosted sessions, Desktop compaction and
+cross-device tailnet access still require device testing.
+[Claude Desktop setup and verification](shared-gateway.md#claude-desktop-on-3p)
 
 The [Desktop web-tools overlay](../examples/claude-desktop-web-tools.json) is a
 configuration example for an existing Desktop 3P deployment. Set your allowed fetch hosts

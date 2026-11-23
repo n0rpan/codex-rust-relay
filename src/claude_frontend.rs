@@ -124,6 +124,15 @@ impl App {
                         });
                         if let Some(window) = entry["context_window"].as_u64() {
                             model["max_input_tokens"] = json!(window);
+                            if window >= 1_000_000 {
+                                model["supports_1m"] = json!(true);
+                            }
+                        }
+                        if let Some(tier) = entry["slug"]
+                            .as_str()
+                            .and_then(|alias| self.claude_family_tier(alias))
+                        {
+                            model["anthropic_family_tier"] = json!(tier);
                         }
                         model
                     })
@@ -143,6 +152,30 @@ impl App {
             }
             _ => messages_error(StatusCode::NOT_FOUND, "Unknown relay endpoint"),
         }
+    }
+
+    fn claude_family_tier(&self, alias: &str) -> Option<&'static str> {
+        let Mode::Codeox {
+            vendors, routes, ..
+        } = &self.mode
+        else {
+            return None;
+        };
+        let (route, _, _) = resolve_model(vendors, routes, alias).ok()?;
+        if route.wire != crate::provider::Wire::AnthropicMessages {
+            return None;
+        }
+        let id = route
+            .upstream_model
+            .strip_prefix("anthropic/")
+            .unwrap_or(&route.upstream_model);
+        let (family, version) = id.strip_prefix("claude-")?.split_once('-')?;
+        if !version.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+            return None;
+        }
+        ["haiku", "sonnet", "opus", "fable"]
+            .into_iter()
+            .find(|tier| *tier == family)
     }
 
     async fn messages_inference(&self, request: Request<Incoming>) -> Response<RelayBody> {
