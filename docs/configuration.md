@@ -73,7 +73,7 @@ Cargo installs into `${CARGO_HOME:-$HOME/.cargo}/bin` by default. Add the instal
 
 ## Add a provider
 
-Start with `ox setup` in a terminal and choose **API key provider**. Enter `openrouter`, `anthropic`, or `openai`
+Start with `ox setup` in a terminal and choose **Add an API key provider**. Enter `openrouter`, `anthropic`, or `openai`
 for connection defaults. For another provider, use the URL and API format from its
 documentation. Setup asks for the **name** of your API key variable. Load the value
 in the shell that will run ox, then use `ox doctor` to check the configuration.
@@ -232,6 +232,11 @@ If Codex shows a stale picker, check for `model_catalog_json` in `$CODEX_HOME/co
 It takes precedence over the live catalog. Pass an explicit alias on the first Codex
 launch if Codex already has a different default model.
 
+Run `ox codex` or `ox claude` with no client arguments from a terminal to choose
+from the same list of configured and discovered aliases with usable keys. Filter
+by model or provider, or pass `--model <alias>` to select one directly. An API key
+configured in ox for Anthropic can power either client.
+
 `ox claude` enables gateway model discovery for its Claude Code process. Open
 `/model` to see additional Claude aliases from the configured providers. To opt out
 for a launch, run:
@@ -270,8 +275,10 @@ Check the provider documentation before changing these settings.
 
 ## Web search with Brave
 
-Add this top-level table in the same `codeox.toml` and load `BRAVE_SEARCH_API_KEY` into
-your shell. Restart ox. Remove the table or set `enabled = false` to stop using Brave.
+After adding an API provider, choose **Enable Brave web search** in `ox setup`,
+then choose **Done**. Load `BRAVE_SEARCH_API_KEY` into your shell and restart ox.
+The equivalent manual configuration is a top-level table in the same `codeox.toml`.
+Remove the table or set `enabled = false` to stop using Brave.
 
 ```toml
 [search]
@@ -341,7 +348,14 @@ and adapt the [Desktop web-tools overlay](../examples/claude-desktop-web-tools.j
 
 ## Sessions and sign-in
 
-Choose a subscription in `ox setup`, or use `ox help subscriptions` to see the native sign-in commands.
+Use `ox setup` to add API providers, enable Brave or open either stock client's
+sign-in. The menu returns after each action. Select **Done** when finished. Plain `ox codex`
+and `ox claude` use the API registry when it is configured. Choose `:native` in the picker to use a matching subscription
+sign-in alongside configured API models. Otherwise, they start
+their own signed-in stock client. Bare `ox` prefers Codex and uses Claude Code
+if only Claude is signed in. With no API provider, `ox doctor` asks the stock
+clients for sign-in status and reports which subscription launches are ready.
+`ox help subscriptions` lists the explicit native launch commands.
 
 - **ChatGPT plan in Codex.** Run `ox login chatgpt` if you need to sign in.
   Codex manages its normal credentials. `ox login chatgpt status` checks whether

@@ -1,11 +1,13 @@
 # ox
 
-Use Codex or Claude Code with your own model API keys. One provider setup works with both
-CLIs. Run `ox codex` or `ox claude` to start a local relay that exits with the client. Run
-`codex` or `claude` directly for your usual sign-in.
+Run `ox codex` or `ox claude` from your project. Both commands use the same API
+provider setup and open the same model picker when several models are available.
+An Anthropic API key lets either client use Claude models.
 
-**Already installed?** Run `ox setup` to choose a subscription or add an API provider, or `ox --help` to
-see the commands. Typing just `ox` in a terminal opens setup on first use.
+Without an API provider configured, plain `ox codex` and `ox claude` use the
+corresponding client's existing subscription sign-in. Bare `ox` prefers Codex
+and opens Claude Code when only Claude is signed in. Run `ox setup` to add an API
+provider or sign in, and `ox doctor` to check what's configured.
 
 Use `ox help desktop` for Codex and Claude Desktop, `ox help share` to connect
 other devices, or `ox help t3` for T3 Code.
@@ -35,9 +37,10 @@ For unreleased builds, follow the [preview or source install steps](docs/configu
 
 ## 2. Add a provider
 
-Run `ox setup`, choose **API key provider**, and follow the prompts. Enter `openrouter`, `anthropic`, or `openai`
+Run `ox setup`, choose **Add an API key provider**, and follow the prompts. Enter `openrouter`, `anthropic`, or `openai`
 to get connection defaults. When asked for an environment variable, enter its name,
-such as `OPENROUTER_API_KEY`. Load the API key into your shell, then run `ox doctor`.
+such as `OPENROUTER_API_KEY`. Load the API key into your shell. Back in the menu,
+add another provider, enable Brave search or choose **Done**. Then run `ox doctor`.
 
 For repeatable setup with **OpenRouter**, the commands below use a model tested with
 both clients. Load `OPENROUTER_API_KEY` from your secret manager or use this hidden
@@ -66,8 +69,9 @@ have a provider configured, use its existing alias. [Other providers and setup o
 
 ## 3. Try a session
 
-From your project directory, run `ox codex` or `ox claude`, then open `/model`
-to choose a model. To select an alias directly:
+From your project directory, run `ox codex` or `ox claude` and choose from all
+available ox API aliases. Type part of the provider or model name to filter.
+When just one model is available, ox selects it for you. To skip the picker:
 
 ```sh
 ox codex --model openrouter/openai/gpt-5.4-mini
@@ -80,8 +84,8 @@ read. Prompts and tool results go to the selected API provider and use that prov
 
 Use the same alias, **`provider/model-id`**, in either client. Add more providers with
 `ox provider add`, then relaunch. Codex lists configured models in `/model`. In Claude Code,
-`/model` shows [eligible discovered aliases](docs/configuration.md#model-names-and-discovery)
-when launched with `ox claude`. Use `--model <alias>` to select any configured model.
+`/model` shows [eligible discovered aliases](docs/configuration.md#model-names-and-discovery).
+Start a new session through `ox claude` to choose from the full list again.
 
 ## Common tasks
 

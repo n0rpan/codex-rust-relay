@@ -15,13 +15,13 @@ Get started
   Use T3 Code            Run ox help t3 for Codex and Claude Agent SDK setup.
 
 Commands
-  ox                         Open setup on first use, or launch Codex once configured
+  ox                         Launch Codex, or Claude Code if only Claude is signed in
   ox setup [PROVIDER] [opts] Choose a subscription or configure an API provider
-  ox codex [args...]         Launch Codex with the gateway
-  ox claude [args...]        Launch Claude Code with the gateway
+  ox codex [args...]         Choose an API model or use your native ChatGPT sign-in
+  ox claude [args...]        Choose an API model or use your native Claude sign-in
   ox login chatgpt|claude    Open the installed client's native sign-in
   ox provider add [PROVIDER] Add another API provider
-  ox doctor                  Check setup offline
+  ox doctor                  Check API setup or native sign-in status
   ox doctor --live --provider NAME
                              Test one live API request
   ox serve [--port PORT]     Run a persistent loopback gateway
@@ -32,7 +32,7 @@ Commands
   ox --help                  Show this help
 
 Run ox setup --help for options and copyable examples.
-Use plain codex or claude for your usual sign-in.";
+Run ox setup if you have neither an ox API provider nor a native sign-in.";
 
 const DESKTOP: &str = "\
 Connect a desktop app to ox
@@ -200,7 +200,8 @@ pub(crate) fn dispatch(args: &[OsString]) -> Option<Result<u8, RelayError>> {
             Some("login") => println!("{SUBSCRIPTIONS}"),
             Some(client @ ("codex" | "claude")) => println!(
                 "Usage: ox {client} [client arguments]\n\
-                 Run ox setup to add a provider, then launch from your project.\n\
+                 Run from your project. With API providers configured, the bare command\n\
+                 opens the shared model picker. Without providers it uses your native sign-in.\n\
                  Example: ox {client} --model provider/model-id\n\
                  Run {client} --help for arguments accepted by the stock client."
             ),

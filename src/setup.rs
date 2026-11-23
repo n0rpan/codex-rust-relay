@@ -76,32 +76,82 @@ pub(crate) fn run_setup(args: &[OsString], codex_home: &Path) -> Result<u8, Rela
     provider_add_command(args, codex_home, true)
 }
 
-pub(crate) fn choose_subscription() -> Result<Option<&'static str>, RelayError> {
-    let mut input = std::io::stdin().lock();
-    let mut output = std::io::stdout().lock();
+pub(crate) enum SetupChoice {
+    Subscription(&'static str),
+    Provider,
+    Brave,
+    Done,
+}
+
+pub(crate) fn choose_setup() -> Result<SetupChoice, RelayError> {
+    let mut prompt = Prompt {
+        input: &mut std::io::stdin().lock(),
+        output: &mut std::io::stdout().lock(),
+    };
     writeln!(
-        output,
-        "\
-What would you like to use?
-  1. ChatGPT plan with Codex (Codex handles sign-in)
-  2. Claude subscription with Claude Code (Claude Code handles sign-in)
-  3. API key provider for the ox gateway
-
-Choose 3 to set up an ox host for desktop apps, Tailscale, or T3 Code.
-To connect to an existing gateway, see ox help desktop or ox help t3.
-
-Press Ctrl+C to exit."
+        prompt.output,
+        "\nox setup\n\
+         1. Sign in with ChatGPT for Codex\n\
+         2. Sign in with Claude for Claude Code\n\
+         3. Add an API key provider for both clients\n\
+         4. Enable Brave web search for both clients\n\
+         5. Done"
     )?;
-    Prompt {
-        input: &mut input,
-        output: &mut output,
-    }
-    .ask_required_with("Choose 1, 2, or 3", None, |choice| match choice {
-        "1" => Ok(Some("chatgpt")),
-        "2" => Ok(Some("claude")),
-        "3" => Ok(None),
-        _ => Err("enter 1, 2, or 3".to_owned()),
+    prompt.ask_required_with("Choose 1–5", None, |choice| match choice {
+        "1" => Ok(SetupChoice::Subscription("chatgpt")),
+        "2" => Ok(SetupChoice::Subscription("claude")),
+        "3" => Ok(SetupChoice::Provider),
+        "4" => Ok(SetupChoice::Brave),
+        "5" => Ok(SetupChoice::Done),
+        _ => Err("enter a number from 1 to 5".to_owned()),
     })
+}
+
+pub(crate) fn enable_brave(home: &Path) -> Result<(), RelayError> {
+    let path = CodeoxConfig::path(home);
+    let lock = lock_config(home)?;
+    let Some(existing) = read_existing_codeox(&path)? else {
+        println!(
+            "Choose 3 to add an API provider first. Brave search runs through the API gateway."
+        );
+        return Ok(());
+    };
+    let config = parse_config_for_validation(&existing)?;
+    let settings = if let Some(settings) = config.search {
+        settings
+    } else {
+        let document = Document::parse(&existing).map_err(|error| error.message().to_owned())?;
+        let candidate = if let Some(search) = document.get("search") {
+            let span = search
+                .get("enabled")
+                .and_then(Item::span)
+                .ok_or("could not find the disabled Brave setting in codeox.toml")?;
+            let mut candidate = existing;
+            candidate.replace_range(span, "true");
+            candidate
+        } else {
+            append_section(&existing, "[search]\nenv_key = \"BRAVE_SEARCH_API_KEY\"\n")
+        };
+        let settings = parse_config_for_validation(&candidate)?
+            .search
+            .ok_or("could not enable Brave search in codeox.toml")?;
+        write_config_atomic(&path, &candidate)?;
+        settings
+    };
+    drop(lock);
+
+    println!("Brave web search is enabled for the API gateway.");
+    if credential_state(&crate::provider::process_env, &settings.env_key)
+        == CredentialState::Present
+    {
+        println!("${} is set in this environment.", settings.env_key);
+    } else {
+        println!(
+            "Load the Brave Search API key into ${} before launching ox.",
+            settings.env_key
+        );
+    }
+    Ok(())
 }
 
 fn provider_add_command(
@@ -876,7 +926,7 @@ pub(crate) fn run_provider_add(
     }
 
     let section = render_provider_section(&form);
-    let candidate = append_provider(&existing, &section);
+    let candidate = append_section(&existing, &section);
     let config = match parse_config_for_validation(&candidate) {
         Ok(config) => config,
         Err(error) => return usage_error(prompt.output, &format!("invalid codeox.toml: {error}")),
@@ -1005,7 +1055,7 @@ fn write_add_usage(output: &mut dyn Write) -> Result<(), RelayError> {
     writeln!(output)?;
     writeln!(
         output,
-        "Run ox setup with no arguments to choose a subscription or API provider."
+        "Run ox setup with no arguments to manage sign-ins, API providers, and Brave."
     )?;
     writeln!(
         output,
@@ -1210,7 +1260,7 @@ fn toml_string(value: &str) -> String {
     out
 }
 
-fn append_provider(existing: &str, section: &str) -> String {
+fn append_section(existing: &str, section: &str) -> String {
     let mut out = String::with_capacity(existing.len() + section.len() + 2);
     out.push_str(existing);
     if !existing.is_empty() {
@@ -2250,6 +2300,10 @@ fn write_doctor_usage(output: &mut dyn Write) -> Result<(), RelayError> {
     writeln!(output, "  ox doctor [--strict]")?;
     writeln!(
         output,
+        "  Without API providers, shows recognized native client sign-ins."
+    )?;
+    writeln!(
+        output,
         "  ox doctor --live --provider NAME [--model UPSTREAM_MODEL_ID]"
     )?;
     writeln!(output)?;
@@ -2259,7 +2313,7 @@ fn write_doctor_usage(output: &mut dyn Write) -> Result<(), RelayError> {
     )?;
     writeln!(
         output,
-        "without network access. It reports each provider's wire, credential reference,"
+        "without sending inference requests. It reports each provider's wire, credential reference,"
     )?;
     writeln!(
         output,

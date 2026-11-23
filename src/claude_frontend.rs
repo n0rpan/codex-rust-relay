@@ -14,17 +14,6 @@ use crate::{
 };
 
 impl App {
-    fn visible_models(&self) -> impl Iterator<Item = &Value> {
-        let entries = match &self.mode {
-            Mode::Codeox { catalog, .. } => catalog["models"].as_array().map(Vec::as_slice),
-            Mode::Legacy { .. } => None,
-        };
-        entries
-            .unwrap_or_default()
-            .iter()
-            .filter(|entry| entry["visibility"] == "list")
-    }
-
     pub(super) fn claude_aliases(&self) -> Vec<String> {
         let Mode::Codeox {
             vendors, routes, ..

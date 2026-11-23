@@ -337,7 +337,7 @@ jobs:
           file "${binary}" | grep -F -- "${{ matrix.file_type }}"
           # --help prints usage and exits before reading any configuration, so
           # this probes that the executable starts without network or secrets.
-          "${binary}" --help | grep -F "Launch Codex with the gateway"
+          "${binary}" --help | grep -F 'ox codex [args...]'
 
       - name: Test atomic updates on this platform
         timeout-minutes: 15
@@ -382,7 +382,7 @@ jobs:
           mkdir -p "${unpacked}"
           tar --extract --gzip --file "dist/${archive}" --directory "${unpacked}"
           test -x "${unpacked}/ox"
-          "${unpacked}/ox" --help | grep -F "Launch Codex with the gateway"
+          "${unpacked}/ox" --help | grep -F 'ox codex [args...]'
           test "$("${unpacked}/ox" --version)" = "ox ${version}"
           cmp "${unpacked}/ox" "dist/${executable}"
           "dist/${executable}" update --help | grep -F 'Usage: ox update'

@@ -159,6 +159,13 @@ vendor routes in the server’s `codeox.toml`. Sessions and tool execution stay 
 the selected client environment. Enable the new instance for your project and
 select it and its custom model when you start a thread.
 
+For a native subscription session on a remote execution host, sign in with the
+corresponding stock client on that host under the account that runs it. Connect
+to that host using your client's remote execution support. The shared ox API
+gateway uses provider API keys and its own gateway key. For Claude models in
+Codex, add a Claude Console API provider to ox and select its alias in Codex.
+[Claude Code credential use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)
+
 For subscription sessions in T3 Code, sign in with the stock client on its
 execution host. Select the native Codex or Claude instance that uses that sign-in.
 For Claude, T3 keeps using the Agent SDK and its configured runtime. Use the

@@ -16,6 +16,7 @@ mod daemon;
 mod diagnostics;
 mod help;
 mod native;
+mod picker;
 mod provider;
 mod search;
 mod setup;
@@ -152,13 +153,25 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         Some("doctor") if args.iter().any(|arg| arg == "--live") => {
             return diagnostics::run(&args[1..], &codex_home).await;
         }
+        Some("doctor")
+            if args[1..].iter().all(|arg| arg == "--strict")
+                && !CodeoxConfig::path(&codex_home).try_exists()?
+                && matches!(
+                    provider::Provider::load_if_configured(&codex_home, &provider::process_env),
+                    Ok(None)
+                )
+                && native::report_signed_in(&codex_home).await? =>
+        {
+            return Ok(0);
+        }
         _ => {}
     }
     if let Some(result) = setup::dispatch(&args, &codex_home) {
         return result;
     }
     let bare = args.is_empty();
-    let (client_kind, args) = clients::select(args);
+    let (client_kind, mut args) = clients::select(args);
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let env: &Env<'_> = &|name: &str| provider::process_env(name);
 
     let config_path = CodeoxConfig::path(&codex_home);
@@ -171,13 +184,26 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         && let Some(provider) = provider::Provider::load_if_configured(&codex_home, env)?
     {
         LaunchConfig::Legacy(provider)
-    } else if args.is_empty() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        return run_setup(&[], &codex_home).await;
-    } else if bare {
-        help::overview();
-        return Ok(0);
     } else {
-        return Err("no ox provider configured. Run `ox setup` to get started".into());
+        if args.is_empty() {
+            if let Some(code) = native::launch_if_signed_in(client_kind, &codex_home).await? {
+                return Ok(code);
+            }
+            if bare
+                && let Some(code) =
+                    native::launch_if_signed_in(ClientKind::Claude, &codex_home).await?
+            {
+                return Ok(code);
+            }
+            if interactive {
+                return run_setup(&[], &codex_home).await;
+            }
+            if bare {
+                help::overview();
+                return Ok(0);
+            }
+        }
+        return Err("no ox API provider configured. Run `ox setup` to add one, or `ox help subscriptions` for native sign-in".into());
     };
     let mut env_refs = config.env_refs();
     env_refs.insert(daemon::KEY_ENV.to_owned());
@@ -230,6 +256,25 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         LaunchConfig::Legacy(provider) => App::legacy(provider, bundled, &token, client)?,
     };
 
+    if interactive && args.is_empty() && matches!(&app.mode, Mode::Codeox { .. }) {
+        let signed_in = native::signed_in(client_kind, &codex_home).await?;
+        let models = app.launch_models();
+        match picker::choose_model(
+            client_kind,
+            &models,
+            signed_in,
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout().lock(),
+        )? {
+            Some(picker::LaunchChoice::Model(alias)) => {
+                args.extend([OsString::from("--model"), OsString::from(alias)]);
+            }
+            Some(picker::LaunchChoice::Subscription) => {
+                return native::launch_subscription(client_kind, &codex_home).await;
+            }
+            None => return Ok(0),
+        }
+    }
     app.client_kind = client_kind;
     let (mut command, _claude_settings) = match app.client_kind {
         ClientKind::Codex => {
@@ -277,14 +322,29 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
 }
 
 async fn run_setup(args: &[OsString], codex_home: &Path) -> Result<u8, RelayError> {
-    if args.is_empty()
-        && std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal()
-        && let Some(account) = setup::choose_subscription()?
-    {
-        return native::setup_subscription(account, codex_home).await;
+    use setup::SetupChoice;
+
+    if !args.is_empty() || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return setup::run_setup(args, codex_home);
     }
-    setup::run_setup(args, codex_home)
+    loop {
+        let result = match setup::choose_setup()? {
+            SetupChoice::Subscription(account) => native::setup_subscription(account, codex_home)
+                .await
+                .map(|_| ()),
+            SetupChoice::Provider => setup::run_setup(&[], codex_home).map(|_| ()),
+            SetupChoice::Brave => setup::enable_brave(codex_home),
+            SetupChoice::Done => {
+                println!(
+                    "Run `ox doctor` to check setup, then start `ox codex` or `ox claude` from your project."
+                );
+                return Ok(0);
+            }
+        };
+        if let Err(error) = result {
+            eprintln!("ox setup: {error}");
+        }
+    }
 }
 
 fn client_launch_error(client: &str, error: std::io::Error) -> RelayError {
@@ -441,6 +501,37 @@ impl App {
             secrets: Arc::new(secrets),
             search,
         })
+    }
+
+    fn visible_models(&self) -> impl Iterator<Item = &Value> {
+        let entries = match &self.mode {
+            Mode::Codeox { catalog, .. } => catalog["models"].as_array().map(Vec::as_slice),
+            Mode::Legacy { .. } => None,
+        };
+        entries
+            .unwrap_or_default()
+            .iter()
+            .filter(|entry| entry["visibility"] == "list")
+    }
+
+    fn launch_models(&self) -> Vec<(&str, &str)> {
+        let Mode::Codeox {
+            vendors, routes, ..
+        } = &self.mode
+        else {
+            return Vec::new();
+        };
+        self.visible_models()
+            .filter_map(|entry| {
+                let alias = entry["slug"].as_str()?;
+                let Resolution::Route(route) = routes.resolve(alias) else {
+                    return None;
+                };
+                let vendor = &vendors[route.vendor];
+                vendor.auth.as_ref()?;
+                Some((alias, vendor.vendor.key.as_str()))
+            })
+            .collect()
     }
 
     async fn handle(&self, request: Request<Incoming>) -> Response<RelayBody> {
