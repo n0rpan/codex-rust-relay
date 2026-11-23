@@ -1,8 +1,9 @@
 # ox
 
 Run `ox codex` or `ox claude` from your project. Both commands use the same API
-provider setup and open the same model picker when several models are available.
-An Anthropic API key lets either client use Claude models.
+provider setup and model picker. When you’re signed in, choose **0** in the picker
+to start a native subscription session for that client. An Anthropic API key lets
+either client use Claude models through the gateway.
 
 Without an API provider configured, plain `ox codex` and `ox claude` use the
 corresponding client's existing subscription sign-in. Bare `ox` prefers Codex

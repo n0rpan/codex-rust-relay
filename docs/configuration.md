@@ -365,9 +365,10 @@ and adapt the [Desktop web-tools overlay](../examples/claude-desktop-web-tools.j
 
 Use `ox setup` to add API providers, enable Brave or open either stock client's
 sign-in. The menu returns after each action. Select **Done** when finished. Plain `ox codex`
-and `ox claude` use the API registry when it is configured. Choose `:native` in the picker to use a matching subscription
-sign-in alongside configured API models. Otherwise, they start
-their own signed-in stock client. Bare `ox` prefers Codex and uses Claude Code
+and `ox claude` show the API models alongside option **0** for that client's
+subscription when signed in. Choosing the subscription opens a native session
+with its own `/model` list. With no API providers, ox can start the signed-in
+stock client directly. Bare `ox` prefers Codex and uses Claude Code
 if only Claude is signed in. With no API provider, `ox doctor` asks the stock
 clients for sign-in status and reports which subscription launches are ready.
 `ox help subscriptions` lists the explicit native launch commands.

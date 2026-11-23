@@ -345,10 +345,15 @@ assert "Brave search needs a key" in text and argv == []
 print("setup: re-enable an existing Brave configuration without rewriting other settings")
 
 
-text, argv, registry = run(
-    ["claude"], b":native\n", config=shared,
-    claude_signed_in=True, prompt=b"Model number or search",
-)
-assert "Type :native to use your Claude subscription" in text
-assert argv == ["claude"] and registry == shared
-print("shared model picker: native subscription remains available alongside API models")
+for client, plan, expected in (
+    ("codex", "ChatGPT", ["codex", "-c", 'model_provider="openai"']),
+    ("claude", "Claude", ["claude"]),
+):
+    text, argv, registry = run(
+        [client], b"0\n", config=shared,
+        signed_in=True, claude_signed_in=True, prompt=b"Model number or search",
+    )
+    assert f"0. {plan} subscription  [native]" in text
+    assert "anthropic/claude-fixture" in text
+    assert argv == expected and registry == shared, argv
+print("shared model picker: option 0 launches the matching subscription alongside API choices")

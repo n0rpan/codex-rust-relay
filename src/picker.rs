@@ -33,7 +33,7 @@ pub(crate) fn choose_model<'a>(
     let providers: BTreeSet<_> = models.iter().map(|(_, provider)| *provider).collect();
     writeln!(
         output,
-        "Choose a model for {client} ({} available)",
+        "Choose how to start {client} ({} API models available)",
         models.len()
     )?;
     writeln!(
@@ -46,14 +46,13 @@ pub(crate) fn choose_model<'a>(
         "Type to filter by model or provider. Use :n or :p to page, :all to reset, and :q to cancel."
     )?;
 
-    if signed_in {
-        writeln!(output, "Type :native to use your {plan} subscription.")?;
-    }
-
     let mut matches = models.to_vec();
     let mut page = 0;
     let mut answer = String::new();
     loop {
+        if signed_in {
+            writeln!(output, "   0. {plan} subscription  [native]")?;
+        }
         let start = page * PAGE_SIZE;
         let end = (start + PAGE_SIZE).min(matches.len());
         for (index, (alias, provider)) in matches[start..end].iter().enumerate() {
@@ -76,7 +75,7 @@ pub(crate) fn choose_model<'a>(
         let choice = answer.trim();
         match choice {
             ":q" => return Ok(None),
-            ":native" if signed_in => return Ok(Some(LaunchChoice::Subscription)),
+            "0" | ":native" if signed_in => return Ok(Some(LaunchChoice::Subscription)),
             ":n" => page += usize::from(end < matches.len()),
             ":p" => page = page.saturating_sub(1),
             ":all" => {
