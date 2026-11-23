@@ -23,6 +23,7 @@ mod setup;
 mod sse;
 mod standalone_search;
 mod translate;
+mod ui;
 mod update;
 mod upstream;
 mod workers;
@@ -113,7 +114,10 @@ async fn main() -> ExitCode {
     match launch(std::env::args_os().skip(1)).await {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
-            eprintln!("ox: {error}");
+            eprintln!(
+                "{}",
+                ui::render_error("ox", &error.to_string(), ui::stderr_color())
+            );
             ExitCode::FAILURE
         }
     }
@@ -178,6 +182,14 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
     if let Some(result) = setup::dispatch(&args, &codex_home) {
         return result;
     }
+    if let Some(first) = args.first().and_then(|arg| arg.to_str())
+        && let Some(suggestion) = mistyped_command(first)
+    {
+        return Err(format!(
+            "unknown command {first:?}\n  fix: ox {suggestion}   (to send {first:?} to Codex instead: ox codex {first})"
+        )
+        .into());
+    }
     let bare = args.is_empty();
     let (client_kind, mut args) = clients::select(args);
     let classifier = if matches!(client_kind, ClientKind::Claude) {
@@ -189,7 +201,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
 
     let config_path = CodeoxConfig::path(&codex_home);
     let config = if config_path.exists() {
-        LaunchConfig::Codeox(CodeoxConfig::load(&config_path)?)
+        LaunchConfig::Codeox(load_config(&config_path)?)
     } else if matches!(client_kind, ClientKind::Codex)
         && let Some(provider) =
             provider::Provider::load_if_configured(&codex_home, &provider::process_env)?
@@ -199,26 +211,38 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         if classifier.is_some() {
             return Err("--client-classifier needs an ox API provider. Run ox setup first.".into());
         }
-        if args.is_empty() {
-            if let Some(code) = native::launch_if_signed_in(client_kind, &codex_home).await? {
-                return Ok(code);
-            }
-            if bare
-                && let Some(code) =
-                    native::launch_if_signed_in(ClientKind::Claude, &codex_home).await?
-            {
-                return Ok(code);
-            }
-            if interactive {
-                return run_setup(&[], &codex_home).await;
-            }
+        if !args.is_empty() {
+            return Err(NO_PROVIDER.into());
+        }
+        if let Some(code) = native::launch_if_signed_in(client_kind, &codex_home).await? {
+            return Ok(code);
+        }
+        if bare
+            && let Some(code) = native::launch_if_signed_in(ClientKind::Claude, &codex_home).await?
+        {
+            return Ok(code);
+        }
+        if !interactive {
             if bare {
                 help::overview();
                 return Ok(0);
             }
+            return Err(NO_PROVIDER.into());
         }
-        return Err("no ox API provider configured. Run `ox setup` to add one, or `ox help subscriptions` for native sign-in".into());
+        match first_run(client_kind, &codex_home).await? {
+            Some(code) => return Ok(code),
+            None => LaunchConfig::Codeox(load_config(&config_path)?),
+        }
     };
+    if interactive
+        && args.is_empty()
+        && matches!(&config, LaunchConfig::Codeox(_))
+        && !api_ready(&codex_home)
+        && !native::has_saved_account(client_kind, &codex_home)
+        && let Err(error) = setup::prompt_missing_keys(&codex_home)
+    {
+        eprintln!("ox setup: {error}");
+    }
     let saved = match &config {
         LaunchConfig::Codeox(config) => provider::SavedKeys::for_config(&codex_home, config)?,
         LaunchConfig::Legacy(_) => provider::SavedKeys::default(),
@@ -290,6 +314,9 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         .as_deref()
         .map(|mode| app.client_classifier(mode))
         .transpose()?;
+    if let Some(requested) = clients::explicit_model(&args) {
+        app.check_launch_model(requested)?;
+    }
     if interactive && args.is_empty() && matches!(&app.mode, Mode::Codeox { .. }) {
         let signed_in = classifier.is_none() && native::has_saved_account(client_kind, &codex_home);
         let models = app.launch_models();
@@ -384,6 +411,141 @@ fn exempt_loopback_proxy(command: &mut Command) {
     }
 }
 
+const NO_PROVIDER: &str = "no ox API provider configured. Run `ox setup` to add one, or `ox help subscriptions` for native sign-in";
+
+const OX_COMMANDS: &[&str] = &[
+    "setup", "doctor", "provider", "serve", "update", "login", "help", "codex", "claude",
+];
+/// Stock Codex subcommands that `ox <word>` forwards unchanged.
+const CODEX_COMMANDS: &[&str] = &[
+    "exec",
+    "review",
+    "logout",
+    "mcp",
+    "mcp-server",
+    "app-server",
+    "completion",
+    "sandbox",
+    "debug",
+    "apply",
+    "resume",
+    "fork",
+    "cloud",
+    "features",
+];
+
+/// Returns the ox command a mistyped first word most likely meant. Exact ox
+/// commands, stock Codex subcommands, options and prompts return `None`.
+fn mistyped_command(first: &str) -> Option<&'static str> {
+    if first.is_empty()
+        || !first.chars().all(|c| c.is_ascii_alphabetic())
+        || OX_COMMANDS.contains(&first)
+        || CODEX_COMMANDS.contains(&first)
+    {
+        return None;
+    }
+    ui::closest(first, OX_COMMANDS.iter().copied())
+}
+
+/// Loads `codeox.toml` for a launch and points at the doctor when the error
+/// has no more specific remedy.
+fn load_config(path: &Path) -> Result<CodeoxConfig, RelayError> {
+    CodeoxConfig::load(path).map_err(|error| {
+        let message = error.to_string();
+        if ui::fix_hint(&message).is_some() {
+            return error;
+        }
+        format!(
+            "{message}\n  file: {}\n  fix: ox doctor   (it lists every problem in this file)",
+            path.display()
+        )
+        .into()
+    })
+}
+
+/// True when at least one configured API provider has a usable key.
+fn api_ready(codex_home: &Path) -> bool {
+    let Ok(config) = CodeoxConfig::load(&CodeoxConfig::path(codex_home)) else {
+        return false;
+    };
+    let Ok(saved) = provider::SavedKeys::for_config(codex_home, &config) else {
+        return false;
+    };
+    config
+        .vendors
+        .iter()
+        .any(|vendor| vendor.api_key(&|name| saved.get(name)).is_some())
+}
+
+/// Guided setup for a launch with nothing configured. Returns `None` when an
+/// API provider is ready and the launch should continue, or the exit code.
+async fn first_run(client_kind: ClientKind, codex_home: &Path) -> Result<Option<u8>, RelayError> {
+    use setup::SetupChoice;
+
+    let binary = match client_kind {
+        ClientKind::Codex => "codex",
+        ClientKind::Claude => "claude",
+    };
+    let name = ui::client_name(binary);
+    let installed = setup::find_on_path(binary, std::env::var_os("PATH").as_deref()).is_some();
+    println!("Welcome to ox. Nothing is set up yet, so let's do that first.");
+    println!("Choose 1, 2 or 3. ox starts {name} as soon as one of them is ready.");
+    if !installed {
+        println!(
+            "Note: {name} is not installed yet. Install it with: {}",
+            ui::install_command(binary)
+        );
+    }
+    loop {
+        let result = match setup::choose_setup()? {
+            SetupChoice::Subscription(account) => {
+                let client = if account == "chatgpt" {
+                    ClientKind::Codex
+                } else {
+                    ClientKind::Claude
+                };
+                match native::setup_subscription(account, codex_home).await {
+                    Ok(0) => {
+                        if let Some(code) = native::launch_if_signed_in(client, codex_home).await? {
+                            return Ok(Some(code));
+                        }
+                        Ok(())
+                    }
+                    Ok(_) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+            SetupChoice::Provider => match setup::guided_provider(codex_home) {
+                Ok(()) if api_ready(codex_home) && installed => {
+                    println!("\nSetup is complete. Starting {name}.");
+                    return Ok(None);
+                }
+                Ok(()) if api_ready(codex_home) => {
+                    println!(
+                        "\nSetup is complete. Install {name} with: {}\nThen run: ox {binary}",
+                        ui::install_command(binary)
+                    );
+                    return Ok(Some(0));
+                }
+                other => other,
+            },
+            SetupChoice::Brave => setup::enable_brave(codex_home),
+            SetupChoice::Done => {
+                println!(
+                    "Run `ox doctor` to check setup, then start `ox codex` or `ox claude` from your project."
+                );
+                return Ok(Some(0));
+            }
+        };
+        if let Err(error) = result {
+            eprintln!(
+                "{}",
+                ui::render_error("ox setup", &error.to_string(), ui::stderr_color())
+            );
+        }
+    }
+}
+
 async fn run_setup(args: &[OsString], codex_home: &Path) -> Result<u8, RelayError> {
     use setup::SetupChoice;
 
@@ -405,15 +567,22 @@ async fn run_setup(args: &[OsString], codex_home: &Path) -> Result<u8, RelayErro
             }
         };
         if let Err(error) = result {
-            eprintln!("ox setup: {error}");
+            eprintln!(
+                "{}",
+                ui::render_error("ox setup", &error.to_string(), ui::stderr_color())
+            );
         }
     }
 }
 
 fn client_launch_error(client: &str, error: std::io::Error) -> RelayError {
     if error.kind() == std::io::ErrorKind::NotFound {
-        format!("could not find `{client}` on PATH. Install it and check `{client} --version`")
-            .into()
+        format!(
+            "could not find `{client}` on PATH\n  why: ox starts the stock {} CLI and does not bundle it\n  fix: {}",
+            ui::client_name(client),
+            ui::install_command(client)
+        )
+        .into()
     } else {
         error.into()
     }
@@ -626,6 +795,57 @@ impl App {
             .collect()
     }
 
+    /// Checks an explicit provider-qualified `--model` before the client
+    /// starts. A prefix that matches no configured provider is an error with
+    /// the closest provider. An ID missing from a provider's known list only
+    /// earns a note, because prefix routing still reaches the provider.
+    fn check_launch_model(&self, requested: &str) -> Result<(), RelayError> {
+        let Mode::Codeox {
+            vendors, routes, ..
+        } = &self.mode
+        else {
+            return Ok(());
+        };
+        let Some((prefix, rest)) = requested.split_once('/') else {
+            return Ok(());
+        };
+        let keys: Vec<&str> = vendors
+            .iter()
+            .map(|state| state.vendor.key.as_str())
+            .collect();
+        if matches!(routes.resolve(requested), Resolution::Unknown) {
+            if keys.contains(&prefix) {
+                return Ok(());
+            }
+            let fix = match ui::closest(prefix, keys.iter().copied()) {
+                Some(key) => format!("use --model {key}/{}", short(rest)),
+                None => "ox doctor   (it lists your providers and model aliases)".to_owned(),
+            };
+            return Err(format!(
+                "unknown provider {:?} in --model {:?}\n  why: codeox.toml has: {}\n  fix: {fix}",
+                short(prefix),
+                short(requested),
+                keys.join(", ")
+            )
+            .into());
+        }
+        let listed: Vec<&str> = self
+            .visible_models()
+            .filter_map(|entry| entry["slug"].as_str())
+            .filter(|slug| slug.split_once('/').is_some_and(|(key, _)| key == prefix))
+            .collect();
+        if !listed.is_empty()
+            && !listed.contains(&requested)
+            && let Some(suggestion) = ui::closest(requested, listed.iter().copied())
+        {
+            eprintln!(
+                "ox: {} is not in the {prefix} model list. Closest match: {suggestion}. Continuing as requested.",
+                short(requested)
+            );
+        }
+        Ok(())
+    }
+
     async fn handle(&self, request: Request<Incoming>) -> Response<RelayBody> {
         let bearer_matches = request
             .headers()
@@ -675,7 +895,7 @@ impl App {
             .handle(&bytes)
             .await;
         if let Some(notice) = search.take_fallback_notice() {
-            eprintln!("codeox: {notice}");
+            eprintln!("ox: {notice}");
         }
         let status =
             StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -780,7 +1000,7 @@ impl App {
                 };
                 if translate::sanitize_replayed_history(&mut payload, route.wire) {
                     eprintln!(
-                        "codeox: sending this thread's history to provider {:?}",
+                        "ox: sending this thread's history to provider {:?}",
                         state.vendor.key
                     );
                 }
@@ -1101,7 +1321,7 @@ fn resolve_search(
         && policy != "live"
     {
         eprintln!(
-            "codeox: search is configured, but Codex's web_search policy is pinned to {policy:?}; standalone web search stays off"
+            "ox: search is configured, but Codex's web_search policy is pinned to {policy:?}; standalone web search stays off"
         );
         return (None, SearchLaunch::PolicyPinned);
     }
@@ -1115,7 +1335,7 @@ fn resolve_search(
 fn build_search(settings: &SearchSettings, env: &Env<'_>) -> Option<BraveSearch> {
     let Some(key) = env(&settings.env_key) else {
         eprintln!(
-            "codeox: [search] is configured but {} is not set; standalone web search is disabled",
+            "ox: [search] is configured but {} is not set; standalone web search is disabled",
             settings.env_key
         );
         return None;
@@ -1129,7 +1349,7 @@ fn build_search(settings: &SearchSettings, env: &Env<'_>) -> Option<BraveSearch>
         Ok(search) => Some(search),
         Err(error) => {
             eprintln!(
-                "codeox: [search] is configured but unusable ({error}); standalone web search is disabled"
+                "ox: [search] is configured but unusable ({error}); standalone web search is disabled"
             );
             None
         }
@@ -1212,9 +1432,7 @@ fn warn_about_static_catalog(codex_home: &Path) {
     if let Ok(document) = toml_edit::Document::parse(&raw)
         && document.get("model_catalog_json").is_some()
     {
-        eprintln!(
-            "codeox: config.toml sets model_catalog_json, which may hide the codeox model catalog"
-        );
+        eprintln!("ox: config.toml sets model_catalog_json, which may hide the ox model catalog");
     }
 }
 
@@ -1550,6 +1768,75 @@ mod tests {
         fn drop(&mut self) {
             self.task.abort();
         }
+    }
+
+    #[test]
+    fn mistyped_commands_are_caught_but_codex_words_pass_through() {
+        assert_eq!(mistyped_command("docter"), Some("doctor"));
+        assert_eq!(mistyped_command("setpu"), Some("setup"));
+        assert_eq!(mistyped_command("claud"), Some("claude"));
+        assert_eq!(mistyped_command("updat"), Some("update"));
+        for passthrough in [
+            "doctor",
+            "codex",
+            "claude",
+            "exec",
+            "resume",
+            "review",
+            "cloud",
+            "apply",
+            "mcp",
+            "debug",
+            "fork",
+            "--model",
+            "-c",
+            "fix the failing test",
+            "",
+        ] {
+            assert_eq!(mistyped_command(passthrough), None, "{passthrough}");
+        }
+    }
+
+    #[tokio::test]
+    async fn launch_model_check_names_the_closest_provider() {
+        let config = r#"
+[providers.openrouter]
+base_url = "https://openrouter.example/v1"
+env_key = "OPENROUTER_KEY"
+discovery = false
+
+[[providers.openrouter.models]]
+id = "fast-coder"
+"#;
+        let app = App::codeox(
+            CodeoxConfig::load_from_str(config).unwrap(),
+            bundled_fixture(),
+            RELAY_TOKEN,
+            test_client(),
+            MAX_REQUEST_BYTES,
+            &|_| None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(app.check_launch_model("openrouter/fast-coder").is_ok());
+        assert!(app.check_launch_model("openrouter/not-listed").is_ok());
+        assert!(app.check_launch_model("fast-coder").is_ok());
+        assert!(app.check_launch_model("gpt-unknown").is_ok());
+        let error = app
+            .check_launch_model("openroutr/fast-coder")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown provider \"openroutr\""), "{error}");
+        assert!(
+            error.contains("fix: use --model openrouter/fast-coder"),
+            "{error}"
+        );
+        let error = app
+            .check_launch_model("zzzzzz/fast-coder")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("fix: ox doctor"), "{error}");
     }
 
     fn bundled_fixture() -> BundledModels {

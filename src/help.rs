@@ -3,38 +3,31 @@ use std::ffi::OsString;
 use crate::provider::RelayError;
 
 const OVERVIEW: &str = "\
-ox connects Codex and Claude Code to your model API providers.
+ox runs Codex and Claude Code on any model API. One command, nothing to edit by hand.
 
 Get started
-  Use a terminal client  Run ox setup and choose API provider or subscription.
-                         For an API provider, load its key and run ox doctor.
-                         Start ox codex or ox claude from your project.
-  Use your subscription  Run ox help subscriptions for native client sign-in.
-                         API workers are available in ox subscription sessions.
-  Connect a desktop app  Run ox help desktop for Codex and Claude Desktop.
-  Share across devices   Run ox help share for a home server and Tailscale.
-  Use T3 Code            Run ox help t3 for Codex and Claude Agent SDK setup.
+  ox                 First run: guided setup, then your client opens
+  ox codex           Open Codex and pick a model
+  ox claude          Open Claude Code and pick a model
 
-Commands
-  ox                         Launch Codex, or Claude Code if only Claude is signed in
-  ox setup [PROVIDER] [opts] Choose a subscription or configure an API provider
-  ox codex [args...]         Choose an API model or use your native ChatGPT sign-in
-  ox claude [args...]        Choose an API model or use your native Claude sign-in
-  ox login chatgpt|claude    Open the installed client's native sign-in
-  ox provider add [PROVIDER] Add another API provider
-  ox doctor                  Check API setup or find saved native accounts
-  ox doctor --live --provider NAME
-                             Test one live API request
-  ox serve [--port PORT]     Run a persistent loopback gateway
-  ox update [--check]        Install or check for the newest ox release
+If something is off
+  ox doctor          Check everything. The last line is the next command to run
+  ox doctor --fix    Repair what ox can repair itself (files are backed up first)
+  ox setup           Add a provider, paste a key, sign in, or enable web search
+
+More
+  ox codex --model provider/model-id   Skip the picker (same for ox claude)
+  ox doctor --live --provider NAME     Send one real test request
+  ox provider add [PROVIDER] [opts]    Add a provider from a script
+  ox login chatgpt|claude              Sign in with a ChatGPT or Claude plan
+  ox serve [--port PORT]               Share one gateway with desktop apps and devices
+  ox update [--check]                  Install or check for the newest ox release
   ox help [install|setup|desktop|share|t3|subscriptions]
-                             Show help for a task
-  ox --version               Print the installed ox version
-  ox --help                  Show this help
+  ox --version
 
-Run ox setup --help for options and copyable examples.
-Run ox setup if you have neither an ox API provider nor a native sign-in.
-API sessions save settings and history in a separate ox client profile.";
+Providers live in codeox.toml in your Codex home; ox doctor prints the path.
+API sessions use a separate ox client profile, so your own Codex and Claude Code
+settings and history stay untouched.";
 
 const DESKTOP: &str = "\
 Connect a desktop app to ox
@@ -189,6 +182,14 @@ Run ox update --dev or ox update --stable to switch channels.
 Releases: https://github.com/n0rpan/ox/releases
 Manual download steps and platform filenames are in docs/configuration.md.";
 
+const HELP_TOPICS: &[&str] = &[
+    "install",
+    "setup",
+    "desktop",
+    "share",
+    "t3",
+    "subscriptions",
+];
 const TOPICS: &str = "Usage: ox help [install|setup|desktop|share|t3|subscriptions]";
 
 pub(crate) fn overview() {
@@ -211,7 +212,17 @@ pub(crate) fn dispatch(args: &[OsString]) -> Option<Result<u8, RelayError>> {
             Some("share") => println!("{SHARE}"),
             Some("t3") => println!("{T3}"),
             Some("subscriptions") => println!("{SUBSCRIPTIONS}"),
-            _ => return Some(Err(TOPICS.into())),
+            _ => {
+                let topic = topic.to_string_lossy();
+                let fix = crate::ui::closest(&topic, HELP_TOPICS.iter().copied())
+                    .map(|topic| format!("ox help {topic}"))
+                    .unwrap_or_else(|| "ox help".to_owned());
+                return Some(Err(format!(
+                    "unknown help topic {topic:?}\n  why: the topics are {}\n  fix: {fix}",
+                    HELP_TOPICS.join(", ")
+                )
+                .into()));
+            }
         },
         [command, ..] if command == "help" => {
             return Some(Err(TOPICS.into()));

@@ -41,7 +41,7 @@ pub(crate) async fn run(args: &[OsString], home: &Path) -> Result<u8, RelayError
         .vendors
         .iter()
         .find(|vendor| vendor.key == provider)
-        .ok_or("provider is not configured in codeox.toml")?;
+        .ok_or_else(|| unknown_provider(provider, &config))?;
     let model = model
         .or_else(|| vendor.models.first().map(|model| model.id.as_str()))
         .ok_or("pass --model with the vendor's upstream model ID")?;
@@ -59,6 +59,20 @@ pub(crate) async fn run(args: &[OsString], home: &Path) -> Result<u8, RelayError
         first_text.as_secs_f64()
     );
     Ok(0)
+}
+
+fn unknown_provider(requested: &str, config: &CodeoxConfig) -> String {
+    let configured: Vec<&str> = config
+        .vendors
+        .iter()
+        .map(|vendor| vendor.key.as_str())
+        .collect();
+    let fix = crate::ui::closest(requested, configured.iter().copied())
+        .unwrap_or(configured.first().copied().unwrap_or("NAME"));
+    format!(
+        "provider {requested:?} is not configured\n  why: codeox.toml has: {}\n  fix: ox doctor --live --provider {fix}",
+        configured.join(", ")
+    )
 }
 
 fn next_value<'a>(args: &mut impl Iterator<Item = &'a OsString>) -> Result<&'a str, RelayError> {

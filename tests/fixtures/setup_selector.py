@@ -241,7 +241,7 @@ hidden = b"API key (hidden): "
 go_key = "dummy-go-pasted-key"
 brave_key = "dummy-brave-pasted-key"
 text, argv, registry = run(
-    [], [
+    ["setup"], [
         (menu, b"nope\n3\n"),
         (b"Service number:", b"1\n"),
         (hidden, f"{go_key}\n".encode()),
@@ -268,7 +268,7 @@ for expected in (
     assert expected in registry.splitlines(), registry
 assert argv == []
 assert "Run `ox doctor` to check setup" in text
-print("bare ox: guided Go and Brave setup with hidden keys usable after restart")
+print("ox setup: guided Go and Brave setup with hidden keys usable after restart")
 
 
 class Catalog(http.server.BaseHTTPRequestHandler):
@@ -307,6 +307,43 @@ with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Catalog) as vendor:
         vendor.shutdown()
         thread.join()
 print("Other: plain /v1 defaults to Responses and both launchers and ox serve discover the model")
+
+for client in ("codex", "claude"):
+    with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Catalog) as vendor:
+        vendor.calls = []
+        thread = threading.Thread(target=vendor.serve_forever)
+        thread.start()
+        port = vendor.server_port
+        base = f"http://127.0.0.1:{port}/v1"
+        alias = f"custom-127-0-0-1-{port}/fixture"
+        try:
+            text, argv, registry = run(
+                [client], [
+                    (menu, b"3\n"),
+                    (b"Service number:", b"6\n"),
+                    (b"Paste the API base URL", f"{base}\n".encode()),
+                    (hidden, b"fixture-custom-key\n"),
+                    (b"Add another API endpoint", b"\n"),
+                ],
+                saved={f"CUSTOM_127_0_0_1_{port}_API_KEY": (base, "fixture-custom-key")},
+            )
+            assert "Welcome to ox" in text and "Setup is complete" in text, text
+            assert argv[0] == client and argv[-2:] == ["--model", alias], argv
+            assert "Run `ox doctor` to check setup" not in text
+            assert vendor.calls == [True], vendor.calls
+        finally:
+            vendor.shutdown()
+            thread.join()
+print("first run: ox codex and ox claude finish guided setup and launch the client in one go")
+
+partial = '[providers.openrouter]\nbase_url = "http://127.0.0.1:9/v1"\nenv_key = "FIXTURE_MISSING_KEY"\ndiscovery = false\n\n[[providers.openrouter.models]]\nid = "fixture"\n'
+text, argv, registry = run(
+    ["codex"], [(hidden, b"fixture-late-key\n")], config=partial,
+    saved={"FIXTURE_MISSING_KEY": ("http://127.0.0.1:9/v1", "fixture-late-key")},
+)
+assert "has no API key yet" in text and registry == partial
+assert argv[0] == "codex" and argv[-2:] == ["--model", "openrouter/fixture"], argv
+print("launch with a missing key: asks for it once, saves it, and continues")
 
 
 for endpoint, wire in (

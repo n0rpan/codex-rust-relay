@@ -95,11 +95,11 @@ pub(crate) fn choose_setup() -> Result<SetupChoice, RelayError> {
     writeln!(
         prompt.output,
         "\nox setup\n\
-         1. Sign in with ChatGPT (Codex subscription session)\n\
-         2. Sign in with Claude (Claude Code subscription session)\n\
-         3. Add an API key for Codex, Claude Code, or a shared gateway\n\
-         4. Enable Brave web search for both clients\n\
-         5. Done"
+         \x20 1. Sign in with ChatGPT   use your ChatGPT plan in Codex\n\
+         \x20 2. Sign in with Claude    use your Claude plan in Claude Code\n\
+         \x20 3. Add an API key         OpenRouter, Anthropic, OpenAI, or any compatible endpoint\n\
+         \x20 4. Enable web search      Brave Search for both clients\n\
+         \x20 5. Done"
     )?;
     prompt.ask_required_with("Choose 1–5", None, |choice| match choice {
         "1" => Ok(SetupChoice::Subscription("chatgpt")),
@@ -261,6 +261,41 @@ pub(crate) fn guided_provider(home: &Path) -> Result<(), RelayError> {
         }
     }
     Ok(())
+}
+
+/// Asks for the API key of each configured provider that has none, using the
+/// hidden prompt. Returns true when at least one key was saved.
+pub(crate) fn prompt_missing_keys(home: &Path) -> Result<bool, RelayError> {
+    let path = CodeoxConfig::path(home);
+    let config = CodeoxConfig::load(&path)?;
+    let keys = SavedKeys::for_config(home, &config)?;
+    let mut prompt = Prompt {
+        input: &mut std::io::stdin().lock(),
+        output: &mut std::io::stdout().lock(),
+    };
+    let mut saved_any = false;
+    for vendor in &config.vendors {
+        let Some(env) = vendor.env_key.as_deref() else {
+            continue;
+        };
+        if credential_state(&|name| keys.get(name), env) == CredentialState::Present {
+            continue;
+        }
+        writeln!(prompt.output, "{} has no API key yet.", vendor.name)?;
+        let Some(key) = prompt.guided_key(&vendor.name, env)? else {
+            continue;
+        };
+        let _lock = lock_config(home)?;
+        let current = CodeoxConfig::load(&path)?;
+        save_key(home, &current, env, vendor.base_url.as_str(), key)?;
+        writeln!(
+            prompt.output,
+            "Saved the {} key on this device.",
+            vendor.name
+        )?;
+        saved_any = true;
+    }
+    Ok(saved_any)
 }
 
 fn custom_route_id(id: &str, wire: WireKind) -> String {
@@ -578,12 +613,14 @@ fn provider_add_command(
 fn doctor_command(args: &[OsString], codex_home: &Path) -> Result<u8, RelayError> {
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
+    // A broken key file is reported by the doctor instead of ending it.
     let keys = match CodeoxConfig::load(&CodeoxConfig::path(codex_home)) {
-        Ok(config) => SavedKeys::for_config(codex_home, &config)?,
+        Ok(config) => SavedKeys::for_config(codex_home, &config).unwrap_or_default(),
         Err(_) => SavedKeys::default(),
     };
     let env = |name: &str| keys.get(name);
-    run_doctor(args, codex_home, &mut output, &env)
+    let color = crate::ui::stdout_color();
+    run_doctor_styled(args, codex_home, &mut output, &env, color)
 }
 
 // ---------------------------------------------------------------------------
@@ -1507,7 +1544,10 @@ pub(crate) fn run_provider_add(
 fn usage_error(output: &mut dyn Write, message: &str) -> Result<u8, RelayError> {
     writeln!(output, "error: {message}")?;
     writeln!(output)?;
-    write_add_usage(output)?;
+    writeln!(
+        output,
+        "Run `ox setup --help` for options and copyable examples."
+    )?;
     Ok(2)
 }
 
@@ -1886,17 +1926,20 @@ fn check_alias_collisions(config: &CodeoxConfig) -> Result<(), RelayError> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Level {
+    Pass,
     Info,
     Warning,
     Error,
 }
 
 impl Level {
-    fn as_str(self) -> &'static str {
+    /// The mark printed before a diagnostic and its colour code.
+    fn mark(self) -> (&'static str, &'static str) {
         match self {
-            Self::Info => "info",
-            Self::Warning => "warning",
-            Self::Error => "error",
+            Self::Pass => ("✓", crate::ui::GREEN),
+            Self::Info => ("·", crate::ui::DIM),
+            Self::Warning => ("!", crate::ui::YELLOW),
+            Self::Error => ("✗", crate::ui::RED),
         }
     }
 }
@@ -1912,6 +1955,12 @@ struct DoctorReport {
     mode: String,
     diagnostics: Vec<Diagnostic>,
     provider_count: usize,
+    /// The command that resolves the first error that has a known remedy.
+    next: Option<String>,
+    /// Stock clients found on PATH: (codex, claude).
+    clients: (bool, bool),
+    /// First configured provider key, used for the live-probe suggestion.
+    first_provider: Option<String>,
 }
 
 impl DoctorReport {
@@ -1921,6 +1970,25 @@ impl DoctorReport {
             mode: "unknown".to_owned(),
             diagnostics: Vec::new(),
             provider_count: 0,
+            next: None,
+            clients: (false, false),
+            first_provider: None,
+        }
+    }
+
+    fn pass(&mut self, scope: Option<String>, message: impl Into<String>) {
+        self.diagnostics.push(Diagnostic {
+            level: Level::Pass,
+            scope,
+            message: message.into(),
+        });
+    }
+
+    /// Records the remedy for an error. The first suggestion wins, so the
+    /// report ends with the command for the earliest problem.
+    fn suggest(&mut self, command: &str) {
+        if self.next.is_none() {
+            self.next = Some(command.to_owned());
         }
     }
 
@@ -1963,28 +2031,45 @@ impl DoctorReport {
         }
     }
 
-    fn render(&self) -> String {
+    fn render(&self, color: bool) -> String {
+        use crate::ui::{BOLD, paint};
+
         let mut out = String::new();
-        out.push_str("ox doctor (offline)\n");
+        out.push_str(&paint("ox doctor (offline)", BOLD, color));
+        out.push('\n');
         out.push_str(&format!("home: {}\n", self.home.display()));
         out.push_str(&format!("mode: {}\n", self.mode));
         out.push_str(&format!("providers: {}\n", self.provider_count));
-        let mut current: Option<&str> = None;
+
+        // Group by scope in first-seen order. Diagnostics without a scope are
+        // about the setup as a whole and are shown first.
+        let mut scopes: Vec<Option<&str>> = vec![None];
         for diagnostic in &self.diagnostics {
             let scope = diagnostic.scope.as_deref();
-            if scope != current {
-                if let Some(scope) = scope {
-                    out.push('\n');
-                    out.push_str(scope);
-                    out.push('\n');
-                }
-                current = scope;
+            if !scopes.contains(&scope) {
+                scopes.push(scope);
             }
-            out.push_str(&format!(
-                "  {}: {}\n",
-                diagnostic.level.as_str(),
-                diagnostic.message
-            ));
+        }
+        for scope in scopes {
+            let mut lines = self
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.scope.as_deref() == scope)
+                .peekable();
+            if lines.peek().is_none() {
+                continue;
+            }
+            out.push('\n');
+            out.push_str(&paint(scope.unwrap_or("setup"), BOLD, color));
+            out.push('\n');
+            for diagnostic in lines {
+                let (mark, code) = diagnostic.level.mark();
+                out.push_str(&format!(
+                    "  {} {}\n",
+                    paint(mark, code, color),
+                    diagnostic.message
+                ));
+            }
         }
         out.push_str(&format!(
             "\nsummary: {} provider(s), {} error(s), {} warning(s)\n",
@@ -1992,12 +2077,90 @@ impl DoctorReport {
             self.count(Level::Error),
             self.count(Level::Warning)
         ));
+        out.push_str(&format!(
+            "{} {}\n",
+            paint("next:", BOLD, color),
+            self.next_step()
+        ));
         out
+    }
+
+    /// The single command to run next.
+    fn next_step(&self) -> String {
+        if self.count(Level::Error) > 0 {
+            return match &self.next {
+                Some(command) => command.clone(),
+                None => format!(
+                    "edit {} to resolve the ✗ lines, then run ox doctor",
+                    self.home.join(crate::provider::CONFIG_FILE).display()
+                ),
+            };
+        }
+        match self.clients {
+            (false, false) => format!(
+                "{}   (installs Codex; ox needs Codex or Claude Code)",
+                crate::ui::install_command("codex")
+            ),
+            (true, _) => self.launch_step("ox codex"),
+            (false, true) => self.launch_step("ox claude"),
+        }
+    }
+
+    fn launch_step(&self, command: &str) -> String {
+        match &self.first_provider {
+            Some(provider) => format!(
+                "{command}   (or test one real request: ox doctor --live --provider {provider})"
+            ),
+            None => command.to_owned(),
+        }
+    }
+}
+
+/// Finds an executable named `name` in the directories of `path`.
+pub(crate) fn find_on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    std::env::split_paths(path?)
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+fn doctor_clients(report: &mut DoctorReport) {
+    let path = std::env::var_os("PATH");
+    let mut found = [false, false];
+    for (index, client) in ["codex", "claude"].into_iter().enumerate() {
+        let scope = Some("clients".to_owned());
+        match find_on_path(client, path.as_deref()) {
+            Some(location) => {
+                found[index] = true;
+                report.pass(scope, format!("{client} found at {}", location.display()));
+            }
+            None => report.info(
+                scope,
+                format!(
+                    "{client} is not installed. Install {} with: {}",
+                    crate::ui::client_name(client),
+                    crate::ui::install_command(client)
+                ),
+            ),
+        }
+    }
+    report.clients = (found[0], found[1]);
+}
+
+fn doctor_saved_keys(report: &mut DoctorReport, home: &Path) {
+    if let Err(error) = SavedKeys::load(home) {
+        let message = error.to_string();
+        if message == "could not parse ox-api-keys.json" {
+            report.suggest("ox doctor --fix");
+        }
+        report.error(Some("saved keys".to_owned()), message);
     }
 }
 
 fn doctor_report(home: &Path, env: &crate::provider::Env<'_>) -> DoctorReport {
     let mut report = DoctorReport::new(home);
+    doctor_clients(&mut report);
+    doctor_saved_keys(&mut report, home);
     let codeox_path = CodeoxConfig::path(home);
     if codeox_path.exists() {
         report.mode = "multi-vendor (codeox.toml)".to_owned();
@@ -2025,6 +2188,7 @@ fn doctor_multi_vendor(
     let document = match Document::parse(&text) {
         Ok(document) => document,
         Err(error) => {
+            report.suggest("ox doctor --fix");
             report.error(
                 None,
                 format!("could not parse codeox.toml: {}", error.message()),
@@ -2033,6 +2197,7 @@ fn doctor_multi_vendor(
         }
     };
     let Some(providers) = document.get("providers") else {
+        report.suggest("ox doctor --fix");
         report.error(None, "codeox.toml needs a [providers.<name>] table");
         return;
     };
@@ -2044,8 +2209,10 @@ fn doctor_multi_vendor(
         return;
     };
     if table.is_empty() {
+        report.suggest("ox doctor --fix");
         report.error(None, "codeox.toml must configure at least one provider");
     }
+    report.first_provider = table.iter().next().map(|(key, _)| key.to_owned());
 
     let mut diagnoses = Vec::new();
     for (key, item) in table.iter() {
@@ -2081,7 +2248,7 @@ fn doctor_multi_vendor(
                 doctor_credential(report, "search", &search.env_key, env);
             }
             if report.count(Level::Error) == errors_before {
-                report.info(
+                report.pass(
                     None,
                     format!(
                         "config: codeox.toml parses and validates ({} provider(s))",
@@ -2248,7 +2415,7 @@ fn doctor_provider(
         };
         match validate_provider(&form) {
             Ok(()) => {
-                report.info(Some(scope), "validation: ok");
+                report.pass(Some(scope), "validation: ok");
                 return ProviderDiagnosis {
                     key: key.to_owned(),
                     form: Some(form),
@@ -2480,6 +2647,8 @@ fn cross_provider_checks(report: &mut DoctorReport, diagnoses: &[ProviderDiagnos
     }
 }
 
+const KEY_REMEDY: &str = "ox setup   (choose the same service again to paste its key)";
+
 fn doctor_credential(
     report: &mut DoctorReport,
     scope: &str,
@@ -2493,18 +2662,24 @@ fn doctor_credential(
     // The value is inspected only for presence/emptiness; it is never stored
     // or formatted into a diagnostic.
     match credential_state(env, name) {
-        CredentialState::Present => report.info(
+        CredentialState::Present => report.pass(
             Some(scope.to_owned()),
             format!("credentials: {name} is available to ox (value hidden)"),
         ),
-        CredentialState::Missing => report.error(
-            Some(scope.to_owned()),
-            format!("credential reference {name} is not set; add the key in ox setup or export it before launching"),
-        ),
-        CredentialState::Empty => report.error(
-            Some(scope.to_owned()),
-            format!("credential reference {name} is set but empty"),
-        ),
+        CredentialState::Missing => {
+            report.suggest(KEY_REMEDY);
+            report.error(
+                Some(scope.to_owned()),
+                format!("credential reference {name} is not set; add the key in ox setup or export it before launching"),
+            );
+        }
+        CredentialState::Empty => {
+            report.suggest(KEY_REMEDY);
+            report.error(
+                Some(scope.to_owned()),
+                format!("credential reference {name} is set but empty"),
+            );
+        }
         CredentialState::Whitespace => report.warning(
             Some(scope.to_owned()),
             format!("credential reference {name} contains whitespace; the value will be treated as missing"),
@@ -2592,6 +2767,7 @@ fn doctor_legacy(report: &mut DoctorReport, home: &Path, env: &crate::provider::
         Ok(Some(text)) => text,
         Ok(None) => {
             report.mode = "not configured".to_owned();
+            report.suggest("ox setup");
             report.error(
                 None,
                 "neither codeox.toml nor config.toml exists. Run `ox setup` to add a provider",
@@ -2615,6 +2791,7 @@ fn doctor_legacy(report: &mut DoctorReport, home: &Path, env: &crate::provider::
     };
     let Some(id) = document.get("model_provider").and_then(Item::as_str) else {
         report.mode = "not configured".to_owned();
+        report.suggest("ox setup");
         report.error(
             scope,
             "No ox provider configured. Run `ox setup` to get started.",
@@ -2628,6 +2805,7 @@ fn doctor_legacy(report: &mut DoctorReport, home: &Path, env: &crate::provider::
         .and_then(Item::as_table)
     else {
         report.mode = "not configured".to_owned();
+        report.suggest("ox setup");
         report.error(
             scope,
             format!("Codex provider {id:?} has no custom provider settings. Run `ox setup` to add a provider for ox."),
@@ -2670,7 +2848,7 @@ fn doctor_legacy(report: &mut DoctorReport, home: &Path, env: &crate::provider::
 
     let errors_before = report.count(Level::Error);
     match crate::provider::Provider::load(home, env) {
-        Ok(_) => report.info(scope, "config.toml is valid; the legacy relay can start"),
+        Ok(_) => report.pass(scope, "config.toml is valid; the legacy relay can start"),
         Err(error) => {
             if report.count(Level::Error) == errors_before {
                 report.error(scope, error.to_string());
@@ -2746,19 +2924,33 @@ fn opt_str(table: &dyn TableLike, key: &str) -> Result<Option<String>, String> {
 // Doctor command
 // ---------------------------------------------------------------------------
 
+/// Plain-text entry point used by `tests/setup.rs`.
+#[allow(dead_code)]
 pub(crate) fn run_doctor(
     args: &[OsString],
     codex_home: &Path,
     output: &mut dyn Write,
     env: &crate::provider::Env<'_>,
 ) -> Result<u8, RelayError> {
+    run_doctor_styled(args, codex_home, output, env, false)
+}
+
+pub(crate) fn run_doctor_styled(
+    args: &[OsString],
+    codex_home: &Path,
+    output: &mut dyn Write,
+    env: &crate::provider::Env<'_>,
+    color: bool,
+) -> Result<u8, RelayError> {
     let mut strict = false;
+    let mut fix = false;
     for argument in args {
         let argument = argument
             .to_str()
             .ok_or("doctor arguments must be valid UTF-8")?;
         match argument {
             "--strict" => strict = true,
+            "--fix" => fix = true,
             "-h" | "--help" => {
                 write_doctor_usage(output)?;
                 return Ok(0);
@@ -2771,14 +2963,144 @@ pub(crate) fn run_doctor(
             }
         }
     }
+    if fix {
+        let repairs = repair(codex_home)?;
+        writeln!(
+            output,
+            "{}",
+            crate::ui::paint("repairs", crate::ui::BOLD, color)
+        )?;
+        if repairs.is_empty() {
+            writeln!(output, "  · nothing needed repair")?;
+        }
+        for line in &repairs {
+            writeln!(
+                output,
+                "  {} fixed: {line}",
+                crate::ui::paint("✓", crate::ui::GREEN, color)
+            )?;
+        }
+        writeln!(output)?;
+    }
     let report = doctor_report(codex_home, env);
-    write!(output, "{}", report.render())?;
+    write!(output, "{}", report.render(color))?;
     Ok(report.exit_code(strict))
+}
+
+// ---------------------------------------------------------------------------
+// Self-repair
+// ---------------------------------------------------------------------------
+
+/// Same file name as `picker::FAVORITES_FILE`; repeated here because this
+/// module is also compiled into integration tests without the picker.
+const FAVORITES_FILE_NAME: &str = "ox-favorites.json";
+/// A temporary file older than this was left by an interrupted write.
+const STALE_TEMPORARY_SECONDS: u64 = 600;
+
+/// Repairs the local state ox can safely repair itself and returns one line
+/// per repair. Unreadable files are renamed next to the original, never
+/// deleted, so every repair is reversible. Running it again is a no-op.
+pub(crate) fn repair(home: &Path) -> Result<Vec<String>, RelayError> {
+    let mut fixed = Vec::new();
+    if !home.is_dir() {
+        return Ok(fixed);
+    }
+    let _lock = lock_config(home)?;
+
+    let config_path = CodeoxConfig::path(home);
+    if let Ok(Some(text)) = read_existing_codeox(&config_path) {
+        let unusable = match Document::parse(&text) {
+            Err(_) => true,
+            Ok(document) => !document
+                .get("providers")
+                .and_then(Item::as_table)
+                .is_some_and(|table| !table.is_empty()),
+        };
+        if unusable {
+            let backup = quarantine(&config_path)?;
+            fixed.push(format!(
+                "codeox.toml could not be used, so it was moved to {backup}. Saved keys are kept; run ox setup to add your providers again"
+            ));
+        }
+    }
+
+    if SavedKeys::load(home)
+        .is_err_and(|error| error.to_string() == "could not parse ox-api-keys.json")
+    {
+        let backup = quarantine(&SavedKeys::path(home))?;
+        fixed.push(format!(
+            "ox-api-keys.json could not be read, so it was moved to {backup}. Paste your keys again in ox setup"
+        ));
+    }
+
+    let favorites = home.join(FAVORITES_FILE_NAME);
+    if let Ok(Some(text)) = read_optional_text_limited(&favorites, FAVORITES_FILE_NAME)
+        && serde_json::from_str::<Vec<String>>(&text).is_err()
+        && !favorites.is_symlink()
+    {
+        let backup = quarantine(&favorites)?;
+        fixed.push(format!(
+            "ox-favorites.json could not be read, so it was moved to {backup}. Star your models again in the picker"
+        ));
+    }
+
+    let mut removed = 0;
+    for entry in fs::read_dir(home)?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let temporary = [
+            ".codeox.toml.tmp-",
+            ".ox-api-keys.json.tmp-",
+            ".ox-favorites.json.tmp-",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix));
+        let stale = entry
+            .metadata()
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age.as_secs() >= STALE_TEMPORARY_SECONDS);
+        if temporary && stale && fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        fixed.push(format!(
+            "removed {removed} temporary file(s) left by an interrupted save"
+        ));
+    }
+    Ok(fixed)
+}
+
+/// Renames `path` to `<name>.broken-<unix seconds>` in the same directory and
+/// returns the new file name. Never overwrites an existing backup.
+fn quarantine(path: &Path) -> Result<String, RelayError> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("invalid file name")?;
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    let mut backup = format!("{name}.broken-{seconds}");
+    let mut attempt = 1;
+    while path.with_file_name(&backup).symlink_metadata().is_ok() {
+        attempt += 1;
+        backup = format!("{name}.broken-{seconds}-{attempt}");
+    }
+    fs::rename(path, path.with_file_name(&backup))
+        .map_err(|error| format!("could not move {name} aside: {error}"))?;
+    Ok(backup)
 }
 
 fn write_doctor_usage(output: &mut dyn Write) -> Result<(), RelayError> {
     writeln!(output, "Usage:")?;
-    writeln!(output, "  ox doctor [--strict]")?;
+    writeln!(output, "  ox doctor [--fix] [--strict]")?;
     writeln!(
         output,
         "  Without API providers, shows recognized native client sign-ins."
@@ -2809,6 +3131,14 @@ fn write_doctor_usage(output: &mut dyn Write) -> Result<(), RelayError> {
         "With --live, sends one streamed inference probe to the selected vendor."
     )?;
     writeln!(output)?;
+    writeln!(
+        output,
+        "  --fix       repair what ox can repair itself, then run the check. Unreadable"
+    )?;
+    writeln!(
+        output,
+        "              files are moved to <name>.broken-<time>, never deleted"
+    )?;
     writeln!(
         output,
         "  --strict    exit non-zero when there are warnings as well as errors"
