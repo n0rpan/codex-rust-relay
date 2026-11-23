@@ -432,6 +432,10 @@ const CODEX_COMMANDS: &[&str] = &[
     "fork",
     "cloud",
     "features",
+    "plugin",
+    "marketplace",
+    "app",
+    "execpolicy",
 ];
 
 /// Returns the ox command a mistyped first word most likely meant. Exact ox
@@ -1788,6 +1792,10 @@ mod tests {
             "mcp",
             "debug",
             "fork",
+            "plugin",
+            "marketplace",
+            "app",
+            "execpolicy",
             "--model",
             "-c",
             "fix the failing test",
