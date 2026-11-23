@@ -5,13 +5,15 @@
 //! its body is reframed incrementally. Nothing is buffered end to end, so a
 //! long answer streams as it arrives. A stream that ends before a terminal
 //! Responses event is reported as `response.failed`; it is never completed
-//! silently. Dropping the downstream body cancels the upstream request.
+//! silently. Dropping the downstream body cancels the upstream request. Once
+//! the terminal event is sent, the short rest of the upstream body is read in
+//! the background so its connection is reused by the next request.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::stream::{self, Stream, StreamExt};
 use http_body_util::{BodyExt, StreamBody};
@@ -37,6 +39,11 @@ const MAX_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_TRANSLATED_STREAM_BYTES: usize = 32 * 1024 * 1024;
 /// Longest upstream error message relayed back.
 const MAX_ERROR_CHARS: usize = 400;
+/// Longest a finished stream may take to deliver the end of its HTTP body
+/// before its connection is closed instead of reused.
+const RECYCLE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Most trailing bytes read after a terminal event before giving up on reuse.
+const RECYCLE_MAX_BYTES: usize = 64 * 1024;
 
 pub struct Translation<'a> {
     pub vendor: &'a Vendor,
@@ -267,6 +274,32 @@ fn chat_options(options: &ChatOptions) -> chat_completions::AdapterOptions {
     }
 }
 
+/// Read a finished upstream body to its end in the background.
+///
+/// The translators stop at the protocol's terminal event, which arrives before
+/// the HTTP body's own end marker. Dropping the body at that point makes the
+/// HTTP client close the connection, so the next request would pay a new TCP
+/// and TLS handshake. Draining the short tail returns the connection to the
+/// pool instead. The downstream response never waits for this.
+pub(crate) fn recycle<S, E>(mut body: S)
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: Send + 'static,
+{
+    tokio::spawn(async move {
+        let drain = async {
+            let mut budget = RECYCLE_MAX_BYTES;
+            while let Some(Ok(chunk)) = body.next().await {
+                match budget.checked_sub(chunk.len()) {
+                    Some(left) => budget = left,
+                    None => break,
+                }
+            }
+        };
+        let _ = tokio::time::timeout(RECYCLE_TIMEOUT, drain).await;
+    });
+}
+
 enum Translator {
     Anthropic(anthropic::ResponseTranslator),
     Chat(chat_completions::ResponseTranslator),
@@ -344,6 +377,10 @@ impl SseState {
                             if self.translator.is_terminal() {
                                 self.terminal_sent = true;
                                 self.done = true;
+                                recycle(std::mem::replace(
+                                    &mut self.upstream,
+                                    stream::empty().boxed(),
+                                ));
                                 return;
                             }
                         }
@@ -637,6 +674,42 @@ mod tests {
         assert!(event.starts_with("event: response.failed\n"));
         assert!(event.contains("translated response limit"));
         assert!(state.queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recycle_reads_a_finished_body_to_its_end() {
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&ended);
+        let tail = stream::once(async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, RelayError>(Bytes::new())
+        });
+        let body = stream::iter([Ok::<_, RelayError>(Bytes::from_static(b"tail"))]).chain(tail);
+        recycle(Box::pin(body));
+        for _ in 0..100 {
+            if ended.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(ended.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn recycle_gives_up_on_an_oversized_tail() {
+        let polled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&polled);
+        let chunk = Bytes::from(vec![b'x'; RECYCLE_MAX_BYTES / 2]);
+        let body = stream::repeat_with(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, RelayError>(chunk.clone())
+        });
+        recycle(Box::pin(body));
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        // Two chunks use the whole budget; the third ends the drain.
+        assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[test]

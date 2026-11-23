@@ -458,7 +458,9 @@ async fn collect_message(
         }
     }
 
-    if !converter.is_terminal() {
+    if converter.is_terminal() {
+        upstream::recycle(stream);
+    } else {
         if let Err(message) = framer.finish() {
             return messages_error(
                 StatusCode::BAD_GATEWAY,
@@ -609,6 +611,8 @@ impl MessagesState {
                             if self.converter.is_terminal() {
                                 self.terminal_sent = true;
                                 self.done = true;
+                                let upstream: ByteStream = Box::pin(stream::empty());
+                                upstream::recycle(std::mem::replace(&mut self.upstream, upstream));
                                 return;
                             }
                         }
@@ -1513,6 +1517,75 @@ mod tests {
         assert_eq!(events[0]["message"]["model"], "vendor/upstream-model");
         assert_eq!(events[2]["delta"]["text"], "Hello");
         assert_eq!(events[4]["delta"]["stop_reason"], "end_turn");
+    }
+
+    /// A complete Responses stream followed by a tail that stays open until
+    /// `release` fires and then records that it was read to its end.
+    fn stream_with_held_tail() -> (
+        ByteStream,
+        tokio::sync::oneshot::Sender<()>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&drained);
+        let tail = stream::once(async move {
+            let _ = held.await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, RelayError>(Bytes::new())
+        });
+        let body = stream::iter([Ok::<_, RelayError>(Bytes::from(responses_stream()))]).chain(tail);
+        (Box::pin(body), release, drained)
+    }
+
+    async fn wait_until_drained(drained: &std::sync::atomic::AtomicBool) -> bool {
+        for _ in 0..100 {
+            if drained.load(std::sync::atomic::Ordering::SeqCst) {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_finished_messages_stream_ends_at_once_then_drains_its_upstream() {
+        let (upstream, release, drained) = stream_with_held_tail();
+        let response = stream_messages(
+            upstream,
+            "vendor/upstream-model",
+            Arc::new(Vec::new()),
+            KEEPALIVE_INTERVAL,
+        );
+        // The upstream body is still open: the client stream must not wait.
+        let events = tokio::time::timeout(Duration::from_secs(2), collect_sse(response))
+            .await
+            .expect("the Messages stream must end at the terminal event");
+        assert_eq!(events.last().unwrap()["type"], "message_stop");
+        assert!(!drained.load(std::sync::atomic::Ordering::SeqCst));
+        let _ = release.send(());
+        assert!(
+            wait_until_drained(&drained).await,
+            "the upstream body must be read to its end so its connection is reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_collected_message_answers_at_once_then_drains_its_upstream() {
+        let (upstream, release, drained) = stream_with_held_tail();
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            collect_message(upstream, "vendor/x", &[]),
+        )
+        .await
+        .expect("the message must be answered at the terminal event");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!drained.load(std::sync::atomic::Ordering::SeqCst));
+        let _ = release.send(());
+        assert!(
+            wait_until_drained(&drained).await,
+            "the upstream body must be read to its end so its connection is reused"
+        );
     }
 
     #[tokio::test]

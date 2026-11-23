@@ -251,9 +251,11 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         (LaunchConfig::Legacy(_), _) => (None, SearchLaunch::Disabled),
     };
 
-    let bundled = match &codex_profile {
-        Some(home) => bundled_catalog(home, &env_refs).await?,
-        None => BundledModels::default(),
+    let bundled = async {
+        match &codex_profile {
+            Some(home) => bundled_catalog(home, &env_refs).await,
+            None => Ok(BundledModels::default()),
+        }
     };
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let origin = format!("http://{}", listener.local_addr()?);
@@ -270,7 +272,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
 
     let mut app = match config {
         LaunchConfig::Codeox(config) => {
-            App::codeox(
+            App::codeox_with(
                 config,
                 bundled,
                 &token,
@@ -281,7 +283,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
             )
             .await?
         }
-        LaunchConfig::Legacy(provider) => App::legacy(provider, bundled, &token, client)?,
+        LaunchConfig::Legacy(provider) => App::legacy(provider, bundled.await?, &token, client)?,
     };
 
     let classifier = classifier
@@ -454,6 +456,30 @@ impl App {
         env: &Env<'_>,
         search: Option<BraveSearch>,
     ) -> Result<Self, RelayError> {
+        Self::codeox_with(
+            config,
+            std::future::ready(Ok(bundled)),
+            token,
+            client,
+            max_request_bytes,
+            env,
+            search,
+        )
+        .await
+    }
+
+    /// Like [`App::codeox`], but the bundled Codex catalog is still loading.
+    /// It is awaited concurrently with provider model discovery so a launch
+    /// waits for the slower of the two instead of their sum.
+    async fn codeox_with(
+        config: CodeoxConfig,
+        bundled: impl Future<Output = Result<BundledModels, RelayError>>,
+        token: &str,
+        client: Client,
+        max_request_bytes: usize,
+        env: &Env<'_>,
+        search: Option<BraveSearch>,
+    ) -> Result<Self, RelayError> {
         let vendors = config.vendors;
         let mut secrets = Vec::new();
         let auths: Vec<_> = vendors
@@ -476,7 +502,7 @@ impl App {
         let mut discovered: Vec<_> = std::iter::repeat_with(|| None)
             .take(vendors.len())
             .collect();
-        {
+        let discovery = async {
             let client = &client;
             let requests: Vec<_> = vendors
                 .iter()
@@ -506,7 +532,9 @@ impl App {
                     }
                 }
             }
-        }
+            Ok::<(), RelayError>(())
+        };
+        let (bundled, ()) = tokio::try_join!(bundled, discovery)?;
 
         let models_by_vendor: Vec<_> = vendors
             .iter()
@@ -970,13 +998,25 @@ async fn serve(listener: TcpListener, relay: Arc<App>) -> std::io::Result<()> {
     .await
 }
 
+/// Accept one client connection with Nagle's algorithm turned off.
+///
+/// Streamed tokens are many small writes. With Nagle on, the kernel holds a
+/// small write back until the client acknowledges the previous one, and a
+/// client that is busy rendering delays that acknowledgement by up to 40 ms.
+/// Failing to set the option is not fatal: the connection still works.
+async fn accept_connection(listener: &TcpListener) -> std::io::Result<tokio::net::TcpStream> {
+    let (socket, _) = listener.accept().await?;
+    let _ = socket.set_nodelay(true);
+    Ok(socket)
+}
+
 async fn serve_requests<F, Fut>(listener: TcpListener, handle: F) -> std::io::Result<()>
 where
     F: Fn(Request<Incoming>) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Response<RelayBody>> + Send + 'static,
 {
     loop {
-        let (socket, _) = listener.accept().await?;
+        let socket = accept_connection(&listener).await?;
         let handle = handle.clone();
         tokio::spawn(async move {
             let service = service_fn(move |request| {
@@ -1748,6 +1788,94 @@ base_url = "{beta}"
 env_key = "BETA_KEY"
 "#
         )
+    }
+
+    #[tokio::test]
+    async fn accepted_relay_connections_disable_nagle() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let socket = accept_connection(&listener).await.unwrap();
+        assert!(socket.nodelay().unwrap());
+    }
+
+    fn one_vendor_config(base: &str) -> String {
+        format!(
+            r#"
+[providers.alpha]
+name = "Alpha"
+base_url = "{base}"
+env_key = "ALPHA_KEY"
+"#
+        )
+    }
+
+    #[tokio::test]
+    async fn the_bundled_catalog_loads_while_providers_are_discovered() {
+        let mock = spawn_mock(Ok(models_body(&["discovered"])), None).await;
+        let environment = |name: &str| (name == "ALPHA_KEY").then(|| "alpha-secret".to_owned());
+        let hits = Arc::clone(&mock.hits);
+        // Resolves only after the discovery request reached the vendor, so a
+        // launch that waited for the bundled catalog first would never finish.
+        let bundled = async move {
+            while hits.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            Ok(bundled_fixture())
+        };
+        let app = tokio::time::timeout(
+            Duration::from_secs(5),
+            App::codeox_with(
+                CodeoxConfig::load_from_str(&one_vendor_config(&mock.base)).unwrap(),
+                bundled,
+                RELAY_TOKEN,
+                test_client(),
+                1 << 20,
+                &environment,
+                None,
+            ),
+        )
+        .await
+        .expect("the bundled catalog and model discovery must run concurrently")
+        .unwrap();
+        let slugs: Vec<_> = app
+            .visible_models()
+            .filter_map(|entry| entry["slug"].as_str())
+            .collect();
+        assert!(slugs.contains(&"alpha/discovered"), "{slugs:?}");
+    }
+
+    #[tokio::test]
+    async fn a_bundled_catalog_failure_does_not_wait_for_discovery() {
+        // The barrier needs two waiters and only one request arrives, so
+        // discovery never answers on its own.
+        let mock = spawn_mock_behavior(Behavior {
+            models: Ok(models_body(&["discovered"])),
+            catalog_barrier: Some(tokio::sync::Barrier::new(2)),
+            redirect: None,
+            responses_error: None,
+        })
+        .await;
+        let environment = |name: &str| (name == "ALPHA_KEY").then(|| "alpha-secret".to_owned());
+        let bundled = async { Err::<BundledModels, RelayError>("bundled catalog failed".into()) };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            App::codeox_with(
+                CodeoxConfig::load_from_str(&one_vendor_config(&mock.base)).unwrap(),
+                bundled,
+                RELAY_TOKEN,
+                test_client(),
+                1 << 20,
+                &environment,
+                None,
+            ),
+        )
+        .await
+        .expect("a failed bundled catalog must end the launch at once");
+        assert_eq!(
+            result.err().map(|error| error.to_string()).as_deref(),
+            Some("bundled catalog failed")
+        );
     }
 
     #[tokio::test]

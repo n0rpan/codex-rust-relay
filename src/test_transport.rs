@@ -16,6 +16,7 @@
 
 use std::convert::Infallible;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -176,6 +177,9 @@ enum MockBehavior {
     Endless(Payload),
     /// Send one chunk, then never write again (a stalled vendor).
     StallAfterFirst(Payload),
+    /// Send a complete Chat Completions stream through `[DONE]`, then keep the
+    /// HTTP body open until the test releases `MockState::eof_gate`.
+    FinishThenHoldEof,
 }
 
 #[derive(Debug)]
@@ -191,6 +195,10 @@ struct MockState {
     /// Set when the server-side HTTP connection ends, i.e. when the relay
     /// released the upstream request and dropped its socket.
     closed_at: Mutex<Option<Instant>>,
+    /// TCP connections the relay opened to this vendor.
+    connections: AtomicUsize,
+    /// Released by a test to let a `FinishThenHoldEof` body end.
+    eof_gate: tokio::sync::Notify,
 }
 
 impl MockState {
@@ -228,6 +236,7 @@ impl MockVendor {
                     let Ok((socket, _)) = listener.accept().await else {
                         break;
                     };
+                    state.connections.fetch_add(1, Ordering::SeqCst);
                     let state = Arc::clone(&state);
                     tokio::spawn(async move {
                         let service_state = Arc::clone(&state);
@@ -254,6 +263,10 @@ impl MockVendor {
 
     fn hits(&self) -> usize {
         self.state.hits.lock().unwrap().len()
+    }
+
+    fn connections(&self) -> usize {
+        self.state.connections.load(Ordering::SeqCst)
     }
 
     fn authorization(&self) -> Option<String> {
@@ -288,7 +301,7 @@ impl MockVendor {
 
 async fn mock_response(
     behavior: MockBehavior,
-    state: &MockState,
+    state: &Arc<MockState>,
     request: Request<Incoming>,
 ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, Infallible>> {
     let (parts, body) = request.into_parts();
@@ -313,6 +326,7 @@ async fn mock_response(
             MockBehavior::StallAfterFirst(payload) => {
                 Box::pin(once_then_silence(chunk(payload, 0)))
             }
+            MockBehavior::FinishThenHoldEof => Box::pin(finished_then_held(Arc::clone(state))),
         };
     let mut response = Response::new(StreamBody::new(stream).boxed_unsync());
     response
@@ -333,6 +347,35 @@ fn endless(payload: Payload) -> impl Stream<Item = Result<Frame<Bytes>, Infallib
 fn once_then_silence(first: Bytes) -> impl Stream<Item = Result<Frame<Bytes>, Infallible>> + Send {
     stream::once(async move { Ok(Frame::data(first)) })
         .chain(stream::pending::<Result<Frame<Bytes>, Infallible>>())
+}
+
+/// A complete Chat Completions answer in one write. The body then stays open
+/// until the test releases the gate, like a vendor whose HTTP end marker
+/// arrives in a later packet than `[DONE]`.
+fn finished_then_held(
+    state: Arc<MockState>,
+) -> impl Stream<Item = Result<Frame<Bytes>, Infallible>> + Send {
+    stream::unfold(false, move |sent| {
+        let state = Arc::clone(&state);
+        async move {
+            if sent {
+                state.eof_gate.notified().await;
+                return None;
+            }
+            let delta = json!({
+                "id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": 0,
+                "model": "upstream-model",
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hi"}, "finish_reason": null}]
+            });
+            let stop = json!({
+                "id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": 0,
+                "model": "upstream-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            });
+            let events = format!("data: {delta}\n\ndata: {stop}\n\ndata: [DONE]\n\n");
+            Some((Ok(Frame::data(Bytes::from(events))), true))
+        }
+    })
 }
 
 fn chunk(payload: Payload, index: usize) -> Bytes {
@@ -562,4 +605,75 @@ async fn a_stalled_responses_upstream_does_not_hang_the_downstream() {
     eprintln!(
         "stalled pass-through surfaced a downstream transport error after {elapsed:?}: {error}"
     );
+}
+
+/// The translators stop at the wire's terminal event, before the vendor's HTTP
+/// body ends. The downstream stream must end right there, and the vendor
+/// connection must still go back to the pool, so the next request does not pay
+/// a new TCP and TLS handshake.
+#[tokio::test]
+async fn a_finished_translated_stream_keeps_its_upstream_connection() {
+    let mock = MockVendor::spawn(MockBehavior::FinishThenHoldEof).await;
+    let relay = start_relay(
+        &config(&mock.base, Some("chat_completions")),
+        Duration::from_secs(60),
+    )
+    .await;
+    let client = downstream_client();
+
+    for _ in 0..3 {
+        let response = post_streaming(&relay, &client, "alpha/upstream-model").await;
+        // The vendor body is still open here: the downstream stream must not
+        // wait for it.
+        let body = tokio::time::timeout(TEST_DEADLINE, response.text())
+            .await
+            .expect("the downstream stream must end at the terminal event")
+            .expect("the downstream body must be readable");
+        assert!(
+            body.contains("event: response.completed"),
+            "the stream must complete normally, got: {body}"
+        );
+        // Let the vendor end its body, then give the relay a moment to put
+        // the connection back.
+        mock.state.eof_gate.notify_one();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert_eq!(mock.hits(), 3, "three upstream requests were made");
+    assert_eq!(
+        mock.connections(),
+        1,
+        "every request after the first must reuse the pooled vendor connection"
+    );
+}
+
+/// A token must reach the client as soon as the vendor sends it, without
+/// waiting for a later chunk to arrive.
+async fn assert_first_token_is_not_held_back(payload: Payload, wire: Option<&str>) {
+    let mock = MockVendor::spawn(MockBehavior::StallAfterFirst(payload)).await;
+    let relay = start_relay(&config(&mock.base, wire), Duration::from_secs(60)).await;
+    let client = downstream_client();
+
+    let response = post_streaming(&relay, &client, "alpha/upstream-model").await;
+    let mut body = response.bytes_stream();
+    let mut seen = String::new();
+    while !seen.contains("event: response.output_text.delta") {
+        let next = tokio::time::timeout(TEST_DEADLINE, body.next())
+            .await
+            .expect("the only token must be forwarded while the vendor is silent")
+            .expect("the stream must stay open")
+            .expect("the chunk must be readable");
+        seen.push_str(&String::from_utf8_lossy(&next));
+    }
+    assert_eq!(mock.hits(), 1);
+}
+
+#[tokio::test]
+async fn a_translated_token_is_forwarded_without_waiting_for_the_next_chunk() {
+    assert_first_token_is_not_held_back(Payload::Chat, Some("chat_completions")).await;
+}
+
+#[tokio::test]
+async fn a_responses_token_is_forwarded_without_waiting_for_the_next_chunk() {
+    assert_first_token_is_not_held_back(Payload::Responses, None).await;
 }
