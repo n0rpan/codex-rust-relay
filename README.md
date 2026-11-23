@@ -13,9 +13,10 @@ against the latest official clients. [Install Codex](https://developers.openai.c
 [Install Claude Code](https://code.claude.com/docs/en/quickstart)
 
 Sign in to GitHub and open a successful [CI run](https://github.com/n0rpan/codex-rust-relay/actions/workflows/ci.yml)
-with **Release binaries** jobs. Download your platform's artifact from **Artifacts** at the
-bottom of the run. Unzip it, then run these commands from the folder containing the `.tar.gz`
-and its checksum:
+with **Release binaries** jobs on the branch you want to install. Published snapshots
+are retained for 30 days. The binaries target Linux with **glibc 2.39 or newer** (such as
+Ubuntu 24.04) and **macOS 11 or newer**. Download your platform’s artifact from **Artifacts**.
+Unzip it, then run these commands from the folder containing the `.tar.gz` and its checksum:
 
 ```sh
 # Run this in the folder for a single platform artifact.
@@ -23,7 +24,7 @@ if command -v sha256sum >/dev/null 2>&1; then
   sha256sum -c ox-*.tar.gz.sha256 && tar -xzf ox-*.tar.gz
 else
   shasum -a 256 -c ox-*.tar.gz.sha256 && tar -xzf ox-*.tar.gz
-fi && ./ox --help
+fi && ./ox --version
 ```
 
 Install it for your user account and make it available in this shell:
@@ -66,13 +67,15 @@ ox provider add openrouter \
 ox doctor
 ```
 
-Look for **0 errors**. `doctor` prints the config directory and checks the file and
-credential references offline. The next step tests the live connection. Run
+Look for **0 error(s)**. `doctor` shows where to find `codeox.toml` on its `home:` line,
+lists static model aliases, and checks credential references offline. The next step tests
+the live connection. Run
 `ox provider add` without arguments if you prefer prompts.
 
 ## 3. Try a session
 
-From your project directory, run one of these commands:
+From your project directory, run the command for your client with the alias shown by
+`ox provider add`:
 
 ```sh
 ox codex --model openrouter/openai/gpt-5.4-mini
@@ -102,6 +105,7 @@ Use the same alias, **`provider/model-id`**, in either client. Add more provider
 | What you see | What to try |
 | --- | --- |
 | `ox: command not found` | Run `./ox --help` in the extracted folder. Move the binary to a directory on your `PATH`. |
+| Linux reports a missing glibc version, or macOS blocks the downloaded binary | Use the [source installation](docs/configuration.md#install-options) and run `ox --version` again. |
 | Client missing, or Codex’s bundled model catalog fails to load | Run `codex --version` or `claude --version` from the same terminal. For Codex also try `codex debug models --bundled`. If the problem began after an update, check the latest-client CI job. |
 | `provider … is unavailable` | Run `ox doctor` and load the exact variable it names in the shell that launches ox. |
 | `unknown model`, or an empty picker | Pass the full alias from setup. Check the vendor model ID, or pin it with a [static model entry](docs/configuration.md#model-names-and-discovery). |
@@ -109,4 +113,4 @@ Use the same alias, **`provider/model-id`**, in either client. Add more provider
 | Provider returns `404` or rejects the request format | Check that the [base URL and wire format](docs/configuration.md#add-a-provider) match the endpoint. Leave the request path, such as `/chat/completions`, off the base URL. |
 | Provider returns `429` | Check that provider’s quota and rate limits, or choose another configured model. |
 | A direct OpenAI key returns `codex_byok_restricted_by_api_credit_promo` | That account’s API-credit plan rejected the Codex request in live testing. Use an eligible provider credential, or launch plain `codex` for your usual ChatGPT session. |
-| Brave configured but search unavailable | Check the Brave key with `ox doctor`, then [check the client’s search policy](docs/configuration.md#web-search-with-brave). |
+| Brave configured but search unavailable | Run `ox doctor` to check that the key variable is set and see any Codex policy conflict. For one live Codex launch, use `ox codex -c 'web_search="live"' --model <alias>`. Brave checks the key when a search runs. [Search setup](docs/configuration.md#web-search-with-brave) |

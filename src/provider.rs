@@ -48,6 +48,29 @@ pub fn process_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+pub fn configured_web_search_policy(
+    document: &Document<&str>,
+    profile: Option<&str>,
+) -> Option<String> {
+    let profile = profile.or_else(|| document.get("profile").and_then(Item::as_str));
+    let profile_policy = profile.and_then(|profile| {
+        document
+            .get("profiles")?
+            .as_table()?
+            .get(profile)?
+            .as_table()?
+            .get("web_search")?
+            .as_str()
+    });
+    profile_policy
+        .or_else(|| document.get("web_search").and_then(Item::as_str))
+        .map(normalise_web_search_policy)
+}
+
+pub fn normalise_web_search_policy(value: &str) -> String {
+    value.trim().trim_matches(['"', '\'']).to_ascii_lowercase()
+}
+
 pub fn bearer(token: &str) -> Result<HeaderValue, RelayError> {
     Ok(HeaderValue::from_str(&format!("Bearer {token}"))?)
 }

@@ -5,8 +5,8 @@
 ## Install options
 
 Pick the GitHub Actions artifact that matches `uname -sm` from a run with
-**Release binaries** jobs. The runner builds the archive,
-checks its SHA-256, extracts it, and runs the copy inside. Sign in to GitHub to download
+**Release binaries** jobs. CI checks the archive's SHA-256, extracts it, and runs the
+copy inside. Sign in to GitHub to download
 artifacts while they are retained (30 days). [Download instructions](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/download-workflow-artifacts)
 
 | Machine | Artifact name | Target requirements |
@@ -17,12 +17,12 @@ artifacts while they are retained (30 days). [Download instructions](https://doc
 | macOS Intel | `ox-x86_64-apple-darwin` | macOS 11 deployment target |
 
 To build on your own machine, check out this repository and run the following from its root.
-CI uses Rust 1.100.0. Building from source is also an option if the Linux artifact requires a
-newer glibc than you have.
+CI uses Rust 1.100.0. Build from source if the Linux artifact needs a newer glibc or
+if macOS Gatekeeper blocks the CI download. [Apple’s Gatekeeper guidance](https://support.apple.com/en-us/102445)
 
 ```sh
 cargo install --locked --path .
-ox --help
+ox --version
 ```
 
 Cargo installs into `${CARGO_HOME:-$HOME/.cargo}/bin` by default. Add the install directory to
@@ -66,7 +66,8 @@ give it a separate provider name such as `anthropic-legacy` to keep both routes.
 `ox provider add --help` lists all flags. Running `ox provider add` without arguments in
 a terminal prompts for the fields. The command creates `codeox.toml` or appends a provider,
 preserving existing settings. To change an existing entry, edit the file and relaunch.
-`ox doctor --strict` also treats warnings as errors.
+For static models, setup prints their aliases and launch commands. `ox doctor --strict`
+also treats warnings as errors.
 
 ### Where settings and keys live
 
@@ -119,7 +120,8 @@ for that provider. A bare model ID is accepted only if routing can resolve it un
 If Codex shows a stale picker, check for `model_catalog_json` in `$CODEX_HOME/config.toml`.
 It takes precedence over the live catalog. Claude Code offers a limited set of custom slots
 by default. Set `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` to opt in to its gateway catalog,
-or use `--model <alias>` directly. Use qualified names to avoid built-in Claude aliases like
+or use `--model <alias>` directly. Pass an explicit alias on the first Codex launch too,
+since Codex may already have a different default model. Use qualified names to avoid built-in Claude aliases like
 `sonnet` being rewritten by the client. [Claude Code model discovery](https://code.claude.com/docs/en/llm-gateway-protocol#model-discovery)
 
 ### Protocol-specific options
@@ -152,34 +154,41 @@ timeout_seconds = 30
 Ask for a web search and source links. ox sends the query and applicable filters to Brave.
 Citations returned to the model become part of that provider's conversation. The Brave key
 stays in ox. LLM Context is used when the plan supports it. An entitlement error switches
-that client to Brave Web Search for the rest of the launch.
+that client to Brave Web Search for the rest of the launch and prints a notice to stderr.
 
 - **Codex** uses the live standalone search tool. An explicit `disabled`, `cached`, or
   `indexed` policy in a launch flag, the selected profile, or the top level of
-  `config.toml` takes precedence. For live search on one launch, use
-  `ox codex -c 'web_search="live"'`. Without Brave, hosted search
+  `config.toml` takes precedence. `ox doctor` checks the configured default profile and
+  top-level settings. For live search on one launch, use
+  `ox codex -c 'web_search="live"' --model <alias>`. Without Brave, hosted search
   is vendor-dependent on Responses-only setups. With any translated vendor and no explicit
   search policy, ox disables hosted search for the launch.
 - **Claude Code** uses its existing `WebSearch` tool and permission rules. Its separate
   `WebFetch` tool fetches URLs under Claude Code's network and permission settings. Without
   Brave, Anthropic can still run provider-side search when its endpoint supports it. For a
   translated route without Brave, add `"WebSearch"` to Claude Code's
-  `permissions.deny` list to hide the unsupported tool.
+  `permissions.deny` list to hide the unsupported tool:
+
+```json
+{
+  "permissions": { "deny": ["WebSearch"] }
+}
+```
 
 See [search limits](compatibility.md#search-and-fetch) for filters and supported operations.
 
 ## Claude Code Auto mode
 
 The [CLI settings example](../examples/claude-code-auto.settings.json) retains Claude
-Code's default classifier and asks before `WebFetch`. Use the example only where it fits
-your existing Claude Code settings. Paths below are relative to the checkout root.
+Code's default classifier and asks before `WebFetch`. The commands below pass the
+same settings inline, so they work from your own project directory.
 
 Add `claude-sonnet-5` on the current Anthropic route or use the
 [provider example](../examples/claude-providers.toml), then launch:
 
 ```sh
 ox claude --model anthropic/claude-sonnet-5 --permission-mode auto \
-  --settings ./examples/claude-code-auto.settings.json
+  --settings '{"autoMode":{"environment":["$defaults"]},"permissions":{"ask":["WebFetch"]}}'
 ```
 
 For a translated model, route Claude Code's classifier requests to a configured model that
@@ -189,7 +198,7 @@ Anthropic classifier route as above.
 ```sh
 CLAUDE_CODE_AUTO_MODE_SERVER=0 CLAUDE_CODE_AUTO_MODE_MODEL=anthropic/claude-sonnet-5 \
   ox claude --model openrouter/openai/gpt-5.4-mini --permission-mode auto \
-  --settings ./examples/claude-code-auto.settings.json
+  --settings '{"autoMode":{"environment":["$defaults"]},"permissions":{"ask":["WebFetch"]}}'
 ```
 
 The classifier receives action context through the Anthropic route. Check `/status` for
@@ -205,8 +214,9 @@ once they have a separate stable inference gateway. See [Desktop scope](compatib
 
 - **Codex** uses your existing Codex home. Run `codex` for your usual ChatGPT sign-in
   and `ox codex` for API-backed sessions. In the project, use `ox codex resume` to pick
-  an API-backed thread. Use a fresh thread and a reviewed summary to move between native
-  ChatGPT and API-backed sessions.
+  an API-backed thread. The picker contains threads from both launchers, so select one
+  you started through ox. Use a fresh thread and a reviewed summary to move between
+  native ChatGPT and API-backed sessions.
 - **Codex vendor switches** use the full alias in `/model` between completed turns.
   The new provider receives the portable conversation and tool history. ox keeps opaque
   provider continuation data scoped to its original route. Switch only when you intend

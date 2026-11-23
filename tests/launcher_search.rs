@@ -123,6 +123,20 @@ fn read(path: &Path) -> String {
 }
 
 #[test]
+fn version_is_available_without_a_home_or_stock_client() {
+    let output = Command::new(binary())
+        .env_clear()
+        .arg("--version")
+        .output()
+        .expect("run ox --version");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        concat!("ox ", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
 fn provider_add_creates_the_shared_home_without_a_client_installed() {
     let home = TempDir::new("launcher-subcommands");
     let config_home = home.0.join("new-home");

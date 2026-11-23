@@ -889,10 +889,27 @@ pub(crate) fn run_provider_add(
             "  models: discovery on; {count} static model(s), also used as overrides"
         )?,
     }
-    writeln!(
-        prompt.output,
-        "Next: run `ox doctor` to verify the configuration, then start a client with `ox codex` or `ox claude`."
-    )?;
+    let mut first_alias = None;
+    for model in &form.models {
+        let alias = alias_for(&form.key, &model.id, model.alias.as_deref())?;
+        writeln!(prompt.output, "  model alias: {alias}")?;
+        first_alias.get_or_insert(alias);
+    }
+    if let Some(alias) = first_alias {
+        let quoted = format!("'{}'", alias.replace('\'', "'\\''"));
+        writeln!(
+            prompt.output,
+            "Next: run `ox doctor`, then choose a client:"
+        )?;
+        writeln!(prompt.output, "  ox codex --model {quoted}")?;
+        writeln!(prompt.output, "  ox claude --model {quoted}")?;
+    } else {
+        writeln!(
+            prompt.output,
+            "Next: run `ox doctor`, then launch with a model alias in the form {}/<upstream-model-id>.",
+            form.key
+        )?;
+    }
     Ok(0)
 }
 
@@ -1439,10 +1456,12 @@ fn doctor_multi_vendor(
         .map(|diagnosis| diagnosis.key.clone())
         .collect::<BTreeSet<_>>();
     cross_provider_checks(report, &diagnoses);
-    doctor_codex_config(report, home, &vendor_keys);
+    let config = parse_config_for_validation(&text);
+    let search_configured = config.as_ref().is_ok_and(|config| config.search.is_some());
+    doctor_codex_config(report, home, &vendor_keys, search_configured);
 
     let errors_before = report.count(Level::Error);
-    match parse_config_for_validation(&text) {
+    match config {
         Ok(config) => {
             if let Some(search) = &config.search {
                 report.info(
@@ -1571,6 +1590,11 @@ fn doctor_provider(
             if models.len() == 1 { "y" } else { "ies" }
         ),
     );
+    for model in &models {
+        if let Ok(alias) = alias_for(key, &model.id, model.alias.as_deref()) {
+            report.info(Some(scope.clone()), format!("model alias: {alias}"));
+        }
+    }
     if !discovery && models.is_empty() {
         report.warning(
             Some(scope.clone()),
@@ -1874,7 +1898,12 @@ fn doctor_credential(
     }
 }
 
-fn doctor_codex_config(report: &mut DoctorReport, home: &Path, vendor_keys: &BTreeSet<String>) {
+fn doctor_codex_config(
+    report: &mut DoctorReport,
+    home: &Path,
+    vendor_keys: &BTreeSet<String>,
+    search_configured: bool,
+) {
     let scope = Some("config.toml".to_owned());
     let path = home.join("config.toml");
     let text = match read_optional_text_limited(&path, "config.toml") {
@@ -1891,7 +1920,7 @@ fn doctor_codex_config(report: &mut DoctorReport, home: &Path, vendor_keys: &BTr
             return;
         }
     };
-    let document = match Document::parse(&text) {
+    let document = match Document::parse(text.as_str()) {
         Ok(document) => document,
         Err(error) => {
             report.error(
@@ -1905,6 +1934,17 @@ fn doctor_codex_config(report: &mut DoctorReport, home: &Path, vendor_keys: &BTr
         report.warning(
             scope.clone(),
             "model_catalog_json is set; Codex ignores live model discovery (ox warns at launch)",
+        );
+    }
+    if search_configured
+        && let Some(policy) = crate::provider::configured_web_search_policy(&document, None)
+        && matches!(policy.as_str(), "disabled" | "cached" | "indexed")
+    {
+        report.warning(
+            scope.clone(),
+            format!(
+                "Codex's configured web_search = {policy:?} keeps Brave search off. For a live launch use `ox codex -c 'web_search=\"live\"' --model <alias>`."
+            ),
         );
     }
     if document

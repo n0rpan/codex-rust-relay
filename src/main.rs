@@ -120,13 +120,21 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
     let args: Vec<OsString> = args.collect();
     if args
         .first()
+        .is_some_and(|arg| arg == "--version" || arg == "-V")
+    {
+        println!("ox {}", env!("CARGO_PKG_VERSION"));
+        return Ok(0);
+    }
+    if args
+        .first()
         .is_some_and(|arg| arg == "--help" || arg == "-h")
     {
         println!(
             "ox codex [args...]  Launch Codex with the gateway\n\
              ox claude [args...] Launch Claude Code with the gateway\n\
              ox provider add    Configure a provider\n\
-             ox doctor          Check provider configuration"
+             ox doctor          Check provider configuration\n\
+             ox --version       Print the installed ox version"
         );
         return Ok(0);
     }
@@ -821,21 +829,6 @@ fn build_search(settings: &SearchSettings, env: &Env<'_>) -> Option<BraveSearch>
 /// command-line `-c` overrides, the selected profile, then top-level config.
 /// `None` means the user never pinned a policy.
 fn explicit_web_search_policy(args: &[OsString], codex_home: &Path) -> Option<String> {
-    let mut top_level = None;
-    let mut config_profile = None;
-    if let Ok(raw) = std::fs::read_to_string(codex_home.join("config.toml"))
-        && let Ok(document) = toml_edit::Document::parse(&raw)
-    {
-        top_level = document
-            .get("web_search")
-            .and_then(|item| item.as_str())
-            .map(normalise_policy);
-        config_profile = document
-            .get("profile")
-            .and_then(|item| item.as_str())
-            .map(str::to_owned);
-    }
-
     let mut cli_policy = None;
     let mut cli_profile = None;
     let mut index = 0;
@@ -872,23 +865,11 @@ fn explicit_web_search_policy(args: &[OsString], codex_home: &Path) -> Option<St
         index += 1;
     }
 
-    let mut profile_policy = None;
-    if let Some(profile) = cli_profile.or(config_profile)
-        && let Ok(raw) = std::fs::read_to_string(codex_home.join("config.toml"))
-        && let Ok(document) = toml_edit::Document::parse(&raw)
-        && let Some(table) = document
-            .get("profiles")
-            .and_then(|item| item.as_table())
-            .and_then(|profiles| profiles.get(&profile))
-            .and_then(|item| item.as_table())
-    {
-        profile_policy = table
-            .get("web_search")
-            .and_then(|item| item.as_str())
-            .map(normalise_policy);
-    }
-
-    cli_policy.or(profile_policy).or(top_level)
+    cli_policy.or_else(|| {
+        let raw = std::fs::read_to_string(codex_home.join("config.toml")).ok()?;
+        let document = toml_edit::Document::parse(raw.as_str()).ok()?;
+        provider::configured_web_search_policy(&document, cli_profile.as_deref())
+    })
 }
 
 fn config_assignment(raw: &str) -> Option<String> {
@@ -896,11 +877,7 @@ fn config_assignment(raw: &str) -> Option<String> {
     if key.trim() != "web_search" {
         return None;
     }
-    Some(normalise_policy(value))
-}
-
-fn normalise_policy(raw: &str) -> String {
-    raw.trim().trim_matches(['"', '\'']).to_ascii_lowercase()
+    Some(provider::normalise_web_search_policy(value))
 }
 
 fn legacy_overrides(provider_id: &str, base_url: &str) -> Vec<String> {

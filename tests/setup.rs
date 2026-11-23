@@ -169,6 +169,15 @@ fn adds_provider_with_flags_and_preserves_existing_bytes() {
     assert!(after.contains("name = \"Beta One\""), "{after}");
     assert!(after.contains("context_window = 128000"), "{after}");
     assert!(after.contains("alias = \"beta/stable\""), "{after}");
+    assert!(output.contains("model alias: beta/stable"), "{output}");
+    assert!(
+        output.contains("ox codex --model 'beta/stable'"),
+        "{output}"
+    );
+    assert!(
+        output.contains("ox claude --model 'beta/stable'"),
+        "{output}"
+    );
     assert!(
         after.contains("input_modalities = [\"text\", \"image\"]"),
         "{after}"
@@ -1016,7 +1025,45 @@ fn doctor_checks_the_claude_example_and_its_brave_credential() {
     );
     assert_eq!(code, 0, "{output}");
     assert!(output.contains("Brave Search: up to 8 results"), "{output}");
+    assert!(
+        output.contains("model alias: anthropic/claude-sonnet-5"),
+        "{output}"
+    );
     assert!(!output.contains("fixture-brave"), "{output}");
+}
+
+#[test]
+fn doctor_reports_the_selected_profile_blocking_brave() {
+    let home = TempHome::new();
+    home.write(
+        "codeox.toml",
+        include_str!("../examples/claude-providers.toml"),
+    );
+    let env = [
+        ("ANTHROPIC_API_KEY", "fixture-anthropic"),
+        ("BRAVE_SEARCH_API_KEY", "fixture-brave"),
+    ];
+    home.write(
+        "config.toml",
+        "profile = 'work'\nweb_search = 'live'\n[profiles.work]\nweb_search = 'cached'\n",
+    );
+    let (code, output) = run_doctor(home.path(), &["--strict"], &env);
+    assert_eq!(code, 1, "{output}");
+    assert!(
+        output.contains("web_search = \"cached\" keeps Brave search off"),
+        "{output}"
+    );
+    assert!(
+        output.contains("ox codex -c 'web_search=\"live\"'"),
+        "{output}"
+    );
+
+    home.write(
+        "config.toml",
+        "profile = 'work'\nweb_search = 'cached'\n[profiles.work]\nweb_search = 'live'\n",
+    );
+    let (code, output) = run_doctor(home.path(), &["--strict"], &env);
+    assert_eq!(code, 0, "{output}");
 }
 
 #[test]

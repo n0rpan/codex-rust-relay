@@ -82,9 +82,10 @@ process alone and excludes real model and network latency.
 
 ### Measured release
 
-The ox 0.1.0 release from commit `22dfc62` passed all six client and protocol
-combinations on a Qualcomm Oryon host with 12 logical CPUs running Linux
-7.3.0-77-omarchy (aarch64) on 2026-11-23. Executable SHA-256
+The ox 0.1.0 release from commit `22dfc62` met its memory, CPU, and added-latency
+targets for all six client and protocol combinations. The test ran on a Qualcomm
+Oryon host with 12 logical CPUs running Linux 7.3.0-77-omarchy (aarch64) on 2026-11-23.
+SHA-256 of the local executable used in the test
 `ee83bf98511205f872191c2c0a5084d042eb2c883a24e610e1ca3f051dfa00eb`.
 
 | Client | Upstream API | Added p95 first event | Warm idle RSS | Peak RSS, eight streams |

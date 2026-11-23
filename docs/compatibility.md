@@ -22,6 +22,9 @@ ox launches the client found on `PATH`. For the current verified versions, see t
 
 ### Live provider checks
 
+These checks used live provider accounts. Auto mode was exercised in these runs.
+The loopback suite above checks tool execution and permissions separately.
+
 | Provider and model | Codex | Claude Code |
 | --- | --- | --- |
 | OpenRouter Responses · `openai/gpt-5.4-mini` | Coding, restart and resume, Brave citations | Read and edit, including Auto mode with the Anthropic classifier route |
@@ -74,7 +77,7 @@ Tool availability, context windows, quotas and key permissions depend on the pro
 | Codex `web.run` via Brave | Live text queries and citation links. Up to four queries and eight domains per filter group. Recency accepts 1, 7, 30 or 365 days. |
 | Codex page open, click, find, images, screenshots or other standalone operations | The Brave bridge returns a tool error. It supports `search_query` only. |
 | Codex domain rules | Allowed domains filter returned URLs. The bridge rejects a blocked-domain filter. |
-| Claude Code `WebSearch` via Brave | One Brave query per dedicated CLI search request. Domain and country filters and citation links are supported. The tested CLI can discover the tool with `ToolSearch`. |
+| Claude Code `WebSearch` via Brave | One Brave query per dedicated CLI search request. Use allowed domains or blocked domains separately. Country filters and citation links are supported. The tested CLI can discover the tool with `ToolSearch`. |
 | Claude Code `WebFetch` | The CLI fetches under its own permissions and network settings. ox routes any follow-up model call. |
 | Brave data flow | Brave receives the explicit search query and supported filters. Search output is visible to the inference provider once the client includes it in conversation history. |
 
