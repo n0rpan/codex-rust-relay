@@ -11,6 +11,7 @@ import select
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import threading
@@ -23,7 +24,7 @@ binary = pathlib.Path(os.environ.get("OX_TEST_BINARY", "target/release/ox")).res
 def run(
     args, choices=None, signed_in=False, claude_signed_in=False,
     config=None, prompt="Choose 1–5".encode(), saved=None, model=None,
-    favorites=None, expected_favorites=None,
+    favorites=None, expected_favorites=None, expected_lineup=None,
 ):
     with tempfile.TemporaryDirectory(prefix="ox-selector-") as tmp:
         home = pathlib.Path(tmp)
@@ -31,6 +32,7 @@ def run(
         bindir.mkdir()
         trace = home / "trace"
         context_trace = home / "context"
+        lineup_trace = home / "lineup"
         original = 'model_provider = "openai"\n'
         (home / "config.toml").write_text(original)
         if config is not None:
@@ -64,6 +66,9 @@ fi
 printf '%s\\n' "$(basename "$0")" "$@" > "$FIXTURE_TRACE"
 if [ "$(basename "$0")" = claude ]; then
     printf '%s' "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-}" > "$FIXTURE_CONTEXT"
+    if [ "$1" = --settings ]; then
+        "$FIXTURE_PYTHON" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("modelPicker")))' "$2" > "$FIXTURE_LINEUP"
+    fi
 fi
 ''')
             fake.chmod(0o755)
@@ -71,6 +76,7 @@ fi
             "HOME": tmp, "CODEX_HOME": tmp, "CLAUDE_CONFIG_DIR": tmp,
             "PATH": f"{bindir}:/usr/bin:/bin", "FIXTURE_TRACE": str(trace),
             "TERM": "xterm-256color", "FIXTURE_CONTEXT": str(context_trace),
+            "FIXTURE_PYTHON": sys.executable, "FIXTURE_LINEUP": str(lineup_trace),
             "FIXTURE_SIGNED_IN": "yes" if signed_in else "no",
             "FIXTURE_CLAUDE_SIGNED_IN": "yes" if claude_signed_in else "no",
             "OPENROUTER_API_KEY": "dummy-fixture-credential",
@@ -167,7 +173,11 @@ fi
                 assert doctor.returncode != 0 and "is not set" in doctor.stdout
             if expected_favorites is not None:
                 persisted = json.loads((home / "ox-favorites.json").read_text())
-                assert sorted(persisted) == sorted(expected_favorites)
+                assert persisted == expected_favorites
+            if expected_lineup is not None:
+                lineup = json.loads(lineup_trace.read_text())
+                assert lineup["replaceBuiltInOptions"] is True
+                assert [row["model"] for row in lineup["options"]] == expected_lineup
             return text, trace.read_text().splitlines() if trace.exists() else [], registry
         finally:
             if proc.poll() is None:
@@ -401,6 +411,18 @@ text, argv, registry = run(
 )
 assert argv[-2:] == ["--model", favorites[1]] and registry == shared
 print("live picker: stars persist, appear first in Codex, and can be removed in the starred view")
+
+
+before = ["openrouter/model-13", "alibaba/qwen-fixture", "anthropic/claude-fixture"]
+after = ["alibaba/qwen-fixture", "openrouter/model-13", "anthropic/claude-fixture"]
+text, argv, registry = run(
+    ["claude"], [
+        (b"> " + "★ openrouter/model-13".encode(), b"\x1b[1;3B"),
+        (b"  " + "★ alibaba/qwen-fixture".encode(), b"\r"),
+    ], config=shared, favorites=before, expected_favorites=after, expected_lineup=after,
+)
+assert argv[-2:] == ["--model", "openrouter/model-13"] and registry == shared
+print("live picker: reorder favorites and pass the same lineup to Claude Code")
 
 
 previous = shared + '\n[search]\nenabled = false # manual opt-out\nenv_key = "CUSTOM_BRAVE_KEY"\nmax_results = 3\n'

@@ -275,6 +275,32 @@ pub fn catalog_json(models: &[CatalogModel], bundled: &BundledModels) -> Value {
     json!({ "models": entries })
 }
 
+pub(crate) fn prioritize_favorites(catalog: &mut Value, favorites: &[String]) {
+    if favorites.is_empty() {
+        return;
+    }
+    let Some(models) = catalog["models"].as_array_mut() else {
+        return;
+    };
+    models.sort_by_cached_key(|entry| {
+        if entry["visibility"] == "list"
+            && let Some(model) = entry["slug"].as_str()
+            && let Some(rank) = favorites.iter().position(|favorite| favorite == model)
+        {
+            rank
+        } else {
+            usize::MAX
+        }
+    });
+    for (priority, entry) in models
+        .iter_mut()
+        .filter(|entry| entry["visibility"] == "list")
+        .enumerate()
+    {
+        entry["priority"] = json!(priority);
+    }
+}
+
 impl CatalogModel {
     fn entry(&self, priority: usize) -> Value {
         let levels = self
@@ -437,6 +463,31 @@ mod tests {
             .map(|spec| spec.id)
             .collect::<Vec<_>>();
         assert_eq!(ids, ["with-tools"]);
+    }
+
+    #[test]
+    fn favorites_follow_saved_order_across_providers() {
+        let mut catalog = json!({"models": [
+            {"slug": "alibaba/a", "priority": 0, "visibility": "list"},
+            {"slug": "openrouter/b", "priority": 1, "visibility": "list"},
+            {"slug": "opencode-go/c", "priority": 2, "visibility": "list"},
+            {"slug": "built-in", "priority": 0, "visibility": "hide"},
+        ]});
+        prioritize_favorites(
+            &mut catalog,
+            &[
+                "opencode-go/c".to_owned(),
+                "built-in".to_owned(),
+                "alibaba/a".to_owned(),
+            ],
+        );
+        let rows = catalog["models"].as_array().unwrap();
+        assert_eq!(rows[0]["slug"], "opencode-go/c");
+        assert_eq!(rows[0]["priority"], 0);
+        assert_eq!(rows[1]["slug"], "alibaba/a");
+        assert_eq!(rows[1]["priority"], 1);
+        assert_eq!(rows[2]["slug"], "openrouter/b");
+        assert_eq!(rows[3]["visibility"], "hide");
     }
 
     #[test]

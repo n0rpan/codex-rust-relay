@@ -279,6 +279,7 @@ pub(crate) fn claude_command(
     token: &str,
     aliases: &[String],
     env_refs: &BTreeSet<String>,
+    starred: &[&str],
     context_window_for: impl FnOnce(&str) -> Option<u64>,
 ) -> Result<(Command, ClaudeLaunchSettings), RelayError> {
     let base_url = anthropic_base_url(origin)?;
@@ -393,7 +394,7 @@ pub(crate) fn claude_command(
         command.env(name, loopback_no_proxy(&existing));
     }
 
-    let (args, settings) = inject_settings(args, overlay_env)?;
+    let (args, settings) = inject_settings(args, overlay_env, starred)?;
     command.args(args).kill_on_drop(true);
     Ok((command, settings))
 }
@@ -443,10 +444,21 @@ fn overlay_env(
 fn inject_settings(
     args: Vec<OsString>,
     overlay_env: SettingsMap,
+    starred: &[&str],
 ) -> Result<(Vec<OsString>, ClaudeLaunchSettings), RelayError> {
     let (mut args, user_settings) = take_user_settings(args)?;
     let mut document = user_settings.unwrap_or_default();
     merge_overlay(&mut document, overlay_env)?;
+    let options: Vec<_> = starred
+        .iter()
+        .filter(|alias| !is_reserved_model_alias(alias))
+        .map(|alias| serde_json::json!({ "model": alias, "label": alias }))
+        .collect();
+    if !options.is_empty() {
+        document.entry("modelPicker".to_owned()).or_insert_with(
+            || serde_json::json!({ "replaceBuiltInOptions": true, "options": options }),
+        );
+    }
     // The stock helper runs a command and adds its output as `x-api-key`; the
     // relay authenticates with the bearer, so keep the launch credential one
     // source only. An empty helper is ignored (verified on 2.1.330).
@@ -900,7 +912,7 @@ mod tests {
         aliases: &[String],
         env_refs: &BTreeSet<String>,
     ) -> (Command, ClaudeLaunchSettings) {
-        claude_command(args, origin, token, aliases, env_refs, |_| None).unwrap()
+        claude_command(args, origin, token, aliases, env_refs, &[], |_| None).unwrap()
     }
 
     fn env_entry(command: &Command, name: &str) -> Option<Option<String>> {
@@ -1389,6 +1401,7 @@ mod tests {
                     "t",
                     &aliases(&["a/b"]),
                     &refs(&[]),
+                    &[],
                     |_| None,
                 )
                 .is_err()
@@ -1403,6 +1416,7 @@ mod tests {
                 "t",
                 &aliases(&["a/b"]),
                 &refs(&[]),
+                &[],
                 |_| None,
             )
             .is_err()
@@ -1493,6 +1507,7 @@ mod tests {
                 "t",
                 &aliases(&["a/b"]),
                 &refs(&[]),
+                &[],
                 |_| None,
             )
             .unwrap_err();
@@ -1590,6 +1605,7 @@ mod tests {
             "t",
             &[],
             &refs(&[]),
+            &[],
             |_| None,
         )
         .unwrap_err();
@@ -1649,6 +1665,7 @@ mod tests {
             "t",
             &aliases(&["sonnet"]),
             &refs(&[]),
+            &[],
             |_| None,
         )
         .unwrap_err();
@@ -1689,6 +1706,7 @@ mod tests {
                     "t",
                     std::slice::from_ref(&alias),
                     &refs(&[]),
+                    &[],
                     |_| None,
                 )
                 .is_err(),
@@ -1704,6 +1722,7 @@ mod tests {
                     token,
                     &aliases(&["a/b"]),
                     &refs(&[]),
+                    &[],
                     |_| None,
                 )
                 .is_err(),
@@ -1718,6 +1737,7 @@ mod tests {
                 "t",
                 &aliases(&["a/b"]),
                 &refs(&[]),
+                &[],
                 |_| None,
             )
             .is_err()

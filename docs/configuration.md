@@ -254,16 +254,21 @@ Run `ox codex` or `ox claude` with no client arguments from a terminal to choose
 from the same list of configured and discovered aliases with usable keys.
 Type a model or provider name to filter immediately. Use the arrow keys to move,
 **Tab** to toggle a star and move to the next match, and **Enter** to launch.
-Use **Ctrl+F** to toggle the starred-only view and **Ctrl+U** to clear the search.
-**Esc** closes the picker and keeps any stars you changed.
+Use **Alt+↑/↓** on a star to reorder it, **Ctrl+F** to show only stars, and
+**Ctrl+U** to clear the search. **Esc** closes the picker and keeps your changes.
 
-Stars are saved by model alias in `$CODEX_HOME/ox-favorites.json` and appear
-at the top of the API model list in both launchers. Pass `--model <alias>`
-to launch directly. An Anthropic API key configured in ox can power either client.
+Stars are saved in order by model alias in `$CODEX_HOME/ox-favorites.json`.
+In API-backed launches, Codex sorts its `/model` catalog with stars first.
+Claude Code shows the ordered lineup from ox in `/model` with the Default and
+current model entries supplied by Claude Code. Managed settings or a
+`modelPicker` explicitly passed to `ox claude --settings` can supply a different
+lineup. The ox launch picker still shows the full available catalog by default.
+Pass `--model <alias>` to launch directly.
+[Claude Code model picker settings](https://code.claude.com/docs/en/settings-reference#modelpicker)
 
-`ox claude` enables gateway model discovery for its Claude Code process. Open
-`/model` to see additional Claude aliases from the configured providers. To opt out
-for a launch, run:
+With no starred lineup, `ox claude` enables gateway model discovery for its
+Claude Code process. Open `/model` to see eligible Claude aliases from the
+configured providers. To opt out of discovery for a launch, run:
 
 ```sh
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0 ox claude
@@ -435,6 +440,25 @@ sessions and restricts third-party services that route requests through those
 subscription credentials, including services built with the Agent SDK.
 [Sign in with ChatGPT for open-source apps](https://developers.openai.com/siwc/token-sharing-open-source) ·
 [Claude credential rules](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)
+
+### Subscription main session with API workers
+
+Start the main session with `ox codex --chatgpt` or `ox claude --native`.
+The stock client's built-in subagents use that session's configured backend.
+For independent work on a different provider, start a separate ox worker and
+bring its result back to the main session. For example, from your project:
+
+```sh
+ox codex exec --sandbox read-only --model 'opencode-go/glm-5.3' \
+  'Review the changes in this project and list any regressions. Leave files as they are.'
+```
+
+The native session uses your subscription. The worker uses the account behind
+its provider alias. Give the worker the files and task it needs. When both the
+main session and its subagents use the ox API relay, model aliases on that relay
+can route to different vendors under the same gateway configuration.
+[Codex subagent settings](https://learn.chatgpt.com/docs/agent-configuration/subagents) ·
+[Claude Code subagent model selection](https://code.claude.com/docs/en/sub-agents#choose-a-model)
 
 ### Upgrade from the original single-provider relay
 

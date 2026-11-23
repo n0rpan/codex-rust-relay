@@ -44,8 +44,11 @@ impl<'a> Row<'a> {
         }
     }
 
-    fn starred(&self, favorites: &BTreeSet<String>) -> bool {
-        matches!(self.choice, LaunchChoice::Model(alias) if favorites.contains(alias))
+    fn favorite_rank(&self, favorites: &[String]) -> Option<usize> {
+        let LaunchChoice::Model(alias) = self.choice else {
+            return None;
+        };
+        favorites.iter().position(|favorite| favorite == alias)
     }
 }
 
@@ -78,7 +81,7 @@ pub(crate) fn choose_model<'a>(
 
     let (mut favorites, mut status) = match read_favorites(home) {
         Ok(favorites) => (favorites, String::new()),
-        Err(error) => (BTreeSet::new(), error.to_string()),
+        Err(error) => (Vec::new(), error.to_string()),
     };
     let mut term = PickerTerminal::open()?;
     let mut query = String::new();
@@ -92,17 +95,19 @@ pub(crate) fn choose_model<'a>(
         let mut matches: Vec<_> = rows
             .iter()
             .filter(|row| {
-                (!only_starred || row.starred(&favorites))
+                (!only_starred || row.favorite_rank(&favorites).is_some())
                     && query_lower
                         .split_whitespace()
                         .all(|word| row.search.contains(word))
             })
             .collect();
-        matches.sort_by_key(|row| match row.choice {
-            LaunchChoice::Subscription => 0,
-            LaunchChoice::Model(alias) if alias.eq_ignore_ascii_case(query.trim()) => 1,
-            _ if row.starred(&favorites) => 2,
-            _ => 3,
+        matches.sort_by_cached_key(|row| match row.choice {
+            LaunchChoice::Subscription => (0, 0),
+            LaunchChoice::Model(alias) if alias.eq_ignore_ascii_case(query.trim()) => (1, 0),
+            _ => match row.favorite_rank(&favorites) {
+                Some(rank) => (2, rank),
+                None => (3, 0),
+            },
         });
         if let Some(choice) = next_choice.take()
             && let Some(index) = matches.iter().position(|row| row.choice == choice)
@@ -155,7 +160,7 @@ pub(crate) fn choose_model<'a>(
         line(
             &mut term.output,
             width,
-            "Ctrl+F toggle starred only   Ctrl+U clear search",
+            "Ctrl+F starred only   Ctrl+U clear search   Alt+↑↓ reorder stars",
         )?;
         if matches.is_empty() {
             line(&mut term.output, width, "No matching models")?;
@@ -163,7 +168,11 @@ pub(crate) fn choose_model<'a>(
         for (index, row) in matches[first..end].iter().enumerate() {
             let active = index + first == selected;
             let cursor = if active { ">" } else { " " };
-            let star = if row.starred(&favorites) { "★" } else { " " };
+            let star = if row.favorite_rank(&favorites).is_some() {
+                "★"
+            } else {
+                " "
+            };
             if active {
                 queue!(term.output, SetAttribute(Attribute::Reverse))?;
             }
@@ -197,6 +206,33 @@ pub(crate) fn choose_model<'a>(
                         }
                         false
                     }
+                    KeyCode::Up | KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                        if let Some(row) = matches.get(selected)
+                            && let LaunchChoice::Model(alias) = row.choice
+                            && row.favorite_rank(&favorites).is_some()
+                        {
+                            match update_favorites(home, |favorites| {
+                                if let Some(index) =
+                                    favorites.iter().position(|model| model == alias)
+                                {
+                                    let target = if key.code == KeyCode::Up {
+                                        index.saturating_sub(1)
+                                    } else {
+                                        (index + 1).min(favorites.len() - 1)
+                                    };
+                                    favorites.swap(index, target);
+                                }
+                            }) {
+                                Ok(updated) => {
+                                    favorites = updated;
+                                    status.clear();
+                                    next_choice = Some(row.choice);
+                                }
+                                Err(error) => status = error.to_string(),
+                            }
+                        }
+                        false
+                    }
                     KeyCode::Up => {
                         selected = selected.saturating_sub(1);
                         false
@@ -217,8 +253,16 @@ pub(crate) fn choose_model<'a>(
                         if let Some(row) = matches.get(selected)
                             && let LaunchChoice::Model(alias) = row.choice
                         {
-                            let star = !row.starred(&favorites);
-                            match save_favorite(home, alias, star) {
+                            let star = row.favorite_rank(&favorites).is_none();
+                            match update_favorites(home, |favorites| {
+                                if star {
+                                    if !favorites.iter().any(|model| model == alias) {
+                                        favorites.push(alias.to_owned());
+                                    }
+                                } else {
+                                    favorites.retain(|model| model != alias);
+                                }
+                            }) {
                                 Ok(updated) => {
                                     favorites = updated;
                                     status.clear();
@@ -274,21 +318,24 @@ pub(crate) fn choose_model<'a>(
     }
 }
 
-fn read_favorites(home: &Path) -> Result<BTreeSet<String>, RelayError> {
+pub(crate) fn read_favorites(home: &Path) -> Result<Vec<String>, RelayError> {
     let Some(text) = read_optional_text_limited(&home.join(FAVORITES_FILE), FAVORITES_FILE)? else {
-        return Ok(BTreeSet::new());
+        return Ok(Vec::new());
     };
-    serde_json::from_str(&text).map_err(|_| format!("Could not read {FAVORITES_FILE}.").into())
+    let mut favorites: Vec<String> =
+        serde_json::from_str(&text).map_err(|_| format!("Could not read {FAVORITES_FILE}."))?;
+    let mut seen = BTreeSet::new();
+    favorites.retain(|alias| seen.insert(alias.clone()));
+    Ok(favorites)
 }
 
-fn save_favorite(home: &Path, alias: &str, starred: bool) -> Result<BTreeSet<String>, RelayError> {
+fn update_favorites(
+    home: &Path,
+    edit: impl FnOnce(&mut Vec<String>),
+) -> Result<Vec<String>, RelayError> {
     let _lock = lock_config(home)?;
     let mut favorites = read_favorites(home)?;
-    if starred {
-        favorites.insert(alias.to_owned());
-    } else {
-        favorites.remove(alias);
-    }
+    edit(&mut favorites);
     write_config_atomic(
         &home.join(FAVORITES_FILE),
         &serde_json::to_string_pretty(&favorites)?,

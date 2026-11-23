@@ -83,8 +83,8 @@ From your project directory, run `ox codex` or `ox claude` and choose from all
 available ox API aliases. Search updates as you type. Use **↑/↓** to move,
 **Tab** to star or unstar, and **Enter** to launch the highlighted model.
 You can star several models before starting a session. They stay at the
-top in both launchers. Press **Ctrl+F** to see just your stars and **Esc**
-to close the picker.
+top in both launchers in the order you starred them. Use **Alt+↑/↓** to reorder,
+**Ctrl+F** to see just your stars, and **Esc** to close the picker.
 
 If one API model is available and you have no native subscription, ox selects
 it for you. To skip the picker:
@@ -99,9 +99,10 @@ they are.”** A reply grounded in the file confirms both the model connection a
 read. Prompts and tool results go to the selected API provider and use that provider’s billing.
 
 Use the same alias, **`provider/model-id`**, in either client. Add more providers with
-`ox provider add`, then relaunch. Codex lists configured models in `/model`. In Claude Code,
-`/model` shows [eligible discovered aliases](docs/configuration.md#model-names-and-discovery).
-Start a new session through `ox claude` to choose from the full list again.
+`ox provider add`, then relaunch. In API-backed sessions, **`/model`** in Codex
+lists your stars first. In Claude Code it shows your starred lineup when you
+have one. Use the ox launch picker to browse the full catalog.
+[Catalog and client behavior](docs/configuration.md#model-names-and-discovery)
 
 ## Common tasks
 

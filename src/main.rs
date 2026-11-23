@@ -274,6 +274,10 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
             None => return Ok(0),
         }
     }
+    let favorites = picker::read_favorites(&codex_home).unwrap_or_default();
+    if let Mode::Codeox { catalog, .. } = &mut app.mode {
+        catalog::prioritize_favorites(catalog, &favorites);
+    }
     app.client_kind = client_kind;
     let (mut command, _claude_settings) = match app.client_kind {
         ClientKind::Codex => {
@@ -291,12 +295,19 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
             (command, None)
         }
         ClientKind::Claude => {
+            let starred: Vec<_> = app
+                .launch_models()
+                .into_iter()
+                .map(|(alias, _)| alias)
+                .filter(|alias| favorites.iter().any(|favorite| favorite == alias))
+                .collect();
             let (command, settings) = clients::claude_command(
                 args,
                 &origin,
                 &token,
                 &app.claude_aliases(),
                 &env_refs,
+                &starred,
                 |model| app.claude_context_window(model),
             )?;
             (command, Some(settings))
