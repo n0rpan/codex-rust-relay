@@ -1,0 +1,165 @@
+//! Claude Code's local Messages interface over the shared provider registry.
+
+use std::sync::Arc;
+
+use hyper::body::{Bytes, Incoming};
+use hyper::{Method, Request, Response, StatusCode};
+use serde_json::{Value, json};
+use subtle::ConstantTimeEq;
+
+use crate::provider::Resolution;
+use crate::{
+    App, Mode, RelayBody, bytes_response, claude_gateway, claude_search, json_response,
+    read_bounded, resolve_model, upstream,
+};
+
+impl App {
+    fn visible_models(&self) -> impl Iterator<Item = &Value> {
+        let entries = match &self.mode {
+            Mode::Codeox { catalog, .. } => catalog["models"].as_array().map(Vec::as_slice),
+            Mode::Legacy { .. } => None,
+        };
+        entries
+            .unwrap_or_default()
+            .iter()
+            .filter(|entry| entry["visibility"] == "list")
+    }
+
+    pub(super) fn claude_aliases(&self) -> Vec<String> {
+        let Mode::Codeox {
+            vendors, routes, ..
+        } = &self.mode
+        else {
+            return Vec::new();
+        };
+        let (mut configured, missing): (Vec<_>, Vec<_>) = self
+            .visible_models()
+            .filter_map(|entry| entry["slug"].as_str())
+            .partition(|alias| {
+                matches!(
+                    routes.resolve(alias),
+                    Resolution::Route(route) if vendors[route.vendor].auth.is_some()
+                )
+            });
+        configured.extend(missing);
+        configured.into_iter().map(str::to_owned).collect()
+    }
+
+    pub(super) async fn handle_messages_client(
+        &self,
+        request: Request<Incoming>,
+        bearer_matches: bool,
+    ) -> Response<RelayBody> {
+        let key_matches = request.headers().get("x-api-key").is_some_and(|key| {
+            self.local_auth
+                .as_bytes()
+                .strip_prefix(b"Bearer ")
+                .is_some_and(|token| key.as_bytes().ct_eq(token).into())
+        });
+        if !bearer_matches && !key_matches {
+            return messages_error(StatusCode::UNAUTHORIZED, "Relay authentication failed");
+        }
+        match (request.method(), request.uri().path()) {
+            (&Method::GET, "/v1/models") => {
+                let data: Vec<_> = self
+                    .visible_models()
+                    .map(|entry| {
+                        json!({
+                            "id": entry["slug"],
+                            "display_name": entry["display_name"],
+                            "description": entry["description"],
+                            "type": "model",
+                            "created_at": "1970-01-01T00:00:00Z",
+                        })
+                    })
+                    .collect();
+                json_response(
+                    StatusCode::OK,
+                    json!({
+                        "first_id": data.first().map(|entry| &entry["id"]),
+                        "last_id": data.last().map(|entry| &entry["id"]),
+                        "data": data,
+                        "has_more": false,
+                    }),
+                )
+            }
+            (&Method::POST, "/v1/messages") => self.messages_inference(request).await,
+            _ => messages_error(StatusCode::NOT_FOUND, "Unknown relay endpoint"),
+        }
+    }
+
+    async fn messages_inference(&self, request: Request<Incoming>) -> Response<RelayBody> {
+        let Mode::Codeox {
+            vendors, routes, ..
+        } = &self.mode
+        else {
+            return messages_error(
+                StatusCode::BAD_REQUEST,
+                "Claude Code needs a shared provider configuration",
+            );
+        };
+        let (parts, body) = request.into_parts();
+        let beta = parts
+            .headers
+            .get("anthropic-beta")
+            .and_then(|value| value.to_str().ok());
+        let bytes = match read_bounded(body, self.max_request_bytes).await {
+            Ok(bytes) => bytes,
+            Err(response) => {
+                return messages_error(response.status(), "Unable to read the Messages request");
+            }
+        };
+        let payload: Value = match serde_json::from_slice(&bytes) {
+            Ok(payload) => payload,
+            Err(_) => return messages_error(StatusCode::BAD_REQUEST, "Request body must be JSON"),
+        };
+        drop(bytes);
+        let Some(requested) = payload
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return messages_error(StatusCode::BAD_REQUEST, "Request body is missing a model");
+        };
+        let (route, state, auth) = match resolve_model(vendors, routes, &requested) {
+            Ok(target) => target,
+            Err((status, message)) => return messages_error(status, &message),
+        };
+        if let Some(result) = claude_search::try_handle(&payload, self.search.as_ref()).await {
+            let reply = claude_search::reply_or_error(result);
+            let status =
+                StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            return bytes_response(status, Bytes::from(reply.body), reply.content_type);
+        }
+        claude_gateway::infer(
+            &self.client,
+            upstream::Translation {
+                vendor: &state.vendor,
+                key: auth,
+                upstream_model: &route.upstream_model,
+                requested_model: &requested,
+                secrets: Arc::clone(&self.secrets),
+            },
+            payload,
+            beta,
+        )
+        .await
+    }
+}
+
+fn messages_error(status: StatusCode, message: &str) -> Response<RelayBody> {
+    let kind = match status {
+        StatusCode::UNAUTHORIZED => "authentication_error",
+        StatusCode::NOT_FOUND => "not_found_error",
+        StatusCode::PAYLOAD_TOO_LARGE => "request_too_large",
+        StatusCode::BAD_REQUEST => "invalid_request_error",
+        _ => "api_error",
+    };
+    json_response(
+        status,
+        json!({
+            "type": "error",
+            "error": { "type": kind, "message": message },
+        }),
+    )
+}

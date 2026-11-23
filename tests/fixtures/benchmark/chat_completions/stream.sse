@@ -1,0 +1,20 @@
+data: {"id":"chatcmpl-bench-1","object":"chat.completion.chunk","created":1700000000,"model":"bench-model","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-bench-1","object":"chat.completion.chunk","created":1700000000,"model":"bench-model","choices":[{"index":0,"delta":{"content":"I "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-bench-1","object":"chat.completion.chunk","created":1700000000,"model":"bench-model","choices":[{"index":0,"delta":{"content":"found "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-bench-1","object":"chat.completion.chunk","created":1700000000,"model":"bench-model","choices":[{"index":0,"delta":{"content":"the "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-bench-1","object":"chat.completion.chunk","created":1700000000,"model":"bench-model","choices":[{"index":0,"delta":{"content":"missing "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-bench-1","object":"chat.completion.chunk","created":1700000000,"model":"bench-model","choices":[{"index":0,"delta":{"content":"flush "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-bench-1","object":"chat.completion.chunk","created":1700000000,"model":"bench-model","choices":[{"index":0,"delta":{"content":"and added a bounded regression test."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-bench-1","object":"chat.completion.chunk","created":1700000000,"model":"bench-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-bench-1","object":"chat.completion.chunk","created":1700000000,"model":"bench-model","choices":[],"usage":{"prompt_tokens":512,"completion_tokens":24,"total_tokens":536}}
+
+data: [DONE]
+

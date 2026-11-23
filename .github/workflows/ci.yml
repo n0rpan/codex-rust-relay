@@ -1,0 +1,310 @@
+name: CI
+
+# Every push and pull request gets the same offline verification: formatting,
+# locked dependency resolution, the full non-ignored test suite, the release
+# build, and the stock Codex and Claude Code loopback fixtures. The wall-clock
+# benchmark in tests/relay_benchmark.rs stays manual.
+#
+# A separate native matrix then builds the locked release binary on Linux
+# x86_64/ARM64 and macOS Intel/Apple silicon, runs it, and uploads one `ox`
+# archive plus SHA-256 checksum per platform. The matrix needs no publication
+# rights and no credentials: every job inherits the workflow's read-only token
+# and only publishes workflow artifacts.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  verify:
+    name: Format, offline tests, release build, stock client fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust 1.100.0 with rustfmt
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.100.0 --profile minimal --component rustfmt --no-self-update
+          rustup default 1.100.0
+          rustc --version
+          cargo --version
+          cargo fmt --version
+
+      - name: Check formatting
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+
+      - name: Fetch locked dependencies
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+
+      - name: Run all non-ignored tests offline against the lockfile
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline
+
+      - name: Build the release binary offline against the lockfile
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --offline
+          test -x target/release/ox
+          file target/release/ox
+
+      - name: Install stock Codex 0.171.0 from the pinned official release
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          version="0.171.0"
+          target="x86_64-unknown-linux-musl"
+          asset="codex-${target}.tar.gz"
+          # Official openai/codex rust-v0.171.0 asset digest from the GitHub
+          # release metadata. The release also publishes a .sigstore bundle;
+          # this workflow pins the same SHA-256 that the official installer
+          # reads from the release asset API.
+          expected_sha256="01baa2e47809f8597be5b2f8abd4e4dfe3fb5bcb6e504c2fbaaad97056c15e8d"
+          url="https://github.com/openai/codex/releases/download/rust-v${version}/${asset}"
+          destination="${RUNNER_TEMP}/codex-${version}"
+          mkdir -p "${destination}"
+          curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+            --output "${RUNNER_TEMP}/${asset}" "${url}"
+          echo "${expected_sha256}  ${RUNNER_TEMP}/${asset}" | sha256sum --check --strict
+          tar --extract --gzip --file "${RUNNER_TEMP}/${asset}" --directory "${destination}"
+          chmod 0755 "${destination}/${target}"
+          actual_version="$("${destination}/${target}" --version)"
+          if [ "${actual_version}" != "codex-cli ${version}" ]; then
+            echo "::error::expected codex-cli ${version}, got ${actual_version}"
+            exit 1
+          fi
+          echo "CODEOX_TEST_CODEX_BIN=${destination}/${target}" >> "${GITHUB_ENV}"
+          echo "Stock Codex fixture binary: ${actual_version}"
+
+      - name: Ensure bubblewrap for Codex's workspace-write sandbox
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          if ! command -v bwrap >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends bubblewrap
+          fi
+          bwrap --version
+          # Ubuntu 24.04 can deny unprivileged user namespaces under AppArmor.
+          # Probe the operation Codex needs and relax only that CI-only kernel
+          # setting if this ephemeral runner blocks it.
+          if ! bwrap --ro-bind / / --dev /dev --proc /proc true >/dev/null 2>&1; then
+            if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            fi
+            bwrap --ro-bind / / --dev /dev --proc /proc true
+          fi
+
+      - name: Install stock Claude Code 2.1.330 from the pinned official release
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          version="2.1.330"
+          archive="${RUNNER_TEMP}/claude-${version}.zst"
+          binary="${RUNNER_TEMP}/claude-${version}"
+          # SHA-256 from the official manifest and compressed manifest.
+          curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
+            --output "${archive}" \
+            "https://downloads.claude.ai/claude-code-releases/${version}/linux-x64/claude.zst"
+          echo "d53a3f9aab93c87bba0813d1101677677b457100824f5c3604fea9915ac5237a  ${archive}" |
+            sha256sum --check --strict
+          # The official installer extracts the manifest length. The digest
+          # below validates the output even if zstd exits after the pipe closes.
+          zstd --quiet --decompress --stdout "${archive}" |
+            head -c 381121040 > "${binary}" || true
+          echo "f390eaa0814e6a1bff74cbb47acb74cb9c89d30ced809fe0af5af00c7bfe8ebb  ${binary}" |
+            sha256sum --check --strict
+          chmod 0755 "${binary}"
+          test "$("${binary}" --version)" = "${version} (Claude Code)"
+          echo "OX_TEST_CLAUDE_BIN=${binary}" >> "${GITHUB_ENV}"
+
+      - name: Disable paid and public inference for fixture steps
+        run: |
+          set -euo pipefail
+          # Dummy keys and a dead loopback proxy make any accidental public
+          # request fail closed. The fixtures also run the CLI with an isolated
+          # HOME/CODEX_HOME and only loopback relay and Brave mocks.
+          for name in OPENAI_API_KEY CODEX_API_KEY ANTHROPIC_API_KEY BRAVE_SEARCH_API_KEY; do
+            echo "${name}=ci-dummy-no-inference" >> "${GITHUB_ENV}"
+          done
+          echo "OPENAI_BASE_URL=http://127.0.0.1:1/v1" >> "${GITHUB_ENV}"
+          for name in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do
+            echo "${name}=http://127.0.0.1:1" >> "${GITHUB_ENV}"
+          done
+          echo "NO_PROXY=127.0.0.1,localhost" >> "${GITHUB_ENV}"
+          echo "no_proxy=127.0.0.1,localhost" >> "${GITHUB_ENV}"
+
+      - name: Run stock Codex 0.171.0 loopback fixtures
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          # Eight switch fixtures and four coding-and-search fixtures. All
+          # use isolated homes, dummy keys, and only loopback traffic.
+          cargo test --locked --offline --features test-brave --test stock_codex_smoke -- \
+            --ignored --nocapture --test-threads=1
+
+      - name: Run native web.run loopback fixture
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --bin ox -- \
+            --ignored --exact --nocapture \
+            translated_tests::stock_codex_emits_web_run_and_calls_the_alpha_search_endpoint
+
+      - name: Verify native and relayed Codex authentication in one home
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --test shared_codex_home -- \
+            --ignored --nocapture --test-threads=1
+
+      - name: Run stock Claude Code 2.1.330 loopback fixtures
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --features test-brave --test stock_claude_smoke -- \
+            --ignored --nocapture --test-threads=1
+
+  release:
+    name: Release binaries (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      # Report every platform instead of cancelling the matrix on one failure.
+      fail-fast: false
+      matrix:
+        # Linux artifacts link the Ubuntu 24.04 glibc (2.39) used by the verify
+        # job. macOS artifacts are native Intel and Apple silicon builds, not
+        # cross-compiled, so each job can run what it packages.
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            file_type: x86-64
+            macos_deployment_target: ""
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            file_type: aarch64
+            macos_deployment_target: ""
+          - platform: macos-x86_64
+            runner: macos-26-intel
+            target: x86_64-apple-darwin
+            file_type: x86_64
+            macos_deployment_target: "11.0"
+          - platform: macos-aarch64
+            runner: macos-26
+            target: aarch64-apple-darwin
+            file_type: arm64
+            macos_deployment_target: "11.0"
+    env:
+      # rustc defaults x86_64-apple-darwin to 10.12 and aarch64-apple-darwin to
+      # 11.0. Pin both macOS artifacts to the 11.0 arm64 floor so the Intel
+      # artifact is not older than its Apple silicon counterpart.
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust 1.100.0
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.100.0 --profile minimal --no-self-update
+          rustup default 1.100.0
+          rustc --version
+          cargo --version
+          rustc --print deployment-target 2>/dev/null || true
+
+      - name: Build the release binary offline against the lockfile
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          if [ "${host}" != "${target}" ]; then
+            echo "::error::runner host ${host} does not match matrix target ${target}"
+            exit 1
+          fi
+          cargo fetch --locked
+          cargo build --release --locked --offline --target "${target}"
+          binary="target/${target}/release/ox"
+          test -x "${binary}"
+          file "${binary}"
+          file "${binary}" | grep -F -- "${{ matrix.file_type }}"
+          # --help prints usage and exits before reading any configuration, so
+          # this probes that the executable starts without network or secrets.
+          "${binary}" --help | grep -F "Launch Codex with the gateway"
+
+      - name: Package ox and SHA-256 checksum
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "${version}" ]; then
+            echo "::error::could not read the package version from Cargo.toml"
+            exit 1
+          fi
+          archive="ox-${version}-${target}.tar.gz"
+          mkdir -p dist
+          tar --create --gzip --file "dist/${archive}" \
+            --directory "target/${target}/release" ox
+          (
+            cd dist
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum --binary "${archive}" > "${archive}.sha256"
+              sha256sum --check --strict "${archive}.sha256"
+            else
+              shasum -a 256 "${archive}" > "${archive}.sha256"
+              shasum -a 256 --check "${archive}.sha256"
+            fi
+            cat "${archive}.sha256"
+          )
+          tar --list --gzip --file "dist/${archive}"
+          # The uploaded archive is what users download, so unpack it and run
+          # that copy rather than the build-tree binary.
+          unpacked="${RUNNER_TEMP}/ox-${target}"
+          rm -rf "${unpacked}"
+          mkdir -p "${unpacked}"
+          tar --extract --gzip --file "dist/${archive}" --directory "${unpacked}"
+          test -x "${unpacked}/ox"
+          "${unpacked}/ox" --help | grep -F "Launch Codex with the gateway"
+
+      - name: Upload ox archive and SHA-256 checksum
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ox-${{ matrix.target }}
+          path: |
+            dist/ox-*.tar.gz
+            dist/ox-*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+          # The archives are already gzip-compressed.
+          compression-level: 0

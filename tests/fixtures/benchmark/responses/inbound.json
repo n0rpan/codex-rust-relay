@@ -1,0 +1,67 @@
+{
+  "model": "mock/bench-model",
+  "instructions": "You are Codex, a coding agent running in a Linux workspace. Use the shell tool for commands and apply_patch for edits. Keep diffs minimal and leave the test suite green.",
+  "input": [
+    {
+      "type": "message",
+      "role": "developer",
+      "content": [
+        {"type": "input_text", "text": "Repository: /workspace/widget. Build with cargo. Do not modify vendored sources. Ask before destructive commands."}
+      ]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {"type": "input_text", "text": "The loopback relay drops the final SSE event when the upstream connection closes without a trailing blank line. Fix the stream forwarder so the last frame is flushed, and add a regression test that uses a chunked upstream response. Keep the change small."}
+      ]
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        {"type": "output_text", "text": "I will inspect the stream forwarder first, then add a bounded regression test around the final flush."}
+      ]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {"type": "input_text", "text": "Also confirm the behavior when the client disconnects mid-stream. Report the exact files you changed."}
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "shell",
+      "description": "Run a shell command in the workspace.",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {"type": "array", "items": {"type": "string"}},
+          "workdir": {"type": "string"},
+          "timeout_ms": {"type": "integer"}
+        },
+        "required": ["command"]
+      }
+    },
+    {
+      "type": "function",
+      "name": "apply_patch",
+      "description": "Apply a unified diff to the workspace.",
+      "parameters": {
+        "type": "object",
+        "properties": {"patch": {"type": "string"}},
+        "required": ["patch"]
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "parallel_tool_calls": false,
+  "reasoning": {"effort": "medium", "summary": "auto"},
+  "include": ["reasoning.encrypted_content"],
+  "stream": true,
+  "store": false
+}

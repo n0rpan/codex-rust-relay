@@ -1,0 +1,23 @@
+{
+  "query": {
+    "original": "rust"
+  },
+  "web": {
+    "results": [
+      {
+        "title": "Rust <strong>Programming</strong> Language",
+        "url": "https://www.rust-lang.org/",
+        "description": "A language empowering everyone &amp; more.",
+        "extra_snippets": [
+          "Fast &amp; reliable."
+        ],
+        "page_age": "2024-02-03T00:00:00"
+      },
+      {
+        "title": "Rust Documentation",
+        "url": "https://doc.rust-lang.org/",
+        "description": "Documentation for the Rust language."
+      }
+    ]
+  }
+}

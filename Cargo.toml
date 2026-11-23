@@ -1,7 +1,12 @@
 [package]
-name = "codex-provider-relay"
+name = "ox"
 version = "0.1.0"
 edition = "2024"
+description = "Local model gateway for stock coding clients and multiple API providers"
+publish = false
+
+[features]
+test-brave = []
 
 [dependencies]
 futures-util = "0.3"
