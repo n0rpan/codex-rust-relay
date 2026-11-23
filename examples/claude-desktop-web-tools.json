@@ -1,0 +1,17 @@
+{
+  "managedMcpServers": [
+    {
+      "name": "Web search",
+      "server": "websearch",
+      "provider": "brave",
+      "headersHelper": "/usr/local/bin/brave-search-headers",
+      "toolPolicy": {
+        "web_search": "allow"
+      }
+    }
+  ],
+  "coworkEgressAllowedHosts": ["doc.rust-lang.org"],
+  "builtinToolPolicy": {
+    "WebFetch": "ask"
+  }
+}

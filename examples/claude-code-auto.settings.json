@@ -1,0 +1,8 @@
+{
+  "autoMode": {
+    "environment": ["$defaults"]
+  },
+  "permissions": {
+    "ask": ["WebFetch"]
+  }
+}

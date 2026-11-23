@@ -1,7 +1,12 @@
 [package]
-name = "codex-provider-relay"
+name = "ox"
 version = "0.1.0"
 edition = "2024"
+description = "Local model gateway for stock coding clients and multiple API providers"
+publish = false
+
+[features]
+test-brave = []
 
 [dependencies]
 futures-util = "0.3"
@@ -11,6 +16,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 subtle = "2"

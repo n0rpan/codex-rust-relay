@@ -1,0 +1,2 @@
+# SSE fixtures end with the blank line that dispatches the final event.
+*.sse whitespace=-blank-at-eof

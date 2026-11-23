@@ -1,0 +1,78 @@
+{
+  "model": "mock/bench-model",
+  "max_tokens": 4096,
+  "system": "You are Claude Code, Anthropic's official CLI for Claude, running in a Linux workspace. Use the Bash tool for commands and the Read and Edit tools for files. Keep diffs minimal and leave the test suite green.\n\nRepository: /workspace/widget. Build with cargo. Do not modify vendored sources. Ask before destructive commands.",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "The loopback relay drops the final SSE event when the upstream connection closes without a trailing blank line. Fix the stream forwarder so the last frame is flushed, and add a regression test that uses a chunked upstream response. Keep the change small."
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "I will inspect the stream forwarder first, then add a bounded regression test around the final flush."
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Also confirm the behavior when the client disconnects mid-stream. Report the exact files you changed."
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "Bash",
+      "description": "Run a shell command in the workspace.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "command": {"type": "string"},
+          "workdir": {"type": "string"},
+          "timeout_ms": {"type": "integer"}
+        },
+        "required": ["command"]
+      }
+    },
+    {
+      "name": "Read",
+      "description": "Read a file from the workspace.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file_path": {"type": "string"},
+          "offset": {"type": "integer"},
+          "limit": {"type": "integer"}
+        },
+        "required": ["file_path"]
+      }
+    },
+    {
+      "name": "Edit",
+      "description": "Apply an exact string replacement to a workspace file.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file_path": {"type": "string"},
+          "old_string": {"type": "string"},
+          "new_string": {"type": "string"},
+          "replace_all": {"type": "boolean"}
+        },
+        "required": ["file_path", "old_string", "new_string"]
+      }
+    }
+  ],
+  "tool_choice": {"type": "auto"},
+  "stream": true
+}

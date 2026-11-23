@@ -1,0 +1,30 @@
+# Merge into $CODEX_HOME/codeox.toml. Export the referenced credentials before launching ox.
+[providers.anthropic]
+name = "Anthropic Messages"
+base_url = "https://api.anthropic.com/v1"
+wire_api = "anthropic_messages"
+anthropic_version = "2026-10-21"
+env_key = "ANTHROPIC_API_KEY"
+discovery = false
+
+[[providers.anthropic.models]]
+id = "claude-sonnet-5"
+
+[[providers.anthropic.models]]
+id = "claude-haiku-5-5"
+
+[providers.anthropic-legacy]
+name = "Anthropic Messages (legacy)"
+base_url = "https://api.anthropic.com/v1"
+wire_api = "anthropic_messages"
+anthropic_version = "2023-06-01"
+env_key = "ANTHROPIC_API_KEY"
+discovery = false
+
+[[providers.anthropic-legacy.models]]
+id = "claude-haiku-5-5"
+
+[search]
+env_key = "BRAVE_SEARCH_API_KEY"
+max_results = 8
+timeout_seconds = 14

@@ -1,0 +1,39 @@
+{
+  "grounding": {
+    "generic": [
+      {
+        "url": "https://www.rust-lang.org/learn",
+        "title": "Learn Rust",
+        "snippets": [
+          "Rust is a fast, reliable programming language.",
+          "The Rust Book is the primary learning resource."
+        ]
+      },
+      {
+        "url": "https://doc.rust-lang.org/book/",
+        "title": "",
+        "snippets": [
+          "The Rust Programming Language book."
+        ]
+      }
+    ],
+    "map": []
+  },
+  "sources": {
+    "https://www.rust-lang.org/learn": {
+      "title": "Learn Rust",
+      "hostname": "www.rust-lang.org",
+      "age": [
+        "Monday, January 15, 2024",
+        "2024-01-15",
+        "380 days ago",
+        "2024-01-15T13:45:02Z"
+      ]
+    },
+    "https://doc.rust-lang.org/book/": {
+      "title": "The Rust Programming Language",
+      "hostname": "doc.rust-lang.org",
+      "age": []
+    }
+  }
+}

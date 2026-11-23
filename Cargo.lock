@@ -72,24 +72,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-provider-relay"
-version = "0.1.0"
-dependencies = [
- "futures-util",
- "getrandom 0.4.3",
- "hex",
- "http-body-util",
- "hyper",
- "hyper-util",
- "reqwest",
- "serde",
- "serde_json",
- "subtle",
- "tokio",
- "toml_edit",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -527,6 +509,25 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "ox"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "getrandom 0.4.3",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tokio",
+ "toml_edit",
+]
 
 [[package]]
 name = "percent-encoding"

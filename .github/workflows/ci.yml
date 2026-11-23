@@ -1,0 +1,433 @@
+name: CI
+
+# Test a reproducible stock-client baseline and the latest official client
+# releases. The daily run checks only latest so upstream updates are visible
+# even when ox has not changed. The relay benchmark stays manual.
+#
+# A separate native matrix then builds the locked release binary on Linux
+# x86_64/ARM64 and macOS Intel/Apple silicon, runs it, and uploads one `ox`
+# archive, native updater binary, and checksums per platform. The matrix uses
+# the read-only token. Only the tag-triggered publication job can write Releases.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "27 6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  verify:
+    name: Stock clients (${{ matrix.client_track }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        client_track: ${{ github.event_name == 'schedule' && fromJSON('["latest"]') || fromJSON('["baseline", "latest"]') }}
+    env:
+      OX_CI_CLIENT_TRACK: ${{ matrix.client_track }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust 1.100.0 with rustfmt
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.100.0 --profile minimal --component rustfmt --no-self-update
+          rustup default 1.100.0
+          rustc --version
+          cargo --version
+          cargo fmt --version
+
+      - name: Check formatting
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+
+      - name: Fetch locked dependencies
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+
+      - name: Run all non-ignored tests offline against the lockfile
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline
+
+      - name: Build the release binary offline against the lockfile
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --offline
+          test -x target/release/ox
+          file target/release/ox
+
+      - name: Exercise first-run setup in a terminal
+        timeout-minutes: 2
+        run: python3 tests/fixtures/setup_selector.py
+
+      - name: Install stock Codex from the official release
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          target="x86_64-unknown-linux-musl"
+          asset="codex-${target}.tar.gz"
+          release_origin="https://releases.openai.com/codex"
+          use_release_origin=false
+          if [ "${OX_CI_CLIENT_TRACK}" = "latest" ]; then
+            echo "Resolving the latest Codex release from OpenAI's release channel"
+            if metadata="$(curl --proto '=https' --fail --silent --show-error --location \
+                --connect-timeout 10 --max-time 30 --retry 2 "${release_origin}/channels/latest")"; then
+              use_release_origin=true
+            else
+              echo "::warning::OpenAI release metadata unavailable; trying GitHub Releases"
+              metadata="$(curl --proto '=https' --fail --silent --show-error \
+                --connect-timeout 10 --max-time 30 --retry 2 \
+                https://api.github.com/repos/openai/codex/releases/latest)"
+            fi
+            tag="$(jq -er '.tag_name | select(test("^rust-v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "${metadata}")"
+            version="${tag#rust-v}"
+            expected_sha256="$(jq -er --arg asset "${asset}" '
+              .assets[] | select(.name == $asset) | .digest
+              | select(test("^sha256:[0-9a-f]{64}$")) | ltrimstr("sha256:")
+            ' <<< "${metadata}")"
+          else
+            version="0.171.0"
+            expected_sha256="01baa2e47809f8597be5b2f8abd4e4dfe3fb5bcb6e504c2fbaaad97056c15e8d"
+          fi
+          url="https://github.com/openai/codex/releases/download/rust-v${version}/${asset}"
+          destination="${RUNNER_TEMP}/codex-${version}"
+          binary="${destination}/codex-${target}"
+          archive="${RUNNER_TEMP}/${asset}"
+          mkdir -p "${destination}"
+          echo "Downloading Codex ${version}"
+          if [ "${use_release_origin}" = true ] &&
+            curl --proto '=https' --fail --silent --show-error --location \
+              --connect-timeout 10 --max-time 120 --retry 2 \
+              --output "${archive}" "${release_origin}/releases/${version}/${asset}"; then
+            echo "Downloaded from OpenAI's release origin"
+          else
+            echo "Downloading from GitHub Releases"
+            curl --proto '=https' --fail --silent --show-error --location \
+              --connect-timeout 10 --max-time 120 --retry 2 --output "${archive}" "${url}"
+          fi
+          echo "${expected_sha256}  ${archive}" | sha256sum --check --strict
+          tar --extract --gzip --file "${archive}" --directory "${destination}"
+          chmod 0755 "${binary}"
+          actual_version="$("${binary}" --version)"
+          if [ "${actual_version}" != "codex-cli ${version}" ]; then
+            echo "::error::expected codex-cli ${version}, got ${actual_version}"
+            exit 1
+          fi
+          echo "CODEOX_TEST_CODEX_BIN=${binary}" >> "${GITHUB_ENV}"
+          echo "Stock Codex fixture binary: ${actual_version}"
+          echo "- Codex (${OX_CI_CLIENT_TRACK}) — ${actual_version}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Ensure bubblewrap for Codex's workspace-write sandbox
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          if ! command -v bwrap >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends bubblewrap
+          fi
+          bwrap --version
+          # Ubuntu 24.04 can deny unprivileged user namespaces under AppArmor.
+          # Probe the operation Codex needs and relax only that CI-only kernel
+          # setting if this ephemeral runner blocks it.
+          if ! bwrap --ro-bind / / --dev /dev --proc /proc true >/dev/null 2>&1; then
+            if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            fi
+            bwrap --ro-bind / / --dev /dev --proc /proc true
+          fi
+
+      - name: Install stock Claude Code from the official release
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          base="https://downloads.claude.ai/claude-code-releases"
+          platform="linux-x64"
+          if [ "${OX_CI_CLIENT_TRACK}" = "latest" ]; then
+            version="$(curl --fail --silent --show-error --location --retry 3 "${base}/latest")"
+            [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            manifest="$(curl --fail --silent --show-error --location --retry 3 \
+              "${base}/${version}/manifest.json")"
+            sha256="$(jq -er --arg platform "${platform}" '
+              .platforms[$platform].checksum | select(test("^[0-9a-f]{64}$"))
+            ' <<< "${manifest}")"
+            size="$(jq -er --arg platform "${platform}" '
+              .platforms[$platform].size | select(. > 0)
+            ' <<< "${manifest}")"
+            compressed_sha256=""
+            if compressed_manifest="$(curl --fail --silent --show-error --location --retry 3 \
+                "${base}/${version}/manifest.zst.json")"; then
+              compressed_sha256="$(jq -er --arg platform "${platform}" '
+                .platforms[$platform].checksum | select(test("^[0-9a-f]{64}$"))
+              ' <<< "${compressed_manifest}")"
+            fi
+          else
+            version="2.1.330"
+            sha256="f390eaa0814e6a1bff74cbb47acb74cb9c89d30ced809fe0af5af00c7bfe8ebb"
+            size="381121040"
+            compressed_sha256="d53a3f9aab93c87bba0813d1101677677b457100824f5c3604fea9915ac5237a"
+          fi
+          archive="${RUNNER_TEMP}/claude-${version}.zst"
+          binary="${RUNNER_TEMP}/claude-${version}"
+          if [ -n "${compressed_sha256}" ]; then
+            curl --fail --silent --show-error --location --retry 3 --output "${archive}" \
+              "${base}/${version}/${platform}/claude.zst"
+            echo "${compressed_sha256}  ${archive}" | sha256sum --check --strict
+            # The official installer extracts the manifest's byte length.
+            # The binary digest below verifies the output after the pipe closes.
+            zstd --quiet --decompress --stdout "${archive}" |
+              head -c "${size}" > "${binary}" || true
+          else
+            curl --fail --silent --show-error --location --retry 3 --output "${binary}" \
+              "${base}/${version}/${platform}/claude"
+          fi
+          echo "${sha256}  ${binary}" | sha256sum --check --strict
+          chmod 0755 "${binary}"
+          actual_version="$("${binary}" --version)"
+          test "${actual_version}" = "${version} (Claude Code)"
+          echo "OX_TEST_CLAUDE_BIN=${binary}" >> "${GITHUB_ENV}"
+          echo "- Claude Code (${OX_CI_CLIENT_TRACK}) — ${actual_version}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Disable paid and public inference for fixture steps
+        run: |
+          set -euo pipefail
+          # Dummy keys and a dead loopback proxy make any accidental public
+          # request fail closed. The fixtures also run the CLI with an isolated
+          # HOME/CODEX_HOME and only loopback relay and Brave mocks.
+          for name in OPENAI_API_KEY CODEX_API_KEY ANTHROPIC_API_KEY BRAVE_SEARCH_API_KEY; do
+            echo "${name}=ci-dummy-no-inference" >> "${GITHUB_ENV}"
+          done
+          echo "OPENAI_BASE_URL=http://127.0.0.1:1/v1" >> "${GITHUB_ENV}"
+          for name in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do
+            echo "${name}=http://127.0.0.1:1" >> "${GITHUB_ENV}"
+          done
+          echo "NO_PROXY=127.0.0.1,localhost" >> "${GITHUB_ENV}"
+          echo "no_proxy=127.0.0.1,localhost" >> "${GITHUB_ENV}"
+
+      - name: Run stock Codex loopback fixtures
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          # Eight switch fixtures and four coding-and-search fixtures. All
+          # use isolated homes, dummy keys, and only loopback traffic.
+          cargo test --locked --offline --features test-brave --test stock_codex_smoke -- \
+            --ignored --nocapture --test-threads=1
+
+      - name: Run native web.run loopback fixture
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --bin ox -- \
+            --ignored --exact --nocapture \
+            translated_tests::stock_codex_emits_web_run_and_calls_the_alpha_search_endpoint
+
+      - name: Verify native and relayed Codex authentication in one home
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --test shared_codex_home -- \
+            --ignored --nocapture --test-threads=1
+
+      - name: Run stock Claude Code loopback fixtures
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --features test-brave --test stock_claude_smoke -- \
+            --ignored --nocapture --test-threads=1
+
+      - name: Run stock Codex App Server and Claude Code through a persistent gateway
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cargo test --locked --offline --test shared_gateway -- --ignored --nocapture
+
+  release:
+    if: github.event_name != 'schedule'
+    name: Release binaries (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      # Report every platform instead of cancelling the matrix on one failure.
+      fail-fast: false
+      matrix:
+        # Linux artifacts link the Ubuntu 24.04 glibc (2.39) used by the verify
+        # job. macOS artifacts are native Intel and Apple silicon builds, not
+        # cross-compiled, so each job can run what it packages.
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            file_type: x86-64
+            macos_deployment_target: ""
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            file_type: aarch64
+            macos_deployment_target: ""
+          - platform: macos-x86_64
+            runner: macos-26-intel
+            target: x86_64-apple-darwin
+            file_type: x86_64
+            macos_deployment_target: "11.0"
+          - platform: macos-aarch64
+            runner: macos-26
+            target: aarch64-apple-darwin
+            file_type: arm64
+            macos_deployment_target: "11.0"
+    env:
+      # rustc defaults x86_64-apple-darwin to 10.12 and aarch64-apple-darwin to
+      # 11.0. Pin both macOS artifacts to the 11.0 arm64 floor so the Intel
+      # artifact is not older than its Apple silicon counterpart.
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust 1.100.0
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.100.0 --profile minimal --no-self-update
+          rustup default 1.100.0
+          rustc --version
+          cargo --version
+          rustc --print deployment-target 2>/dev/null || true
+
+      - name: Build the release binary offline against the lockfile
+        timeout-minutes: 25
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          if [ "${host}" != "${target}" ]; then
+            echo "::error::runner host ${host} does not match matrix target ${target}"
+            exit 1
+          fi
+          cargo fetch --locked
+          cargo build --release --locked --offline --target "${target}"
+          binary="target/${target}/release/ox"
+          test -x "${binary}"
+          file "${binary}"
+          file "${binary}" | grep -F -- "${{ matrix.file_type }}"
+          # --help prints usage and exits before reading any configuration, so
+          # this probes that the executable starts without network or secrets.
+          "${binary}" --help | grep -F "Launch Codex with the gateway"
+
+      - name: Test atomic updates on this platform
+        timeout-minutes: 15
+        run: cargo test --release --locked --offline --target "${{ matrix.target }}" --bin ox update::tests
+
+      - name: Package ox and SHA-256 checksum
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "${version}" ]; then
+            echo "::error::could not read the package version from Cargo.toml"
+            exit 1
+          fi
+          archive="ox-${version}-${target}.tar.gz"
+          executable="ox-${version}-${target}"
+          mkdir -p dist
+          cp "target/${target}/release/ox" "dist/${executable}"
+          tar --create --gzip --file "dist/${archive}" \
+            --directory "target/${target}/release" ox
+          (
+            cd dist
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum --binary "${archive}" > "${archive}.sha256"
+              sha256sum --binary "${executable}" > "${executable}.sha256"
+              sha256sum --check --strict "${archive}.sha256"
+              sha256sum --check --strict "${executable}.sha256"
+            else
+              shasum -a 256 "${archive}" > "${archive}.sha256"
+              shasum -a 256 "${executable}" > "${executable}.sha256"
+              shasum -a 256 --check "${archive}.sha256"
+              shasum -a 256 --check "${executable}.sha256"
+            fi
+            cat "${archive}.sha256"
+          )
+          tar --list --gzip --file "dist/${archive}"
+          # The uploaded archive is what users download, so unpack it and run
+          # that copy rather than the build-tree binary.
+          unpacked="${RUNNER_TEMP}/ox-${target}"
+          rm -rf "${unpacked}"
+          mkdir -p "${unpacked}"
+          tar --extract --gzip --file "dist/${archive}" --directory "${unpacked}"
+          test -x "${unpacked}/ox"
+          "${unpacked}/ox" --help | grep -F "Launch Codex with the gateway"
+          test "$("${unpacked}/ox" --version)" = "ox ${version}"
+          cmp "${unpacked}/ox" "dist/${executable}"
+          "dist/${executable}" update --help | grep -F 'Usage: ox update'
+          OX_TEST_BINARY="dist/${executable}" python3 tests/fixtures/setup_selector.py
+
+      - name: Upload ox archive and SHA-256 checksum
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ox-${{ matrix.target }}
+          path: dist/ox-*
+          if-no-files-found: error
+          retention-days: 30
+          # The archives are already gzip-compressed.
+          compression-level: 0
+
+  publish:
+    name: Publish a tagged release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [verify, release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Publish the four checked platform builds
+        run: |
+          set -euo pipefail
+          if [[ ! "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::use a stable tag vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'ox-*' --dir dist
+          files=()
+          for platform in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            directory="dist/ox-${platform}"
+            executable="ox-${TAG#v}-${platform}"
+            (
+              cd "$directory"
+              sha256sum --check --strict "${executable}.sha256" "${executable}.tar.gz.sha256"
+            )
+            files+=("$directory/$executable" "$directory/$executable.sha256"
+                    "$directory/$executable.tar.gz" "$directory/$executable.tar.gz.sha256")
+          done
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --latest "${files[@]}"

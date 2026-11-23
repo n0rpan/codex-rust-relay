@@ -1,0 +1,16 @@
+[Unit]
+Description=ox model gateway
+After=network-online.target
+
+[Service]
+Type=exec
+Environment=CODEX_HOME=%h/.config/ox
+EnvironmentFile=%h/.config/ox/gateway.env
+ExecStart=%h/.local/bin/ox serve --port 8787
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target
