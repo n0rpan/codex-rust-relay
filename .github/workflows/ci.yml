@@ -87,9 +87,19 @@ jobs:
           set -euo pipefail
           target="x86_64-unknown-linux-musl"
           asset="codex-${target}.tar.gz"
+          release_origin="https://releases.openai.com/codex"
+          use_release_origin=false
           if [ "${OX_CI_CLIENT_TRACK}" = "latest" ]; then
-            metadata="$(curl --fail --silent --show-error --retry 3 \
-              https://api.github.com/repos/openai/codex/releases/latest)"
+            echo "Resolving the latest Codex release from OpenAI's release channel"
+            if metadata="$(curl --proto '=https' --fail --silent --show-error --location \
+                --connect-timeout 10 --max-time 30 --retry 2 "${release_origin}/channels/latest")"; then
+              use_release_origin=true
+            else
+              echo "::warning::OpenAI release metadata unavailable; trying GitHub Releases"
+              metadata="$(curl --proto '=https' --fail --silent --show-error \
+                --connect-timeout 10 --max-time 30 --retry 2 \
+                https://api.github.com/repos/openai/codex/releases/latest)"
+            fi
             tag="$(jq -er '.tag_name | select(test("^rust-v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "${metadata}")"
             version="${tag#rust-v}"
             expected_sha256="$(jq -er --arg asset "${asset}" '
@@ -103,11 +113,21 @@ jobs:
           url="https://github.com/openai/codex/releases/download/rust-v${version}/${asset}"
           destination="${RUNNER_TEMP}/codex-${version}"
           binary="${destination}/codex-${target}"
+          archive="${RUNNER_TEMP}/${asset}"
           mkdir -p "${destination}"
-          curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
-            --output "${RUNNER_TEMP}/${asset}" "${url}"
-          echo "${expected_sha256}  ${RUNNER_TEMP}/${asset}" | sha256sum --check --strict
-          tar --extract --gzip --file "${RUNNER_TEMP}/${asset}" --directory "${destination}"
+          echo "Downloading Codex ${version}"
+          if [ "${use_release_origin}" = true ] &&
+            curl --proto '=https' --fail --silent --show-error --location \
+              --connect-timeout 10 --max-time 120 --retry 2 \
+              --output "${archive}" "${release_origin}/releases/${version}/${asset}"; then
+            echo "Downloaded from OpenAI's release origin"
+          else
+            echo "Downloading from GitHub Releases"
+            curl --proto '=https' --fail --silent --show-error --location \
+              --connect-timeout 10 --max-time 120 --retry 2 --output "${archive}" "${url}"
+          fi
+          echo "${expected_sha256}  ${archive}" | sha256sum --check --strict
+          tar --extract --gzip --file "${archive}" --directory "${destination}"
           chmod 0755 "${binary}"
           actual_version="$("${binary}" --version)"
           if [ "${actual_version}" != "codex-cli ${version}" ]; then
