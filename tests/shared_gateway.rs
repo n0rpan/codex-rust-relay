@@ -74,6 +74,9 @@ async fn mock(home: &Home) -> (Arc<Mutex<Vec<Hit>>>, tokio::task::JoinHandle<()>
              [[providers.{name}.models]]\nid = \"{name}-model\"\n"
         ));
     }
+    config.push_str(
+        "\n[[providers.responses.models]]\nid = \"claude-alternate\"\nname = \"Claude via Responses\"\n",
+    );
     std::fs::write(home.0.join("codeox.toml"), config).unwrap();
 
     let hits = Arc::new(Mutex::new(Vec::new()));
@@ -180,7 +183,7 @@ async fn a_fixed_endpoint_serves_both_client_protocols_and_survives_restart() {
             .any(|m| m["slug"] == "responses/responses-model")
     );
     let claude: Value = client
-        .get(format!("{base}/models"))
+        .get(format!("{base}/models?limit=1000"))
         .header("x-api-key", GATEWAY_KEY)
         .send()
         .await
@@ -188,13 +191,14 @@ async fn a_fixed_endpoint_serves_both_client_protocols_and_survives_restart() {
         .json()
         .await
         .unwrap();
-    assert!(
-        claude["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["id"] == "claude/claude-model")
-    );
+    let models = claude["data"].as_array().unwrap();
+    for alias in [
+        "claude/claude-model",
+        "responses/claude-alternate",
+        "chat/chat-model",
+    ] {
+        assert!(models.iter().any(|model| model["id"] == alias), "{alias}");
+    }
 
     let responses = client
         .post(format!("{base}/responses?internal=private"))
@@ -403,9 +407,10 @@ async fn stock_app_server_and_claude_use_the_same_fixed_gateway() {
         Duration::from_secs(30),
         stock_client("OX_TEST_CLAUDE_BIN", &claude_home)
             .env("CLAUDE_CONFIG_DIR", &claude_home.0)
-            .env("ANTHROPIC_BASE_URL", origin)
+            .env("ANTHROPIC_BASE_URL", &origin)
             .env("ANTHROPIC_AUTH_TOKEN", GATEWAY_KEY)
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            .env("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1")
             .current_dir(&project.0)
             .args(["-p", "Reply OK", "--model", "claude/claude-model"])
             .output(),
@@ -419,6 +424,19 @@ async fn stock_app_server_and_claude_use_the_same_fixed_gateway() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "OK");
+    let cache_path = claude_home.0.join("cache/gateway-models.json");
+    let cache: Value = serde_json::from_slice(
+        &std::fs::read(&cache_path).expect("stock Claude Code did not cache the ox catalog"),
+    )
+    .unwrap();
+    assert_eq!(cache["baseUrl"], origin);
+    let discovered = cache["models"].as_array().unwrap();
+    for alias in ["claude/claude-model", "responses/claude-alternate"] {
+        assert!(
+            discovered.iter().any(|model| model["id"] == alias),
+            "missing discovered model {alias}: {discovered:?}"
+        );
+    }
     gateway.kill().await.unwrap();
     mock.abort();
 

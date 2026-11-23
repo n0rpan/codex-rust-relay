@@ -88,7 +88,8 @@ read. Prompts and tool results go to the selected API provider and use that prov
 
 Use the same alias, **`provider/model-id`**, in either client. Add more providers with
 `ox provider add`, then relaunch. Codex lists configured models in `/model`. In Claude Code,
-`--model <alias>` selects any configured model.
+`--model <alias>` selects any configured model. To show more Claude aliases in `/model`,
+enable [Claude Code model discovery](docs/configuration.md#model-names-and-discovery).
 
 ## Common tasks
 

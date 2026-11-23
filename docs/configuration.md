@@ -130,11 +130,26 @@ can route to an upstream model ID even when discovery omits it, but the model mu
 for that provider. A bare model ID is accepted only if routing can resolve it unambiguously.
 
 If Codex shows a stale picker, check for `model_catalog_json` in `$CODEX_HOME/config.toml`.
-It takes precedence over the live catalog. Claude Code offers a limited set of custom slots
-by default. Set `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` to opt in to its gateway catalog,
-or use `--model <alias>` directly. Pass an explicit alias on the first Codex launch too,
-since Codex may already have a different default model. Use qualified names to avoid built-in Claude aliases like
-`sonnet` being rewritten by the client. [Claude Code model discovery](https://code.claude.com/docs/en/llm-gateway-protocol#model-discovery)
+It takes precedence over the live catalog. Pass an explicit alias on the first Codex
+launch if Codex already has a different default model.
+
+Claude Code's `/model` uses the built-in tier slots and one custom slot by default.
+To discover additional Claude models across providers, start the client with discovery
+enabled and open `/model`:
+
+```sh
+CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 ox claude
+```
+
+ox lists configured aliases in `GET /v1/models`. Claude Code adds discovered aliases
+whose IDs contain `claude` or `anthropic`. Managed picker settings can further limit
+the list. For any configured alias, including a GPT or DeepSeek alias, launch with
+`ox claude --model <provider/model-id>`. Use qualified aliases because the client
+expands built-in names like `sonnet`. [Claude Code model discovery](https://code.claude.com/docs/en/llm-gateway-protocol#model-discovery)
+
+When multiple providers serve the same model, choose the provider-qualified alias
+to control which provider receives the request. ox routes each alias to a single
+upstream. Price-based routing and cross-provider failover are currently unavailable.
 
 ### Protocol-specific options
 

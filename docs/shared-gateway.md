@@ -141,7 +141,9 @@ reach the tailnet URL.
   stock `claude` binary. Set `ANTHROPIC_BASE_URL` to the HTTPS origin,
   `ANTHROPIC_AUTH_TOKEN` to the gateway key as a sensitive value, and
   `ANTHROPIC_API_KEY` to an explicitly empty value. Add your exact model alias
-  as a custom model. [T3 Code Claude router settings](https://github.com/pingdotgg/t3code/blob/main/docs/user/providers-claude.md#other-routers)
+  as a custom model in T3 Code. For the standalone Claude Code CLI pointed at the
+  same daemon, use [model discovery](configuration.md#model-names-and-discovery)
+  with the Claude process to populate its own `/model` picker. [T3 Code Claude router settings](https://github.com/pingdotgg/t3code/blob/main/docs/user/providers-claude.md#other-routers)
 
 T3 Code manages which instance, secret and aliases a thread uses. Add or update
 vendor routes in the server’s `codeox.toml`. Sessions and tool execution stay in
@@ -152,6 +154,13 @@ the selected client environment.
 The repository verifies the shared HTTP endpoint, auth rejection, vendor-key
 isolation and reuse of the same port and key after a restart. The opt-in stock
 fixture sends a Codex App Server turn and a Claude Code CLI turn to the same
-daemon using disposable homes and loopback vendor fixtures. These checks
-exercise inference routing. Desktop UI workflows and a real cross-device tailnet
-connection require the corresponding installations and device access.
+daemon using disposable homes and loopback vendor fixtures. It verifies Codex's
+catalog lookup and Claude Code's discovery of Claude aliases across providers.
+Desktop UI workflows and a real cross-device tailnet connection require the
+corresponding installations and device access.
+
+For a Mac smoke test, first check the authenticated `/v1/models` request from
+the Mac. Then open a fresh local task in each desktop app, select an ox alias
+and ask it to read a small file in a test workspace. Verify the reply streams
+and includes a detail from the file. This exercises inference and a local tool
+in each app.
