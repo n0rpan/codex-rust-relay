@@ -73,10 +73,19 @@ Cargo installs into `${CARGO_HOME:-$HOME/.cargo}/bin` by default. Add the instal
 
 ## Add a provider
 
-Start with `ox setup` in a terminal and choose **Add an API key provider**. Enter `openrouter`, `anthropic`, or `openai`
-for connection defaults. For another provider, use the URL and API format from its
-documentation. Setup asks for the **name** of your API key variable. Load the value
-in the shell that will run ox, then use `ox doctor` to check the configuration.
+Run `ox setup` in a terminal, choose **Add an API key**, and pick the service that
+issued it. For OpenCode Go, OpenRouter, Anthropic, OpenAI and Alibaba Cloud
+Token Plan in Singapore, ox fills in the URL and API format. Paste your key at
+the hidden prompt. If you already exported the provider’s variable, ox uses
+that value. The menu returns so you can add more providers or enable Brave.
+
+For **Other or self-hosted**, paste the API URL. A plain `/v1` URL defaults to
+OpenAI Responses, and ox looks up `/v1/models` when you launch. Pasting a full
+`/chat/completions`, `/messages`, or `/responses` URL selects its format and
+removes the endpoint suffix before discovery. If the service cannot list models,
+add a [static model entry](#model-names-and-discovery) with the exact model ID.
+
+### Scripted or advanced setup
 
 Choose the API format your **provider** expects, regardless of which CLI you use.
 Use a model that supports streaming and tool calls for the coding workflows in the
@@ -186,10 +195,16 @@ Both clients read `codeox.toml` under `$CODEX_HOME`, which defaults to `~/.codex
 Claude Code, that is still the provider registry location. Claude Code's own settings and
 session storage use its normal directory. `ox doctor` prints the registry directory.
 
-In `codeox.toml`, `env_key` is the **name** of an environment variable. ox reads its
-value at launch and keeps configured provider and Brave keys out of the launched client
-environment. Keep the values in your shell environment or load them with your secret manager.
-After rotating a key, restart ox in a shell with the new value.
+In `codeox.toml`, `env_key` is the **name** of an environment variable. A key
+pasted at the hidden prompt lives in `$CODEX_HOME/ox-api-keys.json` as plaintext
+with owner-only permissions (mode 0600). ox uses it only for the configured
+destination and keeps it out of the launched client environment. Protect this
+file like other credentials and keep it out of version control.
+
+An exported variable takes priority over a saved key. To rotate a saved key,
+choose its provider again in `ox setup`, paste the replacement, and restart ox.
+If the variable is exported, unset it in that shell before choosing the provider
+again. To rotate an environment-managed key, load the new value and restart ox.
 
 Use HTTPS for remote providers and HTTP only for loopback. URLs cannot contain embedded
 credentials. `base_url` accepts neither a query string nor a fragment. `models_url` must
@@ -377,10 +392,22 @@ clients for sign-in status and reports which subscription launches are ready.
   `ox claude --resume <session-id> --model <original-alias>`. Start a fresh session
   when changing model or vendor so signed thinking stays with its original route.
 
-The shared gateway uses provider API credentials. Subscription sessions execute
-in the signed-in native client. If your Claude plan includes separate Platform
-credits, use a Claude Console API key to spend those credits through the relay.
+The shared gateway authenticates upstream with provider API keys. To spend
+included API credits through it, claim them and configure an API key from the
+linked OpenAI organization or Claude Console organization. Native subscription
+sign-ins stay with Codex and Claude Code. Running an agent runtime on the server
+would run the agent and its tools on that host, while the ox gateway serves
+model calls for clients that keep their own tools and sessions.
+[ChatGPT API credits](https://developers.openai.com/api/docs/guides/chatgpt-api-credits) ·
 [Claude Platform credits](https://platform.claude.com/docs/en/about-claude/api-credits-for-subscribers)
+
+OpenAI provides a separate OAuth flow for eligible ChatGPT plan requests from
+open-source and locally hosted apps. ox has no integration with that flow today.
+Anthropic permits users to sign in to hosted stock Claude Code for their own
+sessions and restricts third-party services that route requests through those
+subscription credentials, including services built with the Agent SDK.
+[Sign in with ChatGPT for open-source apps](https://developers.openai.com/siwc/token-sharing-open-source) ·
+[Claude credential rules](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)
 
 ### Upgrade from the original single-provider relay
 

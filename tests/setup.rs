@@ -387,7 +387,7 @@ fn credential_values_are_rejected_and_never_echoed() {
     )
     .unwrap();
     assert_eq!(code, 2);
-    assert!(output.contains("credential references"), "{output}");
+    assert!(output.contains("--env-key NAME"), "{output}");
     assert!(!output.contains("another-secret-value"), "{output}");
     assert!(!home.exists("codeox.toml"));
 }
@@ -882,7 +882,10 @@ env_key = "SHADOW_KEY"
     );
     assert!(output.contains("provider alpha"), "{output}");
     assert!(output.contains("wire: responses"), "{output}");
-    assert!(output.contains("credentials: ALPHA_KEY is set"), "{output}");
+    assert!(
+        output.contains("credentials: ALPHA_KEY is available to ox"),
+        "{output}"
+    );
     assert!(
         output.contains("credential reference BETA_KEY is not set"),
         "{output}"
@@ -1197,7 +1200,10 @@ wire_api = "responses"
     assert_eq!(code, 0, "{output}");
     assert!(output.contains("legacy (no codeox.toml"), "{output}");
     assert!(output.contains("selected provider: demo"), "{output}");
-    assert!(output.contains("credentials: DEMO_KEY is set"), "{output}");
+    assert!(
+        output.contains("credentials: DEMO_KEY is available to ox"),
+        "{output}"
+    );
     assert!(output.contains("legacy relay can start"), "{output}");
     assert!(!output.contains("secret"), "{output}");
 

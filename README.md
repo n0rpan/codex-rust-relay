@@ -37,10 +37,19 @@ For unreleased builds, follow the [preview or source install steps](docs/configu
 
 ## 2. Add a provider
 
-Run `ox setup`, choose **Add an API key provider**, and follow the prompts. Enter `openrouter`, `anthropic`, or `openai`
-to get connection defaults. When asked for an environment variable, enter its name,
-such as `OPENROUTER_API_KEY`. Load the API key into your shell. Back in the menu,
-add another provider, enable Brave search or choose **Done**. Then run `ox doctor`.
+1. Run `ox setup`, choose **Add an API key**, then pick the service that issued it.
+2. Paste that service’s API key at the hidden prompt. ox fills in the connection
+   settings and saves the key locally. For **Other or self-hosted**, paste the
+   service’s API URL first.
+3. Back in the menu, add another provider or enable Brave web search. Choose
+   **Done**, then run `ox doctor`.
+
+Use **Sign in with ChatGPT** or **Sign in with Claude** for a subscription
+session in its own client. If your plan offers API credits, claim them and
+add an API key from the linked organization to use those credits in both
+clients and over the shared gateway.
+[OpenAI API credits](https://developers.openai.com/api/docs/guides/chatgpt-api-credits) ·
+[Claude Platform credits](https://platform.claude.com/docs/en/about-claude/api-credits-for-subscribers)
 
 For repeatable setup with **OpenRouter**, the commands below use a model tested with
 both clients. Load `OPENROUTER_API_KEY` from your secret manager or use this hidden
@@ -105,7 +114,7 @@ Start a new session through `ox claude` to choose from the full list again.
 | `ox: command not found` | Run `./ox --help` in the extracted folder. Move the binary to a directory on your `PATH`. |
 | Linux reports a missing glibc version, or macOS blocks the downloaded binary | Use the [source installation](docs/configuration.md#install-options) and run `ox --version` again. |
 | Client missing, or Codex’s bundled model catalog fails to load | Run `codex --version` or `claude --version` from the same terminal. For Codex also try `codex debug models --bundled`. If the problem began after an update, check the latest-client CI job. |
-| `provider … is unavailable` | Run `ox doctor` and load the exact variable it names in the shell that launches ox. |
+| `provider … is unavailable` | Run `ox doctor`. Add the missing key in `ox setup` or export the variable it names. |
 | `unknown model`, or an empty picker | Pass the full alias from setup. Check the vendor model ID, or pin it with a [static model entry](docs/configuration.md#model-names-and-discovery). |
 | Authentication error after a clean `doctor` | Run `ox doctor --live --provider <name>` to check the key, model and streaming with one small API request. |
 | Provider returns `404` or rejects the request format | Check that the [base URL and wire format](docs/configuration.md#add-a-provider) match the endpoint. Leave the request path, such as `/chat/completions`, off the base URL. |

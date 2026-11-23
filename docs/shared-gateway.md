@@ -12,18 +12,18 @@ use the HTTPS address from [Tailscale Serve](#2-publish-it-inside-your-tailnet).
 
 ## 1. Configure and start ox
 
-Install ox on the server, then create its config and add providers using the same
-[provider setup](configuration.md#add-a-provider) commands. For a dedicated config
-directory on the server:
+Install ox on the server and run `ox setup` as the user who will run the service.
+Choose **Add an API key**, select the service, and paste its key. For example,
+to use the config directory expected by the sample systemd service:
 
 ```sh
 export CODEX_HOME="$HOME/.config/ox"
-ox provider add openrouter \
-  --base-url https://openrouter.ai/api/v1 --wire responses \
-  --env-key OPENROUTER_API_KEY --no-discovery --model openai/gpt-5.4-mini
+ox setup
+ox doctor
 ```
 
-Load `OPENROUTER_API_KEY` and any other vendor keys into the environment on the server.
+ox serve loads the keys saved by the wizard for that directory. You can also
+[configure providers with environment variables](configuration.md#scripted-or-advanced-setup).
 For a live check, run `ox doctor --live --provider openrouter`. It sends one small
 streamed prompt and checks for text. The API request may be billed. Plain `ox doctor`
 stays offline.
@@ -39,8 +39,8 @@ ox serve --port 8787
 Use the foreground command to check setup. For persistence on Linux, the
 [systemd user-service example](../examples/ox.service) expects
 `~/.local/bin/ox`, `~/.config/ox/codeox.toml` and `~/.config/ox/gateway.env`. Keep
-`gateway.env` private (mode 0600). Use one `NAME=value` line for each credential,
-including `OX_GATEWAY_KEY`. Install the example into `~/.config/systemd/user/ox.service`,
+`gateway.env` private (mode 0600). Put `OX_GATEWAY_KEY` there, plus one `NAME=value`
+line for each vendor key you manage in the environment. Install the example into `~/.config/systemd/user/ox.service`,
 then start it. Stop any foreground copy using port 8787 before enabling the service:
 
 ```sh

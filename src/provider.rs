@@ -84,6 +84,107 @@ pub fn process_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+/// A local store for keys pasted into the terminal setup. Scope each key to
+/// both its variable name and destination so editing a URL cannot forward it.
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+#[serde(transparent)]
+pub(crate) struct SavedKeys(BTreeMap<String, SavedKey>);
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct SavedKey {
+    scope: String,
+    value: String,
+}
+
+impl SavedKeys {
+    pub(crate) const BRAVE_SCOPE: &str = "https://api.search.brave.com/";
+
+    pub(crate) fn path(home: &Path) -> PathBuf {
+        home.join("ox-api-keys.json")
+    }
+
+    pub(crate) fn load(home: &Path) -> Result<Self, RelayError> {
+        use std::io::Read;
+
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = match options.open(Self::path(home)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(_) => return Err("could not read the local ox API key file".into()),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err("ox-api-keys.json must be a regular file".into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid takes no arguments and has no memory preconditions.
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+                return Err(
+                    "ox-api-keys.json must be owned by the current user with mode 0600".into(),
+                );
+            }
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_CONFIG_BYTES {
+            return Err("ox-api-keys.json is too large".into());
+        }
+        serde_json::from_slice(&bytes).map_err(|_| "could not parse ox-api-keys.json".into())
+    }
+
+    pub(crate) fn for_config(home: &Path, config: &CodeoxConfig) -> Result<Self, RelayError> {
+        let mut keys = Self::load(home)?;
+        keys.0
+            .retain(|name, entry| Self::scope_matches(config, name, &entry.scope));
+        Ok(keys)
+    }
+
+    pub(crate) fn scope_matches(config: &CodeoxConfig, name: &str, scope: &str) -> bool {
+        let vendors = config
+            .vendors
+            .iter()
+            .filter(|vendor| vendor.env_key.as_deref() == Some(name))
+            .map(|vendor| vendor.base_url.as_str());
+        let search = config
+            .search
+            .iter()
+            .filter(|search| search.env_key == name)
+            .map(|_| Self::BRAVE_SCOPE);
+        let mut scopes = vendors.chain(search).peekable();
+        scopes.peek().is_some() && scopes.all(|destination| destination == scope)
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<String> {
+        process_env(name).or_else(|| self.0.get(name).map(|key| key.value.clone()))
+    }
+
+    pub(crate) fn set(
+        &mut self,
+        name: &str,
+        scope: &str,
+        value: String,
+    ) -> Result<String, RelayError> {
+        self.0.insert(
+            name.to_owned(),
+            SavedKey {
+                scope: scope.to_owned(),
+                value,
+            },
+        );
+        serde_json::to_string(self).map_err(|_| "could not encode ox-api-keys.json".into())
+    }
+}
+
 pub fn configured_web_search_policy(
     document: &Document<&str>,
     profile: Option<&str>,

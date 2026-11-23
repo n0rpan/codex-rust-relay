@@ -7,7 +7,7 @@ use std::time::Duration;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde_json::{Value, json};
 
-use crate::provider::{CodeoxConfig, MaxTokensField, RelayError, Vendor, Wire, process_env};
+use crate::provider::{CodeoxConfig, Env, MaxTokensField, RelayError, SavedKeys, Vendor, Wire};
 use crate::sse::SseFramer;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -50,7 +50,8 @@ pub(crate) async fn run(args: &[OsString], home: &Path) -> Result<u8, RelayError
         vendor.key,
         vendor.wire.as_str()
     );
-    probe(vendor, model).await?;
+    let saved = SavedKeys::for_config(home, &config)?;
+    probe(vendor, model, &|name| saved.get(name)).await?;
     println!("PASS: the provider accepted the key and model and streamed text");
     Ok(0)
 }
@@ -62,9 +63,9 @@ fn next_value<'a>(args: &mut impl Iterator<Item = &'a OsString>) -> Result<&'a s
         .ok_or_else(|| USAGE.into())
 }
 
-async fn probe(vendor: &Vendor, model: &str) -> Result<(), RelayError> {
+async fn probe(vendor: &Vendor, model: &str, env: &Env<'_>) -> Result<(), RelayError> {
     let key = vendor
-        .api_key(&process_env)
+        .api_key(env)
         .ok_or_else(|| vendor.unavailable_reason())?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())

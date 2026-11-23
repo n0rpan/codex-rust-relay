@@ -172,7 +172,6 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
     let bare = args.is_empty();
     let (client_kind, mut args) = clients::select(args);
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let env: &Env<'_> = &|name: &str| provider::process_env(name);
 
     let config_path = CodeoxConfig::path(&codex_home);
     let config = if config_path.exists() {
@@ -181,7 +180,8 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         }
         LaunchConfig::Codeox(CodeoxConfig::load(&config_path)?)
     } else if matches!(client_kind, ClientKind::Codex)
-        && let Some(provider) = provider::Provider::load_if_configured(&codex_home, env)?
+        && let Some(provider) =
+            provider::Provider::load_if_configured(&codex_home, &provider::process_env)?
     {
         LaunchConfig::Legacy(provider)
     } else {
@@ -205,6 +205,11 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         }
         return Err("no ox API provider configured. Run `ox setup` to add one, or `ox help subscriptions` for native sign-in".into());
     };
+    let saved = match &config {
+        LaunchConfig::Codeox(config) => provider::SavedKeys::for_config(&codex_home, config)?,
+        LaunchConfig::Legacy(_) => provider::SavedKeys::default(),
+    };
+    let env: &Env<'_> = &|name| saved.get(name);
     let mut env_refs = config.env_refs();
     env_refs.insert(daemon::KEY_ENV.to_owned());
     let client = upstream_client()?;
@@ -332,7 +337,7 @@ async fn run_setup(args: &[OsString], codex_home: &Path) -> Result<u8, RelayErro
             SetupChoice::Subscription(account) => native::setup_subscription(account, codex_home)
                 .await
                 .map(|_| ()),
-            SetupChoice::Provider => setup::run_setup(&[], codex_home).map(|_| ()),
+            SetupChoice::Provider => setup::guided_provider(codex_home),
             SetupChoice::Brave => setup::enable_brave(codex_home),
             SetupChoice::Done => {
                 println!(

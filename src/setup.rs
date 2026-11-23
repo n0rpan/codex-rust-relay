@@ -7,8 +7,8 @@
 //! * duplicate provider keys are refused instead of merged or overwritten;
 //! * edits are serialized, validated with [`provider::CodeoxConfig`], and
 //!   saved with a same-directory temporary file plus rename;
-//! * only credential *references* (`env_key = "NAME"`) are stored. No flag or
-//!   prompt accepts a credential value, and neither command ever prints one.
+//! * the provider registry contains credential references. Guided setup can
+//!   save a key in a separate private file using a hidden terminal prompt.
 //!
 //! `doctor` is offline: it reads `codeox.toml` and `config.toml`, checks the
 //! environment for credential references, and makes no network requests. It
@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 use toml_edit::{Document, Item, TableLike};
 
 use crate::provider::{
-    CodeoxConfig, MAX_CONFIG_BYTES, PROVIDER_ID, RelayError, alias_for, credential_env_error,
-    looks_like_credential,
+    CodeoxConfig, MAX_CONFIG_BYTES, PROVIDER_ID, RelayError, SavedKeys, alias_for,
+    credential_env_error, looks_like_credential,
 };
 
 /// Narrow integration seam for `main.rs`.
@@ -50,6 +50,10 @@ pub fn dispatch(args: &[OsString], codex_home: &Path) -> Option<Result<u8, Relay
 
 fn provider_command(args: &[OsString], codex_home: &Path) -> Result<u8, RelayError> {
     if args.first().is_some_and(|arg| arg == "add") {
+        if args.len() == 1 && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            guided_provider(codex_home)?;
+            return Ok(0);
+        }
         return provider_add_command(&args[1..], codex_home, false);
     }
 
@@ -91,9 +95,9 @@ pub(crate) fn choose_setup() -> Result<SetupChoice, RelayError> {
     writeln!(
         prompt.output,
         "\nox setup\n\
-         1. Sign in with ChatGPT for Codex\n\
-         2. Sign in with Claude for Claude Code\n\
-         3. Add an API key provider for both clients\n\
+         1. Sign in with ChatGPT (Codex subscription session)\n\
+         2. Sign in with Claude (Claude Code subscription session)\n\
+         3. Add an API key for Codex, Claude Code, or a shared gateway\n\
          4. Enable Brave web search for both clients\n\
          5. Done"
     )?;
@@ -105,6 +109,247 @@ pub(crate) fn choose_setup() -> Result<SetupChoice, RelayError> {
         "5" => Ok(SetupChoice::Done),
         _ => Err("enter a number from 1 to 5".to_owned()),
     })
+}
+
+struct ProviderPreset {
+    id: &'static str,
+    name: &'static str,
+    url: &'static str,
+    wire: WireKind,
+    env: &'static str,
+}
+
+const PRESETS: &[ProviderPreset] = &[
+    ProviderPreset {
+        id: "opencode-go",
+        name: "OpenCode Go",
+        url: "https://opencode.ai/inference/go/openai/v1",
+        wire: WireKind::ChatCompletions,
+        env: "OPENCODE_API_KEY",
+    },
+    ProviderPreset {
+        id: "openrouter",
+        name: "OpenRouter",
+        url: "https://openrouter.ai/api/v1",
+        wire: WireKind::Responses,
+        env: "OPENROUTER_API_KEY",
+    },
+    ProviderPreset {
+        id: "anthropic",
+        name: "Anthropic",
+        url: "https://api.anthropic.com/v1",
+        wire: WireKind::AnthropicMessages,
+        env: "ANTHROPIC_API_KEY",
+    },
+    ProviderPreset {
+        id: "openai",
+        name: "OpenAI",
+        url: "https://api.openai.com/v1",
+        wire: WireKind::Responses,
+        env: "OPENAI_API_KEY",
+    },
+    ProviderPreset {
+        id: "alibaba",
+        name: "Alibaba Cloud Token Plan (Singapore)",
+        url: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+        wire: WireKind::ChatCompletions,
+        env: "ALIBABA_API_KEY",
+    },
+];
+
+pub(crate) fn guided_provider(home: &Path) -> Result<(), RelayError> {
+    let mut prompt = Prompt {
+        input: &mut std::io::stdin().lock(),
+        output: &mut std::io::stdout().lock(),
+    };
+    writeln!(prompt.output, "\nWhich service issued your API key?")?;
+    for (index, preset) in PRESETS.iter().enumerate() {
+        writeln!(prompt.output, "  {}. {}", index + 1, preset.name)?;
+    }
+    let other = PRESETS.len() + 1;
+    writeln!(prompt.output, "  {other}. Other or self-hosted")?;
+    writeln!(prompt.output, "  0. Back")?;
+    let choice = prompt.ask_required_with("Service number", None, |answer| {
+        answer
+            .parse::<usize>()
+            .ok()
+            .filter(|number| *number <= other)
+            .ok_or_else(|| format!("choose a number from 0 to {other}"))
+    })?;
+    if choice == 0 {
+        return Ok(());
+    }
+
+    let (id, name, url, wire, env) = if choice == other {
+        let (url, wire) = prompt.ask_required_with(
+            "Paste the API base URL or full inference endpoint",
+            None,
+            infer_connection,
+        )?;
+        let host = url.host_str().unwrap_or("local");
+        let label = host.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+        let port = url
+            .port()
+            .map(|port| format!("-{port}"))
+            .unwrap_or_default();
+        let id = format!("custom-{}{port}", &label[..label.len().min(46)]);
+        let env = default_env_key(&id);
+        writeln!(
+            prompt.output,
+            "Using {} for {host}. ox will look up models when you launch.",
+            wire_label(wire)
+        )?;
+        (id, host.to_owned(), url, wire, env)
+    } else {
+        let preset = &PRESETS[choice - 1];
+        (
+            preset.id.to_owned(),
+            preset.name.to_owned(),
+            reqwest::Url::parse(preset.url)?,
+            preset.wire,
+            preset.env.to_owned(),
+        )
+    };
+
+    let path = CodeoxConfig::path(home);
+    let existing = read_existing_codeox(&path)?
+        .as_deref()
+        .map(parse_config_for_validation)
+        .transpose()?;
+    let current = existing
+        .as_ref()
+        .and_then(|config| config.vendors.iter().find(|v| v.key == id));
+    let env = if let Some(vendor) = current {
+        if vendor.base_url != url || vendor.wire.as_str() != wire.as_str() {
+            return Err(format!("provider {id:?} already uses a different connection. Check its existing settings in codeox.toml").into());
+        }
+        vendor.env_key.clone().ok_or(
+            "this provider has no env_key. Set an env_key in codeox.toml before saving a key",
+        )?
+    } else {
+        env
+    };
+    let key = prompt.guided_key(&name, &env)?;
+    if current.is_none() {
+        let mut args: Vec<_> = [
+            id.as_str(),
+            "--name",
+            &name,
+            "--base-url",
+            url.as_str(),
+            "--wire",
+            wire.as_str(),
+            "--env-key",
+            &env,
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        if id == "anthropic" {
+            args.extend(["--anthropic-version", "2026-10-21"].map(OsString::from));
+        }
+        if id == "opencode-go" {
+            args.extend(
+                ["--models-url", "https://opencode.ai/inference/go/v1/models"].map(OsString::from),
+            );
+        }
+        if id == "alibaba" {
+            args.extend(["--model", "qwen3.8-flash"].map(OsString::from));
+        }
+        let mut report = Vec::new();
+        let code = run_provider_add(
+            &args,
+            home,
+            prompt.input,
+            &mut report,
+            false,
+            &crate::provider::process_env,
+        )?;
+        if code != 0 {
+            prompt.output.write_all(&report)?;
+            return Ok(());
+        }
+    }
+
+    let _lock = lock_config(home)?;
+    let config = CodeoxConfig::load(&path)?;
+    if let Some(key) = key {
+        if !config.vendors.iter().any(|vendor| {
+            vendor.key == id
+                && vendor.base_url == url
+                && vendor.wire.as_str() == wire.as_str()
+                && vendor.env_key.as_deref() == Some(env.as_str())
+        }) {
+            return Err(
+                "provider settings changed during setup. Choose the service again to save its key"
+                    .into(),
+            );
+        }
+        save_key(home, &config, &env, url.as_str(), key)?;
+        writeln!(prompt.output, "Saved the {name} key on this device.")?;
+    }
+    let keys = SavedKeys::for_config(home, &config)?;
+    if credential_state(&|name| keys.get(name), &env) == CredentialState::Present {
+        writeln!(
+            prompt.output,
+            "{name} is ready to try in both ox codex and ox claude."
+        )?;
+    } else {
+        writeln!(
+            prompt.output,
+            "{name} needs a key. Choose it again to paste one, or load ${env}."
+        )?;
+    }
+    Ok(())
+}
+
+fn infer_connection(raw: &str) -> Result<(reqwest::Url, WireKind), String> {
+    let raw = validate_base_url(raw)?;
+    let mut url = reqwest::Url::parse(&raw).map_err(|_| "enter a valid API URL".to_owned())?;
+    let path = url.path().trim_end_matches('/');
+    let (base, wire) = if let Some(base) = path.strip_suffix("/chat/completions") {
+        (base, WireKind::ChatCompletions)
+    } else if let Some(base) = path.strip_suffix("/messages") {
+        (base, WireKind::AnthropicMessages)
+    } else if let Some(base) = path.strip_suffix("/responses") {
+        (base, WireKind::Responses)
+    } else if url.host_str() == Some("api.anthropic.com") || path.ends_with("/apps/anthropic/v1") {
+        (path, WireKind::AnthropicMessages)
+    } else if path.ends_with("/compatible-mode/v1")
+        || path == "/inference/go/openai/v1" && url.host_str() == Some("opencode.ai")
+    {
+        (path, WireKind::ChatCompletions)
+    } else {
+        (path, WireKind::Responses)
+    };
+    let base = if base.is_empty() { "/v1" } else { base }.to_owned();
+    url.set_path(&base);
+    Ok((url, wire))
+}
+
+fn wire_label(wire: WireKind) -> &'static str {
+    match wire {
+        WireKind::Responses => "OpenAI Responses",
+        WireKind::ChatCompletions => "OpenAI Chat Completions",
+        WireKind::AnthropicMessages => "Anthropic Messages",
+    }
+}
+
+fn save_key(
+    home: &Path,
+    config: &CodeoxConfig,
+    name: &str,
+    scope: &str,
+    value: String,
+) -> Result<(), RelayError> {
+    if !SavedKeys::scope_matches(config, name, scope) {
+        return Err(format!(
+            "${name} refers to more than one destination. Give each destination its own env_key in codeox.toml."
+        ).into());
+    }
+    let mut keys = SavedKeys::load(home)?;
+    let encoded = keys.set(name, scope, value)?;
+    write_config_atomic(&SavedKeys::path(home), &encoded)
 }
 
 pub(crate) fn enable_brave(home: &Path) -> Result<(), RelayError> {
@@ -140,16 +385,42 @@ pub(crate) fn enable_brave(home: &Path) -> Result<(), RelayError> {
     };
     drop(lock);
 
-    println!("Brave web search is enabled for the API gateway.");
-    if credential_state(&crate::provider::process_env, &settings.env_key)
-        == CredentialState::Present
-    {
-        println!("${} is set in this environment.", settings.env_key);
+    let mut prompt = Prompt {
+        input: &mut std::io::stdin().lock(),
+        output: &mut std::io::stdout().lock(),
+    };
+    let key = prompt.guided_key("Brave Search", &settings.env_key)?;
+    let _lock = lock_config(home)?;
+    let config = CodeoxConfig::load(&path)?;
+    if let Some(key) = key {
+        if config.search.as_ref().map(|search| search.env_key.as_str())
+            != Some(settings.env_key.as_str())
+        {
+            return Err(
+                "Brave settings changed during setup. Choose Brave again to save its key".into(),
+            );
+        }
+        save_key(
+            home,
+            &config,
+            &settings.env_key,
+            SavedKeys::BRAVE_SCOPE,
+            key,
+        )?;
+        writeln!(prompt.output, "Saved the Brave Search key on this device.")?;
+    }
+    let keys = SavedKeys::for_config(home, &config)?;
+    if credential_state(&|name| keys.get(name), &settings.env_key) == CredentialState::Present {
+        writeln!(
+            prompt.output,
+            "Brave web search is enabled for both API-backed clients."
+        )?;
     } else {
-        println!(
-            "Load the Brave Search API key into ${} before launching ox.",
+        writeln!(
+            prompt.output,
+            "Brave search needs a key. Choose Brave again to paste one, or load ${}.",
             settings.env_key
-        );
+        )?;
     }
     Ok(())
 }
@@ -191,7 +462,11 @@ fn provider_add_command(
 fn doctor_command(args: &[OsString], codex_home: &Path) -> Result<u8, RelayError> {
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
-    let env = |name: &str| crate::provider::process_env(name);
+    let keys = match CodeoxConfig::load(&CodeoxConfig::path(codex_home)) {
+        Ok(config) => SavedKeys::for_config(codex_home, &config)?,
+        Err(_) => SavedKeys::default(),
+    };
+    let env = |name: &str| keys.get(name);
     run_doctor(args, codex_home, &mut output, &env)
 }
 
@@ -408,7 +683,7 @@ fn parse_add_args(args: &[OsString]) -> Result<AddArgs, String> {
             // Never accept a credential value, even accidentally.
             "--api-key" | "--api_key" | "--key" | "--token" | "--secret" | "--password" => {
                 return Err(
-                    "ox stores credential references, not credential values; use --env-key NAME to name an environment variable"
+                    "API keys are accepted only at the hidden ox setup prompt. Use --env-key NAME to refer to an environment variable"
                         .to_owned(),
                 );
             }
@@ -561,6 +836,91 @@ struct Prompt<'a> {
 }
 
 impl Prompt<'_> {
+    fn guided_key(&mut self, service: &str, env: &str) -> Result<Option<String>, RelayError> {
+        if credential_state(&crate::provider::process_env, env) == CredentialState::Present {
+            writeln!(self.output, "Using your existing ${env}.")?;
+            return Ok(None);
+        }
+        writeln!(
+            self.output,
+            "Paste your {service} key to save it locally. Press Enter to keep an existing saved key or use ${env} later."
+        )?;
+        let key = self.hidden_key()?;
+        if key.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(key))
+        }
+    }
+
+    #[cfg(unix)]
+    fn hidden_key(&mut self) -> Result<String, RelayError> {
+        use std::os::fd::AsRawFd;
+
+        struct TerminalMode(i32, libc::termios);
+        impl Drop for TerminalMode {
+            fn drop(&mut self) {
+                // SAFETY: the original settings were read from this terminal.
+                unsafe { libc::tcsetattr(self.0, libc::TCSANOW, &self.1) };
+            }
+        }
+
+        let fd = std::io::stdin().as_raw_fd();
+        let mut original = std::mem::MaybeUninit::uninit();
+        // SAFETY: tcgetattr writes a termios value on success.
+        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+            return Err(
+                "could not hide input on this terminal; set the API key variable in your shell"
+                    .into(),
+            );
+        }
+        // SAFETY: tcgetattr has initialized original.
+        let original = unsafe { original.assume_init() };
+        let mut hidden = original;
+        hidden.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG);
+        hidden.c_cc[libc::VMIN] = 1;
+        hidden.c_cc[libc::VTIME] = 0;
+        let restore = TerminalMode(fd, original);
+        // SAFETY: the descriptor is stdin and hidden is an initialized termios.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &hidden) } != 0 {
+            return Err(
+                "could not hide input on this terminal; set the API key variable in your shell"
+                    .into(),
+            );
+        }
+        self.write_prompt("API key (hidden)", None)?;
+        let mut key = String::new();
+        let mut invalid = false;
+        loop {
+            let mut byte = [0];
+            if self.input.read(&mut byte)? == 0 || matches!(byte[0], 3 | 4) {
+                writeln!(self.output)?;
+                return Err("API key entry cancelled".into());
+            }
+            match byte[0] {
+                b'\r' | b'\n' => break,
+                8 | 127 => {
+                    key.pop();
+                }
+                value if value.is_ascii_graphic() && key.len() < 4096 => {
+                    key.push(char::from(value))
+                }
+                _ => invalid = true,
+            }
+        }
+        drop(restore);
+        writeln!(self.output)?;
+        if invalid {
+            return Err("API keys must contain only printable ASCII with no spaces".into());
+        }
+        Ok(key)
+    }
+
+    #[cfg(not(unix))]
+    fn hidden_key(&mut self) -> Result<String, RelayError> {
+        Err("set the API key variable in your shell on this platform".into())
+    }
+
     fn write_prompt(&mut self, label: &str, default: Option<&str>) -> Result<(), RelayError> {
         match default {
             Some(default) => write!(self.output, "{label} [{default}]: ")?,
@@ -1068,11 +1428,11 @@ fn write_add_usage(output: &mut dyn Write) -> Result<(), RelayError> {
     )?;
     writeln!(
         output,
-        "file byte for byte. Credential values are never accepted or stored:"
+        "file byte for byte. Guided setup can save a key at its hidden prompt."
     )?;
     writeln!(
         output,
-        "--env-key names the environment variable ox reads at launch."
+        "Scripts can use --env-key to name a variable ox reads at launch."
     )?;
     writeln!(output)?;
     writeln!(output, "Options:")?;
@@ -1170,11 +1530,7 @@ fn write_add_usage(output: &mut dyn Write) -> Result<(), RelayError> {
     writeln!(output)?;
     writeln!(
         output,
-        "Run `ox setup` in a terminal for guided setup. For OpenRouter, Anthropic,"
-    )?;
-    writeln!(
-        output,
-        "and OpenAI, enter openrouter, anthropic, or openai to get connection defaults."
+        "In a terminal, run `ox setup` or `ox provider add` to choose from presets."
     )?;
     Ok(())
 }
@@ -1363,7 +1719,7 @@ fn write_config_atomic(path: &Path, contents: &str) -> Result<(), RelayError> {
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result.map_err(|error| format!("could not write codeox.toml atomically: {error}").into())
+    result.map_err(|error| format!("could not write {file_name} atomically: {error}").into())
 }
 
 // ---------------------------------------------------------------------------
@@ -2017,11 +2373,11 @@ fn doctor_credential(
     match credential_state(env, name) {
         CredentialState::Present => report.info(
             Some(scope.to_owned()),
-            format!("credentials: {name} is set (value not shown)"),
+            format!("credentials: {name} is available to ox (value hidden)"),
         ),
         CredentialState::Missing => report.error(
             Some(scope.to_owned()),
-            format!("credential reference {name} is not set in this environment; export it before launching"),
+            format!("credential reference {name} is not set; add the key in ox setup or export it before launching"),
         ),
         CredentialState::Empty => report.error(
             Some(scope.to_owned()),

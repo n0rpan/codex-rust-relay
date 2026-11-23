@@ -38,7 +38,7 @@ const DESKTOP: &str = "\
 Connect a desktop app to ox
 
 1. On the machine that will host ox, run ox setup and ox doctor.
-   Load the upstream API keys there. Run ox help share to create a separate
+   Save the upstream API keys in setup or load them on the host. Run ox help share to create a separate
    OX_GATEWAY_KEY and start ox serve. Use a Tailscale HTTPS URL for another device.
 2. On the client, use the same gateway key and a model alias from /v1/models.
 
@@ -68,10 +68,10 @@ See docs/shared-gateway.md in the ox repository for the client examples.";
 
 const SHARE: &str = r#"Share one ox gateway across devices
 
-1. On the host, add a provider with ox setup, load its API key, and run ox doctor.
+1. On the host, add a provider and its API key with ox setup. Run ox doctor.
 2. Generate a gateway key once with openssl rand -hex 32 and save it in your
-   password manager. Load the same key as OX_GATEWAY_KEY on each restart, in
-   the shell that already has your vendor API keys.
+   password manager. Load the same key as OX_GATEWAY_KEY on each restart.
+   ox serve also needs the saved or exported vendor API keys.
    For Bash or Zsh, paste it at this hidden prompt:
 
      printf 'Gateway key (input hidden): '
@@ -153,8 +153,9 @@ The installed clients own their sign-in and credentials. For Claude subscription
 use, keep API and gateway overrides out of that instance's configuration and
 environment. For T3 Code, select a native provider on the signed-in execution host.
 
-For API vendors, desktop gateways, and sharing, use ox setup and ox serve. The
-shared gateway uses provider credentials configured for that service.";
+For API vendors, desktop gateways, and sharing, add provider API keys with
+ox setup and run ox serve on the host. For included API credits, use an API
+key from the OpenAI or Claude organization where you claimed those credits.";
 
 const INSTALL: &str = "\
 Install or update ox on macOS and Linux
