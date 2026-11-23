@@ -489,6 +489,19 @@ impl Vendor {
         Ok(headers)
     }
 
+    pub(crate) fn discovery_headers(&self, key: &SecretKey) -> Result<HeaderMap, RelayError> {
+        if self.wire == Wire::AnthropicMessages
+            && alibaba_messages_catalog(&self.base_url).as_ref() == Some(&self.models_url)
+        {
+            let mut token = bearer(key.expose())?;
+            token.set_sensitive(true);
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, token);
+            return Ok(headers);
+        }
+        self.auth_headers(key)
+    }
+
     fn hosted_messages_uses_bearer(&self) -> bool {
         self.base_url.scheme() == "https"
             && self.base_url.port_or_known_default() == Some(443)
@@ -763,7 +776,7 @@ fn parse_vendor(key: &str, item: &Item) -> Result<Vendor, RelayError> {
     }
     let base_raw =
         opt_str(table, "base_url")?.ok_or_else(|| format!("providers.{key} needs a base_url"))?;
-    let base_url = parse_provider_url(&base_raw)?;
+    let mut base_url = parse_provider_url(&base_raw)?;
     if base_url.query().is_some() {
         return Err(format!("providers.{key}.base_url must not contain a query string").into());
     }
@@ -771,6 +784,12 @@ fn parse_vendor(key: &str, item: &Item) -> Result<Vendor, RelayError> {
         return Err(format!("providers.{key}.base_url must not contain a fragment").into());
     }
     let wire = Wire::parse(opt_str(table, "wire_api")?.as_deref())?;
+    let companion_catalog = (wire == Wire::AnthropicMessages)
+        .then(|| alibaba_messages_catalog(&base_url))
+        .flatten();
+    if companion_catalog.is_some() && base_url.path().trim_end_matches('/') == "/apps/anthropic" {
+        base_url.set_path("/apps/anthropic/v1");
+    }
     let discovery = opt_bool(table, "discovery")?.unwrap_or(true);
     let models_url = match opt_str(table, "models_url")? {
         Some(raw) => {
@@ -783,7 +802,7 @@ fn parse_vendor(key: &str, item: &Item) -> Result<Vendor, RelayError> {
             }
             url
         }
-        None => default_models_url(&base_url),
+        None => companion_catalog.unwrap_or_else(|| default_models_url(&base_url)),
     };
     let env_key = match opt_str(table, "env_key")? {
         Some(name) => {
@@ -1213,6 +1232,32 @@ fn default_models_url(base: &Url) -> Url {
     url
 }
 
+/// The Anthropic-compatible path has no catalog. Use the OpenAI-compatible
+/// catalog on the very same documented Model Studio origin and plan.
+fn alibaba_messages_catalog(base: &Url) -> Option<Url> {
+    if base.scheme() != "https"
+        || base.port_or_known_default() != Some(443)
+        || !matches!(
+            base.path().trim_end_matches('/'),
+            "/apps/anthropic" | "/apps/anthropic/v1"
+        )
+    {
+        return None;
+    }
+    let path = match base.host_str()? {
+        "coding-intl.dashscope.aliyuncs.com" => "/v1/models",
+        "dashscope.aliyuncs.com"
+        | "dashscope-intl.aliyuncs.com"
+        | "dashscope-us.aliyuncs.com"
+        | "cn-hongkong.dashscope.aliyuncs.com" => "/compatible-mode/v1/models",
+        host if host.ends_with(".maas.aliyuncs.com") => "/compatible-mode/v1/models",
+        _ => return None,
+    };
+    let mut catalog = base.clone();
+    catalog.set_path(path);
+    Some(catalog)
+}
+
 fn parse_provider_url(raw: &str) -> Result<Url, RelayError> {
     let url = Url::parse(raw).map_err(|_| "expected an absolute provider URL")?;
     let loopback = url.host_str().is_some_and(|host| {
@@ -1563,6 +1608,53 @@ include_stream_usage = false
         let headers = beta.auth_headers(&key).unwrap();
         assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer chat-secret");
         assert!(headers.get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn alibaba_messages_discovers_models_from_the_same_origin() {
+        for (base_url, expected_path, companion) in [
+            (
+                "https://fixture.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+                "/compatible-mode/v1/models",
+                true,
+            ),
+            (
+                "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic/v1",
+                "/compatible-mode/v1/models",
+                true,
+            ),
+            (
+                "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1",
+                "/v1/models",
+                true,
+            ),
+            (
+                "https://fake.maas.aliyuncs.com.example/apps/anthropic/v1",
+                "/apps/anthropic/v1/models",
+                false,
+            ),
+        ] {
+            let config = CodeoxConfig::load_from_str(&format!(
+                "[providers.fixture]\nwire_api = \"anthropic_messages\"\nbase_url = {base_url:?}\n"
+            ))
+            .unwrap();
+            let vendor = &config.vendors[0];
+            let key = SecretKey::new("fixture-key".into());
+            assert_eq!(vendor.models_url.origin(), vendor.base_url.origin());
+            assert_eq!(vendor.models_url.path(), expected_path);
+            assert_eq!(vendor.endpoint().path(), "/apps/anthropic/v1/messages");
+            assert_eq!(
+                vendor
+                    .discovery_headers(&key)
+                    .unwrap()
+                    .contains_key(AUTHORIZATION),
+                companion
+            );
+            assert_eq!(
+                vendor.auth_headers(&key).unwrap()["x-api-key"],
+                "fixture-key"
+            );
+        }
     }
 
     #[test]

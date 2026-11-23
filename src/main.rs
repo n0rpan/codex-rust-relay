@@ -861,7 +861,7 @@ async fn discover(
     key: &SecretKey,
 ) -> Result<ProviderModels, String> {
     let headers = vendor
-        .auth_headers(key)
+        .discovery_headers(key)
         .map_err(|_| "could not build discovery headers".to_owned())?;
     let response = client
         .get(vendor.models_url.clone())

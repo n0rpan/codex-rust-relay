@@ -226,11 +226,95 @@ pub(crate) fn guided_provider(home: &Path) -> Result<(), RelayError> {
         )
     };
 
+    let saved = save_guided_route(home, &mut prompt, id.clone(), &name, url, wire, env)?;
+    if saved && choice == other {
+        writeln!(
+            prompt.output,
+            "One endpoint works with both ox codex and ox claude. ox translates when the formats differ."
+        )?;
+        let mut configured = vec![wire];
+        while configured.len() < 3
+            && prompt.ask_bool("Add another API endpoint for this provider", false)?
+        {
+            let (url, wire) = prompt.ask_required_with(
+                "Paste the full inference URL ending in /messages, /responses or /chat/completions",
+                None,
+                |raw| {
+                    let (url, wire) = infer_connection(raw, WireKind::Responses)?;
+                    if configured.contains(&wire) {
+                        return Err("choose an endpoint for a different API format".to_owned());
+                    }
+                    Ok((url, wire))
+                },
+            )?;
+            let route_id = custom_route_id(&id, wire);
+            let env = default_env_key(&route_id);
+            writeln!(
+                prompt.output,
+                "Adding {route_id} using {}.",
+                wire_label(wire)
+            )?;
+            if !save_guided_route(home, &mut prompt, route_id, &name, url, wire, env)? {
+                break;
+            }
+            configured.push(wire);
+        }
+    }
+    Ok(())
+}
+
+fn custom_route_id(id: &str, wire: WireKind) -> String {
+    let suffix = match wire {
+        WireKind::AnthropicMessages => "-messages",
+        WireKind::ChatCompletions => "-chat",
+        WireKind::Responses => "-responses",
+    };
+    format!("{}{suffix}", &id[..id.len().min(64 - suffix.len())])
+}
+
+fn save_guided_route(
+    home: &Path,
+    prompt: &mut Prompt<'_>,
+    mut id: String,
+    name: &str,
+    url: reqwest::Url,
+    wire: WireKind,
+    mut env: String,
+) -> Result<bool, RelayError> {
     let path = CodeoxConfig::path(home);
     let existing = read_existing_codeox(&path)?
         .as_deref()
         .map(parse_config_for_validation)
         .transpose()?;
+    if id == "alibaba"
+        && existing.as_ref().is_some_and(|config| {
+            config
+                .vendors
+                .iter()
+                .any(|vendor| vendor.key == id && vendor.wire.as_str() != wire.as_str())
+        })
+    {
+        id = match wire {
+            WireKind::AnthropicMessages => "alibaba-messages",
+            _ => "alibaba-chat",
+        }
+        .to_owned();
+        env = default_env_key(&id);
+        writeln!(
+            prompt.output,
+            "Adding {id} alongside your existing Alibaba route."
+        )?;
+    } else if id.starts_with("custom-")
+        && existing.as_ref().is_some_and(|config| {
+            config
+                .vendors
+                .iter()
+                .any(|vendor| vendor.key == id && vendor.wire.as_str() != wire.as_str())
+        })
+    {
+        id = custom_route_id(&id, wire);
+        env = default_env_key(&id);
+    }
     let current = existing
         .as_ref()
         .and_then(|config| config.vendors.iter().find(|v| v.key == id));
@@ -244,12 +328,12 @@ pub(crate) fn guided_provider(home: &Path) -> Result<(), RelayError> {
     } else {
         env
     };
-    let key = prompt.guided_key(&name, &env)?;
+    let key = prompt.guided_key(name, &env)?;
     if current.is_none() {
         let mut args: Vec<_> = [
             id.as_str(),
             "--name",
-            &name,
+            name,
             "--base-url",
             url.as_str(),
             "--wire",
@@ -275,11 +359,8 @@ pub(crate) fn guided_provider(home: &Path) -> Result<(), RelayError> {
                 ["--models-url", "https://opencode.ai/inference/go/v1/models"].map(OsString::from),
             );
         }
-        if id == "alibaba" {
+        if matches!(id.as_str(), "alibaba" | "alibaba-messages" | "alibaba-chat") {
             args.extend(["--model", "qwen3.8-flash"].map(OsString::from));
-            if wire == WireKind::AnthropicMessages {
-                args.push(OsString::from("--no-discovery"));
-            }
         }
         let mut report = Vec::new();
         let code = run_provider_add(
@@ -292,7 +373,7 @@ pub(crate) fn guided_provider(home: &Path) -> Result<(), RelayError> {
         )?;
         if code != 0 {
             prompt.output.write_all(&report)?;
-            return Ok(());
+            return Ok(false);
         }
     }
 
@@ -325,7 +406,7 @@ pub(crate) fn guided_provider(home: &Path) -> Result<(), RelayError> {
             "{name} needs a key. Choose it again to paste one, or load ${env}."
         )?;
     }
-    Ok(())
+    Ok(true)
 }
 
 fn infer_connection(raw: &str, default_wire: WireKind) -> Result<(reqwest::Url, WireKind), String> {

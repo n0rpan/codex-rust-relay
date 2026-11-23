@@ -191,11 +191,19 @@ Keep the two protocols under separate provider names when you want both.
 | Anthropic | Already uses `https://api.anthropic.com/v1`. [Anthropic Messages](https://platform.claude.com/docs/en/api/messages) |
 | OpenRouter | `https://openrouter.ai/api/v1`, with `wire_api = "anthropic_messages"`. ox uses bearer auth. [OpenRouter's Claude Code guide](https://openrouter.ai/docs/guides/coding-agents/claude-code-integration) |
 | OpenCode Go | `https://opencode.ai/inference/go/anthropic/v1`, with `wire_api = "anthropic_messages"`. ox uses bearer auth and keeps its Go session routing. OpenCode may translate internally for some models. [Go endpoints](https://opencode.ai/docs/console/harnesses/#base-urls) |
-| Alibaba Cloud | Paste the Anthropic-compatible URL for your account, ending in `/apps/anthropic` or `/apps/anthropic/v1`. Configure model IDs explicitly because that API has no `/models` catalog. [Model Studio Messages](https://www.alibabacloud.com/help/en/model-studio/anthropic-api-messages) |
+| Alibaba Cloud | Paste your account's URL ending in `/apps/anthropic`. ox adds the API version path and discovers models through the OpenAI-compatible catalog on the same host. The model still has to be available on the Messages route. [Model Studio Messages](https://www.alibabacloud.com/help/en/model-studio/anthropic-api-messages) |
 | OpenAI | Use Responses. ox translates the request and uses `/responses/input_tokens` for a provider-backed count. [OpenAI token counting](https://developers.openai.com/api/docs/guides/token-counting) |
 
-To add an alternate route through guided setup, choose **Other or self-hosted**
-and paste its full URL ending in `/messages`. If you add routes manually and
+For Alibaba, select **Alibaba Cloud** again and paste the second URL. When you
+already use the Chat Completions route, setup adds `alibaba-messages` alongside
+it. Paste your key for the Messages route. A previously configured Messages
+route with `discovery = false` can use the companion catalog by turning discovery on.
+
+For a custom provider, choose **Other or self-hosted**. A single endpoint works
+with both clients through ox translation. To add another API format, answer yes
+at **Add another API endpoint for this provider** and paste its full inference URL
+ending in `/messages`, `/responses` or `/chat/completions`. Each route gets a model
+alias prefix you can select in either client. If you add routes manually and
 both use the same vendor key, give each route a distinct `env_key` reference.
 This lets ox keep any saved key scoped to that route's base URL. For example,
 with `OPENCODE_MESSAGES_API_KEY` available in your shell:

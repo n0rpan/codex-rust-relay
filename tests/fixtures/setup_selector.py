@@ -266,6 +266,7 @@ with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Catalog) as vendor:
                 (b"Service number:", b"6\n"),
                 (b"Paste the API base URL", f"{base}\n".encode()),
                 (hidden, b"fixture-custom-key\n"),
+                (b"Add another API endpoint", b"\n"),
             ],
             saved={f"CUSTOM_127_0_0_1_{port}_API_KEY": (base, "fixture-custom-key")},
             model=f"custom-127-0-0-1-{port}/fixture",
@@ -287,12 +288,31 @@ for endpoint, wire in (
             (b"Service number:", b"6\n"),
             (b"Paste the API base URL", f"{endpoint}\n".encode()),
             (hidden, b"\n"),
+            (b"Add another API endpoint", b"\n"),
         ],
     )
     assert f'wire_api = "{wire}"' in registry
     assert f'base_url = "{endpoint.split("/v1")[0]}/v1"' in registry
     assert "needs a key" in text
 print("Other: full Chat Completions and Messages endpoints select their own format")
+
+text, argv, registry = run(["provider", "add"], [
+    (b"Service number:", b"6\n"),
+    (b"Paste the API base URL", b"https://fixture.example/v1/responses\n"),
+    (hidden, b"fixture-responses-key\n"),
+    (b"Add another API endpoint", b"y\n"),
+    (b"Paste the full inference URL", b"https://fixture.example/v1/messages\n"),
+    (hidden, b"fixture-messages-key\n"),
+    (b"Add another API endpoint", b"\n"),
+], saved={
+    "CUSTOM_FIXTURE_EXAMPLE_API_KEY": ("https://fixture.example/v1", "fixture-responses-key"),
+    "CUSTOM_FIXTURE_EXAMPLE_MESSAGES_API_KEY": ("https://fixture.example/v1", "fixture-messages-key"),
+})
+assert "One endpoint works with both" in text
+assert "[providers.custom-fixture-example]" in registry
+assert "[providers.custom-fixture-example-messages]" in registry
+assert 'wire_api = "anthropic_messages"' in registry
+print("Other: add Responses and Messages endpoints together with separate credentials")
 
 
 for path, base, wire in (
@@ -311,7 +331,26 @@ for path, base, wire in (
     assert f'base_url = "{host}{base}"' in registry
     assert f'wire_api = "{wire}"' in registry
     assert 'env_key = "ALIBABA_API_KEY"' in registry
+    assert "discovery = false" not in registry
 print("Alibaba Cloud: prompt uses the supplied account URL and infers its API format")
+
+host = "https://fixture-workspace.maas.aliyuncs.com"
+alibaba_chat = f'''[providers.alibaba]
+base_url = "{host}/compatible-mode/v1"
+wire_api = "chat_completions"
+env_key = "ALIBABA_API_KEY"
+'''
+text, argv, registry = run(["provider", "add"], [
+    (b"Service number:", b"5\n"),
+    (b"Paste the Alibaba Cloud API URL", f"{host}/apps/anthropic\n".encode()),
+    (hidden, b"fixture-alibaba-messages-key\n"),
+], config=alibaba_chat, saved={
+    "ALIBABA_MESSAGES_API_KEY": (f"{host}/apps/anthropic/v1", "fixture-alibaba-messages-key"),
+})
+assert registry.startswith(alibaba_chat)
+assert "[providers.alibaba-messages]" in registry
+assert "discovery = false" not in registry
+print("Alibaba Cloud: adding Messages preserves the existing Chat Completions route")
 
 
 text, argv, registry = run([

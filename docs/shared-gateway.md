@@ -130,6 +130,17 @@ calls the gateway at `/v1/alpha/search`. [Brave setup](configuration.md#web-sear
    read a file in a disposable project. Use the in-app export for a managed
    deployment. [Example profile](../examples/claude-desktop-gateway.json) · [Anthropic setup](https://claude.com/docs/third-party/claude-desktop/gateway#configure-the-app)
 
+For Alibaba and other aliases Desktop cannot discover as Claude models, add the
+exact ox alias under **Models**. For example, enter
+`alibaba-messages/deepseek-v4.1-flash-1017` and give it the display name
+**DeepSeek V4.1 Flash · Alibaba**. Desktop sends that alias to ox and ox sends the
+underlying model ID to Alibaba. To set a Claude capability profile, open the entry's
+**Claude model behind this ID** field (`behavesAs` in JSON) and enter the full
+Claude ID, for example `claude-sonnet-5-5`. This changes effort and context
+assumptions. Use it only when the route supports the settings Desktop will send.
+For an Alibaba model, start with its actual context limit and a clear display
+name. [Desktop model controls](https://claude.com/docs/third-party/claude-desktop/models#map-an-unrecognized-model-id-to-a-claude-model)
+
 **Context and caching.** Set `modelPrefer1mContext` for discovery, or `supports1m`
 on a matching `inferenceModels` entry, when the selected route supports 1M. ox
 advertises `supports_1m` when it knows the model has at least 1M input tokens.

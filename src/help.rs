@@ -56,7 +56,9 @@ Claude Desktop on 3P
   Open Developer > Configure Third-Party Inference. Choose Gateway,
   Static API key, and Bearer auth.
   Use the HTTPS gateway origin with no /v1 suffix. Enter the gateway key.
-  Start with a native Anthropic route and use its exact ox model alias.
+  In Models, add the exact ox alias, such as alibaba-messages/qwen3.8-flash.
+  Use a display name for the picker. The optional Claude model behind this ID
+  field changes the effort and context profile for a compatible model.
   Apply Changes and choose Save & Restart. The shared gateway guide shows
   how to check caching, compaction, and Auto mode on the Mac.
 
