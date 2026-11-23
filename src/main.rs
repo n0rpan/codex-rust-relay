@@ -3081,24 +3081,24 @@ env_key = "BRAVE_SEARCH_API_KEY"
         text
     }
 
-    /// Opt-in proof against the installed stock Codex 0.171.0. The relay serves
+    /// Opt-in proof against the installed stock Codex CLI. The relay serves
     /// the model catalog and `/v1/alpha/search`; the vendor and Brave are both
     /// loopback mocks. Nothing here reaches a real model or Brave.
     #[tokio::test]
-    #[ignore = "opt-in: set CODEOX_TEST_CODEX_BIN to the stock Codex 0.171.0 binary"]
+    #[ignore = "opt-in: set CODEOX_TEST_CODEX_BIN to the stock Codex binary"]
     async fn stock_codex_emits_web_run_and_calls_the_alpha_search_endpoint() {
         let binary = match std::env::var_os("CODEOX_TEST_CODEX_BIN") {
             Some(path) => std::path::PathBuf::from(path),
-            None => panic!("set CODEOX_TEST_CODEX_BIN to the stock Codex 0.171.0 binary"),
+            None => panic!("set CODEOX_TEST_CODEX_BIN to the stock Codex binary"),
         };
         let version = std::process::Command::new(&binary)
             .arg("--version")
             .output()
             .expect("run the stock Codex binary");
-        let version = String::from_utf8_lossy(&version.stdout);
-        assert!(
-            version.contains("0.171.0"),
-            "expected stock Codex 0.171.0, got {version:?}"
+        assert!(version.status.success(), "stock Codex --version failed");
+        println!(
+            "Testing stock Codex: {}",
+            String::from_utf8_lossy(&version.stdout).trim()
         );
 
         let responses = Arc::new(AtomicUsize::new(0));

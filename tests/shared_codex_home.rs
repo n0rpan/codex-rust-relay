@@ -46,7 +46,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-const STOCK_CODEX_VERSION: &str = "codex-cli 0.171.0";
 const ACCOUNT_ID: &str = "acct-shared-home-fixture";
 const ACCOUNT_EMAIL: &str = "fixture@example.invalid";
 const VENDOR_KEY: &str = "vendor-key-shared-home-fixture";
@@ -197,14 +196,11 @@ fn manual_suite_requires_an_explicit_cli_path() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "opt-in: set CODEOX_TEST_CODEX_BIN to the stock Codex 0.171.0 binary"]
+#[ignore = "opt-in: set CODEOX_TEST_CODEX_BIN to the stock Codex binary"]
 fn stock_codex_keeps_native_auth_and_codeox_uses_the_vendor_key_on_the_same_home() {
     let codex = stock_binary();
     let version = codex_version(&codex);
-    assert!(
-        version.contains(STOCK_CODEX_VERSION),
-        "this fixture records {STOCK_CODEX_VERSION} wire shapes, but CODEOX_TEST_CODEX_BIN reports {version:?}"
-    );
+    println!("Testing stock Codex: {version}");
     require_tool("python3", "--version");
     require_tool("openssl", "version");
 

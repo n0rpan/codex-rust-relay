@@ -1,9 +1,8 @@
 name: CI
 
-# Every push and pull request gets the same offline verification: formatting,
-# locked dependency resolution, the full non-ignored test suite, the release
-# build, and the stock Codex and Claude Code loopback fixtures. The wall-clock
-# benchmark in tests/relay_benchmark.rs stays manual.
+# Test a reproducible stock-client baseline and the latest official client
+# releases. The daily run checks only latest so upstream updates are visible
+# even when ox has not changed. The relay benchmark stays manual.
 #
 # A separate native matrix then builds the locked release binary on Linux
 # x86_64/ARM64 and macOS Intel/Apple silicon, runs it, and uploads one `ox`
@@ -12,7 +11,11 @@ name: CI
 # and only publishes workflow artifacts.
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "27 6 * * *"
 
 permissions:
   contents: read
@@ -28,9 +31,15 @@ env:
 
 jobs:
   verify:
-    name: Format, offline tests, release build, stock client fixtures
+    name: Stock clients (${{ matrix.client_track }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        client_track: ${{ github.event_name == 'schedule' && fromJSON('["latest"]') || fromJSON('["baseline", "latest"]') }}
+    env:
+      OX_CI_CLIENT_TRACK: ${{ matrix.client_track }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -72,18 +81,25 @@ jobs:
           test -x target/release/ox
           file target/release/ox
 
-      - name: Install stock Codex 0.171.0 from the pinned official release
+      - name: Install stock Codex from the official release
         timeout-minutes: 10
         run: |
           set -euo pipefail
-          version="0.171.0"
           target="x86_64-unknown-linux-musl"
           asset="codex-${target}.tar.gz"
-          # Official openai/codex rust-v0.171.0 asset digest from the GitHub
-          # release metadata. The release also publishes a .sigstore bundle;
-          # this workflow pins the same SHA-256 that the official installer
-          # reads from the release asset API.
-          expected_sha256="01baa2e47809f8597be5b2f8abd4e4dfe3fb5bcb6e504c2fbaaad97056c15e8d"
+          if [ "${OX_CI_CLIENT_TRACK}" = "latest" ]; then
+            metadata="$(curl --fail --silent --show-error --retry 3 \
+              https://api.github.com/repos/openai/codex/releases/latest)"
+            tag="$(jq -er '.tag_name | select(test("^rust-v[0-9]+\\.[0-9]+\\.[0-9]+$"))' <<< "${metadata}")"
+            version="${tag#rust-v}"
+            expected_sha256="$(jq -er --arg asset "${asset}" '
+              .assets[] | select(.name == $asset) | .digest
+              | select(test("^sha256:[0-9a-f]{64}$")) | ltrimstr("sha256:")
+            ' <<< "${metadata}")"
+          else
+            version="0.171.0"
+            expected_sha256="01baa2e47809f8597be5b2f8abd4e4dfe3fb5bcb6e504c2fbaaad97056c15e8d"
+          fi
           url="https://github.com/openai/codex/releases/download/rust-v${version}/${asset}"
           destination="${RUNNER_TEMP}/codex-${version}"
           binary="${destination}/codex-${target}"
@@ -100,6 +116,7 @@ jobs:
           fi
           echo "CODEOX_TEST_CODEX_BIN=${binary}" >> "${GITHUB_ENV}"
           echo "Stock Codex fixture binary: ${actual_version}"
+          echo "- Codex (${OX_CI_CLIENT_TRACK}) — ${actual_version}" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Ensure bubblewrap for Codex's workspace-write sandbox
         timeout-minutes: 10
@@ -120,28 +137,56 @@ jobs:
             bwrap --ro-bind / / --dev /dev --proc /proc true
           fi
 
-      - name: Install stock Claude Code 2.1.330 from the pinned official release
+      - name: Install stock Claude Code from the official release
         timeout-minutes: 10
         run: |
           set -euo pipefail
-          version="2.1.330"
+          base="https://downloads.claude.ai/claude-code-releases"
+          platform="linux-x64"
+          if [ "${OX_CI_CLIENT_TRACK}" = "latest" ]; then
+            version="$(curl --fail --silent --show-error --location --retry 3 "${base}/latest")"
+            [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            manifest="$(curl --fail --silent --show-error --location --retry 3 \
+              "${base}/${version}/manifest.json")"
+            sha256="$(jq -er --arg platform "${platform}" '
+              .platforms[$platform].checksum | select(test("^[0-9a-f]{64}$"))
+            ' <<< "${manifest}")"
+            size="$(jq -er --arg platform "${platform}" '
+              .platforms[$platform].size | select(. > 0)
+            ' <<< "${manifest}")"
+            compressed_sha256=""
+            if compressed_manifest="$(curl --fail --silent --show-error --location --retry 3 \
+                "${base}/${version}/manifest.zst.json")"; then
+              compressed_sha256="$(jq -er --arg platform "${platform}" '
+                .platforms[$platform].checksum | select(test("^[0-9a-f]{64}$"))
+              ' <<< "${compressed_manifest}")"
+            fi
+          else
+            version="2.1.330"
+            sha256="f390eaa0814e6a1bff74cbb47acb74cb9c89d30ced809fe0af5af00c7bfe8ebb"
+            size="381121040"
+            compressed_sha256="d53a3f9aab93c87bba0813d1101677677b457100824f5c3604fea9915ac5237a"
+          fi
           archive="${RUNNER_TEMP}/claude-${version}.zst"
           binary="${RUNNER_TEMP}/claude-${version}"
-          # SHA-256 from the official manifest and compressed manifest.
-          curl --fail --silent --show-error --location --retry 3 --retry-delay 2 \
-            --output "${archive}" \
-            "https://downloads.claude.ai/claude-code-releases/${version}/linux-x64/claude.zst"
-          echo "d53a3f9aab93c87bba0813d1101677677b457100824f5c3604fea9915ac5237a  ${archive}" |
-            sha256sum --check --strict
-          # The official installer extracts the manifest length. The digest
-          # below validates the output even if zstd exits after the pipe closes.
-          zstd --quiet --decompress --stdout "${archive}" |
-            head -c 381121040 > "${binary}" || true
-          echo "f390eaa0814e6a1bff74cbb47acb74cb9c89d30ced809fe0af5af00c7bfe8ebb  ${binary}" |
-            sha256sum --check --strict
+          if [ -n "${compressed_sha256}" ]; then
+            curl --fail --silent --show-error --location --retry 3 --output "${archive}" \
+              "${base}/${version}/${platform}/claude.zst"
+            echo "${compressed_sha256}  ${archive}" | sha256sum --check --strict
+            # The official installer extracts the manifest's byte length.
+            # The binary digest below verifies the output after the pipe closes.
+            zstd --quiet --decompress --stdout "${archive}" |
+              head -c "${size}" > "${binary}" || true
+          else
+            curl --fail --silent --show-error --location --retry 3 --output "${binary}" \
+              "${base}/${version}/${platform}/claude"
+          fi
+          echo "${sha256}  ${binary}" | sha256sum --check --strict
           chmod 0755 "${binary}"
-          test "$("${binary}" --version)" = "${version} (Claude Code)"
+          actual_version="$("${binary}" --version)"
+          test "${actual_version}" = "${version} (Claude Code)"
           echo "OX_TEST_CLAUDE_BIN=${binary}" >> "${GITHUB_ENV}"
+          echo "- Claude Code (${OX_CI_CLIENT_TRACK}) — ${actual_version}" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Disable paid and public inference for fixture steps
         run: |
@@ -159,7 +204,7 @@ jobs:
           echo "NO_PROXY=127.0.0.1,localhost" >> "${GITHUB_ENV}"
           echo "no_proxy=127.0.0.1,localhost" >> "${GITHUB_ENV}"
 
-      - name: Run stock Codex 0.171.0 loopback fixtures
+      - name: Run stock Codex loopback fixtures
         timeout-minutes: 15
         run: |
           set -euo pipefail
@@ -183,7 +228,7 @@ jobs:
           cargo test --locked --offline --test shared_codex_home -- \
             --ignored --nocapture --test-threads=1
 
-      - name: Run stock Claude Code 2.1.330 loopback fixtures
+      - name: Run stock Claude Code loopback fixtures
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -191,6 +236,7 @@ jobs:
             --ignored --nocapture --test-threads=1
 
   release:
+    if: github.event_name != 'schedule'
     name: Release binaries (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
