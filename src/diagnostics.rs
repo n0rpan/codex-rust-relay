@@ -2,12 +2,12 @@
 
 use std::ffi::OsString;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde_json::{Value, json};
 
-use crate::provider::{CodeoxConfig, MaxTokensField, RelayError, Vendor, Wire, process_env};
+use crate::provider::{CodeoxConfig, Env, MaxTokensField, RelayError, SavedKeys, Vendor, Wire};
 use crate::sse::SseFramer;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -50,8 +50,14 @@ pub(crate) async fn run(args: &[OsString], home: &Path) -> Result<u8, RelayError
         vendor.key,
         vendor.wire.as_str()
     );
-    probe(vendor, model).await?;
+    let saved = SavedKeys::for_config(home, &config)?;
+    let (first_event, first_text) = probe(vendor, model, &|name| saved.get(name)).await?;
     println!("PASS: the provider accepted the key and model and streamed text");
+    println!(
+        "Upstream first event: {:.2}s. First visible text: {:.2}s.",
+        first_event.as_secs_f64(),
+        first_text.as_secs_f64()
+    );
     Ok(0)
 }
 
@@ -62,9 +68,13 @@ fn next_value<'a>(args: &mut impl Iterator<Item = &'a OsString>) -> Result<&'a s
         .ok_or_else(|| USAGE.into())
 }
 
-async fn probe(vendor: &Vendor, model: &str) -> Result<(), RelayError> {
+async fn probe(
+    vendor: &Vendor,
+    model: &str,
+    env: &Env<'_>,
+) -> Result<(Duration, Duration), RelayError> {
     let key = vendor
-        .api_key(&process_env)
+        .api_key(env)
         .ok_or_else(|| vendor.unavailable_reason())?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -91,6 +101,7 @@ async fn probe(vendor: &Vendor, model: &str) -> Result<(), RelayError> {
         }
     };
 
+    let start = Instant::now();
     let mut response = client
         .post(url)
         .headers(
@@ -124,6 +135,7 @@ async fn probe(vendor: &Vendor, model: &str) -> Result<(), RelayError> {
 
     let mut framer = SseFramer::new(RESPONSE_LIMIT);
     let mut remaining = RESPONSE_LIMIT;
+    let mut first_event = None;
     while let Some(bytes) = response
         .chunk()
         .await
@@ -136,6 +148,8 @@ async fn probe(vendor: &Vendor, model: &str) -> Result<(), RelayError> {
             if event.data == "[DONE]" && vendor.wire == Wire::ChatCompletions {
                 continue;
             }
+            let elapsed = start.elapsed();
+            let first_event = *first_event.get_or_insert(elapsed);
             let data: Value = serde_json::from_str(&event.data)
                 .map_err(|_| "provider sent malformed JSON in its event stream")?;
             if data.get("error").is_some()
@@ -155,7 +169,7 @@ async fn probe(vendor: &Vendor, model: &str) -> Result<(), RelayError> {
                 _ => continue,
             };
             if text.as_str().is_some_and(|text| !text.trim().is_empty()) {
-                return Ok(());
+                return Ok((first_event, elapsed));
             }
         }
     }

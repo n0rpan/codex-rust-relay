@@ -15,10 +15,15 @@ the same client session. “Switch” changes the vendor in the same Codex sessi
 | Anthropic Messages `2023-06-01` | Coding, Brave citations, resume, switch | Coding, Brave citations, resume |
 | Anthropic Messages `2026-10-21` | Coding, Brave citations, resume, switch | Coding, Brave citations, resume |
 
-Native ChatGPT and API-backed Codex used their own credentials with the same Codex home
-in a loopback fixture. The clients retain their local tool execution, permissions and history.
+Stock Codex and Claude Code fixtures compare the native profile trees before
+and after API-backed launches. They verify that relay sessions use separate
+settings and history. The clients execute tools locally. [Client profiles](configuration.md#sessions-and-sign-in)
 ox launches the client found on `PATH`. For the current verified versions, see the
 `Stock clients (latest)` job in the [latest CI run](https://github.com/n0rpan/codex-rust-relay/actions/workflows/ci.yml).
+
+Subscription sessions started through ox can delegate to API workers through
+MCP. The local fixtures cover a stock Codex goal, a stock Claude Code workflow,
+workspace edits, and cancellation. [Background workers](configuration.md#subscription-main-session-with-api-workers)
 
 ### Live provider checks
 
@@ -36,12 +41,40 @@ Direct OpenAI returned `codex_byok_restricted_by_api_credit_promo` for the API-c
 account tested. The Responses success above used a separate OpenRouter account.
 Tool availability, context windows, quotas and key permissions depend on the provider and model.
 
+## Claude Code gateway protocol
+
+Use `ANTHROPIC_BASE_URL` with `ox serve`, or let `ox claude` configure the
+connection for you. ox exposes the Anthropic Messages format and routes each
+model to the API configured for its provider.
+[Claude Code gateway guide](https://code.claude.com/docs/en/llm-gateway-protocol)
+
+| Feature | What ox supports |
+| --- | --- |
+| Messages and authentication | `POST /v1/messages` accepts Claude Code's `?beta=true` request. Authenticate to ox with a bearer token or `x-api-key`. The provider uses its own configured API credential. |
+| Native Anthropic streaming | Streams the upstream event sequence directly, including pings, partial tool arguments, signed thinking and safeguards. Fine-grained tool streaming is a [client opt-in](configuration.md#fine-grained-tool-streaming). |
+| Native Anthropic request fields | Preserves system block order, cache markers and beta body fields. Forwards bounded `anthropic-*` capability headers, including repeated beta values. A configured `anthropic_version` wins over the client's version. With no pin, ox uses a valid client version or the `2023-06-01` default. |
+| Retries and limits | Native Messages preserves standard bounded error envelopes and retry or usage-limit metadata when those values contain no configured credential. A synthesized error can lack the details Claude Code uses for automatic feature recovery. |
+| Model discovery | Authenticated `GET /v1/models` reports the aliases and any known context limits. Claude Code's automatic discovery filters IDs to names containing `claude` or `anthropic`. Use ox's [starred lineup and context settings](configuration.md#model-names-and-discovery) for other models. |
+| Translated streaming | Delivers text, tool events and terminal status. After 15 seconds without a downstream event, ox sends a ping while waiting for the next upstream event. The upstream read timeout still applies. Use [Claude Code's classifier](configuration.md#claude-code-auto-mode) for safety review. |
+| Token counting | `POST /v1/messages/count_tokens` uses the selected provider's counting endpoint. The Responses adapter translates the prompt and tools for `/responses/input_tokens`. If counting is unavailable, including on Chat Completions routes, Claude Code can estimate usage locally. |
+| Connection warm-up | `HEAD /api/hello` returns `204` locally. It uses no credentials and makes no provider request. |
+| Other connection methods | Bedrock InvokeModel, Vertex `rawPredict`, AWS workspace headers and Claude apps gateway sign-in are outside this implementation. Stock subscription sign-ins run in their native clients. |
+
+ox authenticates upstream with the provider credential. It filters client auth,
+workspace, and hop-by-hop headers before forwarding API capability headers.
+Only direct Anthropic requests carry the client's `beta=true` query flag.
+For older Claude models behind custom aliases,
+you can set `modelOverrides` in Claude Code to give the alias the upstream
+model's capabilities. Claude Code's fast-mode availability check and WebFetch
+domain check use its own direct connection to `api.anthropic.com`.
+[Custom model capabilities](https://code.claude.com/docs/en/llm-gateway-protocol#settings-for-unrecognized-model-ids)
+
 ## Where API translation ends
 
 - **Native paths.** Codex to a Responses provider streams the upstream response directly.
   Claude Code to Anthropic preserves Messages features the selected upstream supports,
   including signed thinking, cache markers, and Auto mode safeguards. The relay applies
-  the upstream model ID and configured Anthropic API version, including its sampling rules.
+  the upstream model ID and the effective Anthropic API version's sampling rules.
 - **Client tools.** Coding tools run in the CLI. For translated Codex requests, ox maps
   functions, namespaced calls such as `web.run`, and freeform `apply_patch` into the
   upstream tool format. Code-mode `additional_tools` and arbitrary provider-hosted
@@ -63,8 +96,7 @@ Tool availability, context windows, quotas and key permissions depend on the pro
 - **Claude Code translation.** Responses and Chat Completions cannot supply Anthropic
   signed thinking or server-side Auto mode verdicts. Use [Claude Code’s classifier](configuration.md#claude-code-auto-mode)
   for translated models. Anthropic cache-control markers and provider-hosted containers
-  have no equivalent in these routes. `/v1/messages/count_tokens` is unavailable.
-  The stock client can estimate context without it.
+  have no equivalent in these routes.
 - **Streaming.** If a vendor promises a streaming API but sends a JSON body for a
   streaming request, translated inference can fail. A translated stream failure is
   surfaced to the client. A native Responses stream can end with a transport error.
@@ -91,8 +123,11 @@ search may have separate costs. [Enable search](configuration.md#web-search-with
 The local launchers bind an ephemeral loopback address and exit with their clients.
 `ox serve` supplies a stable endpoint and gateway key for external clients. The
 shared endpoint is tested against stock Codex App Server and Claude Code CLI.
-Desktop app UI flows, hosted sessions, Desktop compaction and cross-device tailnet
-access are outside the verified matrix. [Home-server setup](shared-gateway.md)
+The Claude Desktop 3P API fixture checks model capability metadata, 1-hour
+caching fields, streaming tool IDs and verdicts, and native context-limit and
+billing errors. Desktop app UI flows, hosted sessions, Desktop compaction and
+cross-device tailnet access still require device testing.
+[Claude Desktop setup and verification](shared-gateway.md#claude-desktop-on-3p)
 
 The [Desktop web-tools overlay](../examples/claude-desktop-web-tools.json) is a
 configuration example for an existing Desktop 3P deployment. Set your allowed fetch hosts
@@ -120,5 +155,8 @@ apply their own tool permissions and shell sandbox rules. [Claude Desktop web to
   300 seconds between reads. An active stream can last longer.
 - Successful native Responses stream bytes are forwarded. Bounded native Messages
   error envelopes pass through when they contain no configured credentials.
-  Other HTTP error details are reduced and redacted. Numeric `Retry-After` is preserved on `429` where supported.
+  Other HTTP error details are reduced and redacted. Buffered native Messages
+  replies also keep numeric `Retry-After`, boolean `x-should-retry`, and bounded
+  unified rate-limit headers when they contain no configured credential.
+  Translated failures preserve numeric `Retry-After` on `429` where supported.
   Closing the client stream cancels the upstream request.

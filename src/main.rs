@@ -16,6 +16,7 @@ mod daemon;
 mod diagnostics;
 mod help;
 mod native;
+mod picker;
 mod provider;
 mod search;
 mod setup;
@@ -24,6 +25,7 @@ mod standalone_search;
 mod translate;
 mod update;
 mod upstream;
+mod workers;
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -152,42 +154,86 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         Some("doctor") if args.iter().any(|arg| arg == "--live") => {
             return diagnostics::run(&args[1..], &codex_home).await;
         }
+        Some("doctor")
+            if args[1..].iter().all(|arg| arg == "--strict")
+                && !CodeoxConfig::path(&codex_home).try_exists()?
+                && matches!(
+                    provider::Provider::load_if_configured(&codex_home, &provider::process_env),
+                    Ok(None)
+                )
+                && native::report_saved_accounts(&codex_home) =>
+        {
+            return Ok(0);
+        }
         _ => {}
     }
     if let Some(result) = setup::dispatch(&args, &codex_home) {
         return result;
     }
     let bare = args.is_empty();
-    let (client_kind, args) = clients::select(args);
-    let env: &Env<'_> = &|name: &str| provider::process_env(name);
+    let (client_kind, mut args) = clients::select(args);
+    let classifier = if matches!(client_kind, ClientKind::Claude) {
+        clients::take_client_classifier(&mut args)?
+    } else {
+        None
+    };
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
 
     let config_path = CodeoxConfig::path(&codex_home);
     let config = if config_path.exists() {
-        if matches!(client_kind, ClientKind::Codex) {
-            warn_about_static_catalog(&codex_home);
-        }
         LaunchConfig::Codeox(CodeoxConfig::load(&config_path)?)
     } else if matches!(client_kind, ClientKind::Codex)
-        && let Some(provider) = provider::Provider::load_if_configured(&codex_home, env)?
+        && let Some(provider) =
+            provider::Provider::load_if_configured(&codex_home, &provider::process_env)?
     {
         LaunchConfig::Legacy(provider)
-    } else if args.is_empty() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        return run_setup(&[], &codex_home).await;
-    } else if bare {
-        help::overview();
-        return Ok(0);
     } else {
-        return Err("no ox provider configured. Run `ox setup` to get started".into());
+        if classifier.is_some() {
+            return Err("--client-classifier needs an ox API provider. Run ox setup first.".into());
+        }
+        if args.is_empty() {
+            if let Some(code) = native::launch_if_signed_in(client_kind, &codex_home).await? {
+                return Ok(code);
+            }
+            if bare
+                && let Some(code) =
+                    native::launch_if_signed_in(ClientKind::Claude, &codex_home).await?
+            {
+                return Ok(code);
+            }
+            if interactive {
+                return run_setup(&[], &codex_home).await;
+            }
+            if bare {
+                help::overview();
+                return Ok(0);
+            }
+        }
+        return Err("no ox API provider configured. Run `ox setup` to add one, or `ox help subscriptions` for native sign-in".into());
     };
+    let saved = match &config {
+        LaunchConfig::Codeox(config) => provider::SavedKeys::for_config(&codex_home, config)?,
+        LaunchConfig::Legacy(_) => provider::SavedKeys::default(),
+    };
+    let env: &Env<'_> = &|name| saved.get(name);
     let mut env_refs = config.env_refs();
     env_refs.insert(daemon::KEY_ENV.to_owned());
     let client = upstream_client()?;
 
-    let (search, search_launch) = match (&config, &client_kind) {
-        (LaunchConfig::Codeox(config), ClientKind::Codex) => {
-            resolve_search(config.search.as_ref(), env, &args, &codex_home)
+    let codex_profile = if matches!(client_kind, ClientKind::Codex) {
+        let home = clients::relay_client_home(&codex_home, ClientKind::Codex)?;
+        if matches!(&config, LaunchConfig::Codeox(_)) {
+            warn_about_static_catalog(&home);
         }
-        (LaunchConfig::Codeox(config), ClientKind::Claude) => (
+        Some(home)
+    } else {
+        None
+    };
+    let (search, search_launch) = match (&config, &codex_profile) {
+        (LaunchConfig::Codeox(config), Some(home)) => {
+            resolve_search(config.search.as_ref(), env, &args, home)
+        }
+        (LaunchConfig::Codeox(config), None) => (
             config
                 .search
                 .as_ref()
@@ -197,9 +243,9 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         (LaunchConfig::Legacy(_), _) => (None, SearchLaunch::Disabled),
     };
 
-    let bundled = match client_kind {
-        ClientKind::Codex => bundled_catalog(&codex_home, &env_refs).await?,
-        ClientKind::Claude => BundledModels::default(),
+    let bundled = match &codex_profile {
+        Some(home) => bundled_catalog(home, &env_refs).await?,
+        None => BundledModels::default(),
     };
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let origin = format!("http://{}", listener.local_addr()?);
@@ -230,29 +276,90 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         LaunchConfig::Legacy(provider) => App::legacy(provider, bundled, &token, client)?,
     };
 
+    let classifier = classifier
+        .as_deref()
+        .map(|mode| app.client_classifier(mode))
+        .transpose()?;
+    if interactive && args.is_empty() && matches!(&app.mode, Mode::Codeox { .. }) {
+        let signed_in = classifier.is_none() && native::has_saved_account(client_kind, &codex_home);
+        let models = app.launch_models();
+        match picker::choose_model(client_kind, &models, signed_in, &codex_home)? {
+            Some(picker::LaunchChoice::Model(alias)) => {
+                args.extend([OsString::from("--model"), OsString::from(alias)]);
+            }
+            Some(picker::LaunchChoice::Subscription) => {
+                let relay = workers::Relay::new(listener, app, token);
+                return native::launch_subscription(client_kind, &codex_home, Some(relay)).await;
+            }
+            None => return Ok(0),
+        }
+    }
+    let favorites = picker::read_favorites(&codex_home).unwrap_or_default();
+    if let Mode::Codeox { catalog, .. } = &mut app.mode {
+        catalog::prioritize_favorites(catalog, &favorites);
+    }
     app.client_kind = client_kind;
-    let (mut command, _claude_settings) = match app.client_kind {
-        ClientKind::Codex => {
-            let mut command = Command::new("codex");
+    let (mut command, _claude_settings) = match codex_profile {
+        Some(home) => {
+            let mut command = codex_relay_command(&home)?;
             for name in &env_refs {
                 command.env_remove(name);
             }
-            command
-                .env("CODEX_HOME", &codex_home)
-                .env(TOKEN_ENV, &token);
+            command.env(TOKEN_ENV, &token);
             for entry in &overrides {
                 command.arg("-c").arg(entry);
             }
             command.args(args);
             (command, None)
         }
-        ClientKind::Claude => {
-            let (command, settings) =
-                clients::claude_command(args, &origin, &token, &app.claude_aliases(), &env_refs)?;
+        None => {
+            let client_home = clients::relay_client_home(&codex_home, ClientKind::Claude)?;
+            if let Some(classifier) = &classifier {
+                match classifier {
+                    Some(alias) => eprintln!(
+                        "ox: Claude Code will send separate classifier requests to {alias}; API usage may be billed."
+                    ),
+                    None => eprintln!(
+                        "ox: no configured Sonnet 5 or Sonnet 4.6 classifier found. Claude Code will use its own classifier selection."
+                    ),
+                }
+            }
+            let starred: Vec<_> = app
+                .launch_models()
+                .into_iter()
+                .map(|(alias, _)| alias)
+                .filter(|alias| favorites.iter().any(|favorite| favorite == alias))
+                .collect();
+            let (command, settings) = clients::claude_command(
+                args,
+                &origin,
+                &token,
+                &app.claude_aliases(),
+                &env_refs,
+                clients::ClaudeLaunchOptions {
+                    starred: &starred,
+                    config_dir: Some(&client_home),
+                    client_classifier: classifier.as_ref().map(|alias| alias.as_deref()),
+                },
+                |model| app.claude_model_info(model),
+            )?;
             (command, Some(settings))
         }
     };
     command.kill_on_drop(true);
+    exempt_loopback_proxy(&mut command);
+
+    let mut child = command.spawn().map_err(|error| {
+        let client = command.as_std().get_program().to_string_lossy();
+        client_launch_error(&client, error)
+    })?;
+    tokio::select! {
+        status = child.wait() => Ok(status?.code().unwrap_or(1) as u8),
+        result = serve(listener, Arc::new(app)) => Err(result.unwrap_err().into()),
+    }
+}
+
+fn exempt_loopback_proxy(command: &mut Command) {
     for name in ["NO_PROXY", "no_proxy"] {
         let existing = std::env::var(name)
             .or_else(|_| {
@@ -265,26 +372,32 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
             .unwrap_or_default();
         command.env(name, format!("{existing},127.0.0.1,localhost"));
     }
-
-    let mut child = command.spawn().map_err(|error| {
-        let client = command.as_std().get_program().to_string_lossy();
-        client_launch_error(&client, error)
-    })?;
-    tokio::select! {
-        status = child.wait() => Ok(status?.code().unwrap_or(1) as u8),
-        result = serve(listener, Arc::new(app)) => Err(result.unwrap_err().into()),
-    }
 }
 
 async fn run_setup(args: &[OsString], codex_home: &Path) -> Result<u8, RelayError> {
-    if args.is_empty()
-        && std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal()
-        && let Some(account) = setup::choose_subscription()?
-    {
-        return native::setup_subscription(account, codex_home).await;
+    use setup::SetupChoice;
+
+    if !args.is_empty() || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return setup::run_setup(args, codex_home);
     }
-    setup::run_setup(args, codex_home)
+    loop {
+        let result = match setup::choose_setup()? {
+            SetupChoice::Subscription(account) => native::setup_subscription(account, codex_home)
+                .await
+                .map(|_| ()),
+            SetupChoice::Provider => setup::guided_provider(codex_home),
+            SetupChoice::Brave => setup::enable_brave(codex_home),
+            SetupChoice::Done => {
+                println!(
+                    "Run `ox doctor` to check setup, then start `ox codex` or `ox claude` from your project."
+                );
+                return Ok(0);
+            }
+        };
+        if let Err(error) = result {
+            eprintln!("ox setup: {error}");
+        }
+    }
 }
 
 fn client_launch_error(client: &str, error: std::io::Error) -> RelayError {
@@ -357,15 +470,16 @@ impl App {
             .collect();
         {
             let client = &client;
-            let mut requests =
-                futures_util::stream::iter(vendors.iter().zip(&auths).enumerate().filter_map(
-                    |(index, (vendor, auth))| {
-                        auth.as_ref()
-                            .filter(|_| vendor.discovery)
-                            .map(|key| async move { (index, discover(client, vendor, key).await) })
-                    },
-                ))
-                .buffer_unordered(4);
+            let requests: Vec<_> = vendors
+                .iter()
+                .zip(&auths)
+                .enumerate()
+                .filter_map(|(index, (vendor, auth))| {
+                    let key = auth.as_ref().filter(|_| vendor.discovery)?;
+                    Some(async move { (index, discover(client, vendor, key).await) })
+                })
+                .collect();
+            let mut requests = futures_util::stream::iter(requests).buffer_unordered(4);
 
             let deadline = tokio::time::Instant::now() + CATALOG_TIMEOUT;
             loop {
@@ -414,7 +528,9 @@ impl App {
                     slug: alias,
                     display_name: spec.name.clone().unwrap_or_else(|| spec.id.clone()),
                     description: vendor.name.clone(),
-                    context_window: spec.context_window,
+                    context_window: spec
+                        .context_window
+                        .or_else(|| catalog::published_context_window(&vendor.base_url, &spec.id)),
                     input_modalities: spec.input_modalities.clone(),
                     reasoning_efforts: spec.reasoning_efforts.clone(),
                     apply_patch: vendor.wire.is_translated(),
@@ -443,13 +559,48 @@ impl App {
         })
     }
 
+    fn visible_models(&self) -> impl Iterator<Item = &Value> {
+        let entries = match &self.mode {
+            Mode::Codeox { catalog, .. } => catalog["models"].as_array().map(Vec::as_slice),
+            Mode::Legacy { .. } => None,
+        };
+        entries
+            .unwrap_or_default()
+            .iter()
+            .filter(|entry| entry["visibility"] == "list")
+    }
+
+    fn launch_models(&self) -> Vec<(&str, &str)> {
+        let Mode::Codeox {
+            vendors, routes, ..
+        } = &self.mode
+        else {
+            return Vec::new();
+        };
+        self.visible_models()
+            .filter_map(|entry| {
+                let alias = entry["slug"].as_str()?;
+                let Resolution::Route(route) = routes.resolve(alias) else {
+                    return None;
+                };
+                let vendor = &vendors[route.vendor];
+                vendor.auth.as_ref()?;
+                Some((alias, vendor.vendor.key.as_str()))
+            })
+            .collect()
+    }
+
     async fn handle(&self, request: Request<Incoming>) -> Response<RelayBody> {
         let bearer_matches = request
             .headers()
             .get(AUTHORIZATION)
             .is_some_and(|auth| auth.as_bytes().ct_eq(self.local_auth.as_bytes()).into());
         if matches!(self.client_kind, ClientKind::Claude)
-            || self.persistent && matches!(request.uri().path(), "/v1/messages" | "/v1/models")
+            || self.persistent
+                && matches!(
+                    request.uri().path(),
+                    "/v1/messages" | "/v1/messages/count_tokens" | "/v1/models" | "/api/hello"
+                )
         {
             return self.handle_messages_client(request, bearer_matches).await;
         }
@@ -531,7 +682,11 @@ impl App {
         }
     }
 
-    async fn inference(&self, request: Request<Incoming>) -> Response<RelayBody> {
+    async fn inference<B>(&self, request: Request<B>) -> Response<RelayBody>
+    where
+        B: Body<Data = Bytes> + Send + Unpin + 'static,
+        B::Error: Into<RelayError>,
+    {
         let (parts, body) = request.into_parts();
         let path = parts
             .uri
@@ -723,7 +878,7 @@ async fn discover(
     key: &SecretKey,
 ) -> Result<ProviderModels, String> {
     let headers = vendor
-        .auth_headers(key)
+        .discovery_headers(key)
         .map_err(|_| "could not build discovery headers".to_owned())?;
     let response = client
         .get(vendor.models_url.clone())
@@ -759,7 +914,10 @@ async fn read_upstream(response: reqwest::Response, limit: usize) -> Result<Byte
     Ok(Bytes::from(buffer))
 }
 
-async fn read_bounded(body: Incoming, limit: usize) -> Result<Bytes, Response<RelayBody>> {
+async fn read_bounded(
+    body: impl Body<Data = Bytes> + Unpin,
+    limit: usize,
+) -> Result<Bytes, Response<RelayBody>> {
     if body
         .size_hint()
         .upper()
@@ -797,13 +955,25 @@ fn too_large(limit: usize) -> Response<RelayBody> {
 }
 
 async fn serve(listener: TcpListener, relay: Arc<App>) -> std::io::Result<()> {
+    serve_requests(listener, move |request| {
+        let relay = Arc::clone(&relay);
+        async move { relay.handle(request).await }
+    })
+    .await
+}
+
+async fn serve_requests<F, Fut>(listener: TcpListener, handle: F) -> std::io::Result<()>
+where
+    F: Fn(Request<Incoming>) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Response<RelayBody>> + Send + 'static,
+{
     loop {
         let (socket, _) = listener.accept().await?;
-        let relay = Arc::clone(&relay);
+        let handle = handle.clone();
         tokio::spawn(async move {
             let service = service_fn(move |request| {
-                let relay = Arc::clone(&relay);
-                async move { Ok::<_, std::convert::Infallible>(relay.handle(request).await) }
+                let response = handle(request);
+                async move { Ok::<_, std::convert::Infallible>(response.await) }
             });
             let _ = http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())
@@ -1007,6 +1177,7 @@ async fn bundled_catalog(
     let mut command = Command::new("codex");
     command
         .env("CODEX_HOME", codex_home)
+        .env_remove("CODEX_SQLITE_HOME")
         .args(["debug", "models", "--bundled"]);
     for name in strip {
         command.env_remove(name);
@@ -1019,6 +1190,23 @@ async fn bundled_catalog(
         return Err("could not read the bundled Codex model catalog".into());
     }
     Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn codex_relay_command(home: &Path) -> Result<Command, RelayError> {
+    let mut command = Command::new("codex");
+    let state = home.to_str().ok_or("Codex profile path must be UTF-8")?;
+    let logs = home.join("log");
+    let logs = logs.to_str().ok_or("Codex log path must be UTF-8")?;
+    // A copied config or an inherited env var can otherwise point Codex
+    // back to the native databases and logs despite a separate CODEX_HOME.
+    command
+        .env("CODEX_HOME", home)
+        .env_remove("CODEX_SQLITE_HOME")
+        .arg("-c")
+        .arg(format!("sqlite_home={}", json!(state)))
+        .arg("-c")
+        .arg(format!("log_dir={}", json!(logs)));
+    Ok(command)
 }
 
 fn random_token() -> Result<String, RelayError> {

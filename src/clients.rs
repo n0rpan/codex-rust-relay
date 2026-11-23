@@ -262,6 +262,130 @@ impl Drop for ClaudeLaunchSettings {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct ClaudeLaunchOptions<'a> {
+    pub starred: &'a [&'a str],
+    pub config_dir: Option<&'a Path>,
+    /// None keeps the normal route-based default. Some(None) selects the
+    /// client's default model for a separate classifier request.
+    pub client_classifier: Option<Option<&'a str>>,
+}
+
+pub(crate) fn claude_config_override() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Stock clients can save `/model` selections back into their user files.
+/// Give each relay client a persistent home so model changes and resumes stay
+/// in that profile even if ox or its child is interrupted.
+pub(crate) fn relay_client_home(
+    codex_home: &Path,
+    client: ClientKind,
+) -> Result<PathBuf, RelayError> {
+    let (name, source, files): (_, _, &[_]) = match client {
+        ClientKind::Codex => (
+            "codex",
+            Some(codex_home.to_path_buf()),
+            &[
+                "config.toml",
+                "AGENTS.md",
+                "AGENTS.override.md",
+                "requirements.toml",
+            ],
+        ),
+        ClientKind::Claude => (
+            "claude",
+            claude_config_override().or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude"))
+            }),
+            &["settings.json", "CLAUDE.md"],
+        ),
+    };
+    let root = codex_home.canonicalize()?.join("ox-clients");
+    let profile = root.join(name);
+    for directory in [&root, &profile] {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        if let Err(error) = builder.create(directory)
+            && error.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(error.into());
+        }
+        if !std::fs::symlink_metadata(directory)?.is_dir() {
+            return Err("the ox client profile must be a directory and cannot be a symlink".into());
+        }
+    }
+    let _lock = crate::setup::lock_config(&profile)?;
+    if files.iter().any(|file| profile.join(file).is_symlink()) {
+        return Err(
+            "ox client settings cannot link back to files outside the relay profile".into(),
+        );
+    }
+    let marker = profile.join(".initialized");
+    if !marker.try_exists()? {
+        if let Some(source) = source {
+            for file in files {
+                let from = source.join(file);
+                let to = profile.join(file);
+                if from.try_exists()? && !to.try_exists()? {
+                    let bytes = read_limited(&from, "client profile setting")?;
+                    let text = std::str::from_utf8(&bytes)
+                        .map_err(|_| "could not copy a non-UTF-8 client setting")?;
+                    crate::setup::write_config_atomic(&to, text)?;
+                }
+            }
+        }
+        crate::setup::write_config_atomic(&marker, "")?;
+    }
+    Ok(profile)
+}
+
+pub(crate) struct ClaudeModelInfo {
+    pub can_request_server_review: bool,
+    pub context_window: Option<u64>,
+}
+
+pub(crate) fn take_client_classifier(
+    args: &mut Vec<OsString>,
+) -> Result<Option<String>, RelayError> {
+    let mut classifier = None;
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            break;
+        }
+        let Some(arg) = arg.to_str() else {
+            index += 1;
+            continue;
+        };
+        let (value, count) = if arg == "--client-classifier" {
+            (args.get(index + 1).and_then(|value| value.to_str()), 2)
+        } else if let Some(value) = arg.strip_prefix("--client-classifier=") {
+            (Some(value), 1)
+        } else {
+            index += 1;
+            continue;
+        };
+        if classifier.is_some() {
+            return Err("--client-classifier can only be specified once".into());
+        }
+        classifier = Some(
+            value
+                .filter(|model| valid_model_value(model) && !is_reserved_model_alias(model))
+                .ok_or("--client-classifier requires auto or an Anthropic model alias")?
+                .to_owned(),
+        );
+        args.drain(index..index + count);
+    }
+    Ok(classifier)
+}
+
 /// Builds the stock `claude` command for one relay launch.
 ///
 /// `origin` is the relay listener origin (`http://127.0.0.1:<port>`), `token`
@@ -271,13 +395,16 @@ impl Drop for ClaudeLaunchSettings {
 /// Returns the command together with the settings-file guard; keep the guard
 /// alive until the child exits. Model selection is expressed through the
 /// launch-scoped settings plus environment so an explicit `--model` remains
-/// authoritative.
+/// authoritative. Metadata for that model can supply Claude's starting context
+/// window.
 pub(crate) fn claude_command(
     args: Vec<OsString>,
     origin: &str,
     token: &str,
     aliases: &[String],
     env_refs: &BTreeSet<String>,
+    options: ClaudeLaunchOptions<'_>,
+    model_info_for: impl FnOnce(&str) -> Option<ClaudeModelInfo>,
 ) -> Result<(Command, ClaudeLaunchSettings), RelayError> {
     let base_url = anthropic_base_url(origin)?;
     if !valid_token(token) {
@@ -330,8 +457,6 @@ pub(crate) fn claude_command(
             overlay_env.insert(name.to_owned(), Value::String(String::new()));
         }
     }
-    let (args, settings) = inject_settings(args, overlay_env)?;
-
     let mut command = Command::new("claude");
     // Vendor and search credentials are relay-only and must never reach the
     // stock client. The one-time relay token is not needed by Claude either.
@@ -343,6 +468,35 @@ pub(crate) fn claude_command(
         .env_remove(DEFAULT_SEARCH_ENV_KEY);
     for name in SCRUBBED_ENV {
         command.env_remove(name);
+    }
+    if let Some(path) = options.config_dir {
+        let key = "CLAUDE_CONFIG_DIR";
+        let value = path
+            .to_str()
+            .ok_or("Claude Code profile path must be UTF-8")?;
+        overlay_env.insert(key.to_owned(), Value::String(value.to_owned()));
+        command.env(key, path);
+    }
+
+    // Claude Code reads this once per process for custom model IDs. Use the
+    // starting model's window, leaving user overrides in env/settings in force.
+    const CONTEXT_ENV: &str = "CLAUDE_CODE_MAX_CONTEXT_TOKENS";
+    let starting_model = match requested {
+        Some("opus") => Some(opus),
+        Some("sonnet") => Some(sonnet),
+        Some("haiku") => Some(haiku),
+        Some(model) if is_reserved_model_alias(model) => None,
+        Some(model) => Some(model),
+        None => Some(default.as_str()),
+    };
+    let model_info = starting_model.and_then(model_info_for);
+    if !env_refs
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(CONTEXT_ENV))
+        && std::env::var_os(CONTEXT_ENV).is_none()
+        && let Some(window) = model_info.as_ref().and_then(|model| model.context_window)
+    {
+        command.env(CONTEXT_ENV, window.to_string());
     }
 
     const MODEL_DISCOVERY_ENV: &str = "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY";
@@ -373,6 +527,27 @@ pub(crate) fn claude_command(
         command.env(name, loopback_no_proxy(&existing));
     }
 
+    const SERVER_REVIEW_ENV: &str = "CLAUDE_CODE_AUTO_MODE_SERVER";
+    const CLASSIFIER_MODEL_ENV: &str = "CLAUDE_CODE_AUTO_MODE_MODEL";
+    if let Some(classifier) = options.client_classifier {
+        overlay_env.insert(SERVER_REVIEW_ENV.to_owned(), Value::String("0".to_owned()));
+        command.env(SERVER_REVIEW_ENV, "0");
+        if let Some(classifier) = classifier {
+            overlay_env.insert(
+                CLASSIFIER_MODEL_ENV.to_owned(),
+                Value::String(classifier.to_owned()),
+            );
+            command.env(CLASSIFIER_MODEL_ENV, classifier);
+        }
+    } else if model_info.is_some_and(|model| !model.can_request_server_review)
+        && !env_refs.contains(SERVER_REVIEW_ENV)
+        && std::env::var_os(SERVER_REVIEW_ENV).is_none()
+    {
+        // Matching the Messages format alone does not provide server review.
+        // Keep Claude Code's own classifier active on other routes by default.
+        command.env(SERVER_REVIEW_ENV, "0");
+    }
+    let (args, settings) = inject_settings(args, overlay_env, options.starred)?;
     command.args(args).kill_on_drop(true);
     Ok((command, settings))
 }
@@ -422,10 +597,21 @@ fn overlay_env(
 fn inject_settings(
     args: Vec<OsString>,
     overlay_env: SettingsMap,
+    starred: &[&str],
 ) -> Result<(Vec<OsString>, ClaudeLaunchSettings), RelayError> {
     let (mut args, user_settings) = take_user_settings(args)?;
     let mut document = user_settings.unwrap_or_default();
     merge_overlay(&mut document, overlay_env)?;
+    let options: Vec<_> = starred
+        .iter()
+        .filter(|alias| !is_reserved_model_alias(alias))
+        .map(|alias| serde_json::json!({ "model": alias, "label": alias }))
+        .collect();
+    if !options.is_empty() {
+        document.entry("modelPicker".to_owned()).or_insert_with(
+            || serde_json::json!({ "replaceBuiltInOptions": true, "options": options }),
+        );
+    }
     // The stock helper runs a command and adds its output as `x-api-key`; the
     // relay authenticates with the bearer, so keep the launch credential one
     // source only. An empty helper is ignored (verified on 2.1.330).
@@ -722,9 +908,10 @@ fn inspect_managed_settings(path: &Path) -> Result<(), RelayError> {
             _ => true,
         };
         if set
-            && ROUTING_ENV
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(key))
+            && (key.eq_ignore_ascii_case("CLAUDE_CONFIG_DIR")
+                || ROUTING_ENV
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(key)))
         {
             return Err(format!(
                 concat!(
@@ -879,7 +1066,16 @@ mod tests {
         aliases: &[String],
         env_refs: &BTreeSet<String>,
     ) -> (Command, ClaudeLaunchSettings) {
-        claude_command(args, origin, token, aliases, env_refs).unwrap()
+        claude_command(
+            args,
+            origin,
+            token,
+            aliases,
+            env_refs,
+            ClaudeLaunchOptions::default(),
+            |_| None,
+        )
+        .unwrap()
     }
 
     fn env_entry(command: &Command, name: &str) -> Option<Option<String>> {
@@ -1367,7 +1563,9 @@ mod tests {
                     "http://127.0.0.1:1",
                     "t",
                     &aliases(&["a/b"]),
-                    &refs(&[])
+                    &refs(&[]),
+                    ClaudeLaunchOptions::default(),
+                    |_| None,
                 )
                 .is_err()
             );
@@ -1381,6 +1579,8 @@ mod tests {
                 "t",
                 &aliases(&["a/b"]),
                 &refs(&[]),
+                ClaudeLaunchOptions::default(),
+                |_| None,
             )
             .is_err()
         );
@@ -1470,6 +1670,8 @@ mod tests {
                 "t",
                 &aliases(&["a/b"]),
                 &refs(&[]),
+                ClaudeLaunchOptions::default(),
+                |_| None,
             )
             .unwrap_err();
             assert!(error.to_string().contains("managed"));
@@ -1560,8 +1762,16 @@ mod tests {
 
     #[test]
     fn empty_alias_list_accepts_only_an_explicit_model() {
-        let error =
-            claude_command(Vec::new(), "http://127.0.0.1:1", "t", &[], &refs(&[])).unwrap_err();
+        let error = claude_command(
+            Vec::new(),
+            "http://127.0.0.1:1",
+            "t",
+            &[],
+            &refs(&[]),
+            ClaudeLaunchOptions::default(),
+            |_| None,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("--model"));
 
         let (command, settings) = launch(
@@ -1618,6 +1828,8 @@ mod tests {
             "t",
             &aliases(&["sonnet"]),
             &refs(&[]),
+            ClaudeLaunchOptions::default(),
+            |_| None,
         )
         .unwrap_err();
         assert!(error.to_string().contains("built-in"));
@@ -1656,7 +1868,9 @@ mod tests {
                     "http://127.0.0.1:1",
                     "t",
                     std::slice::from_ref(&alias),
-                    &refs(&[])
+                    &refs(&[]),
+                    ClaudeLaunchOptions::default(),
+                    |_| None,
                 )
                 .is_err(),
                 "{alias:?} should be rejected"
@@ -1670,7 +1884,9 @@ mod tests {
                     "http://127.0.0.1:1",
                     token,
                     &aliases(&["a/b"]),
-                    &refs(&[])
+                    &refs(&[]),
+                    ClaudeLaunchOptions::default(),
+                    |_| None,
                 )
                 .is_err(),
                 "{token:?} should be rejected"
@@ -1683,7 +1899,9 @@ mod tests {
                 "http://127.0.0.1:1",
                 "t",
                 &aliases(&["a/b"]),
-                &refs(&[])
+                &refs(&[]),
+                ClaudeLaunchOptions::default(),
+                |_| None,
             )
             .is_err()
         );

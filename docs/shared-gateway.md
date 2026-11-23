@@ -6,24 +6,28 @@
 by default. One server keeps the model registry and vendor keys. Devices connect
 using a separate gateway key and run their own clients, tools and sessions.
 
+The worker MCP server runs inside an `ox codex` or `ox claude` subscription
+launch on the client machine. It serves that launch's jobs over loopback.
+[Run a background worker](configuration.md#subscription-main-session-with-api-workers)
+
 Run `ox help share`, `ox help desktop`, or `ox help t3` for the steps in your
 terminal. For a single host, start with loopback. For clients on another device,
 use the HTTPS address from [Tailscale Serve](#2-publish-it-inside-your-tailnet).
 
 ## 1. Configure and start ox
 
-Install ox on the server, then create its config and add providers using the same
-[provider setup](configuration.md#add-a-provider) commands. For a dedicated config
-directory on the server:
+Install ox on the server and run `ox setup` as the user who will run the service.
+Choose **Add an API key**, select the service, and paste its key. For example,
+to use the config directory expected by the sample systemd service:
 
 ```sh
 export CODEX_HOME="$HOME/.config/ox"
-ox provider add openrouter \
-  --base-url https://openrouter.ai/api/v1 --wire responses \
-  --env-key OPENROUTER_API_KEY --no-discovery --model openai/gpt-5.4-mini
+ox setup
+ox doctor
 ```
 
-Load `OPENROUTER_API_KEY` and any other vendor keys into the environment on the server.
+ox serve loads the keys saved by the wizard for that directory. You can also
+[configure providers with environment variables](configuration.md#scripted-or-advanced-setup).
 For a live check, run `ox doctor --live --provider openrouter`. It sends one small
 streamed prompt and checks for text. The API request may be billed. Plain `ox doctor`
 stays offline.
@@ -39,8 +43,8 @@ ox serve --port 8787
 Use the foreground command to check setup. For persistence on Linux, the
 [systemd user-service example](../examples/ox.service) expects
 `~/.local/bin/ox`, `~/.config/ox/codeox.toml` and `~/.config/ox/gateway.env`. Keep
-`gateway.env` private (mode 0600). Use one `NAME=value` line for each credential,
-including `OX_GATEWAY_KEY`. Install the example into `~/.config/systemd/user/ox.service`,
+`gateway.env` private (mode 0600). Put `OX_GATEWAY_KEY` there, plus one `NAME=value`
+line for each vendor key you manage in the environment. Install the example into `~/.config/systemd/user/ox.service`,
 then start it. Stop any foreground copy using port 8787 before enabling the service:
 
 ```sh
@@ -90,14 +94,19 @@ HTTP 401. Use the HTTPS origin from Serve for Claude and the same origin plus
 
 ### Codex Desktop
 
+The desktop app stores gateway settings you apply. Adding a provider and
+selecting it as current changes that app's saved settings. For a manual
+configuration with separate settings and history, put the example in
+`config.toml` under a dedicated `CODEX_HOME` and launch the client with that
+environment variable.
+
 Open **Settings → Model Providers & Gateways**. If custom gateways are available,
 choose **Add → Gateway or custom provider**. Name it **ox**, use the API base URL
 including `/v1` and choose **Environment variable** authentication with
 `OX_GATEWAY_KEY` as the variable name. If available, select **Set as current
-provider**. For manual setup, merge
-[the Codex configuration example](../examples/codex-gateway.toml) into the
-execution host’s user-level Codex `config.toml`. Replace the URL and alias. Keep the
-catalog URL at `/v1/catalog`. Supply `OX_GATEWAY_KEY` to the app process through
+provider**. For manual setup, replace the URL and alias in
+[the Codex configuration example](../examples/codex-gateway.toml) and keep the
+catalog path at `/v1/catalog`. Supply `OX_GATEWAY_KEY` to the app process through
 your normal desktop secret delivery, then restart the app. A variable exported in
 a terminal is available only to processes launched from it.
 
@@ -114,24 +123,64 @@ calls the gateway at `/v1/alpha/search`. [Brave setup](configuration.md#web-sear
 
 ### Claude Desktop on 3P
 
-Use **Configure Third-Party Inference** on a supported desktop installation or use
-your managed profile. Set the inference provider to **Gateway**. Use the HTTPS
-origin, bearer auth and the gateway key. [Claude Desktop profile example](../examples/claude-desktop-gateway.json)
+1. Open **Developer → Configure Third-Party Inference…** in Claude Desktop on a
+   supported device. Under **Connection**, pick **Gateway** and **Static API key**.
+   Enter the Tailscale HTTPS origin, the `OX_GATEWAY_KEY` value, and **Bearer**.
+   **x-api-key** also works with ox. The gateway key grants access to the shared
+   ox server. Keep the completed profile private.
+2. Pick a native Anthropic model for the first test. The example profile uses
+   `anthropic/claude-sonnet-5`. Change `inferenceModels[].name` to the exact ID
+   returned by the gateway's `/v1/models`. Set `behavesAs` to the underlying
+   Claude model ID. Without an explicit list, Desktop filters discovery to IDs
+   it recognizes as Claude. ox advertises known model limits and Claude family
+   tiers for native Messages routes.
+3. Apply the settings and choose **Save & Restart**. Start a new Chat or Code
+   session. Confirm that the selected model replies and that a Code session can
+   read a file in a disposable project. Use the in-app export for a managed
+   deployment. [Example profile](../examples/claude-desktop-gateway.json) · [Anthropic setup](https://claude.com/docs/third-party/claude-desktop/gateway#configure-the-app)
 
-Start with a native Anthropic route and set `inferenceModels` to the exact route
-aliases. In the example, the server needs an `anthropic` provider with model ID
-`claude-sonnet-5`. The `behavesAs` field tells Desktop which Anthropic model the
-alias represents. Use supported model values matching your provider.
-[Claude Desktop gateway configuration](https://claude.com/docs/third-party/claude-desktop/gateway)
+For Alibaba and other aliases Desktop cannot discover as Claude models, add the
+exact ox alias under **Models**. For example, enter
+`alibaba-messages/deepseek-v4.1-flash-1017` and give it the display name
+**DeepSeek V4.1 Flash · Alibaba**. Desktop sends that alias to ox and ox sends the
+underlying model ID to Alibaba. To set a Claude capability profile, open the entry's
+**Claude model behind this ID** field (`behavesAs` in JSON) and enter the full
+Claude ID, for example `claude-sonnet-5-5`. This changes effort and context
+assumptions. Use it only when the route supports the settings Desktop will send.
+For an Alibaba model, start with its actual context limit and a clear display
+name. [Desktop model controls](https://claude.com/docs/third-party/claude-desktop/models#map-an-unrecognized-model-id-to-a-claude-model)
 
-Native Anthropic routes preserve successful Messages streams, usage and signed
-thinking, and forward bounded native error responses when they contain no
-configured credentials. Desktop-specific session recovery, compaction and Auto
-mode need end-to-end testing on the installed app. Translated routes lack
-Anthropic-only features such as signed thinking and server-side review. The
-relay's Brave bridge handles Claude Code’s dedicated search call. For Desktop’s
-provider-side search, use a native Anthropic route that supports it or configure
-[Desktop’s bundled web tools](../examples/claude-desktop-web-tools.json) separately.
+**Context and caching.** Set `modelPrefer1mContext` for discovery, or `supports1m`
+on a matching `inferenceModels` entry, when the selected route supports 1M. ox
+advertises `supports_1m` when it knows the model has at least 1M input tokens.
+For unrecognized aliases with a different window, Desktop can use
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` in Claude Code managed settings. Choose the
+smallest supported limit among the aliases that share that setting.
+On native routes ox retains 1-hour `cache_control` markers, cache creation and
+read usage, signed thinking, SSE pings, and the provider's compaction error
+wording. The provider determines which features it accepts. Check cache reads on
+subsequent turns and run `/compact` in a long test session on the Mac. Keep
+buffering off and use a proxy timeout long enough for compaction streams.
+[Context and compaction](https://claude.com/docs/third-party/claude-desktop/gateway#context-window-and-compaction)
+
+**Auto mode and MCP tool search.** Server-side Auto mode works only with an
+upstream that returns real verdicts. Test each model in a new local Code session,
+then look for `cli_api_auto_mode_server_check` with state `verdict` under
+**Help → Troubleshooting → Generate Diagnostic Report**. For a translated or
+otherwise incompatible route, set `inferenceGatewayAutoModeServerChecks` to
+`false` on the same Desktop profile to select the built-in check while it is
+available. `toolSearchEnabled` is a separate opt-in. Turn it on only for routes
+that accept the tool-search beta, `defer_loading`, and `tool_reference`.
+[Auto mode diagnostics](https://claude.com/docs/third-party/claude-desktop/gateway#test-auto-mode-checks-on-one-device)
+
+The `ox serve` tests cover the API contract with loopback providers. A live
+Sonnet 5 probe through ox cached 2,926 tokens on a 1-hour breakpoint and read the
+same 2,926 tokens on the next request. The Desktop picker, actual compaction, and
+Auto mode verdicts still need the Mac app check. A provider's native `402` billing
+error is preserved. ox serves a
+static gateway key and does not issue per-user budgets or validate enterprise
+OIDC tokens. For Desktop search, use an upstream that supports it or configure
+[Desktop’s bundled web tools](../examples/claude-desktop-web-tools.json).
 
 ### T3 Code
 
@@ -145,9 +194,10 @@ reach the tailnet URL.
   also sets the native catalog URL. Keep the ordinary ChatGPT instance for
   ChatGPT-backed sessions. [T3 Code Codex provider settings](https://github.com/pingdotgg/t3code/blob/main/docs/user/providers-codex.md)
 - **Claude instance.** T3 Code runs the Claude Agent SDK with its configured
-  Claude runtime. Use a separate Claude config directory if you also sign in
-  with Claude on this host. In the instance's **Environment variables**, set
-  `ANTHROPIC_BASE_URL` to the HTTPS origin,
+  Claude runtime. In the instance's **Environment variables**, set
+  `CLAUDE_CONFIG_DIR` to a dedicated directory on the execution host to keep
+  its settings and history separate from your usual Claude Code profile.
+  Set `ANTHROPIC_BASE_URL` to the HTTPS origin,
   `ANTHROPIC_AUTH_TOKEN` to the gateway key as a sensitive value, and
   `ANTHROPIC_API_KEY` to an explicitly empty value. Add your exact model alias
   as a custom model in T3 Code. For the standalone Claude Code CLI pointed at the
@@ -158,6 +208,13 @@ T3 Code manages which instance, secret and aliases a thread uses. Add or update
 vendor routes in the server’s `codeox.toml`. Sessions and tool execution stay in
 the selected client environment. Enable the new instance for your project and
 select it and its custom model when you start a thread.
+
+For a native subscription session on a remote execution host, sign in with the
+corresponding stock client on that host under the account that runs it. Connect
+to that host using your client's remote execution support. The shared ox API
+gateway uses provider API keys and its own gateway key. For Claude models in
+Codex, add a Claude Console API provider to ox and select its alias in Codex.
+[Claude Code credential use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)
 
 For subscription sessions in T3 Code, sign in with the stock client on its
 execution host. Select the native Codex or Claude instance that uses that sign-in.

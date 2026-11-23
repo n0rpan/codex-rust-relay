@@ -35,6 +35,10 @@ struct ProviderModel {
     capabilities: Capabilities,
     #[serde(default)]
     limit: Limits,
+    #[serde(default)]
+    context_length: Value,
+    #[serde(default)]
+    max_input_tokens: Value,
 }
 
 #[derive(Default, Deserialize)]
@@ -139,6 +143,8 @@ impl ModelSpec {
             .context
             .into_iter()
             .chain(model.limit.input)
+            .chain(model.context_length.as_u64())
+            .chain(model.max_input_tokens.as_u64())
             .filter(|limit| *limit > 0)
             .min();
         let mut input_modalities = vec!["text".to_owned()];
@@ -190,6 +196,17 @@ impl ModelSpec {
             self.reasoning_efforts = reasoning_efforts.clone();
         }
     }
+}
+
+/// Model Studio's compatibility catalog omits capacity for this snapshot.
+pub(crate) fn published_context_window(vendor_url: &reqwest::Url, model: &str) -> Option<u64> {
+    // https://www.alibabacloud.com/notice/detail?_p_lc=1&id=2225
+    (model == "deepseek-v4.1-flash-1017"
+        && vendor_url.scheme() == "https"
+        && vendor_url
+            .domain()
+            .is_some_and(|host| host.ends_with(".aliyuncs.com")))
+    .then_some(1_000_000)
 }
 
 fn normalise_modalities(input: &[String]) -> Vec<String> {
@@ -267,6 +284,32 @@ pub fn catalog_json(models: &[CatalogModel], bundled: &BundledModels) -> Value {
         Some(hidden)
     }));
     json!({ "models": entries })
+}
+
+pub(crate) fn prioritize_favorites(catalog: &mut Value, favorites: &[String]) {
+    if favorites.is_empty() {
+        return;
+    }
+    let Some(models) = catalog["models"].as_array_mut() else {
+        return;
+    };
+    models.sort_by_cached_key(|entry| {
+        if entry["visibility"] == "list"
+            && let Some(model) = entry["slug"].as_str()
+            && let Some(rank) = favorites.iter().position(|favorite| favorite == model)
+        {
+            rank
+        } else {
+            usize::MAX
+        }
+    });
+    for (priority, entry) in models
+        .iter_mut()
+        .filter(|entry| entry["visibility"] == "list")
+        .enumerate()
+    {
+        entry["priority"] = json!(priority);
+    }
 }
 
 impl CatalogModel {
@@ -358,6 +401,34 @@ mod tests {
     }
 
     #[test]
+    fn reads_context_from_each_catalog_and_uses_the_tightest_limit() {
+        let upstream = serde_json::from_value::<ProviderModels>(json!({
+            "data": [
+                {"id": "go", "limit": {"context": 1_000_000, "output": 131_072}},
+                {"id": "router", "context_length": 256_000},
+                {"id": "anthropic", "max_input_tokens": 200_000},
+                {"id": "bounded", "limit": {"context": 256_000, "input": 200_000}, "context_length": 128_000},
+                {"id": "unknown", "context_length": "unspecified", "max_input_tokens": 0}
+            ]
+        }))
+        .unwrap();
+        let limits: Vec<_> = merge_models(Some(upstream), &[])
+            .into_iter()
+            .map(|model| model.context_window)
+            .collect();
+        assert_eq!(
+            limits,
+            [
+                Some(1_000_000),
+                Some(256_000),
+                Some(200_000),
+                Some(128_000),
+                None
+            ]
+        );
+    }
+
+    #[test]
     fn static_entries_override_capabilities_and_add_models() {
         let discovered = serde_json::from_value::<ProviderModels>(json!({
             "data": [{"id": "coder", "limit": {"context": 8192}}]
@@ -403,6 +474,31 @@ mod tests {
             .map(|spec| spec.id)
             .collect::<Vec<_>>();
         assert_eq!(ids, ["with-tools"]);
+    }
+
+    #[test]
+    fn favorites_follow_saved_order_across_providers() {
+        let mut catalog = json!({"models": [
+            {"slug": "alibaba/a", "priority": 0, "visibility": "list"},
+            {"slug": "openrouter/b", "priority": 1, "visibility": "list"},
+            {"slug": "opencode-go/c", "priority": 2, "visibility": "list"},
+            {"slug": "built-in", "priority": 0, "visibility": "hide"},
+        ]});
+        prioritize_favorites(
+            &mut catalog,
+            &[
+                "opencode-go/c".to_owned(),
+                "built-in".to_owned(),
+                "alibaba/a".to_owned(),
+            ],
+        );
+        let rows = catalog["models"].as_array().unwrap();
+        assert_eq!(rows[0]["slug"], "opencode-go/c");
+        assert_eq!(rows[0]["priority"], 0);
+        assert_eq!(rows[1]["slug"], "alibaba/a");
+        assert_eq!(rows[1]["priority"], 1);
+        assert_eq!(rows[2]["slug"], "openrouter/b");
+        assert_eq!(rows[3]["visibility"], "hide");
     }
 
     #[test]

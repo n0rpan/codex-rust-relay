@@ -113,6 +113,14 @@ const ALLOWED_EFFORTS: [&str; 7] = ["minimal", "low", "medium", "high", "xhigh",
 /// `upstream_model` always wins over the request's `model`, mirroring the
 /// relay's other translated adapters.
 pub(crate) fn into_responses(input: &Value, upstream_model: &str) -> Result<Value, String> {
+    convert(input, upstream_model, false)
+}
+
+pub(crate) fn into_input_token_count(input: &Value, upstream_model: &str) -> Result<Value, String> {
+    convert(input, upstream_model, true)
+}
+
+fn convert(input: &Value, upstream_model: &str, count_only: bool) -> Result<Value, String> {
     if upstream_model.trim().is_empty() {
         return Err("the upstream model id must not be empty".to_owned());
     }
@@ -123,7 +131,9 @@ pub(crate) fn into_responses(input: &Value, upstream_model: &str) -> Result<Valu
     reject_provider_tool_containers(request)?;
     validate_thinking(request.get("thinking"))?;
 
-    let max_tokens = positive_u64(request.get("max_tokens"), "max_tokens")?;
+    let max_tokens = (!count_only)
+        .then(|| positive_u64(request.get("max_tokens"), "max_tokens"))
+        .transpose()?;
 
     let mut builder = Builder::default();
     if let Some(system) = request.get("system") {
@@ -168,6 +178,10 @@ pub(crate) fn into_responses(input: &Value, upstream_model: &str) -> Result<Valu
     if let Some(parallel) = parallel_tool_calls {
         body.insert("parallel_tool_calls".to_owned(), json!(parallel));
     }
+    let Some(max_tokens) = max_tokens else {
+        apply_output_config(request.get("output_config"), &mut body)?;
+        return Ok(Value::Object(body));
+    };
     body.insert("max_output_tokens".to_owned(), json!(max_tokens));
     insert_sampling(request, "temperature", &mut body)?;
     insert_sampling(request, "top_p", &mut body)?;

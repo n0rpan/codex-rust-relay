@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::catalog::BundledModels;
-use crate::provider::{CodeoxConfig, RelayError, process_env};
+use crate::provider::{CodeoxConfig, RelayError, SavedKeys, process_env};
 use crate::{App, MAX_REQUEST_BYTES, build_search, serve, upstream_client};
 
 const DEFAULT_PORT: u16 = 8787;
@@ -41,18 +41,20 @@ pub(crate) async fn run(args: &[OsString], home: &Path) -> Result<u8, RelayError
         return Err("no ox provider configured. Run `ox setup` before starting `ox serve`".into());
     }
     let config = CodeoxConfig::load(&path)?;
+    let saved = SavedKeys::for_config(home, &config)?;
+    let env = |name: &str| saved.get(name);
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     let search = config
         .search
         .as_ref()
-        .and_then(|settings| build_search(settings, &process_env));
+        .and_then(|settings| build_search(settings, &env));
     let mut gateway = App::codeox(
         config,
         BundledModels::default(),
         &key,
         upstream_client()?,
         MAX_REQUEST_BYTES,
-        &process_env,
+        &env,
         search,
     )
     .await?;

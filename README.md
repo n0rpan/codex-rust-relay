@@ -1,11 +1,14 @@
 # ox
 
-Use Codex or Claude Code with your own model API keys. One provider setup works with both
-CLIs. Run `ox codex` or `ox claude` to start a local relay that exits with the client. Run
-`codex` or `claude` directly for your usual sign-in.
+Run `ox codex` or `ox claude` from your project. Both commands use the same API
+provider setup and model picker. When you’re signed in, the picker also lists that
+client’s native subscription. An Anthropic API key lets either client use Claude
+models through the gateway.
 
-**Already installed?** Run `ox setup` to choose a subscription or add an API provider, or `ox --help` to
-see the commands. Typing just `ox` in a terminal opens setup on first use.
+Without an API provider configured, plain `ox codex` and `ox claude` use the
+corresponding client's existing subscription sign-in. Bare `ox` prefers Codex
+and opens Claude Code when only Claude is signed in. Run `ox setup` to add an API
+provider or sign in, and `ox doctor` to check what's configured.
 
 Use `ox help desktop` for Codex and Claude Desktop, `ox help share` to connect
 other devices, or `ox help t3` for T3 Code.
@@ -35,9 +38,19 @@ For unreleased builds, follow the [preview or source install steps](docs/configu
 
 ## 2. Add a provider
 
-Run `ox setup`, choose **API key provider**, and follow the prompts. Enter `openrouter`, `anthropic`, or `openai`
-to get connection defaults. When asked for an environment variable, enter its name,
-such as `OPENROUTER_API_KEY`. Load the API key into your shell, then run `ox doctor`.
+1. Run `ox setup`, choose **Add an API key**, then pick the service that issued it.
+2. Paste that service’s API key at the hidden prompt. ox fills in the connection
+   settings and saves the key locally. For **Other or self-hosted**, paste the
+   service’s API URL first.
+3. Back in the menu, add another provider or enable Brave web search. Choose
+   **Done**, then run `ox doctor`.
+
+Use **Sign in with ChatGPT** or **Sign in with Claude** for a subscription
+session in its own client. If your plan offers API credits, claim them and
+add an API key from the linked organization to use those credits in both
+clients and over the shared gateway.
+[OpenAI API credits](https://developers.openai.com/api/docs/guides/chatgpt-api-credits) ·
+[Claude Platform credits](https://platform.claude.com/docs/en/about-claude/api-credits-for-subscribers)
 
 For repeatable setup with **OpenRouter**, the commands below use a model tested with
 both clients. Load `OPENROUTER_API_KEY` from your secret manager or use this hidden
@@ -66,8 +79,15 @@ have a provider configured, use its existing alias. [Other providers and setup o
 
 ## 3. Try a session
 
-From your project directory, run `ox codex` or `ox claude`, then open `/model`
-to choose a model. To select an alias directly:
+From your project directory, run `ox codex` or `ox claude` and choose from all
+available ox API aliases. Search updates as you type. Use **↑/↓** to move,
+**Tab** to star or unstar, and **Enter** to launch the highlighted model.
+You can star several models before starting a session. They stay at the
+top in both launchers in the order you starred them. Use **Alt+↑/↓** to reorder,
+**Ctrl+F** to see just your stars, and **Esc** to close the picker.
+
+If one API model is available and you have no native subscription, ox selects
+it for you. To skip the picker:
 
 ```sh
 ox codex --model openrouter/openai/gpt-5.4-mini
@@ -79,9 +99,25 @@ they are.”** A reply grounded in the file confirms both the model connection a
 read. Prompts and tool results go to the selected API provider and use that provider’s billing.
 
 Use the same alias, **`provider/model-id`**, in either client. Add more providers with
-`ox provider add`, then relaunch. Codex lists configured models in `/model`. In Claude Code,
-`/model` shows [eligible discovered aliases](docs/configuration.md#model-names-and-discovery)
-when launched with `ox claude`. Use `--model <alias>` to select any configured model.
+`ox provider add`, then relaunch. In API-backed sessions, **`/model`** in Codex
+lists your stars first. In Claude Code it shows your starred lineup when you
+have one. Use the ox launch picker to browse the full catalog.
+[Catalog and client behavior](docs/configuration.md#model-names-and-discovery)
+
+API-backed launches keep their model defaults and new sessions in separate ox
+profiles. Plain `codex` and `claude` continue using your usual settings and sign-in.
+Use `ox codex resume` or `ox claude --resume <session-id>` for a relay session.
+Choosing a subscription in ox opens your usual client profile, so its sign-in
+and settings changes are shared with the plain command.
+[Profiles and session recovery](docs/configuration.md#sessions-and-sign-in)
+
+**Use both in one session.** Pick your subscription in `ox codex` or
+`ox claude`, then ask **“List my API models and subscription routes.”**
+Pick an alias and ask **“Start a Codex goal worker on that model to
+fix the failing tests. Let it edit this project and tell me the job ID.”**
+The main conversation stays on your subscription, and ox runs the worker in
+the background using the selected API provider.
+[Delegate to an API worker](docs/configuration.md#subscription-main-session-with-api-workers)
 
 ## Common tasks
 
@@ -90,6 +126,7 @@ when launched with `ox claude`. Use `--model <alias>` to select any configured m
 | Connect Anthropic, OpenAI, a Chat Completions vendor, or a local server | [Provider setup](docs/configuration.md#add-a-provider) |
 | Add Brave citations or configure Claude Code Auto mode | [Search and Claude settings](docs/configuration.md#web-search-with-brave) |
 | Resume a session, switch models, or keep my usual ChatGPT sign-in | [Sessions and sign-in](docs/configuration.md#sessions-and-sign-in) |
+| Keep my subscription and delegate to an API model | [API workers](docs/configuration.md#subscription-main-session-with-api-workers) |
 | Share one ox gateway on a tailnet or connect desktop clients and T3 Code | [Home-server setup](docs/shared-gateway.md) |
 | See supported clients, API versions, and feature boundaries | [Compatibility](docs/compatibility.md) |
 | Reproduce checks or measure the relay | [Verification and performance](docs/verification.md) |
@@ -101,8 +138,9 @@ when launched with `ox claude`. Use `--model <alias>` to select any configured m
 | `ox: command not found` | Run `./ox --help` in the extracted folder. Move the binary to a directory on your `PATH`. |
 | Linux reports a missing glibc version, or macOS blocks the downloaded binary | Use the [source installation](docs/configuration.md#install-options) and run `ox --version` again. |
 | Client missing, or Codex’s bundled model catalog fails to load | Run `codex --version` or `claude --version` from the same terminal. For Codex also try `codex debug models --bundled`. If the problem began after an update, check the latest-client CI job. |
-| `provider … is unavailable` | Run `ox doctor` and load the exact variable it names in the shell that launches ox. |
+| `provider … is unavailable` | Run `ox doctor`. Add the missing key in `ox setup` or export the variable it names. |
 | `unknown model`, or an empty picker | Pass the full alias from setup. Check the vendor model ID, or pin it with a [static model entry](docs/configuration.md#model-names-and-discovery). |
+| Plain `codex` or `claude` opens on an ox alias saved by an older build | Use `/model` in the plain client to choose a subscription model, then start a fresh session. [Profiles and session recovery](docs/configuration.md#sessions-and-sign-in) |
 | Authentication error after a clean `doctor` | Run `ox doctor --live --provider <name>` to check the key, model and streaming with one small API request. |
 | Provider returns `404` or rejects the request format | Check that the [base URL and wire format](docs/configuration.md#add-a-provider) match the endpoint. Leave the request path, such as `/chat/completions`, off the base URL. |
 | Provider returns `429` | Check that provider’s quota and rate limits, or choose another configured model. |

@@ -277,11 +277,18 @@ fn native_sign_in_and_launch_use_stock_clients() {
         )
     };
 
+    let auth = home.0.join("auth.json");
+    fs::write(&auth, r#"{"OPENAI_API_KEY":"fixture-api-key"}"#).unwrap();
     let blocked = run(&["codex", "--chatgpt"], "API key configured");
     assert!(!blocked.status.success());
     assert!(String::from_utf8_lossy(&blocked.stderr).contains("Run ox login chatgpt"));
     assert!(!capture.0.join("run-args").exists());
 
+    fs::write(
+        &auth,
+        r#"{"auth_mode":"chatgpt","tokens":{"access_token":"fixture-token"}}"#,
+    )
+    .unwrap();
     let cases: &[(&[&str], &str)] = &[
         (
             &["login", "chatgpt", "--device-auth"],
@@ -313,6 +320,16 @@ fn native_sign_in_and_launch_use_stock_clients() {
     let codex = run(&["codex", "--chatgpt"], "Logged in using ChatGPT");
     assert!(codex.status.success());
     assert!(!read(&capture.0.join("run-env")).contains("must-not-use-api-key"));
+
+    fs::write(
+        home.0.join("config.toml"),
+        "cli_auth_credentials_store = \"keyring\"\n",
+    )
+    .unwrap();
+    let blocked = run(&["codex", "--chatgpt"], "API key configured");
+    assert!(!blocked.status.success());
+    let codex = run(&["codex", "--chatgpt"], "Logged in using ChatGPT");
+    assert!(codex.status.success());
 }
 
 #[test]

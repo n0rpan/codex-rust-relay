@@ -245,12 +245,19 @@ jobs:
             --ignored --exact --nocapture \
             translated_tests::stock_codex_emits_web_run_and_calls_the_alpha_search_endpoint
 
-      - name: Verify native and relayed Codex authentication in one home
+      - name: Verify native client auth, profiles and API workers
         timeout-minutes: 5
         run: |
           set -euo pipefail
           cargo test --locked --offline --test shared_codex_home -- \
             --ignored --nocapture --test-threads=1
+
+      - name: Run background Codex goals and Claude Code workflows
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cargo build --locked --offline
+          OX_TEST_BINARY=target/debug/ox python3 -u tests/fixtures/background_workers.py
 
       - name: Run stock Claude Code loopback fixtures
         timeout-minutes: 10
@@ -337,7 +344,7 @@ jobs:
           file "${binary}" | grep -F -- "${{ matrix.file_type }}"
           # --help prints usage and exits before reading any configuration, so
           # this probes that the executable starts without network or secrets.
-          "${binary}" --help | grep -F "Launch Codex with the gateway"
+          "${binary}" --help | grep -F 'ox codex [args...]'
 
       - name: Test atomic updates on this platform
         timeout-minutes: 15
@@ -382,7 +389,7 @@ jobs:
           mkdir -p "${unpacked}"
           tar --extract --gzip --file "dist/${archive}" --directory "${unpacked}"
           test -x "${unpacked}/ox"
-          "${unpacked}/ox" --help | grep -F "Launch Codex with the gateway"
+          "${unpacked}/ox" --help | grep -F 'ox codex [args...]'
           test "$("${unpacked}/ox" --version)" = "ox ${version}"
           cmp "${unpacked}/ox" "dist/${executable}"
           "dist/${executable}" update --help | grep -F 'Usage: ox update'

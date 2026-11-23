@@ -10,18 +10,19 @@ Get started
                          For an API provider, load its key and run ox doctor.
                          Start ox codex or ox claude from your project.
   Use your subscription  Run ox help subscriptions for native client sign-in.
+                         API workers are available in ox subscription sessions.
   Connect a desktop app  Run ox help desktop for Codex and Claude Desktop.
   Share across devices   Run ox help share for a home server and Tailscale.
   Use T3 Code            Run ox help t3 for Codex and Claude Agent SDK setup.
 
 Commands
-  ox                         Open setup on first use, or launch Codex once configured
+  ox                         Launch Codex, or Claude Code if only Claude is signed in
   ox setup [PROVIDER] [opts] Choose a subscription or configure an API provider
-  ox codex [args...]         Launch Codex with the gateway
-  ox claude [args...]        Launch Claude Code with the gateway
+  ox codex [args...]         Choose an API model or use your native ChatGPT sign-in
+  ox claude [args...]        Choose an API model or use your native Claude sign-in
   ox login chatgpt|claude    Open the installed client's native sign-in
   ox provider add [PROVIDER] Add another API provider
-  ox doctor                  Check setup offline
+  ox doctor                  Check API setup or find saved native accounts
   ox doctor --live --provider NAME
                              Test one live API request
   ox serve [--port PORT]     Run a persistent loopback gateway
@@ -32,13 +33,14 @@ Commands
   ox --help                  Show this help
 
 Run ox setup --help for options and copyable examples.
-Use plain codex or claude for your usual sign-in.";
+Run ox setup if you have neither an ox API provider nor a native sign-in.
+API sessions save settings and history in a separate ox client profile.";
 
 const DESKTOP: &str = "\
 Connect a desktop app to ox
 
 1. On the machine that will host ox, run ox setup and ox doctor.
-   Load the upstream API keys there. Run ox help share to create a separate
+   Save the upstream API keys in setup or load them on the host. Run ox help share to create a separate
    OX_GATEWAY_KEY and start ox serve. Use a Tailscale HTTPS URL for another device.
 2. On the client, use the same gateway key and a model alias from /v1/models.
 
@@ -49,13 +51,19 @@ Codex Desktop
   Choose Environment variable auth and enter OX_GATEWAY_KEY for the gateway key.
   Load that variable into the app process. A terminal export reaches programs
   launched from that terminal.
-  For manual setup, merge the example below into your user config.toml
-  (normally ~/.codex/config.toml). It uses /v1/catalog for model discovery.
+  Add ox as a separate provider in the app. For manual setup, use the Codex
+  example in docs/shared-gateway.md with a separate CODEX_HOME. It uses
+  /v1/catalog for model discovery.
 
 Claude Desktop on 3P
-  Open Configure Third-Party Inference. Choose Gateway with Bearer auth.
+  Open Developer > Configure Third-Party Inference. Choose Gateway,
+  Static API key, and Bearer auth.
   Use the HTTPS gateway origin with no /v1 suffix. Enter the gateway key.
-  Start with a native Anthropic route and use its exact ox model alias.
+  In Models, add the exact ox alias, such as alibaba-messages/qwen3.8-flash.
+  Use a display name for the picker. The optional Claude model behind this ID
+  field changes the effort and context profile for a compatible model.
+  Apply Changes and choose Save & Restart. The shared gateway guide shows
+  how to check caching, compaction, and Auto mode on the Mac.
 
 Try it
   Start a fresh local task using ox. Ask it to read a small file in a test
@@ -68,10 +76,10 @@ See docs/shared-gateway.md in the ox repository for the client examples.";
 
 const SHARE: &str = r#"Share one ox gateway across devices
 
-1. On the host, add a provider with ox setup, load its API key, and run ox doctor.
+1. On the host, add a provider and its API key with ox setup. Run ox doctor.
 2. Generate a gateway key once with openssl rand -hex 32 and save it in your
-   password manager. Load the same key as OX_GATEWAY_KEY on each restart, in
-   the shell that already has your vendor API keys.
+   password manager. Load the same key as OX_GATEWAY_KEY on each restart.
+   ox serve also needs the saved or exported vendor API keys.
    For Bash or Zsh, paste it at this hidden prompt:
 
      printf 'Gateway key (input hidden): '
@@ -139,7 +147,7 @@ Use your own plan in the native client
 ChatGPT plan in Codex
   ox login chatgpt                    Open Codex's native sign-in
   ox login chatgpt --device-auth      Use device-code sign-in on a supported account
-  ox login chatgpt status             Check the existing sign-in
+  ox login chatgpt status             Check for a saved sign-in or configured keyring
   ox codex --chatgpt [args...]        Start a native ChatGPT-backed Codex session
 
 ChatGPT API credits exclude Codex usage authenticated with an API key.
@@ -149,12 +157,21 @@ Claude subscription in Claude Code
   ox login claude                     Open Claude Code's native sign-in
   ox claude --native [args...]         Start Claude Code with its own settings
 
-The installed clients own their sign-in and credentials. For Claude subscription
-use, keep API and gateway overrides out of that instance's configuration and
+Subscription sessions use your usual client profile. The installed clients manage
+sign-in and settings changes there. API sessions started by ox use separate
+profiles. For Claude subscription use, keep API and gateway overrides out of
+that instance's configuration and
 environment. For T3 Code, select a native provider on the signed-in execution host.
 
-For API vendors, desktop gateways, and sharing, use ox setup and ox serve. The
-shared gateway uses provider credentials configured for that service.";
+With API providers configured, an ox subscription session adds ox_workers
+for that launch. Ask to list your ox API models or start a background worker.
+You can ask for a Codex goal on an API alias, or a Claude Code workflow with
+an API model or your Claude subscription. Use the job ID to check or cancel it.
+Plain codex and claude use their own tools.
+
+For API vendors, desktop gateways, and sharing, add provider API keys with
+ox setup and run ox serve on the host. For included API credits, use an API
+key from the OpenAI or Claude organization where you claimed those credits.";
 
 const INSTALL: &str = "\
 Install or update ox on macOS and Linux
@@ -198,12 +215,22 @@ pub(crate) fn dispatch(args: &[OsString]) -> Option<Result<u8, RelayError>> {
         [command, flag] if flag == "-h" || flag == "--help" => match command.to_str() {
             Some("setup") => return Some(crate::setup::print_setup_help()),
             Some("login") => println!("{SUBSCRIPTIONS}"),
-            Some(client @ ("codex" | "claude")) => println!(
-                "Usage: ox {client} [client arguments]\n\
-                 Run ox setup to add a provider, then launch from your project.\n\
+            Some(client @ ("codex" | "claude")) => {
+                println!(
+                    "Usage: ox {client} [client arguments]\n\
+                 Run from your project. With API providers configured, the bare command\n\
+                 opens the shared model picker. Type to search and press Tab to star models.\n\
+                 Without providers it uses your native sign-in.\n\
                  Example: ox {client} --model provider/model-id\n\
                  Run {client} --help for arguments accepted by the stock client."
-            ),
+                );
+                if client == "claude" {
+                    println!(
+                        "--client-classifier auto|ALIAS  Use an Anthropic model for separate Auto mode\n\
+                         classifier requests. API usage may be billed."
+                    );
+                }
+            }
             _ => return None,
         },
         [command, account, flag]

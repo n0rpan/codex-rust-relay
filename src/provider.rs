@@ -78,10 +78,111 @@ const MAX_ALIAS_BYTES: usize = 256;
 const MAX_AMBIGUOUS_ALIASES: usize = 4;
 
 /// Reads a configuration value from the environment.
-pub type Env<'a> = dyn Fn(&str) -> Option<String> + 'a;
+pub type Env<'a> = dyn Fn(&str) -> Option<String> + Sync + 'a;
 
 pub fn process_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// A local store for keys pasted into the terminal setup. Scope each key to
+/// both its variable name and destination so editing a URL cannot forward it.
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+#[serde(transparent)]
+pub(crate) struct SavedKeys(BTreeMap<String, SavedKey>);
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct SavedKey {
+    scope: String,
+    value: String,
+}
+
+impl SavedKeys {
+    pub(crate) const BRAVE_SCOPE: &str = "https://api.search.brave.com/";
+
+    pub(crate) fn path(home: &Path) -> PathBuf {
+        home.join("ox-api-keys.json")
+    }
+
+    pub(crate) fn load(home: &Path) -> Result<Self, RelayError> {
+        use std::io::Read;
+
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = match options.open(Self::path(home)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(_) => return Err("could not read the local ox API key file".into()),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err("ox-api-keys.json must be a regular file".into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid takes no arguments and has no memory preconditions.
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+                return Err(
+                    "ox-api-keys.json must be owned by the current user with mode 0600".into(),
+                );
+            }
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_CONFIG_BYTES {
+            return Err("ox-api-keys.json is too large".into());
+        }
+        serde_json::from_slice(&bytes).map_err(|_| "could not parse ox-api-keys.json".into())
+    }
+
+    pub(crate) fn for_config(home: &Path, config: &CodeoxConfig) -> Result<Self, RelayError> {
+        let mut keys = Self::load(home)?;
+        keys.0
+            .retain(|name, entry| Self::scope_matches(config, name, &entry.scope));
+        Ok(keys)
+    }
+
+    pub(crate) fn scope_matches(config: &CodeoxConfig, name: &str, scope: &str) -> bool {
+        let vendors = config
+            .vendors
+            .iter()
+            .filter(|vendor| vendor.env_key.as_deref() == Some(name))
+            .map(|vendor| vendor.base_url.as_str());
+        let search = config
+            .search
+            .iter()
+            .filter(|search| search.env_key == name)
+            .map(|_| Self::BRAVE_SCOPE);
+        let mut scopes = vendors.chain(search).peekable();
+        scopes.peek().is_some() && scopes.all(|destination| destination == scope)
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<String> {
+        process_env(name).or_else(|| self.0.get(name).map(|key| key.value.clone()))
+    }
+
+    pub(crate) fn set(
+        &mut self,
+        name: &str,
+        scope: &str,
+        value: String,
+    ) -> Result<String, RelayError> {
+        self.0.insert(
+            name.to_owned(),
+            SavedKey {
+                scope: scope.to_owned(),
+                value,
+            },
+        );
+        serde_json::to_string(self).map_err(|_| "could not encode ox-api-keys.json".into())
+    }
 }
 
 pub fn configured_web_search_policy(
@@ -201,6 +302,7 @@ impl ThinkingMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnthropicOptions {
     pub version: String,
+    pub(crate) version_pinned: bool,
     pub thinking: ThinkingMode,
     pub thinking_budget_tokens: u64,
     /// Whether an `output_config.effort` hint is sent. Implied by
@@ -212,6 +314,7 @@ impl Default for AnthropicOptions {
     fn default() -> Self {
         Self {
             version: "2023-06-01".to_owned(),
+            version_pinned: false,
             thinking: ThinkingMode::Off,
             thinking_budget_tokens: 4096,
             effort: false,
@@ -222,7 +325,11 @@ impl Default for AnthropicOptions {
 impl AnthropicOptions {
     /// API versions from 2026-10-21 remove `temperature`, `top_p` and `top_k`.
     pub fn rejects_sampling(&self) -> bool {
-        self.version.as_str() >= "2026-10-21"
+        Self::version_rejects_sampling(&self.version)
+    }
+
+    pub(crate) fn version_rejects_sampling(version: &str) -> bool {
+        version >= "2026-10-21"
     }
 
     /// `output_config.effort` is only sent when explicitly requested, because
@@ -355,31 +462,67 @@ impl Vendor {
         Some(SecretKey::new(key))
     }
 
-    /// Scheme-specific auth headers. The Responses and Chat Completions wires
-    /// use `Authorization: Bearer`; Anthropic Messages uses `x-api-key` plus the
-    /// configured version header. No header is ever sent for another wire.
+    /// Build authentication for the selected upstream. The documented hosted
+    /// Messages gateways use bearer auth; other Messages providers use x-api-key.
     pub fn auth_headers(&self, key: &SecretKey) -> Result<HeaderMap, RelayError> {
         let mut headers = HeaderMap::new();
-        let mut value = match self.wire {
-            Wire::AnthropicMessages => HeaderValue::from_str(key.expose())?,
-            Wire::Responses | Wire::ChatCompletions => {
-                HeaderValue::from_str(&format!("Bearer {}", key.expose()))?
-            }
+        let bearer = self.wire != Wire::AnthropicMessages || self.hosted_messages_uses_bearer();
+        let (name, mut value) = if bearer {
+            (
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", key.expose()))?,
+            )
+        } else {
+            (
+                HeaderName::from_static("x-api-key"),
+                HeaderValue::from_str(key.expose())?,
+            )
         };
         value.set_sensitive(true);
-        match self.wire {
-            Wire::AnthropicMessages => {
-                headers.insert(HeaderName::from_static("x-api-key"), value);
-                headers.insert(
-                    HeaderName::from_static("anthropic-version"),
-                    HeaderValue::from_str(&self.anthropic.version)?,
-                );
-            }
-            Wire::Responses | Wire::ChatCompletions => {
-                headers.insert(AUTHORIZATION, value);
-            }
+        headers.insert(name, value);
+        if self.wire == Wire::AnthropicMessages {
+            headers.insert(
+                HeaderName::from_static("anthropic-version"),
+                HeaderValue::from_str(&self.anthropic.version)?,
+            );
         }
         Ok(headers)
+    }
+
+    pub(crate) fn discovery_headers(&self, key: &SecretKey) -> Result<HeaderMap, RelayError> {
+        if self.wire == Wire::AnthropicMessages
+            && alibaba_messages_catalog(&self.base_url).as_ref() == Some(&self.models_url)
+        {
+            let mut token = bearer(key.expose())?;
+            token.set_sensitive(true);
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, token);
+            return Ok(headers);
+        }
+        self.auth_headers(key)
+    }
+
+    fn hosted_messages_uses_bearer(&self) -> bool {
+        self.base_url.scheme() == "https"
+            && self.base_url.port_or_known_default() == Some(443)
+            && matches!(
+                (
+                    self.base_url.host_str(),
+                    self.base_url.path().trim_end_matches('/')
+                ),
+                (Some("openrouter.ai"), "/api/v1")
+                    | (
+                        Some("opencode.ai"),
+                        "/inference/anthropic/v1" | "/inference/go/anthropic/v1"
+                    )
+            )
+    }
+
+    pub(crate) fn is_direct_anthropic(&self) -> bool {
+        self.wire == Wire::AnthropicMessages
+            && self.base_url.scheme() == "https"
+            && self.base_url.host_str() == Some("api.anthropic.com")
+            && self.base_url.port_or_known_default() == Some(443)
     }
 
     /// Attach an origin-scoped routing identifier for OpenCode Go. Derive it
@@ -633,7 +776,7 @@ fn parse_vendor(key: &str, item: &Item) -> Result<Vendor, RelayError> {
     }
     let base_raw =
         opt_str(table, "base_url")?.ok_or_else(|| format!("providers.{key} needs a base_url"))?;
-    let base_url = parse_provider_url(&base_raw)?;
+    let mut base_url = parse_provider_url(&base_raw)?;
     if base_url.query().is_some() {
         return Err(format!("providers.{key}.base_url must not contain a query string").into());
     }
@@ -641,6 +784,12 @@ fn parse_vendor(key: &str, item: &Item) -> Result<Vendor, RelayError> {
         return Err(format!("providers.{key}.base_url must not contain a fragment").into());
     }
     let wire = Wire::parse(opt_str(table, "wire_api")?.as_deref())?;
+    let companion_catalog = (wire == Wire::AnthropicMessages)
+        .then(|| alibaba_messages_catalog(&base_url))
+        .flatten();
+    if companion_catalog.is_some() && base_url.path().trim_end_matches('/') == "/apps/anthropic" {
+        base_url.set_path("/apps/anthropic/v1");
+    }
     let discovery = opt_bool(table, "discovery")?.unwrap_or(true);
     let models_url = match opt_str(table, "models_url")? {
         Some(raw) => {
@@ -653,7 +802,7 @@ fn parse_vendor(key: &str, item: &Item) -> Result<Vendor, RelayError> {
             }
             url
         }
-        None => default_models_url(&base_url),
+        None => companion_catalog.unwrap_or_else(|| default_models_url(&base_url)),
     };
     let env_key = match opt_str(table, "env_key")? {
         Some(name) => {
@@ -723,6 +872,7 @@ fn parse_anthropic_options(
             );
         }
         options.version = version;
+        options.version_pinned = true;
     }
     options.thinking = ThinkingMode::parse(opt_str(table, "anthropic_thinking")?.as_deref())?;
     if let Some(budget) = opt_integer(table, "anthropic_thinking_budget_tokens")? {
@@ -777,7 +927,7 @@ fn parse_chat_options(
     Ok(options)
 }
 
-fn valid_api_version(value: &str) -> bool {
+pub(crate) fn valid_api_version(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 10
         && bytes[4] == b'-'
@@ -1080,6 +1230,32 @@ fn default_models_url(base: &Url) -> Url {
     let mut url = base.clone();
     url.set_path(&format!("{}/models", base.path().trim_end_matches('/')));
     url
+}
+
+/// The Anthropic-compatible path has no catalog. Use the OpenAI-compatible
+/// catalog on the very same documented Model Studio origin and plan.
+fn alibaba_messages_catalog(base: &Url) -> Option<Url> {
+    if base.scheme() != "https"
+        || base.port_or_known_default() != Some(443)
+        || !matches!(
+            base.path().trim_end_matches('/'),
+            "/apps/anthropic" | "/apps/anthropic/v1"
+        )
+    {
+        return None;
+    }
+    let path = match base.host_str()? {
+        "coding-intl.dashscope.aliyuncs.com" => "/v1/models",
+        "dashscope.aliyuncs.com"
+        | "dashscope-intl.aliyuncs.com"
+        | "dashscope-us.aliyuncs.com"
+        | "cn-hongkong.dashscope.aliyuncs.com" => "/compatible-mode/v1/models",
+        host if host.ends_with(".maas.aliyuncs.com") => "/compatible-mode/v1/models",
+        _ => return None,
+    };
+    let mut catalog = base.clone();
+    catalog.set_path(path);
+    Some(catalog)
 }
 
 fn parse_provider_url(raw: &str) -> Result<Url, RelayError> {
@@ -1432,6 +1608,75 @@ include_stream_usage = false
         let headers = beta.auth_headers(&key).unwrap();
         assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer chat-secret");
         assert!(headers.get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn alibaba_messages_discovers_models_from_the_same_origin() {
+        for (base_url, expected_path, companion) in [
+            (
+                "https://fixture.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+                "/compatible-mode/v1/models",
+                true,
+            ),
+            (
+                "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic/v1",
+                "/compatible-mode/v1/models",
+                true,
+            ),
+            (
+                "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic/v1",
+                "/v1/models",
+                true,
+            ),
+            (
+                "https://fake.maas.aliyuncs.com.example/apps/anthropic/v1",
+                "/apps/anthropic/v1/models",
+                false,
+            ),
+        ] {
+            let config = CodeoxConfig::load_from_str(&format!(
+                "[providers.fixture]\nwire_api = \"anthropic_messages\"\nbase_url = {base_url:?}\n"
+            ))
+            .unwrap();
+            let vendor = &config.vendors[0];
+            let key = SecretKey::new("fixture-key".into());
+            assert_eq!(vendor.models_url.origin(), vendor.base_url.origin());
+            assert_eq!(vendor.models_url.path(), expected_path);
+            assert_eq!(vendor.endpoint().path(), "/apps/anthropic/v1/messages");
+            assert_eq!(
+                vendor
+                    .discovery_headers(&key)
+                    .unwrap()
+                    .contains_key(AUTHORIZATION),
+                companion
+            );
+            assert_eq!(
+                vendor.auth_headers(&key).unwrap()["x-api-key"],
+                "fixture-key"
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_messages_bearer_auth_is_scoped_to_documented_endpoints() {
+        for (base_url, bearer) in [
+            ("https://openrouter.ai/api/v1", true),
+            ("https://opencode.ai/inference/go/anthropic/v1", true),
+            ("https://api.anthropic.com/v1", false),
+            ("https://openrouter.ai:8443/api/v1", false),
+            ("https://openrouter.ai.example/api/v1", false),
+        ] {
+            let config = CodeoxConfig::load_from_str(&format!(
+                "[providers.fixture]\nbase_url = {base_url:?}\nwire_api = \"anthropic_messages\"\n"
+            ))
+            .unwrap();
+            let headers = config.vendors[0]
+                .auth_headers(&SecretKey::new("fixture-key".into()))
+                .unwrap();
+            assert_eq!(headers.contains_key(AUTHORIZATION), bearer, "{base_url}");
+            assert_eq!(headers.contains_key("x-api-key"), !bearer, "{base_url}");
+            assert_eq!(headers["anthropic-version"], "2023-06-01");
+        }
     }
 
     #[test]

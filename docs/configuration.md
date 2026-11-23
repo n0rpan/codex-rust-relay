@@ -73,10 +73,20 @@ Cargo installs into `${CARGO_HOME:-$HOME/.cargo}/bin` by default. Add the instal
 
 ## Add a provider
 
-Start with `ox setup` in a terminal and choose **API key provider**. Enter `openrouter`, `anthropic`, or `openai`
-for connection defaults. For another provider, use the URL and API format from its
-documentation. Setup asks for the **name** of your API key variable. Load the value
-in the shell that will run ox, then use `ox doctor` to check the configuration.
+Run `ox setup` in a terminal, choose **Add an API key**, and pick the service that
+issued it. For OpenCode Go, OpenRouter, Anthropic and OpenAI, ox fills in the URL
+and API format. For Alibaba Cloud, paste the endpoint shown in your Model Studio
+account or the one already working in Oxa. Paste your key at the hidden prompt.
+If you already exported the provider’s variable, ox uses that value. The menu
+returns so you can add more providers or enable Brave.
+
+For **Other or self-hosted**, paste the API URL. A plain `/v1` URL defaults to
+OpenAI Responses, and ox looks up `/v1/models` when you launch. Pasting a full
+`/chat/completions`, `/messages`, or `/responses` URL selects its format and
+removes the endpoint suffix before discovery. If the service cannot list models,
+add a [static model entry](#model-names-and-discovery) with the exact model ID.
+
+### Scripted or advanced setup
 
 Choose the API format your **provider** expects, regardless of which CLI you use.
 Use a model that supports streaming and tool calls for the coding workflows in the
@@ -147,16 +157,18 @@ ox derives a stable OpenCode session identifier from the client session header
 when one is available. Clients without a session header get a fresh identifier
 per request.
 
-Alibaba Cloud Model Studio uses region- and plan-specific URLs. Start from
-the base URL in your working account or client configuration. Use Chat
-Completions with an OpenAI-compatible URL. [Alibaba Cloud endpoints by region and plan](https://www.alibabacloud.com/help/en/model-studio/base-url)
+Alibaba Cloud Model Studio uses region-, plan- and sometimes workspace-specific
+URLs. Choose **Alibaba Cloud** in `ox setup` and paste the URL that matches
+your API key. ox defaults to Chat Completions for an OpenAI-compatible base URL
+and recognizes the Anthropic-compatible URL by its path. [Alibaba Cloud endpoints by region and plan](https://www.alibabacloud.com/help/en/model-studio/base-url)
 
 For example, the Singapore **Token Plan** base URL worked with `qwen3.8-flash`
-through both ox frontends. Load the key from that Token Plan as `ALIBABA_API_KEY`.
+through both ox frontends. For scripted setup, load your OpenAI-compatible
+base URL as `ALIBABA_BASE_URL` and its key as `ALIBABA_API_KEY`.
 
 ```sh
 ox provider add alibaba \
-  --base-url https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1 \
+  --base-url "$ALIBABA_BASE_URL" \
   --wire chat_completions --env-key ALIBABA_API_KEY \
   --no-discovery --model qwen3.8-flash
 ox doctor --live --provider alibaba
@@ -167,6 +179,41 @@ The international **Coding Plan** URL is a separate endpoint. It returned
 HTTP 405 with a coding-agent restriction in a live relay check. If you see
 this error, confirm the URL against the plan attached to your key.
 [Alibaba Cloud Token Plan troubleshooting](https://www.alibabacloud.com/help/en/model-studio/token-plan-faq)
+
+### Choose a Messages route for Claude Code
+
+Choose a Messages endpoint to avoid translating Claude Code requests inside ox.
+The provider determines which models, tools, and counting endpoints work on that route.
+Keep the two protocols under separate provider names when you want both.
+
+| Setup preset | Messages option |
+| --- | --- |
+| Anthropic | Already uses `https://api.anthropic.com/v1`. [Anthropic Messages](https://platform.claude.com/docs/en/api/messages) |
+| OpenRouter | `https://openrouter.ai/api/v1`, with `wire_api = "anthropic_messages"`. ox uses bearer auth. [OpenRouter's Claude Code guide](https://openrouter.ai/docs/guides/coding-agents/claude-code-integration) |
+| OpenCode Go | `https://opencode.ai/inference/go/anthropic/v1`, with `wire_api = "anthropic_messages"`. ox uses bearer auth and keeps its Go session routing. OpenCode may translate internally for some models. [Go endpoints](https://opencode.ai/docs/console/harnesses/#base-urls) |
+| Alibaba Cloud | Paste your account's URL ending in `/apps/anthropic`. ox adds the API version path and discovers models through the OpenAI-compatible catalog on the same host. The model still has to be available on the Messages route. [Model Studio Messages](https://www.alibabacloud.com/help/en/model-studio/anthropic-api-messages) |
+| OpenAI | Use Responses. ox translates the request and uses `/responses/input_tokens` for a provider-backed count. [OpenAI token counting](https://developers.openai.com/api/docs/guides/token-counting) |
+
+For Alibaba, select **Alibaba Cloud** again and paste the second URL. When you
+already use the Chat Completions route, setup adds `alibaba-messages` alongside
+it. Paste your key for the Messages route. A previously configured Messages
+route with `discovery = false` can use the companion catalog by turning discovery on.
+
+For a custom provider, choose **Other or self-hosted**. A single endpoint works
+with both clients through ox translation. To add another API format, answer yes
+at **Add another API endpoint for this provider** and paste its full inference URL
+ending in `/messages`, `/responses` or `/chat/completions`. Each route gets a model
+alias prefix you can select in either client. If you add routes manually and
+both use the same vendor key, give each route a distinct `env_key` reference.
+This lets ox keep any saved key scoped to that route's base URL. For example,
+with `OPENCODE_MESSAGES_API_KEY` available in your shell:
+
+```sh
+ox provider add opencode-go-messages \
+  --base-url https://opencode.ai/inference/go/anthropic/v1 \
+  --models-url https://opencode.ai/inference/go/v1/models \
+  --wire anthropic_messages --env-key OPENCODE_MESSAGES_API_KEY
+```
 
 ### Check the live connection
 
@@ -186,10 +233,16 @@ Both clients read `codeox.toml` under `$CODEX_HOME`, which defaults to `~/.codex
 Claude Code, that is still the provider registry location. Claude Code's own settings and
 session storage use its normal directory. `ox doctor` prints the registry directory.
 
-In `codeox.toml`, `env_key` is the **name** of an environment variable. ox reads its
-value at launch and keeps configured provider and Brave keys out of the launched client
-environment. Keep the values in your shell environment or load them with your secret manager.
-After rotating a key, restart ox in a shell with the new value.
+In `codeox.toml`, `env_key` is the **name** of an environment variable. A key
+pasted at the hidden prompt lives in `$CODEX_HOME/ox-api-keys.json` as plaintext
+with owner-only permissions (mode 0600). ox uses it only for the configured
+destination and keeps it out of the launched client environment. Protect this
+file like other credentials and keep it out of version control.
+
+An exported variable takes priority over a saved key. To rotate a saved key,
+choose its provider again in `ox setup`, paste the replacement, and restart ox.
+If the variable is exported, unset it in that shell before choosing the provider
+again. To rotate an environment-managed key, load the new value and restart ox.
 
 Use HTTPS for remote providers and HTTP only for loopback. URLs cannot contain embedded
 credentials. `base_url` accepts neither a query string nor a fragment. `models_url` must
@@ -228,13 +281,30 @@ configured provider's prefix. Keep your alias stable for resume. A known provide
 can route to an upstream model ID even when discovery omits it, but the model must exist
 for that provider. A bare model ID is accepted only if routing can resolve it unambiguously.
 
-If Codex shows a stale picker, check for `model_catalog_json` in `$CODEX_HOME/config.toml`.
-It takes precedence over the live catalog. Pass an explicit alias on the first Codex
-launch if Codex already has a different default model.
+If Codex shows a stale picker, check for `model_catalog_json` in
+`$CODEX_HOME/ox-clients/codex/config.toml`. It takes precedence over the live
+catalog and may have been copied from your native settings on first launch.
+Pass an explicit alias if the relay profile already has a different default model.
 
-`ox claude` enables gateway model discovery for its Claude Code process. Open
-`/model` to see additional Claude aliases from the configured providers. To opt out
-for a launch, run:
+Run `ox codex` or `ox claude` with no client arguments from a terminal to choose
+from the same list of configured and discovered aliases with usable keys.
+Type a model or provider name to filter immediately. Use the arrow keys to move,
+**Tab** to toggle a star and move to the next match, and **Enter** to launch.
+Use **Alt+↑/↓** on a star to reorder it, **Ctrl+F** to show only stars, and
+**Ctrl+U** to clear the search. **Esc** closes the picker and keeps your changes.
+
+Stars are saved in order by model alias in `$CODEX_HOME/ox-favorites.json`.
+In API-backed launches, Codex sorts its `/model` catalog with stars first.
+Claude Code shows the ordered lineup from ox in `/model` with the Default and
+current model entries supplied by Claude Code. Managed settings or a
+`modelPicker` explicitly passed to `ox claude --settings` can supply a different
+lineup. The ox launch picker still shows the full available catalog by default.
+Pass `--model <alias>` to launch directly.
+[Claude Code model picker settings](https://code.claude.com/docs/en/settings-reference#modelpicker)
+
+With no starred lineup, `ox claude` enables gateway model discovery for its
+Claude Code process. Open `/model` to see eligible Claude aliases from the
+configured providers. To opt out of discovery for a launch, run:
 
 ```sh
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0 ox claude
@@ -248,6 +318,26 @@ whose IDs contain `claude` or `anthropic`. Managed picker settings can further l
 the list. For any configured alias, including a GPT or DeepSeek alias, launch with
 `ox claude --model <provider/model-id>`. Use qualified aliases because the client
 expands built-in names like `sonnet`. [Claude Code model discovery](https://code.claude.com/docs/en/llm-gateway-protocol#model-discovery)
+
+#### Context limits
+
+ox reads advertised context limits from model discovery and uses a static
+`context_window` entry when you provide one. Codex receives the limit in its
+model catalog. For a custom model ID in `ox claude`, ox gives Claude Code the
+starting model’s limit through `CLAUDE_CODE_MAX_CONTEXT_TOKENS`. A value you set
+in your shell or Claude settings can override that. If discovery omits the limit,
+set `context_window` on the model entry. For Alibaba Cloud's
+`deepseek-v4.1-flash-1017`, ox uses the published 1,000,000-token limit when
+the catalog omits it.
+[Alibaba Cloud model announcement](https://www.alibabacloud.com/notice/detail?_p_lc=1&id=2225)
+
+Claude Code reads the limit for the whole process. Relaunch through ox when
+changing to a custom model with a different limit. Claude Code can keep its
+built-in limit for IDs it recognizes as Claude models. Clients that connect
+directly to `ox serve` can read known limits as `max_input_tokens` from
+`/v1/models`. Claude Code's gateway discovery currently reads the names and
+descriptions from that list, so direct connections need their own context setting.
+[Claude Code context settings](https://code.claude.com/docs/en/model-config#correct-the-window-for-a-gateway-or-custom-model-id)
 
 When multiple providers serve the same model, choose the provider-qualified alias
 to control which provider receives the request. ox routes each alias to a single
@@ -270,8 +360,10 @@ Check the provider documentation before changing these settings.
 
 ## Web search with Brave
 
-Add this top-level table in the same `codeox.toml` and load `BRAVE_SEARCH_API_KEY` into
-your shell. Restart ox. Remove the table or set `enabled = false` to stop using Brave.
+After adding an API provider, choose **Enable Brave web search** in `ox setup`,
+then choose **Done**. Load `BRAVE_SEARCH_API_KEY` into your shell and restart ox.
+The equivalent manual configuration is a top-level table in the same `codeox.toml`.
+Remove the table or set `enabled = false` to stop using Brave.
 
 ```toml
 [search]
@@ -308,48 +400,102 @@ See [search limits](compatibility.md#search-and-fetch) for filters and supported
 
 ## Claude Code Auto mode
 
-The [CLI settings example](../examples/claude-code-auto.settings.json) retains Claude
-Code's default classifier and asks before `WebFetch`. The commands below pass the
-same settings inline, so they work from your own project directory.
-
-Add `claude-sonnet-5` on the current Anthropic route or use the
-[provider example](../examples/claude-providers.toml), then launch:
+Add Anthropic in `ox setup`, then run `ox doctor` to check that your key is
+available. Start a session on a model your Anthropic account can use:
 
 ```sh
-ox claude --model anthropic/claude-sonnet-5 --permission-mode auto \
-  --settings '{"autoMode":{"environment":["$defaults"]},"permissions":{"ask":["WebFetch"]}}'
+ox claude --model anthropic/claude-sonnet-5 --permission-mode auto
 ```
 
-For a translated model, route Claude Code's classifier requests to a configured model that
-supports review. This example uses the OpenRouter model from the quickstart and the same
-Anthropic classifier route as above.
+On eligible native Anthropic routes, ox forwards the beta header, `safeguards`,
+streamed `safeguard_results`, and tool-use IDs. Check the **Auto mode server** row
+in Claude Code's `/status` to see whether server review is active.
+[Claude Code classifier billing](https://code.claude.com/docs/en/auto-mode-classifier-billing#make-the-session-eligible)
+
+When a session starts outside the direct Anthropic API, ox defaults
+`CLAUDE_CODE_AUTO_MODE_SERVER` to `0`. Claude Code handles the review through
+separate classifier requests, which can count toward API usage. To use a configured
+Anthropic model for those requests, add `--client-classifier auto`:
 
 ```sh
-CLAUDE_CODE_AUTO_MODE_SERVER=0 CLAUDE_CODE_AUTO_MODE_MODEL=anthropic/claude-sonnet-5 \
-  ox claude --model openrouter/openai/gpt-5.4-mini --permission-mode auto \
-  --settings '{"autoMode":{"environment":["$defaults"]},"permissions":{"ask":["WebFetch"]}}'
+ox claude --model openrouter/openai/gpt-5.4-mini --permission-mode auto \
+  --client-classifier auto
 ```
 
-The classifier receives action context through the Anthropic route. Check `/status` for
-the effective permission mode and server review setting. Claude Code can fall back to
-Manual mode if a model is ineligible. If an unfamiliar alias makes the client assume a
-larger context window than the endpoint supports, set `CLAUDE_CODE_MAX_CONTEXT_TOKENS`
-to the actual limit. [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes#auto-mode)
+ox looks for Sonnet 5, then Sonnet 4.6, in the catalog of configured direct
+Anthropic routes with credentials. If neither is available, Claude Code chooses
+its own classifier. You can also select a specific Anthropic Messages alias, such
+as `--client-classifier anthropic/claude-sonnet-4-6`. That route receives the
+action context needed for review. Model selection for classifier requests
+requires Claude Code 2.1.302 or later. Claude Code can deny checked actions if
+the classifier is unavailable. The server setting applies for the launch.
+Start a new session on an eligible direct Anthropic route to use its server checks.
+If another endpoint supports Anthropic server checks, set
+`CLAUDE_CODE_AUTO_MODE_SERVER` to `1` for that launch.
+[Claude Code classifier model selection](https://code.claude.com/docs/en/permission-modes#choose-the-classifier-model)
 
-Claude Desktop 3P users can also configure a stable [ox gateway](shared-gateway.md#claude-desktop-on-3p)
+The [CLI settings example](../examples/claude-code-auto.settings.json) keeps
+Claude Code's default classifier and asks before `WebFetch`.
+
+### Fine-grained tool streaming
+
+For a native Anthropic endpoint that supports fine-grained tool streaming, opt in
+when starting Claude Code through ox:
+
+```sh
+CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1 \
+  ox claude --model anthropic/claude-sonnet-5
+```
+
+Claude Code leaves this off by default on custom gateways. Enabling it lets a
+compatible provider send tool arguments as they are generated. It applies to
+tool arguments and leaves answer text generation and Auto mode review timing
+to their respective upstream requests. To time provider inference on its own,
+run `ox doctor --live --provider anthropic --model claude-sonnet-5`. It reports
+time to the first stream event and first visible text.
+[Claude Code feature pass-through](https://code.claude.com/docs/en/llm-gateway-protocol#feature-pass-through)
+
+For Desktop, configure a stable [ox gateway](shared-gateway.md#claude-desktop-on-3p)
 and adapt the [Desktop web-tools overlay](../examples/claude-desktop-web-tools.json).
 
 ## Sessions and sign-in
 
-Choose a subscription in `ox setup`, or use `ox help subscriptions` to see the native sign-in commands.
+Use `ox setup` to add API providers, enable Brave or open either stock client's
+sign-in. The menu returns after each action. Select **Done** when finished. Plain `ox codex`
+and `ox claude` show that client's subscription at the top of the picker
+when signed in, alongside the API models. Choosing the subscription opens a native session
+with its own `/model` list. With no API providers, ox can start the signed-in
+stock client directly. Bare `ox` prefers Codex and uses Claude Code
+if only Claude has a saved account. With no API provider, `ox doctor` checks for
+saved accounts without launching either client. Each client validates its own
+credentials when you open a subscription session. If Codex uses its keyring,
+ox reports the configured store and leaves the account check to Codex.
+`ox help subscriptions` lists the sign-in commands.
+
+| Launch | Where the client saves its settings and history |
+| --- | --- |
+| `codex`, `claude`, or a subscription selected in ox | Your usual client profile |
+| `ox codex` with an API model | `$CODEX_HOME/ox-clients/codex` |
+| `ox claude` with an API model | `$CODEX_HOME/ox-clients/claude` |
+
+`$CODEX_HOME` defaults to `~/.codex`. The first API-backed launch seeds the
+new profile with user settings. Login files and old sessions stay with your
+usual client. Change API-session defaults, including `/model` preferences and
+user-level MCP registrations, in the relay profile. ox keeps Codex’s SQLite
+state and logs in that profile by default. Project and managed settings still apply.
+Signing in or changing preferences after choosing a **subscription** in ox uses
+the same profile as the plain command.
+
+If an older ox launch left its alias selected as the native default, open plain
+`codex` or `claude`, use `/model` to choose a model from that client's subscription,
+and start a new session.
 
 - **ChatGPT plan in Codex.** Run `ox login chatgpt` if you need to sign in.
-  Codex manages its normal credentials. `ox login chatgpt status` checks whether
-  a ChatGPT sign-in is present. Native Codex sign-in works without registering
+  Codex manages its normal credentials. `ox login chatgpt status` reports a
+  saved sign-in or configured keyring. Native Codex sign-in works without registering
   ox as a third-party integration. Use `ox codex --chatgpt` for that account or
   `ox codex` for API-backed sessions. In the project, use `ox codex resume` to pick
-  an API-backed thread. The picker contains threads from both launchers, so select one
-  you started through ox. Use a fresh thread and a reviewed summary to move between
+  a thread from the relay profile. Use a fresh thread and a reviewed summary to move between
   native ChatGPT and API-backed sessions. [Codex authentication](https://developers.openai.com/codex/auth)
 - **Codex vendor switches** use the full alias in `/model` between completed turns.
   The new provider receives the portable conversation and tool history. ox keeps opaque
@@ -359,14 +505,79 @@ Choose a subscription in `ox setup`, or use `ox help subscriptions` to see the n
   sign-in, then `ox claude --native` to launch with its own settings. Use a Claude
   environment free of gateway and API overrides for subscription sessions.
   [Claude Code authentication](https://code.claude.com/docs/en/authentication)
-- **Claude Code relay sessions** use its normal project history. From the same project use
+- **Claude Code relay sessions** use the relay profile's project history. From the same project use
   `ox claude --resume <session-id> --model <original-alias>`. Start a fresh session
   when changing model or vendor so signed thinking stays with its original route.
 
-The shared gateway uses provider API credentials. Subscription sessions execute
-in the signed-in native client. If your Claude plan includes separate Platform
-credits, use a Claude Console API key to spend those credits through the relay.
+The shared gateway authenticates upstream with provider API keys. To spend
+included API credits through it, claim them and configure an API key from the
+linked OpenAI organization or Claude Console organization. Native subscription
+sign-ins stay with Codex and Claude Code. Running an agent runtime on the server
+would run the agent and its tools on that host, while the ox gateway serves
+model calls for clients that keep their own tools and sessions.
+[ChatGPT API credits](https://developers.openai.com/api/docs/guides/chatgpt-api-credits) ·
 [Claude Platform credits](https://platform.claude.com/docs/en/about-claude/api-credits-for-subscribers)
+
+OpenAI provides a separate OAuth flow for eligible ChatGPT plan requests from
+open-source and locally hosted apps. ox has no integration with that flow today.
+Anthropic permits users to sign in to hosted stock Claude Code for their own
+sessions and restricts third-party services that route requests through those
+subscription credentials, including services built with the Agent SDK.
+[Sign in with ChatGPT for open-source apps](https://developers.openai.com/siwc/token-sharing-open-source) ·
+[Claude credential rules](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)
+
+### Subscription main session with API workers
+
+1. Add an API provider in `ox setup` and check it with `ox doctor`.
+2. Run `ox codex` or `ox claude` and choose the subscription row. You can
+   also run `ox codex --chatgpt` or `ox claude --native`.
+3. Ask **“List my API models and subscription routes.”** ox lists API models
+   with their provider and your stars first. It includes the saved ChatGPT and
+   Claude subscription routes it detects. Use the full alias in a request such as **“Start a
+   Codex goal worker on `opencode-go/glm-5.3` to fix the failing tests in this
+   project. Let it edit files. Give me the job ID.”** Substitute your chosen alias.
+
+The `ox_workers` MCP server is available only for that launch. It uses an authenticated loopback
+connection and needs no `ox serve` process or saved MCP entry. Plain `codex`
+and `claude` keep their existing MCP setup. If the tools are missing, check
+`/mcp` in the subscription session and check any managed MCP policy.
+Approve the tool call when your client prompts.
+
+| Ask for | What starts |
+| --- | --- |
+| Codex session on an API model | Stock Codex in the project with the selected ox alias |
+| Codex goal on an API model | A stock Codex app-server thread with Goal mode |
+| Claude Code session or workflow on an API model | Stock Claude Code in the project with the selected ox alias |
+| Claude Code session or workflow on your subscription | Stock Claude Code on the host's saved Claude account. Ask for a subscription worker and omit the API alias. |
+
+`start_ox_worker` returns a job ID. Ask for status or the result with
+`ox_worker_status`, or ask to stop it with `cancel_ox_worker`. Jobs run between
+tool calls and have no ox wall-clock limit. They stop when the parent ox launch
+exits. The status includes the stock client's session ID when available.
+Work already written to the project stays there if you cancel.
+
+Workers start with read access in the current project. Tell the main agent
+explicitly when a worker may edit files. Client permissions still apply,
+including to shell commands. Give concurrent writers separate working
+directories by starting their parent sessions there. The main session and
+its built-in subagents use your subscription. The worker bills the API provider
+you picked or the Claude subscription you requested.
+
+For a second opinion on a piece of text, ask for `delegate_to_ox_model`.
+That tool makes one model request with a 90-second timeout. For development,
+tests, and other multi-step tasks, ask for a background worker.
+
+In the client, `/model` shows the subscription's account-specific model choices.
+The worker catalog reports the detected subscription routes alongside the API
+models and identifies Claude as a supported subscription worker.
+[Codex subagent settings](https://learn.chatgpt.com/docs/agent-configuration/subagents) ·
+[Claude Code subagent model selection](https://code.claude.com/docs/en/sub-agents#choose-a-model)
+
+Goal and Workflow modes need support from the installed client and selected
+model. If a mode fails, check the job status. You can also run it directly in
+`ox codex --model <alias>` or `ox claude --model <alias>`.
+[Codex Goal mode](https://learn.chatgpt.com/docs/long-running-work) ·
+[Claude Code workflows](https://code.claude.com/docs/en/workflows)
 
 ### Upgrade from the original single-provider relay
 
