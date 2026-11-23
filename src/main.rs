@@ -291,6 +291,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         catalog::prioritize_favorites(catalog, &favorites);
     }
     app.client_kind = client_kind;
+    let client_home = clients::relay_client_home(&codex_home, client_kind)?;
     let (mut command, _claude_settings) = match app.client_kind {
         ClientKind::Codex => {
             let mut command = Command::new("codex");
@@ -298,7 +299,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
                 command.env_remove(name);
             }
             command
-                .env("CODEX_HOME", &codex_home)
+                .env("CODEX_HOME", &client_home)
                 .env(TOKEN_ENV, &token);
             for entry in &overrides {
                 command.arg("-c").arg(entry);
@@ -331,6 +332,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
                 &env_refs,
                 clients::ClaudeLaunchOptions {
                     starred: &starred,
+                    config_dir: Some(&client_home),
                     client_classifier: classifier.as_ref().map(|alias| alias.as_deref()),
                 },
                 |model| app.claude_model_info(model),

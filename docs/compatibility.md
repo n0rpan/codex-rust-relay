@@ -15,8 +15,9 @@ the same client session. “Switch” changes the vendor in the same Codex sessi
 | Anthropic Messages `2023-06-01` | Coding, Brave citations, resume, switch | Coding, Brave citations, resume |
 | Anthropic Messages `2026-10-21` | Coding, Brave citations, resume, switch | Coding, Brave citations, resume |
 
-Native ChatGPT and API-backed Codex used their own credentials with the same Codex home
-in a loopback fixture. The clients retain their local tool execution, permissions and history.
+Native ChatGPT and API-backed Codex used separate client profiles in a loopback
+fixture. The clients execute tools locally and use their own persistent settings
+and history. [Client profiles](configuration.md#sessions-and-sign-in)
 ox launches the client found on `PATH`. For the current verified versions, see the
 `Stock clients (latest)` job in the [latest CI run](https://github.com/n0rpan/codex-rust-relay/actions/workflows/ci.yml).
 

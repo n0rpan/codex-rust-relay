@@ -26,6 +26,7 @@ def run(
     config=None, prompt="Choose 1–5".encode(), saved=None, model=None,
     favorites=None, expected_favorites=None, expected_lineup=None,
     expected_context=None, expected_classifier=None,
+    persist_model=False,
 ):
     with tempfile.TemporaryDirectory(prefix="ox-selector-") as tmp:
         home = pathlib.Path(tmp)
@@ -37,6 +38,9 @@ def run(
         lineup_trace = home / "lineup"
         original = 'model_provider = "openai"\n'
         (home / "config.toml").write_text(original)
+        native_claude = '{"model":"claude-sonnet-5","permissions":{"deny":["Bash"]}}\n'
+        if persist_model:
+            (home / "settings.json").write_text(native_claude)
         if config is not None:
             (home / "codeox.toml").write_text(config)
         if favorites is not None:
@@ -65,6 +69,22 @@ fi
 if env | grep -q '^CUSTOM_.*_API_KEY='; then
     exit 9
 fi
+if [ "$FIXTURE_PERSIST_MODEL" = yes ]; then
+    "$FIXTURE_PYTHON" - "$(basename "$0")" <<'PYTEST'
+import json, os, pathlib, sys
+if sys.argv[1] == "claude":
+    path = pathlib.Path(os.environ["CLAUDE_CONFIG_DIR"]) / "settings.json"
+    settings = json.loads(path.read_text())
+    assert settings["model"] == "claude-sonnet-5"
+    assert settings["permissions"]["deny"] == ["Bash"]
+    settings["model"] = "alibaba/qwen-fixture"
+    path.write_text(json.dumps(settings))
+else:
+    path = pathlib.Path(os.environ["CODEX_HOME"]) / "config.toml"
+    path.write_text(path.read_text() + 'model = "alibaba/qwen-fixture"\\n')
+PYTEST
+    [ "$?" = 0 ] || exit 10
+fi
 printf '%s\\n' "$(basename "$0")" "$@" > "$FIXTURE_TRACE"
 if [ "$(basename "$0")" = claude ]; then
     printf '%s' "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-}" > "$FIXTURE_CONTEXT"
@@ -82,6 +102,7 @@ fi
             "FIXTURE_CLASSIFIER": str(classifier_trace),
             "FIXTURE_PYTHON": sys.executable, "FIXTURE_LINEUP": str(lineup_trace),
             "FIXTURE_SIGNED_IN": "yes" if signed_in else "no",
+            "FIXTURE_PERSIST_MODEL": "yes" if persist_model else "no",
             "FIXTURE_CLAUDE_SIGNED_IN": "yes" if claude_signed_in else "no",
             "OPENROUTER_API_KEY": "dummy-fixture-credential",
             "ANTHROPIC_API_KEY": "dummy-anthropic-credential",
@@ -123,6 +144,14 @@ fi
             assert "Provider key:" not in text
             assert "dummy-fixture-credential" not in text
             assert (home / "config.toml").read_text() == original
+            if persist_model:
+                assert (home / "settings.json").read_text() == native_claude
+                if args[0] == "codex":
+                    updated = home / "ox-clients" / "codex" / "config.toml"
+                    assert 'model = "alibaba/qwen-fixture"' in updated.read_text()
+                else:
+                    updated = home / "ox-clients" / "claude" / "settings.json"
+                    assert json.loads(updated.read_text())["model"] == "alibaba/qwen-fixture"
             registry = (home / "codeox.toml").read_text() if (home / "codeox.toml").exists() else None
             if saved:
                 secret_file = home / "ox-api-keys.json"
@@ -435,6 +464,10 @@ alibaba_snapshot = shared.replace(
 run(["claude", "--model", "alibaba/deepseek-v4.1-flash-1017"],
     config=alibaba_snapshot, expected_context="1000000")
 print("Claude launch: Alibaba's model context reaches the client without discovery metadata")
+
+for client in ("codex", "claude"):
+    run([client, "--model", "alibaba/qwen-fixture"], config=shared, persist_model=True)
+print("Relay client model saves are isolated from both native settings files")
 
 search_prompt = b"Search as you type"
 for client, search, expected in (

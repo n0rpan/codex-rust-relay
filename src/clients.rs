@@ -265,9 +265,82 @@ impl Drop for ClaudeLaunchSettings {
 #[derive(Default)]
 pub(crate) struct ClaudeLaunchOptions<'a> {
     pub starred: &'a [&'a str],
+    pub config_dir: Option<&'a Path>,
     /// None keeps the normal route-based default. Some(None) selects the
     /// client's default model for a separate classifier request.
     pub client_classifier: Option<Option<&'a str>>,
+}
+
+/// Stock clients can save `/model` selections back into their user files.
+/// Give each relay client a persistent home so model changes and resumes stay
+/// in that profile even if ox or its child is interrupted.
+pub(crate) fn relay_client_home(
+    codex_home: &Path,
+    client: ClientKind,
+) -> Result<PathBuf, RelayError> {
+    let (name, source, files): (_, _, &[_]) = match client {
+        ClientKind::Codex => (
+            "codex",
+            Some(codex_home.to_path_buf()),
+            &[
+                "config.toml",
+                "AGENTS.md",
+                "AGENTS.override.md",
+                "requirements.toml",
+            ],
+        ),
+        ClientKind::Claude => (
+            "claude",
+            std::env::var_os("CLAUDE_CONFIG_DIR")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude"))
+                }),
+            &["settings.json", "CLAUDE.md"],
+        ),
+    };
+    let root = codex_home.canonicalize()?.join("ox-clients");
+    let profile = root.join(name);
+    for directory in [&root, &profile] {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        if let Err(error) = builder.create(directory)
+            && error.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(error.into());
+        }
+        if !std::fs::symlink_metadata(directory)?.is_dir() {
+            return Err("the ox client profile must be a directory and cannot be a symlink".into());
+        }
+    }
+    let _lock = crate::setup::lock_config(&profile)?;
+    if files.iter().any(|file| profile.join(file).is_symlink()) {
+        return Err(
+            "ox client settings cannot link back to files outside the relay profile".into(),
+        );
+    }
+    let marker = profile.join(".initialized");
+    if !marker.try_exists()? {
+        if let Some(source) = source {
+            for file in files {
+                let from = source.join(file);
+                let to = profile.join(file);
+                if from.try_exists()? && !to.try_exists()? {
+                    let bytes = read_limited(&from, "client profile setting")?;
+                    let text = std::str::from_utf8(&bytes)
+                        .map_err(|_| "could not copy a non-UTF-8 client setting")?;
+                    crate::setup::write_config_atomic(&to, text)?;
+                }
+            }
+        }
+        crate::setup::write_config_atomic(&marker, "")?;
+    }
+    Ok(profile)
 }
 
 pub(crate) struct ClaudeModelInfo {
@@ -392,6 +465,14 @@ pub(crate) fn claude_command(
         .env_remove(DEFAULT_SEARCH_ENV_KEY);
     for name in SCRUBBED_ENV {
         command.env_remove(name);
+    }
+    if let Some(path) = options.config_dir {
+        let key = "CLAUDE_CONFIG_DIR";
+        let value = path
+            .to_str()
+            .ok_or("Claude Code profile path must be UTF-8")?;
+        overlay_env.insert(key.to_owned(), Value::String(value.to_owned()));
+        command.env(key, path);
     }
 
     // Claude Code reads this once per process for custom model IDs. Use the
@@ -824,9 +905,10 @@ fn inspect_managed_settings(path: &Path) -> Result<(), RelayError> {
             _ => true,
         };
         if set
-            && ROUTING_ENV
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(key))
+            && (key.eq_ignore_ascii_case("CLAUDE_CONFIG_DIR")
+                || ROUTING_ENV
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(key)))
         {
             return Err(format!(
                 concat!(

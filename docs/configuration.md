@@ -469,13 +469,23 @@ if only Claude is signed in. With no API provider, `ox doctor` asks the stock
 clients for sign-in status and reports which subscription launches are ready.
 `ox help subscriptions` lists the explicit native launch commands.
 
+API-backed launches keep their settings, model choices, and new sessions under
+`$CODEX_HOME/ox-clients/codex` or `$CODEX_HOME/ox-clients/claude`.
+ox seeds the new profiles with the client's user settings on first launch.
+Project and managed settings still apply. Use the relay profile for separate
+user-level settings, plugins, and MCP registrations. Sessions recorded before
+profiles were separated are in the original client history.
+
+If an older ox launch left its alias selected as the native default, open plain
+`codex` or `claude`, use `/model` to choose a model from that client's subscription,
+and start a new session.
+
 - **ChatGPT plan in Codex.** Run `ox login chatgpt` if you need to sign in.
   Codex manages its normal credentials. `ox login chatgpt status` checks whether
   a ChatGPT sign-in is present. Native Codex sign-in works without registering
   ox as a third-party integration. Use `ox codex --chatgpt` for that account or
   `ox codex` for API-backed sessions. In the project, use `ox codex resume` to pick
-  an API-backed thread. The picker contains threads from both launchers, so select one
-  you started through ox. Use a fresh thread and a reviewed summary to move between
+  a thread from the relay profile. Use a fresh thread and a reviewed summary to move between
   native ChatGPT and API-backed sessions. [Codex authentication](https://developers.openai.com/codex/auth)
 - **Codex vendor switches** use the full alias in `/model` between completed turns.
   The new provider receives the portable conversation and tool history. ox keeps opaque
@@ -485,7 +495,7 @@ clients for sign-in status and reports which subscription launches are ready.
   sign-in, then `ox claude --native` to launch with its own settings. Use a Claude
   environment free of gateway and API overrides for subscription sessions.
   [Claude Code authentication](https://code.claude.com/docs/en/authentication)
-- **Claude Code relay sessions** use its normal project history. From the same project use
+- **Claude Code relay sessions** use the relay profile's project history. From the same project use
   `ox claude --resume <session-id> --model <original-alias>`. Start a fresh session
   when changing model or vendor so signed thinking stays with its original route.
 

@@ -1,4 +1,4 @@
-//! One scratch `CODEX_HOME`, two launch paths.
+//! One scratch ox configuration, two stock Codex profiles.
 //!
 //! This opt-in test records the auth contract that makes `codeox` safe to use
 //! beside an existing native ChatGPT login:
@@ -11,7 +11,7 @@
 //!    `Authorization: Bearer <fake access token>` and
 //!    `chatgpt-account-id: <fake account id>`. That is native ChatGPT account
 //!    auth, not an API key.
-//! 2. **The same `CODEX_HOME` through codeox.** Codex is launched with
+//! 2. **The API relay through ox.** Codex is launched in a separate profile with
 //!    `model_provider=codeox` and `CODEOX_TOKEN`, so the model request goes to
 //!    the relay. The relay forwards to the fixture vendor with only that
 //!    vendor's fake key. The ChatGPT access token never reaches the vendor.
@@ -237,7 +237,7 @@ fn manual_suite_requires_an_explicit_cli_path() {
 
 #[test]
 #[ignore = "opt-in: set CODEOX_TEST_CODEX_BIN to the stock Codex binary"]
-fn stock_codex_keeps_native_auth_and_codeox_uses_the_vendor_key_on_the_same_home() {
+fn stock_codex_uses_native_credentials_and_an_isolated_relay_profile() {
     let codex = stock_binary();
     let version = codex_version(&codex);
     println!("Testing stock Codex: {version}");
@@ -442,6 +442,9 @@ fn stock_codex_keeps_native_auth_and_codeox_uses_the_vendor_key_on_the_same_home
         codeox_before,
         "codeox must not change its own codeox.toml"
     );
+    let relay_profile = codex_home.join("ox-clients/codex");
+    assert!(relay_profile.join("config.toml").is_file());
+    assert!(!relay_profile.join("auth.json").exists());
 }
 
 // ---------------------------------------------------------------------------
