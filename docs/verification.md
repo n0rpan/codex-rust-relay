@@ -57,13 +57,42 @@ The coding fixtures need working stock-client sandbox support and permission to 
 loopback sockets. See the [Codex fixtures](../tests/fixtures/stock_codex/README.md)
 and [Claude Code fixtures](../tests/fixtures/stock_claude/README.md) for details.
 
+`cargo test` also runs the installer against a local archive: a fresh install,
+an upgrade, a wrong checksum, a missing build and an unknown option. It uses
+`file://` URLs and needs no network. To lint the installer the way CI does:
+
+```sh
+sh -n install.sh && bash -n install.sh && shellcheck install.sh
+```
+
 GitHub Actions runs the offline checks and packages native binaries for both
 architectures on Linux and macOS. Each platform runs the setup selector from the
-packaged binary and tests updater downloads and atomic replacement over loopback. See [install options](configuration.md#install-options).
-For maintainers, pushing a stable tag matching the Cargo version (for example,
-`v0.1.0`) publishes the four platform binaries and their checksums after both
-stock-client tracks and all platform packaging checks pass. Ordinary CI runs
-keep their output as preview artifacts.
+packaged binary, tests updater downloads and atomic replacement over loopback,
+and installs its own archive with `install.sh` twice (fresh, then upgrade). See
+[install options](configuration.md#install-options).
+
+### How releases are published
+
+For maintainers. Both publishing jobs run only after both stock-client tracks
+and all four platform builds pass.
+
+- **Dev.** Every push to `main` replaces the pre-release tagged `dev`. CI
+  uploads the new files to a hidden draft first and then swaps it in, so the
+  previous dev build stays downloadable until the new one is complete. The job
+  then installs the published build with `sh install.sh --dev` and checks its
+  version. If a dev publish fails, use **Run workflow** on `main` to publish
+  again. A re-run of an older commit does not replace a newer dev build.
+- **Stable.** Pushing a tag `vX.Y.Z` publishes that release and marks it as
+  the latest. The tag sets the version the binaries report. `Cargo.toml` does
+  not need to match it.
+- **Version numbers.** A dev build is the highest stable version with the
+  patch raised by one, then `-dev.` and the workflow run number. With no
+  stable release it is `0.0.1-dev.N`.
+
+Pull-request runs build and test the same binaries and keep them as workflow
+artifacts. They publish nothing. A tag-protection rule or ruleset that covers
+the `dev` tag, or immutable releases, would make the dev job fail at its swap
+step.
 
 ## Live smoke checks
 
@@ -96,7 +125,7 @@ ox launches the `codex` or `claude` executable on `PATH` with its launch-scoped
 provider settings and relay credential. Updating either client takes effect on
 the next launch.
 
-The [CI workflow](https://github.com/n0rpan/codex-rust-relay/actions/workflows/ci.yml)
+The [CI workflow](https://github.com/n0rpan/ox/actions/workflows/ci.yml)
 runs the same coding, tool, search, resume and auth scenarios against two inputs:
 
 - **Baseline** uses checksum-pinned Codex 0.171.0 and Claude Code 2.1.330 on PRs and
@@ -114,6 +143,52 @@ client, replace the fixture paths above with the output of `command -v codex` or
 Enable **Actions → Only notify for failed workflows** in your GitHub notification
 settings for failure alerts. GitHub sends scheduled-run notifications to the account
 associated with the schedule. [GitHub Actions notifications](https://docs.github.com/en/actions/concepts/workflows-and-actions/notifications-for-workflow-runs)
+
+## How ox stays fast
+
+ox is on the path of every token, so the design goal is to add nothing you can
+notice.
+
+- **One process, one thread.** A single-threaded async runtime. There is no
+  channel hop between reading a token from the provider and writing it to the
+  client, and no polling loop while idle.
+- **Three system calls per token.** Wait, read, write. Tokens are never
+  batched or held for a timer.
+- **Pass-through where the formats match.** Codex on a Responses API and
+  Claude Code on a Messages API have their streams forwarded as they arrive.
+- **Event-by-event translation elsewhere.** A translated stream is reframed
+  one event at a time and never buffered end to end.
+- **No Nagle delay.** Client sockets use `TCP_NODELAY`. Without it, a client
+  that is busy rendering holds back the tokens behind it for up to 40 ms.
+- **Connections are reused.** One pooled HTTPS client per process with
+  keep-alive. After a translated stream ends, ox reads the short rest of the
+  provider's HTTP body in the background so the connection returns to the pool
+  and the next request skips the TCP and TLS handshake.
+- **Parallel startup.** `ox codex` loads Codex's bundled model catalog while
+  provider model lists are fetched, so a launch waits for the slower of the
+  two and not their sum.
+- **Small release build.** Whole-program optimisation and no symbol table.
+  This makes the download and memory use smaller. It did not measurably change
+  speed. Panics still unwind, so one failed connection cannot take the relay
+  down.
+- **Nothing extra on the request path.** No request logging and no disk
+  writes while relaying.
+
+ox uses HTTP/1.1 with keep-alive to providers. It does not use HTTP/2, and
+translation copies the request body: a 1 MB conversation adds about 3 to 5 ms
+before its first byte in the measurement below.
+
+These tests fail if a change holds tokens back or stops reusing connections.
+They need no timing thresholds and run in the normal test suite:
+
+```sh
+cargo test --locked --bin ox -- \
+  a_translated_token_is_forwarded_without_waiting_for_the_next_chunk \
+  a_responses_token_is_forwarded_without_waiting_for_the_next_chunk \
+  a_finished_translated_stream_keeps_its_upstream_connection \
+  accepted_relay_connections_disable_nagle \
+  the_bundled_catalog_loads_while_providers_are_discovered
+```
 
 ## Benchmark a release on Linux
 
@@ -135,10 +210,60 @@ The two runs take about six minutes in total. For each API the harness samples
 loopback mock, and peak memory with eight concurrent streams. It measures the relay
 process alone and excludes real model and network latency.
 
-### Measured release
+For a quicker pass of about one minute per client, shorten the idle window and
+the stream hold. Use the full run for numbers you intend to publish:
 
-The ox 0.1.0 release from commit `22dfc62` met its memory, CPU, and added-latency
-targets for all six client and protocol combinations. The test ran on a Qualcomm
+```sh
+CODEOX_BENCH_BIN="$ox_release_copy/ox" CODEOX_BENCH_IDLE_SECS=10 CODEOX_BENCH_STREAM_HOLD_MS=500 \
+  cargo test --release --locked --offline --test relay_benchmark -- --ignored --nocapture
+```
+
+Each run ends with `RESULT: PASS (16 checks)` when every target is met.
+
+### Current measurement
+
+Measured on 2026-11-23 on a release build of this branch, after the latency
+changes described above. The host was a 4-vCPU Intel Xeon 2.1 GHz Firecracker
+virtual machine running Linux 6.18 and Ubuntu 24.04. Everything ran on
+loopback against a mock provider. System calls are slow on this kind of
+virtual machine, so the CPU figures are pessimistic for a laptop.
+
+The first four rows come from the quick form of the benchmark above, for all
+six client and API combinations. Both clients ended with
+`RESULT: PASS (16 checks)`.
+
+| Measure | Result |
+| --- | --- |
+| Added time to first event, p95 | 0.32 to 0.58 ms |
+| Added time to first event, p50 | 0.10 to 0.30 ms |
+| Warm idle memory (RSS) | 5.8 to 6.3 MiB |
+| Idle CPU | 0.0000% of one core over 10 seconds |
+| Release executable | about 5.2 MB (8.4 MB before the release profile) |
+
+The rows below come from a separate loopback stream harness that is not part
+of this repository. It streamed tokens through ox and directly, and compared
+the two. They cannot be reproduced with the commands on this page. The
+regression tests in [How ox stays fast](#how-ox-stays-fast) guard the same
+behaviour.
+
+| Measure | Before | After |
+| --- | ---: | ---: |
+| Delay added per token at 200 tokens/s, p50 | 0.06 to 0.12 ms | 0.06 to 0.12 ms |
+| Delay added per token at 200 tokens/s, p95 | | at most 0.15 ms |
+| Total stream time | | +0.0% |
+| Delay added per token with a client busy 3 ms per read (Codex on Chat Completions), p95 | 38.7 ms | under 0.1 ms |
+| New provider connections in 20 requests, each of the four translated paths | 20 | 0 |
+| New provider connections in 20 requests, each of the two pass-through paths | 0 | 0 |
+| Launch with a 150 ms catalog command and a 300 ms model list | 461 ms | 309 ms |
+| CPU per token | | 63 to 101 µs, or 1.3 to 2.0% of one core at 200 tokens/s |
+| Added time to first byte for a 1 MB request | | 2.7 to 4.6 ms |
+
+“Before” is commit `fcf77de`. An empty cell was not measured separately.
+
+### Earlier full run
+
+A release build of commit `22dfc62`, from before the latency changes above, met
+its memory, CPU, and added-latency targets for all six client and protocol combinations. The test ran on a Qualcomm
 Oryon host with 12 logical CPUs running Linux 7.3.0-77-omarchy (aarch64) on 2026-11-23.
 SHA-256 of the local executable used in the test
 `ee83bf98511205f872191c2c0a5084d042eb2c883a24e610e1ca3f051dfa00eb`.
