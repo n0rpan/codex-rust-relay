@@ -114,7 +114,7 @@ pub(crate) fn choose_setup() -> Result<SetupChoice, RelayError> {
 struct ProviderPreset {
     id: &'static str,
     name: &'static str,
-    url: &'static str,
+    url: Option<&'static str>,
     wire: WireKind,
     env: &'static str,
 }
@@ -123,35 +123,35 @@ const PRESETS: &[ProviderPreset] = &[
     ProviderPreset {
         id: "opencode-go",
         name: "OpenCode Go",
-        url: "https://opencode.ai/inference/go/openai/v1",
+        url: Some("https://opencode.ai/inference/go/openai/v1"),
         wire: WireKind::ChatCompletions,
         env: "OPENCODE_API_KEY",
     },
     ProviderPreset {
         id: "openrouter",
         name: "OpenRouter",
-        url: "https://openrouter.ai/api/v1",
+        url: Some("https://openrouter.ai/api/v1"),
         wire: WireKind::Responses,
         env: "OPENROUTER_API_KEY",
     },
     ProviderPreset {
         id: "anthropic",
         name: "Anthropic",
-        url: "https://api.anthropic.com/v1",
+        url: Some("https://api.anthropic.com/v1"),
         wire: WireKind::AnthropicMessages,
         env: "ANTHROPIC_API_KEY",
     },
     ProviderPreset {
         id: "openai",
         name: "OpenAI",
-        url: "https://api.openai.com/v1",
+        url: Some("https://api.openai.com/v1"),
         wire: WireKind::Responses,
         env: "OPENAI_API_KEY",
     },
     ProviderPreset {
         id: "alibaba",
-        name: "Alibaba Cloud Token Plan (Singapore)",
-        url: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+        name: "Alibaba Cloud",
+        url: None,
         wire: WireKind::ChatCompletions,
         env: "ALIBABA_API_KEY",
     },
@@ -184,7 +184,7 @@ pub(crate) fn guided_provider(home: &Path) -> Result<(), RelayError> {
         let (url, wire) = prompt.ask_required_with(
             "Paste the API base URL or full inference endpoint",
             None,
-            infer_connection,
+            |raw| infer_connection(raw, WireKind::Responses),
         )?;
         let host = url.host_str().unwrap_or("local");
         let label = host.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
@@ -202,11 +202,26 @@ pub(crate) fn guided_provider(home: &Path) -> Result<(), RelayError> {
         (id, host.to_owned(), url, wire, env)
     } else {
         let preset = &PRESETS[choice - 1];
+        let (url, wire) = if let Some(url) = preset.url {
+            (reqwest::Url::parse(url)?, preset.wire)
+        } else {
+            prompt.ask_required_with(
+                "Paste the Alibaba Cloud API URL from your account",
+                None,
+                |raw| {
+                    let (url, wire) = infer_connection(raw, preset.wire)?;
+                    if !url.host_str().is_some_and(|host| host.ends_with(".aliyuncs.com")) {
+                        return Err("use your Alibaba Cloud endpoint ending in .aliyuncs.com, or choose Other for a custom gateway".to_owned());
+                    }
+                    Ok((url, wire))
+                },
+            )?
+        };
         (
             preset.id.to_owned(),
             preset.name.to_owned(),
-            reqwest::Url::parse(preset.url)?,
-            preset.wire,
+            url,
+            wire,
             preset.env.to_owned(),
         )
     };
@@ -255,6 +270,9 @@ pub(crate) fn guided_provider(home: &Path) -> Result<(), RelayError> {
         }
         if id == "alibaba" {
             args.extend(["--model", "qwen3.8-flash"].map(OsString::from));
+            if wire == WireKind::AnthropicMessages {
+                args.push(OsString::from("--no-discovery"));
+            }
         }
         let mut report = Vec::new();
         let code = run_provider_add(
@@ -303,7 +321,7 @@ pub(crate) fn guided_provider(home: &Path) -> Result<(), RelayError> {
     Ok(())
 }
 
-fn infer_connection(raw: &str) -> Result<(reqwest::Url, WireKind), String> {
+fn infer_connection(raw: &str, default_wire: WireKind) -> Result<(reqwest::Url, WireKind), String> {
     let raw = validate_base_url(raw)?;
     let mut url = reqwest::Url::parse(&raw).map_err(|_| "enter a valid API URL".to_owned())?;
     let path = url.path().trim_end_matches('/');
@@ -313,16 +331,25 @@ fn infer_connection(raw: &str) -> Result<(reqwest::Url, WireKind), String> {
         (base, WireKind::AnthropicMessages)
     } else if let Some(base) = path.strip_suffix("/responses") {
         (base, WireKind::Responses)
-    } else if url.host_str() == Some("api.anthropic.com") || path.ends_with("/apps/anthropic/v1") {
+    } else if url.host_str() == Some("api.anthropic.com")
+        || path.ends_with("/apps/anthropic")
+        || path.ends_with("/apps/anthropic/v1")
+    {
         (path, WireKind::AnthropicMessages)
     } else if path.ends_with("/compatible-mode/v1")
         || path == "/inference/go/openai/v1" && url.host_str() == Some("opencode.ai")
     {
         (path, WireKind::ChatCompletions)
     } else {
-        (path, WireKind::Responses)
+        (path, default_wire)
     };
-    let base = if base.is_empty() { "/v1" } else { base }.to_owned();
+    let base = if base.ends_with("/apps/anthropic") && wire == WireKind::AnthropicMessages {
+        format!("{base}/v1")
+    } else if base.is_empty() {
+        "/v1".to_owned()
+    } else {
+        base.to_owned()
+    };
     url.set_path(&base);
     Ok((url, wire))
 }

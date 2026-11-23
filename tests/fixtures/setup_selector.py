@@ -259,6 +259,25 @@ for endpoint, wire in (
 print("Other: full Chat Completions and Messages endpoints select their own format")
 
 
+for path, base, wire in (
+    ("/compatible-mode/v1/chat/completions", "/compatible-mode/v1", "chat_completions"),
+    ("/apps/anthropic", "/apps/anthropic/v1", "anthropic_messages"),
+):
+    host = "https://fixture-workspace.maas.aliyuncs.com"
+    text, argv, registry = run(
+        ["provider", "add"], [
+            (b"Service number:", b"5\n"),
+            (b"Paste the Alibaba Cloud API URL", f"{host}{path}\n".encode()),
+        ],
+    )
+    assert "5. Alibaba Cloud" in text
+    assert "[providers.alibaba]" in registry
+    assert f'base_url = "{host}{base}"' in registry
+    assert f'wire_api = "{wire}"' in registry
+    assert 'env_key = "ALIBABA_API_KEY"' in registry
+print("Alibaba Cloud: prompt uses the supplied account URL and infers its API format")
+
+
 text, argv, registry = run([
     "provider", "add", "openrouter",
     "--base-url", "https://openrouter.ai/api/v1",

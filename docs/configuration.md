@@ -74,10 +74,11 @@ Cargo installs into `${CARGO_HOME:-$HOME/.cargo}/bin` by default. Add the instal
 ## Add a provider
 
 Run `ox setup` in a terminal, choose **Add an API key**, and pick the service that
-issued it. For OpenCode Go, OpenRouter, Anthropic, OpenAI and Alibaba Cloud
-Token Plan in Singapore, ox fills in the URL and API format. Paste your key at
-the hidden prompt. If you already exported the provider’s variable, ox uses
-that value. The menu returns so you can add more providers or enable Brave.
+issued it. For OpenCode Go, OpenRouter, Anthropic and OpenAI, ox fills in the URL
+and API format. For Alibaba Cloud, paste the endpoint shown in your Model Studio
+account or the one already working in Oxa. Paste your key at the hidden prompt.
+If you already exported the provider’s variable, ox uses that value. The menu
+returns so you can add more providers or enable Brave.
 
 For **Other or self-hosted**, paste the API URL. A plain `/v1` URL defaults to
 OpenAI Responses, and ox looks up `/v1/models` when you launch. Pasting a full
@@ -156,16 +157,18 @@ ox derives a stable OpenCode session identifier from the client session header
 when one is available. Clients without a session header get a fresh identifier
 per request.
 
-Alibaba Cloud Model Studio uses region- and plan-specific URLs. Start from
-the base URL in your working account or client configuration. Use Chat
-Completions with an OpenAI-compatible URL. [Alibaba Cloud endpoints by region and plan](https://www.alibabacloud.com/help/en/model-studio/base-url)
+Alibaba Cloud Model Studio uses region-, plan- and sometimes workspace-specific
+URLs. Choose **Alibaba Cloud** in `ox setup` and paste the URL that matches
+your API key. ox defaults to Chat Completions for an OpenAI-compatible base URL
+and recognizes the Anthropic-compatible URL by its path. [Alibaba Cloud endpoints by region and plan](https://www.alibabacloud.com/help/en/model-studio/base-url)
 
 For example, the Singapore **Token Plan** base URL worked with `qwen3.8-flash`
-through both ox frontends. Load the key from that Token Plan as `ALIBABA_API_KEY`.
+through both ox frontends. For scripted setup, load your OpenAI-compatible
+base URL as `ALIBABA_BASE_URL` and its key as `ALIBABA_API_KEY`.
 
 ```sh
 ox provider add alibaba \
-  --base-url https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1 \
+  --base-url "$ALIBABA_BASE_URL" \
   --wire chat_completions --env-key ALIBABA_API_KEY \
   --no-discovery --model qwen3.8-flash
 ox doctor --live --provider alibaba
