@@ -247,18 +247,31 @@ and adapt the [Desktop web-tools overlay](../examples/claude-desktop-web-tools.j
 
 ## Sessions and sign-in
 
-- **Codex** uses your existing Codex home. Run `codex` for your usual ChatGPT sign-in
-  and `ox codex` for API-backed sessions. In the project, use `ox codex resume` to pick
+Use `ox help subscriptions` to see the native sign-in commands.
+
+- **ChatGPT plan in Codex.** Run `ox login chatgpt` if you need to sign in.
+  Codex manages its normal credentials. `ox login chatgpt status` checks whether
+  a ChatGPT sign-in is present. Use `ox codex --chatgpt` for that account or
+  `ox codex` for API-backed sessions. In the project, use `ox codex resume` to pick
   an API-backed thread. The picker contains threads from both launchers, so select one
   you started through ox. Use a fresh thread and a reviewed summary to move between
-  native ChatGPT and API-backed sessions.
+  native ChatGPT and API-backed sessions. [Codex authentication](https://developers.openai.com/codex/auth)
 - **Codex vendor switches** use the full alias in `/model` between completed turns.
   The new provider receives the portable conversation and tool history. ox keeps opaque
   provider continuation data scoped to its original route. Switch only when you intend
   to send the thread context to the new provider.
-- **Claude Code** uses its normal project history. From the same project use
+- **Claude subscription in Claude Code.** Run `ox login claude` to open Claude Code's
+  sign-in, then `ox claude --native` to launch with its own settings. Use a Claude
+  environment free of gateway and API overrides for subscription sessions.
+  [Claude Code authentication](https://code.claude.com/docs/en/authentication)
+- **Claude Code relay sessions** use its normal project history. From the same project use
   `ox claude --resume <session-id> --model <original-alias>`. Start a fresh session
   when changing model or vendor so signed thinking stays with its original route.
+
+The shared gateway uses provider API credentials. Subscription sessions execute
+in the signed-in native client. If your Claude plan includes separate Platform
+credits, use a Claude Console API key to spend those credits through the relay.
+[Claude Platform credits](https://platform.claude.com/docs/en/about-claude/api-credits-for-subscribers)
 
 ### Upgrade from the original single-provider relay
 

@@ -54,6 +54,10 @@ if [ "$1" = "debug" ] && [ "$2" = "models" ]; then
   printf '{"models":[]}'
   exit 0
 fi
+if [ "$3" = "login" ] && [ "$4" = "status" ]; then
+  printf '%s\n' "$FAKE_CODEX_LOGIN_STATUS" >&2
+  exit 0
+fi
 env > "$CAPTURE/run-env"
 printf '%s\n' "$@" > "$CAPTURE/run-args"
 exit 0
@@ -227,6 +231,7 @@ fn first_run_and_help_work_with_only_native_codex_settings() {
         ("desktop", "Model Providers & Gateways"),
         ("share", "tailscale serve --bg"),
         ("t3", "Claude Agent SDK"),
+        ("subscriptions", "ox login chatgpt"),
     ] {
         let output = Command::new(binary())
             .env_clear()
@@ -245,6 +250,55 @@ fn first_run_and_help_work_with_only_native_codex_settings() {
     assert!(String::from_utf8_lossy(&run(&["doctor"]).stdout).contains("Run `ox setup`"));
     assert!(!home.0.join("codeox.toml").exists());
     assert_eq!(read(&native_config), original);
+}
+
+#[test]
+fn native_sign_in_and_launch_use_stock_clients() {
+    let home = TempDir::new("launcher-native-home");
+    let capture = TempDir::new("launcher-native-capture");
+    let fake_bin = TempDir::new("launcher-native-bin");
+    write_fake_client(&fake_bin.0, "codex");
+    write_fake_client(&fake_bin.0, "claude");
+    let run = |args: &[&str], status: &str| {
+        run_launcher(
+            &home.0,
+            &capture.0,
+            &fake_bin.0,
+            &[
+                ("FAKE_CODEX_LOGIN_STATUS", status),
+                ("OPENAI_API_KEY", "must-not-use-api-key"),
+            ],
+            args,
+        )
+    };
+
+    let blocked = run(&["codex", "--chatgpt"], "API key configured");
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("Run ox login chatgpt"));
+    assert!(!capture.0.join("run-args").exists());
+
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["login", "chatgpt", "--device-auth"],
+            "-c\nmodel_provider=\"openai\"\nlogin\n--device-auth\n",
+        ),
+        (&["login", "claude"], "auth\nlogin\n--claudeai\n"),
+        (
+            &["codex", "--chatgpt", "resume"],
+            "-c\nmodel_provider=\"openai\"\nresume\n",
+        ),
+        (&["claude", "--native", "--continue"], "--continue\n"),
+    ];
+    for &(args, forwarded) in cases {
+        let output = run(args, "Logged in using ChatGPT");
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(read(&capture.0.join("run-args")), forwarded);
+    }
+    assert!(!capture.0.join("bundled-env").exists());
+    assert!(!home.0.join("codeox.toml").exists());
+    let codex = run(&["codex", "--chatgpt"], "Logged in using ChatGPT");
+    assert!(codex.status.success());
+    assert!(!read(&capture.0.join("run-env")).contains("must-not-use-api-key"));
 }
 
 #[test]

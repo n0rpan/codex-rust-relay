@@ -103,6 +103,10 @@ fn provider_add_command(
             output,
             "For desktop apps or a shared gateway, see ox help desktop or ox help share.\n"
         )?;
+        writeln!(
+            output,
+            "For a personal subscription, see ox help subscriptions.\n"
+        )?;
     }
     run_provider_add(
         args,

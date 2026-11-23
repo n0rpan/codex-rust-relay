@@ -9,6 +9,7 @@ see the commands. Typing just `ox` in a terminal opens setup on first use.
 
 Use `ox help desktop` for Codex and Claude Desktop, `ox help share` to connect
 other devices, or `ox help t3` for T3 Code.
+For a ChatGPT or Claude subscription, run `ox help subscriptions`.
 
 ## 1. Install
 

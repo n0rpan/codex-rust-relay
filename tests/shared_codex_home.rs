@@ -3,7 +3,7 @@
 //! This opt-in test records the auth contract that makes `codeox` safe to use
 //! beside an existing native ChatGPT login:
 //!
-//! 1. **Stock Codex, run directly.** A disposable `CODEX_HOME` holds a fake
+//! 1. **Stock Codex via `ox codex --chatgpt`.** A disposable `CODEX_HOME` holds a fake
 //!    `auth.json` (account tokens, not an API key) and a `config.toml` whose
 //!    `chatgpt_base_url` points at a loopback HTTP discovery server. Codex
 //!    0.171.0 discovers the selected workspace, then sends
@@ -239,11 +239,13 @@ fn stock_codex_keeps_native_auth_and_codeox_uses_the_vendor_key_on_the_same_home
     .expect("write config.toml");
     fs::write(project.join("fixture.txt"), "disposable\n").expect("write project fixture");
 
-    // ---- 1. Stock Codex directly: native ChatGPT account auth --------------
+    // ---- 1. Stock Codex with native ChatGPT account auth -------------------
     let phase1_log = tree.path.join("phase1.log");
-    let mut direct = Command::new(&codex);
+    let mut direct = Command::new(env!("CARGO_BIN_EXE_ox"));
     direct
         .args([
+            "codex",
+            "--chatgpt",
             "exec",
             "--skip-git-repo-check",
             "--json",
@@ -251,7 +253,16 @@ fn stock_codex_keeps_native_auth_and_codeox_uses_the_vendor_key_on_the_same_home
         ])
         .current_dir(&project)
         .stdin(Stdio::null());
-    let mut environment = loopback_env(&home, &codex_home, &tmp, "/usr/bin:/bin");
+    let mut environment = loopback_env(
+        &home,
+        &codex_home,
+        &tmp,
+        &format!("{}:/usr/bin:/bin", bin.display()),
+    );
+    environment.push((
+        "OPENAI_API_KEY".to_owned(),
+        "unused-fixture-api-key".to_owned(),
+    ));
     environment.push((
         "CODEX_CA_CERTIFICATE".to_owned(),
         ca_cert.display().to_string(),

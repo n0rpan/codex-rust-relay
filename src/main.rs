@@ -15,6 +15,7 @@ mod clients;
 mod daemon;
 mod diagnostics;
 mod help;
+mod native;
 mod provider;
 mod search;
 mod setup;
@@ -138,6 +139,9 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
         .ok_or("set CODEX_HOME or HOME")?;
+    if let Some(result) = native::dispatch(&args, &codex_home).await {
+        return result;
+    }
     match args.first().and_then(|arg| arg.to_str()) {
         Some("serve") => return daemon::run(&args[1..], &codex_home).await,
         Some("doctor") if args.iter().any(|arg| arg == "--live") => {

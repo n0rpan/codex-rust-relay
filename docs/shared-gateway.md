@@ -159,6 +159,12 @@ vendor routes in the server’s `codeox.toml`. Sessions and tool execution stay 
 the selected client environment. Enable the new instance for your project and
 select it and its custom model when you start a thread.
 
+For subscription sessions in T3 Code, sign in with the stock client on its
+execution host. Select the native Codex or Claude instance that uses that sign-in.
+For Claude, T3 keeps using the Agent SDK and its configured runtime. Use the
+native instance's Claude config directory when signing in and keep the gateway
+environment variables on the separate ox instance. [T3 Code Claude accounts](https://github.com/pingdotgg/t3code/blob/main/docs/user/providers-claude.md#separate-accounts-or-configurations)
+
 ## Verification boundary
 
 The repository verifies the shared HTTP endpoint, auth rejection, vendor-key

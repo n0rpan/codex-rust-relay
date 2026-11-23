@@ -8,6 +8,7 @@ ox connects Codex and Claude Code to your model API providers.
 Get started
   Use a terminal client  Run ox setup, load your API key, then run ox doctor.
                          Start ox codex or ox claude from your project.
+  Use your subscription  Run ox help subscriptions for native client sign-in.
   Connect a desktop app  Run ox help desktop for Codex and Claude Desktop.
   Share across devices   Run ox help share for a home server and Tailscale.
   Use T3 Code            Run ox help t3 for Codex and Claude Agent SDK setup.
@@ -17,12 +18,13 @@ Commands
   ox setup [KEY] [options]   Add a provider with prompts or flags
   ox codex [args...]         Launch Codex with the gateway
   ox claude [args...]        Launch Claude Code with the gateway
+  ox login chatgpt|claude    Open the installed client's native sign-in
   ox provider add [KEY]      Add another provider
   ox doctor                  Check setup offline
   ox doctor --live --provider KEY
                              Test one live API request
   ox serve [--port PORT]     Run a persistent loopback gateway
-  ox help [setup|desktop|share|t3]
+  ox help [setup|desktop|share|t3|subscriptions]
                              Show help for a task
   ox --version               Print the installed ox version
   ox --help                  Show this help
@@ -122,7 +124,31 @@ Claude
 
 Enable the instance for your project. Start a new thread with that instance
 and the full provider/model-id alias.
+For subscription sessions, sign in with the stock client on the execution
+host and select the ordinary T3 provider. See ox help subscriptions.
 See docs/shared-gateway.md in the ox repository for the client examples.";
+
+const SUBSCRIPTIONS: &str = "\
+Use your own plan in the native client
+
+ChatGPT plan in Codex
+  ox login chatgpt                    Open Codex's native sign-in
+  ox login chatgpt --device-auth      Use device-code sign-in on a supported account
+  ox login chatgpt status             Check the existing sign-in
+  ox codex --chatgpt [args...]        Start a native ChatGPT-backed Codex session
+
+Claude subscription in Claude Code
+  ox login claude                     Open Claude Code's native sign-in
+  ox claude --native [args...]         Start Claude Code with its own settings
+
+The installed clients own their sign-in and credentials. For Claude subscription
+use, keep API and gateway overrides out of that instance's configuration and
+environment. For T3 Code, select a native provider on the signed-in execution host.
+
+For API vendors, desktop gateways, and sharing, use ox setup and ox serve. The
+shared gateway uses provider credentials configured for that service.";
+
+const TOPICS: &str = "Usage: ox help [setup|desktop|share|t3|subscriptions]";
 
 pub(crate) fn overview() {
     println!("{OVERVIEW}");
@@ -132,6 +158,7 @@ pub(crate) fn dispatch(args: &[OsString]) -> Option<Result<u8, RelayError>> {
     match args {
         [flag, ..] if flag == "-h" || flag == "--help" => overview(),
         [command] if command == "help" => overview(),
+        [command] if command == "login" => println!("{SUBSCRIPTIONS}"),
         [command, topic] if command == "help" => match topic.to_str() {
             Some("setup") => return Some(crate::setup::print_setup_help()),
             Some("desktop") => println!(
@@ -141,13 +168,15 @@ pub(crate) fn dispatch(args: &[OsString]) -> Option<Result<u8, RelayError>> {
             ),
             Some("share") => println!("{SHARE}"),
             Some("t3") => println!("{T3}"),
-            _ => return Some(Err("usage: ox help [setup|desktop|share|t3]".into())),
+            Some("subscriptions") => println!("{SUBSCRIPTIONS}"),
+            _ => return Some(Err(TOPICS.into())),
         },
         [command, ..] if command == "help" => {
-            return Some(Err("usage: ox help [setup|desktop|share|t3]".into()));
+            return Some(Err(TOPICS.into()));
         }
         [command, flag] if flag == "-h" || flag == "--help" => match command.to_str() {
             Some("setup") => return Some(crate::setup::print_setup_help()),
+            Some("login") => println!("{SUBSCRIPTIONS}"),
             Some(client @ ("codex" | "claude")) => println!(
                 "Usage: ox {client} [client arguments]\n\
                  Run ox setup to add a provider, then launch from your project.\n\
@@ -156,6 +185,14 @@ pub(crate) fn dispatch(args: &[OsString]) -> Option<Result<u8, RelayError>> {
             ),
             _ => return None,
         },
+        [command, account, flag]
+            if (flag == "-h" || flag == "--help")
+                && ((command == "login" && (account == "chatgpt" || account == "claude"))
+                    || (command == "codex" && account == "--chatgpt")
+                    || (command == "claude" && account == "--native")) =>
+        {
+            println!("{SUBSCRIPTIONS}");
+        }
         _ => return None,
     }
     Some(Ok(0))
