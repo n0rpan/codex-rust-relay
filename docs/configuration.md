@@ -278,6 +278,23 @@ the list. For any configured alias, including a GPT or DeepSeek alias, launch wi
 `ox claude --model <provider/model-id>`. Use qualified aliases because the client
 expands built-in names like `sonnet`. [Claude Code model discovery](https://code.claude.com/docs/en/llm-gateway-protocol#model-discovery)
 
+#### Context limits
+
+ox reads advertised context limits from model discovery and uses a static
+`context_window` entry when you provide one. Codex receives the limit in its
+model catalog. For a custom model ID in `ox claude`, ox gives Claude Code the
+starting model’s limit through `CLAUDE_CODE_MAX_CONTEXT_TOKENS`. A value you set
+in your shell or Claude settings can override that. If discovery omits the limit,
+set `context_window` on the model entry.
+
+Claude Code reads the limit for the whole process. Relaunch through ox when
+changing to a custom model with a different limit. Claude Code can keep its
+built-in limit for IDs it recognizes as Claude models. Clients that connect
+directly to `ox serve` can read known limits as `max_input_tokens` from
+`/v1/models`. Claude Code's gateway discovery currently reads the names and
+descriptions from that list, so direct connections need their own context setting.
+[Claude Code context settings](https://code.claude.com/docs/en/model-config#correct-the-window-for-a-gateway-or-custom-model-id)
+
 When multiple providers serve the same model, choose the provider-qualified alias
 to control which provider receives the request. ox routes each alias to a single
 upstream. Price-based routing and cross-provider failover are currently unavailable.

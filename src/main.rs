@@ -291,8 +291,14 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
             (command, None)
         }
         ClientKind::Claude => {
-            let (command, settings) =
-                clients::claude_command(args, &origin, &token, &app.claude_aliases(), &env_refs)?;
+            let (command, settings) = clients::claude_command(
+                args,
+                &origin,
+                &token,
+                &app.claude_aliases(),
+                &env_refs,
+                |model| app.claude_context_window(model),
+            )?;
             (command, Some(settings))
         }
     };

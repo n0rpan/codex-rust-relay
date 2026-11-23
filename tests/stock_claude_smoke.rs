@@ -411,6 +411,17 @@ fn run_scenario(endpoint: Endpoint) {
         ],
     );
     let initial_events = json_lines(&initial);
+    let usage = initial_events
+        .iter()
+        .find(|event| event["type"] == "result")
+        .and_then(|event| event["modelUsage"].as_object())
+        .expect("stock Claude Code should report its model usage");
+    assert!(
+        usage
+            .values()
+            .any(|entry| entry["contextWindow"] == 131_072),
+        "Claude Code must use the configured context window: {usage:?}"
+    );
     let session = claude_session(&initial_events);
     let calls = assert_coding_stream(&initial_events);
     assert_eq!(

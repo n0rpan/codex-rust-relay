@@ -35,6 +35,10 @@ struct ProviderModel {
     capabilities: Capabilities,
     #[serde(default)]
     limit: Limits,
+    #[serde(default)]
+    context_length: Value,
+    #[serde(default)]
+    max_input_tokens: Value,
 }
 
 #[derive(Default, Deserialize)]
@@ -139,6 +143,8 @@ impl ModelSpec {
             .context
             .into_iter()
             .chain(model.limit.input)
+            .chain(model.context_length.as_u64())
+            .chain(model.max_input_tokens.as_u64())
             .filter(|limit| *limit > 0)
             .min();
         let mut input_modalities = vec!["text".to_owned()];
@@ -355,6 +361,34 @@ mod tests {
         assert_eq!(models[1]["slug"], "bundled-model");
         assert_eq!(models[1]["visibility"], "hide");
         assert_eq!(models[1]["supported_in_api"], false);
+    }
+
+    #[test]
+    fn reads_context_from_each_catalog_and_uses_the_tightest_limit() {
+        let upstream = serde_json::from_value::<ProviderModels>(json!({
+            "data": [
+                {"id": "go", "limit": {"context": 1_000_000, "output": 131_072}},
+                {"id": "router", "context_length": 256_000},
+                {"id": "anthropic", "max_input_tokens": 200_000},
+                {"id": "bounded", "limit": {"context": 256_000, "input": 200_000}, "context_length": 128_000},
+                {"id": "unknown", "context_length": "unspecified", "max_input_tokens": 0}
+            ]
+        }))
+        .unwrap();
+        let limits: Vec<_> = merge_models(Some(upstream), &[])
+            .into_iter()
+            .map(|model| model.context_window)
+            .collect();
+        assert_eq!(
+            limits,
+            [
+                Some(1_000_000),
+                Some(256_000),
+                Some(200_000),
+                Some(128_000),
+                None
+            ]
+        );
     }
 
     #[test]

@@ -34,6 +34,27 @@ impl App {
         configured.into_iter().map(str::to_owned).collect()
     }
 
+    pub(super) fn claude_context_window(&self, model: &str) -> Option<u64> {
+        let Mode::Codeox {
+            vendors, routes, ..
+        } = &self.mode
+        else {
+            return None;
+        };
+        let Resolution::Route(target) = routes.resolve(model) else {
+            return None;
+        };
+        vendors[target.vendor].auth.as_ref()?;
+        self.visible_models().find_map(|entry| {
+            let window = entry["context_window"].as_u64()?;
+            let Resolution::Route(route) = routes.resolve(entry["slug"].as_str()?) else {
+                return None;
+            };
+            (route.vendor == target.vendor && route.upstream_model == target.upstream_model)
+                .then_some(window)
+        })
+    }
+
     pub(super) async fn handle_messages_client(
         &self,
         request: Request<Incoming>,
@@ -53,13 +74,17 @@ impl App {
                 let data: Vec<_> = self
                     .visible_models()
                     .map(|entry| {
-                        json!({
+                        let mut model = json!({
                             "id": entry["slug"],
                             "display_name": entry["display_name"],
                             "description": entry["description"],
                             "type": "model",
                             "created_at": "1970-01-01T00:00:00Z",
-                        })
+                        });
+                        if let Some(window) = entry["context_window"].as_u64() {
+                            model["max_input_tokens"] = json!(window);
+                        }
+                        model
                     })
                     .collect();
                 json_response(

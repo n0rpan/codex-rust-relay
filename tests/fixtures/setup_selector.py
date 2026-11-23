@@ -30,6 +30,7 @@ def run(
         bindir = home / "bin"
         bindir.mkdir()
         trace = home / "trace"
+        context_trace = home / "context"
         original = 'model_provider = "openai"\n'
         (home / "config.toml").write_text(original)
         if config is not None:
@@ -61,12 +62,15 @@ if env | grep -q '^CUSTOM_.*_API_KEY='; then
     exit 9
 fi
 printf '%s\\n' "$(basename "$0")" "$@" > "$FIXTURE_TRACE"
+if [ "$(basename "$0")" = claude ]; then
+    printf '%s' "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-}" > "$FIXTURE_CONTEXT"
+fi
 ''')
             fake.chmod(0o755)
         env = {
             "HOME": tmp, "CODEX_HOME": tmp, "CLAUDE_CONFIG_DIR": tmp,
             "PATH": f"{bindir}:/usr/bin:/bin", "FIXTURE_TRACE": str(trace),
-            "TERM": "xterm-256color",
+            "TERM": "xterm-256color", "FIXTURE_CONTEXT": str(context_trace),
             "FIXTURE_SIGNED_IN": "yes" if signed_in else "no",
             "FIXTURE_CLAUDE_SIGNED_IN": "yes" if claude_signed_in else "no",
             "OPENROUTER_API_KEY": "dummy-fixture-credential",
@@ -132,6 +136,7 @@ printf '%s\\n' "$(basename "$0")" "$@" > "$FIXTURE_TRACE"
                     assert launched.returncode == 0, launched.stderr
                     argv = trace.read_text().splitlines()
                     assert argv[0] == client and argv[-2:] == ["--model", model], argv
+                assert context_trace.read_text() == "123456"
                 with socket.socket() as sock:
                     sock.bind(("127.0.0.1", 0))
                     port = sock.getsockname()[1]
@@ -150,7 +155,8 @@ printf '%s\\n' "$(basename "$0")" "$@" > "$FIXTURE_TRACE"
                         )
                         http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
                         with http.open(req, timeout=5) as response:
-                            assert model in {item["id"] for item in json.load(response)["data"]}
+                            limits = {item["id"]: item.get("max_input_tokens") for item in json.load(response)["data"]}
+                            assert limits.get(model) == 123456
                     finally:
                         daemon.terminate()
                         daemon.wait(timeout=5)
@@ -223,7 +229,7 @@ class Catalog(http.server.BaseHTTPRequestHandler):
         self.send_response(200 if ok else 401)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(b'{"data":[{"id":"fixture"}]}')
+        self.wfile.write(b'{"data":[{"id":"fixture","limit":{"context":123456}}]}')
 
     def log_message(self, *args):
         pass

@@ -271,13 +271,15 @@ impl Drop for ClaudeLaunchSettings {
 /// Returns the command together with the settings-file guard; keep the guard
 /// alive until the child exits. Model selection is expressed through the
 /// launch-scoped settings plus environment so an explicit `--model` remains
-/// authoritative.
+/// authoritative. Metadata for that model can supply Claude's starting context
+/// window.
 pub(crate) fn claude_command(
     args: Vec<OsString>,
     origin: &str,
     token: &str,
     aliases: &[String],
     env_refs: &BTreeSet<String>,
+    context_window_for: impl FnOnce(&str) -> Option<u64>,
 ) -> Result<(Command, ClaudeLaunchSettings), RelayError> {
     let base_url = anthropic_base_url(origin)?;
     if !valid_token(token) {
@@ -330,8 +332,6 @@ pub(crate) fn claude_command(
             overlay_env.insert(name.to_owned(), Value::String(String::new()));
         }
     }
-    let (args, settings) = inject_settings(args, overlay_env)?;
-
     let mut command = Command::new("claude");
     // Vendor and search credentials are relay-only and must never reach the
     // stock client. The one-time relay token is not needed by Claude either.
@@ -343,6 +343,26 @@ pub(crate) fn claude_command(
         .env_remove(DEFAULT_SEARCH_ENV_KEY);
     for name in SCRUBBED_ENV {
         command.env_remove(name);
+    }
+
+    // Claude Code reads this once per process for custom model IDs. Use the
+    // starting model's window, leaving user overrides in env/settings in force.
+    const CONTEXT_ENV: &str = "CLAUDE_CODE_MAX_CONTEXT_TOKENS";
+    let starting_model = match requested {
+        Some("opus") => Some(opus),
+        Some("sonnet") => Some(sonnet),
+        Some("haiku") => Some(haiku),
+        Some(model) if is_reserved_model_alias(model) => None,
+        Some(model) => Some(model),
+        None => Some(default.as_str()),
+    };
+    if !env_refs
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(CONTEXT_ENV))
+        && std::env::var_os(CONTEXT_ENV).is_none()
+        && let Some(window) = starting_model.and_then(context_window_for)
+    {
+        command.env(CONTEXT_ENV, window.to_string());
     }
 
     const MODEL_DISCOVERY_ENV: &str = "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY";
@@ -373,6 +393,7 @@ pub(crate) fn claude_command(
         command.env(name, loopback_no_proxy(&existing));
     }
 
+    let (args, settings) = inject_settings(args, overlay_env)?;
     command.args(args).kill_on_drop(true);
     Ok((command, settings))
 }
@@ -879,7 +900,7 @@ mod tests {
         aliases: &[String],
         env_refs: &BTreeSet<String>,
     ) -> (Command, ClaudeLaunchSettings) {
-        claude_command(args, origin, token, aliases, env_refs).unwrap()
+        claude_command(args, origin, token, aliases, env_refs, |_| None).unwrap()
     }
 
     fn env_entry(command: &Command, name: &str) -> Option<Option<String>> {
@@ -1367,7 +1388,8 @@ mod tests {
                     "http://127.0.0.1:1",
                     "t",
                     &aliases(&["a/b"]),
-                    &refs(&[])
+                    &refs(&[]),
+                    |_| None,
                 )
                 .is_err()
             );
@@ -1381,6 +1403,7 @@ mod tests {
                 "t",
                 &aliases(&["a/b"]),
                 &refs(&[]),
+                |_| None,
             )
             .is_err()
         );
@@ -1470,6 +1493,7 @@ mod tests {
                 "t",
                 &aliases(&["a/b"]),
                 &refs(&[]),
+                |_| None,
             )
             .unwrap_err();
             assert!(error.to_string().contains("managed"));
@@ -1560,8 +1584,15 @@ mod tests {
 
     #[test]
     fn empty_alias_list_accepts_only_an_explicit_model() {
-        let error =
-            claude_command(Vec::new(), "http://127.0.0.1:1", "t", &[], &refs(&[])).unwrap_err();
+        let error = claude_command(
+            Vec::new(),
+            "http://127.0.0.1:1",
+            "t",
+            &[],
+            &refs(&[]),
+            |_| None,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("--model"));
 
         let (command, settings) = launch(
@@ -1618,6 +1649,7 @@ mod tests {
             "t",
             &aliases(&["sonnet"]),
             &refs(&[]),
+            |_| None,
         )
         .unwrap_err();
         assert!(error.to_string().contains("built-in"));
@@ -1656,7 +1688,8 @@ mod tests {
                     "http://127.0.0.1:1",
                     "t",
                     std::slice::from_ref(&alias),
-                    &refs(&[])
+                    &refs(&[]),
+                    |_| None,
                 )
                 .is_err(),
                 "{alias:?} should be rejected"
@@ -1670,7 +1703,8 @@ mod tests {
                     "http://127.0.0.1:1",
                     token,
                     &aliases(&["a/b"]),
-                    &refs(&[])
+                    &refs(&[]),
+                    |_| None,
                 )
                 .is_err(),
                 "{token:?} should be rejected"
@@ -1683,7 +1717,8 @@ mod tests {
                 "http://127.0.0.1:1",
                 "t",
                 &aliases(&["a/b"]),
-                &refs(&[])
+                &refs(&[]),
+                |_| None,
             )
             .is_err()
         );
