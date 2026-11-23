@@ -205,8 +205,8 @@ fn stock_codex_keeps_native_auth_and_codeox_uses_the_vendor_key_on_the_same_home
         version.contains(STOCK_CODEX_VERSION),
         "this fixture records {STOCK_CODEX_VERSION} wire shapes, but CODEOX_TEST_CODEX_BIN reports {version:?}"
     );
-    require_tool("python3");
-    require_tool("openssl");
+    require_tool("python3", "--version");
+    require_tool("openssl", "version");
 
     let tree = TempTree::new("shared-home");
     let home = tree.path.join("home");
@@ -585,9 +585,9 @@ fn codex_version(codex: &Path) -> String {
     .to_owned()
 }
 
-fn require_tool(tool: &str) {
+fn require_tool(tool: &str, version_arg: &str) {
     let status = Command::new(tool)
-        .arg("--version")
+        .arg(version_arg)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
