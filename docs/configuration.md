@@ -290,7 +290,10 @@ ox reads advertised context limits from model discovery and uses a static
 model catalog. For a custom model ID in `ox claude`, ox gives Claude Code the
 starting model’s limit through `CLAUDE_CODE_MAX_CONTEXT_TOKENS`. A value you set
 in your shell or Claude settings can override that. If discovery omits the limit,
-set `context_window` on the model entry.
+set `context_window` on the model entry. For Alibaba Cloud's
+`deepseek-v4.1-flash-1017`, ox uses the published 1,000,000-token limit when
+the catalog omits it.
+[Alibaba Cloud model announcement](https://www.alibabacloud.com/notice/detail?_p_lc=1&id=2225)
 
 Claude Code reads the limit for the whole process. Relaunch through ox when
 changing to a custom model with a different limit. Claude Code can keep its
@@ -361,35 +364,60 @@ See [search limits](compatibility.md#search-and-fetch) for filters and supported
 
 ## Claude Code Auto mode
 
-The [CLI settings example](../examples/claude-code-auto.settings.json) retains Claude
-Code's default classifier and asks before `WebFetch`. The commands below pass the
-same settings inline, so they work from your own project directory.
-
-Add `claude-sonnet-5` on the current Anthropic route or use the
-[provider example](../examples/claude-providers.toml), then launch:
+Add Anthropic in `ox setup`, then run `ox doctor` to check that your key is
+available. Start a session on a model your Anthropic account can use:
 
 ```sh
-ox claude --model anthropic/claude-sonnet-5 --permission-mode auto \
-  --settings '{"autoMode":{"environment":["$defaults"]},"permissions":{"ask":["WebFetch"]}}'
+ox claude --model anthropic/claude-sonnet-5 --permission-mode auto
 ```
 
-For a translated model, route Claude Code's classifier requests to a configured model that
-supports review. This example uses the OpenRouter model from the quickstart and the same
-Anthropic classifier route as above.
+On eligible native Anthropic routes, ox forwards the beta header, `safeguards`,
+streamed `safeguard_results`, and tool-use IDs. Check the **Auto mode server** row
+in Claude Code's `/status` to see whether server review is active.
+[Claude Code classifier billing](https://code.claude.com/docs/en/auto-mode-classifier-billing#make-the-session-eligible)
+
+When a session starts on a translated model, ox defaults
+`CLAUDE_CODE_AUTO_MODE_SERVER` to `0`. Claude Code handles the review through
+separate classifier requests, which can count toward API usage. To use a configured
+Anthropic model for those requests, add `--client-classifier auto`:
 
 ```sh
-CLAUDE_CODE_AUTO_MODE_SERVER=0 CLAUDE_CODE_AUTO_MODE_MODEL=anthropic/claude-sonnet-5 \
-  ox claude --model openrouter/openai/gpt-5.4-mini --permission-mode auto \
-  --settings '{"autoMode":{"environment":["$defaults"]},"permissions":{"ask":["WebFetch"]}}'
+ox claude --model openrouter/openai/gpt-5.4-mini --permission-mode auto \
+  --client-classifier auto
 ```
 
-The classifier receives action context through the Anthropic route. Check `/status` for
-the effective permission mode and server review setting. Claude Code can fall back to
-Manual mode if a model is ineligible. If an unfamiliar alias makes the client assume a
-larger context window than the endpoint supports, set `CLAUDE_CODE_MAX_CONTEXT_TOKENS`
-to the actual limit. [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes#auto-mode)
+ox looks for Sonnet 5, then Sonnet 4.6, in the catalog of configured direct
+Anthropic routes with credentials. If neither is available, Claude Code chooses
+its own classifier. You can also select a specific Anthropic Messages alias, such
+as `--client-classifier anthropic/claude-sonnet-4-6`. That route receives the
+action context needed for review. Model selection for classifier requests
+requires Claude Code 2.1.302 or later. Claude Code can deny checked actions if
+the classifier is unavailable. The server setting applies for the launch.
+Start a new session on a native model to use its server checks.
+[Claude Code classifier model selection](https://code.claude.com/docs/en/permission-modes#choose-the-classifier-model)
 
-Claude Desktop 3P users can also configure a stable [ox gateway](shared-gateway.md#claude-desktop-on-3p)
+The [CLI settings example](../examples/claude-code-auto.settings.json) keeps
+Claude Code's default classifier and asks before `WebFetch`.
+
+### Fine-grained tool streaming
+
+For a native Anthropic endpoint that supports fine-grained tool streaming, opt in
+when starting Claude Code through ox:
+
+```sh
+CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1 \
+  ox claude --model anthropic/claude-sonnet-5
+```
+
+Claude Code leaves this off by default on custom gateways. Enabling it lets a
+compatible provider send tool arguments as they are generated. It applies to
+tool arguments and leaves answer text generation and Auto mode review timing
+to their respective upstream requests. To time provider inference on its own,
+run `ox doctor --live --provider anthropic --model claude-sonnet-5`. It reports
+time to the first stream event and first visible text.
+[Claude Code feature pass-through](https://code.claude.com/docs/en/llm-gateway-protocol#feature-pass-through)
+
+For Desktop, configure a stable [ox gateway](shared-gateway.md#claude-desktop-on-3p)
 and adapt the [Desktop web-tools overlay](../examples/claude-desktop-web-tools.json).
 
 ## Sessions and sign-in

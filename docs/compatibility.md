@@ -36,6 +36,32 @@ Direct OpenAI returned `codex_byok_restricted_by_api_credit_promo` for the API-c
 account tested. The Responses success above used a separate OpenRouter account.
 Tool availability, context windows, quotas and key permissions depend on the provider and model.
 
+## Claude Code gateway protocol
+
+Use `ANTHROPIC_BASE_URL` with `ox serve`, or let `ox claude` configure the
+connection for you. ox exposes the Anthropic Messages format and routes each
+model to the API configured for its provider.
+[Claude Code gateway guide](https://code.claude.com/docs/en/llm-gateway-protocol)
+
+| Feature | What ox supports |
+| --- | --- |
+| Messages and authentication | `POST /v1/messages` accepts Claude Code's `?beta=true` request. Authenticate to ox with a bearer token or `x-api-key`. The provider uses its own configured API credential. |
+| Native Anthropic streaming | Streams the upstream event sequence directly, including pings, partial tool arguments, signed thinking and safeguards. Fine-grained tool streaming is a [client opt-in](configuration.md#fine-grained-tool-streaming). |
+| Native Anthropic request fields | Preserves system block order, cache markers and beta body fields. Uses the route's configured `anthropic_version` and applies its sampling rules. Forwards valid `anthropic-beta` values, including repeated headers. |
+| Retries and limits | Native Messages preserves standard bounded error envelopes and retry or usage-limit metadata when those values contain no configured credential. A synthesized error can lack the details Claude Code uses for automatic feature recovery. |
+| Model discovery | Authenticated `GET /v1/models` reports the aliases and any known context limits. Claude Code's automatic discovery filters IDs to names containing `claude` or `anthropic`. Use ox's [starred lineup and context settings](configuration.md#model-names-and-discovery) for other models. |
+| Translated streaming | Delivers translated text, tool events and terminal status. It does not generate idle pings or Anthropic server-side safety verdicts. [Set up Claude Code's classifier](configuration.md#claude-code-auto-mode) for these routes. |
+| Optional endpoints | Claude Code estimates usage locally because `/v1/messages/count_tokens` is unavailable. The `HEAD /api/hello` warm-up is unsupported. |
+| Other connection methods | Bedrock InvokeModel, Vertex `rawPredict`, AWS workspace headers and Claude apps gateway sign-in are outside this implementation. Stock subscription sign-ins run in their native clients. |
+
+ox authenticates upstream with the provider credential. Its native relay drops
+client auth headers and currently only passes `anthropic-beta` from the
+`anthropic-*` request headers. For older Claude models behind custom aliases,
+you can set `modelOverrides` in Claude Code to give the alias the upstream
+model's capabilities. Claude Code's fast-mode availability check and WebFetch
+domain check use its own direct connection to `api.anthropic.com`.
+[Custom model capabilities](https://code.claude.com/docs/en/llm-gateway-protocol#settings-for-unrecognized-model-ids)
+
 ## Where API translation ends
 
 - **Native paths.** Codex to a Responses provider streams the upstream response directly.
@@ -120,5 +146,8 @@ apply their own tool permissions and shell sandbox rules. [Claude Desktop web to
   300 seconds between reads. An active stream can last longer.
 - Successful native Responses stream bytes are forwarded. Bounded native Messages
   error envelopes pass through when they contain no configured credentials.
-  Other HTTP error details are reduced and redacted. Numeric `Retry-After` is preserved on `429` where supported.
+  Other HTTP error details are reduced and redacted. Buffered native Messages
+  replies also keep numeric `Retry-After`, boolean `x-should-retry`, and bounded
+  unified rate-limit headers when they contain no configured credential.
+  Translated failures preserve numeric `Retry-After` on `429` where supported.
   Closing the client stream cancels the upstream request.

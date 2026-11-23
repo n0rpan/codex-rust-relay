@@ -58,13 +58,11 @@ type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, RelayError>> + Send>>;
 
 /// Answer one Claude Code Messages request from the routed vendor.
 ///
-/// `beta` is the caller's `anthropic-beta` header value, if any. It is only
-/// forwarded on the native Anthropic wire.
+/// Anthropic beta headers are forwarded only on the native Anthropic wire.
 pub(crate) async fn infer(
     client: &Client,
     context: Translation<'_>,
     payload: Value,
-    beta: Option<&str>,
 ) -> Response<crate::RelayBody> {
     if !payload.is_object() {
         return messages_error(
@@ -74,7 +72,7 @@ pub(crate) async fn infer(
         );
     }
     match context.vendor.wire {
-        Wire::AnthropicMessages => infer_native(client, context, payload, beta).await,
+        Wire::AnthropicMessages => infer_native(client, context, payload).await,
         Wire::Responses | Wire::ChatCompletions => infer_translated(client, context, payload).await,
     }
 }
@@ -84,7 +82,6 @@ async fn infer_native(
     client: &Client,
     context: Translation<'_>,
     payload: Value,
-    beta: Option<&str>,
 ) -> Response<crate::RelayBody> {
     let wants_stream = payload
         .get("stream")
@@ -92,13 +89,8 @@ async fn infer_native(
         .unwrap_or(false);
     let payload = prepare_native_body(payload, context.vendor, context.upstream_model);
 
-    let headers = match native_headers(
-        context.vendor,
-        context.key,
-        context.incoming,
-        beta,
-        wants_stream,
-    ) {
+    let headers = match native_headers(context.vendor, context.key, context.incoming, wants_stream)
+    {
         Ok(headers) => headers,
         Err(_) => {
             return messages_error(
@@ -130,6 +122,13 @@ async fn infer_native(
     if upstream::is_http_failure(&upstream) {
         return messages_http_failure(upstream, &context.secrets, true).await;
     }
+    if upstream.status().is_redirection() {
+        return messages_error(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            "provider returned an unexpected redirect",
+        );
+    }
 
     // Trust the response, not only the request flag: a vendor that does return
     // SSE must be streamed, and one that returned JSON is relayed as JSON.
@@ -146,6 +145,7 @@ async fn infer_native(
     }
 
     let status = upstream.status();
+    let metadata = native_response_metadata(upstream.headers(), &context.secrets);
     let bytes = match crate::read_upstream(upstream, MAX_NATIVE_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -157,7 +157,11 @@ async fn infer_native(
         }
     };
     match serde_json::from_slice::<Value>(&bytes) {
-        Ok(value) => crate::json_response(status, value),
+        Ok(value) => {
+            let mut response = crate::json_response(status, value);
+            response.headers_mut().extend(metadata);
+            response
+        }
         Err(_) => messages_error(
             StatusCode::BAD_GATEWAY,
             "api_error",
@@ -588,7 +592,6 @@ fn native_headers(
     vendor: &Vendor,
     key: &SecretKey,
     incoming: Option<&HeaderMap>,
-    beta: Option<&str>,
     wants_stream: bool,
 ) -> Result<HeaderMap, RelayError> {
     let mut headers = vendor.inference_headers(key, incoming)?;
@@ -596,26 +599,26 @@ fn native_headers(
     if wants_stream {
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
     }
-    if let Some(value) = beta_header_value(beta) {
-        headers.insert(ANTHROPIC_BETA, value);
+    if let Some(incoming) = incoming {
+        for value in incoming.get_all(&ANTHROPIC_BETA) {
+            if valid_beta(value.to_str().ok()) {
+                headers.append(ANTHROPIC_BETA, value.clone());
+            }
+        }
     }
     Ok(headers)
 }
 
 /// Accept a conservative `anthropic-beta` token list, never an arbitrary
 /// header value.
-fn beta_header_value(beta: Option<&str>) -> Option<HeaderValue> {
-    let beta = beta?.trim();
-    if beta.is_empty() || beta.len() > MAX_BETA_CHARS {
-        return None;
-    }
-    let allowed = beta.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b',' | b' ')
-    });
-    if !allowed {
-        return None;
-    }
-    HeaderValue::from_str(beta).ok()
+fn valid_beta(beta: Option<&str>) -> bool {
+    beta.is_some_and(|beta| {
+        beta.len() <= MAX_BETA_CHARS
+            && !beta.trim().is_empty()
+            && beta.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b',' | b' ')
+            })
+    })
 }
 
 /// Turn a buffered relay body into a byte stream so cancellation of the
@@ -651,22 +654,54 @@ async fn messages_http_failure(
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u32>().ok());
+    let metadata = native.then(|| native_response_metadata(response.headers(), secrets));
     let body = read_upstream_error(response).await;
-    if native
+    let mut downstream = if native
         && let Some(body) = &body
         && body["type"] == "error"
         && body["error"]["type"].is_string()
         && body["error"]["message"].is_string()
         && !contains_secret(body, secrets)
     {
-        let mut downstream = crate::json_response(status, body.clone());
+        crate::json_response(status, body.clone())
+    } else {
+        let message = upstream_error(status.as_u16(), body.as_ref(), secrets);
+        messages_error(status, kind_for_status(status), &message)
+    };
+    if let Some(metadata) = metadata {
+        downstream.headers_mut().extend(metadata);
+    } else {
         copy_retry_after(&mut downstream, status, retry_after, secrets);
-        return downstream;
     }
-    let message = upstream_error(status.as_u16(), body.as_ref(), secrets);
-    let mut downstream = messages_error(status, kind_for_status(status), &message);
-    copy_retry_after(&mut downstream, status, retry_after, secrets);
     downstream
+}
+
+/// Metadata Claude Code uses for retry and usage-limit decisions, filtered
+/// before attaching it to a buffered native Messages response.
+fn native_response_metadata(headers: &HeaderMap, secrets: &[String]) -> HeaderMap {
+    let mut metadata = HeaderMap::new();
+    for (name, value) in headers {
+        let Ok(text) = value.to_str() else {
+            continue;
+        };
+        let supported = match name.as_str() {
+            "retry-after" => {
+                !text.is_empty()
+                    && text.bytes().all(|byte| byte.is_ascii_digit())
+                    && text.parse::<u32>().is_ok()
+            }
+            "x-should-retry" => matches!(text, "true" | "false"),
+            name => name.starts_with("anthropic-ratelimit-unified-") && text.len() <= 1024,
+        };
+        if supported
+            && !secrets
+                .iter()
+                .any(|key| !key.is_empty() && (text.contains(key) || name.as_str().contains(key)))
+        {
+            metadata.append(name, value.clone());
+        }
+    }
+    metadata
 }
 
 fn contains_secret(value: &Value, secrets: &[String]) -> bool {
@@ -878,6 +913,15 @@ mod tests {
 
     impl MockUpstream {
         fn spawn(status: u16, content_type: &'static str, reply: &'static str) -> Self {
+            Self::spawn_with_headers(status, content_type, reply, &[])
+        }
+
+        fn spawn_with_headers(
+            status: u16,
+            content_type: &'static str,
+            reply: &'static str,
+            extra_headers: &'static [(&str, &str)],
+        ) -> Self {
             let hits = Arc::new(Mutex::new(Vec::new()));
             let recorded = Arc::clone(&hits);
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -914,6 +958,12 @@ mod tests {
                                 response
                                     .headers_mut()
                                     .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+                                for &(name, value) in extra_headers {
+                                    response.headers_mut().append(
+                                        HeaderName::from_static(name),
+                                        HeaderValue::from_static(value),
+                                    );
+                                }
                                 Ok::<_, Infallible>(response)
                             }
                         });
@@ -986,7 +1036,6 @@ mod tests {
             &Client::new(),
             context(&vendor, &key, &secrets),
             json!([1, 2, 3]),
-            None,
         )
         .await;
         let (status, body) = response_json(response).await;
@@ -1047,29 +1096,37 @@ mod tests {
     }
 
     #[test]
-    fn beta_is_forwarded_only_when_it_is_a_safe_token_list() {
-        assert_eq!(
-            beta_header_value(Some(
-                "interleaved-thinking-2025-05-14,context-1m-2025-08-07"
-            ))
-            .unwrap(),
-            "interleaved-thinking-2025-05-14,context-1m-2025-08-07"
-        );
-        assert!(beta_header_value(Some("  ")).is_none());
-        assert!(beta_header_value(Some("bad\r\nX-Injected: 1")).is_none());
-        assert!(beta_header_value(Some("semi;colon")).is_none());
-        assert!(beta_header_value(Some(&"a".repeat(MAX_BETA_CHARS + 1))).is_none());
-        assert!(beta_header_value(None).is_none());
-    }
-
-    #[test]
-    fn native_headers_never_copy_caller_authentication() {
+    fn native_headers_forward_beta_values_and_drop_caller_authentication() {
         let vendor = vendor(Wire::AnthropicMessages);
         let key = SecretKey::new("sk-vendor-key".to_owned());
-        let headers = native_headers(&vendor, &key, None, Some("beta-1"), true).unwrap();
+        let mut incoming = HeaderMap::new();
+        incoming.append(
+            ANTHROPIC_BETA,
+            HeaderValue::from_static("interleaved-thinking-2025-05-14"),
+        );
+        incoming.append(
+            ANTHROPIC_BETA,
+            HeaderValue::from_static("dangerous-tool-use-2026-09-03"),
+        );
+        incoming.append(ANTHROPIC_BETA, HeaderValue::from_static("bad;value"));
+        incoming.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer relay-fixture"),
+        );
+        incoming.insert("x-api-key", HeaderValue::from_static("relay-fixture"));
+        let headers = native_headers(&vendor, &key, Some(&incoming), true).unwrap();
         assert_eq!(headers["x-api-key"], "sk-vendor-key");
         assert_eq!(headers["anthropic-version"], "2023-06-01");
-        assert_eq!(headers[ANTHROPIC_BETA], "beta-1");
+        assert_eq!(
+            headers.get_all(&ANTHROPIC_BETA).iter().collect::<Vec<_>>(),
+            [
+                "interleaved-thinking-2025-05-14",
+                "dangerous-tool-use-2026-09-03"
+            ]
+        );
+        assert!(!valid_beta(Some("  ")));
+        assert!(!valid_beta(Some("bad\r\nX-Injected: 1")));
+        assert!(!valid_beta(Some(&"a".repeat(MAX_BETA_CHARS + 1))));
         assert_eq!(headers[ACCEPT], "text/event-stream");
         assert!(!headers.contains_key("authorization"));
     }
@@ -1345,8 +1402,15 @@ mod tests {
         const REPLY: &str = concat!(
             "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
             "event: ping\ndata: {\"type\":\"ping\"}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,",
+            "\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool-fixture\",\"name\":\"read_fixture\",\"input\":{}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,",
+            "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,",
+            "\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"fixture.txt\\\"}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
             "event: message_delta\ndata: {\"type\":\"message_delta\",",
-            "\"delta\":{\"safeguard_results\":[]}}\n\n",
+            "\"delta\":{\"safeguard_results\":[{\"tool_use_id\":\"tool-fixture\",\"decision\":\"deny\"}]}}\n\n",
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
         let mock = MockUpstream::spawn(200, "text/event-stream", REPLY);
@@ -1358,6 +1422,11 @@ mod tests {
             "max_tokens": 1024,
             "stream": true,
             "safeguards": {"fixture": true},
+            "tools": [{
+                "name": "read_fixture",
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+                "eager_input_streaming": true
+            }],
             "messages": [{
                 "role": "assistant",
                 "content": [
@@ -1366,18 +1435,24 @@ mod tests {
                 ]
             }]
         });
+        let mut incoming = HeaderMap::new();
+        incoming.insert(
+            ANTHROPIC_BETA,
+            HeaderValue::from_static(
+                "interleaved-thinking-2025-05-14,dangerous-tool-use-2026-09-03",
+            ),
+        );
         let response = infer(
             &Client::new(),
             Translation {
                 vendor: &vendor,
                 key: &key,
-                incoming: None,
+                incoming: Some(&incoming),
                 upstream_model: "real-model",
                 requested_model: "vendor/upstream-model",
                 secrets: Arc::clone(&secrets),
             },
             payload,
-            Some("interleaved-thinking-2025-05-14,dangerous-tool-use-2026-09-03"),
         )
         .await;
 
@@ -1397,6 +1472,7 @@ mod tests {
         assert!(!hit.headers.contains_key("authorization"));
         assert_eq!(hit.body["model"], "real-model");
         assert_eq!(hit.body["safeguards"], json!({"fixture": true}));
+        assert_eq!(hit.body["tools"][0]["eager_input_streaming"], true);
         assert_eq!(hit.body["messages"][0]["content"][0]["signature"], "c2ln");
         assert_eq!(hit.body["messages"][0]["content"][1]["text"], "answer");
         assert_eq!(hit.body["stream"], true);
@@ -1405,7 +1481,12 @@ mod tests {
     #[tokio::test]
     async fn native_wire_relays_non_streaming_json_unchanged() {
         const REPLY: &str = r#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"thinking","thinking":"t","signature":"sig"},{"type":"text","text":"ok"}],"model":"real-model","stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}"#;
-        let mock = MockUpstream::spawn(200, "application/json", REPLY);
+        let mock = MockUpstream::spawn_with_headers(
+            200,
+            "application/json",
+            REPLY,
+            &[("anthropic-ratelimit-unified-status", "allowed")],
+        );
         let vendor = vendor_at(&mock.base, Wire::AnthropicMessages);
         let key = SecretKey::new("sk-vendor-key".to_owned());
         let secrets = Arc::new(vec!["sk-vendor-key".to_owned()]);
@@ -1424,11 +1505,14 @@ mod tests {
                 "max_tokens": 16,
                 "messages": [{"role": "user", "content": "hi"}]
             }),
-            None,
         )
         .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["anthropic-ratelimit-unified-status"],
+            "allowed"
+        );
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let relayed: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(relayed, serde_json::from_str::<Value>(REPLY).unwrap());
@@ -1442,7 +1526,18 @@ mod tests {
     #[tokio::test]
     async fn native_wire_preserves_the_context_limit_error_envelope() {
         const ERROR: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 200001 tokens > 200000 maximum"},"request_id":"req_fixture"}"#;
-        let mock = MockUpstream::spawn(400, "application/json", ERROR);
+        let mock = MockUpstream::spawn_with_headers(
+            400,
+            "application/json",
+            ERROR,
+            &[
+                ("x-should-retry", "false"),
+                ("retry-after", "17"),
+                ("anthropic-ratelimit-unified-status", "rejected"),
+                ("anthropic-ratelimit-unified-fixture", "sk-vendor-key"),
+                ("x-fixture", "sk-vendor-key"),
+            ],
+        );
         let vendor = vendor_at(&mock.base, Wire::AnthropicMessages);
         let key = SecretKey::new("sk-vendor-key".to_owned());
         let response = infer(
@@ -1456,9 +1551,20 @@ mod tests {
                 secrets: Arc::new(vec!["sk-vendor-key".to_owned()]),
             },
             json!({"model": "vendor/upstream-model", "max_tokens": 10, "messages": []}),
-            None,
         )
         .await;
+        assert_eq!(response.headers()["x-should-retry"], "false");
+        assert_eq!(response.headers()[RETRY_AFTER], "17");
+        assert_eq!(
+            response.headers()["anthropic-ratelimit-unified-status"],
+            "rejected"
+        );
+        assert!(
+            !response
+                .headers()
+                .contains_key("anthropic-ratelimit-unified-fixture")
+        );
+        assert!(!response.headers().contains_key("x-fixture"));
         let (status, body) = response_json(response).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body, serde_json::from_str::<Value>(ERROR).unwrap());
@@ -1485,7 +1591,6 @@ mod tests {
                 secrets,
             },
             json!({"model": "vendor/upstream-model", "max_tokens": 10, "messages": []}),
-            None,
         )
         .await;
         let (status, body) = response_json(response).await;
@@ -1495,6 +1600,29 @@ mod tests {
         let message = body["error"]["message"].as_str().unwrap();
         assert!(message.contains("[redacted]"));
         assert!(!message.contains("sk-vendor-key"));
+    }
+
+    #[tokio::test]
+    async fn native_wire_does_not_relay_redirects_even_with_sse_content_type() {
+        let mock = MockUpstream::spawn_with_headers(
+            302,
+            "text/event-stream",
+            "",
+            &[("location", "https://untrusted.example/")],
+        );
+        let vendor = vendor_at(&mock.base, Wire::AnthropicMessages);
+        let key = SecretKey::new("sk-vendor-key".to_owned());
+        let secrets = Arc::new(vec!["sk-vendor-key".to_owned()]);
+        let client = crate::upstream_client().unwrap();
+        let response = infer(
+            &client,
+            context(&vendor, &key, &secrets),
+            json!({"model": "vendor/upstream-model", "stream": true, "messages": []}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(!response.headers().contains_key("location"));
+        mock.only_hit();
     }
 
     #[tokio::test]

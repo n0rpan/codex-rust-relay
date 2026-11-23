@@ -34,24 +34,66 @@ impl App {
         configured.into_iter().map(str::to_owned).collect()
     }
 
-    pub(super) fn claude_context_window(&self, model: &str) -> Option<u64> {
+    pub(super) fn client_classifier(
+        &self,
+        request: &str,
+    ) -> Result<Option<String>, crate::provider::RelayError> {
+        use crate::provider::Wire;
+        let Mode::Codeox {
+            vendors, routes, ..
+        } = &self.mode
+        else {
+            return Ok(None);
+        };
+        if request != "auto" {
+            if let Ok((route, _, _)) = resolve_model(vendors, routes, request)
+                && route.wire == Wire::AnthropicMessages
+            {
+                return Ok(Some(request.to_owned()));
+            }
+            return Err("--client-classifier needs a model alias on an available Anthropic Messages provider".into());
+        }
+        let model_preference = ["claude-sonnet-5", "claude-sonnet-4-6"];
+        Ok(self
+            .visible_models()
+            .filter_map(|entry| {
+                let alias = entry["slug"].as_str()?;
+                let (route, state, _) = resolve_model(vendors, routes, alias).ok()?;
+                if route.wire != Wire::AnthropicMessages
+                    || state.vendor.base_url.scheme() != "https"
+                    || state.vendor.base_url.host_str() != Some("api.anthropic.com")
+                    || state.vendor.base_url.port_or_known_default() != Some(443)
+                {
+                    return None;
+                }
+                let priority = model_preference
+                    .iter()
+                    .position(|model| *model == route.upstream_model)?;
+                Some((priority, alias))
+            })
+            .min_by_key(|(priority, _)| *priority)
+            .map(|(_, alias)| alias.to_owned()))
+    }
+
+    pub(super) fn claude_model_info(&self, model: &str) -> Option<crate::clients::ClaudeModelInfo> {
         let Mode::Codeox {
             vendors, routes, ..
         } = &self.mode
         else {
             return None;
         };
-        let Resolution::Route(target) = routes.resolve(model) else {
-            return None;
-        };
-        vendors[target.vendor].auth.as_ref()?;
-        self.visible_models().find_map(|entry| {
+        let (target, _, _) = resolve_model(vendors, routes, model).ok()?;
+        let context_window = self.visible_models().find_map(|entry| {
             let window = entry["context_window"].as_u64()?;
             let Resolution::Route(route) = routes.resolve(entry["slug"].as_str()?) else {
                 return None;
             };
             (route.vendor == target.vendor && route.upstream_model == target.upstream_model)
                 .then_some(window)
+        });
+        Some(crate::clients::ClaudeModelInfo {
+            wire: target.wire,
+            context_window,
         })
     }
 
@@ -113,10 +155,6 @@ impl App {
             );
         };
         let (parts, body) = request.into_parts();
-        let beta = parts
-            .headers
-            .get("anthropic-beta")
-            .and_then(|value| value.to_str().ok());
         let bytes = match read_bounded(body, self.max_request_bytes).await {
             Ok(bytes) => bytes,
             Err(response) => {
@@ -156,7 +194,6 @@ impl App {
                 secrets: Arc::clone(&self.secrets),
             },
             payload,
-            beta,
         )
         .await
     }

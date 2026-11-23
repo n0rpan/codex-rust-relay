@@ -262,6 +262,54 @@ impl Drop for ClaudeLaunchSettings {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct ClaudeLaunchOptions<'a> {
+    pub starred: &'a [&'a str],
+    /// None keeps the normal route-based default. Some(None) selects the
+    /// client's default model for a separate classifier request.
+    pub client_classifier: Option<Option<&'a str>>,
+}
+
+pub(crate) struct ClaudeModelInfo {
+    pub wire: crate::provider::Wire,
+    pub context_window: Option<u64>,
+}
+
+pub(crate) fn take_client_classifier(
+    args: &mut Vec<OsString>,
+) -> Result<Option<String>, RelayError> {
+    let mut classifier = None;
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        if arg == "--" {
+            break;
+        }
+        let Some(arg) = arg.to_str() else {
+            index += 1;
+            continue;
+        };
+        let (value, count) = if arg == "--client-classifier" {
+            (args.get(index + 1).and_then(|value| value.to_str()), 2)
+        } else if let Some(value) = arg.strip_prefix("--client-classifier=") {
+            (Some(value), 1)
+        } else {
+            index += 1;
+            continue;
+        };
+        if classifier.is_some() {
+            return Err("--client-classifier can only be specified once".into());
+        }
+        classifier = Some(
+            value
+                .filter(|model| valid_model_value(model) && !is_reserved_model_alias(model))
+                .ok_or("--client-classifier requires auto or an Anthropic model alias")?
+                .to_owned(),
+        );
+        args.drain(index..index + count);
+    }
+    Ok(classifier)
+}
+
 /// Builds the stock `claude` command for one relay launch.
 ///
 /// `origin` is the relay listener origin (`http://127.0.0.1:<port>`), `token`
@@ -279,8 +327,8 @@ pub(crate) fn claude_command(
     token: &str,
     aliases: &[String],
     env_refs: &BTreeSet<String>,
-    starred: &[&str],
-    context_window_for: impl FnOnce(&str) -> Option<u64>,
+    options: ClaudeLaunchOptions<'_>,
+    model_info_for: impl FnOnce(&str) -> Option<ClaudeModelInfo>,
 ) -> Result<(Command, ClaudeLaunchSettings), RelayError> {
     let base_url = anthropic_base_url(origin)?;
     if !valid_token(token) {
@@ -357,11 +405,12 @@ pub(crate) fn claude_command(
         Some(model) => Some(model),
         None => Some(default.as_str()),
     };
+    let model_info = starting_model.and_then(model_info_for);
     if !env_refs
         .iter()
         .any(|name| name.eq_ignore_ascii_case(CONTEXT_ENV))
         && std::env::var_os(CONTEXT_ENV).is_none()
-        && let Some(window) = starting_model.and_then(context_window_for)
+        && let Some(window) = model_info.as_ref().and_then(|model| model.context_window)
     {
         command.env(CONTEXT_ENV, window.to_string());
     }
@@ -394,7 +443,31 @@ pub(crate) fn claude_command(
         command.env(name, loopback_no_proxy(&existing));
     }
 
-    let (args, settings) = inject_settings(args, overlay_env, starred)?;
+    const SERVER_REVIEW_ENV: &str = "CLAUDE_CODE_AUTO_MODE_SERVER";
+    const CLASSIFIER_MODEL_ENV: &str = "CLAUDE_CODE_AUTO_MODE_MODEL";
+    if let Some(classifier) = options.client_classifier {
+        overlay_env.insert(SERVER_REVIEW_ENV.to_owned(), Value::String("0".to_owned()));
+        command.env(SERVER_REVIEW_ENV, "0");
+        if let Some(classifier) = classifier {
+            overlay_env.insert(
+                CLASSIFIER_MODEL_ENV.to_owned(),
+                Value::String(classifier.to_owned()),
+            );
+            command.env(CLASSIFIER_MODEL_ENV, classifier);
+        }
+    } else if model_info.is_some_and(|model| {
+        matches!(
+            model.wire,
+            crate::provider::Wire::Responses | crate::provider::Wire::ChatCompletions
+        )
+    }) && !env_refs.contains(SERVER_REVIEW_ENV)
+        && std::env::var_os(SERVER_REVIEW_ENV).is_none()
+    {
+        // Neither translated API can return a server-side tool verdict.
+        // Keep Claude Code's own classifier active on these routes.
+        command.env(SERVER_REVIEW_ENV, "0");
+    }
+    let (args, settings) = inject_settings(args, overlay_env, options.starred)?;
     command.args(args).kill_on_drop(true);
     Ok((command, settings))
 }
@@ -912,7 +985,16 @@ mod tests {
         aliases: &[String],
         env_refs: &BTreeSet<String>,
     ) -> (Command, ClaudeLaunchSettings) {
-        claude_command(args, origin, token, aliases, env_refs, &[], |_| None).unwrap()
+        claude_command(
+            args,
+            origin,
+            token,
+            aliases,
+            env_refs,
+            ClaudeLaunchOptions::default(),
+            |_| None,
+        )
+        .unwrap()
     }
 
     fn env_entry(command: &Command, name: &str) -> Option<Option<String>> {
@@ -1401,7 +1483,7 @@ mod tests {
                     "t",
                     &aliases(&["a/b"]),
                     &refs(&[]),
-                    &[],
+                    ClaudeLaunchOptions::default(),
                     |_| None,
                 )
                 .is_err()
@@ -1416,7 +1498,7 @@ mod tests {
                 "t",
                 &aliases(&["a/b"]),
                 &refs(&[]),
-                &[],
+                ClaudeLaunchOptions::default(),
                 |_| None,
             )
             .is_err()
@@ -1507,7 +1589,7 @@ mod tests {
                 "t",
                 &aliases(&["a/b"]),
                 &refs(&[]),
-                &[],
+                ClaudeLaunchOptions::default(),
                 |_| None,
             )
             .unwrap_err();
@@ -1605,7 +1687,7 @@ mod tests {
             "t",
             &[],
             &refs(&[]),
-            &[],
+            ClaudeLaunchOptions::default(),
             |_| None,
         )
         .unwrap_err();
@@ -1665,7 +1747,7 @@ mod tests {
             "t",
             &aliases(&["sonnet"]),
             &refs(&[]),
-            &[],
+            ClaudeLaunchOptions::default(),
             |_| None,
         )
         .unwrap_err();
@@ -1706,7 +1788,7 @@ mod tests {
                     "t",
                     std::slice::from_ref(&alias),
                     &refs(&[]),
-                    &[],
+                    ClaudeLaunchOptions::default(),
                     |_| None,
                 )
                 .is_err(),
@@ -1722,7 +1804,7 @@ mod tests {
                     token,
                     &aliases(&["a/b"]),
                     &refs(&[]),
-                    &[],
+                    ClaudeLaunchOptions::default(),
                     |_| None,
                 )
                 .is_err(),
@@ -1737,7 +1819,7 @@ mod tests {
                 "t",
                 &aliases(&["a/b"]),
                 &refs(&[]),
-                &[],
+                ClaudeLaunchOptions::default(),
                 |_| None,
             )
             .is_err()

@@ -198,6 +198,17 @@ impl ModelSpec {
     }
 }
 
+/// Model Studio's compatibility catalog omits capacity for this snapshot.
+pub(crate) fn published_context_window(vendor_url: &reqwest::Url, model: &str) -> Option<u64> {
+    // https://www.alibabacloud.com/notice/detail?_p_lc=1&id=2225
+    (model == "deepseek-v4.1-flash-1017"
+        && vendor_url.scheme() == "https"
+        && vendor_url
+            .domain()
+            .is_some_and(|host| host.ends_with(".aliyuncs.com")))
+    .then_some(1_000_000)
+}
+
 fn normalise_modalities(input: &[String]) -> Vec<String> {
     let mut modalities = Vec::new();
     for modality in input {

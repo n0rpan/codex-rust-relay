@@ -25,6 +25,7 @@ def run(
     args, choices=None, signed_in=False, claude_signed_in=False,
     config=None, prompt="Choose 1–5".encode(), saved=None, model=None,
     favorites=None, expected_favorites=None, expected_lineup=None,
+    expected_context=None, expected_classifier=None,
 ):
     with tempfile.TemporaryDirectory(prefix="ox-selector-") as tmp:
         home = pathlib.Path(tmp)
@@ -32,6 +33,7 @@ def run(
         bindir.mkdir()
         trace = home / "trace"
         context_trace = home / "context"
+        classifier_trace = home / "classifier"
         lineup_trace = home / "lineup"
         original = 'model_provider = "openai"\n'
         (home / "config.toml").write_text(original)
@@ -66,6 +68,7 @@ fi
 printf '%s\\n' "$(basename "$0")" "$@" > "$FIXTURE_TRACE"
 if [ "$(basename "$0")" = claude ]; then
     printf '%s' "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-}" > "$FIXTURE_CONTEXT"
+    printf '%s\\n' "${CLAUDE_CODE_AUTO_MODE_SERVER:-}" "${CLAUDE_CODE_AUTO_MODE_MODEL:-}" > "$FIXTURE_CLASSIFIER"
     if [ "$1" = --settings ]; then
         "$FIXTURE_PYTHON" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("modelPicker")))' "$2" > "$FIXTURE_LINEUP"
     fi
@@ -76,6 +79,7 @@ fi
             "HOME": tmp, "CODEX_HOME": tmp, "CLAUDE_CONFIG_DIR": tmp,
             "PATH": f"{bindir}:/usr/bin:/bin", "FIXTURE_TRACE": str(trace),
             "TERM": "xterm-256color", "FIXTURE_CONTEXT": str(context_trace),
+            "FIXTURE_CLASSIFIER": str(classifier_trace),
             "FIXTURE_PYTHON": sys.executable, "FIXTURE_LINEUP": str(lineup_trace),
             "FIXTURE_SIGNED_IN": "yes" if signed_in else "no",
             "FIXTURE_CLAUDE_SIGNED_IN": "yes" if claude_signed_in else "no",
@@ -178,6 +182,11 @@ fi
                 lineup = json.loads(lineup_trace.read_text())
                 assert lineup["replaceBuiltInOptions"] is True
                 assert [row["model"] for row in lineup["options"]] == expected_lineup
+            if expected_context is not None:
+                assert context_trace.read_text() == expected_context
+            if expected_classifier is not None:
+                classifier = classifier_trace.read_text().splitlines()
+                assert classifier == list(expected_classifier), (classifier, expected_classifier)
             return text, trace.read_text().splitlines() if trace.exists() else [], registry
         finally:
             if proc.poll() is None:
@@ -364,6 +373,29 @@ env_key = "OPENROUTER_API_KEY"
 discovery = false
 
 """ + "\n".join(f'[[providers.openrouter.models]]\nid = "model-{i}"\n' for i in range(14))
+
+for main_model, options, config, expected in (
+    ("anthropic/claude-fixture", [], shared, ("", "")),
+    ("alibaba/qwen-fixture", [], shared, ("0", "")),
+    ("openrouter/model-1", [], shared, ("0", "")),
+    ("alibaba/qwen-fixture", ["--client-classifier=auto"], shared, ("0", "")),
+    ("alibaba/qwen-fixture", ["--client-classifier", "auto"],
+     shared.replace('id = "claude-fixture"', 'id = "claude-sonnet-5"'),
+     ("0", "anthropic/claude-sonnet-5")),
+):
+    text, argv, registry = run(
+        ["claude", "--model", main_model, *options], config=config,
+        expected_classifier=expected,
+    )
+    assert argv[0] == "claude" and argv[3:] == ["--model", main_model], argv
+print("Claude launch: native review default, translated review fallback, and configured Sonnet classifier")
+
+alibaba_snapshot = shared.replace(
+    "https://alibaba.example/v1", "https://catalog-fixture.maas.aliyuncs.com/v1",
+).replace('id = "qwen-fixture"', 'id = "deepseek-v4.1-flash-1017"')
+run(["claude", "--model", "alibaba/deepseek-v4.1-flash-1017"],
+    config=alibaba_snapshot, expected_context="1000000")
+print("Claude launch: Alibaba's model context reaches the client without discovery metadata")
 
 search_prompt = b"Search as you type"
 for client, search, expected in (

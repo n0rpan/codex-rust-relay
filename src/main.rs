@@ -171,6 +171,11 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
     }
     let bare = args.is_empty();
     let (client_kind, mut args) = clients::select(args);
+    let classifier = if matches!(client_kind, ClientKind::Claude) {
+        clients::take_client_classifier(&mut args)?
+    } else {
+        None
+    };
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
 
     let config_path = CodeoxConfig::path(&codex_home);
@@ -185,6 +190,9 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
     {
         LaunchConfig::Legacy(provider)
     } else {
+        if classifier.is_some() {
+            return Err("--client-classifier needs an ox API provider. Run ox setup first.".into());
+        }
         if args.is_empty() {
             if let Some(code) = native::launch_if_signed_in(client_kind, &codex_home).await? {
                 return Ok(code);
@@ -261,8 +269,12 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         LaunchConfig::Legacy(provider) => App::legacy(provider, bundled, &token, client)?,
     };
 
+    let classifier = classifier
+        .as_deref()
+        .map(|mode| app.client_classifier(mode))
+        .transpose()?;
     if interactive && args.is_empty() && matches!(&app.mode, Mode::Codeox { .. }) {
-        let signed_in = native::signed_in(client_kind, &codex_home).await?;
+        let signed_in = classifier.is_none() && native::signed_in(client_kind, &codex_home).await?;
         let models = app.launch_models();
         match picker::choose_model(client_kind, &models, signed_in, &codex_home)? {
             Some(picker::LaunchChoice::Model(alias)) => {
@@ -295,6 +307,16 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
             (command, None)
         }
         ClientKind::Claude => {
+            if let Some(classifier) = &classifier {
+                match classifier {
+                    Some(alias) => eprintln!(
+                        "ox: Claude Code will send separate classifier requests to {alias}; API usage may be billed."
+                    ),
+                    None => eprintln!(
+                        "ox: no configured Sonnet 5 or Sonnet 4.6 classifier found. Claude Code will use its own classifier selection."
+                    ),
+                }
+            }
             let starred: Vec<_> = app
                 .launch_models()
                 .into_iter()
@@ -307,8 +329,11 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
                 &token,
                 &app.claude_aliases(),
                 &env_refs,
-                &starred,
-                |model| app.claude_context_window(model),
+                clients::ClaudeLaunchOptions {
+                    starred: &starred,
+                    client_classifier: classifier.as_ref().map(|alias| alias.as_deref()),
+                },
+                |model| app.claude_model_info(model),
             )?;
             (command, Some(settings))
         }
@@ -490,7 +515,9 @@ impl App {
                     slug: alias,
                     display_name: spec.name.clone().unwrap_or_else(|| spec.id.clone()),
                     description: vendor.name.clone(),
-                    context_window: spec.context_window,
+                    context_window: spec
+                        .context_window
+                        .or_else(|| catalog::published_context_window(&vendor.base_url, &spec.id)),
                     input_modalities: spec.input_modalities.clone(),
                     reasoning_efforts: spec.reasoning_efforts.clone(),
                     apply_patch: vendor.wire.is_translated(),

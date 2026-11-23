@@ -199,14 +199,22 @@ pub(crate) fn dispatch(args: &[OsString]) -> Option<Result<u8, RelayError>> {
         [command, flag] if flag == "-h" || flag == "--help" => match command.to_str() {
             Some("setup") => return Some(crate::setup::print_setup_help()),
             Some("login") => println!("{SUBSCRIPTIONS}"),
-            Some(client @ ("codex" | "claude")) => println!(
-                "Usage: ox {client} [client arguments]\n\
+            Some(client @ ("codex" | "claude")) => {
+                println!(
+                    "Usage: ox {client} [client arguments]\n\
                  Run from your project. With API providers configured, the bare command\n\
                  opens the shared model picker. Type to search and press Tab to star models.\n\
                  Without providers it uses your native sign-in.\n\
                  Example: ox {client} --model provider/model-id\n\
                  Run {client} --help for arguments accepted by the stock client."
-            ),
+                );
+                if client == "claude" {
+                    println!(
+                        "--client-classifier auto|ALIAS  Use an Anthropic model for separate Auto mode\n\
+                         classifier requests. API usage may be billed."
+                    );
+                }
+            }
             _ => return None,
         },
         [command, account, flag]
