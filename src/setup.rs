@@ -941,6 +941,21 @@ pub(crate) fn run_provider_add(
         writeln!(prompt.output, "  model alias: {alias}")?;
         first_alias.get_or_insert(alias);
     }
+    if config.vendors.iter().any(|vendor| {
+        vendor.key == form.key
+            && vendor.base_url.scheme() == "https"
+            && vendor.base_url.host_str() == Some("api.openai.com")
+            && vendor.base_url.port_or_known_default() == Some(443)
+    }) {
+        writeln!(
+            prompt.output,
+            "  Codex with this API key requires Codex access in your OpenAI API organization."
+        )?;
+        writeln!(
+            prompt.output,
+            "  For ChatGPT plan usage, run `ox login chatgpt` and `ox codex --chatgpt`."
+        )?;
+    }
     if let Some(alias) = first_alias {
         let quoted = format!("'{}'", alias.replace('\'', "'\\''"));
         writeln!(

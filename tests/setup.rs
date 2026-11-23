@@ -601,6 +601,28 @@ fn duplicate_model_ids_and_single_model_flags_are_rejected() {
 }
 
 #[test]
+fn direct_openai_setup_explains_codex_api_access_and_chatgpt_sign_in() {
+    for (name, url, direct_openai) in [
+        ("openai-direct", "https://api.openai.com/v1", true),
+        ("openai", "https://api.openai.com.example/v1", false),
+    ] {
+        let home = TempHome::new();
+        let (code, output) = add_ok(home.path(), &[name, "--base-url", url], &[]);
+        assert_eq!(code, 0, "{output}");
+        assert_eq!(
+            output.contains("requires Codex access in your OpenAI API organization"),
+            direct_openai,
+            "{output}"
+        );
+        assert_eq!(
+            output.contains("ox codex --chatgpt"),
+            direct_openai,
+            "{output}"
+        );
+    }
+}
+
+#[test]
 fn interactive_setup_prompts_for_references_only() {
     let home = TempHome::new();
     let input = "\

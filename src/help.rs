@@ -142,6 +142,9 @@ ChatGPT plan in Codex
   ox login chatgpt status             Check the existing sign-in
   ox codex --chatgpt [args...]        Start a native ChatGPT-backed Codex session
 
+ChatGPT API credits exclude Codex usage authenticated with an API key.
+See https://developers.openai.com/api/docs/guides/chatgpt-api-credits.
+
 Claude subscription in Claude Code
   ox login claude                     Open Claude Code's native sign-in
   ox claude --native [args...]         Start Claude Code with its own settings

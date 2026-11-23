@@ -98,6 +98,11 @@ organization access error in Codex. If OpenAI says Codex API access is disabled 
 organization, ask the OpenAI API organization owner to check the setting for that key.
 [Codex authentication](https://developers.openai.com/codex/auth)
 
+The API credits benefit for eligible ChatGPT plans covers standard Responses API usage
+in the linked API organization. It excludes Codex usage authenticated with API keys.
+Use `ox login chatgpt` and `ox codex --chatgpt` to use your ChatGPT plan in Codex.
+[OpenAI's API credit terms](https://developers.openai.com/api/docs/guides/chatgpt-api-credits#what-the-credits-cover)
+
 For example, add Anthropic Messages using a current API version verified with Anthropic:
 
 ```sh
