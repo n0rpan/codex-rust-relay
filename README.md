@@ -16,6 +16,14 @@ Claude Code installed.
 [Install Codex](https://developers.openai.com/codex/cli/) ·
 [Install Claude Code](https://code.claude.com/docs/en/quickstart)
 
+Dev release
+```sh
+curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh -s -- --dev
+ox setup
+ox codex      # or: ox claude
+```
+
+Stable release (not released yet)
 ```sh
 curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh
 ox setup
