@@ -308,7 +308,10 @@ async fn infer_translated(
     canonical["stream"] = json!(true);
 
     let upstream = match context.vendor.wire {
-        Wire::Responses => responses_upstream(client, &context, canonical).await,
+        Wire::Responses => {
+            context.vendor.add_cache_hints(&mut canonical);
+            responses_upstream(client, &context, canonical).await
+        }
         Wire::ChatCompletions => {
             upstream::translated(
                 client,

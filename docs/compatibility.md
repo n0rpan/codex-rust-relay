@@ -95,8 +95,9 @@ domain check use its own direct connection to `api.anthropic.com`.
   `pause_turn` becomes a failed turn on the Anthropic-to-Codex adapter.
 - **Claude Code translation.** Responses and Chat Completions cannot supply Anthropic
   signed thinking or server-side Auto mode verdicts. Use [Claude Code’s classifier](configuration.md#claude-code-auto-mode)
-  for translated models. Anthropic cache-control markers and provider-hosted containers
-  have no equivalent in these routes.
+  for translated models. Provider-hosted containers have no equivalent in these routes.
+  Anthropic cache-control markers are replaced by each provider's own caching.
+  [What ox does on each route](verification.md#how-ox-stays-fast)
 - **Streaming.** If a vendor promises a streaming API but sends a JSON body for a
   streaming request, translated inference can fail. A translated stream failure is
   surfaced to the client. A native Responses stream can end with a transport error.

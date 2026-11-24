@@ -42,7 +42,8 @@
 //! * `system` is an array of `text` blocks. Prompt-cache breakpoints are
 //!   expressed with `cache_control` on system blocks, message blocks, tools,
 //!   and sometimes a top-level body field. All of them are stripped; Responses
-//!   has no equivalent marker in the request body.
+//!   caches prompt prefixes automatically and has no equivalent marker. The
+//!   session ID in `metadata.user_id` is sent as `prompt_cache_key` instead.
 //! * Tools carry `eager_input_streaming`, `defer_loading`, `cache_control`, and
 //!   `caller` hints that are not part of the Responses function-tool schema.
 //!   They are ignored, while the name, description and complete JSON Schema
@@ -189,6 +190,9 @@ fn convert(input: &Value, upstream_model: &str, count_only: bool) -> Result<Valu
         body.insert("stop".to_owned(), stop);
     }
     if let Some(metadata) = translate_metadata(request.get("metadata"))? {
+        if let Some(key) = prompt_cache_key(&metadata) {
+            body.insert("prompt_cache_key".to_owned(), json!(key));
+        }
         body.insert("metadata".to_owned(), metadata);
     }
     if let Some(tier) = translate_service_tier(request.get("service_tier"))? {
@@ -309,6 +313,24 @@ fn translate_stop_sequences(value: Option<&Value>) -> Result<Option<Value>, Stri
     }
 }
 
+/// A stable per-session key for the provider's prompt cache.
+///
+/// Responses providers cache prompt prefixes automatically, and route
+/// requests that share a `prompt_cache_key` to the same cache; Codex sends
+/// one for every conversation. Claude Code names its session inside the
+/// JSON-encoded `metadata.user_id`, so the same session keeps hitting the
+/// cache it warmed. No session ID, no key.
+fn prompt_cache_key(metadata: &Value) -> Option<String> {
+    let encoded = metadata.get("user_id")?.as_str()?;
+    let user: Value = serde_json::from_str(encoded).ok()?;
+    let session = user.get("session_id")?.as_str()?;
+    let valid = (1..=64).contains(&session.len())
+        && session
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+    valid.then(|| session.to_owned())
+}
+
 fn translate_metadata(value: Option<&Value>) -> Result<Option<Value>, String> {
     let Some(value) = value.filter(|value| !value.is_null()) else {
         return Ok(None);
@@ -407,6 +429,9 @@ fn apply_output_config(value: Option<&Value>, body: &mut Map<String, Value>) -> 
 // System text
 // ---------------------------------------------------------------------------
 
+/// Prefix of the attribution block Claude Code puts first in `system`.
+const BILLING_HEADER: &str = "x-anthropic-billing-header:";
+
 fn append_system(value: &Value, instructions: &mut Vec<String>, path: &str) -> Result<(), String> {
     match value {
         Value::String(text) => {
@@ -424,7 +449,13 @@ fn append_system(value: &Value, instructions: &mut Vec<String>, path: &str) -> R
                 match required_str(block, "type", &block_path)? {
                     "text" => {
                         let text = field_str(block, "text", &block_path)?;
-                        if !text.trim().is_empty() {
+                        // Claude Code opens `system` with a billing line for
+                        // Anthropic whose fingerprint changes with every
+                        // conversation. Another provider has no use for it,
+                        // and at the top of the prompt it would stop one
+                        // session, subagent or worker from reading the
+                        // system prompt and tools another already cached.
+                        if !text.trim().is_empty() && !text.starts_with(BILLING_HEADER) {
                             instructions.push(text.to_owned());
                         }
                     }
@@ -1264,6 +1295,8 @@ mod tests {
             converted["metadata"]["user_id"],
             "{\"device_id\":\"d\",\"session_id\":\"s\"}"
         );
+        // The session keeps one provider-side prompt cache.
+        assert_eq!(converted["prompt_cache_key"], "s");
         assert_eq!(
             converted["instructions"],
             "You are Claude Code, Anthropic's official CLI for Claude.\nYou are an agent working with the user."
@@ -1593,6 +1626,8 @@ mod tests {
         assert_eq!(converted["stop"], json!(["STOP", "END"]));
         assert_eq!(converted["service_tier"], "default");
         assert_eq!(converted["metadata"], json!({"user_id": "u"}));
+        // A user ID without a session names no cache.
+        assert!(converted.get("prompt_cache_key").is_none());
         assert_eq!(converted["reasoning"], json!({"effort": "high"}));
         assert_eq!(
             converted["text"]["format"],
@@ -1608,6 +1643,62 @@ mod tests {
         let converted = into_responses(&defaults, "m").unwrap();
         assert!(converted.get("temperature").is_none());
         assert!(converted.get("top_p").is_none());
+    }
+
+    #[test]
+    fn a_later_claude_code_turn_extends_the_earlier_request() {
+        // Shapes captured from stock Claude Code 2.1.331: the environment
+        // note is a block array with a cache marker on the first turn and a
+        // plain string once it is history, and the marker moves to the new
+        // last user block. Neither may change what the provider sees.
+        let first = json!({
+            "max_tokens": 64,
+            "system": [{"type": "text", "text": "You are a Claude agent.", "cache_control": {"type": "ephemeral"}}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "say hi"}]},
+                {"role": "system", "content": [{"type": "text", "text": "# Environment", "cache_control": {"type": "ephemeral"}}]}
+            ]
+        });
+        let second = json!({
+            "max_tokens": 64,
+            "system": [{"type": "text", "text": "You are a Claude agent.", "cache_control": {"type": "ephemeral"}}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "say hi"}]},
+                {"role": "system", "content": "# Environment"},
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                {"role": "user", "content": [{"type": "text", "text": "again", "cache_control": {"type": "ephemeral"}}]}
+            ]
+        });
+        let first = into_responses(&first, "m").unwrap();
+        let second = into_responses(&second, "m").unwrap();
+        assert_eq!(first["instructions"], second["instructions"]);
+        let (earlier, later) = (
+            first["input"].as_array().unwrap(),
+            second["input"].as_array().unwrap(),
+        );
+        assert_eq!(later.len(), earlier.len() + 2);
+        assert_eq!(later[..earlier.len()], earlier[..]);
+    }
+
+    #[test]
+    fn the_per_conversation_billing_line_is_not_sent_to_other_providers() {
+        // Two conversations differ only in the fingerprint Claude Code puts
+        // in its billing line. The translated prompt must be identical, or
+        // neither can read the prefix the other cached.
+        let request = |fingerprint: &str| {
+            json!({
+                "max_tokens": 64,
+                "system": [
+                    {"type": "text", "text": format!("x-anthropic-billing-header: cc_version=2.1.331.{fingerprint}; cc_entrypoint=sdk-cli;")},
+                    {"type": "text", "text": "You are a Claude agent.", "cache_control": {"type": "ephemeral"}}
+                ],
+                "messages": [{"role": "user", "content": "go"}]
+            })
+        };
+        let first = into_responses(&request("471"), "m").unwrap();
+        let second = into_responses(&request("fb2"), "m").unwrap();
+        assert_eq!(first["instructions"], "You are a Claude agent.");
+        assert_eq!(first, second);
     }
 
     #[test]

@@ -530,6 +530,36 @@ impl Vendor {
             )
     }
 
+    /// Asks the provider to cache the prompt, where it only does so on
+    /// request and the request has not already asked.
+    ///
+    /// OpenRouter caches OpenAI, DeepSeek, Grok and similar models by itself,
+    /// but Claude models only when the request carries a top-level
+    /// `cache_control`. Neither Codex nor the translators send one, so
+    /// without it every turn of a Claude model through OpenRouter is billed
+    /// and processed in full. The field is part of OpenRouter's Responses
+    /// and Chat Completions request schema. On the Messages wire the
+    /// conversation carries Anthropic's own block markers instead.
+    pub(crate) fn add_cache_hints(&self, body: &mut serde_json::Value) {
+        if self.wire == Wire::AnthropicMessages || !self.is_openrouter() {
+            return;
+        }
+        if let Some(body) = body.as_object_mut()
+            && !body.contains_key("cache_control")
+        {
+            body.insert(
+                "cache_control".to_owned(),
+                serde_json::json!({"type": "ephemeral"}),
+            );
+        }
+    }
+
+    fn is_openrouter(&self) -> bool {
+        self.base_url.scheme() == "https"
+            && self.base_url.port_or_known_default() == Some(443)
+            && self.base_url.host_str() == Some("openrouter.ai")
+    }
+
     pub(crate) fn is_direct_anthropic(&self) -> bool {
         self.wire == Wire::AnthropicMessages
             && self.base_url.scheme() == "https"
@@ -1667,6 +1697,45 @@ include_stream_usage = false
                 "fixture-key"
             );
         }
+    }
+
+    #[test]
+    fn openrouter_is_asked_to_cache_and_other_providers_are_left_alone() {
+        let hinted = |base_url: &str, wire: &str, body: serde_json::Value| {
+            let config = CodeoxConfig::load_from_str(&format!(
+                "[providers.fixture]\nbase_url = {base_url:?}\nwire_api = {wire:?}\n"
+            ))
+            .unwrap();
+            let mut body = body;
+            config.vendors[0].add_cache_hints(&mut body);
+            body
+        };
+        let ephemeral = serde_json::json!({"type": "ephemeral"});
+        let plain = serde_json::json!({"model": "m"});
+        for wire in ["responses", "chat_completions"] {
+            let body = hinted("https://openrouter.ai/api/v1", wire, plain.clone());
+            assert_eq!(body["cache_control"], ephemeral, "{wire}");
+            // Any other host may reject a field it does not know.
+            for base_url in [
+                "https://api.openai.com/v1",
+                "https://openrouter.ai.example/api/v1",
+                "http://127.0.0.1:8080/v1",
+            ] {
+                assert_eq!(hinted(base_url, wire, plain.clone()), plain, "{base_url}");
+            }
+        }
+        // Messages requests carry block markers, and a caller's own choice wins.
+        let messages = hinted(
+            "https://openrouter.ai/api/v1",
+            "anthropic_messages",
+            plain.clone(),
+        );
+        assert_eq!(messages, plain);
+        let chosen = serde_json::json!({"cache_control": {"type": "ephemeral", "ttl": "1h"}});
+        assert_eq!(
+            hinted("https://openrouter.ai/api/v1", "responses", chosen.clone()),
+            chosen
+        );
     }
 
     #[test]

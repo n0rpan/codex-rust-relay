@@ -106,13 +106,13 @@ fn translates_a_codex_request_shape() {
     assert_eq!(translated["model"], "claude-upstream");
     assert_eq!(translated["max_tokens"], 1024);
     assert_eq!(translated["stream"], true);
-    assert_eq!(translated["system"], "You are a coding agent.");
+    assert_eq!(translated["system"][0]["text"], "You are a coding agent.");
     assert_eq!(translated["temperature"], 0.2);
     assert_eq!(translated["top_p"], 0.9);
     assert_eq!(translated["output_config"], json!({"effort": "medium"}));
     assert_eq!(translated["messages"][0]["role"], "user");
     assert_eq!(
-        translated["messages"][0]["content"][0],
+        without_cache_markers(&translated["messages"][0]["content"][0]),
         json!({"type": "text", "text": "list files"})
     );
     assert_eq!(translated["tools"][0]["name"], "shell");
@@ -146,9 +146,12 @@ fn preserves_instruction_order_and_text() {
         "stream": true
     });
     let translated = translate_request(&request, "claude-upstream").unwrap();
-    assert_eq!(translated["system"], "base instructions\n\ndeveloper rules");
     assert_eq!(
-        translated["messages"],
+        translated["system"][0]["text"],
+        "base instructions\n\ndeveloper rules"
+    );
+    assert_eq!(
+        without_cache_markers(&translated["messages"]),
         json!([
             {"role": "user", "content": [{"type": "text", "text": "hello"}]},
             {"role": "assistant", "content": [{"type": "text", "text": "first"}]},
@@ -170,9 +173,9 @@ fn keeps_mid_conversation_developer_messages_in_order() {
         "stream": true
     });
     let translated = translate_request(&request, "claude-upstream").unwrap();
-    assert_eq!(translated["system"], "base instructions");
+    assert_eq!(translated["system"][0]["text"], "base instructions");
     assert_eq!(
-        translated["messages"],
+        without_cache_markers(&translated["messages"]),
         json!([
             {
                 "role": "user",
@@ -220,7 +223,7 @@ fn ignores_configuration_updates_and_accepts_stream_options() {
         json!([
             {"role": "user", "content": [{"type": "text", "text": "hi"}]},
             {"role": "assistant", "content": [{"type": "text", "text": "hello"}]},
-            {"role": "user", "content": [{"type": "text", "text": "next"}]}
+            {"role": "user", "content": [{"type": "text", "text": "next", "cache_control": {"type": "ephemeral"}}]}
         ])
     );
 }
@@ -1106,9 +1109,9 @@ fn replays_two_tool_turns_with_thinking_in_order() {
     });
 
     let translated = translate_request(&request, "claude-x").unwrap();
-    assert_eq!(translated["system"], "base instructions");
+    assert_eq!(translated["system"][0]["text"], "base instructions");
     assert_eq!(
-        translated["messages"],
+        without_cache_markers(&translated["messages"]),
         json!([
             {"role": "user", "content": [{"type": "text", "text": "start"}]},
             {
@@ -1284,4 +1287,113 @@ fn closes_output_items_in_output_index_order() {
         vec![(0, "reasoning"), (1, "message"), (2, "function_call")]
     );
     assert_eq!(events.last().unwrap()["type"], "response.completed");
+}
+
+#[test]
+fn marks_prompt_cache_breakpoints_on_the_system_prompt_and_the_last_turn() {
+    // Anthropic caches only what a request marks. Codex replays the whole
+    // conversation each turn, so the system prompt (which also covers the
+    // tools) and the end of the conversation are both marked.
+    let request = json!({
+        "instructions": "You are a coding agent.",
+        "input": [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "second"}
+        ],
+        "stream": true
+    });
+    let translated = translate_request(&request, "claude-upstream").unwrap();
+    let ephemeral = json!({"type": "ephemeral"});
+    assert_eq!(translated["system"].as_array().unwrap().len(), 1);
+    assert_eq!(translated["system"][0]["cache_control"], ephemeral);
+
+    let messages = translated["messages"].as_array().unwrap();
+    let last = messages.last().unwrap()["content"].as_array().unwrap();
+    assert_eq!(last.last().unwrap()["cache_control"], ephemeral);
+    // Exactly one marker in the conversation: earlier turns are found through
+    // the cache lookback, and Anthropic allows only four markers per request.
+    let marked = messages
+        .iter()
+        .flat_map(|message| message["content"].as_array().unwrap())
+        .filter(|block| block.get("cache_control").is_some())
+        .count();
+    assert_eq!(marked, 1);
+
+    // The same request translates to the same bytes, or the cache never hits.
+    assert_eq!(
+        serde_json::to_string(&translated).unwrap(),
+        serde_json::to_string(&translate_request(&request, "claude-upstream").unwrap()).unwrap()
+    );
+}
+
+/// The conversation with its prompt-cache markers removed, for tests that
+/// are about message order and content rather than caching.
+fn without_cache_markers(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => items.iter().map(without_cache_markers).collect(),
+        Value::Object(fields) => fields
+            .iter()
+            .filter(|(name, _)| *name != "cache_control")
+            .map(|(name, value)| (name.clone(), without_cache_markers(value)))
+            .collect::<serde_json::Map<_, _>>()
+            .into(),
+        other => other.clone(),
+    }
+}
+
+#[test]
+fn a_later_turn_extends_the_earlier_request_block_for_block() {
+    // The provider cache matches on the exact prefix. Whatever one turn sent
+    // must come back unchanged, in order, at the start of the next turn's
+    // request; only the cache marker moves to the new end.
+    let mut input = vec![
+        json!({"type": "message", "role": "developer", "content": "base instructions"}),
+        json!({"role": "user", "content": "list files"}),
+        json!({"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{\"command\":\"ls\"}"}),
+        json!({"type": "function_call_output", "call_id": "call_1", "output": "a.txt"}),
+    ];
+    let tools = json!([{
+        "type": "function",
+        "name": "shell",
+        "description": "Run a command",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}
+    }]);
+    let translate = |input: &[Value]| {
+        translate_request(
+            &json!({"input": input, "tools": tools, "stream": true}),
+            "claude-upstream",
+        )
+        .unwrap()
+    };
+    let blocks = |request: &Value| -> Vec<(String, Value)> {
+        request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| {
+                let role = message["role"].as_str().unwrap().to_owned();
+                message["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(move |block| (role.clone(), without_cache_markers(block)))
+            })
+            .collect()
+    };
+
+    let first = translate(&input);
+    input.extend([
+        json!({"role": "assistant", "content": "There is one file."}),
+        json!({"role": "user", "content": "now read it"}),
+        json!({"type": "function_call", "call_id": "call_2", "name": "shell", "arguments": "{\"command\":\"cat a.txt\"}"}),
+        json!({"type": "function_call_output", "call_id": "call_2", "output": "hello"}),
+    ]);
+    let second = translate(&input);
+
+    assert_eq!(first["system"], second["system"]);
+    assert_eq!(first["tools"], second["tools"]);
+    let (earlier, later) = (blocks(&first), blocks(&second));
+    assert!(later.len() > earlier.len());
+    assert_eq!(later[..earlier.len()], earlier[..]);
 }

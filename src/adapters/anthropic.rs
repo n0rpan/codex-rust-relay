@@ -36,6 +36,15 @@
 //!   recording the configured name keeps envelope provenance stable. Model
 //!   names that differ only by a dated suffix are also treated as compatible.
 //!
+//! # Prompt caching
+//!
+//! Anthropic caches only what a request marks, and Codex replays the whole
+//! conversation every turn. The translated request therefore carries two
+//! `cache_control` breakpoints: one on the system block (the cached prefix is
+//! tools, then system) and one on the last cacheable block of the last
+//! message. The translation is deterministic, so an unchanged prefix produces
+//! the same bytes and the next turn reads it from the cache.
+//!
 //! # Known gaps in this slice
 //!
 //! Rejected explicitly: hosted/server tools, custom (freeform) tools, image and
@@ -87,6 +96,38 @@ pub const DEFAULT_MAX_TOKENS: u64 = 8192;
 // ---------------------------------------------------------------------------
 // Public request translation
 // ---------------------------------------------------------------------------
+
+/// Marks the end of the conversation as a prompt-cache breakpoint.
+///
+/// Anthropic caches nothing unless the request asks for it, and Codex replays
+/// the whole conversation on every turn. With this marker (and the one on the
+/// system block) each turn reads the previous turn's prefix from the cache
+/// instead of paying for, and waiting on, the full history again.
+///
+/// The marker goes on the last block of the last message that may carry one:
+/// thinking blocks and empty text blocks may not.
+fn mark_conversation_cache_breakpoint(messages: &mut [Value]) {
+    let Some(blocks) = messages
+        .last_mut()
+        .and_then(|message| message.get_mut("content"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    let cacheable = |block: &Value| match block.get("type").and_then(Value::as_str) {
+        Some("text") => block
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty()),
+        Some("tool_use" | "tool_result" | "image" | "document") => true,
+        _ => false,
+    };
+    if let Some(block) = blocks.iter_mut().rev().find(|block| cacheable(block))
+        && let Some(block) = block.as_object_mut()
+    {
+        block.insert("cache_control".to_owned(), json!({"type": "ephemeral"}));
+    }
+}
 
 /// Translate one OpenAI Responses API request body into an Anthropic Messages
 /// request body.
@@ -144,12 +185,20 @@ pub fn translate_request(input: &Value, upstream_model: &str) -> Result<Value, S
     translated.insert("model".to_owned(), json!(upstream_model));
     translated.insert("max_tokens".to_owned(), json!(max_tokens));
     if !system_parts.is_empty() {
-        translated.insert("system".to_owned(), json!(system_parts.join("\n\n")));
+        // A block rather than a string, so it can carry the cache breakpoint
+        // that covers the tools and the system prompt.
+        translated.insert(
+            "system".to_owned(),
+            json!([{
+                "type": "text",
+                "text": system_parts.join("\n\n"),
+                "cache_control": {"type": "ephemeral"},
+            }]),
+        );
     }
-    translated.insert(
-        "messages".to_owned(),
-        Value::Array(std::mem::take(&mut builder.messages)),
-    );
+    let mut messages = std::mem::take(&mut builder.messages);
+    mark_conversation_cache_breakpoint(&mut messages);
+    translated.insert("messages".to_owned(), Value::Array(messages));
     if !tools.is_empty() {
         translated.insert("tools".to_owned(), Value::Array(tools));
         if let Some(choice) = request.get("tool_choice").filter(|value| !value.is_null())
