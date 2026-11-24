@@ -134,9 +134,14 @@ fn version_is_available_without_a_home_or_stock_client() {
         .output()
         .expect("run ox --version");
     assert!(output.status.success());
+    // Release builds compile in OX_BUILD_VERSION; see VERSION in src/main.rs.
+    let version = match option_env!("OX_BUILD_VERSION") {
+        Some(version) if !version.is_empty() => version,
+        _ => env!("CARGO_PKG_VERSION"),
+    };
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        concat!("ox ", env!("CARGO_PKG_VERSION"))
+        format!("ox {version}")
     );
 }
 
@@ -504,5 +509,71 @@ fn normal_codex_arguments_survive_unchanged() {
             .iter()
             .map(|arg| arg.to_str().unwrap())
             .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn errors_name_the_problem_and_the_command_that_fixes_it() {
+    let home = TempDir::new("launcher-errors-home");
+    let empty_path = TempDir::new("launcher-errors-no-clients");
+    let run = |args: &[&str]| {
+        Command::new(binary())
+            .env_clear()
+            .env("HOME", &home.0)
+            .env("CODEX_HOME", &home.0)
+            .env("PATH", &empty_path.0)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let stderr =
+        |output: &std::process::Output| String::from_utf8_lossy(&output.stderr).into_owned();
+
+    let typo = run(&["docter"]);
+    assert!(!typo.status.success());
+    let text = stderr(&typo);
+    assert!(text.contains("ox: unknown command \"docter\""), "{text}");
+    assert!(text.contains("\n  fix: ox doctor"), "{text}");
+
+    let topic = run(&["help", "desktp"]);
+    assert!(!topic.status.success());
+    assert!(
+        stderr(&topic).contains("\n  fix: ox help desktop"),
+        "{}",
+        stderr(&topic)
+    );
+
+    write_codeox_config(&home.0, false);
+    let missing_client = run(&["codex", "--model", "alpha/alpha-model"]);
+    assert!(!missing_client.status.success());
+    let text = stderr(&missing_client);
+    assert!(text.contains("could not find `codex` on PATH"), "{text}");
+    assert!(
+        text.contains("\n  why: ox starts the stock Codex CLI"),
+        "{text}"
+    );
+    assert!(text.contains("\n  fix: "), "{text}");
+
+    let probe = run(&["doctor", "--live", "--provider", "alpah"]);
+    assert!(!probe.status.success());
+    let text = stderr(&probe);
+    assert!(
+        text.contains("provider \"alpah\" is not configured"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\n  fix: ox doctor --live --provider alpha"),
+        "{text}"
+    );
+
+    fs::write(home.0.join("codeox.toml"), "[providers.alpha\n").unwrap();
+    let broken = run(&["claude"]);
+    assert!(!broken.status.success());
+    let text = stderr(&broken);
+    assert!(text.contains("ox: could not parse codeox.toml"), "{text}");
+    assert!(text.contains("\n  fix: ox doctor --fix"), "{text}");
+    assert!(
+        !text.contains('\x1b'),
+        "piped errors have no colour: {text}"
     );
 }

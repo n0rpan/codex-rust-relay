@@ -128,9 +128,21 @@ impl SavedKeys {
         {
             use std::os::unix::fs::MetadataExt;
             // SAFETY: geteuid takes no arguments and has no memory preconditions.
-            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            if metadata.uid() != unsafe { libc::geteuid() } {
                 return Err(
                     "ox-api-keys.json must be owned by the current user with mode 0600".into(),
+                );
+            }
+            if metadata.mode() & 0o077 != 0 {
+                // The file is ours, so tightening it is always safe. Repair
+                // it instead of refusing to start.
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(
+                        |_| "ox-api-keys.json must be owned by the current user with mode 0600",
+                    )?;
+                eprintln!(
+                    "ox: fixed ox-api-keys.json, which other users on this device could read. It is private again (mode 0600)."
                 );
             }
         }

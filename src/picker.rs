@@ -59,7 +59,7 @@ pub(crate) fn choose_model<'a>(
     home: &Path,
 ) -> Result<Option<LaunchChoice<'a>>, RelayError> {
     match models {
-        [] if !signed_in => return Err("no models are ready to launch. Run `ox doctor` to check providers, or supply a known alias with `--model`".into()),
+        [] if !signed_in => return Err("no models are ready to launch\n  why: no configured provider has both a usable key and a model list".into()),
         [] => return Ok(Some(LaunchChoice::Subscription)),
         [(alias, _)] if !signed_in => return Ok(Some(LaunchChoice::Model(alias))),
         _ => {}

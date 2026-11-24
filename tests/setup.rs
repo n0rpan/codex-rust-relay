@@ -13,6 +13,8 @@ mod catalog;
 mod provider;
 #[path = "../src/setup.rs"]
 mod setup;
+#[path = "../src/ui.rs"]
+mod ui;
 
 use std::ffi::OsString;
 use std::fs;
@@ -1257,4 +1259,170 @@ fn doctor_rejects_unknown_flags_with_usage_exit_code() {
     assert_eq!(code, 2, "{output}");
     assert!(output.contains("unknown doctor option"), "{output}");
     assert!(output.contains("offline"), "{output}");
+}
+
+// ---------------------------------------------------------------------------
+// doctor: presentation, next step, and self-repair
+// ---------------------------------------------------------------------------
+
+#[test]
+fn doctor_marks_each_line_and_ends_with_the_next_command() {
+    let home = TempHome::new();
+    let (code, output) = run_doctor(home.path(), &[], &[]);
+    assert_eq!(code, 1, "{output}");
+    assert!(output.contains("  ✗ neither codeox.toml"), "{output}");
+    assert!(output.trim_end().ends_with("next: ox setup"), "{output}");
+    assert!(
+        !output.contains('\x1b'),
+        "plain output has no colour: {output}"
+    );
+
+    home.write("codeox.toml", ALPHA_CONFIG);
+    let (code, output) = run_doctor(home.path(), &[], &[]);
+    assert_eq!(code, 1, "{output}");
+    assert!(
+        output.contains("  ✗ credential reference ALPHA_KEY is not set"),
+        "{output}"
+    );
+    assert!(
+        output.contains("next: ox setup   (choose the same service again to paste its key)"),
+        "{output}"
+    );
+
+    let (code, output) = run_doctor(home.path(), &[], &[("ALPHA_KEY", "fixture-value")]);
+    assert_eq!(code, 0, "{output}");
+    assert!(output.contains("\nclients\n"), "{output}");
+    assert!(output.contains("\nprovider alpha\n"), "{output}");
+    assert!(
+        output.contains("  ✓ credentials: ALPHA_KEY is available"),
+        "{output}"
+    );
+    assert!(output.contains("  ✓ validation: ok"), "{output}");
+    assert!(output.contains("  · wire: responses"), "{output}");
+    let last = output.trim_end().lines().last().unwrap();
+    assert!(last.starts_with("next: "), "{output}");
+    assert!(
+        !output.contains("info:") && !output.contains("error:"),
+        "{output}"
+    );
+}
+
+#[test]
+fn find_on_path_returns_the_first_matching_file() {
+    let first = TempHome::new();
+    let second = TempHome::new();
+    second.write("codex", "");
+    let path = std::env::join_paths([first.path(), second.path()]).unwrap();
+    assert_eq!(
+        setup::find_on_path("codex", Some(path.as_os_str())),
+        Some(second.path().join("codex"))
+    );
+    assert_eq!(setup::find_on_path("claude", Some(path.as_os_str())), None);
+    assert_eq!(setup::find_on_path("codex", None), None);
+}
+
+#[test]
+fn doctor_fix_moves_unusable_files_aside_and_is_idempotent() {
+    let home = TempHome::new();
+    home.write("codeox.toml", "[providers.alpha\n");
+    home.write("ox-favorites.json", "[1,");
+
+    let (code, output) = run_doctor(home.path(), &[], &[]);
+    assert_eq!(code, 1, "{output}");
+    assert!(output.contains("could not parse codeox.toml"), "{output}");
+    assert!(
+        output.trim_end().ends_with("next: ox doctor --fix"),
+        "{output}"
+    );
+    assert!(
+        home.exists("codeox.toml"),
+        "a plain doctor run changes nothing"
+    );
+
+    let (code, output) = run_doctor(home.path(), &["--fix"], &[]);
+    assert_eq!(code, 1, "{output}");
+    assert!(output.starts_with("repairs\n"), "{output}");
+    assert!(
+        output.contains("fixed: codeox.toml could not be used"),
+        "{output}"
+    );
+    assert!(
+        output.contains("fixed: ox-favorites.json could not be read"),
+        "{output}"
+    );
+    assert!(output.trim_end().ends_with("next: ox setup"), "{output}");
+    assert!(!home.exists("codeox.toml") && !home.exists("ox-favorites.json"));
+    let backups: Vec<String> = fs::read_dir(home.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.contains(".broken-"))
+        .collect();
+    assert_eq!(backups.len(), 2, "{backups:?}");
+    let config_backup = backups
+        .iter()
+        .find(|name| name.starts_with("codeox.toml.broken-"))
+        .unwrap();
+    assert_eq!(home.read(config_backup), "[providers.alpha\n");
+
+    let (_, output) = run_doctor(home.path(), &["--fix"], &[]);
+    assert!(output.contains("nothing needed repair"), "{output}");
+}
+
+#[test]
+fn doctor_fix_leaves_a_valid_setup_untouched() {
+    let home = TempHome::new();
+    home.write("codeox.toml", ALPHA_CONFIG);
+    home.write("ox-favorites.json", "[\"alpha/alpha-coder\"]");
+    home.write(".codeox.toml.tmp-0011223344556677", "fresh temporary file");
+    let (code, output) = run_doctor(home.path(), &["--fix"], &[("ALPHA_KEY", "fixture-value")]);
+    assert_eq!(code, 0, "{output}");
+    assert!(output.contains("nothing needed repair"), "{output}");
+    assert_eq!(home.read("codeox.toml"), ALPHA_CONFIG);
+    assert_eq!(home.read("ox-favorites.json"), "[\"alpha/alpha-coder\"]");
+    assert!(home.exists(".codeox.toml.tmp-0011223344556677"));
+}
+
+#[cfg(unix)]
+#[test]
+fn saved_key_file_is_repaired_or_reported_but_never_fatal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = TempHome::new();
+    home.write("codeox.toml", ALPHA_CONFIG);
+    let keys = home.path().join("ox-api-keys.json");
+    home.write(
+        "ox-api-keys.json",
+        r#"{"ALPHA_KEY":{"scope":"https://alpha.example/v1","value":"fixture-saved-value"}}"#,
+    );
+    fs::set_permissions(&keys, fs::Permissions::from_mode(0o644)).unwrap();
+    let loaded = provider::SavedKeys::load(home.path()).unwrap();
+    assert_eq!(
+        loaded.get("ALPHA_KEY").as_deref(),
+        Some("fixture-saved-value")
+    );
+    assert_eq!(
+        fs::metadata(&keys).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    home.write("ox-api-keys.json", "{not json");
+    let (code, output) = run_doctor(home.path(), &[], &[("ALPHA_KEY", "fixture-value")]);
+    assert_eq!(code, 1, "{output}");
+    assert!(
+        output.contains("\nsaved keys\n  ✗ could not parse ox-api-keys.json"),
+        "{output}"
+    );
+    assert!(
+        output.trim_end().ends_with("next: ox doctor --fix"),
+        "{output}"
+    );
+
+    let (code, output) = run_doctor(home.path(), &["--fix"], &[("ALPHA_KEY", "fixture-value")]);
+    assert_eq!(code, 0, "{output}");
+    assert!(
+        output.contains("fixed: ox-api-keys.json could not be read"),
+        "{output}"
+    );
+    assert!(!home.exists("ox-api-keys.json"));
+    assert!(!output.contains("fixture-saved-value") && !output.contains("fixture-value"));
 }

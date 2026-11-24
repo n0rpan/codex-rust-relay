@@ -4,40 +4,62 @@
 
 ## Install options
 
-Download the **binary and its matching `.sha256` file** from the latest stable
-release. Use `uname -sm` to choose the platform suffix. Use the filename without
-`.tar.gz` for the commands below. [GitHub Releases](https://github.com/n0rpan/codex-rust-relay/releases/latest)
+```sh
+curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh
+```
 
-| Machine | Binary filename suffix | Requirements |
+The installer works on macOS and Linux. It picks the build for your machine,
+downloads it with its `.sha256` file, verifies the checksum, and installs
+`~/.local/bin/ox` with an atomic rename. A running ox keeps its old file until
+it exits, so the same command also upgrades. If the checksum does not match,
+nothing is installed. When it finishes it prints the installed version, the
+line to add to your shell profile if the directory is not on `PATH`, and the
+next step, `ox setup`. Install the stock `codex` or `claude` CLI separately.
+
+| Machine | Platform name (`<target>`) | Requirements |
 | --- | --- | --- |
 | macOS Apple silicon (`Darwin arm64`) | `aarch64-apple-darwin` | macOS 11 or newer |
 | macOS Intel (`Darwin x86_64`) | `x86_64-apple-darwin` | macOS 11 or newer |
 | Linux x86-64 (`Linux x86_64`) | `x86_64-unknown-linux-gnu` | glibc 2.39 or newer |
 | Linux ARM64 (`Linux aarch64`) | `aarch64-unknown-linux-gnu` | glibc 2.39 or newer |
 
-**macOS.** In the directory containing both files, set `asset` to your exact
-downloaded filename:
+The installer needs `curl` or `wget`, `tar`, and `sha256sum` or `shasum`. On
+Linux it checks the glibc version first. With an older glibc or musl it stops
+and prints the [source build](#build-from-source) command.
 
-```sh
-asset='ox-0.1.0-aarch64-apple-darwin'
-shasum -a 256 -c "$asset.sha256" &&
-  mkdir -p "$HOME/.local/bin" &&
-  install -m 755 "$asset" "$HOME/.local/bin/ox"
-```
+| Installer option | Effect |
+| --- | --- |
+| `--stable` | Install the latest stable release. This is the default. |
+| `--dev` | Install the dev pre-release. Pass it as `… \| sh -s -- --dev`. |
+| `OX_CHANNEL=stable` or `OX_CHANNEL=dev` | Same as the flags. A flag wins over the variable. |
+| `OX_INSTALL_DIR=/absolute/path` | Install directory. The default is `$HOME/.local/bin`. |
+| `OX_INSTALL_BASE_URL=URL` | Download `ox-<target>.tar.gz` and its `.sha256` from this URL instead of GitHub, for a mirror or an offline copy. |
+| `OX_INSTALL_SKIP_GLIBC_CHECK=1` | Skip the Linux glibc check. |
 
-**Linux.** Use the same steps with `sha256sum`:
+### Release channels
 
-```sh
-asset='ox-0.1.0-x86_64-unknown-linux-gnu'
-sha256sum -c "$asset.sha256" &&
-  mkdir -p "$HOME/.local/bin" &&
-  install -m 755 "$asset" "$HOME/.local/bin/ox"
-```
+| Channel | Source | Version | Fixed download URL |
+| --- | --- | --- | --- |
+| stable | A pushed tag `vX.Y.Z` | `X.Y.Z` | `https://github.com/n0rpan/ox/releases/latest/download/ox-<target>.tar.gz` |
+| dev | Every commit on `main` | `X.Y.(Z+1)-dev.N` | `https://github.com/n0rpan/ox/releases/download/dev/ox-<target>.tar.gz` |
 
-If `ox` is missing on PATH, run `export PATH="$HOME/.local/bin:$PATH"` in Bash or
-Zsh and add the same line to `~/.bashrc` or `~/.zshrc` for future terminals.
-Run `ox --version`, then `ox setup`. Install the stock `codex` or `claude` CLI
-separately if you want to launch it through ox.
+**No stable release has been tagged yet.** Until one is, the dev pre-release is
+the only download. Run without a channel, the installer says
+`No stable ox release is published yet. Installing the dev build instead.` and
+continues. With an explicit `--stable` it stops and asks you to run it again
+with `--dev`.
+
+The dev channel is a single GitHub pre-release tagged `dev`. CI replaces it
+after every commit on `main` passes the stock-client checks and the four
+platform builds, so the tag always points at the newest such commit. Its
+version is the highest stable version with the patch number raised by one,
+then `-dev.` and the CI run number. With no stable release that is
+`0.0.1-dev.N`. A dev version always sorts below the stable release it leads
+up to: `0.0.1-dev.2` < `0.0.1-dev.10` < `0.0.1`.
+
+`ox --version` prints the version built into the binary. A release binary
+reports the version CI resolved. A source build reports the version in
+`Cargo.toml` and counts as a stable build.
 
 ### Update an existing installation
 
@@ -46,32 +68,89 @@ ox update --check
 ox update
 ```
 
+A build follows its own channel. A stable build looks at the latest stable
+release, and a dev build looks at the dev pre-release.
+
+| Command | Effect |
+| --- | --- |
+| `ox update --check` | Report whether a newer release exists. Installs nothing. |
+| `ox update` | Install the newer release on this build's channel. |
+| `ox update --dev` | Switch to the dev pre-release. |
+| `ox update --stable` | Switch back to the latest stable release. |
+
+`--check` combines with either channel flag. A channel switch installs the
+other channel's current build even when its version number is lower, which is
+how `ox update --stable` returns a dev build to stable. From a stable or source
+build before the first stable release, `ox update` reports
+`no stable ox release has been published yet` and points to `ox update --dev`.
+
 `ox update` verifies the binary against the SHA-256 digest published by GitHub,
 then replaces the running executable's file. Use an install directory writable
 by your own account. Restart any running `ox serve` or ox-launched sessions to
 use the new binary. The updater leaves provider settings and credentials alone.
+Running the installer again has the same effect as `ox update`.
 
-### Preview builds and source installation
+### Manual download
 
-Before the first stable release, or to try an unreleased commit, use a successful
-CI run. Sign in to GitHub and download the `ox-<target>` artifact for your
-platform, then unzip it and use the same checksum and install steps above.
-Older CI artifacts contain only a `.tar.gz` and its checksum. Verify the archive,
-extract it, and install the extracted `ox` file. [GitHub Actions builds](https://github.com/n0rpan/codex-rust-relay/actions/workflows/ci.yml)
+Every release on the [Releases page](https://github.com/n0rpan/ox/releases)
+carries these files for each platform, each with a matching `.sha256` file:
 
-To build on your own machine, check out this repository and run the following from its root.
-CI uses Rust 1.100.0. Build from source if the Linux artifact needs a newer glibc or
-if macOS Gatekeeper blocks the CI download. [Apple’s Gatekeeper guidance](https://support.apple.com/en-us/102445)
+| File | Contents |
+| --- | --- |
+| `ox-<target>.tar.gz` | The `ox` binary. The name is the same in every release, which gives the fixed URLs above. |
+| `ox-<version>-<target>.tar.gz` | The same archive under a versioned name. |
+| `ox-<version>-<target>` | The bare binary that `ox update` downloads. |
+
+To install without the script, set `target` from the table above and `base`
+to the channel you want:
 
 ```sh
-cargo install --locked --path .
+target='x86_64-unknown-linux-gnu'
+base='https://github.com/n0rpan/ox/releases/download/dev'
+# For stable: base='https://github.com/n0rpan/ox/releases/latest/download'
+curl -fsSLO "$base/ox-$target.tar.gz"
+curl -fsSLO "$base/ox-$target.tar.gz.sha256"
+sha256sum -c "ox-$target.tar.gz.sha256" &&
+  tar -xzf "ox-$target.tar.gz" &&
+  mkdir -p "$HOME/.local/bin" &&
+  install -m 755 ox "$HOME/.local/bin/ox"
+```
+
+On macOS, use `shasum -a 256 -c` in place of `sha256sum -c`. If `ox` is
+missing on PATH, run `export PATH="$HOME/.local/bin:$PATH"` in Bash or Zsh and
+add the same line to `~/.bashrc` or `~/.zshrc` for future terminals. Run
+`ox --version`, then `ox setup`.
+
+Each CI run on a pull request also keeps its four `ox-<target>` builds as
+workflow artifacts. Sign in to GitHub to download one from the run page.
+[GitHub Actions builds](https://github.com/n0rpan/ox/actions/workflows/ci.yml)
+
+### Build from source
+
+Build from source if your Linux has an older glibc or uses musl, or if macOS
+Gatekeeper blocks a downloaded binary. CI uses Rust 1.100.0.
+[Apple’s Gatekeeper guidance](https://support.apple.com/en-us/102445)
+
+```sh
+cargo install --locked --git https://github.com/n0rpan/ox
 ox --version
 ```
 
-Cargo installs into `${CARGO_HOME:-$HOME/.cargo}/bin` by default. Add the install directory to
-`PATH` if the shell cannot find `ox`. Install the stock `codex` or `claude` CLI separately.
+From a checkout, run `cargo install --locked --path .` in its root. Cargo
+installs into `${CARGO_HOME:-$HOME/.cargo}/bin` by default. Add that directory
+to `PATH` if the shell cannot find `ox`. Install the stock `codex` or `claude`
+CLI separately.
 
 ## Add a provider
+
+The first time you run `ox`, `ox codex` or `ox claude` in a terminal with no
+provider and no saved sign-in, ox opens this setup for you. As soon as an API
+provider has a usable key it prints `Setup is complete. Starting Codex.` (or
+`Starting Claude Code.`) and opens the client in the same command. If that
+client is not installed yet, ox prints its install command and the command to
+run afterwards. Choosing **Done** leaves without launching. A launch with extra
+arguments, or one that is not on a terminal, never opens setup. It reports that
+no provider is configured.
 
 Run `ox setup` in a terminal, choose **Add an API key**, and pick the service that
 issued it. For OpenCode Go, OpenRouter, Anthropic and OpenAI, ox fills in the URL
@@ -227,6 +306,75 @@ add `--model <upstream-model-id>` using the provider's model ID. The probe uses 
 provider's endpoint and credentials. Tool calling, Brave search and a Desktop
 client session are separate checks. Plain `ox doctor` stays offline.
 
+### Check and repair a setup
+
+```sh
+ox doctor
+ox doctor --fix
+```
+
+`ox doctor` reads your setup offline and prints one line per fact, grouped
+under `setup`, `clients`, `saved keys`, one `provider <name>` heading per
+provider, and `config.toml`. Each line starts with a mark:
+
+| Mark | Meaning |
+| --- | --- |
+| `✓` | Checked and fine |
+| `·` | Information |
+| `!` | Warning. `ox doctor --strict` exits non-zero for these too. |
+| `✗` | Error. The launch would fail. |
+
+The report ends with a `summary:` line and a `next:` line. `next:` is the one
+command to run: the fix for the first error, or the launch command when
+everything is fine. The exit status is 0 when healthy, 1 when problems were
+found, and 2 for a usage error. Colour is used only on a terminal, and
+`NO_COLOR` and `TERM=dumb` turn it off. Key values are never printed.
+
+The `clients` group shows where `codex` and `claude` were found on `PATH`. A
+missing client is information, with the install command for your platform,
+because a host that only runs `ox serve` needs neither.
+
+A plain `ox doctor` never changes a file. `ox doctor --fix` first repairs what
+ox can safely repair, lists each repair under `repairs`, then runs the check:
+
+| Situation | What `ox doctor --fix` does |
+| --- | --- |
+| `codeox.toml` is not valid TOML, or has no provider | Moves it to `codeox.toml.broken-<time>`. Saved keys are kept. Run `ox setup` to add your providers again. |
+| `ox-api-keys.json` cannot be parsed | Moves it to `ox-api-keys.json.broken-<time>`. Paste your keys again in `ox setup`. |
+| `ox-favorites.json` cannot be parsed | Moves it to `ox-favorites.json.broken-<time>`. Star your models again in the picker. |
+| Temporary files left by an interrupted save | Removes them once they are at least 10 minutes old. |
+
+`<time>` is the Unix time of the repair. Unreadable files are renamed, never
+deleted, so every repair can be undone by renaming the file back. Running
+`--fix` again prints `nothing needed repair`. A provider entry that parses but
+is wrong, such as an invalid `wire_api` or URL, is reported and left alone, and
+so is a `codeox.toml` that is a symbolic link.
+
+Two situations are handled at launch, without the doctor:
+
+- **A provider is configured but no key is usable.** A plain `ox codex` or
+  `ox claude` on a terminal, with no saved sign-in for that client, says
+  `<Provider> has no API key yet.` and asks for the key at the hidden prompt.
+  It saves the key and continues the launch. Press Enter to skip.
+- **The saved-key file became readable by other users.** See
+  [where settings and keys live](#where-settings-and-keys-live).
+
+Errors from ox share one shape: the problem on the first line, then optional
+`why:` and `file:` lines, then a `fix:` line with a command you can copy.
+
+```text
+ox: could not find `codex` on PATH
+  why: ox starts the stock Codex CLI and does not bundle it
+  fix: npm install -g @openai/codex
+```
+
+On macOS the `fix:` line is `brew install --cask codex`. A mistyped ox command,
+help topic, `--provider` name or `--model` provider prefix gets the corrected
+command on its `fix:` line. Stock Codex subcommands such as `ox exec` and
+`ox resume`, options, and prompts of more than one word still go to Codex
+unchanged. A single word that is close to an ox command is treated as a typo.
+To send it to Codex, run `ox codex <word>`.
+
 ### Where settings and keys live
 
 Both clients read `codeox.toml` under `$CODEX_HOME`, which defaults to `~/.codex`. For
@@ -238,6 +386,9 @@ pasted at the hidden prompt lives in `$CODEX_HOME/ox-api-keys.json` as plaintext
 with owner-only permissions (mode 0600). ox uses it only for the configured
 destination and keeps it out of the launched client environment. Protect this
 file like other credentials and keep it out of version control.
+If the file's permissions are loosened, for example by a restored backup or
+synced dotfiles, ox sets them back to 0600 the next time it reads the file and
+prints one line saying so. A key file owned by another user is refused.
 
 An exported variable takes priority over a saved key. To rotate a saved key,
 choose its provider again in `ox setup`, paste the replacement, and restart ox.
@@ -280,6 +431,12 @@ letter or digit. Keep aliases unique. A provider-qualified alias cannot use anot
 configured provider's prefix. Keep your alias stable for resume. A known provider prefix
 can route to an upstream model ID even when discovery omits it, but the model must exist
 for that provider. A bare model ID is accepted only if routing can resolve it unambiguously.
+
+`--model` is checked before the client starts. A provider prefix that matches
+no configured provider stops the launch, with the closest provider name on the
+error's `fix:` line. A model ID that is missing from a known provider's list
+only prints a note with the closest match, and the launch continues as
+requested. A value without a `/` is passed on unchecked.
 
 If Codex shows a stale picker, check for `model_catalog_json` in
 `$CODEX_HOME/ox-clients/codex/config.toml`. It takes precedence over the live

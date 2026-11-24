@@ -438,7 +438,7 @@ fn initialize(params: &Value) -> Value {
         .unwrap_or(PROTOCOL_VERSIONS[0]);
     json!({
         "protocolVersion": version,
-        "serverInfo": {"name": SERVER, "version": env!("CARGO_PKG_VERSION")},
+        "serverInfo": {"name": SERVER, "version": crate::VERSION},
         "capabilities": {"tools": {}},
         "instructions": "Use start_ox_worker for long coding tasks, Codex goals or Claude workflows, then check ox_worker_status. Use delegate_to_ox_model for one short text answer. Start jobs only at the user's request and only enable workspace writes when requested. The named provider bills the delegated work.",
     })

@@ -972,7 +972,7 @@ fn anthropic_base_url(origin: &str) -> Result<String, RelayError> {
 }
 
 /// Finds an explicit `--model <value>` or `--model=<value>` before `--`.
-fn explicit_model(args: &[OsString]) -> Option<&str> {
+pub(crate) fn explicit_model(args: &[OsString]) -> Option<&str> {
     for (index, arg) in args.iter().enumerate() {
         let Some(text) = arg.to_str() else {
             continue;

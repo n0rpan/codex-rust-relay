@@ -7,7 +7,10 @@ name: CI
 # A separate native matrix then builds the locked release binary on Linux
 # x86_64/ARM64 and macOS Intel/Apple silicon, runs it, and uploads one `ox`
 # archive, native updater binary, and checksums per platform. The matrix uses
-# the read-only token. Only the tag-triggered publication job can write Releases.
+# the read-only token. Only the two publication jobs can write Releases:
+#   - every push to main replaces the rolling pre-release tagged `dev`, whose
+#     version is the latest stable release plus one patch, `-dev.<run number>`;
+#   - a pushed tag vMAJOR.MINOR.PATCH publishes that stable release.
 on:
   push:
     branches: [main]
@@ -30,6 +33,54 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  version:
+    name: Resolve the build version
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      channel: ${{ steps.resolve.outputs.channel }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REF: ${{ github.ref }}
+      REF_NAME: ${{ github.ref_name }}
+      RUN_NUMBER: ${{ github.run_number }}
+    steps:
+      - name: Resolve the version and channel
+        id: resolve
+        run: |
+          set -euo pipefail
+          stable_tag='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ "${REF}" == refs/tags/v* ]]; then
+            if [[ ! "${REF_NAME}" =~ ${stable_tag} ]]; then
+              echo "::error::use a stable tag vMAJOR.MINOR.PATCH, not ${REF_NAME}"
+              exit 1
+            fi
+            version="${REF_NAME#v}"
+            channel="stable"
+          else
+            # Highest published stable release: not a draft, not a pre-release,
+            # tagged vMAJOR.MINOR.PATCH. No stable release yet means 0.0.0.
+            tags="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq '.[] | select((.draft or .prerelease) | not) | .tag_name')"
+            latest="$(printf '%s\n' "${tags}" | grep -E "${stable_tag}" | sed 's/^v//' |
+              sort -t . -k 1,1n -k 2,2n -k 3,3n | tail -n 1 || true)"
+            latest="${latest:-0.0.0}"
+            IFS=. read -r major minor patch <<< "${latest}"
+            version="${major}.${minor}.$((patch + 1))-dev.${RUN_NUMBER}"
+            channel="dev"
+            echo "Latest stable release: ${latest}"
+          fi
+          if [[ ! "${version}" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-dev\.[1-9][0-9]*)?$ ]]; then
+            echo "::error::resolved an invalid version: ${version}"
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
+          echo "Building ox ${version} (${channel})"
+          echo "- ox ${version} (${channel})" >> "${GITHUB_STEP_SUMMARY}"
+
   verify:
     name: Stock clients (${{ matrix.client_track }})
     runs-on: ubuntu-24.04
@@ -60,6 +111,13 @@ jobs:
         run: |
           set -euo pipefail
           cargo fmt --all -- --check
+
+      - name: Lint the installer script
+        run: |
+          set -euo pipefail
+          sh -n install.sh
+          bash -n install.sh
+          shellcheck install.sh
 
       - name: Fetch locked dependencies
         timeout-minutes: 15
@@ -274,6 +332,7 @@ jobs:
 
   release:
     if: github.event_name != 'schedule'
+    needs: version
     name: Release binaries (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -310,6 +369,9 @@ jobs:
       # 11.0. Pin both macOS artifacts to the 11.0 arm64 floor so the Intel
       # artifact is not older than its Apple silicon counterpart.
       MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
+      # Compiled into the binary (see VERSION in src/main.rs). Job-level so the
+      # build and test steps share one compilation.
+      OX_BUILD_VERSION: ${{ needs.version.outputs.version }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -330,6 +392,10 @@ jobs:
         timeout-minutes: 25
         run: |
           set -euo pipefail
+          if [ -z "${OX_BUILD_VERSION}" ]; then
+            echo "::error::the version job did not resolve a build version"
+            exit 1
+          fi
           target="${{ matrix.target }}"
           host="$(rustc -vV | sed -n 's/^host: //p')"
           if [ "${host}" != "${target}" ]; then
@@ -344,7 +410,8 @@ jobs:
           file "${binary}" | grep -F -- "${{ matrix.file_type }}"
           # --help prints usage and exits before reading any configuration, so
           # this probes that the executable starts without network or secrets.
-          "${binary}" --help | grep -F 'ox codex [args...]'
+          "${binary}" --help | grep -F 'Open Codex and pick a model'
+          test "$("${binary}" --version)" = "ox ${OX_BUILD_VERSION}"
 
       - name: Test atomic updates on this platform
         timeout-minutes: 15
@@ -355,32 +422,34 @@ jobs:
         run: |
           set -euo pipefail
           target="${{ matrix.target }}"
-          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
-          if [ -z "${version}" ]; then
-            echo "::error::could not read the package version from Cargo.toml"
-            exit 1
-          fi
+          version="${OX_BUILD_VERSION}"
           archive="ox-${version}-${target}.tar.gz"
           executable="ox-${version}-${target}"
+          # The alias has no version in its name, so the download URL of the
+          # latest stable release and of the dev pre-release never changes.
+          alias="ox-${target}.tar.gz"
+          rm -rf dist
           mkdir -p dist
           cp "target/${target}/release/ox" "dist/${executable}"
           tar --create --gzip --file "dist/${archive}" \
             --directory "target/${target}/release" ox
+          cp "dist/${archive}" "dist/${alias}"
           (
             cd dist
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum --binary "${archive}" > "${archive}.sha256"
-              sha256sum --binary "${executable}" > "${executable}.sha256"
-              sha256sum --check --strict "${archive}.sha256"
-              sha256sum --check --strict "${executable}.sha256"
-            else
-              shasum -a 256 "${archive}" > "${archive}.sha256"
-              shasum -a 256 "${executable}" > "${executable}.sha256"
-              shasum -a 256 --check "${archive}.sha256"
-              shasum -a 256 --check "${executable}.sha256"
-            fi
-            cat "${archive}.sha256"
+            # Each .sha256 file names the file it checks, so the alias needs
+            # its own checksum file rather than a copy.
+            for file in "${archive}" "${executable}" "${alias}"; do
+              if command -v sha256sum >/dev/null 2>&1; then
+                sha256sum --binary "${file}" > "${file}.sha256"
+                sha256sum --check --strict "${file}.sha256"
+              else
+                shasum -a 256 "${file}" > "${file}.sha256"
+                shasum -a 256 --check "${file}.sha256"
+              fi
+            done
+            cat "${archive}.sha256" "${alias}.sha256"
           )
+          cmp "dist/${archive}" "dist/${alias}"
           tar --list --gzip --file "dist/${archive}"
           # The uploaded archive is what users download, so unpack it and run
           # that copy rather than the build-tree binary.
@@ -389,11 +458,42 @@ jobs:
           mkdir -p "${unpacked}"
           tar --extract --gzip --file "dist/${archive}" --directory "${unpacked}"
           test -x "${unpacked}/ox"
-          "${unpacked}/ox" --help | grep -F 'ox codex [args...]'
+          "${unpacked}/ox" --help | grep -F 'Open Codex and pick a model'
           test "$("${unpacked}/ox" --version)" = "ox ${version}"
           cmp "${unpacked}/ox" "dist/${executable}"
           "dist/${executable}" update --help | grep -F 'Usage: ox update'
           OX_TEST_BINARY="dist/${executable}" python3 tests/fixtures/setup_selector.py
+
+      - name: Install the packaged archive with install.sh
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          base="file://${PWD}/dist"
+          prefix="${RUNNER_TEMP}/ox-install-test"
+          rm -rf "${prefix}"
+          mkdir -p "${prefix}/home"
+          # A fresh install, then an upgrade over the installed copy.
+          for round in fresh upgrade; do
+            HOME="${prefix}/home" OX_INSTALL_BASE_URL="${base}" OX_INSTALL_DIR="${prefix}/bin" \
+              sh install.sh | tee "${prefix}/${round}.log"
+            test "$("${prefix}/bin/ox" --version)" = "ox ${OX_BUILD_VERSION}"
+            grep -F "Installed ox ${OX_BUILD_VERSION}" "${prefix}/${round}.log"
+            grep -F "ox setup" "${prefix}/${round}.log"
+          done
+          cmp "${prefix}/bin/ox" "target/${target}/release/ox"
+          test "$(find "${prefix}/bin" -mindepth 1 | wc -l | tr -d ' ')" = "1"
+          # A wrong checksum must install nothing.
+          mkdir -p "${prefix}/tampered"
+          cp "dist/ox-${target}.tar.gz" "${prefix}/tampered/"
+          echo "0000000000000000000000000000000000000000000000000000000000000000 *ox-${target}.tar.gz" \
+            > "${prefix}/tampered/ox-${target}.tar.gz.sha256"
+          if HOME="${prefix}/home" OX_INSTALL_BASE_URL="file://${prefix}/tampered" \
+            OX_INSTALL_DIR="${prefix}/rejected" sh install.sh; then
+            echo "::error::install.sh accepted an archive with a wrong checksum"
+            exit 1
+          fi
+          test ! -e "${prefix}/rejected/ox"
 
       - name: Upload ox archive and SHA-256 checksum
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -405,10 +505,159 @@ jobs:
           # The archives are already gzip-compressed.
           compression-level: 0
 
+  publish-dev:
+    name: Publish the rolling dev pre-release
+    # Every push to main, and a manual run on main to repair a missing release.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [version, verify, release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    # One swap at a time, and never cancel a swap for a queued one.
+    concurrency:
+      group: publish-dev
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.version.outputs.version }}
+      CHANNEL: ${{ needs.version.outputs.channel }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Replace the dev pre-release
+        id: publish
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          if [[ "${CHANNEL}" != "dev" || ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+$ ]]; then
+            echo "::error::expected a dev version, got ${VERSION} (${CHANNEL})"
+            exit 1
+          fi
+          # A re-run of an old workflow run must not replace a newer dev build.
+          head="$(gh api "repos/${repo}/git/ref/heads/main" --jq '.object.sha')"
+          if [ "${head}" != "${GITHUB_SHA}" ]; then
+            echo "::notice::main moved to ${head}; leaving the dev release to that commit's run"
+            echo "published=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          gh run download "${GITHUB_RUN_ID}" --repo "${repo}" --pattern 'ox-*' --dir dist
+          files=(install.sh)
+          for platform in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            directory="dist/ox-${platform}"
+            executable="ox-${VERSION}-${platform}"
+            alias="ox-${platform}.tar.gz"
+            (
+              cd "${directory}"
+              sha256sum --check --strict "${executable}.sha256" "${executable}.tar.gz.sha256" "${alias}.sha256"
+            )
+            files+=("${directory}/${executable}" "${directory}/${executable}.sha256"
+                    "${directory}/${executable}.tar.gz" "${directory}/${executable}.tar.gz.sha256"
+                    "${directory}/${alias}" "${directory}/${alias}.sha256")
+          done
+
+          notes="${RUNNER_TEMP}/dev-notes.md"
+          {
+            echo "Development build of ox, rebuilt from every commit on \`main\`."
+            echo
+            echo "> [!WARNING]"
+            echo "> This is a moving pre-release. Its files are replaced on every push to \`main\` and it can break. Use the latest stable release unless you want to test unreleased changes."
+            echo
+            echo "- Version: \`${VERSION}\`"
+            echo "- Commit: ${GITHUB_SHA}"
+            echo
+            echo "Install or switch to this build:"
+            echo
+            echo '```sh'
+            echo "curl -fsSL https://raw.githubusercontent.com/${repo}/main/install.sh | sh -s -- --dev"
+            echo '```'
+            echo
+            echo "Already running ox? Use \`ox update --dev\`."
+          } > "${notes}"
+
+          # Stage everything in a draft first. Uploads are the slow, failure
+          # prone part, and a draft is invisible, so the public dev release is
+          # untouched until every asset is in place.
+          staging="dev-staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          releases="$(gh api --paginate "repos/${repo}/releases?per_page=100" \
+            --jq '.[] | [.id, .draft, .tag_name] | @tsv')"
+          # Remove drafts left behind by a failed or cancelled earlier run.
+          while IFS=$'\t' read -r id draft tag; do
+            if [ "${draft}" = "true" ] && [[ "${tag}" == dev-staging-* ]]; then
+              gh api --method DELETE "repos/${repo}/releases/${id}"
+            fi
+          done <<< "${releases}"
+          gh release create "${staging}" --repo "${repo}" --draft --prerelease \
+            --target "${GITHUB_SHA}" --title "ox ${VERSION} (dev)" --notes-file "${notes}" "${files[@]}"
+          staged_id="$(gh api --paginate "repos/${repo}/releases?per_page=100" \
+            --jq ".[] | select(.draft and .tag_name == \"${staging}\") | .id")"
+          if [[ ! "${staged_id}" =~ ^[0-9]+$ ]]; then
+            echo "::error::could not find the staged draft release ${staging}"
+            exit 1
+          fi
+
+          # The swap: three quick API calls. If it stops half-way, the staged
+          # draft is cleaned up and the swap is redone by the next run or by
+          # re-running this job.
+          while IFS=$'\t' read -r id draft tag; do
+            if [ "${tag}" = "dev" ]; then
+              gh api --method DELETE "repos/${repo}/releases/${id}"
+            fi
+          done <<< "${releases}"
+          if [ -n "$(gh api "repos/${repo}/git/matching-refs/tags/dev" \
+            --jq '.[] | select(.ref == "refs/tags/dev") | .ref')" ]; then
+            gh api --method DELETE "repos/${repo}/git/refs/tags/dev"
+          fi
+          gh api --method PATCH "repos/${repo}/releases/${staged_id}" \
+            -f tag_name=dev -f target_commitish="${GITHUB_SHA}" \
+            -F draft=false -F prerelease=true -f make_latest=false > /dev/null
+
+          # Check what the public now sees.
+          published="$(gh api "repos/${repo}/releases/tags/dev" \
+            --jq '[.draft, .prerelease, (.assets | length)] | @tsv')"
+          if [ "${published}" != "$(printf 'false\ttrue\t%s' "${#files[@]}")" ]; then
+            echo "::error::unexpected dev release state (draft, prerelease, assets): ${published}"
+            exit 1
+          fi
+          tagged="$(gh api "repos/${repo}/git/ref/tags/dev" --jq '.object.sha')"
+          if [ "${tagged}" != "${GITHUB_SHA}" ]; then
+            echo "::error::the dev tag points at ${tagged}, expected ${GITHUB_SHA}"
+            exit 1
+          fi
+          echo "published=true" >> "${GITHUB_OUTPUT}"
+          echo "- Published [ox ${VERSION} (dev)](https://github.com/${repo}/releases/tag/dev)" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Install the published dev build the way users do
+        if: steps.publish.outputs.published == 'true'
+        run: |
+          set -euo pipefail
+          prefix="${RUNNER_TEMP}/ox-dev-smoke"
+          installed=""
+          # Release downloads can lag the API by a few seconds.
+          for attempt in 1 2 3 4 5 6; do
+            rm -rf "${prefix}"
+            if OX_INSTALL_DIR="${prefix}/bin" sh install.sh --dev &&
+              installed="$("${prefix}/bin/ox" --version)" &&
+              [ "${installed}" = "ox ${VERSION}" ]; then
+              break
+            fi
+            echo "attempt ${attempt}: installed '${installed}', expected 'ox ${VERSION}'"
+            installed=""
+            sleep 10
+          done
+          test "${installed}" = "ox ${VERSION}"
+
   publish:
     name: Publish a tagged release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [verify, release]
+    needs: [version, verify, release]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -417,7 +666,13 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Publish the four checked platform builds
         run: |
           set -euo pipefail
@@ -425,16 +680,22 @@ jobs:
             echo "::error::use a stable tag vMAJOR.MINOR.PATCH"
             exit 1
           fi
+          if [ "${VERSION}" != "${TAG#v}" ]; then
+            echo "::error::the binaries were built as ${VERSION}, not ${TAG#v}"
+            exit 1
+          fi
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'ox-*' --dir dist
-          files=()
+          files=(install.sh)
           for platform in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
             directory="dist/ox-${platform}"
-            executable="ox-${TAG#v}-${platform}"
+            executable="ox-${VERSION}-${platform}"
+            alias="ox-${platform}.tar.gz"
             (
               cd "$directory"
-              sha256sum --check --strict "${executable}.sha256" "${executable}.tar.gz.sha256"
+              sha256sum --check --strict "${executable}.sha256" "${executable}.tar.gz.sha256" "${alias}.sha256"
             )
             files+=("$directory/$executable" "$directory/$executable.sha256"
-                    "$directory/$executable.tar.gz" "$directory/$executable.tar.gz.sha256")
+                    "$directory/$executable.tar.gz" "$directory/$executable.tar.gz.sha256"
+                    "$directory/$alias" "$directory/$alias.sha256")
           done
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --latest "${files[@]}"

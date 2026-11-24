@@ -16,7 +16,7 @@ use the HTTPS address from [Tailscale Serve](#2-publish-it-inside-your-tailnet).
 
 ## 1. Configure and start ox
 
-Install ox on the server and run `ox setup` as the user who will run the service.
+[Install ox](configuration.md#install-options) on the server and run `ox setup` as the user who will run the service.
 Choose **Add an API key**, select the service, and paste its key. For example,
 to use the config directory expected by the sample systemd service:
 
@@ -39,6 +39,10 @@ Share that key with the client devices. Keep the upstream vendor keys on the ser
 ```sh
 ox serve --port 8787
 ```
+
+If the port is taken, ox reports `port 8787 is already in use` and its `fix:`
+line gives the next port as a ready command. ox never picks another port by
+itself, because your clients are configured with the port number.
 
 Use the foreground command to check setup. For persistence on Linux, the
 [systemd user-service example](../examples/ox.service) expects

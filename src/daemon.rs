@@ -14,6 +14,17 @@ use crate::{App, MAX_REQUEST_BYTES, build_search, serve, upstream_client};
 const DEFAULT_PORT: u16 = 8787;
 pub(crate) use crate::provider::GATEWAY_KEY_ENV as KEY_ENV;
 
+fn bind_error(port: u16, error: std::io::Error) -> RelayError {
+    if error.kind() != std::io::ErrorKind::AddrInUse {
+        return error.into();
+    }
+    let other = if port == u16::MAX { port - 1 } else { port + 1 };
+    format!(
+        "port {port} is already in use\n  why: another program, possibly another ox serve, is listening on 127.0.0.1:{port}\n  fix: ox serve --port {other}   (then use that port in your client settings)"
+    )
+    .into()
+}
+
 pub(crate) async fn run(args: &[OsString], home: &Path) -> Result<u8, RelayError> {
     let port = match args {
         [] => DEFAULT_PORT,
@@ -43,7 +54,9 @@ pub(crate) async fn run(args: &[OsString], home: &Path) -> Result<u8, RelayError
     let config = CodeoxConfig::load(&path)?;
     let saved = SavedKeys::for_config(home, &config)?;
     let env = |name: &str| saved.get(name);
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+        .await
+        .map_err(|error| bind_error(port, error))?;
     let search = config
         .search
         .as_ref()
@@ -63,4 +76,31 @@ pub(crate) async fn run(args: &[OsString], home: &Path) -> Result<u8, RelayError
     eprintln!("ox: serving on http://{}", listener.local_addr()?);
     serve(listener, Arc::new(gateway)).await?;
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_busy_port_explains_itself_and_offers_another_port() {
+        let busy = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        let message = bind_error(8787, busy).to_string();
+        assert!(
+            message.starts_with("port 8787 is already in use"),
+            "{message}"
+        );
+        assert!(
+            message.contains("\n  fix: ox serve --port 8788"),
+            "{message}"
+        );
+        let busy = std::io::Error::from(std::io::ErrorKind::AddrInUse);
+        assert!(
+            bind_error(u16::MAX, busy)
+                .to_string()
+                .contains("--port 65534")
+        );
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(!bind_error(80, denied).to_string().contains("fix:"));
+    }
 }
