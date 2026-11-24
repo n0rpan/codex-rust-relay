@@ -160,10 +160,29 @@ notice.
   one event at a time and never buffered end to end.
 - **No Nagle delay.** Client sockets use `TCP_NODELAY`. Without it, a client
   that is busy rendering holds back the tokens behind it for up to 40 ms.
-- **Connections are reused.** One pooled HTTPS client per process with
-  keep-alive. After a translated stream ends, ox reads the short rest of the
-  provider's HTTP body in the background so the connection returns to the pool
-  and the next request skips the TCP and TLS handshake.
+- **Connections are reused.** One pooled HTTPS client per process. After a
+  translated stream ends, ox reads the short rest of the provider's HTTP body
+  in the background so the connection returns to the pool and the next request
+  skips the TCP and TLS handshake.
+- **Connections survive a pause.** An unused provider connection is kept for
+  five minutes, with TCP keep-alive every 30 seconds so a NAT gateway does not
+  drop it while you read or type.
+- **HTTP/2 where the provider offers it.** Parallel requests, such as a
+  background worker, a classifier and the main conversation, share one
+  connection. A provider that only speaks HTTP/1.1 is used as before. Set
+  `OX_HTTP1=1` to force HTTP/1.1 for a provider or proxy with a broken HTTP/2
+  implementation.
+- **The first prompt does not wait for a handshake.** Once the launch model
+  is known, ox opens the connection to its provider while the client starts.
+  Model discovery already does this for providers that list their models; for
+  a provider with `discovery = false`, ox sends one request without
+  credentials to open the connection.
+- **Provider prompt caches are used.** Codex replays the whole conversation
+  on every turn. For a Claude model, ox marks the system prompt and the end of
+  the conversation as cache breakpoints, so each turn reads the previous one
+  from the provider's cache. Without the markers the Messages API caches
+  nothing. For Claude Code on a Responses API, ox sends the session ID as
+  `prompt_cache_key` so one session keeps hitting the cache it warmed.
 - **Parallel startup.** `ox codex` loads Codex's bundled model catalog while
   provider model lists are fetched, so a launch waits for the slower of the
   two and not their sum.
@@ -174,9 +193,10 @@ notice.
 - **Nothing extra on the request path.** No request logging and no disk
   writes while relaying.
 
-ox uses HTTP/1.1 with keep-alive to providers. It does not use HTTP/2, and
-translation copies the request body: a 1 MB conversation adds about 3 to 5 ms
-before its first byte in the measurement below.
+Translation copies the request body: a 1 MB conversation adds about 3 to 5 ms
+before its first byte in the measurement below. HTTP/2, the connection warm-up
+and the cache markers are covered by unit tests but have not been measured
+against a live provider, because CI makes no public inference requests.
 
 These tests fail if a change holds tokens back or stops reusing connections.
 They need no timing thresholds and run in the normal test suite:
@@ -238,7 +258,7 @@ six client and API combinations. Both clients ended with
 | Added time to first event, p50 | 0.10 to 0.30 ms |
 | Warm idle memory (RSS) | 5.8 to 6.3 MiB |
 | Idle CPU | 0.0000% of one core over 10 seconds |
-| Release executable | about 5.2 MB (8.4 MB before the release profile) |
+| Release executable | about 5.6 MB (8.4 MB before the release profile) |
 
 The rows below come from a separate loopback stream harness that is not part
 of this repository. It streamed tokens through ox and directly, and compared

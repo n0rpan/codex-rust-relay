@@ -68,6 +68,9 @@ const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CATALOG_BYTES: usize = 8 * 1024 * 1024;
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long an unused provider connection stays open for the next request.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 const MAX_ECHOED_MODEL_CHARS: usize = 120;
 
 struct App {
@@ -330,6 +333,9 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
             }
             None => return Ok(0),
         }
+    }
+    if let Some(model) = clients::explicit_model(&args) {
+        app.prewarm(model);
     }
     let favorites = picker::read_favorites(&codex_home).unwrap_or_default();
     if let Mode::Codeox { catalog, .. } = &mut app.mode {
@@ -803,6 +809,37 @@ impl App {
     /// starts. A prefix that matches no configured provider is an error with
     /// the closest provider. An ID missing from a provider's known list only
     /// earns a note, because prefix routing still reaches the provider.
+    /// Opens the provider connection for the launch model while the client
+    /// is still starting, so the first prompt does not wait for DNS, TCP and
+    /// TLS. Best effort: failures are ignored and the first request connects
+    /// as usual.
+    fn prewarm(&self, model: &str) {
+        let Some(url) = self.prewarm_target(model) else {
+            return;
+        };
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            // No credentials: only the connection matters, whatever the reply.
+            let _ = client.head(url).timeout(CONNECT_TIMEOUT).send().await;
+        });
+    }
+
+    /// The URL to connect to ahead of the first request, or `None` when a
+    /// warm-up would not help: the provider has no key, is reached over plain
+    /// HTTP (local servers connect instantly), or model discovery has already
+    /// opened its connection.
+    fn prewarm_target(&self, model: &str) -> Option<reqwest::Url> {
+        let Mode::Codeox {
+            vendors, routes, ..
+        } = &self.mode
+        else {
+            return None;
+        };
+        let (_, state, _) = resolve_model(vendors, routes, model).ok()?;
+        let vendor = &state.vendor;
+        (vendor.base_url.scheme() == "https" && !vendor.discovery).then(|| vendor.base_url.clone())
+    }
+
     fn check_launch_model(&self, requested: &str) -> Result<(), RelayError> {
         let Mode::Codeox {
             vendors, routes, ..
@@ -1083,12 +1120,33 @@ impl App {
     }
 }
 
+/// The one pooled client for every provider request.
+///
+/// A provider connection costs a DNS lookup, a TCP handshake and a TLS
+/// handshake, so the client is tuned to pay that once per session:
+/// - HTTP/2 where the provider offers it, so parallel requests (workers,
+///   classifier and title requests) share one connection;
+/// - idle connections are kept for five minutes, and TCP keep-alive stops
+///   NAT gateways from dropping them while the user reads or types.
+///
+/// `OX_HTTP1=1` forces HTTP/1.1 for a provider or proxy with a broken HTTP/2
+/// implementation.
 fn upstream_client() -> Result<Client, reqwest::Error> {
-    Client::builder()
+    let builder = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(Duration::from_secs(300))
-        .build()
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .tcp_keepalive(TCP_KEEPALIVE);
+    if http1_only(std::env::var_os("OX_HTTP1").as_deref()) {
+        builder.http1_only().build()
+    } else {
+        builder.build()
+    }
+}
+
+fn http1_only(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 fn resolve_model<'a>(
@@ -1803,6 +1861,69 @@ mod tests {
         ] {
             assert_eq!(mistyped_command(passthrough), None, "{passthrough}");
         }
+    }
+
+    #[tokio::test]
+    async fn prewarm_targets_only_keyed_https_providers_without_discovery() {
+        let config = r#"
+[providers.static]
+base_url = "https://static.example/v1"
+env_key = "STATIC_KEY"
+discovery = false
+
+[[providers.static.models]]
+id = "fast-coder"
+
+[providers.local]
+base_url = "http://127.0.0.1:9/v1"
+env_key = "LOCAL_KEY"
+discovery = false
+
+[[providers.local.models]]
+id = "fast-coder"
+
+[providers.nokey]
+base_url = "https://nokey.example/v1"
+env_key = "MISSING_KEY"
+discovery = false
+
+[[providers.nokey.models]]
+id = "fast-coder"
+"#;
+        let environment = |name: &str| match name {
+            "STATIC_KEY" | "LOCAL_KEY" => Some("secret".to_owned()),
+            _ => None,
+        };
+        let app = App::codeox(
+            CodeoxConfig::load_from_str(config).unwrap(),
+            bundled_fixture(),
+            RELAY_TOKEN,
+            test_client(),
+            1 << 20,
+            &environment,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.prewarm_target("static/fast-coder").unwrap().as_str(),
+            "https://static.example/v1"
+        );
+        // Plain HTTP connects instantly, a provider without a key cannot be
+        // used, and an unknown alias has no provider.
+        assert!(app.prewarm_target("local/fast-coder").is_none());
+        assert!(app.prewarm_target("nokey/fast-coder").is_none());
+        assert!(app.prewarm_target("unknown/fast-coder").is_none());
+    }
+
+    #[test]
+    fn ox_http1_forces_http1_only_when_set_to_a_true_value() {
+        use std::ffi::OsStr;
+        assert!(!http1_only(None));
+        assert!(!http1_only(Some(OsStr::new(""))));
+        assert!(!http1_only(Some(OsStr::new("0"))));
+        assert!(http1_only(Some(OsStr::new("1"))));
+        assert!(upstream_client().is_ok());
     }
 
     #[tokio::test]
@@ -3348,7 +3469,8 @@ context_window = 200000
         assert_eq!(body["model"], "upstream-model");
         assert_eq!(body["max_tokens"], 64);
         assert_eq!(body["stream"], true);
-        assert_eq!(body["system"], "You are a coding agent.");
+        assert_eq!(body["system"][0]["text"], "You are a coding agent.");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert!(body.get("max_output_tokens").is_none());
         assert!(body.get("store").is_none());
         assert!(

@@ -113,13 +113,16 @@ excluded.
 | Tokens per second | unchanged: total stream time +0.0% |
 | CPU while idle | 0% in a 10-second sample |
 | Memory | about 6 MiB resident when idle |
-| Size | one executable of about 5.2 MB, one thread, no background process |
+| Size | one executable of about 5.6 MB, one thread, no background process |
 
-Three things keep it there. Each token costs three system calls (wait, read,
+A few things keep it there. Each token costs three system calls (wait, read,
 write) on one thread, with no batching between provider and client. Client
 sockets use `TCP_NODELAY`, so a client that is busy rendering does not stall
-the tokens behind it. Provider connections are reused, so a follow-up request
-does not pay a new TCP and TLS handshake.
+the tokens behind it. Provider connections are opened while the client
+starts, shared over HTTP/2 and kept alive through pauses, so requests do not
+pay a new TCP and TLS handshake. Where a provider caches prompts only on
+request, ox makes the request, so a long conversation is not processed from
+scratch on each turn.
 [How to reproduce these numbers](docs/verification.md#how-ox-stays-fast)
 
 ## Release channels

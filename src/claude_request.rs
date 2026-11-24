@@ -42,7 +42,8 @@
 //! * `system` is an array of `text` blocks. Prompt-cache breakpoints are
 //!   expressed with `cache_control` on system blocks, message blocks, tools,
 //!   and sometimes a top-level body field. All of them are stripped; Responses
-//!   has no equivalent marker in the request body.
+//!   caches prompt prefixes automatically and has no equivalent marker. The
+//!   session ID in `metadata.user_id` is sent as `prompt_cache_key` instead.
 //! * Tools carry `eager_input_streaming`, `defer_loading`, `cache_control`, and
 //!   `caller` hints that are not part of the Responses function-tool schema.
 //!   They are ignored, while the name, description and complete JSON Schema
@@ -189,6 +190,9 @@ fn convert(input: &Value, upstream_model: &str, count_only: bool) -> Result<Valu
         body.insert("stop".to_owned(), stop);
     }
     if let Some(metadata) = translate_metadata(request.get("metadata"))? {
+        if let Some(key) = prompt_cache_key(&metadata) {
+            body.insert("prompt_cache_key".to_owned(), json!(key));
+        }
         body.insert("metadata".to_owned(), metadata);
     }
     if let Some(tier) = translate_service_tier(request.get("service_tier"))? {
@@ -307,6 +311,24 @@ fn translate_stop_sequences(value: Option<&Value>) -> Result<Option<Value>, Stri
     } else {
         Ok(Some(Value::Array(sequences)))
     }
+}
+
+/// A stable per-session key for the provider's prompt cache.
+///
+/// Responses providers cache prompt prefixes automatically, and route
+/// requests that share a `prompt_cache_key` to the same cache; Codex sends
+/// one for every conversation. Claude Code names its session inside the
+/// JSON-encoded `metadata.user_id`, so the same session keeps hitting the
+/// cache it warmed. No session ID, no key.
+fn prompt_cache_key(metadata: &Value) -> Option<String> {
+    let encoded = metadata.get("user_id")?.as_str()?;
+    let user: Value = serde_json::from_str(encoded).ok()?;
+    let session = user.get("session_id")?.as_str()?;
+    let valid = (1..=64).contains(&session.len())
+        && session
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+    valid.then(|| session.to_owned())
 }
 
 fn translate_metadata(value: Option<&Value>) -> Result<Option<Value>, String> {
@@ -1264,6 +1286,8 @@ mod tests {
             converted["metadata"]["user_id"],
             "{\"device_id\":\"d\",\"session_id\":\"s\"}"
         );
+        // The session keeps one provider-side prompt cache.
+        assert_eq!(converted["prompt_cache_key"], "s");
         assert_eq!(
             converted["instructions"],
             "You are Claude Code, Anthropic's official CLI for Claude.\nYou are an agent working with the user."
@@ -1593,6 +1617,8 @@ mod tests {
         assert_eq!(converted["stop"], json!(["STOP", "END"]));
         assert_eq!(converted["service_tier"], "default");
         assert_eq!(converted["metadata"], json!({"user_id": "u"}));
+        // A user ID without a session names no cache.
+        assert!(converted.get("prompt_cache_key").is_none());
         assert_eq!(converted["reasoning"], json!({"effort": "high"}));
         assert_eq!(
             converted["text"]["format"],
