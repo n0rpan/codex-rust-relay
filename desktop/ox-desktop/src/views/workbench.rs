@@ -24,9 +24,6 @@ fn current_activity(store: &Store) -> Option<activity::Scene> {
     {
         return Some(Scene::Waiting);
     }
-    if store.job(id).is_some_and(|job| job.live && job.can_stop()) {
-        return Some(Scene::Worker);
-    }
     let transcript = store.transcript(id)?;
     if transcript.is_loading() {
         return Some(Scene::Loading);
@@ -136,8 +133,7 @@ impl Workbench {
         })
         .detach();
         cx.observe_window_visibility(window, |s, _, window, cx| {
-            if let Some(store) = &mut s.store {
-                store.set_jobs_visible(window.is_visible());
+            if s.store.is_some() {
                 let _ = s.wake.try_send(());
             }
             if window.is_visible() && s.front {
@@ -234,7 +230,6 @@ impl Workbench {
                             if let Err(e) = store.search(s.query.clone()) {
                                 s.launch_error = Some(e.to_string());
                             }
-                            store.set_jobs_visible(window.is_visible());
                             deadline = store.next_deadline();
                             store.set_front(s.front);
                             s.store = Some(store);
@@ -631,9 +626,7 @@ impl Workbench {
                     .child(icon)
                     .child(crate::kit::small(p, scene.label()))
             });
-        let transcript = self
-            .worker_transcript(cx)
-            .unwrap_or_else(|| self.transcript_panel(cx));
+        let transcript = self.transcript_panel(cx);
         let controls = self.thread_menu(cx);
         let review_toggle = self.review_toggle(cx);
         let inline_request = self.pane_width < px(825.);

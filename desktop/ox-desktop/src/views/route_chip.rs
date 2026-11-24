@@ -212,9 +212,6 @@ impl Workbench {
             return vec![];
         };
         let owner = store.selected();
-        if owner.is_some_and(|id| store.job(id).is_some()) {
-            return vec![];
-        }
         let p = Palette::get(cx);
         let settings = store.options(owner);
         let enabled = store.can_send(owner);

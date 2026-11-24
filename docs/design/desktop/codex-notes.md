@@ -37,9 +37,9 @@ The workbench opens one listing connection per available Codex home for the curr
 
 ## Native runtime boundary
 
-The workbench owns the thread list, transcript rendering, drafts, pending user input, and worker views. A native runtime supplies session identity, history, stream events, and the actions currently available on a thread or worker. Keep its wire names, request matching, authentication, permission semantics, and terminal resume arguments inside its integration. A capability can differ between two sessions using the same executable. For example, the Codex decoder converts an agent message’s `phase` into the shared transcript’s update flag. The renderer receives the author label from the active runtime.
+The workbench owns the thread list, transcript rendering, drafts and pending user input. A native runtime supplies session identity, history, stream events, and the actions currently available on a thread. Keep its wire names, request matching, authentication, permission semantics, and terminal resume arguments inside its integration. A capability can differ between two sessions using the same executable. For example, the Codex decoder converts an agent message’s `phase` into the shared transcript’s update flag. The renderer receives the author label from the active runtime.
 
-Codex is the reference runtime for this sprint. Its stock protocol and the OX billing route remain authoritative. OX worker controls use their originating parent connection. The shared worker view receives the displayed runtime, messages, and available actions from that connection. Claude Code now maps its stream events and session capabilities to those views. Its stock protocol, billing checks, and session-scoped process model are documented in [Claude Code runtime checks](claude-notes.md).
+Codex is the reference runtime for this sprint. Its stock protocol and the OX billing route remain authoritative. OX workers are host-owned sessions on their own route and use the shared transcript, as described in [OX session host](host-notes.md). Claude Code maps its stream events and session capabilities to the same views. Its stock protocol, billing checks, and session-scoped process model are documented in [Claude Code runtime checks](claude-notes.md).
 
 ### Workbench parity with stock Codex
 

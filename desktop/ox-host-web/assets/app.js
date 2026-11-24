@@ -243,6 +243,13 @@ class Link {
       }
       return;
     }
+    if (msg.type === "worker_reply") {
+      notice(
+        msg.error ??
+          `Started worker ${msg.result?.job_id} on ${msg.result?.model}. It appears under this session.`,
+      );
+      return;
+    }
     if (msg.type === "ack" || msg.type === "error") {
       if (msg.type === "error") this.opens.delete(msg.id);
       const cb = this.pending.get(msg.id);
@@ -434,7 +441,9 @@ function catalog() {
     if (
       (filter === "requests" && !needsInput) ||
       (filter === "active" &&
-        !session.capabilities.some((c) => c === "stop" || c === "steer"))
+        !session.capabilities.some((c) => c === "stop" || c === "steer")) ||
+      (filter === "finished" &&
+        (needsInput || ["running", "needs_input"].includes(session.status)))
     )
       continue;
     const list = byProject.get(scope.project) ?? [];
@@ -450,7 +459,11 @@ function catalog() {
       children = new Map();
     for (const entry of list)
       if (entry.session.parent) {
-        const k = keyOf(entry.scope, entry.session.parent),
+        // A host-owned worker runs on its own route; its origin names the parent's scope.
+        const k = keyOf(
+            entry.session.detail?.origin?.parent?.scope ?? entry.scope,
+            entry.session.parent,
+          ),
           group = children.get(k) ?? [];
         group.push(entry);
         children.set(k, group);
@@ -462,7 +475,7 @@ function catalog() {
       done.add(key);
       const b = button("", () => open(scope, session.id));
       b.dataset.source =
-        session.parent || session.detail?.worker || session.detail?.job
+        session.parent || session.detail?.worker || session.detail?.origin
           ? "worker"
           : scope.route.billing !== "subscription"
             ? "api"
@@ -498,6 +511,8 @@ function catalog() {
           ? "No pending requests."
           : filter === "active"
             ? "No active sessions."
+            : filter === "finished"
+              ? "No finished sessions."
             : "No sessions found.",
       ),
     );
@@ -768,7 +783,7 @@ function conversation() {
     g?.sessions.find((x) => x.id === id) ??
     cold.get(k)?.sessions.find((x) => x.id === id);
   const caps = row?.capabilities || [];
-  const worker = Boolean(row?.detail?.job);
+  const origin = row?.detail?.origin;
   controls.update({
     scope,
     id,
@@ -784,37 +799,20 @@ function conversation() {
   $("context").textContent =
     leaf(scope.project) +
     " · " +
-    routesLabel(row?.detail?.route || scope.route);
+    routesLabel(row?.detail?.route || scope.route) +
+    (origin
+      ? ` · worker ${origin.job_id} · ${origin.ceiling === "write" ? "workspace write" : "read-only"} ceiling`
+      : "");
   const timeline = s?.transcripts[id];
   const inputCaps = id ? caps : (s?.capabilities ?? []);
   updateExtras(s, inputCaps, detailLink, id);
   showReview(timeline?.detail?.reviews);
-  const job = row?.detail?.job;
-  if (job) {
-    const snapshot = job.snapshot ?? {};
-    const items = (snapshot.messages ?? []).map((m, i) => ({
-      id: String(i),
-      turn: id,
-      role: m.role,
-      text: m.text,
-      revision: 0,
-    }));
-    for (const [tag, text] of Object.entries({
-      progress: snapshot.progress,
-      result: snapshot.result,
-      error: job.error ?? snapshot.error,
-    })) {
-      if (text) items.push({ id: tag, turn: id, role: tag, text, revision: 0 });
-    }
-    transcript(items);
-  } else transcript(timeline?.items || []);
+  transcript(timeline?.items || []);
   $("older").hidden = !timeline?.detail?.older;
   $("older").onclick = () => detailLink.act({ load_older: id });
-  $("refresh-worker").hidden = !job || !caps.includes("refresh");
-  $("refresh-worker").onclick = () =>
-    detailLink.act({ worker_control: [id, "refresh"] });
+  $("start-worker").hidden = !id || !caps.includes("open");
   showAsks((s?.asks || []).filter((a) => a.thread === id));
-  if (selected.revealLatest && (timeline?.items?.length || job)) {
+  if (selected.revealLatest && timeline?.items?.length) {
     selected.revealLatest = false;
     const answers = $("timeline").querySelectorAll(".assistant, .result");
     const latest =
@@ -852,13 +850,13 @@ function conversation() {
   $("operator-session").hidden =
     !id ||
     !!row?.parent ||
-    !!row?.detail?.job ||
+    !!origin ||
     !caps.includes("send") ||
     caps.includes("stop");
   $("stop").hidden = !caps.includes("stop");
   $("stop").disabled = !detailLink?.ready;
   $("stop").onclick = () =>
-    detailLink.act(worker ? { worker_control: [id, "stop"] } : { stop: id });
+    detailLink.act({ stop: id });
 }
 function render() {
   if (!$("pair").hidden) return;
@@ -966,6 +964,36 @@ $("new-form").onsubmit = async (e) => {
     notice(error.message);
   }
 };
+$("start-worker").onclick = () => {
+  $("worker-models").replaceChildren(
+    ...routes
+      .filter((r) => r.billing?.api)
+      .map((r) => new Option(r.billing.api)),
+  );
+  $("worker-form").hidden = false;
+  $("worker-task").focus();
+};
+$("worker-cancel").onclick = () => ($("worker-form").hidden = true);
+$("worker-form").onsubmit = (e) => {
+  e.preventDefault();
+  if (!selected?.id) return;
+  const model = $("worker-model").value.trim() || null;
+  const start = {
+    parent: selected.id,
+    runtime: $("worker-runtime").value,
+    model,
+    mode: $("worker-mode").value,
+    task: $("worker-task").value,
+    write: $("worker-write").checked,
+  };
+  detailLink?.act({ start_worker: start }, null, (ok, message) => {
+    if (!ok) notice(message || "The host refused this worker.");
+    else {
+      $("worker-form").hidden = true;
+      $("worker-task").value = "";
+    }
+  });
+};
 $("draft").oninput = () => {
   mentionInput();
   if (selected)
@@ -982,9 +1010,7 @@ $("composer").onsubmit = (e) => {
   const content = $("draft").value;
   const owner = keyOf(scope, id);
   const images = imagesFor(owner);
-  const action = row?.detail?.job
-    ? { worker_control: [id, { steer: content }] }
-    : images.length
+  const action = images.length
       ? { send_images: [id, content, images.map((v) => v.image)] }
       : { send_text: [id, content] };
   pendingNew = { owner };

@@ -143,3 +143,17 @@ pub(crate) fn attach(stream: UnixStream, id: u64, events: SyncSender<Message>) -
     });
     Ok(())
 }
+
+#[cfg(test)]
+pub(crate) fn test_peer() -> (Peer, mpsc::Receiver<Packet>) {
+    let (writer, rx) = mpsc::sync_channel(256);
+    let (stop, _) = UnixStream::pair().expect("socket pair");
+    (
+        Peer {
+            writer,
+            queued: Arc::new(AtomicUsize::new(0)),
+            stop,
+        },
+        rx,
+    )
+}

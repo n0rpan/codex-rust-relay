@@ -154,21 +154,9 @@ impl Store {
     fn session_view(&self, r: &ThreadRow) -> SessionView {
         let id = r.id.as_str();
         let t = self.transcript(id);
-        let j = self.job(id);
         let running = t.is_some_and(|t| t.active_turn().is_some());
         let mut caps = vec!["open".to_owned()];
-        let status = if let Some(j) = j {
-            if j.can_steer() {
-                caps.push("steer".into());
-            }
-            if j.can_stop() {
-                caps.push("stop".into());
-            }
-            if !j.pending {
-                caps.push("refresh".into());
-            }
-            j.status()
-        } else {
+        let status = {
             if self.can_send(Some(id)) {
                 caps.push(if running { "steer" } else { "send" }.into());
                 self.composer_caps(Some(id), &mut caps);
@@ -214,16 +202,20 @@ impl Store {
             }
         };
         let detail = json!({"row":r,"worker":r.worker,"unread":r.unread,"order":r.activity_order.to_string(),"generated":r.generated_title,
-            "owned":t.is_some()||j.is_some(),"changing":self.changing_options(id),"terminal":self.in_terminal(id),"sending":self.sending(Some(id)),
-            "route":self.thread_route(Some(id)),"options":t.map(|_|self.options(Some(id))),"access":self.applied_access(Some(id)),"command_caps":(self.is_session_scoped() && t.is_some()).then(||self.command_caps(Some(id))),
-            "job":j.map(|j|json!({"parent":j.parent,"title":j.title,"snapshot":j.snapshot,"live":j.live,"pending":j.pending,"error":j.error}))});
+            "owned":t.is_some(),"changing":self.changing_options(id),"terminal":self.in_terminal(id),"sending":self.sending(Some(id)),
+            "route":self.thread_route(Some(id)),"options":t.map(|_|self.options(Some(id))),"access":self.applied_access(Some(id)),"command_caps":(self.is_session_scoped() && t.is_some()).then(||self.command_caps(Some(id)))});
+        let mut detail = detail;
+        let mut parent = r.parent_thread_id.clone();
+        if let Some((nest, extra)) = self.host_annotations.get(id) {
+            if let (Some(target), Some(fields)) = (detail.as_object_mut(), extra.as_object()) {
+                target.extend(fields.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+            parent = parent.or_else(|| nest.clone());
+        }
         SessionView {
             id: r.id.clone(),
             title: r.title().into(),
-            parent: r
-                .parent_thread_id
-                .clone()
-                .or_else(|| j.map(|j| j.parent.clone())),
+            parent,
             status: status.into(),
             updated_at: r.updated_at,
             capabilities: caps,

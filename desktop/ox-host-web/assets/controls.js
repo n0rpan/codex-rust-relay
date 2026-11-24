@@ -201,7 +201,7 @@ export class SessionControls {
       draft = id === null;
     const detail = state?.detail ?? {},
       own = row?.detail ?? {};
-    const present = !!state && (draft || (!!row && !own.job));
+    const present = !!state && (draft || !!row);
     $("session-controls").hidden = !present;
     if (!present) return;
     this.caps = (draft ? state.capabilities : row.capabilities) ?? [];
@@ -224,8 +224,14 @@ export class SessionControls {
     } else {
       badge.removeAttribute("aria-label");
     }
-    this.allowed = (detail.access_choices ?? []).filter((x) =>
-      Object.hasOwn(modes, x),
+    // A worker's mode stays within its recorded ceiling. The host enforces this too.
+    const ceiling = own.origin?.ceiling;
+    const withinCeiling = (x) =>
+      !ceiling ||
+      ["read_only", "default", "plan"].includes(x) ||
+      (ceiling === "write" && ["workspace", "accept_edits"].includes(x));
+    this.allowed = (detail.access_choices ?? []).filter(
+      (x) => Object.hasOwn(modes, x) && withinCeiling(x),
     );
     if ($("session-settings").hidden) return;
     const options = this.allowed.map((v) => [v, modes[v]]);

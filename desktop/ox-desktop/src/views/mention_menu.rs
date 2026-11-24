@@ -46,9 +46,7 @@ impl Workbench {
         let Some(store) = &mut self.store else {
             return;
         };
-        if store.selected() != owner.as_deref()
-            || owner.as_deref().is_some_and(|id| store.job(id).is_some())
-        {
+        if store.selected() != owner.as_deref() {
             return;
         }
         let range = token(&value, read.cursor());

@@ -380,12 +380,8 @@ impl Store {
         };
         if let Some(id) = thread {
             if self
-                .jobs
-                .values()
-                .any(|j| j.parent == id && j.live && j.snapshot.status == "running")
-                || self
-                    .transcript(&id)
-                    .is_some_and(|t| t.active_turn().is_some())
+                .transcript(&id)
+                .is_some_and(|t| t.active_turn().is_some())
                 || self.asks.iter().any(|a| a.thread.as_ref() == Some(&id))
                 || (self.is_session_scoped()
                     && (id.contains('/')

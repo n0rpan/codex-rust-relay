@@ -81,16 +81,15 @@ impl Store {
             ));
         }
         if row.worker {
-            if self.jobs.contains_key(&row.id)
-                || (self.is_session_scoped()
-                    && self
-                        .child_threads
-                        .get(&row.id)
-                        .is_some_and(|(parent, cwd)| {
-                            Some(parent) == row.parent_thread_id.as_ref()
-                                && cwd == &self.profile.project
-                        })
-                    && self.transcript(&row.id).is_some())
+            if self.is_session_scoped()
+                && self
+                    .child_threads
+                    .get(&row.id)
+                    .is_some_and(|(parent, cwd)| {
+                        Some(parent) == row.parent_thread_id.as_ref()
+                            && cwd == &self.profile.project
+                    })
+                && self.transcript(&row.id).is_some()
             {
                 return self.open_catalog_id(&row.id);
             }
@@ -116,16 +115,6 @@ impl Store {
         self.open_catalog_alias(id, false)
     }
     fn open_catalog_alias(&mut self, id: &str, confirm_alias: bool) -> io::Result<()> {
-        if self.jobs.contains_key(id) {
-            self.selection += 1;
-            self.selected = Some(id.into());
-            if let Some(job) = self.jobs.get_mut(id)
-                && !job.pending
-            {
-                job.poll = Some(std::time::Instant::now());
-            }
-            return Ok(());
-        }
         self.selection += 1;
         self.selected = Some(id.into());
         let entry = self.transcripts.entry(id.into()).or_default();
@@ -261,7 +250,6 @@ impl Store {
             self.transcripts.entry(id.into()).or_default().verified = true;
             if let Some(page) = &mut initial {
                 self.history_preview(id, page);
-                self.observe_jobs_page(id, page);
             }
             let t = self.transcripts.entry(id.into()).or_default();
             t.model = Some(reply.model);
@@ -297,9 +285,8 @@ impl Store {
         );
     }
 
-    pub(super) fn history_page(&mut self, id: &str, mut page: TurnPage) {
+    pub(super) fn history_page(&mut self, id: &str, page: TurnPage) {
         self.history_preview(id, &page);
-        self.observe_jobs_page(id, &mut page);
         let result = self
             .transcripts
             .entry(id.into())

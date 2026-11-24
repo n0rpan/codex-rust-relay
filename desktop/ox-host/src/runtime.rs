@@ -281,7 +281,6 @@ impl RuntimeConfig {
             },
             move |e| receive(e),
         );
-        store.set_jobs_visible(true);
         Ok(store)
     }
 }

@@ -5,7 +5,9 @@ use std::{sync::mpsc, time::Duration};
 #[test]
 #[ignore = "requires the stock Codex OX worker fixture"]
 fn stock_ox_worker() {
-    use ox_desk_core::worker::WorkerAction;
+    use ox_desk_core::{actions::Action, origin::Relation, runtime::Billing};
+    // The parent starts a worker through its OX tools. The host owns the worker
+    // as an ordinary session on the worker's own API route, stamped with its origin.
     let (tx, rx) = mpsc::channel();
     let dir = std::env::current_dir().unwrap();
     let mut store = open_store(dir.clone(), Route::CODEX_SUBSCRIPTION, move |e| {
@@ -15,24 +17,13 @@ fn stock_ox_worker() {
     let deadline = Instant::now() + Duration::from_secs(28);
     let mut sent = false;
     let mut parent = None;
-    let mut steered = false;
-    let mut stopped = false;
-    let mut picked = false;
     let mut allowed = false;
-    let finished = loop {
+    loop {
         if let Ok(e) = rx.recv_timeout(Duration::from_millis(15)) {
             store.apply(e);
         }
         store.tick(Instant::now());
-        assert!(
-            Instant::now() < deadline,
-            "jobs={:?}, steered={steered} stopped={stopped} allowed={allowed}, notice={:?}",
-            store
-                .jobs()
-                .map(|(id, j)| (id, j.status(), &j.error))
-                .collect::<Vec<_>>(),
-            store.notice()
-        );
+        assert!(Instant::now() < deadline, "notice={:?}", store.notice());
         if !sent && store.state() == &Connection::Ready {
             store.edit(None, "Start the OX worker fixture.".into());
             store.submit(None).unwrap();
@@ -56,71 +47,80 @@ fn stock_ox_worker() {
             store.answer(&id, choice).unwrap();
             allowed = true;
         }
-        let Some((id, j)) = store.jobs().next() else {
-            continue;
-        };
-        let id = id.to_owned();
-        assert_eq!(Some(&j.parent), parent.as_ref());
-        assert_eq!(j.snapshot.model, "fixture/demo");
-        if !picked {
-            store.select(&id).unwrap();
-            picked = true;
-            continue;
-        }
-        if j.can_steer() && !steered {
-            let text = "Apply the OX worker clarification.";
-            store.edit(Some(&id), text.into());
-            store
-                .job_request(&id, WorkerAction::Steer(text.into()))
-                .unwrap();
-            steered = true;
-        } else if steered
-            && !stopped
-            && j.can_stop()
-            && j.snapshot
-                .messages
-                .iter()
-                .any(|m| m.text.contains("OX worker clarification"))
-        {
-            store.job_request(&id, WorkerAction::Stop).unwrap();
-            stopped = true;
-        } else if stopped && j.snapshot.status == "cancelled" {
-            break id;
-        }
-    };
-    assert!(allowed && steered && stopped);
-    drop(store);
-    // A new desktop connection attaches to the same host. The cancelled job
-    // retains its identity and messages, with no remaining write controls.
-    let (tx, rx) = mpsc::channel();
-    let mut store = open_store(dir, Route::CODEX_SUBSCRIPTION, move |e| {
-        let _ = tx.send(e);
-    })
-    .unwrap();
-    let parent = parent.unwrap();
-    let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        store.apply(
-            rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .unwrap(),
-        );
-        store.tick(Instant::now());
-        if store.selected().is_none() && store.catalog_row(&parent).is_some() {
-            store.select(&parent).unwrap();
-        }
-        if let Some(job) = store.job(&finished) {
-            assert_eq!(job.parent, parent);
-            assert_eq!(job.snapshot.status, "cancelled");
-            assert!(
-                job.snapshot
-                    .messages
-                    .iter()
-                    .any(|m| m.text.contains("OX worker clarification"))
-            );
-            assert!(!job.can_steer() && !job.can_stop());
+        if allowed && store.asks().is_empty() {
             break;
         }
     }
+    let parent = parent.unwrap();
+    let route = Route::codex_api("fixture/demo".into());
+    let (tx, rx) = mpsc::channel();
+    let mut worker = open_store(dir, route.clone(), move |e| {
+        let _ = tx.send(e);
+    })
+    .unwrap();
+    let mut steered = false;
+    let mut stopped = false;
+    let id = loop {
+        if let Ok(e) = rx.recv_timeout(Duration::from_millis(15)) {
+            worker.apply(e);
+        }
+        assert!(Instant::now() < deadline + Duration::from_secs(20));
+        let Some(id) = worker
+            .threads()
+            .iter()
+            .map(|r| r.id.clone())
+            .find(|id| worker.origin(id).is_some())
+        else {
+            continue;
+        };
+        let origin = worker.origin(&id).unwrap().clone();
+        assert_eq!(origin.relation, Relation::Worker);
+        assert_eq!(origin.parent.session.as_deref(), Some(parent.as_str()));
+        assert_eq!(
+            origin.parent.scope.as_ref().map(|s| &s.route),
+            Some(&Route::CODEX_SUBSCRIPTION)
+        );
+        assert_eq!(origin.route.billing, Billing::Api("fixture/demo".into()));
+        if worker.selected() != Some(id.as_str()) {
+            worker.select(&id).unwrap();
+            continue;
+        }
+        let running = worker
+            .transcript(&id)
+            .is_some_and(|t| t.active_turn().is_some());
+        if running && !steered && worker.can_send(Some(&id)) {
+            worker
+                .dispatch(Action::SendText(
+                    Some(id.clone()),
+                    "Apply the OX worker clarification.".into(),
+                ))
+                .unwrap();
+            steered = true;
+        } else if running && steered && !stopped {
+            worker.dispatch(Action::Stop(id.clone())).unwrap();
+            stopped = true;
+        } else if stopped && !running {
+            break id;
+        }
+    };
+    // The worker keeps its stamp after the subscriber reconnects.
+    drop(worker);
+    let (tx, rx) = mpsc::channel();
+    let mut again = open_store(std::env::current_dir().unwrap(), route, move |e| {
+        let _ = tx.send(e);
+    })
+    .unwrap();
+    let until = Instant::now() + Duration::from_secs(8);
+    while again.origin(&id).is_none() {
+        again.apply(
+            rx.recv_timeout(until.saturating_duration_since(Instant::now()))
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        again.origin(&id).unwrap().parent.session.as_deref(),
+        Some(parent.as_str())
+    );
 }
 #[test]
 #[ignore = "requires the stock Codex worker fixture"]

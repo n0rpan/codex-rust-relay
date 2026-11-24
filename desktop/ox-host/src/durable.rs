@@ -26,13 +26,20 @@ pub(crate) struct SavedSession {
     parent: Option<String>,
     updated_at: i64,
     active: bool,
+    /// The immutable worker stamp. No task, prompt or result is stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    origin: Option<ox_desk_core::origin::Origin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    marks: Option<crate::workers::Marks>,
 }
 impl SavedScope {
     pub(crate) fn from_state(s: &ScopeState) -> Self {
         let mut sessions: Vec<_> = s
             .sessions
             .iter()
-            .filter(|r| r.detail["owned"] == true || r.parent.is_some())
+            .filter(|r| {
+                r.detail["owned"] == true || r.parent.is_some() || !r.detail["origin"].is_null()
+            })
             .map(|r| SavedSession {
                 id: r.id.clone(),
                 title: r.title.chars().take(192).collect(),
@@ -42,6 +49,8 @@ impl SavedScope {
                     r.status.as_str(),
                     "running" | "needs_input" | "interrupted" | "Last seen running"
                 ),
+                origin: serde_json::from_value(r.detail["origin"].clone()).ok(),
+                marks: serde_json::from_value(r.detail["worker_marks"].clone()).ok(),
             })
             .collect();
         sessions.sort_by(|a, b| a.id.cmp(&b.id));
@@ -52,6 +61,17 @@ impl SavedScope {
             sessions,
             pending,
         }
+    }
+    pub(crate) fn origins(
+        &self,
+    ) -> impl Iterator<Item = (&str, ox_desk_core::origin::Origin, crate::workers::Marks)> {
+        self.sessions.iter().filter_map(|s| {
+            Some((
+                s.id.as_str(),
+                s.origin.clone()?,
+                s.marks.clone().unwrap_or_default(),
+            ))
+        })
     }
     pub(crate) fn recover(&self) -> ScopeState {
         ScopeState {
@@ -71,7 +91,8 @@ impl SavedScope {
                     updated_at: s.updated_at,
                     status: if s.active { "interrupted" } else { "idle" }.into(),
                     capabilities: vec![],
-                    detail: serde_json::json!({"owned":true,"recovered":true}),
+                    detail: serde_json::json!({"owned":true,"recovered":true,"worker":s.origin.is_some(),
+                        "origin":s.origin,"worker_marks":s.marks}),
                 })
                 .collect(),
         }

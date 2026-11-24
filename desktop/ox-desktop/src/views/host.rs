@@ -129,7 +129,13 @@ impl Host {
             }
         })
         .detach();
-        let filter = crate::kit::field("", "Search threads…", false, window, cx);
+        let filter = crate::kit::field(
+            "",
+            "Search threads… (is:running, is:waiting, is:finished)",
+            false,
+            window,
+            cx,
+        );
         cx.subscribe(
             &filter,
             |s, field, event: &gpui_component::input::InputEvent, cx| {
@@ -543,12 +549,6 @@ impl Host {
             if store.profile().provider != t.model_provider {
                 continue;
             }
-            if let Some(job) = store.job(&t.id) {
-                return (
-                    Some(view.route.clone()),
-                    Some(if job.can_steer() { "Running" } else { "Worker" }),
-                );
-            }
             if store
                 .asks()
                 .iter()
@@ -705,17 +705,7 @@ impl Host {
             };
             let (route, status) = self.project_row_state(project, t, scope, cx);
             let api = scope.api;
-            let job = self
-                .panes
-                .iter()
-                .map(|p| p.read(cx))
-                .filter(|p| p.project == project && scope.matches(&p.route))
-                .filter_map(|p| p.store.as_ref())
-                .find_map(|s| s.job(&t.id))
-                .map(|j| j.view());
-            let badge = if let Some(job) = &job {
-                format!("{} · {}", job.runtime, job.status)
-            } else {
+            let badge = {
                 route.as_ref().map_or_else(
                     || match (&t.model, api) {
                         (None, true) => "OX API · saved model unknown".into(),

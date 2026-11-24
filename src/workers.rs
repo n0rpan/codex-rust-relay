@@ -108,6 +108,8 @@ impl Relay {
             origin,
             home: home.to_owned(),
             cwd: project_directory(args, client)?,
+            session: session_hint(args, client),
+            launch: crate::random_token()?.chars().take(16).collect(),
             client,
             slots: Semaphore::new(4),
             jobs: Mutex::new(jobs::Jobs::default()),
@@ -122,6 +124,43 @@ impl Relay {
                 async move { service.handle(request).await }
             }) => Err(result.unwrap_err().into()),
         }
+    }
+}
+
+/// The native session a terminal launch resumes, from its own arguments. The host
+/// uses it only to let a resumed parent see the workers it started earlier.
+fn session_hint(args: &[OsString], client: ClientKind) -> Option<String> {
+    let args: Vec<&str> = args
+        .iter()
+        .take_while(|arg| *arg != "--")
+        .filter_map(|a| a.to_str())
+        .collect();
+    let valid = |id: &&str| {
+        !id.is_empty()
+            && id.len() <= 128
+            && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    match client {
+        ClientKind::Claude => args
+            .windows(2)
+            .find_map(|w| {
+                matches!(w[0], "--resume" | "-r" | "--session-id")
+                    .then_some(w[1])
+                    .filter(valid)
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                args.iter().find_map(|a| {
+                    a.strip_prefix("--resume=")
+                        .or_else(|| a.strip_prefix("--session-id="))
+                        .filter(valid)
+                        .map(str::to_owned)
+                })
+            }),
+        ClientKind::Codex => args
+            .windows(2)
+            .find(|w| w[0] == "resume" && valid(&w[1]))
+            .map(|w| w[1].to_owned()),
     }
 }
 
@@ -152,6 +191,8 @@ struct Service {
     origin: String,
     home: PathBuf,
     cwd: PathBuf,
+    session: Option<String>,
+    launch: String,
     client: ClientKind,
     slots: Semaphore,
     jobs: Mutex<jobs::Jobs>,
@@ -300,12 +341,21 @@ impl Service {
                         }
                     }
                 }
-                Some("list_ox_workers") => tool_result(Ok(self.jobs.lock().unwrap().list())),
+                Some("list_ox_workers") => tool_result(self.list_jobs().await),
                 Some("steer_ox_worker") => {
                     let result = async {
-                        let request = serde_json::from_value(params["arguments"].clone())
-                            .map_err(|_| "Provide a worker job ID and message.".to_string())?;
+                        let request: jobs::Steer =
+                            serde_json::from_value(params["arguments"].clone())
+                                .map_err(|_| "Provide a worker job ID and message.".to_string())?;
                         let app = self.app().await.map_err(|e| e.to_string())?;
+                        if !self.jobs.lock().unwrap().has(request.job_id) {
+                            let text = crate::upstream::redact(&request.text, &app.secrets);
+                            return self
+                                .host_call(
+                                    json!({"op":"steer","job_id":request.job_id,"text":text}),
+                                )
+                                .await;
+                        }
                         let received = self.jobs.lock().unwrap().steer(request, &app.secrets)?;
                         tokio::time::timeout(Duration::from_secs(30), received)
                             .await
@@ -320,11 +370,22 @@ impl Service {
                 Some(tool @ ("ox_worker_status" | "cancel_ox_worker")) => {
                     match serde_json::from_value(params["arguments"].clone()) {
                         Ok(job) => {
-                            let mut jobs = self.jobs.lock().unwrap();
-                            let result = if tool == "cancel_ox_worker" {
-                                jobs.cancel(job)
+                            let job: jobs::JobId = job;
+                            let local = self.jobs.lock().unwrap().has(job.job_id);
+                            let result = if !local {
+                                let op = if tool == "cancel_ox_worker" {
+                                    "cancel"
+                                } else {
+                                    "status"
+                                };
+                                self.host_call(json!({"op":op,"job_id":job.job_id})).await
                             } else {
-                                jobs.status(job)
+                                let mut jobs = self.jobs.lock().unwrap();
+                                if tool == "cancel_ox_worker" {
+                                    jobs.cancel(job)
+                                } else {
+                                    jobs.status(job)
+                                }
                             };
                             tool_result(result)
                         }
@@ -343,8 +404,8 @@ impl Service {
         )
     }
 
-    async fn start_job(&self, mut request: jobs::Start) -> Result<Value, String> {
-        let grant = request.authorize(&self.cwd).await?;
+    async fn start_job(&self, request: jobs::Start) -> Result<Value, String> {
+        request.validate()?;
         let app = self.app().await?;
         if let Some(model) = &request.model
             && let Mode::Codeox {
@@ -354,33 +415,56 @@ impl Service {
             crate::resolve_model(vendors, routes, model)
                 .map_err(|(_, error)| crate::upstream::redact(&error, &app.secrets).into_owned())?;
         }
-        let result = self.jobs.lock().unwrap().start(
-            request,
-            &self.home,
-            &self.cwd,
-            Arc::clone(&app.secrets),
-        )?;
-        if let Some(grant) = grant {
-            // The host receives only the local worker MCP capability of this OX launch.
-            let port = self
-                .origin
-                .strip_prefix("http://127.0.0.1:")
-                .ok_or("Invalid OX worker endpoint")?
-                .parse::<u16>()
-                .map_err(|e| e.to_string())?;
-            if let Err(e) = grant
-                .register(port, self.token.clone(), result.clone())
+        // A running session host owns the worker, so it outlives this helper and
+        // its approvals reach the human clients. Without one, run it here as before.
+        if let Some(host) = crate::host_lifetime::HostLink::find(&self.cwd)? {
+            let start = request.host_start(&app.secrets);
+            let reply = host
+                .send(self.launch.clone(), self.caller(), Some(start), None)
                 .await
+                .map_err(|e| crate::upstream::redact(&e, &app.secrets).into_owned())?;
+            return Ok(redact_value(reply, &app.secrets));
+        }
+        self.jobs
+            .lock()
+            .unwrap()
+            .start(request, &self.home, &self.cwd, Arc::clone(&app.secrets))
+    }
+
+    fn caller(&self) -> Value {
+        json!({
+            "project": self.cwd,
+            "runtime": match self.client {
+                ClientKind::Codex => "codex",
+                ClientKind::Claude => "claude",
+            },
+            "session": self.session,
+            "launch": self.launch,
+        })
+    }
+
+    async fn host_call(&self, call: Value) -> Result<Value, String> {
+        let app = self.app().await?;
+        let host = crate::host_lifetime::HostLink::find(&self.cwd)?
+            .ok_or("Unknown worker job in this ox launch.")?;
+        let reply = host
+            .send(self.launch.clone(), self.caller(), None, Some(call))
+            .await
+            .map_err(|e| crate::upstream::redact(&e, &app.secrets).into_owned())?;
+        Ok(redact_value(reply, &app.secrets))
+    }
+
+    async fn list_jobs(&self) -> Result<Value, String> {
+        let mut local = self.jobs.lock().unwrap().list();
+        if crate::host_lifetime::HostLink::find(&self.cwd)?.is_some() {
+            let hosted = self.host_call(json!({"op":"list"})).await?;
+            if let (Some(jobs), Some(more)) =
+                (local["jobs"].as_array_mut(), hosted["jobs"].as_array())
             {
-                if let Ok(id) =
-                    serde_json::from_value(serde_json::json!({"job_id":result["job_id"]}))
-                {
-                    let _ = self.jobs.lock().unwrap().cancel(id);
-                }
-                return Err(e);
+                jobs.extend(more.iter().cloned());
             }
         }
-        Ok(result)
+        Ok(local)
     }
 
     async fn list_models(&self, filters: ListModels) -> Result<Value, String> {
@@ -466,6 +550,24 @@ impl Service {
     }
 }
 
+fn redact_value(value: Value, secrets: &[String]) -> Value {
+    match value {
+        Value::String(text) => Value::String(crate::upstream::redact(&text, secrets).into_owned()),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|v| redact_value(v, secrets))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, redact_value(v, secrets)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 fn prepare_app(mut app: App, home: &Path, token: &str) -> App {
     let favorites = crate::picker::read_favorites(home).unwrap_or_default();
     if let Mode::Codeox { catalog, .. } = &mut app.mode {
@@ -537,7 +639,7 @@ fn tools() -> Value {
             },
             {
                 "name":"list_ox_workers",
-                "description":"List workers started in this OX launch and their current status.",
+                "description":"List workers started by this session or OX launch and their current status. Workers owned by the OX session host keep running after this launch ends.",
                 "inputSchema":{"type":"object","properties":{},"additionalProperties":false},
                 "annotations":{"readOnlyHint":true,"openWorldHint":false}
             },
@@ -641,4 +743,37 @@ async fn worker_text(mut body: RelayBody) -> Result<String, String> {
         }
     }
     Err("The provider stream ended before completing the worker request.".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn args(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
+    }
+    #[test]
+    fn a_resumed_terminal_launch_names_its_native_session() {
+        let id = "0b8d6f2e-3c41-4f0a-9e57-1d2c3b4a5f60";
+        assert_eq!(
+            session_hint(&args(&["--resume", id]), ClientKind::Claude).as_deref(),
+            Some(id)
+        );
+        assert_eq!(
+            session_hint(&args(&[&format!("--session-id={id}")]), ClientKind::Claude).as_deref(),
+            Some(id)
+        );
+        assert_eq!(
+            session_hint(&args(&["resume", id]), ClientKind::Codex).as_deref(),
+            Some(id)
+        );
+        assert_eq!(
+            session_hint(&args(&["--", "--resume", id]), ClientKind::Claude),
+            None
+        );
+        assert_eq!(
+            session_hint(&args(&["--resume", "../x"]), ClientKind::Claude),
+            None
+        );
+        assert_eq!(session_hint(&args(&[]), ClientKind::Codex), None);
+    }
 }

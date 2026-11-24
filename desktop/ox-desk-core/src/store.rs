@@ -47,7 +47,6 @@ pub use crate::codex::history::ThreadRow;
 enum Pending {
     Options(String, routes_thread::Options),
     Limits(u64),
-    Job(String, crate::worker::WorkerAction),
     Discover(commands::Discovery),
     LeaveForTerminal(commands::Handoff),
     Descendants(workers::Discovery),
@@ -70,15 +69,12 @@ enum Pending {
 
 pub struct Store {
     host_opened: Option<String>,
-    host_jobs: Option<jobs::HostControl>,
+    host_annotations: HashMap<String, (Option<String>, serde_json::Value)>,
     naming: Option<titles::Service>,
     authorized_models: HashMap<String, String>,
     next_options: Option<routes_thread::Options>,
     pub usage: crate::usage::Usage,
-    jobs: HashMap<String, jobs::Job>,
     archived_threads: HashSet<String>,
-    archived_updates: HashMap<String, crate::ports::ox_workers::Snapshot>,
-    jobs_visible: bool,
     commands: commands::Catalog,
     handoff_ready: Option<commands::Handoff>,
     terminal_threads: HashSet<String>,
@@ -116,6 +112,20 @@ impl Store {
     pub fn take_opened(&mut self) -> Option<String> {
         self.host_opened.take()
     }
+    /// Host-owned metadata published with a session row, such as a worker's
+    /// origin stamp. `parent` nests the row under a session in another scope.
+    pub fn annotate_session(
+        &mut self,
+        id: &str,
+        parent: Option<String>,
+        detail: serde_json::Value,
+    ) {
+        let next = (parent, detail);
+        if self.host_annotations.get(id) != Some(&next) {
+            self.host_annotations.insert(id.to_owned(), next);
+            self.changed.mark(Changed::THREADS);
+        }
+    }
     pub fn opening_thread(&self) -> bool {
         self.pending.values().any(|(_, p)| {
             matches!(p, Pending::Compose(compose::Operation::New(_)))
@@ -131,15 +141,12 @@ impl Store {
     fn with_link(profile: Profile, link: Link) -> Self {
         Self {
             host_opened: None,
-            host_jobs: None,
+            host_annotations: Default::default(),
             naming: None,
             authorized_models: Default::default(),
             next_options: None,
             usage: Default::default(),
-            jobs: Default::default(),
             archived_threads: Default::default(),
-            archived_updates: Default::default(),
-            jobs_visible: true,
             commands: Default::default(),
             handoff_ready: None,
             terminal_threads: Default::default(),
@@ -212,8 +219,6 @@ impl Store {
         if self.profile != previous.profile {
             return;
         }
-        self.jobs = std::mem::take(&mut previous.jobs);
-        self.invalidate_jobs();
         self.child_threads = std::mem::take(&mut previous.child_threads);
         self.terminal_threads = std::mem::take(&mut previous.terminal_threads);
         self.authorized_models = std::mem::take(&mut previous.authorized_models);
@@ -228,9 +233,6 @@ impl Store {
             })
             .map(|(id, _)| id.clone())
             .collect();
-        if let Some(job) = self.selected.as_ref().and_then(|id| self.jobs.get(id)) {
-            self.reopen.push(job.parent.clone());
-        }
         self.reopen.extend(std::mem::take(&mut previous.reopen));
         self.reopen.sort_unstable();
         self.reopen.dedup();
@@ -320,11 +322,7 @@ impl Store {
         if self.remote().is_some() {
             return None;
         }
-        self.pending
-            .values()
-            .map(|(when, _)| *when)
-            .chain(self.job_deadline())
-            .min()
+        self.pending.values().map(|(when, _)| *when).min()
     }
 
     fn request(&mut self, call: Call, pending: Pending) -> io::Result<()> {
@@ -397,7 +395,6 @@ impl Store {
         if self.remote().is_some() {
             return;
         }
-        self.tick_jobs(now);
         let expired: Vec<_> = self
             .pending
             .iter()
@@ -436,7 +433,6 @@ impl Store {
                     self.mention.error = Some(message);
                 }
             }
-            Pending::Job(id, _) => self.job_failed(&id, message),
             Pending::PaletteSearch(_) => self.palette_search.failed(message),
             Pending::ThreadOp(_) => self.notice = Some(message),
             Pending::ChildIdentity(_) => (), // A child can exit before its metadata arrives.
@@ -480,7 +476,7 @@ impl Store {
                     self.changed.transcript(id);
                 }
             }
-            Pending::ThreadOp(_) | Pending::Job(_, _) => self.changed.mark(Changed::THREADS),
+            Pending::ThreadOp(_) => self.changed.mark(Changed::THREADS),
             Pending::Initialize | Pending::Account => self.changed.mark(Changed::CONNECTION),
             Pending::PaletteSearch(_)
             | Pending::ChildIdentity(_)
@@ -535,7 +531,6 @@ impl Store {
                     Connection::Closed(reason.clone())
                 };
                 self.asks.clear();
-                self.invalidate_jobs();
                 self.listing = false;
                 for row in &mut self.catalog.rows {
                     row.status = None;
@@ -578,7 +573,6 @@ impl Store {
                     (Pending::LeaveForTerminal(handoff), Reply::Unsubscribed(_)) => {
                         self.handoff_ready = Some(handoff);
                     }
-                    (Pending::Job(id, op), Reply::Job(reply)) => self.job_reply(&id, op, reply),
                     (Pending::ThreadOp(op), reply) => self.finish_thread_op(op, reply)?,
                     (Pending::ChildIdentity(id), Reply::Read(read)) => {
                         self.observe_child_identity(&id, *read.thread);
@@ -654,12 +648,11 @@ impl Store {
                             ));
                         }
                         self.cursor = page.next_cursor;
-                        self.restore_job_rows();
                     }
                     (pending, _) => self.failed(pending, "Unexpected Codex response type".into()),
                 }
             }
-            Frame::Activity(mut activity) => {
+            Frame::Activity(activity) => {
                 if matches!(
                     activity.change,
                     crate::codex::activity::Change::TurnCompleted { error: None }
@@ -667,15 +660,6 @@ impl Store {
                     self.title_after_turn(&activity.thread);
                 }
 
-                if let crate::codex::activity::Change::Item { row, .. } = &mut activity.change
-                    && let Some(observation) = row.job.take()
-                {
-                    let verified = self
-                        .transcripts
-                        .get(&activity.thread)
-                        .is_some_and(|t| t.verified && t.ready);
-                    self.observe_job(&activity.thread, *observation, verified);
-                }
                 if let crate::codex::activity::Change::Item { row, .. } = &activity.change
                     && let crate::transcript::item::Item::AgentOperation {
                         tool,
@@ -773,8 +757,6 @@ mod mention_menu;
 mod palette_search;
 
 mod workers;
-
-mod jobs;
 
 mod thread_ops;
 pub(crate) use thread_ops::ThreadOperation;

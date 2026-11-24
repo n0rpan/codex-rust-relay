@@ -12,7 +12,6 @@ use std::{
 static LEASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 const PARENT_LEASE: &str = "OX_HOST_PARENT_LEASE";
 const ENDPOINT: &str = "OX_HOST_LIFETIME_SOCKET";
-const CHILD_MODE: &str = "OX_HOST_WORKER_CEILING";
 
 fn request(addr: &std::ffi::OsStr, body: Value) -> io::Result<UnixStream> {
     let mut socket = UnixStream::connect(Path::new(addr))?;
@@ -26,7 +25,7 @@ fn request(addr: &std::ffi::OsStr, body: Value) -> io::Result<UnixStream> {
     if ack[0] != 1 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "Worker access exceeds its active parent’s permission ceiling.",
+            "The session host refused this OX helper.",
         ));
     }
     Ok(socket)
@@ -58,73 +57,6 @@ pub(crate) fn supervise() -> io::Result<()> {
         })?;
     Ok(())
 }
-pub(crate) struct Grant {
-    socket: UnixStream,
-    pub parent: String,
-}
-impl Grant {
-    pub(crate) async fn register(
-        mut self,
-        port: u16,
-        token: String,
-        snapshot: Value,
-    ) -> Result<(), String> {
-        tokio::task::spawn_blocking(move || {
-            let data = serde_json::to_vec(&json!({"port":port,"token":token,"snapshot":snapshot}))?;
-            self.socket.write_all(&(data.len() as u32).to_be_bytes())?;
-            self.socket.write_all(&data)?;
-            let mut ack = [0];
-            self.socket.read_exact(&mut ack)?;
-            if ack[0] != 1 {
-                return Err(io::Error::other("Host refused the worker registration"));
-            }
-            Ok::<_, io::Error>(())
-        })
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())
-    }
-}
-pub(crate) async fn authorize(
-    cwd: &Path,
-    write: bool,
-    claude: bool,
-) -> Result<Option<Grant>, String> {
-    let Some(addr) = env::var_os(ENDPOINT) else {
-        return Ok(None);
-    };
-    if let Some(ceiling) = env::var_os(CHILD_MODE)
-        && write
-        && (ceiling != "write" || claude)
-    {
-        return Err("A nested OX worker cannot expand its parent’s sandbox.".into());
-    }
-    if LEASE.get().is_none() {
-        return Err("This OX worker gateway is not attached to a live host".into());
-    }
-    let project = cwd.canonicalize().map_err(|e| e.to_string())?;
-    let route: Value = serde_json::from_str(
-        &env::var("OX_HOST_WORKER_ROUTE")
-            .map_err(|_| "This helper is not attached to a host billing route")?,
-    )
-    .map_err(|e| e.to_string())?;
-    let parent = env::var("OX_HOST_WORKER_PARENT").ok();
-    tokio::task::spawn_blocking(move||{
-        let mut socket=request(&addr,json!({"type":"worker","scope":{"project":project,"route":route},"parent":parent,"write":write,"claude":claude}))?;
-        let mut size=[0;4];socket.read_exact(&mut size)?;
-        let n=u32::from_be_bytes(size) as usize;if n>4096{return Err(io::Error::other("Invalid host parent identity"));}
-        let mut data=vec![0;n];socket.read_exact(&mut data)?;
-        Ok::<_,io::Error>(Some(Grant{socket,parent:String::from_utf8(data).map_err(io::Error::other)?}))
-    }).await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())
-}
-pub(crate) fn inherit(command: &mut tokio::process::Command, write: bool) {
-    if hosted() {
-        command.env(CHILD_MODE, if write { "write" } else { "read" });
-        if let Some(lease) = LEASE.get() {
-            command.env(PARENT_LEASE, lease);
-        }
-    }
-}
 pub(crate) fn hosted() -> bool {
     env::var_os(ENDPOINT).is_some()
 }
@@ -132,11 +64,184 @@ pub(crate) fn hosted() -> bool {
 pub(crate) fn isolate_stock(command: &mut tokio::process::Command) {
     for key in [
         ENDPOINT,
-        CHILD_MODE,
         PARENT_LEASE,
         "OX_HOST_WORKER_ROUTE",
         "OX_HOST_WORKER_PARENT",
     ] {
         command.env_remove(key);
     }
+}
+
+/// A gateway's way to the session host, if one serves this launch. A helper the
+/// host started uses its private lifetime endpoint. Any other helper, such as
+/// `ox claude` in a terminal, uses the per-user host socket when a host is running.
+pub(crate) enum HostLink {
+    Hosted {
+        addr: std::ffi::OsString,
+        scope: Value,
+    },
+    External {
+        socket: std::path::PathBuf,
+    },
+}
+
+impl HostLink {
+    pub(crate) fn find(cwd: &Path) -> Result<Option<Self>, String> {
+        if let Some(addr) = env::var_os(ENDPOINT) {
+            if LEASE.get().is_none() {
+                return Err("This OX worker gateway is not attached to a live host".into());
+            }
+            let project = cwd.canonicalize().map_err(|e| e.to_string())?;
+            let route: Value = serde_json::from_str(
+                &env::var("OX_HOST_WORKER_ROUTE")
+                    .map_err(|_| "This helper is not attached to a host billing route")?,
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(Some(Self::Hosted {
+                addr,
+                scope: json!({"project": project, "route": route}),
+            }));
+        }
+        let socket = host_socket();
+        Ok(socket
+            .filter(|s| UnixStream::connect(s).is_ok())
+            .map(|socket| Self::External { socket }))
+    }
+
+    /// Send one launch (`call` is None) or parent call and wait for the host's answer.
+    pub(crate) async fn send(
+        self,
+        launch: String,
+        caller: Value,
+        start: Option<Value>,
+        call: Option<Value>,
+    ) -> Result<Value, String> {
+        let wait = Duration::from_secs(if start.is_some() { 80 } else { 15 });
+        tokio::task::spawn_blocking(move || match self {
+            Self::Hosted { addr, scope } => {
+                let body = match (start, call) {
+                    (Some(mut start), _) => {
+                        start["parent"] =
+                            env::var("OX_HOST_WORKER_PARENT").unwrap_or_default().into();
+                        json!({"type":"launch","scope":scope,"launch":launch,"start":start})
+                    }
+                    (None, call) => json!({"type":"call","scope":scope,"launch":launch,
+                        "parent":env::var("OX_HOST_WORKER_PARENT").ok(),"call":call}),
+                };
+                let mut socket =
+                    UnixStream::connect(Path::new(&addr)).map_err(|e| e.to_string())?;
+                socket
+                    .set_read_timeout(Some(wait))
+                    .map_err(|e| e.to_string())?;
+                let body = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+                socket
+                    .write_all(&(body.len() as u32).to_be_bytes())
+                    .map_err(|e| e.to_string())?;
+                socket.write_all(&body).map_err(|e| e.to_string())?;
+                let mut size = [0; 4];
+                socket
+                    .read_exact(&mut size)
+                    .map_err(|_| "The session host closed the worker request.")?;
+                let n = u32::from_be_bytes(size) as usize;
+                if n > 16 * 1024 * 1024 {
+                    return Err("The session host sent an oversized worker reply.".into());
+                }
+                let mut data = vec![0; n];
+                socket.read_exact(&mut data).map_err(|e| e.to_string())?;
+                decode(serde_json::from_slice(&data).map_err(|e| e.to_string())?)
+            }
+            Self::External { socket } => {
+                let mut stream = UnixStream::connect(&socket).map_err(|e| e.to_string())?;
+                stream
+                    .set_read_timeout(Some(wait))
+                    .map_err(|e| e.to_string())?;
+                let id = format!(
+                    "worker-{}",
+                    crate::random_token().map_err(|e| e.to_string())?
+                );
+                let frame = match (start, call) {
+                    (Some(start), _) => {
+                        json!({"type":"worker_launch","id":id,"caller":caller,"start":start})
+                    }
+                    (None, call) => {
+                        json!({"type":"worker_call","id":id,"caller":caller,"call":call})
+                    }
+                };
+                for line in [json!({"type":"hello","version":1}), frame] {
+                    let mut bytes = serde_json::to_vec(&line).map_err(|e| e.to_string())?;
+                    bytes.push(b'\n');
+                    stream.write_all(&bytes).map_err(|e| e.to_string())?;
+                }
+                let reader = io::BufReader::new(stream);
+                for line in io::BufRead::lines(reader) {
+                    let line =
+                        line.map_err(|_| "The session host did not answer the worker request.")?;
+                    let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    match frame["type"].as_str() {
+                        Some("worker_reply") if frame["id"] == id.as_str() => {
+                            return decode(frame);
+                        }
+                        Some("error") if frame["id"].is_null() || frame["id"] == id.as_str() => {
+                            return Err(frame["message"]
+                                .as_str()
+                                .unwrap_or("The session host refused the worker request.")
+                                .into());
+                        }
+                        _ => continue,
+                    }
+                }
+                Err("The session host closed the worker request.".into())
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+}
+
+fn decode(reply: Value) -> Result<Value, String> {
+    match reply.get("error").and_then(Value::as_str) {
+        Some(error) => Err(error.to_owned()),
+        None => Ok(reply.get("result").cloned().unwrap_or(Value::Null)),
+    }
+}
+
+/// The per-user host socket, computed exactly as the host computes it.
+fn host_socket() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let absolute = |name: &str| {
+        env::var_os(name)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    if let Some(path) = absolute("OX_HOST_SOCKET") {
+        return Some(path);
+    }
+    let state_dir = match absolute("OX_HOST_STATE_DIR") {
+        Some(root) => root,
+        None => absolute("XDG_STATE_HOME")
+            .or_else(|| {
+                absolute("HOME").map(|h| {
+                    h.join(if cfg!(target_os = "macos") {
+                        "Library/Application Support"
+                    } else {
+                        ".local/state"
+                    })
+                })
+            })?
+            .join("ox/host"),
+    };
+    let hash = state_dir
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325u64, |v, b| {
+            (v ^ u64::from(*b)).wrapping_mul(0x100000001b3)
+        });
+    let name = format!("ox-host-{}-{hash:016x}", unsafe { libc::geteuid() });
+    absolute("XDG_RUNTIME_DIR")
+        .map(|p| p.join(&name).join("host.sock"))
+        .filter(|p| p.as_os_str().as_encoded_bytes().len() < 100)
+        .or_else(|| Some(Path::new("/tmp").join(name).join("host.sock")))
 }

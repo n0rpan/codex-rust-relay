@@ -13,8 +13,6 @@ pub mod request;
 
 pub mod commands;
 
-pub mod jobs;
-
 pub mod version;
 
 /// Installed schema methods needed to dispatch each runtime-owned action on Codex.
@@ -50,7 +48,6 @@ pub fn action_methods(operation: crate::actions::Operation) -> &'static [names::
             Method::Account,
             Method::ThreadStart,
         ],
-        Operation::WorkerControl => &[Method::CallTool],
         Operation::Submit => &[
             Method::ThreadStart,
             Method::Account,

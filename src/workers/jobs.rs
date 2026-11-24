@@ -30,8 +30,6 @@ pub(super) struct Jobs {
 pub(super) struct Start {
     runtime: Runtime,
     mode: Mode,
-    #[serde(skip)]
-    host_parent: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     task: String,
@@ -57,14 +55,14 @@ enum Mode {
 #[derive(Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct JobId {
-    job_id: u64,
+    pub job_id: u64,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Steer {
-    job_id: u64,
-    text: String,
+    pub job_id: u64,
+    pub text: String,
 }
 
 struct Instruction {
@@ -180,7 +178,7 @@ impl Jobs {
         {
             self.entries.remove(&id);
         }
-        let mut command = request
+        let command = request
             .command(home, cwd)
             .map_err(|error| error.to_string())?;
         // Worker IDs appear in archived transcripts. Never recycle a small counter on reconnect.
@@ -190,9 +188,6 @@ impl Jobs {
                 break candidate;
             }
         };
-        if let Some(parent) = &request.host_parent {
-            command.env("OX_HOST_WORKER_PARENT", format!("ox:{parent}:{id}"));
-        }
         let (sender, instructions) = mpsc::channel(4);
         let state = Arc::new(Mutex::new(State {
             status: "running",
@@ -249,6 +244,10 @@ impl Jobs {
         Ok(initial)
     }
 
+    pub(super) fn has(&self, id: u64) -> bool {
+        self.entries.contains_key(&id)
+    }
+
     pub(super) fn status(&self, id: JobId) -> Result<Value, String> {
         self.entries
             .get(&id.job_id)
@@ -279,20 +278,18 @@ impl Drop for Jobs {
 }
 
 impl Start {
-    pub(super) async fn authorize(
-        &mut self,
-        cwd: &Path,
-    ) -> Result<Option<crate::host_lifetime::Grant>, String> {
-        let grant = crate::host_lifetime::authorize(
-            cwd,
-            self.workspace_write,
-            self.runtime == Runtime::Claude,
-        )
-        .await?;
-        self.host_parent = grant.as_ref().map(|g| g.parent.clone());
-        Ok(grant)
+    /// The launch the session host receives. Secrets are removed from the task first.
+    pub(super) fn host_start(&self, secrets: &[String]) -> Value {
+        json!({
+            "parent": "",
+            "runtime": self.runtime,
+            "model": self.model,
+            "mode": self.mode,
+            "task": crate::upstream::redact(&self.task, secrets),
+            "write": self.workspace_write,
+        })
     }
-    fn validate(&self) -> Result<(), String> {
+    pub(super) fn validate(&self) -> Result<(), String> {
         if self.task.trim().is_empty() || self.task.len() > 32 * 1024 {
             return Err("Provide a task of up to 32 KiB.".into());
         }
@@ -343,7 +340,6 @@ impl Start {
                 crate::native::claude_account_command(home)?
             }
         };
-        crate::host_lifetime::inherit(&mut command, self.workspace_write);
         command
             .current_dir(cwd)
             .env("CODEX_HOME", home)

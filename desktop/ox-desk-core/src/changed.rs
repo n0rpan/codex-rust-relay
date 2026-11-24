@@ -17,6 +17,12 @@ impl Changed {
             self.transcripts.push(id.to_owned());
         }
     }
+    pub fn merge(&mut self, other: Changed) {
+        self.bits |= other.bits;
+        for id in other.transcripts {
+            self.transcript(&id);
+        }
+    }
     pub fn dirty_threads(&self) -> &[String] {
         &self.transcripts
     }

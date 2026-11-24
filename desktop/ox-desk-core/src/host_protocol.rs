@@ -48,6 +48,18 @@ pub enum Client {
         action: Action,
         approval: Option<String>,
     },
+    /// A same-user OX gateway that the host does not run asks it to own a worker.
+    WorkerLaunch {
+        id: String,
+        caller: crate::origin::ExternalCaller,
+        start: crate::origin::WorkerStart,
+    },
+    /// The parent-agent tools of such a gateway.
+    WorkerCall {
+        id: String,
+        caller: crate::origin::ExternalCaller,
+        call: crate::origin::ParentCall,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -98,6 +110,11 @@ pub enum Server {
     },
     Ack {
         id: String,
+    },
+    WorkerReply {
+        id: String,
+        result: Option<Value>,
+        error: Option<String>,
     },
     Error {
         id: Option<String>,

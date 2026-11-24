@@ -709,8 +709,12 @@ Approve the tool call when your client prompts.
 
 `start_ox_worker` returns a job ID. Ask for status or the result with
 `ox_worker_status`, or ask to stop it with `cancel_ox_worker`. Jobs run between
-tool calls and have no ox wall-clock limit. They stop when the parent ox launch
-exits. The status includes the stock client's session ID when available.
+tool calls and have no ox wall-clock limit. Without a running OX session host
+they stop when the parent ox launch exits. When the session host is running
+(OX Desktop or `ox host install`), it owns the worker as an ordinary session:
+the worker keeps running after you close the terminal, its approvals reach
+your desktop and paired phone, and a resumed parent can still read its status.
+The status includes the stock client's session ID when available.
 Work already written to the project stays there if you cancel.
 
 Workers start with read access in the current project. Tell the main agent
