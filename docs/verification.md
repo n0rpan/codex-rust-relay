@@ -177,12 +177,26 @@ notice.
   Model discovery already does this for providers that list their models; for
   a provider with `discovery = false`, ox sends one request without
   credentials to open the connection.
-- **Provider prompt caches are used.** Codex replays the whole conversation
-  on every turn. For a Claude model, ox marks the system prompt and the end of
-  the conversation as cache breakpoints, so each turn reads the previous one
-  from the provider's cache. Without the markers the Messages API caches
-  nothing. For Claude Code on a Responses API, ox sends the session ID as
-  `prompt_cache_key` so one session keeps hitting the cache it warmed.
+- **Provider prompt caches are used.** Both clients replay the whole
+  conversation on every turn, so a cache miss costs seconds and the full
+  input price. What ox does on each route:
+
+  | Client | Provider API | Caching |
+  | --- | --- | --- |
+  | Codex | Responses | Passed through unchanged, with Codex's `prompt_cache_key`. |
+  | Codex | Messages | ox marks the system prompt and the end of the conversation as cache breakpoints. Without them the Messages API caches nothing. |
+  | Codex | Chat Completions | The provider's automatic prefix cache. `prompt_cache_key` is not sent, because some providers reject it. |
+  | Claude Code | Messages | Passed through with Claude Code's own cache markers. |
+  | Claude Code | Responses | The provider's automatic prefix cache, with the session ID as `prompt_cache_key`. |
+  | Claude Code | Chat Completions | The provider's automatic prefix cache. |
+
+  On every translated route the request for a later turn starts with exactly
+  what the earlier turn sent, which is what a prefix cache needs. Claude
+  Code's billing line, whose fingerprint changes with each conversation, is
+  left out of translated requests so sessions, subagents and workers share
+  one cached system prompt and tool list. On OpenRouter, which caches Claude
+  models only on request, ox adds the top-level `cache_control` field to
+  Responses and Chat Completions requests.
 - **Parallel startup.** `ox codex` loads Codex's bundled model catalog while
   provider model lists are fetched, so a launch waits for the slower of the
   two and not their sum.

@@ -1068,6 +1068,9 @@ impl App {
                     .await;
                 }
                 payload["model"] = json!(route.upstream_model);
+                if path == "/responses" {
+                    state.vendor.add_cache_hints(&mut payload);
+                }
                 let body = match serde_json::to_vec(&payload) {
                     Ok(body) => body,
                     Err(_) => {

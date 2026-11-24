@@ -1341,3 +1341,59 @@ fn without_cache_markers(value: &Value) -> Value {
         other => other.clone(),
     }
 }
+
+#[test]
+fn a_later_turn_extends_the_earlier_request_block_for_block() {
+    // The provider cache matches on the exact prefix. Whatever one turn sent
+    // must come back unchanged, in order, at the start of the next turn's
+    // request; only the cache marker moves to the new end.
+    let mut input = vec![
+        json!({"type": "message", "role": "developer", "content": "base instructions"}),
+        json!({"role": "user", "content": "list files"}),
+        json!({"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{\"command\":\"ls\"}"}),
+        json!({"type": "function_call_output", "call_id": "call_1", "output": "a.txt"}),
+    ];
+    let tools = json!([{
+        "type": "function",
+        "name": "shell",
+        "description": "Run a command",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}
+    }]);
+    let translate = |input: &[Value]| {
+        translate_request(
+            &json!({"input": input, "tools": tools, "stream": true}),
+            "claude-upstream",
+        )
+        .unwrap()
+    };
+    let blocks = |request: &Value| -> Vec<(String, Value)> {
+        request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| {
+                let role = message["role"].as_str().unwrap().to_owned();
+                message["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(move |block| (role.clone(), without_cache_markers(block)))
+            })
+            .collect()
+    };
+
+    let first = translate(&input);
+    input.extend([
+        json!({"role": "assistant", "content": "There is one file."}),
+        json!({"role": "user", "content": "now read it"}),
+        json!({"type": "function_call", "call_id": "call_2", "name": "shell", "arguments": "{\"command\":\"cat a.txt\"}"}),
+        json!({"type": "function_call_output", "call_id": "call_2", "output": "hello"}),
+    ]);
+    let second = translate(&input);
+
+    assert_eq!(first["system"], second["system"]);
+    assert_eq!(first["tools"], second["tools"]);
+    let (earlier, later) = (blocks(&first), blocks(&second));
+    assert!(later.len() > earlier.len());
+    assert_eq!(later[..earlier.len()], earlier[..]);
+}

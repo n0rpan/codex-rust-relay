@@ -204,6 +204,7 @@ fn prepare_body(
     };
     body.as_object_mut()
         .ok_or("the translated request must be a JSON object")?;
+    vendor.add_cache_hints(&mut body);
     Ok((body, normalized.map))
 }
 

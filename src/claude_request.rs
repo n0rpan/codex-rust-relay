@@ -429,6 +429,9 @@ fn apply_output_config(value: Option<&Value>, body: &mut Map<String, Value>) -> 
 // System text
 // ---------------------------------------------------------------------------
 
+/// Prefix of the attribution block Claude Code puts first in `system`.
+const BILLING_HEADER: &str = "x-anthropic-billing-header:";
+
 fn append_system(value: &Value, instructions: &mut Vec<String>, path: &str) -> Result<(), String> {
     match value {
         Value::String(text) => {
@@ -446,7 +449,13 @@ fn append_system(value: &Value, instructions: &mut Vec<String>, path: &str) -> R
                 match required_str(block, "type", &block_path)? {
                     "text" => {
                         let text = field_str(block, "text", &block_path)?;
-                        if !text.trim().is_empty() {
+                        // Claude Code opens `system` with a billing line for
+                        // Anthropic whose fingerprint changes with every
+                        // conversation. Another provider has no use for it,
+                        // and at the top of the prompt it would stop one
+                        // session, subagent or worker from reading the
+                        // system prompt and tools another already cached.
+                        if !text.trim().is_empty() && !text.starts_with(BILLING_HEADER) {
                             instructions.push(text.to_owned());
                         }
                     }
@@ -1634,6 +1643,62 @@ mod tests {
         let converted = into_responses(&defaults, "m").unwrap();
         assert!(converted.get("temperature").is_none());
         assert!(converted.get("top_p").is_none());
+    }
+
+    #[test]
+    fn a_later_claude_code_turn_extends_the_earlier_request() {
+        // Shapes captured from stock Claude Code 2.1.331: the environment
+        // note is a block array with a cache marker on the first turn and a
+        // plain string once it is history, and the marker moves to the new
+        // last user block. Neither may change what the provider sees.
+        let first = json!({
+            "max_tokens": 64,
+            "system": [{"type": "text", "text": "You are a Claude agent.", "cache_control": {"type": "ephemeral"}}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "say hi"}]},
+                {"role": "system", "content": [{"type": "text", "text": "# Environment", "cache_control": {"type": "ephemeral"}}]}
+            ]
+        });
+        let second = json!({
+            "max_tokens": 64,
+            "system": [{"type": "text", "text": "You are a Claude agent.", "cache_control": {"type": "ephemeral"}}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "say hi"}]},
+                {"role": "system", "content": "# Environment"},
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                {"role": "user", "content": [{"type": "text", "text": "again", "cache_control": {"type": "ephemeral"}}]}
+            ]
+        });
+        let first = into_responses(&first, "m").unwrap();
+        let second = into_responses(&second, "m").unwrap();
+        assert_eq!(first["instructions"], second["instructions"]);
+        let (earlier, later) = (
+            first["input"].as_array().unwrap(),
+            second["input"].as_array().unwrap(),
+        );
+        assert_eq!(later.len(), earlier.len() + 2);
+        assert_eq!(later[..earlier.len()], earlier[..]);
+    }
+
+    #[test]
+    fn the_per_conversation_billing_line_is_not_sent_to_other_providers() {
+        // Two conversations differ only in the fingerprint Claude Code puts
+        // in its billing line. The translated prompt must be identical, or
+        // neither can read the prefix the other cached.
+        let request = |fingerprint: &str| {
+            json!({
+                "max_tokens": 64,
+                "system": [
+                    {"type": "text", "text": format!("x-anthropic-billing-header: cc_version=2.1.331.{fingerprint}; cc_entrypoint=sdk-cli;")},
+                    {"type": "text", "text": "You are a Claude agent.", "cache_control": {"type": "ephemeral"}}
+                ],
+                "messages": [{"role": "user", "content": "go"}]
+            })
+        };
+        let first = into_responses(&request("471"), "m").unwrap();
+        let second = into_responses(&request("fb2"), "m").unwrap();
+        assert_eq!(first["instructions"], "You are a Claude agent.");
+        assert_eq!(first, second);
     }
 
     #[test]
