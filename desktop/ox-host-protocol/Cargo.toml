@@ -1,0 +1,10 @@
+[package]
+name = "ox-host-protocol"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+ox-desk-core = { path = "../ox-desk-core", features = ["schema"] }
+schemars = "1"
+serde_json = "1"

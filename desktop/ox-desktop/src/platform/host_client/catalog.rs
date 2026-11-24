@@ -1,0 +1,107 @@
+use super::*;
+use ox_desk_core::host_protocol::{Change, SessionView};
+use std::sync::Mutex;
+
+pub(crate) enum CatalogEvent {
+    Reset,
+    Archived(Scope, std::collections::HashSet<String>),
+    Replace(Scope, Vec<SessionView>),
+    Update(Scope, SessionView),
+}
+pub(crate) struct CatalogWatch {
+    // Drop disconnects even a reader asleep on an idle socket.
+    socket: Arc<Mutex<Option<UnixStream>>>,
+    cancel: mpsc::Sender<()>,
+}
+impl Drop for CatalogWatch {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(());
+        if let Some(s) = self.socket.lock().unwrap().take() {
+            let _ = s.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+pub(crate) fn watch_catalog() -> io::Result<(CatalogWatch, flume::Receiver<CatalogEvent>)> {
+    let (tx, rx) = flume::bounded(32);
+    let (cancel, cancelled) = mpsc::channel();
+    let socket = Arc::new(Mutex::new(None));
+    let connection = socket.clone();
+    thread::Builder::new()
+        .name("ox-host-catalog".into())
+        .spawn(move || {
+            let read = || -> io::Result<()> {
+                let (mut input, mut stream, caps) = handshake()?;
+                {
+                    let mut active = connection.lock().unwrap();
+                    if cancelled.try_recv() != Err(mpsc::TryRecvError::Empty) {
+                        return Ok(());
+                    }
+                    *active = Some(stream.try_clone()?);
+                }
+                // An installed host can outlive its original desktop binary.
+                let request = if caps.iter().any(|cap| cap == "live_catalog") {
+                    Client::WatchCatalog
+                } else {
+                    Client::Subscribe {
+                        scope: None,
+                        after: None,
+                    }
+                };
+                write_frame(&mut stream, &request)?;
+                let emit = |event| tx.send(event).map_err(io::Error::other);
+                loop {
+                    match read_frame(&mut input)? {
+                        Server::Snapshot { scopes, .. } => {
+                            emit(CatalogEvent::Reset)?;
+                            for s in scopes {
+                                if let Ok(ids) =
+                                    serde_json::from_value(s.detail["archived"].clone())
+                                {
+                                    emit(CatalogEvent::Archived(s.scope.clone(), ids))?;
+                                }
+                                emit(CatalogEvent::Replace(s.scope, s.sessions))?;
+                            }
+                        }
+                        Server::Delta { scope, changes, .. } => {
+                            for change in changes {
+                                match change {
+                                    Change::Sessions { sessions } => {
+                                        emit(CatalogEvent::Replace(scope.clone(), sessions))?
+                                    }
+                                    Change::Session { session } => {
+                                        emit(CatalogEvent::Update(scope.clone(), session))?
+                                    }
+                                    Change::State { detail, .. } => {
+                                        if let Ok(ids) =
+                                            serde_json::from_value(detail["archived"].clone())
+                                        {
+                                            emit(CatalogEvent::Archived(scope.clone(), ids))?;
+                                        }
+                                    }
+                                    _ => (),
+                                }
+                            }
+                        }
+                        Server::Error { message, .. } => return Err(io::Error::other(message)),
+                        _ => (),
+                    }
+                }
+            };
+            let mut pause = Duration::from_millis(300);
+            loop {
+                let started = std::time::Instant::now();
+                let _ = read();
+                connection.lock().unwrap().take();
+                if cancelled.recv_timeout(pause) != Err(mpsc::RecvTimeoutError::Timeout) {
+                    break;
+                }
+                pause = if started.elapsed() > Duration::from_secs(15) {
+                    Duration::from_millis(300)
+                } else {
+                    (pause * 2).min(Duration::from_secs(5))
+                };
+            }
+        })?;
+    Ok((CatalogWatch { socket, cancel }, rx))
+}

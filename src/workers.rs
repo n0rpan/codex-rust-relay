@@ -49,6 +49,9 @@ impl Relay {
     }
 
     pub(crate) async fn load(home: &Path) -> Result<Option<Self>, RelayError> {
+        if crate::native::title_generation() {
+            return Ok(None);
+        }
         let path = CodeoxConfig::path(home);
         if !path.try_exists()? {
             return Ok(None);
@@ -297,6 +300,23 @@ impl Service {
                         }
                     }
                 }
+                Some("list_ox_workers") => tool_result(Ok(self.jobs.lock().unwrap().list())),
+                Some("steer_ox_worker") => {
+                    let result = async {
+                        let request = serde_json::from_value(params["arguments"].clone())
+                            .map_err(|_| "Provide a worker job ID and message.".to_string())?;
+                        let app = self.app().await.map_err(|e| e.to_string())?;
+                        let received = self.jobs.lock().unwrap().steer(request, &app.secrets)?;
+                        tokio::time::timeout(Duration::from_secs(30), received)
+                            .await
+                            .map_err(|_| "Timed out waiting for the worker's acknowledgement.")?
+                            .map_err(
+                                |_| "The worker finished before acknowledging the instruction.",
+                            )?
+                    }
+                    .await;
+                    tool_result(result)
+                }
                 Some(tool @ ("ox_worker_status" | "cancel_ox_worker")) => {
                     match serde_json::from_value(params["arguments"].clone()) {
                         Ok(job) => {
@@ -323,7 +343,8 @@ impl Service {
         )
     }
 
-    async fn start_job(&self, request: jobs::Start) -> Result<Value, String> {
+    async fn start_job(&self, mut request: jobs::Start) -> Result<Value, String> {
+        let grant = request.authorize(&self.cwd).await?;
         let app = self.app().await?;
         if let Some(model) = &request.model
             && let Mode::Codeox {
@@ -333,10 +354,33 @@ impl Service {
             crate::resolve_model(vendors, routes, model)
                 .map_err(|(_, error)| crate::upstream::redact(&error, &app.secrets).into_owned())?;
         }
-        self.jobs
-            .lock()
-            .unwrap()
-            .start(request, &self.home, &self.cwd, Arc::clone(&app.secrets))
+        let result = self.jobs.lock().unwrap().start(
+            request,
+            &self.home,
+            &self.cwd,
+            Arc::clone(&app.secrets),
+        )?;
+        if let Some(grant) = grant {
+            // The host receives only the local worker MCP capability of this OX launch.
+            let port = self
+                .origin
+                .strip_prefix("http://127.0.0.1:")
+                .ok_or("Invalid OX worker endpoint")?
+                .parse::<u16>()
+                .map_err(|e| e.to_string())?;
+            if let Err(e) = grant
+                .register(port, self.token.clone(), result.clone())
+                .await
+            {
+                if let Ok(id) =
+                    serde_json::from_value(serde_json::json!({"job_id":result["job_id"]}))
+                {
+                    let _ = self.jobs.lock().unwrap().cancel(id);
+                }
+                return Err(e);
+            }
+        }
+        Ok(result)
     }
 
     async fn list_models(&self, filters: ListModels) -> Result<Value, String> {
@@ -490,6 +534,18 @@ fn tools() -> Value {
                     "additionalProperties": false,
                 },
                 "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+            },
+            {
+                "name":"list_ox_workers",
+                "description":"List workers started in this OX launch and their current status.",
+                "inputSchema":{"type":"object","properties":{},"additionalProperties":false},
+                "annotations":{"readOnlyHint":true,"openWorldHint":false}
+            },
+            {
+                "name":"steer_ox_worker",
+                "description":"Deliver a follow-up instruction to a running worker which reports can_steer. It keeps its original model, workspace, and permissions.",
+                "inputSchema":{"type":"object","properties":{"job_id":{"type":"integer","minimum":1},"text":{"type":"string"}},"required":["job_id","text"],"additionalProperties":false},
+                "annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":true}
             },
             {
                 "name": "ox_worker_status",

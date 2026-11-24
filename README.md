@@ -9,7 +9,22 @@ provider key once, and both clients get the same models, the same picker and
 the same web search. There is no second config to keep in sync, no key copied
 between tools, and plain `codex` and `claude` keep working exactly as before.
 
-## Quick start
+**OX Desktop** bundles the same `ox` gateway with a native Linux or macOS workbench and a session host. The standalone terminal install needs only the gateway. Choose a subscription or an OX API model for each session. The local session host keeps turns and workers running when you close the window. Pair a phone over Tailscale to follow a turn or answer its next approval. [Desktop guide](desktop/README.md)
+
+## Install OX Desktop from the dev release
+
+Once the merged commit passes CI on `main` and the rolling **dev** release lists the desktop archives, run this in your project directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh -s -- --dev --desktop
+ox desktop .
+```
+
+Rerun the installer command to update the desktop app, session host and CLI together. Install the stock Codex or Claude Code CLI you want to use. Existing native sign-ins and saved sessions are available in the app. You can also open **OX Desktop** from the Linux application launcher or from **~/Applications** on macOS. To test a commit before it reaches the dev release, use its branch workflow packages. [Dev release assets](https://github.com/n0rpan/ox/releases/tag/dev) · [Branch package instructions](desktop/README.md#run-a-packaged-build)
+
+Pair a phone in **Settings → Remote access** to see and control the same live sessions. On iPhone, install OX on the Home Screen, open it there, and tap **Scan pairing QR**. Open **Session notifications** to enable alerts for approvals and questions. [Phone setup and desktop controls](desktop/README.md#keep-sessions-running-and-pair-a-phone)
+
+## CLI quick start
 
 You need macOS 11+ or Linux with glibc 2.39+ (x86-64 or ARM64), and Codex or
 Claude Code installed.
@@ -126,6 +141,8 @@ scratch on each turn.
 [How to reproduce these numbers](docs/verification.md#how-ox-stays-fast)
 
 ## Release channels
+
+The table covers the standalone CLI. For desktop updates, rerun the installer with `--dev --desktop` to get a matching set of binaries.
 
 | Channel | What it is | Version looks like | Install | Stay current |
 | --- | --- | --- | --- | --- |

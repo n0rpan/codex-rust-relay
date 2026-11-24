@@ -1,0 +1,847 @@
+//! A workbench owns the visible state for one project and billing route.
+use crate::platform::open_store;
+use crate::{activity, appearance::Palette, col, platform, row};
+use gpui::{prelude::FluentBuilder, *};
+use ox_desk_core::actions::Action as DeskAction;
+use ox_desk_core::{
+    inbox::Inbox,
+    store::{Connection, Route, Store},
+};
+use std::{collections::HashMap, path::PathBuf, time::Instant};
+
+mod review;
+mod thread_menu;
+mod usage;
+
+fn current_activity(store: &Store) -> Option<activity::Scene> {
+    use activity::Scene;
+    use ox_desk_core::transcript::{Row, item::Item};
+    let id = store.selected()?;
+    if store
+        .asks()
+        .iter()
+        .any(|ask| ask.thread.as_deref() == Some(id))
+    {
+        return Some(Scene::Waiting);
+    }
+    if store.job(id).is_some_and(|job| job.live && job.can_stop()) {
+        return Some(Scene::Worker);
+    }
+    let transcript = store.transcript(id)?;
+    if transcript.is_loading() {
+        return Some(Scene::Loading);
+    }
+    let active = transcript.active_turn()?;
+    let tail = transcript
+        .len()
+        .checked_sub(1)
+        .and_then(|i| transcript.row(i));
+    let key = match tail {
+        Some(Row::Message(key)) => Some(key),
+        Some(Row::Tools(group)) => group.back(),
+        None => None,
+    };
+    let item = key
+        .filter(|key| key.turn == active)
+        .and_then(|key| transcript.entry(key));
+    Some(match item.map(|entry| &entry.item) {
+        Some(Item::AgentMessage { .. } | Item::Plan { .. }) => Scene::Typing,
+        Some(Item::AgentOperation { status, .. }) if active_tool(status) => Scene::Worker,
+        Some(
+            Item::CommandExecution { status, .. }
+            | Item::McpToolCall { status, .. }
+            | Item::FileChange { status, .. }
+            | Item::ToolCall { status, .. },
+        ) if active_tool(status) => Scene::Tool,
+        Some(Item::WebSearch { .. }) => Scene::Tool,
+        _ => Scene::Thinking,
+    })
+}
+fn active_tool(status: &str) -> bool {
+    matches!(status, "inProgress" | "in_progress" | "running" | "started")
+}
+
+pub struct Workbench {
+    pub(super) pending_local_command: Option<super::terminal_review::Pending>,
+    pub(super) enter_sends: bool,
+    review: review::ReviewPane,
+    pub(super) review_width: u32,
+    pub(super) pane_width: Pixels,
+    resizing_review: bool,
+    pub(super) model_picker: Option<super::route_chip::Picker>,
+    thread_edit: Option<thread_menu::ThreadEdit>,
+    pub(super) project: PathBuf,
+    pub(super) route: Route,
+    pub(super) front: bool,
+    pub(super) query: String,
+    pending_selection: Option<(ox_desk_core::store::ThreadRow, bool)>,
+    pub(super) store: Option<Store>,
+    pub(super) launch_error: Option<String>,
+    pub(super) mention_index: usize,
+    pub(super) mention_task: Option<Task<()>>,
+    pub(super) file_hover: Option<(Option<String>, Vec<PathBuf>)>,
+    pub(super) image_work: HashMap<Option<String>, usize>,
+    pub(super) pending_command: Option<(Option<String>, String)>,
+    pub(super) connecting: bool,
+    pub(super) awaiting_login: bool,
+    retry_available: bool,
+    first_frame: Option<Instant>,
+    pub(super) stats: Option<Stats>,
+    pub(super) wake: flume::Sender<()>,
+    waiting_frame: Option<flume::Sender<()>>,
+    pub(super) editors: HashMap<Option<String>, Entity<gpui_component::input::TextareaState>>,
+    pub(super) focused_ask: Option<ox_desk_core::runtime::RequestId>,
+    pub(super) answer_fields:
+        HashMap<ox_desk_core::runtime::RequestId, Vec<Entity<gpui_component::input::InputState>>>,
+    pub(super) fire: Option<Entity<activity::Runner>>,
+    pub(super) runner: Option<Entity<activity::Runner>>,
+    pub(super) transcript_views: HashMap<String, super::transcript::TranscriptView>,
+    _pump: Task<()>,
+}
+
+pub(super) struct FocusSearch;
+impl EventEmitter<FocusSearch> for Workbench {}
+pub(super) struct CatalogChanged;
+impl EventEmitter<CatalogChanged> for Workbench {}
+
+#[derive(Default)]
+pub(super) struct Stats {
+    pub(super) drains: u64,
+    pub(super) notifications: u64,
+    pub(super) rows: u64,
+    pub(super) spawns: u64,
+    pub(super) stop_ns: u64,
+    pub(super) painted: std::rc::Rc<std::cell::Cell<u64>>,
+    pub(super) tail_height: std::rc::Rc<std::cell::Cell<f32>>,
+    pub(super) tail_owner: Option<(String, usize)>,
+    pub(super) measured_items: std::collections::HashSet<usize>,
+}
+
+impl Workbench {
+    pub fn new(
+        project: PathBuf,
+        route: Route,
+        first_frame: Option<Instant>,
+        stats: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.observe_window_activation(window, |s, window, cx| {
+            if s.front {
+                cx.notify();
+            }
+            if window.is_window_active() && s.awaiting_login && s.front {
+                s.reconnect(window, cx);
+            }
+        })
+        .detach();
+        cx.observe_window_visibility(window, |s, _, window, cx| {
+            if let Some(store) = &mut s.store {
+                store.set_jobs_visible(window.is_visible());
+                let _ = s.wake.try_send(());
+            }
+            if window.is_visible() && s.front {
+                cx.notify();
+            } else {
+                if let Some(waiter) = s.waiting_frame.take() {
+                    let _ = waiter.try_send(());
+                }
+                s.runner = None;
+                s.fire = None;
+            }
+        })
+        .detach();
+        let (wake, pump) = Self::connection(project.clone(), route.clone(), window, cx);
+        Self {
+            enter_sends: cx
+                .global::<crate::preferences::behavior::Active>()
+                .enter_sends,
+            thread_edit: None,
+            review: Default::default(),
+            review_width: 360,
+            pane_width: window.viewport_size().width,
+            resizing_review: false,
+            model_picker: None,
+            front: true,
+            query: String::new(),
+            pending_selection: None,
+            project,
+            route,
+            store: None,
+            launch_error: None,
+            pending_local_command: None,
+            mention_index: 0,
+            mention_task: None,
+            file_hover: None,
+            image_work: Default::default(),
+            pending_command: None,
+            connecting: true,
+            awaiting_login: false,
+            retry_available: true,
+            first_frame,
+            stats: stats.then(Stats::default),
+            wake,
+            waiting_frame: None,
+            runner: None,
+            fire: None,
+            focused_ask: None,
+            editors: HashMap::new(),
+            answer_fields: HashMap::new(),
+            transcript_views: HashMap::new(),
+            _pump: pump,
+        }
+    }
+
+    fn connection(
+        directory: PathBuf,
+        billing: Route,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (flume::Sender<()>, Task<()>) {
+        let (wake, wakes) = flume::bounded(1);
+        let signal = wake.clone();
+        let inbox = Inbox::new(move || {
+            let _ = signal.try_send(());
+        });
+        let input = inbox.clone();
+        let start = cx.background_spawn(async move {
+            open_store(directory, billing, move |event| input.push(event))
+        });
+        let pump = cx.spawn_in(window, async move |view, cx| {
+            let result = start.await;
+            let mut deadline = None;
+            if view
+                .update_in(cx, |s, window, cx| {
+                    s.connecting = false;
+                    match result {
+                        Ok(mut store) => {
+                            if let Some(previous) = &mut s.store {
+                                if s.pending_selection.is_none()
+                                    && store.profile().project == previous.profile().project
+                                    && store.profile().route == previous.profile().route
+                                    && let Some(row) =
+                                        previous.selected().and_then(|id| previous.catalog_row(id))
+                                {
+                                    s.pending_selection = Some((row.clone(), false));
+                                }
+                                store.recover_from(previous);
+                                s.answer_fields.clear();
+                                s.focused_ask = None;
+                                s.transcript_views.clear();
+                            }
+                            s.pending_command = None;
+                            s.launch_error = None;
+                            if let Err(e) = store.search(s.query.clone()) {
+                                s.launch_error = Some(e.to_string());
+                            }
+                            store.set_jobs_visible(window.is_visible());
+                            deadline = store.next_deadline();
+                            store.set_front(s.front);
+                            s.store = Some(store);
+                            if let Some(stats) = &mut s.stats {
+                                stats.spawns += 1;
+                            }
+                        }
+                        Err(error) => {
+                            s.launch_error = Some(error.to_string());
+                            s.retry_once(window, cx);
+                        }
+                    }
+                    if window.is_visible() {
+                        cx.emit(CatalogChanged);
+                        if s.front {
+                            cx.notify();
+                        }
+                    }
+                })
+                .is_err()
+            {
+                return;
+            }
+            let (tick, frames) = flume::bounded(1);
+            let frame_pending = std::rc::Rc::new(std::cell::Cell::new(false));
+            loop {
+                let awakened = if let Some(when) = deadline {
+                    let timer = cx
+                        .background_executor()
+                        .timer(when.saturating_duration_since(Instant::now()));
+                    futures_lite::future::or(async { wakes.recv_async().await.is_ok() }, async {
+                        timer.await;
+                        true
+                    })
+                    .await
+                } else {
+                    wakes.recv_async().await.is_ok()
+                };
+                if !awakened {
+                    break;
+                }
+                // Keep the inbox full until the visible frame is due. The reader
+                // can continue appending without waking the main thread for each delta.
+                let next = view.update_in(cx, |s, window, _| {
+                    if !window.is_visible()
+                        || !s.front
+                        || inbox.starts_with(|event| event.unblocks_interaction())
+                    {
+                        return None;
+                    }
+                    s.waiting_frame = Some(tick.clone());
+                    if !frame_pending.replace(true) {
+                        let send = tick.clone();
+                        let pending = frame_pending.clone();
+                        window.on_next_frame(move |_, _| {
+                            pending.set(false);
+                            let _ = send.try_send(());
+                        });
+                    }
+                    Some(())
+                });
+                match next {
+                    Ok(Some(())) => {
+                        // Some Wayland compositors pause frame callbacks for a covered
+                        // surface without a visibility event. Keep protocol work moving.
+                        let timeout = cx
+                            .background_executor()
+                            .timer(std::time::Duration::from_millis(80));
+                        futures_lite::future::or(
+                            async {
+                                let _ = frames.recv_async().await;
+                            },
+                            timeout,
+                        )
+                        .await;
+                    }
+                    Ok(None) => (),
+                    Err(_) => break,
+                }
+                if view
+                    .update_in(cx, |s, window, cx| {
+                        s.waiting_frame = None;
+                        let batch = inbox.take();
+                        let local_result = s.local_command_outcome(&batch);
+                        if let Some(store) = s.store.as_mut() {
+                            if !batch.is_empty()
+                                && let Some(stats) = &mut s.stats
+                            {
+                                stats.drains += 1;
+                            }
+                            let changed = store.drain(batch, Instant::now());
+                            if store.profile().route == Route::CODEX_SUBSCRIPTION
+                                && store.state() == &Connection::Ready
+                            {
+                                s.awaiting_login = false;
+                            }
+                            if s.front
+                                && store.state() == &Connection::Ready
+                                && store.profile().route == Route::CODEX_SUBSCRIPTION
+                                && !store.usage.requested
+                            {
+                                let _ = store.read_limits();
+                            }
+                            if store.state() == &Connection::Ready
+                                && let Some((row, confirmed)) = s.pending_selection.take()
+                                && (confirmed
+                                    || store.selected() != Some(row.id.as_str())
+                                    || !store
+                                        .transcript(&row.id)
+                                        .is_some_and(|t| t.is_ready() || t.active_turn().is_some()))
+                            {
+                                s.launch_error = store
+                                    .dispatch(if confirmed {
+                                        DeskAction::ConfirmAliasAndResume(Box::new(row))
+                                    } else {
+                                        DeskAction::OpenCatalogRow(Box::new(row))
+                                    })
+                                    .err()
+                                    .map(|e| e.to_string());
+                            }
+                            deadline = store.next_deadline();
+                            let disconnected = matches!(store.state(), Connection::Closed(_));
+                            if window.is_visible() && changed.affects_catalog() {
+                                cx.emit(CatalogChanged);
+                            }
+                            if window.is_visible()
+                                && s.front
+                                && changed.affects_view(store.selected())
+                            {
+                                if let Some(stats) = &mut s.stats {
+                                    stats.notifications += 1;
+                                }
+                                cx.notify();
+                            }
+                            s.finish_local_command(local_result, cx);
+                            s.finish_command_discovery(cx);
+                            s.launch_handoff(cx);
+                            if disconnected {
+                                s.retry_once(window, cx);
+                            }
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (wake, pump)
+    }
+
+    pub(super) fn waiting_for_subscription(&self) -> bool {
+        !self.route.is_api()
+            && self
+                .store
+                .as_ref()
+                .is_some_and(|s| s.state() == &Connection::SignInRequired)
+    }
+    pub(super) fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.connecting
+            || self
+                .store
+                .as_ref()
+                .is_some_and(|s| s.state() == &Connection::Connecting)
+        {
+            return;
+        }
+        self.pending_local_command = None;
+        // Returning before terminal login finishes must leave the next activation armed.
+        if !self.waiting_for_subscription() {
+            self.awaiting_login = false;
+        }
+        self.connecting = true;
+        self.launch_error = None;
+        (self.wake, self._pump) =
+            Self::connection(self.project.clone(), self.route.clone(), window, cx);
+        cx.notify();
+    }
+    fn retry_once(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.retry_available) {
+            self.reconnect(window, cx);
+        }
+    }
+
+    pub(super) fn select_catalog(
+        &mut self,
+        row: ox_desk_core::store::ThreadRow,
+        confirmed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .store
+            .as_ref()
+            .is_some_and(|s| s.state() == &Connection::Ready)
+        {
+            self.action(
+                cx,
+                if confirmed {
+                    DeskAction::ConfirmAliasAndResume(Box::new(row))
+                } else {
+                    DeskAction::OpenCatalogRow(Box::new(row))
+                },
+            );
+        } else {
+            self.pending_selection = Some((row, confirmed));
+            cx.notify();
+        }
+    }
+    pub(super) fn restore_review(&mut self, open: bool, width: u32) {
+        self.review.open = open;
+        if width > 0 {
+            self.review_width = width.clamp(230, 600);
+        }
+    }
+    pub(super) fn review_visible(&self) -> bool {
+        self.review.open
+    }
+    pub(super) fn restore_selection(&mut self, row: ox_desk_core::store::ThreadRow) {
+        self.pending_selection = Some((row, false))
+    }
+    pub(super) fn layout_selection(&self) -> Option<&ox_desk_core::store::ThreadRow> {
+        self.pending_selection
+            .as_ref()
+            .map(|(row, _)| row)
+            .or_else(|| {
+                let store = self.store.as_ref()?;
+                store.catalog_row(store.selected()?)
+            })
+    }
+    pub(super) fn action(&mut self, cx: &mut Context<Self>, action: DeskAction) {
+        if matches!(
+            action,
+            DeskAction::NewDraft | DeskAction::OpenCatalogRow(_) | DeskAction::SelectThread(_)
+        ) {
+            cx.emit(CatalogChanged);
+            self.pending_selection = None;
+            self.model_picker = None;
+            self.thread_edit = None;
+            self.pending_command = None;
+        }
+        if matches!(action, DeskAction::Stop(_))
+            && let Some(stats) = &mut self.stats
+        {
+            stats.stop_ns = ox_desk_core::perf::monotonic_ns();
+        }
+        if let Some(store) = &mut self.store {
+            self.launch_error = match store.dispatch(action) {
+                Ok(ox_desk_core::actions::Effect::Applied) => None,
+                Ok(ox_desk_core::actions::Effect::FocusSearch) => {
+                    cx.emit(FocusSearch);
+                    None
+                }
+                Err(err) => Some(err.to_string()),
+            };
+            let _ = self.wake.try_send(());
+            cx.notify();
+        }
+    }
+    fn launch_handoff(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = &mut self.store else { return };
+        let Some(handoff) = store.take_handoff() else {
+            return;
+        };
+        let project = store.profile().project.clone();
+        let task = cx.background_spawn(async move {
+            platform::launch_runtime_terminal(&project, handoff.argv)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |s, cx| {
+                match result {
+                    Ok(()) => {
+                        let copy = handoff.command != "/terminal";
+                        if copy {
+                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                handoff.command.clone(),
+                            ));
+                        }
+                        if let Some(store) = &mut s.store
+                            && store.draft(handoff.thread.as_deref()).trim() == handoff.command
+                        {
+                            store.edit(handoff.thread.as_deref(), String::new());
+                        }
+                        s.launch_error = Some(if copy {
+                            format!("Paste the command in stock {}.", s.route.runtime.name())
+                        } else {
+                            format!(
+                                "Type / to browse the stock {} commands.",
+                                s.route.runtime.name()
+                            )
+                        });
+                    }
+                    Err(e) => {
+                        if let Some(id) = handoff.thread
+                            && s.store.as_ref().and_then(|s| s.selected()) == Some(id.as_str())
+                        {
+                            s.action(cx, DeskAction::ResumeHere(id));
+                        }
+                        s.launch_error = Some(e);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+    pub(super) fn set_front(&mut self, front: bool, cx: &mut Context<Self>) {
+        self.front = front;
+        if let Some(store) = &mut self.store {
+            store.set_front(front);
+        }
+        if front {
+            cx.notify();
+        } else {
+            self.runner = None;
+            self.fire = None;
+        }
+    }
+}
+
+impl Render for Workbench {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::app::guard(cx, |cx| self.draw(window, cx).into_any_element())
+    }
+}
+
+impl Workbench {
+    fn draw(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = Palette::get(cx);
+        if let Some(started) = self.first_frame.take() {
+            window.on_next_frame(move |_, cx| {
+                println!("desk-first-frame ms={}", started.elapsed().as_millis());
+                cx.quit();
+            });
+        }
+        if let Some(issue) = self.first_run_issue() {
+            return self.onboarding(issue, cx);
+        }
+        let unavailable = !self.connecting
+            && self.store.as_ref().is_none_or(|s| {
+                matches!(
+                    s.state(),
+                    Connection::Closed(_) | Connection::SignInRequired
+                )
+            });
+        let connecting = format!("Connecting to {}…", self.route.runtime.name());
+        let sign_in = format!("Sign in to {}", self.route.runtime.account());
+        let status = self.launch_error.as_deref().unwrap_or_else(|| {
+            if self.connecting {
+                return &connecting;
+            }
+            match self.store.as_ref().map(Store::state) {
+                None | Some(Connection::Connecting) => &connecting,
+                Some(Connection::Ready) => "Connected",
+                Some(Connection::SignInRequired) => &sign_in,
+                Some(Connection::Closed(message)) => message,
+            }
+        });
+        let title = self
+            .store
+            .as_ref()
+            .filter(|store| {
+                self.launch_error.is_none()
+                    && !self.connecting
+                    && store.state() == &Connection::Ready
+            })
+            .and_then(|store| store.catalog_row(store.selected()?))
+            .map(|row| row.title().to_owned());
+        let status = status.to_owned();
+        let scene = self.store.as_ref().and_then(current_activity);
+        let animate = p.motion && self.front && window.is_visible() && window.is_window_active();
+        if let Some(scene) = scene.filter(|scene| animate && *scene != activity::Scene::Waiting) {
+            if self
+                .runner
+                .as_ref()
+                .is_none_or(|r| r.read(cx).scene != scene)
+            {
+                self.runner = Some(cx.new(|_| activity::Runner::new(scene)));
+            }
+        } else {
+            self.runner = None;
+        }
+        let activity_status = scene
+            .filter(|s| *s != activity::Scene::Loading)
+            .map(|scene| {
+                let icon = self
+                    .runner
+                    .as_ref()
+                    .map(|r| r.clone().into_any_element())
+                    .unwrap_or_else(|| scene.sprite(p, 0));
+                row()
+                    .gap_2()
+                    .py_1()
+                    .child(icon)
+                    .child(crate::kit::small(p, scene.label()))
+            });
+        let transcript = self
+            .worker_transcript(cx)
+            .unwrap_or_else(|| self.transcript_panel(cx));
+        let controls = self.thread_menu(cx);
+        let review_toggle = self.review_toggle(cx);
+        let inline_request = self.pane_width < px(825.);
+        let asks = self.ask_sheet(inline_request, window, cx);
+        let usage = self.usage_bar(cx);
+        let review = asks.is_none().then(|| self.review_panel(cx)).flatten();
+        let review_width = px(self.review_width as f32 + 5.);
+        let narrow_review = review.is_some() && self.pane_width - review_width < px(500.);
+        let detail_width = if review.is_some() && !narrow_review {
+            self.pane_width - review_width
+        } else if asks.is_some() && !inline_request {
+            self.pane_width - px(325.)
+        } else {
+            self.pane_width
+        };
+        let composer = self.composer(detail_width, window, cx);
+        let (inline_sheet, side_sheet) = if inline_request {
+            (asks, None)
+        } else {
+            (None, asks)
+        };
+        row()
+            .size_full()
+            .bg(rgb(p.bg))
+            .text_color(rgb(p.fg))
+            .when(!narrow_review, |layout| {
+                layout.child(
+                    col()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .when(detail_width < px(480.), |view| view.p_2())
+                        .when(detail_width >= px(480.), |view| view.p_4())
+                        .child(
+                            row()
+                                .gap_2()
+                                .justify_between()
+                                .when(detail_width < px(500.), |header| {
+                                    header.flex_col().items_start()
+                                })
+                                .child(
+                                    col()
+                                        .min_w_0()
+                                        .max_w_full()
+                                        .when(detail_width >= px(500.), |col| col.flex_1())
+                                        .when_some(title, |col, title| {
+                                            col.child(
+                                                div()
+                                                    .id("current-thread-title")
+                                                    .text_size(px(20.))
+                                                    .truncate()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child(title.clone())
+                                                    .tooltip(move |window, cx| {
+                                                        gpui_component::tooltip::Tooltip::new(
+                                                            title.clone(),
+                                                        )
+                                                        .build(window, cx)
+                                                    }),
+                                            )
+                                        })
+                                        .when(status != "Connected", |view| {
+                                            view.child(crate::small(p, status.clone()))
+                                        })
+                                        .when(status == "Connected", |view| {
+                                            let project = self
+                                                .project
+                                                .file_name()
+                                                .unwrap_or_default()
+                                                .to_string_lossy();
+                                            view.child(
+                                                row()
+                                                    .gap_2()
+                                                    .child(
+                                                        div().w(px(5.)).h(px(5.)).bg(rgb(p.accent)),
+                                                    )
+                                                    .child(crate::small(
+                                                        p,
+                                                        format!(
+                                                            "{project}   /   {}",
+                                                            self.route.label()
+                                                        ),
+                                                    )),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    row()
+                                        .flex_wrap()
+                                        .min_w_0()
+                                        .gap_2()
+                                        .children(review_toggle)
+                                        .children(controls),
+                                ),
+                        )
+                        .when_some(
+                            self.store
+                                .as_ref()
+                                .and_then(|s| s.selected().filter(|id| s.in_terminal(id)))
+                                .map(str::to_owned),
+                            |view, id| {
+                                view.child(crate::kit::button(
+                                    p,
+                                    "resume-here",
+                                    format!(
+                                        "Resume here after closing stock {}",
+                                        self.route.runtime.name()
+                                    ),
+                                    false,
+                                    true,
+                                    cx.listener(move |s, _, _, cx| {
+                                        s.action(cx, DeskAction::ResumeHere(id.clone()))
+                                    }),
+                                ))
+                            },
+                        )
+                        .when(unavailable, |view| {
+                            view.child(crate::kit::button(
+                                p,
+                                "retry-connection",
+                                "Reconnect",
+                                false,
+                                true,
+                                cx.listener(|s, _, window, cx| s.reconnect(window, cx)),
+                            ))
+                        })
+                        .when_some(
+                            self.store.as_ref().and_then(Store::command_notice),
+                            |d, message| {
+                                d.child(
+                                    row()
+                                        .flex_wrap()
+                                        .gap_2()
+                                        .child(message.to_owned())
+                                        .child(crate::kit::copy_message(
+                                            p,
+                                            "copy-command-notice",
+                                            message,
+                                        ))
+                                        .child(crate::kit::button(
+                                            p,
+                                            "dismiss-notice",
+                                            "Dismiss",
+                                            false,
+                                            true,
+                                            cx.listener(|s, _, _, cx| {
+                                                s.action(cx, DeskAction::DismissNotice)
+                                            }),
+                                        )),
+                                )
+                            },
+                        )
+                        .child(transcript)
+                        .children(activity_status)
+                        .children(inline_sheet)
+                        .child(composer)
+                        .children(usage),
+                )
+            })
+            .on_mouse_move(cx.listener(|s, event: &MouseMoveEvent, window, cx| {
+                if !s.resizing_review {
+                    return;
+                }
+                if event.pressed_button == Some(MouseButton::Left) {
+                    let available = window.viewport_size().width - event.position.x;
+                    let limit = f32::from(s.pane_width - px(505.)).clamp(230., 600.);
+                    s.review_width = f32::from(available).clamp(230., limit) as u32;
+                    s.review_layout_changed(cx);
+                } else {
+                    s.resizing_review = false;
+                }
+                cx.notify();
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|s, _, _, _| s.resizing_review = false),
+            )
+            .when_some(review, |d, pane| {
+                d.when(!narrow_review, |layout| {
+                    layout.child(
+                        div()
+                            .id("review-divider")
+                            .w(px(5.))
+                            .h_full()
+                            .cursor_col_resize()
+                            .bg(rgb(p.line))
+                            .hover(move |style| style.bg(rgb(p.accent)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|s, _, _, cx| {
+                                    s.resizing_review = true;
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                })
+                .child(
+                    col()
+                        .h_full()
+                        .w(px(self.review_width as f32))
+                        .flex_shrink_0()
+                        .when(narrow_review, |pane| pane.w_full().min_w_0())
+                        .child(pane),
+                )
+            })
+            .children(side_sheet)
+    }
+}
+
+#[cfg(test)]
+mod tests;

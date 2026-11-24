@@ -1,0 +1,7 @@
+{"expect":{"/type":"control_request","/request/subtype":"initialize"}}
+{"send":{"type":"control_response","response":{"subtype":"success","request_id":"$request","response":{"claude_code_version":"2.1.331","commands":[],"models":[],"account":{"apiProvider":"firstParty","subscriptionType":"Claude Max"}}}}}
+{"expect":{"/type":"user","/message/content/0/text":"Write the marker"}}
+{"send":{"type":"system","subtype":"init","session_id":"00000000-0000-4000-8000-000000000001","cwd":"$cwd","model":"sonnet","tools":["Bash"],"slash_commands":[],"permissionMode":"default"}}
+{"send":{"type":"control_request","request_id":"permission-1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"echo fixture"},"tool_use_id":"tool-1"}}}
+{"expect":{"/type":"control_response","/response/request_id":"permission-1","/response/response/behavior":"deny"}}
+{"send":{"type":"result","session_id":"00000000-0000-4000-8000-000000000001","subtype":"success","is_error":false,"stop_reason":"end_turn"}}

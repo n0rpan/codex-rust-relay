@@ -1,0 +1,8 @@
+# Each exception names the slice that removes it from the production build.
+# Platform terminal handoff forwards the environment. It never opens Codex files.
+[legacy_wire]
+
+# Stock Claude Code has no catalog/history RPC. Read its project session JSONL
+# only to list or replay conversations; resume and fork must use stock Claude.
+[stock_read_only]
+"claude/catalog.rs" = "selected Claude profiles: projects/<project>/<session UUID>.jsonl"

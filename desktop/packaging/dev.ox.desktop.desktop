@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=OX Desktop
+Exec=ox-desktop
+Icon=dev.ox.desktop
+Comment=Work with Codex and OX models in a project
+Terminal=false
+Categories=Development;
+StartupWMClass=dev.ox.desktop

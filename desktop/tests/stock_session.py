@@ -1,0 +1,536 @@
+"""Exercise the compiled desktop session backend with stock Codex and loopback providers."""
+
+import base64
+import json
+import os
+import ssl
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+ACCOUNT = "desktop-fixture-account"
+
+
+def jwt(payload):
+    def encode(value):
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).decode().rstrip("=")
+
+    return f"{encode({'alg': 'none'})}.{encode(payload)}.sig"
+
+
+class Fixture(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def reply(self, status, content_type, payload):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            # Interrupting an in-flight turn closes its inference request.
+            pass
+
+    def do_GET(self):
+        if self.path == "/backend-api/wham/accounts/check":
+            info = {
+                "id": ACCOUNT,
+                "workspace_backend_origin": self.server.tls_origin,
+                "account_routing_override": "NO_CONSTRAINT",
+            }
+            self.reply(
+                200, "application/json", json.dumps({"accounts": [info]}).encode()
+            )
+        elif self.path.split("?")[0].endswith("/wham/usage"):
+            now = int(time.time())
+            self.reply(200, "application/json", json.dumps({
+                "plan_type": "plus",
+                "rate_limit": {"allowed": True, "limit_reached": False,
+                    "primary_window": {"used_percent": 92, "limit_window_seconds": 18000,
+                                       "reset_after_seconds": 600, "reset_at": now + 600}},
+            }).encode())
+        elif self.path.startswith("/v1/models"):
+            self.reply(
+                200, "application/json", b'{"object":"list","data":[{"id":"demo"}]}'
+            )
+        else:
+            self.reply(404, "application/json", b"{}")
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        if self.path in ("/backend-api/codex/responses", "/v1/responses"):
+            if self.path.startswith("/backend-api"):
+                assert self.headers["Authorization"] == f"Bearer {self.server.access}"
+                assert self.headers["chatgpt-account-id"] == ACCOUNT
+                assert self.server.https
+            else:
+                assert self.headers["Authorization"] == "Bearer fixture-only"
+            if self.server.mode == "native" and b"verify-picked-settings" in body and not (self.server.project / "model-settings-received").exists():
+                params = json.loads(body)
+                expected = json.loads((self.server.project / "expected-model-settings.json").read_text())
+                assert params["model"] == expected["model"], params["model"]
+                assert params["reasoning"]["effort"] == expected["effort"], params["reasoning"]
+                if expected["tier"]:
+                    assert params.get("service_tier") == expected["tier"], (params.get("service_tier"), expected["tier"])
+                (self.server.project / "model-settings-received").touch()
+            item = {
+                "id": "msg_fixture",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "fixture complete",
+                        "annotations": [],
+                    }
+                ],
+            }
+            naming = b"Name a conversation using its first user message" in body
+            if naming:
+                assert not json.loads(body).get("tools")
+                item["content"][0]["text"] = "Fixture conversation"
+            elif self.server.mode in ("ox-workers", "worker-cwd"):
+                payload = json.loads(body)
+                result = next(
+                    (
+                        i.get("output")
+                        for i in payload.get("input", [])
+                        if i.get("type") == "function_call_output"
+                        and i.get("call_id") == "start-fixture-job"
+                    ),
+                    None,
+                )
+                if result is not None and "job_id" not in str(result):
+                    item["content"][0]["text"] = f"OX worker launch failed: {result}"
+                if result is None:
+                    tools = payload["tools"]
+                    choices = [(t.get("name", ""), {}) for t in tools]
+                    choices.extend(
+                        (child["name"], {"namespace": group["name"]})
+                        for group in tools
+                        for child in group.get("tools", [])
+                    )
+                    match = next(
+                        (
+                            (name, ns)
+                            for name, ns in choices
+                            if name.endswith("start_ox_worker")
+                        ),
+                        None,
+                    )
+                    assert match is not None, (
+                        f"Fixture expected OX worker in tools {choices}"
+                    )
+                    name, namespace = match
+                    args = {
+                        "runtime": "codex",
+                        "mode": "session",
+                        "model": "fixture/demo",
+                        "task": "OX worker fixture task",
+                    }
+                    if self.server.mode == "worker-cwd":
+                        args["workspace_write"] = True
+                    item = {
+                        "id": "fc_start",
+                        "type": "function_call",
+                        "status": "completed",
+                        "call_id": "start-fixture-job",
+                        "name": name,
+                        "arguments": json.dumps(args),
+                        **namespace,
+                    }
+            events = [
+                {"type": "response.output_item.done", "output_index": 0, "item": item},
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_fixture",
+                        "object": "response",
+                        "created_at": 1700000000,
+                        "model": "demo",
+                        "status": "completed",
+                        "output": [item],
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 1,
+                            "total_tokens": 2,
+                        },
+                    },
+                },
+            ]
+            stream = "".join(
+                "event: " + e["type"] + "\ndata: " + json.dumps(e) + "\n\n"
+                for e in events
+            )
+        elif self.path in ("/v1/chat/completions", "/other/v1/chat/completions"):
+            req = json.loads(body)
+            if self.path.startswith("/other/"):
+                assert self.headers["Authorization"] == "Bearer other-only"
+                assert "model-switch-foreign" in str(req["messages"])
+                (self.server.project / "other-provider-received").touch()
+            else:
+                assert self.headers["Authorization"] == "Bearer fixture-only"
+            if any(m.get("role") == "user" and "model-switch-second" in str(m.get("content")) for m in req["messages"]):
+                assert req["model"] == "alternate", req["model"]
+            else:
+                assert req["model"] == "demo", req["model"]
+            has_output = any(m["role"] == "tool" for m in req["messages"])
+            chunks = [{"role": "assistant"}]
+            calls = None
+            naming = b"Name a conversation using its first user message" in body
+            if naming:
+                assert not req.get("tools")
+                chunks.append({"content":"Fixture conversation"})
+            elif any(m.get("role") == "user" and "model-switch-" in str(m.get("content")) for m in req["messages"]):
+                chunks.append({"content":"fixture complete"})
+            elif self.server.mode == "worker-cwd":
+                if has_output:
+                    chunks.append({"content": "worker directory checked"})
+                else:
+                    name = next(t["function"]["name"] for t in req["tools"]
+                                if t["function"]["name"].endswith("exec_command"))
+                    args = {"cmd": "cat fixture-input > worker-marker"}
+                    calls = (name, args)
+            elif self.server.mode == "ox-workers":
+                # Keep inference active until the UI steers and cancels this job.
+                time.sleep(8)
+                chunks.append({"content": "OX worker fixture answer"})
+            elif self.server.mode == "workers" or (
+                self.server.mode == "parallel" and any(
+                    "desktop fixture worker" in str(m.get("content", "")) or
+                    "desk-child-task" in str(m.get("content", ""))
+                    for m in req["messages"] if m["role"] == "user"
+                )
+            ):
+                functions = {t["function"]["name"]: t["function"] for t in req["tools"]}
+                messages = req["messages"]
+                child = any(
+                    "desk-child-task" in str(m.get("content", ""))
+                    for m in messages
+                    if m["role"] == "user"
+                )
+                followup = any(
+                    "Confirm the worker follow-up" in str(m.get("content", ""))
+                    for m in messages
+                    if m["role"] == "user"
+                )
+                if not child and not has_output:
+                    calls = (
+                        "spawn_agent",
+                        {"message": "desk-child-task", "agent_type": "default"},
+                    )
+                elif child and (not has_output or followup):
+                    if followup and self.server.mode == "parallel":
+                        self.server.followup_requested.set()
+                    calls = (
+                        "exec_command",
+                        {
+                            "cmd": "echo child-followup"
+                            if followup
+                            else "echo child-probe",
+                            "sandbox_permissions": "require_escalated",
+                            "justification": "Approve child task",
+                        },
+                    )
+                elif not child and not any(
+                    m["role"] == "tool" and "parent-probe" in str(m.get("content", ""))
+                    for m in messages
+                ):
+                    calls = (
+                        "exec_command",
+                        {
+                            "cmd": "echo parent-probe",
+                            "sandbox_permissions": "require_escalated",
+                            "justification": "Approve parent task",
+                        },
+                    )
+                if calls:
+                    name, args = calls
+                    name = next((n for n in functions if n.endswith(name)), None)
+                    assert name, list(functions)
+                else:
+                    if child and self.server.mode == "parallel" and any(
+                        "window clarification" in str(m.get("content", "")) for m in messages
+                    ):
+                        self.server.steered.set()
+                    chunks.append({"content": "desk-worker-answer"})
+            elif has_output:
+                chunks.append({"content": "fixture complete"})
+            else:
+                name = next(
+                    t["function"]["name"]
+                    for t in req["tools"]
+                    if t["function"]["name"].endswith("exec_command")
+                )
+                args = {
+                    "cmd": "echo accepted > approved.txt",
+                    "sandbox_permissions": "require_escalated",
+                    "justification": "Approve this fixture?",
+                }
+                calls = (name, args)
+            if calls:
+                chunks.append(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call-"
+                                + str(
+                                    sum(m["role"] == "tool" for m in req["messages"])
+                                ),
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": json.dumps(args),
+                                },
+                            }
+                        ]
+                    }
+                )
+            stream = ""
+            for delta in chunks + [{}]:
+                finish = None if delta else ("tool_calls" if calls else "stop")
+                frame = {
+                    "id": "chat-demo",
+                    "object": "chat.completion.chunk",
+                    "created": 1700000000,
+                    "model": "demo",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                }
+                stream += "data: " + json.dumps(frame) + "\n\n"
+            stream += "data: [DONE]\n\n"
+        else:
+            self.reply(404, "application/json", b"{}")
+            return
+        self.reply(200, "text/event-stream", stream.encode())
+
+
+def run():
+    rust_test = Path(sys.argv[1]).resolve()
+    ox = Path(os.environ["OX_TEST_OX_BIN"]).resolve(strict=True)
+    codex = Path(os.environ["CODEOX_TEST_CODEX_BIN"]).resolve(strict=True)
+    with tempfile.TemporaryDirectory(prefix="ox-desktop-tests-") as temp:
+        root = Path(temp)
+        binaries = root / "bin"
+        binaries.mkdir()
+        (binaries / "ox").symlink_to(ox)
+        (binaries / "codex").symlink_to(codex)
+        if node := shutil.which("node"):
+            (binaries / "node").symlink_to(node)  # Installed npm wrappers use /usr/bin/env node.
+
+        def openssl(*args):
+            subprocess.run(
+                ["openssl", *args], cwd=root, check=True, stderr=subprocess.DEVNULL
+            )
+
+        openssl(
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=Desktop test CA",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-keyout",
+            "ca.key",
+            "-out",
+            "ca.pem",
+        )
+        openssl(
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-subj",
+            "/CN=127.0.0.1",
+            "-keyout",
+            "server.key",
+            "-out",
+            "server.csr",
+        )
+        (root / "server.ext").write_text(
+            "subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage=serverAuth\n"
+        )
+        openssl(
+            "x509",
+            "-req",
+            "-in",
+            "server.csr",
+            "-CA",
+            "ca.pem",
+            "-CAkey",
+            "ca.key",
+            "-CAcreateserial",
+            "-out",
+            "server.pem",
+            "-days",
+            "1",
+            "-extfile",
+            "server.ext",
+        )
+        cert = root / "ca.pem"
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.load_cert_chain(root / "server.pem", root / "server.key")
+        with (
+            ThreadingHTTPServer(("127.0.0.1", 0), Fixture) as http,
+            ThreadingHTTPServer(("127.0.0.1", 0), Fixture) as https,
+        ):
+            https.socket = tls.wrap_socket(https.socket, server_side=True)
+            expiry = int(time.time()) + 86400
+            access = jwt({"exp": expiry})
+            for server in [http, https]:
+                server.tls_origin = f"https://127.0.0.1:{https.server_port}"
+                server.https = server is https
+                server.access = access
+                threading.Thread(target=server.serve_forever, daemon=True).start()
+            modes = [
+                "workers",
+                "ox-workers",
+                "worker-cwd",
+                "allow",
+                "deny",
+                "stop",
+                "native",
+                "wrong-auth",
+                "legacy",
+            ]
+            selected = os.environ.get("OX_DESKTOP_TEST_CASE")
+            if selected:
+                assert selected in modes
+                modes = [selected]
+            for mode in modes:
+                http.mode = https.mode = mode
+                base = root / mode
+                home = base / "codex"
+                home.mkdir(parents=True)
+                project = base / "project"
+                project.mkdir()
+                http.project = https.project = project
+                native_base = f"http://127.0.0.1:{http.server_port}/backend-api"
+                vendor_base = f"http://127.0.0.1:{http.server_port}/v1"
+                (home / "config.toml").write_text(
+                    f'model = "gpt-5.1-codex"\nchatgpt_base_url = "{native_base}"\n'
+                )
+                if mode == "native":
+                    with (home / "config.toml").open("a") as config:
+                        config.write("[features]\ngoals=true\nenable_request_compression=false\n")
+                if mode in ("native", "ox-workers", "worker-cwd"):
+                    identity = jwt(
+                        {
+                            "exp": expiry,
+                            "email": "fixture@example.invalid",
+                            "https://api.openai.com/auth": {
+                                "chatgpt_account_id": ACCOUNT,
+                                "chatgpt_plan_type": "plus",
+                            },
+                        }
+                    )
+                    tokens = {
+                        "id_token": identity,
+                        "access_token": access,
+                        "refresh_token": "fixture",
+                        "account_id": ACCOUNT,
+                    }
+                    (home / "auth.json").write_text(
+                        json.dumps(
+                            {
+                                "OPENAI_API_KEY": None,
+                                "tokens": tokens,
+                                "last_refresh": time.strftime(
+                                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
+                                ),
+                            }
+                        )
+                    )
+                elif mode == "wrong-auth":
+                    (home / "auth.json").write_text(
+                        json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "fake"})
+                    )
+                elif mode == "legacy":
+                    seeded_profile = home / "ox-clients" / "codex"
+                    seeded_profile.mkdir(parents=True)
+                    (seeded_profile / "config.toml").write_text(
+                        'model_provider = "openai"\n'
+                    )
+                    (home / "config.toml").write_text(
+                        f'model = "demo"\nmodel_provider = "legacy"\n[model_providers.legacy]\n'
+                        f'name = "Fixture"\nbase_url = "{vendor_base}"\nenv_key = "OX_FIXTURE_KEY"\nwire_api = "responses"\n'
+                    )
+                if mode in ("ox-workers", "worker-cwd"):
+                    with (home / "config.toml").open("a") as config:
+                        config.write(
+                            "[features]\ntool_search=false\nenable_request_compression=false\n"
+                        )
+                if mode not in ("legacy", "native", "wrong-auth"):
+                    (home / "codeox.toml").write_text(
+                        f'[providers.fixture]\nname="Fixture"\nwire_api="chat_completions"\nbase_url="{vendor_base}"\n'
+                        'env_key="OX_FIXTURE_KEY"\ndiscovery=false\n[[providers.fixture.models]]\nid="demo"\ncontext_window=131072\n'
+                    )
+                if mode == "allow":
+                    with (home / "codeox.toml").open("a") as config:
+                        config.write('[[providers.fixture.models]]\nid="alternate"\ncontext_window=131072\n')
+                        config.write(
+                            f'[providers.other]\nname="Second"\nwire_api="chat_completions"\nbase_url="http://127.0.0.1:{http.server_port}/other/v1"\n'
+                            'env_key="OX_SECOND_FIXTURE_KEY"\ndiscovery=false\n[[providers.other.models]]\nid="demo"\ncontext_window=131072\n'
+                        )
+                env = {
+                    "HOME": str(base),
+                    "CODEX_HOME": str(home),
+                    "PATH": f"{binaries}:/usr/bin:/bin",
+                    "OX_DESKTOP_FIXTURE_MODE": mode,
+                    "OX_FIXTURE_KEY": "fixture-only",
+                    "OX_SECOND_FIXTURE_KEY": "other-only",
+                    "CODEX_CA_CERTIFICATE": str(cert),
+                    "SSL_CERT_FILE": str(cert),
+                    "NO_PROXY": "127.0.0.1,localhost",
+                }
+                for k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]:
+                    env[k] = "http://127.0.0.1:1"
+                if mode == "worker-cwd":
+                    from stock_boundaries import verify_worker_directories
+                    verify_worker_directories(ox, project, env)
+                    print(f"PASS {mode}", flush=True)
+                    continue
+                case = {"workers": "stock_subagent", "ox-workers": "stock_ox_worker"}.get(mode, "stock_session")
+                cases = [case]
+                if mode in ("allow", "native"):
+                    cases.append("stock_reopen")
+                if mode == "allow":
+                    cases.extend(["stock_model_switch", "stock_model_cold_routes"])
+                for case in cases:
+                    name = f"views::workbench::tests::{case}"
+                    from host_fixture import session_host
+                    env["XDG_STATE_HOME"] = str(base / "state")
+                    with session_host(ox.with_name("ox-host"), base, env):
+                        result = subprocess.run(
+                            [rust_test, "--exact", name, "--ignored", "--nocapture"],
+                            env=env, cwd=project, timeout=60, check=True,
+                            stdout=subprocess.PIPE, text=True,
+                        )
+                    assert f"test {name} ... ok" in result.stdout, result.stdout
+                if mode == "native":
+                    from stock_boundaries import verify_catalog
+                    verify_catalog(ox, project, env)
+                    from stock_boundaries import verify_route_catalogs
+                    (home / "codeox.toml").write_text(
+                        f'[providers.fixture]\nname="Fixture"\nwire_api="chat_completions"\nbase_url="{vendor_base}"\n'
+                        'env_key="OX_FIXTURE_KEY"\ndiscovery=false\n[[providers.fixture.models]]\nid="demo"\ncontext_window=131072\n'
+                    )
+                    verify_route_catalogs(ox, project, env)
+                print(f"PASS {mode}", flush=True)
+
+
+if __name__ == "__main__":
+    run()

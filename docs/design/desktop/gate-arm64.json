@@ -1,0 +1,202 @@
+{
+  "platform": "aarch64",
+  "renderer": "/usr/share/vulkan/icd.d/freedreno_icd.json",
+  "display": "wayland",
+  "scenarios": {
+    "G1": {
+      "passed": true,
+      "launch_ms": [
+        169.674182,
+        174.378847,
+        176.249535,
+        177.317041,
+        170.073142,
+        162.299969,
+        165.459104,
+        154.446691,
+        161.313192,
+        169.251367
+      ],
+      "ninth_ms": 176.249535
+    },
+    "G2": {
+      "passed": true,
+      "cpu_percent": 0.0,
+      "seconds": 60.00427398299871,
+      "app": {
+        "cpu_ticks": 18,
+        "pid": 575503,
+        "pss_kib": 58895,
+        "rss_kib": 109820,
+        "start_ticks": 2195265,
+        "threads": 40,
+        "voluntary_context_switches": 583
+      },
+      "children": [
+        {
+          "cpu_ticks": 0,
+          "pid": 575557,
+          "pss_kib": 2779,
+          "rss_kib": 4236,
+          "start_ticks": 2195280,
+          "threads": 2,
+          "voluntary_context_switches": 5
+        }
+      ]
+    },
+    "G3": {
+      "passed": null,
+      "voluntary_switches_per_second": 4.066377006230151,
+      "target": 2
+    },
+    "G4": {
+      "passed": true,
+      "hidden_frames": 0,
+      "voluntary_switches": 246,
+      "seconds": 60,
+      "gpui_reported_visible": true
+    },
+    "G5": {
+      "passed": true,
+      "opened_threads": 30,
+      "rss_bytes": 115113984,
+      "pss_bytes": 80199680,
+      "children": [
+        {
+          "cpu_ticks": 0,
+          "pid": 582720,
+          "pss_kib": 2781,
+          "rss_kib": 4236,
+          "start_ticks": 2207318,
+          "threads": 2,
+          "voluntary_context_switches": 95
+        }
+      ]
+    },
+    "G6": {
+      "passed": true,
+      "reached": 5000,
+      "catalog_len": 5000,
+      "maximum_rows_in_layout": 10,
+      "row_budget": 26,
+      "draw_p95_ms": 2.562047
+    },
+    "G8": {
+      "passed": true,
+      "reply_to_tail_paint_ms": 74.27988,
+      "distinct_history_rows": 14,
+      "viewport_with_overscan": 15,
+      "rows_built": 38,
+      "history_items": 2000
+    },
+    "G7": {
+      "passed": true,
+      "simultaneous_threads": 4,
+      "message_bytes": 200000,
+      "deltas_per_second_per_thread": 200,
+      "draw_p95_ms": 3.782655,
+      "dirty_to_present_p95_ms": 38.731775,
+      "present_interval_p95_ms": 19.578879,
+      "drains": 182,
+      "frames": 216,
+      "typed_draft_visible": true
+    },
+    "G10": {
+      "passed": true,
+      "control_to_pipe_ms": 0.182084,
+      "frame_budget_ms": 16.666666666666668
+    },
+    "navigation": {
+      "passed": true,
+      "threads": 30,
+      "keys": [
+        "Down",
+        "End",
+        "Up",
+        "Home"
+      ]
+    },
+    "reconnect": {
+      "passed": true,
+      "automatic_restarts": 1,
+      "manual_restarts": 1,
+      "draft_restored": true,
+      "replayed_sends": 0
+    },
+    "G9": {
+      "passed": true,
+      "new_threads": 20,
+      "thread_selections": 20,
+      "route_changes": 20,
+      "new_and_switch_spawns": 0,
+      "first_api_route_spawns": 0,
+      "subsequent_route_spawns": 0,
+      "app_servers": [
+        "openai",
+        "codeox"
+      ]
+    },
+    "layout": {
+      "passed": true,
+      "sidebar_width": 302,
+      "open_panes": 2,
+      "selected_thread_restored": true,
+      "independent_projects_restored": true
+    },
+    "G12": {
+      "passed": true,
+      "outside_store_hits": [],
+      "keyfile_mode": "0o600",
+      "saved": true,
+      "journal_output_bytes": 1694
+    },
+    "G11": {
+      "passed": null,
+      "stripped_bytes": 41695104
+    },
+    "G13": {
+      "hyprland": "v0.57.2",
+      "scales": [
+        {
+          "scale": 1.25,
+          "size": [
+            1526,
+            854
+          ]
+        },
+        {
+          "scale": 1.5,
+          "size": [
+            1270,
+            710
+          ]
+        }
+      ],
+      "tiling": {
+        "single": [
+          1270,
+          710
+        ],
+        "split": [
+          632,
+          710
+        ],
+        "restored": true
+      },
+      "workspace_restored": true,
+      "output_power_cycle": true,
+      "keymaps": [
+        "English (US)",
+        "Norwegian",
+        "English (US)"
+      ],
+      "hardware_suspend_resume": "unverified"
+    }
+  },
+  "probe_commit": "50d60e64d14ef15ed4c4dee39e34cd5a77e6e4ba",
+  "application_sha256": "1c0c8df40d2b0e722abc6c769b0bf4e633e587278e6e5b1c3fc6ac8b97526f74",
+  "probe_sha256": "3bb6dc21b33362cbe72629cbec933ca2856992a91aa9672cb342078a049b5f90",
+  "companion_sha256": "bb3fe1326d33973b43e1adc0fcb9e83baa17d205fd119e7d5cd29f2578dec8a0",
+  "commit": "50d60e64d14ef15ed4c4dee39e34cd5a77e6e4ba",
+  "workflow": "https://github.com/n0rpan/ox/actions/runs/45430986035"
+}

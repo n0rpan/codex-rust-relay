@@ -18,6 +18,12 @@ pub(crate) async fn dispatch(args: &[OsString], home: &Path) -> Option<Result<u8
         [client, mode, rest @ ..] if client == "codex" && mode == "--chatgpt" => {
             Some(launch_chatgpt(rest, home, None).await)
         }
+        [client, mode] if client == "claude" && mode == "--subscription" => {
+            Some(launch_subscription(ClientKind::Claude, home, None).await)
+        }
+        [client, mode, args @ ..] if client == "claude" && mode == "--subscription" => {
+            Some(launch_claude_subscription(args, home).await)
+        }
         [client, mode, rest @ ..] if client == "claude" && mode == "--native" => {
             Some(launch_claude(rest, home).await)
         }
@@ -122,13 +128,103 @@ async fn login(account: Option<&str>, args: &[OsString], home: &Path) -> Result<
             command.arg("login").args(args);
             launch(command).await
         }
+        (Some("claude"), [status]) if status == "status" => {
+            check_claude_subscription(home).await?;
+            println!("Claude Code is signed in with a Claude subscription.");
+            Ok(0)
+        }
         (Some("claude"), []) => {
             let mut command = claude_account_command(home)?;
             command.args(["auth", "login", "--claudeai"]);
             launch(command).await
         }
-        _ => Err("usage: ox login chatgpt [--device-auth | status], or ox login claude".into()),
+        _ => Err(
+            "usage: ox login chatgpt [--device-auth | status], or ox login claude [status]".into(),
+        ),
     }
+}
+
+// Exposed to the desktop as a stable, non-identifying failure marker.
+const CLAUDE_SIGN_IN: &str = "no Claude subscription sign-in found. Run ox login claude first";
+
+fn checked_claude_command(home: &Path) -> Result<Command, RelayError> {
+    crate::clients::ensure_no_managed_override(&[])?;
+    let mut command = claude_account_command(home)?;
+    // Stock settings outrank its inherited environment. Preserve permissions,
+    // hooks, and other user settings while keeping the selected account route.
+    let mut env = serde_json::Map::new();
+    for name in crate::clients::ROUTING_ENV
+        .iter()
+        .copied()
+        .chain(["ANTHROPIC_PROFILE"])
+    {
+        env.insert(name.to_owned(), "".into());
+    }
+    let config = CodeoxConfig::path(home);
+    if config.try_exists()? {
+        for name in CodeoxConfig::load(&config)?.env_refs() {
+            env.insert(name, "".into());
+        }
+    }
+    // The optional OX worker MCP server sets its own short-lived TOKEN_ENV.
+    for name in [crate::daemon::KEY_ENV, DEFAULT_SEARCH_ENV_KEY] {
+        env.insert(name.into(), "".into());
+    }
+    let native_dir = crate::clients::claude_profiles(home)?.subscription;
+    env.insert(
+        "CLAUDE_CONFIG_DIR".into(),
+        serde_json::to_value(&native_dir)?,
+    );
+    command.env("CLAUDE_CONFIG_DIR", native_dir);
+    let settings = serde_json::json!({"env":env,"apiKeyHelper":""});
+    command.arg("--settings").arg(settings.to_string());
+    Ok(command)
+}
+
+async fn check_claude_subscription(home: &Path) -> Result<(), RelayError> {
+    let mut command = checked_claude_command(home)?;
+    command
+        .args(["auth", "status", "--json"])
+        .stdin(Stdio::null());
+    let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+        .await
+        .map_err(|_| "Claude Code timed out checking the subscription")??;
+    let account: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| "Claude Code did not return a readable account status")?;
+    if output.status.success()
+        && account["loggedIn"] == true
+        && account["apiProvider"] == "firstParty"
+        && account["authMethod"] == "claude.ai"
+        && account["apiKeySource"].as_str().is_none_or(|s| s == "none")
+    {
+        return Ok(());
+    }
+    Err(CLAUDE_SIGN_IN.into())
+}
+
+async fn launch_claude_subscription(args: &[OsString], home: &Path) -> Result<u8, RelayError> {
+    if args.iter().any(|arg| {
+        let name = arg.to_string_lossy();
+        matches!(
+            name.split('=').next(),
+            Some("--settings" | "--managed-settings" | "--bare")
+        )
+    }) {
+        return Err("subscription launches own their authentication settings".into());
+    }
+    check_claude_subscription(home).await?;
+    launch_session(
+        checked_claude_command(home)?,
+        args,
+        home,
+        ClientKind::Claude,
+        None,
+    )
+    .await
+}
+
+pub(crate) fn title_generation() -> bool {
+    std::env::var_os("OX_TITLE_GENERATION").as_deref() == Some(std::ffi::OsStr::new("1"))
 }
 
 async fn launch_chatgpt(
@@ -144,7 +240,24 @@ async fn launch_chatgpt(
     if !ready {
         return Err("no ChatGPT sign-in found. Run ox login chatgpt first".into());
     }
-    launch_session(codex_command(home)?, args, home, ClientKind::Codex, relay).await
+    let mut command = codex_command(home)?;
+    // A tool-free ephemeral exec ignores the user's general startup config, but it must
+    // use the same ChatGPT account store and endpoint as the foreground stock client.
+    if title_generation() {
+        let config = home.join("config.toml");
+        if config.try_exists()? {
+            let text = std::fs::read_to_string(config)?;
+            let doc = text.parse::<toml_edit::DocumentMut>()?;
+            for key in ["cli_auth_credentials_store", "chatgpt_base_url"] {
+                if let Some(v) = doc.get(key).and_then(toml_edit::Item::as_str) {
+                    command
+                        .arg("-c")
+                        .arg(format!("{key}={}", serde_json::json!(v)));
+                }
+            }
+        }
+    }
+    launch_session(command, args, home, ClientKind::Codex, relay).await
 }
 
 async fn check_chatgpt_keyring(home: &Path) -> Result<bool, RelayError> {
@@ -300,6 +413,8 @@ pub(crate) fn claude_account_command(home: &Path) -> Result<Command, RelayError>
     for name in crate::clients::ROUTING_ENV {
         command.env_remove(name);
     }
+    // A named Console profile takes precedence over Claude Code's saved login.
+    command.env_remove("ANTHROPIC_PROFILE");
     Ok(command)
 }
 
@@ -331,6 +446,7 @@ fn command(client: &str, home: &Path) -> Result<Command, RelayError> {
 }
 
 pub(crate) async fn launch(mut command: Command) -> Result<u8, RelayError> {
+    crate::host_lifetime::isolate_stock(&mut command);
     let status = command.status().await.map_err(|error| {
         let client = command.as_std().get_program().to_string_lossy();
         crate::client_launch_error(&client, error)

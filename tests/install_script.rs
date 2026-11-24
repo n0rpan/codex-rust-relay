@@ -100,6 +100,7 @@ fn install(base: &Path, install_dir: &Path, home: &Path, arguments: &[&str]) -> 
         .env("OX_INSTALL_DIR", install_dir)
         .env("OX_INSTALL_SKIP_GLIBC_CHECK", "1")
         .env("HOME", home)
+        .env("XDG_DATA_HOME", home.join("share"))
         .env("SHELL", "/bin/zsh")
         .env_remove("OX_CHANNEL")
         .output()
@@ -185,4 +186,118 @@ fn refuses_a_wrong_checksum_a_missing_build_and_unknown_options() {
     let output = install(&release, &bin, &home, &["--help"]);
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("Usage: install.sh [--stable|--dev]"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn optional_desktop_installs_launches_and_preserves_existing_profile() {
+    if ready().is_none() {
+        return;
+    }
+    let root = TempDir::new("desktop-install");
+    let release = root.0.join("release");
+    let source = release.join("ox-desktop");
+    let home = root.0.join("home");
+    let bin = home.join("bin with space %");
+    let project = home.join("project with $ and ;");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&project).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_ox"), source.join("ox")).unwrap();
+    let gui = source.join("ox-desktop");
+    fs::write(&gui, "#!/bin/sh\nif [ \"$1\" = --version ]; then \"$(dirname \"$0\")/ox\" --version | sed 's/^ox /ox-desktop /'; else printf '%s' \"$1\" > \"$HOME/opened\"; fi\n").unwrap();
+    fs::set_permissions(&gui, fs::Permissions::from_mode(0o755)).unwrap();
+    for file in ["dev.ox.desktop.desktop", "ox-desktop.png"] {
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("desktop/packaging")
+                .join(file),
+            source.join(file),
+        )
+        .unwrap();
+    }
+    let asset = format!("ox-desktop-linux-{}.tar.gz", std::env::consts::ARCH);
+    let archive = release.join(&asset);
+    let checksum = release.join(format!("{asset}.sha256"));
+    let pack = || {
+        assert!(
+            Command::new("tar")
+                .arg("-czf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(&release)
+                .arg("ox-desktop")
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(&checksum, format!("{}  {asset}\n", sha256(&archive))).unwrap();
+    };
+    pack();
+    let run = || install(&release, &bin, &home, &["--desktop"]);
+    let installed = run();
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let installed_gui = fs::read_link(bin.join("ox-desktop")).unwrap();
+    let entry = home.join("share/applications/dev.ox.desktop.desktop");
+    assert!(
+        fs::read_to_string(&entry)
+            .unwrap()
+            .contains("bin with space %%/ox-desktop")
+    );
+    if has("desktop-file-validate") {
+        assert!(
+            Command::new("desktop-file-validate")
+                .arg(entry)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let config = home.join(".codex/config.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, "# existing user settings\n").unwrap();
+    assert!(run().status.success());
+    assert_eq!(
+        fs::read_link(bin.join("ox-desktop")).unwrap(),
+        installed_gui
+    );
+    assert!(
+        Command::new(bin.join("ox"))
+            .arg("desktop")
+            .arg(&project)
+            .env("HOME", &home)
+            .env_remove("CODEX_HOME")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let marker = home.join("opened");
+    for _ in 0..100 {
+        if fs::read_to_string(&marker).ok().as_deref() == project.to_str() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        fs::read_to_string(marker).unwrap(),
+        project.to_str().unwrap()
+    );
+    fs::write(&checksum, format!("{}  {asset}\n", "0".repeat(64))).unwrap();
+    assert!(!run().status.success());
+    fs::write(&gui, "#!/bin/sh\necho ox-desktop 0.0.0-incompatible\n").unwrap();
+    pack();
+    let mismatch = run();
+    assert!(!mismatch.status.success());
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("versions differ"));
+    assert_eq!(
+        fs::read_link(bin.join("ox-desktop")).unwrap(),
+        installed_gui
+    );
+    assert_eq!(
+        fs::read_to_string(config).unwrap(),
+        "# existing user settings\n"
+    );
 }

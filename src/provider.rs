@@ -180,6 +180,27 @@ impl SavedKeys {
         process_env(name).or_else(|| self.0.get(name).map(|key| key.value.clone()))
     }
 
+    fn scoped_value(&self, name: &str, scope: &str) -> Option<String> {
+        self.0
+            .get(name)
+            .filter(|key| key.scope == scope)
+            .map(|key| key.value.clone())
+    }
+
+    pub(crate) fn scopes(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .map(|(name, entry)| (name.as_str(), entry.scope.as_str()))
+    }
+
+    pub(crate) fn remove(&mut self, name: &str, scope: &str) -> Result<String, RelayError> {
+        if !self.0.get(name).is_some_and(|entry| entry.scope == scope) {
+            return Err("The saved credential changed. Reload settings and try again.".into());
+        }
+        self.0.remove(name);
+        Ok(serde_json::to_string(self)?)
+    }
+
     pub(crate) fn set(
         &mut self,
         name: &str,
@@ -1193,6 +1214,18 @@ impl Provider {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
+        Self::from_config(&raw, |name, scope| {
+            if let Some(value) = env(name) {
+                return Ok(Some(value));
+            }
+            Ok(SavedKeys::load(codex_home)?.scoped_value(name, scope))
+        })
+    }
+
+    pub(crate) fn from_config(
+        raw: &str,
+        key_for: impl FnOnce(&str, &str) -> Result<Option<String>, RelayError>,
+    ) -> Result<Option<Self>, RelayError> {
         let config = Document::parse(raw).map_err(|_| "could not parse Codex config.toml")?;
         let Some(id) = config.get("model_provider").and_then(Item::as_str) else {
             return Ok(None);
@@ -1238,7 +1271,8 @@ impl Provider {
         if let Some(reason) = credential_env_error(env_key) {
             return Err(reason.into());
         }
-        let upstream_auth = bearer_from_env(env, env_key)
+        let upstream_auth = key_for(env_key, base.as_str())?
+            .and_then(bearer_from_key)
             .ok_or_else(|| format!("set a valid API key in {env_key}"))?;
         Ok(Some(Self {
             id: id.to_owned(),
@@ -1258,8 +1292,7 @@ impl Provider {
     }
 }
 
-fn bearer_from_env(env: &Env<'_>, name: &str) -> Option<HeaderValue> {
-    let key = env(name)?;
+fn bearer_from_key(key: String) -> Option<HeaderValue> {
     if key.is_empty() || key.chars().any(char::is_whitespace) {
         return None;
     }

@@ -157,6 +157,33 @@ const PRESETS: &[ProviderPreset] = &[
     },
 ];
 
+/// Templates use the same provider IDs, wire formats and key references as terminal setup.
+pub(crate) fn desktop_presets() -> Vec<(String, String)> {
+    let mut templates: Vec<_> = PRESETS
+        .iter()
+        .map(|preset| {
+            let url = preset.url.unwrap_or("https://YOUR-ENDPOINT/v1");
+            let mut text = format!(
+                "[providers.{}]\nbase_url = {}\nwire_api = {}\nenv_key = {}\ndiscovery = true\n",
+                preset.id,
+                toml_string(url),
+                toml_string(preset.wire.as_str()),
+                toml_string(preset.env)
+            );
+            if preset.id == "opencode-go" {
+                text.push_str("models_url = \"https://opencode.ai/inference/go/v1/models\"\n");
+            }
+            if preset.id == "anthropic" {
+                text.push_str("anthropic_version = \"2026-10-21\"\n");
+            }
+            (preset.name.into(), text)
+        })
+        .collect();
+    templates.push(("Custom".into(),"[providers.custom]\nbase_url = \"http://127.0.0.1:8000/v1\"\nwire_api = \"chat_completions\"\nenv_key = \"CUSTOM_API_KEY\"\ndiscovery = false\n\n[[providers.custom.models]]\nid = \"my-model\"\n".into()));
+    templates.push(("Brave Search".into(),"[search]\nenabled = true\nenv_key = \"BRAVE_SEARCH_API_KEY\"\nmax_results = 8\ntimeout_seconds = 30\n".into()));
+    templates
+}
+
 pub(crate) fn guided_provider(home: &Path) -> Result<(), RelayError> {
     let mut prompt = Prompt {
         input: &mut std::io::stdin().lock(),
@@ -486,7 +513,7 @@ fn wire_label(wire: WireKind) -> &'static str {
     }
 }
 
-fn save_key(
+pub(crate) fn save_key(
     home: &Path,
     config: &CodeoxConfig,
     name: &str,
@@ -1897,7 +1924,7 @@ pub(crate) fn parse_config_for_validation(text: &str) -> Result<CodeoxConfig, Re
     CodeoxConfig::load_from_str(text)
 }
 
-fn check_alias_collisions(config: &CodeoxConfig) -> Result<(), RelayError> {
+pub(crate) fn check_alias_collisions(config: &CodeoxConfig) -> Result<(), RelayError> {
     let mut aliases: BTreeMap<String, (String, String)> = BTreeMap::new();
     for vendor in &config.vendors {
         for model in &vendor.models {

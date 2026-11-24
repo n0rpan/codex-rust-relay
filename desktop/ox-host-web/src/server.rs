@@ -1,0 +1,666 @@
+#[path = "project_picker.rs"]
+mod project_picker;
+use crate::{
+    admin::{Reply, Request},
+    bridge, push,
+    state::{self, Purpose, State},
+};
+use axum::{
+    Json, Router,
+    body::Body,
+    extract::{ConnectInfo, DefaultBodyLimit, State as Extract, WebSocketUpgrade},
+    http::{HeaderMap, HeaderValue, Request as HttpRequest, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use serde::Deserialize;
+use serde_json::json;
+use std::{
+    fs, io,
+    net::{Ipv4Addr, SocketAddr},
+    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{TcpListener, UnixListener, UnixStream},
+    sync::{Semaphore, oneshot},
+    task::JoinHandle,
+};
+
+#[derive(Clone)]
+pub(crate) struct App {
+    pub state: Arc<Mutex<State>>,
+    pub host: Arc<PathBuf>,
+    pub slots: Arc<Semaphore>,
+    pub discovered: Arc<Mutex<std::collections::HashSet<ox_desk_core::host_protocol::Scope>>>,
+}
+#[path = "operator.rs"]
+mod operator;
+#[path = "operator_handoff.rs"]
+mod operator_handoff;
+#[path = "remote_settings.rs"]
+mod remote_settings;
+type ErrCode = StatusCode;
+const DENY: StatusCode = StatusCode::FORBIDDEN;
+pub fn run(state_dir: PathBuf, host_socket: PathBuf) -> io::Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(serve(state_dir, host_socket))
+}
+async fn serve(dir: PathBuf, socket: PathBuf) -> io::Result<()> {
+    let store = State::load(&dir)?;
+    let app = App {
+        state: Arc::new(Mutex::new(store)),
+        host: Arc::new(socket),
+        slots: Arc::new(Semaphore::new(64)),
+        discovered: Default::default(),
+    };
+    let local = crate::admin::socket_path(&dir);
+    state::private_dir(local.parent().expect("admin socket directory"))?;
+    if let Ok(meta) = fs::symlink_metadata(&local) {
+        if !meta.file_type().is_socket()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || std::os::unix::net::UnixStream::connect(&local).is_ok()
+        {
+            return Err(io::Error::other("Remote administration socket is occupied"));
+        }
+        fs::remove_file(&local)?;
+    }
+    let admin = UnixListener::bind(&local)?;
+    fs::set_permissions(&local, fs::Permissions::from_mode(0o600))?;
+    let mut listener = None;
+    let prior = app.state.lock().unwrap().configuration();
+    if let Some((origin, port)) = prior
+        && let Ok((_, active)) = listen(app.clone(), origin, port).await
+    {
+        listener = Some(active);
+    }
+    tokio::spawn(push::watch(app.clone()));
+    let mut staged: Option<Staged> = None;
+    let (released, mut ended) = tokio::sync::mpsc::unbounded_channel::<String>();
+    loop {
+        let mut stream = tokio::select! {
+            biased;
+            Some(ticket) = ended.recv() => {
+                if staged.as_ref().is_some_and(|s| s.ticket == ticket) { staged = None; }
+                continue;
+            }
+            result = admin.accept() => result?.0,
+        };
+        if stream.peer_cred()?.uid() != unsafe { libc::geteuid() } {
+            continue;
+        }
+        let Ok(Ok(req)) =
+            tokio::time::timeout(Duration::from_secs(3), read_request(&mut stream)).await
+        else {
+            continue;
+        };
+        let result = administer(&app, &mut listener, &mut staged, req)
+            .await
+            .map_err(|e| e.to_string());
+        let lease = result.as_ref().ok().and_then(|r| r.reservation.clone());
+        if let Ok(mut bytes) = serde_json::to_vec(&result) {
+            bytes.push(b'\n');
+            let _ = tokio::time::timeout(Duration::from_secs(2), stream.write_all(&bytes)).await;
+        }
+        if let Some(ticket) = lease {
+            let released = released.clone();
+            tokio::spawn(async move {
+                let _ = stream.read(&mut [0u8]).await;
+                let _ = released.send(ticket);
+            });
+        }
+    }
+}
+async fn read_request(stream: &mut UnixStream) -> io::Result<Request> {
+    let mut bytes = Vec::new();
+    BufReader::new(stream.take(4097))
+        .read_until(b'\n', &mut bytes)
+        .await?;
+    if bytes.len() > 4096 || !bytes.ends_with(b"\n") {
+        return Err(io::Error::other("Invalid request"));
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+struct Listener {
+    stop: oneshot::Sender<()>,
+    task: JoinHandle<()>,
+}
+async fn shutdown(listener: &mut Option<Listener>) {
+    if let Some(l) = listener.take() {
+        let _ = l.stop.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(1), l.task).await;
+    }
+}
+enum ServeChange {
+    Enable {
+        origin: String,
+        socket: Option<TcpListener>,
+    },
+    Remove,
+}
+struct Staged {
+    ticket: String,
+    change: ServeChange,
+}
+async fn administer(
+    app: &App,
+    listener: &mut Option<Listener>,
+    staged: &mut Option<Staged>,
+    req: Request,
+) -> io::Result<Reply> {
+    let mut pairing = None;
+    let mut reservation = None;
+    if staged.is_some()
+        && matches!(
+            req,
+            Request::Enable { .. }
+                | Request::Disable
+                | Request::Reserve { .. }
+                | Request::ReserveRemoval { .. }
+        )
+    {
+        return Err(io::Error::other(
+            "Another Serve setup is already in progress.",
+        ));
+    }
+    match req {
+        Request::Status => {}
+        Request::Pair { login } => {
+            if listener.is_none() || staged.is_some() {
+                return Err(io::Error::other(
+                    "Enable the local remote access listener first",
+                ));
+            }
+            pairing = Some(app.state.lock().unwrap().invite(login)?);
+        }
+        Request::TerminalGrant { id, enabled } => {
+            app.state.lock().unwrap().terminal_grant(&id, enabled)?
+        }
+        Request::Revoke { id } => app.state.lock().unwrap().revoke(&id)?,
+        Request::Disable => {
+            app.state.lock().unwrap().set_origin(None, 0)?;
+            shutdown(listener).await;
+        }
+        Request::Reserve { origin, port } => {
+            let origin =
+                state::origin(&origin).ok_or_else(|| io::Error::other("Invalid Serve origin"))?;
+            let socket = if listener.is_some() {
+                if app.state.lock().unwrap().configuration() != Some((origin.clone(), port)) {
+                    return Err(io::Error::other(
+                        "Disable the existing Serve address first.",
+                    ));
+                }
+                None
+            } else {
+                Some(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?)
+            };
+            let ticket = state::random();
+            reservation = Some(ticket.clone());
+            *staged = Some(Staged {
+                ticket,
+                change: ServeChange::Enable { origin, socket },
+            });
+        }
+        Request::ReserveRemoval {
+            origin,
+            expected_enabled,
+        } => {
+            // Retain the existing authenticated listener until Serve confirms its mapping is gone.
+            let origin =
+                state::origin(&origin).ok_or_else(|| io::Error::other("Invalid Serve origin"))?;
+            let prior = app.state.lock().unwrap().configuration();
+            if listener.is_some() != expected_enabled
+                || prior.is_some_and(|(active, _)| active != origin)
+            {
+                return Err(io::Error::other(
+                    "Remote access changed. Refresh before disabling it.",
+                ));
+            }
+            let ticket = state::random();
+            reservation = Some(ticket.clone());
+            *staged = Some(Staged {
+                ticket,
+                change: ServeChange::Remove,
+            });
+        }
+        Request::Commit { ticket } => {
+            if staged.as_ref().is_none_or(|s| s.ticket != ticket) {
+                return Err(io::Error::other(
+                    "The Serve setup expired or was cancelled.",
+                ));
+            }
+            match staged.take().unwrap().change {
+                ServeChange::Enable {
+                    origin,
+                    socket: Some(socket),
+                } => {
+                    let port = socket.local_addr()?.port();
+                    app.state
+                        .lock()
+                        .unwrap()
+                        .set_origin(Some(origin.clone()), port)?;
+                    *listener = Some(start_listener(app.clone(), origin, socket));
+                }
+                ServeChange::Enable { socket: None, .. } => {}
+                ServeChange::Remove => {
+                    app.state.lock().unwrap().set_origin(None, 0)?;
+                    shutdown(listener).await;
+                }
+            }
+        }
+        Request::Enable { origin, port } => {
+            let origin = state::origin(&origin)
+                .ok_or_else(|| io::Error::other("Enter an HTTPS Tailscale Serve hostname"))?;
+            let existing = app.state.lock().unwrap().configuration();
+            if existing != Some((origin.clone(), port)) || listener.is_none() {
+                if listener.is_some() {
+                    return Err(io::Error::other(
+                        "Disable the current Serve address before changing it",
+                    ));
+                }
+                let (port, l) = listen(app.clone(), origin.clone(), port).await?;
+                if let Err(e) = app.state.lock().unwrap().set_origin(Some(origin), port) {
+                    let _ = l.stop.send(());
+                    return Err(e);
+                }
+                *listener = Some(l);
+            }
+        }
+    }
+    let mut reply = app.state.lock().unwrap().reply(pairing);
+    reply.enabled = listener.is_some();
+    reply.reservation = reservation;
+    Ok(reply)
+}
+async fn listen(app: App, origin: String, port: u16) -> io::Result<(u16, Listener)> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
+    let actual = listener.local_addr()?.port();
+    Ok((actual, start_listener(app, origin, listener)))
+}
+fn start_listener(app: App, origin: String, listener: TcpListener) -> Listener {
+    let router = Router::new()
+        .route(
+            "/",
+            get(|| async {
+                asset(
+                    "text/html; charset=utf-8",
+                    include_bytes!("../assets/index.html"),
+                )
+            }),
+        )
+        .route(
+            "/composer-tools.js",
+            get(|| async {
+                asset(
+                    "text/javascript",
+                    include_bytes!("../assets/composer-tools.js"),
+                )
+            }),
+        )
+        .route(
+            "/app.js",
+            get(|| async { asset("text/javascript", include_bytes!("../assets/app.js")) }),
+        )
+        .route(
+            "/wire.js",
+            get(|| async { asset("text/javascript", include_bytes!("../assets/wire.js")) }),
+        )
+        .route(
+            "/settings.js",
+            get(|| async { asset("text/javascript", include_bytes!("../assets/settings.js")) }),
+        )
+        .route(
+            "/settings.css",
+            get(|| async { asset("text/css", include_bytes!("../assets/settings.css")) }),
+        )
+        .route(
+            "/controls.js",
+            get(|| async { asset("text/javascript", include_bytes!("../assets/controls.js")) }),
+        )
+        .route(
+            "/model.js",
+            get(|| async { asset("text/javascript", include_bytes!("../assets/model.js")) }),
+        )
+        .route(
+            "/pair-camera.js",
+            get(|| async {
+                asset(
+                    "text/javascript",
+                    include_bytes!("../assets/pair-camera.js"),
+                )
+            }),
+        )
+        .route(
+            "/vendor/marked-18.3.0.js",
+            get(|| async {
+                asset(
+                    "text/javascript",
+                    include_bytes!("../assets/vendor/marked-18.3.0.js"),
+                )
+            }),
+        )
+        .route(
+            "/vendor/jsQR-1.4.0.js",
+            get(|| async {
+                asset(
+                    "text/javascript",
+                    include_bytes!("../assets/vendor/jsQR-1.4.0.js"),
+                )
+            }),
+        )
+        .route(
+            "/vendor/jsQR.LICENSE",
+            get(|| async {
+                asset(
+                    "text/plain",
+                    include_bytes!("../assets/vendor/jsQR.LICENSE"),
+                )
+            }),
+        )
+        .route(
+            "/device.js",
+            get(|| async { asset("text/javascript", include_bytes!("../assets/device.js")) }),
+        )
+        .route(
+            "/style.css",
+            get(|| async { asset("text/css", crate::cartridges::stylesheet()) }),
+        )
+        .route(
+            "/sw.js",
+            get(|| async { asset("text/javascript", include_bytes!("../assets/sw.js")) }),
+        )
+        .route(
+            "/marquee.png",
+            get(|| async { asset("image/png", include_bytes!("../assets/marquee.png")) }),
+        )
+        .route(
+            "/horizon.png",
+            get(|| async { asset("image/png", include_bytes!("../assets/horizon.png")) }),
+        )
+        .route(
+            "/cartridges.png",
+            get(|| async { asset("image/png", include_bytes!("../assets/cartridges.png")) }),
+        )
+        .route(
+            "/icon.png",
+            get(|| async { asset("image/png", include_bytes!("../assets/icon.png")) }),
+        )
+        .route(
+            "/icon-192.png",
+            get(|| async { asset("image/png", include_bytes!("../assets/icon-192.png")) }),
+        )
+        .route(
+            "/manifest.webmanifest",
+            get(|| async {
+                asset(
+                    "application/manifest+json",
+                    include_bytes!("../assets/manifest.json"),
+                )
+            }),
+        )
+        .route(
+            "/api/settings",
+            post(remote_settings::settings).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route("/api/pair", post(pair))
+        .route("/api/challenge", post(challenge))
+        .route("/api/push", post(subscribe))
+        .route("/api/operator", get(operator::upgrade))
+        .route(
+            "/operator.js",
+            get(|| async { asset("text/javascript", include_bytes!("../assets/operator.js")) }),
+        )
+        .route("/api/socket", get(upgrade))
+        .layer(DefaultBodyLimit::max(8192))
+        .layer(middleware::from_fn_with_state(origin, guard))
+        .with_state(app);
+    let (stop, rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = rx.await;
+        })
+        .await;
+    });
+    Listener { stop, task }
+}
+fn asset(kind: &'static str, bytes: &'static [u8]) -> Response {
+    ([(header::CONTENT_TYPE, kind)], bytes).into_response()
+}
+fn one<'a>(headers: &'a HeaderMap, key: &str) -> Option<&'a str> {
+    let mut values = headers.get_all(key).iter();
+    let first = values.next()?.to_str().ok()?;
+    values.next().is_none().then_some(first)
+}
+fn login(headers: &HeaderMap) -> Option<&str> {
+    one(headers, "tailscale-user-login").filter(|s| {
+        !s.is_empty() && s.len() <= 254 && !s.bytes().any(|b| b.is_ascii_control() || b == b' ')
+    })
+}
+fn permitted(origin: &str, peer: SocketAddr, path: &str, headers: &HeaderMap) -> bool {
+    peer.ip().is_loopback()
+        && login(headers).is_some()
+        && one(headers, "host") == origin.strip_prefix("https://")
+        && (!path.starts_with("/api/") || one(headers, "origin") == Some(origin))
+}
+async fn guard(
+    Extract(origin): Extract<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: HttpRequest<Body>,
+    next: Next,
+) -> Response {
+    if !permitted(&origin, peer, req.uri().path(), req.headers()) {
+        return DENY.into_response();
+    }
+    let mut response = next.run(req).await;
+    let h = response.headers_mut();
+    for (k, v) in [
+        ("cache-control", "no-store"),
+        ("referrer-policy", "no-referrer"),
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        (
+            "permissions-policy",
+            "camera=(self), microphone=(), geolocation=()",
+        ),
+    ] {
+        h.insert(k, HeaderValue::from_static(v));
+    }
+    let ws = origin.replacen("https://", "wss://", 1);
+    let csp = format!(
+        "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; media-src 'self' blob:; connect-src 'self' {ws}; worker-src 'self'; manifest-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
+    );
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_str(&csp).expect("validated Serve origin"),
+    );
+    response
+}
+const COOKIE: &str = "__Host-ox-device";
+fn token(h: &HeaderMap) -> Result<&str, ErrCode> {
+    let cookie = one(h, "cookie").ok_or(DENY)?;
+    let mut values = cookie
+        .split(';')
+        .filter_map(|v| v.trim().split_once('='))
+        .filter(|(k, _)| *k == COOKIE);
+    let token = values.next().ok_or(DENY)?.1;
+    if values.next().is_some() {
+        return Err(DENY);
+    }
+    Ok(token)
+}
+fn device(app: &App, h: &HeaderMap) -> Result<String, ErrCode> {
+    let token = token(h)?;
+    app.state
+        .lock()
+        .unwrap()
+        .identity(login(h).ok_or(DENY)?, token)
+        .ok_or(DENY)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Pair {
+    code: String,
+    key: String,
+    signature: String,
+    label: String,
+}
+async fn pair(
+    Extract(app): Extract<App>,
+    h: HeaderMap,
+    Json(p): Json<Pair>,
+) -> Result<Response, ErrCode> {
+    let token = app
+        .state
+        .lock()
+        .unwrap()
+        .pair(
+            login(&h).ok_or(DENY)?,
+            &p.code,
+            &p.key,
+            &p.signature,
+            &p.label,
+        )
+        .ok_or(DENY)?;
+    Ok((
+        [(
+            header::SET_COOKIE,
+            format!(
+                "{COOKIE}={token}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+                state::INACTIVE
+            ),
+        )],
+        StatusCode::NO_CONTENT,
+    )
+        .into_response())
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Challenge {
+    purpose: Purpose,
+}
+async fn challenge(
+    Extract(app): Extract<App>,
+    h: HeaderMap,
+    Json(c): Json<Challenge>,
+) -> Result<Response, ErrCode> {
+    let id = device(&app, &h)?;
+    let mut s = app.state.lock().unwrap();
+    let terminal = s.terminal_generation(&id).is_some();
+    if c.purpose == Purpose::Terminal && !terminal {
+        return Err(DENY);
+    }
+    let nonce = s
+        .challenge(&id, c.purpose)
+        .ok_or(StatusCode::TOO_MANY_REQUESTS)?;
+    let vapid = if c.purpose == Purpose::Push {
+        Some(
+            s.public_key()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        )
+    } else {
+        None
+    };
+    let cookie = format!(
+        "{COOKIE}={}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+        token(&h)?,
+        state::INACTIVE
+    );
+    Ok((
+        [(header::SET_COOKIE, cookie)],
+        Json(json!({"nonce":nonce,"vapid":vapid,"terminal":terminal})),
+    )
+        .into_response())
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Proof {
+    pub nonce: String,
+    pub signature: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Subscribe {
+    proof: Proof,
+    subscription: Option<push::Subscription>,
+}
+async fn subscribe(
+    Extract(app): Extract<App>,
+    h: HeaderMap,
+    Json(input): Json<Subscribe>,
+) -> Result<StatusCode, ErrCode> {
+    let id = device(&app, &h)?;
+    let mut s = app.state.lock().unwrap();
+    if !s.prove(
+        &id,
+        Purpose::Push,
+        &input.proof.nonce,
+        &input.proof.signature,
+    ) {
+        return Err(DENY);
+    }
+    if input.subscription.as_ref().is_some_and(|sub| !sub.valid()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    s.set_push(&id, input.subscription)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    s.changed.send_modify(|v| *v = v.wrapping_add(1));
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn upgrade(
+    Extract(app): Extract<App>,
+    h: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ErrCode> {
+    let id = device(&app, &h)?;
+    let slot = app
+        .slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+    Ok(ws
+        .max_frame_size(9 * 1024 * 1024)
+        .max_message_size(9 * 1024 * 1024)
+        .on_upgrade(move |socket| async move {
+            let _slot = slot;
+            bridge::session(app, id, socket).await
+        }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn serve_identity_from_a_non_loopback_peer_or_foreign_origin_is_rejected() {
+        let origin = "https://machine.test.ts.net:8443";
+        let mut h = HeaderMap::new();
+        h.insert("host", "machine.test.ts.net:8443".parse().unwrap());
+        h.insert("origin", origin.parse().unwrap());
+        h.insert("tailscale-user-login", "test@example.test".parse().unwrap());
+        for remote in ["192.168.1.44:3434", "100.64.0.2:1024", "[2001:db8::1]:443"] {
+            assert!(!permitted(
+                origin,
+                remote.parse().unwrap(),
+                "/api/socket",
+                &h
+            ));
+        }
+        let local = "127.0.0.1:41234".parse().unwrap();
+        assert!(permitted(origin, local, "/api/socket", &h));
+        h.append("origin", "https://elsewhere.invalid".parse().unwrap());
+        assert!(!permitted(origin, local, "/api/socket", &h));
+        h.remove("origin");
+        assert!(!permitted(origin, local, "/api/pair", &h));
+        h.remove("tailscale-user-login");
+        assert!(!permitted(origin, local, "/", &h));
+    }
+}

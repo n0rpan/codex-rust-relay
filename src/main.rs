@@ -13,12 +13,16 @@ mod claude_response;
 mod claude_search;
 mod clients;
 mod daemon;
+mod desktop_launch;
+mod desktop_settings;
 mod diagnostics;
 mod help;
+mod host_lifetime;
 mod native;
 mod picker;
 mod provider;
 mod search;
+mod settings_protocol;
 mod setup;
 mod sse;
 mod standalone_search;
@@ -26,6 +30,7 @@ mod translate;
 mod ui;
 mod update;
 mod upstream;
+mod version;
 mod workers;
 
 use std::collections::BTreeSet;
@@ -104,13 +109,7 @@ struct VendorState {
     auth: Option<SecretKey>,
 }
 
-/// The version this binary reports. Release builds set `OX_BUILD_VERSION`
-/// at compile time (for example `0.1.1-dev.38`); every other build uses the
-/// version in Cargo.toml.
-pub(crate) const VERSION: &str = match option_env!("OX_BUILD_VERSION") {
-    Some(version) if !version.is_empty() => version,
-    _ => env!("CARGO_PKG_VERSION"),
-};
+pub(crate) use version::VERSION;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -142,6 +141,9 @@ impl LaunchConfig {
 
 async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> {
     let args: Vec<OsString> = args.collect();
+    if args.first().is_some_and(|a| a == "codex" || a == "claude") {
+        host_lifetime::supervise()?;
+    }
     if args
         .first()
         .is_some_and(|arg| arg == "--version" || arg == "-V")
@@ -151,6 +153,12 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
     }
     if let Some(result) = help::dispatch(&args) {
         return result;
+    }
+    if args.first().is_some_and(|arg| arg == "host") {
+        return desktop_launch::host(&args[1..]);
+    }
+    if args.first().is_some_and(|arg| arg == "desktop") {
+        return desktop_launch::run(&args[1..]);
     }
     if args.first().is_some_and(|arg| arg == "update") {
         return update::run(&args[1..]).await;
@@ -164,6 +172,9 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         return result;
     }
     match args.first().and_then(|arg| arg.to_str()) {
+        Some("--ox-desktop-settings-v1") if args.len() == 1 => {
+            return desktop_settings::run(&codex_home).await;
+        }
         Some("setup") => return run_setup(&args[1..], &codex_home).await,
         Some("serve") => return daemon::run(&args[1..], &codex_home).await,
         Some("doctor") if args.iter().any(|arg| arg == "--live") => {
@@ -294,7 +305,24 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
             config.vendors.iter().any(|v| v.wire.is_translated()),
             search_launch,
         ),
-        LaunchConfig::Legacy(provider) => legacy_overrides(&provider.id, &base_url),
+        LaunchConfig::Legacy(provider) => {
+            let mut options = legacy_overrides(&provider.id, &base_url);
+            if native::title_generation() {
+                // Ephemeral naming jobs ignore all user config, including the selected provider.
+                // Carry just the relay identity; inference credentials remain with OX.
+                options.push(format!("model_provider={}", json!(provider.id)));
+                options.push(format!(
+                    "model_providers.{}.name={}",
+                    provider.id,
+                    json!(provider.name)
+                ));
+                options.push(format!(
+                    "model_providers.{}.wire_api=\"responses\"",
+                    provider.id
+                ));
+            }
+            options
+        }
     };
 
     let mut app = match config {
@@ -392,6 +420,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
     command.kill_on_drop(true);
     exempt_loopback_proxy(&mut command);
 
+    host_lifetime::isolate_stock(&mut command);
     let mut child = command.spawn().map_err(|error| {
         let client = command.as_std().get_program().to_string_lossy();
         client_launch_error(&client, error)

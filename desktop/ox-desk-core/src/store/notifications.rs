@@ -1,0 +1,295 @@
+use super::{Connection, Notification, Route, Store};
+use crate::changed::Changed;
+use std::io;
+
+impl Store {
+    pub fn applied_access(&self, id: Option<&str>) -> Option<crate::runtime::Access> {
+        if let Some(remote) = self.remote() {
+            return id
+                .and_then(|id| remote.access.get(id).copied())
+                .or_else(|| id.is_none().then_some(remote.draft_access).flatten());
+        }
+        if self.is_session_scoped() {
+            self.claude_applied_access(id)
+        } else {
+            self.transcript(id?).and_then(|t| t.access())
+        }
+    }
+    pub fn next_access(&self) -> Option<crate::codex::access::Access> {
+        self.next_preset
+    }
+    pub fn set_next_access(&mut self, access: crate::codex::access::Access) {
+        if !crate::runtime::Access::choices(self.profile.route.runtime).contains(&access)
+            && access != crate::runtime::Access::Configured
+        {
+            return;
+        }
+        if self.is_session_scoped() {
+            match self.claude_next_mode(access) {
+                Ok(true) => return,
+                Ok(false) => (),
+                Err(e) => {
+                    self.notice = Some(e.to_string());
+                    return;
+                }
+            }
+        }
+        self.next_preset = (access != crate::codex::access::Access::Configured).then_some(access);
+    }
+    pub fn can_change_access(&self, id: &str) -> bool {
+        if let Some(remote) = self.remote() {
+            return remote.can(id, "access");
+        }
+        self.can_send(Some(id))
+            && self.transcripts[id].active_turn().is_none()
+            && !self.asks.iter().any(|a| a.thread.as_deref() == Some(id))
+            && !self
+                .pending
+                .values()
+                .any(|(_, p)| matches!(p,super::Pending::Access(t) if t==id))
+    }
+    pub fn set_access(&mut self, id: &str, preset: crate::codex::access::Access) -> io::Result<()> {
+        if self.remote().is_some() {
+            return self.forward(crate::actions::Action::SetAccess(id.into(), preset));
+        }
+        if !self.can_change_access(id)
+            || !crate::runtime::Access::choices(self.profile.route.runtime).contains(&preset)
+        {
+            return Err(io::Error::other(
+                "Permissions cannot be changed for this thread right now",
+            ));
+        }
+        if self.is_session_scoped() {
+            if self.applied_access(Some(id)) == Some(preset) {
+                return Ok(());
+            }
+            return self.claude_mode(id, preset);
+        }
+        self.request(
+            crate::codex::request::Call::Access {
+                thread: id.into(),
+                preset,
+            },
+            super::Pending::Access(id.into()),
+        )
+    }
+    pub(super) fn notification(&mut self, notice: Notification) -> io::Result<()> {
+        match notice {
+            Notification::Started(row) => self.observed_row(*row),
+            Notification::Status { thread, status } => self.activity_status(&thread, status),
+            Notification::Settings { thread, settings } => {
+                let pending_model=self.pending.values().any(|(_,p)|matches!(p,super::Pending::Options(owner,o) if owner==&thread && o.model==settings.model));
+                let mismatch = self
+                    .expected_alias(&thread)
+                    .is_some_and(|model| model != settings.model)
+                    && !pending_model;
+                if let Some(t) = self.transcripts.get_mut(&thread) {
+                    t.model = Some(settings.model.clone());
+                    t.tier = settings.service_tier;
+                    t.effort = settings.effort;
+                    if t.access != Some(settings.access) {
+                        self.changed.mark(Changed::THREADS);
+                    }
+                    t.access = Some(settings.access);
+                    if settings.provider != self.profile.provider || mismatch {
+                        t.verified = false;
+                        t.ready = false;
+                        t.error=Some("Codex changed this thread’s billing route. Reopen it on its current route.".into());
+                    }
+                    self.changed.transcript(&thread);
+                }
+            }
+            Notification::Tokens { thread, usage, .. } => {
+                if let Some(t) = self.transcripts.get_mut(&thread) {
+                    t.usage = Some(usage);
+                    self.changed.transcript(&thread);
+                }
+            }
+            Notification::RateLimits(limits) if self.profile.route == Route::CODEX_SUBSCRIPTION => {
+                self.usage.update(limits);
+                self.changed.mark(Changed::NOTICE);
+            }
+            Notification::Diff { thread, turn, diff } => {
+                if let Some(t) = self.transcripts.get_mut(&thread) {
+                    t.reviews.turn(&turn, false).diff(diff);
+                    self.changed.transcript(&thread);
+                }
+            }
+            Notification::FilePatch {
+                thread,
+                turn,
+                item,
+                changes,
+            } => {
+                if let Some(t) = self.transcripts.get_mut(&thread) {
+                    t.reviews.turn(&turn, false).files(&item, &changes, false);
+                    self.changed.transcript(&thread);
+                }
+            }
+            Notification::Plan {
+                thread,
+                turn,
+                explanation,
+                steps,
+            } => {
+                if let Some(t) = self.transcripts.get_mut(&thread) {
+                    let plan = t.reviews.turn(&turn, false);
+                    plan.explanation = explanation;
+                    plan.steps = steps
+                        .into_iter()
+                        .map(|s| crate::transcript::review::Step {
+                            text: s.step,
+                            status: s.status,
+                        })
+                        .collect();
+                    self.changed.transcript(&thread);
+                }
+            }
+            Notification::Resolved(id) => {
+                let before = self.asks.len();
+                self.asks.retain(|a| a.id != id);
+                if before != self.asks.len() {
+                    self.changed.mark(Changed::ASK);
+                }
+            }
+            Notification::Closed(id) => {
+                if let Some(row) = self.catalog.get_mut(&id) {
+                    row.status = None;
+                }
+                for ask in self.asks.iter().filter(|a| a.thread.as_ref() == Some(&id)) {
+                    self.link
+                        .codex()?
+                        .reject(ask.id.clone(), -32000, "Thread closed")?;
+                }
+                self.asks.retain(|a| a.thread.as_ref() != Some(&id));
+                if let Some(t) = self.transcripts.get_mut(&id) {
+                    t.verified = false;
+                    t.ready = false;
+                    t.active_turn = None;
+                    t.error = Some("Codex closed this thread. Select it to reconnect.".into());
+                }
+                self.changed.mark(Changed::THREADS | Changed::ASK);
+            }
+            Notification::Renamed { thread, name } => {
+                if let Some(row) = self.catalog.get_mut(&thread) {
+                    row.name = name;
+                    self.catalog_revision += 1;
+                    if self.listing {
+                        self.created_while_listing.insert(thread);
+                    }
+                    self.changed.mark(Changed::THREADS);
+                }
+            }
+            Notification::Archived(id) => {
+                self.archived_threads.insert(id.clone());
+                self.catalog.remove(&id);
+                self.catalog_revision += 1;
+                if self.selected() == Some(&id) {
+                    self.new_session();
+                }
+                self.changed.mark(Changed::THREADS);
+            }
+            Notification::Account { auth_mode }
+                if self.profile.route == Route::CODEX_SUBSCRIPTION =>
+            {
+                let signed_in =
+                    matches!(auth_mode.as_deref(), Some("chatgpt" | "chatgptAuthTokens"));
+                let transition = match self.state {
+                    Connection::SignInRequired => signed_in,
+                    Connection::Ready => !signed_in,
+                    _ => false,
+                };
+                if transition
+                    && !self
+                        .pending
+                        .values()
+                        .any(|(_, p)| matches!(p, super::Pending::Account))
+                {
+                    // A notification is a hint. Only account/read can authorize subscription usage.
+                    self.request(
+                        crate::codex::request::Call::Account,
+                        super::Pending::Account,
+                    )?;
+                }
+            }
+            Notification::Error {
+                thread,
+                message,
+                will_retry: false,
+                ..
+            } => {
+                if let Some(t) = self.transcripts.get_mut(&thread) {
+                    t.error = Some(message);
+                    self.changed.transcript(&thread);
+                }
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codex::{
+        frame::{Frame, RequestId},
+        reply::Reply,
+    };
+    use crate::links::codex::{Launch, Link, LinkEvent};
+    use crate::store::{Pending, Profile};
+    use serde_json::json;
+
+    #[test]
+    fn subscription_login_hint_waits_for_a_verified_account_and_coalesces_refreshes() {
+        let project = std::env::temp_dir();
+        let link = Link::spawn(
+            Launch {
+                executable: "/bin/cat".into(),
+                arguments: vec![],
+                directory: project.clone(),
+                path: "/usr/bin:/bin".into(),
+            },
+            |_| {},
+        )
+        .unwrap();
+        let mut store = Store::open(
+            Profile {
+                project,
+                route: Route::CODEX_SUBSCRIPTION,
+                provider: "openai".into(),
+            },
+            link,
+        )
+        .unwrap();
+        store.state = Connection::SignInRequired;
+        let notification = || Notification::Account {
+            auth_mode: Some("chatgpt".into()),
+        };
+        let pending = |s: &Store| -> Vec<i64> {
+            s.pending
+                .iter()
+                .filter_map(|(id, (_, p))| matches!(p, Pending::Account).then_some(*id))
+                .collect()
+        };
+        for (kind, ready) in [("apiKey", false), ("chatgpt", true)] {
+            store.notification(notification()).unwrap();
+            store.notification(notification()).unwrap();
+            let requests = pending(&store);
+            assert_eq!(requests.len(), 1);
+            assert_eq!(store.state(), &Connection::SignInRequired);
+            let reply = serde_json::from_value(json!({"account":{"type":kind}})).unwrap();
+            store.apply(LinkEvent::Frame(Frame::Reply {
+                id: RequestId::Number(requests[0]),
+                result: Ok(Reply::Account(reply)),
+            }));
+            assert_eq!(store.state() == &Connection::Ready, ready);
+        }
+        store.notification(notification()).unwrap();
+        assert!(pending(&store).is_empty());
+        store.profile.route = Route::codex_api("vendor/model".into());
+        store.state = Connection::SignInRequired;
+        store.notification(notification()).unwrap();
+        assert!(pending(&store).is_empty());
+    }
+}

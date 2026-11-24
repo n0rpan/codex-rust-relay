@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#171825" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <title>OX Sessions</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/icon.png" />
+    <link rel="icon" href="/icon.png" />
+    <link rel="stylesheet" href="/style.css" />
+    <link rel="stylesheet" href="/settings.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header>
+      <button id="home" class="wordmark" aria-label="All sessions">
+        <img src="/marquee.png" width="64" height="40" alt="OX" /></button
+      ><span class="separator"></span><span id="location">Sessions</span>
+      <div id="network" role="status">Connecting</div>
+    </header>
+    <main>
+      <section id="pair" hidden>
+        <h1>Pair this device</h1>
+        <p id="pair-hint">
+          Open Remote access in OX Desktop and scan a pairing code for your
+          Tailscale account, or paste its pairing link below.
+        </p>
+        <button id="scan-pair" type="button">Scan pairing QR</button>
+        <div id="camera-panel" hidden>
+          <video
+            id="camera-preview"
+            playsinline
+            muted
+            aria-label="Pairing camera preview"
+          ></video>
+          <button id="cancel-camera" type="button">Close camera</button>
+        </div>
+        <p id="camera-status" role="status"></p>
+        <form id="pair-form">
+          <div id="paste-pair">
+            <label for="pair-link">Pairing link</label
+            ><input
+              id="pair-link"
+              type="url"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder="https://…/#pair=…"
+            />
+          </div>
+          <label for="device-label">Device name</label
+          ><input
+            id="device-label"
+            required
+            maxlength="64"
+            autocomplete="off"
+            placeholder="My phone"
+          /><button class="primary">Pair device</button>
+        </form>
+      </section>
+      <section id="catalog" hidden>
+        <div class="heading">
+          <h1>Sessions</h1>
+          <button id="new" class="primary">＋ New session</button>
+          <details class="action-menu">
+            <summary aria-label="More session list actions">•••</summary>
+            <div>
+              <button type="button" id="operator-home">Host terminal</button>
+              <button id="open-phone-settings" type="button">Settings</button>
+            </div>
+          </details>
+        </div>
+        <details id="notification-setup">
+          <summary id="notification-summary">Session notifications</summary>
+          <p id="notification-guide" role="status"></p>
+          <button id="notifications" type="button" hidden>
+            Enable notifications
+          </button>
+        </details>
+        <input
+          id="find-sessions"
+          type="search"
+          aria-label="Search sessions"
+          placeholder="Search sessions or projects…"
+          autocomplete="off"
+        />
+        <div id="filters" role="group" aria-label="Session filter">
+          <button data-filter="all" aria-pressed="true">All</button
+          ><button data-filter="active" aria-pressed="false">Active</button
+          ><button data-filter="requests" aria-pressed="false">Requests</button>
+        </div>
+        <div id="list"></div>
+      </section>
+      <section id="create" hidden>
+        <button class="back">← Sessions</button>
+        <h1>New session</h1>
+        <form id="new-form">
+          <label for="project">Project</label
+          ><select id="project" required></select
+          ><button id="browse-projects" type="button">
+            Browse laptop folders
+          </button>
+          <section
+            id="folder-picker"
+            aria-label="Choose a project folder"
+            hidden
+          >
+            <label for="folder-path">Folder on laptop</label>
+            <input
+              id="folder-path"
+              type="text"
+              autocapitalize="off"
+              spellcheck="false"
+            />
+            <div class="actions">
+              <button type="button" id="folder-go">Go</button
+              ><button type="button" id="folder-up">Up</button>
+            </div>
+            <div id="folder-list"></div>
+            <button id="folder-more" type="button" hidden>More folders</button>
+            <button id="folder-use" type="button">Use this folder</button>
+          </section>
+          <label for="route">Runtime and billing</label
+          ><select id="route" required></select
+          ><button class="primary">Continue</button>
+        </form>
+      </section>
+      <section id="conversation" hidden>
+        <nav class="conversation-nav" aria-label="Session navigation">
+          <button class="back">‹ Sessions</button>
+          <details class="action-menu">
+            <summary aria-label="More session actions">•••</summary>
+            <div>
+              <button type="button" id="operator-project">Project terminal</button>
+              <button type="button" id="operator-session" hidden>Open session in terminal</button>
+            </div>
+          </details>
+        </nav>
+        <div id="context"></div>
+        <h1 id="title"></h1>
+        <button id="older" class="quiet" hidden>Load earlier messages</button
+        ><button id="refresh-worker" class="quiet" hidden>
+          Refresh worker
+        </button>
+        <div id="session-controls" hidden>
+          <div class="session-toolbar">
+            <button
+              type="button"
+              id="access-mode"
+              aria-controls="session-settings"
+            ></button>
+            <button
+              type="button"
+              id="open-settings"
+              class="quiet"
+              aria-controls="session-settings"
+            >
+              Session settings
+            </button>
+          </div>
+          <section id="session-settings" hidden aria-label="Session settings">
+            <form id="permissions-form">
+              <label for="permission">Permission mode</label>
+              <select id="permission"></select
+              ><button id="apply-permission" type="submit">Apply mode</button>
+            </form>
+            <div id="model-fields"></div>
+            <form id="native-command-form" hidden>
+              <label for="native-command">Native command</label>
+              <select id="native-command"></select>
+              <input
+                id="command-args"
+                aria-label="Command arguments"
+                placeholder="Arguments (optional)"
+              />
+              <button type="submit">Run command</button>
+            </form>
+            <div id="thread-actions" class="actions"></div>
+            <div id="session-usage"></div>
+            <p id="control-status" role="status" hidden></p>
+          </section>
+        </div>
+        <details id="review-pane" hidden>
+          <summary>Changes &amp; plan</summary>
+          <div id="review-content"></div>
+        </details>
+        <div id="timeline" aria-label="Transcript"></div>
+        <div id="asks"></div>
+        <form id="composer">
+          <label class="sr" for="draft">Message</label
+          ><textarea
+            id="draft"
+            rows="1"
+            placeholder="Message…"
+            aria-label="Message"
+          ></textarea>
+          <div id="mention-choices"></div>
+          <div id="attached-images"></div>
+          <div class="actions">
+            <label id="attach-label" hidden
+              >Attach image<input
+                type="file"
+                id="attach-image"
+                accept="image/png,image/jpeg,image/gif,image/webp"
+                multiple
+            /></label>
+            <button type="button" id="stop" hidden>Stop</button
+            ><button class="primary" id="send">Send</button>
+          </div>
+        </form>
+      </section>
+      <dialog id="operator-panel" aria-labelledby="operator-title">
+        <div class="operator-heading">
+          <div>
+            <h2 id="operator-title">Host terminal</h2>
+            <p id="operator-state" role="status"></p>
+          </div>
+          <button id="operator-close" aria-label="Close terminal" autofocus>Close</button>
+        </div>
+        <div id="operator-review" hidden>
+          <p>Working directory</p><pre id="operator-directory"></pre>
+          <p>Command</p><pre id="operator-command"></pre>
+        </div>
+        <button id="operator-run" class="primary" hidden>Run</button>
+        <div id="operator-tools" hidden>
+          <pre id="operator-screen" aria-label="Terminal screen" tabindex="0"></pre>
+          <a id="operator-link" rel="noopener noreferrer" target="_blank" hidden
+            >Open native sign-in page</a
+          >
+          <div class="operator-controls">
+            <div class="operator-keys" role="group" aria-label="Terminal keys">
+              <button data-key="interrupt" aria-label="Interrupt, Control C">Ctrl+C</button>
+              <button data-key="eof" aria-label="End of input, Control D">Ctrl+D</button>
+              <button data-key="tab">Tab</button>
+              <button data-key="escape">Esc</button>
+              <button data-key="up" aria-label="Up arrow">↑</button>
+              <button data-key="down" aria-label="Down arrow">↓</button>
+            </div>
+            <label for="operator-input">Terminal input</label>
+            <div class="operator-entry">
+              <input
+                type="password" id="operator-input" enterkeyhint="send"
+                autocomplete="off" autocapitalize="none" autocorrect="off"
+                spellcheck="false" data-lpignore="true"
+              />
+              <button id="operator-visibility" type="button" aria-label="Show input">Show</button>
+              <button id="operator-send" class="primary">Send line</button>
+            </div>
+          </div>
+        </div>
+      </dialog>
+      <p id="message" role="alert" hidden></p>
+    </main>
+  </body>
+</html>

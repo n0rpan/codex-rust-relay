@@ -54,6 +54,10 @@ if [ "$1" = "debug" ] && [ "$2" = "models" ]; then
   printf '{"models":[]}'
   exit 0
 fi
+if [ "$3" = "auth" ] && [ "$4" = "status" ]; then
+  printf '%s\n' "$FAKE_CLAUDE_STATUS"
+  exit 0
+fi
 if [ "$3" = "login" ] && [ "$4" = "status" ]; then
   printf '%s\n' "$FAKE_CODEX_LOGIN_STATUS" >&2
   exit 0
@@ -276,6 +280,7 @@ fn native_sign_in_and_launch_use_stock_clients() {
                 ("OPENAI_API_BASE", "https://fixture-openai.invalid/v1"),
                 ("ANTHROPIC_BASE_URL", "https://fixture-anthropic.invalid"),
                 ("ANTHROPIC_AUTH_TOKEN", "fixture-gateway-value"),
+                ("ANTHROPIC_PROFILE", "fixture-console-account"),
                 ("CLAUDE_CODE_USE_BEDROCK", "1"),
             ],
             args,
@@ -305,15 +310,17 @@ fn native_sign_in_and_launch_use_stock_clients() {
             "-c\nmodel_provider=\"openai\"\nresume\n",
         ),
         (&["claude", "--native", "--continue"], "--continue\n"),
+        (&["claude", "--subscription"], "\n"),
     ];
     for &(args, forwarded) in cases {
         let output = run(args, "Logged in using ChatGPT");
         assert!(output.status.success(), "{:?}", output.stderr);
         assert_eq!(read(&capture.0.join("run-args")), forwarded);
         let env = read(&capture.0.join("run-env"));
-        if args == ["login", "claude"] {
+        if args == ["login", "claude"] || args == ["claude", "--subscription"] {
             assert!(!env.contains("ANTHROPIC_BASE_URL="));
             assert!(!env.contains("ANTHROPIC_AUTH_TOKEN="));
+            assert!(!env.contains("ANTHROPIC_PROFILE="));
             assert!(!env.contains("CLAUDE_CODE_USE_BEDROCK="));
         } else if args[0] == "codex" || args[1] == "chatgpt" {
             assert!(!env.contains("OPENAI_BASE_URL="));
@@ -576,4 +583,56 @@ fn errors_name_the_problem_and_the_command_that_fixes_it() {
         !text.contains('\x1b'),
         "piped errors have no colour: {text}"
     );
+}
+
+#[test]
+fn streamed_claude_subscription_checks_stock_and_owns_routing_settings() {
+    let home = TempDir::new("claude-home");
+    let capture = TempDir::new("capture");
+    let bin = TempDir::new("bin");
+    write_fake_client(&bin.0, "claude");
+    let run = |account: &str, args: &[&str]| {
+        run_launcher(
+            &home.0,
+            &capture.0,
+            &bin.0,
+            &[
+                ("FAKE_CLAUDE_STATUS", account),
+                ("ANTHROPIC_API_KEY", "unrelated-key"),
+                ("ANTHROPIC_PROFILE", "another-profile"),
+            ],
+            args,
+        )
+    };
+    let stream = [
+        "claude",
+        "--subscription",
+        "-p",
+        "--input-format",
+        "stream-json",
+    ];
+    for bad in [
+        r#"{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}"#,
+        r#"{"loggedIn":true,"authMethod":"api_key","apiProvider":"firstParty"}"#,
+        r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"bedrock"}"#,
+        r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","apiKeySource":"apiKeyHelper"}"#,
+    ] {
+        assert!(!run(bad, &stream).status.success());
+        assert!(!capture.0.join("run-args").exists());
+    }
+    let good = r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}"#;
+    assert!(run(good, &["login", "claude", "status"]).status.success());
+    assert!(!capture.0.join("run-args").exists());
+    let launched = run(good, &stream);
+    assert!(launched.status.success(), "{:?}", launched.stderr);
+    let args = read(&capture.0.join("run-args"));
+    let mut parts = args.lines();
+    assert_eq!(parts.next(), Some("--settings"));
+    let overlay: serde_json::Value = serde_json::from_str(parts.next().unwrap()).unwrap();
+    assert_eq!(overlay["apiKeyHelper"], "");
+    assert_eq!(overlay["env"]["ANTHROPIC_API_KEY"], "");
+    assert_eq!(overlay["env"]["ANTHROPIC_BASE_URL"], "");
+    assert_eq!(parts.collect::<Vec<_>>(), &stream[2..]);
+    let env = read(&capture.0.join("run-env"));
+    assert!(!env.contains("unrelated-key") && !env.contains("another-profile"));
 }

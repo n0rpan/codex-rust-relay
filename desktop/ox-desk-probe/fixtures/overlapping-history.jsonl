@@ -1,0 +1,17 @@
+{"expect":{"method":"initialize"},"capture":"init"}
+{"send":{"result":{}},"replyTo":"init"}
+{"expect":{"method":"initialized"}}
+{"expect":{"method":"thread/list"},"capture":"list"}
+{"send":{"result":{"data":[{"id":"a","cwd":"/synthetic","modelProvider":"codeox","model":"fixture/demo","preview":"first","updatedAt":10},{"id":"b","cwd":"/synthetic","modelProvider":"codeox","model":"fixture/demo","preview":"second","updatedAt":8},{"id":"stale","cwd":"/synthetic","modelProvider":"codeox","model":"fixture/demo","preview":"stale","updatedAt":7}]}},"replyTo":"list"}
+{"expect":{"method":"thread/read","params":{"threadId":"a","includeTurns":false}},"capture":"a-read"}
+{"expect":{"method":"thread/read","params":{"threadId":"b","includeTurns":false}},"capture":"b-read"}
+{"send":{"result":{"thread":{"id":"b","cwd":"/synthetic","modelProvider":"codeox","model":"fixture/demo"}}},"replyTo":"b-read"}
+{"expect":{"method":"thread/resume","params":{"threadId":"b","cwd":"/synthetic","excludeTurns":true,"initialTurnsPage":{"limit":12,"sortDirection":"desc","itemsView":"full"}}},"capture":"b-open"}
+{"send":{"result":{"thread":{"id":"b","cwd":"/synthetic","modelProvider":"codeox","model":"fixture/demo"},"modelProvider":"codeox","model":"fixture/demo","initialTurnsPage":{"data":[{"id":"bt","status":"completed","items":[{"id":"msg","type":"agentMessage","text":"B"}]}]}}},"replyTo":"b-open"}
+{"send":{"result":{"thread":{"id":"a","cwd":"/synthetic","modelProvider":"codeox"}}},"replyTo":"a-read"}
+{"expect":{"method":"thread/resume"},"capture":"a-open"}
+{"send":{"result":{"thread":{"id":"a","cwd":"/synthetic","modelProvider":"codeox"},"modelProvider":"codeox","model":"fixture/demo","initialTurnsPage":{"data":[{"id":"latest","status":"completed","items":[{"id":"tool1","type":"commandExecution","command":"pwd","status":"completed"},{"id":"tool2","type":"commandExecution","command":"ls","status":"completed"},{"id":"msg","type":"agentMessage","text":"A new"}]},{"id":"prev","status":"completed","items":[{"id":"msg","type":"agentMessage","text":"A previous"}]}],"nextCursor":"older"}}},"replyTo":"a-open"}
+{"expect":{"method":"thread/turns/list","params":{"threadId":"a","sortDirection":"desc","limit":12,"itemsView":"full","cursor":"older"}},"capture":"older"}
+{"send":{"result":{"data":[{"id":"prev","status":"completed","items":[{"id":"msg","type":"agentMessage","text":"A previous"}]},{"id":"early","status":"completed","items":[{"id":"msg","type":"agentMessage","text":"A oldest"}]}]}},"replyTo":"older"}
+{"expect":{"method":"thread/read","params":{"threadId":"stale","includeTurns":false}},"capture":"stale"}
+{"send":{"result":{"thread":{"id":"stale","cwd":"/different","modelProvider":"codeox"}}},"replyTo":"stale"}

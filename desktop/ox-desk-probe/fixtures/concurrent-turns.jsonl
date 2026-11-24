@@ -1,0 +1,23 @@
+{"expect":{"method":"initialize"},"capture":"i"}
+{"send":{"result":{}},"replyTo":"i"}
+{"expect":{"method":"initialized"}}
+{"expect":{"method":"thread/list"},"capture":"l"}
+{"send":{"result":{"data":[]}},"replyTo":"l"}
+{"expect":{"method":"thread/start"},"capture":"a"}
+{"send":{"result":{"thread":{"id":"a","cwd":"/synthetic","modelProvider":"codeox"},"model":"fixture/demo","modelProvider":"codeox"}},"replyTo":"a"}
+{"expect":{"method":"turn/start","params":{"threadId":"a","input":[{"type":"text","text":"one"}]}},"capture":"at"}
+{"send":{"method":"turn/started","params":{"threadId":"a","turn":{"id":"t1","status":"inProgress"}}}}
+{"send":{"result":{"turn":{"id":"t1","status":"inProgress"}}},"replyTo":"at"}
+{"expect":{"method":"thread/start"},"capture":"b"}
+{"expect":{"method":"turn/steer","params":{"threadId":"a","expectedTurnId":"t1","input":[{"type":"text","text":"follow one"}]}},"capture":"steer"}
+{"send":{"result":{"thread":{"id":"b","cwd":"/synthetic","modelProvider":"codeox"},"model":"fixture/demo","modelProvider":"codeox"}},"replyTo":"b"}
+{"expect":{"method":"turn/start","params":{"threadId":"b","input":[{"type":"text","text":"two"}]}},"capture":"bt"}
+{"send":{"method":"turn/started","params":{"threadId":"b","turn":{"id":"t2","status":"inProgress"}}}}
+{"send":{"method":"turn/completed","params":{"threadId":"b","turn":{"id":"t2","status":"completed"}}}}
+{"send":{"result":{"turn":{"id":"t2","status":"inProgress"}}},"replyTo":"bt"}
+{"send":{"error":{"code":-1,"message":"turn no longer accepts input"}},"replyTo":"steer"}
+{"expect":{"method":"turn/interrupt","params":{"threadId":"a","turnId":"t1"}},"capture":"stop"}
+{"send":{"result":{}},"replyTo":"stop"}
+{"send":{"method":"turn/completed","params":{"threadId":"a","turn":{"id":"t1","status":"interrupted"}}}}
+{"expect":{"method":"thread/start"},"capture":"bad"}
+{"send":{"result":{"thread":{"id":"x","cwd":"/synthetic","modelProvider":"codeox"},"model":"wrong/model","modelProvider":"codeox"}},"replyTo":"bad"}

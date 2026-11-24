@@ -1,0 +1,13 @@
+{"expect":{"method":"initialize"},"capture":"setup"}
+{"send":{"result":{"userAgent":"fixture"}},"replyTo":"setup"}
+{"expect":{"method":"initialized"}}
+{"expect":{"method":"thread/list"},"capture":"catalog"}
+{"send":{"id":"ask","method":"item/commandExecution/requestApproval","params":{"threadId":"background","turnId":"turn","availableDecisions":["decline","cancel"],"command":"pwd"}}}
+{"expect":{"id":"ask","result":{"decision":"decline"}}}
+{"send":{"result":{"data":[{"id":"mine","cwd":"/synthetic","model":"fixture/demo","modelProvider":"codeox","name":"This project","preview":"","updatedAt":3},{"id":"wrong-project","cwd":"/neighbor","modelProvider":"codeox","preview":"","updatedAt":2},{"id":"wrong-model","cwd":"/synthetic","modelProvider":"codeox","model":"other","preview":"","updatedAt":1}],"nextCursor":"next"}},"replyTo":"catalog"}
+{"expect":{"method":"thread/list","params":{"cwd":"/synthetic","modelProviders":[],"sortKey":"updated_at","sourceKinds":["cli","vscode","exec","appServer","subAgent","subAgentThreadSpawn","subAgentReview","subAgentCompact","subAgentOther"],"limit":50,"cursor":"next"}},"capture":"page"}
+{"send":{"result":{"data":[],"nextCursor":null}},"replyTo":"page"}
+{"send":{"method":"thread/status/changed","params":{"threadId":"mine","status":{"type":"active","activeFlags":["waitingOnUserInput"]}}}}
+{"send":{"method":"turn/completed","params":{"threadId":"mine","turn":{"id":"unopened","status":"failed","error":{"message":"fixture failure"}}}}}
+{"send":{"method":"thread/archived","params":{"threadId":"mine"}}}
+{"send":{"method":"thread/name/updated","params":{"threadId":"wrong-model","threadName":"Moved row"}}}

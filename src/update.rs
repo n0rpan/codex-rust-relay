@@ -21,7 +21,7 @@ const CURRENT: &str = crate::VERSION;
 const DEV_TAG: &str = "dev";
 const MAX_RELEASE_BYTES: usize = 512 * 1024;
 const MAX_BINARY_BYTES: u64 = 64 * 1024 * 1024;
-const USAGE: &str = "Usage: ox update [--check] [--dev|--stable]";
+const USAGE: &str = "Usage: ox update [--check [--json]] [--dev|--stable]";
 
 /// A release version: `X.Y.Z` or the development form `X.Y.Z-dev.N`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +110,7 @@ enum Command {
     Help,
     Update {
         check_only: bool,
+        json: bool,
         channel: Option<Channel>,
     },
 }
@@ -154,30 +155,37 @@ impl Installation {
 
 fn parse_args(args: &[OsString]) -> Result<Command, RelayError> {
     let mut check_only = false;
+    let mut json = false;
     let mut channel = None;
     for arg in args {
         match arg.to_str() {
             Some("-h" | "--help") => return Ok(Command::Help),
+            Some("--json") if !json => json = true,
             Some("--check") if !check_only => check_only = true,
             Some("--dev") if channel.is_none() => channel = Some(Channel::Dev),
             Some("--stable") if channel.is_none() => channel = Some(Channel::Stable),
             _ => return Err(USAGE.into()),
         }
     }
+    if json && !check_only {
+        return Err(USAGE.into());
+    }
     Ok(Command::Update {
         check_only,
+        json,
         channel,
     })
 }
 
 pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
-    let (check_only, requested) = match parse_args(args)? {
+    let (check_only, json, requested) = match parse_args(args)? {
         Command::Help => {
             println!("{USAGE}");
             println!("Install the newest ox release over the running executable.");
             println!("A stable build follows stable releases. A dev build follows the dev");
             println!("pre-release that is rebuilt from every commit on main.");
             println!("  --check    Look for a newer release without installing it");
+            println!("  --json     Report installed and available versions with --check");
             println!("  --dev      Switch to the dev pre-release");
             println!("  --stable   Switch back to the latest stable release");
             return Ok(0);
@@ -185,7 +193,8 @@ pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
         Command::Update {
             check_only,
             channel,
-        } => (check_only, channel),
+            json,
+        } => (check_only, json, channel),
     };
 
     let target = target_triple(std::env::consts::OS, std::env::consts::ARCH)
@@ -213,8 +222,15 @@ pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
         }))
         .build()?;
     let metadata_url = channel.metadata_url();
-    let Some(update) = latest(&client, &metadata_url, channel, switching, CURRENT, target).await?
-    else {
+    let update = latest(&client, &metadata_url, channel, switching, CURRENT, target).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"installed": CURRENT, "available": update.as_ref().map(|u| &u.version)})
+        );
+        return Ok(0);
+    }
+    let Some(update) = update else {
         match channel {
             Channel::Stable => println!("ox {CURRENT} is up to date."),
             Channel::Dev => println!("ox {CURRENT} is up to date on the dev channel."),
@@ -664,6 +680,7 @@ mod tests {
     fn parses_update_arguments_and_builds_channel_urls() {
         let update = |check_only, channel| Command::Update {
             check_only,
+            json: false,
             channel,
         };
         assert_eq!(parse_args(&[]).unwrap(), update(false, None));
@@ -683,6 +700,14 @@ mod tests {
             parse_args(&arguments(&["--check", "--dev"])).unwrap(),
             update(true, Some(Channel::Dev))
         );
+        assert_eq!(
+            parse_args(&arguments(&["--json", "--check"])).unwrap(),
+            Command::Update {
+                check_only: true,
+                json: true,
+                channel: None
+            }
+        );
         for help in [&["-h"][..], &["--help"], &["--dev", "--help"]] {
             assert_eq!(parse_args(&arguments(help)).unwrap(), Command::Help);
         }
@@ -691,6 +716,8 @@ mod tests {
             &["--dev", "--dev"],
             &["--check", "--check"],
             &["--beta"],
+            &["--json"],
+            &["--json", "--json", "--check"],
             &["dev"],
         ] {
             assert_eq!(

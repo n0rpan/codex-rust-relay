@@ -1,0 +1,59 @@
+//! The OX helper owns provider storage, configuration locks and credentials.
+use crate::settings_protocol::{Request, VERSION, model::Snapshot};
+use serde::de::DeserializeOwned;
+use std::{
+    ffi::OsStr,
+    io::Write,
+    path::Path,
+    process::{Command, Stdio},
+};
+
+pub fn request<T: DeserializeOwned>(
+    ox: &Path,
+    path: &OsStr,
+    request: Request,
+) -> Result<T, String> {
+    request_ref(ox, path, &request)
+}
+pub fn request_ref<T: DeserializeOwned>(
+    ox: &Path,
+    path: &OsStr,
+    request: &Request,
+) -> Result<T, String> {
+    let mut child = process(ox, path)
+        .arg("--ox-desktop-settings-v1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Could not open the OX settings service: {e}"))?;
+    let mut input = child.stdin.take().expect("stdin is piped");
+    let write = serde_json::to_writer(&mut input, &request)
+        .and_then(|_| input.flush().map_err(serde_json::Error::io));
+    drop(input);
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    write.map_err(|e| e.to_string())?;
+    serde_json::from_slice(&output.stdout)
+        .map_err(|_| "The OX executable returned an incompatible settings response.".into())
+}
+
+pub fn snapshot(ox: &Path, path: &OsStr) -> Result<Snapshot, String> {
+    let settings: Snapshot = request(ox, path, Request::ReadRows)?;
+    if settings.version != VERSION {
+        return Err(format!(
+            "The OX helper speaks settings protocol {}. This desktop requires version {VERSION}.",
+            settings.version
+        ));
+    }
+    Ok(settings)
+}
+
+/// Both the settings port and native runtime jobs use the same companion and child PATH.
+pub(crate) fn process(ox: &Path, path: &OsStr) -> Command {
+    let mut cmd = Command::new(ox);
+    cmd.env("PATH", path);
+    cmd
+}

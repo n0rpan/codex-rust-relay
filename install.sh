@@ -7,6 +7,7 @@
 # Options (flags win over environment variables):
 #   --stable                 Install the latest stable release (default)
 #   --dev                    Install the rolling development pre-release
+#   --desktop                Include OX Desktop and its matching CLI
 #   OX_CHANNEL=dev|stable    Same as the flags
 #   OX_INSTALL_DIR=DIR       Install directory (default: $HOME/.local/bin)
 #   OX_INSTALL_BASE_URL=URL  Download ox-<target>.tar.gz from URL instead of GitHub
@@ -27,6 +28,7 @@ green=""
 yellow=""
 reset=""
 work=""
+desktop_stage=""
 
 setup_colours() {
     if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
@@ -57,6 +59,7 @@ die() {
 }
 
 cleanup() {
+    if [ -n "$desktop_stage" ]; then rm -rf "$desktop_stage"; fi
     if [ -n "$work" ]; then
         rm -rf "$work"
     fi
@@ -66,8 +69,9 @@ usage() {
     cat <<'EOF'
 Install ox on macOS or Linux.
 
-Usage: install.sh [--stable|--dev]
+Usage: install.sh [--stable|--dev] [--desktop]
 
+  --desktop  Include the native desktop application, session host and matching CLI
   --stable   Install the latest stable release (default)
   --dev      Install the rolling development pre-release
 
@@ -232,11 +236,95 @@ path_hint() {
     esac
 }
 
+# Keep the GUI, session host and gateway together in one immutable installation.
+prepare_desktop() {
+    packages="$install_dir/.ox-desktop"
+    mkdir -p "$packages"
+    case "$os" in
+        Darwin) binary_subdir="OX Desktop.app/Contents/MacOS" ;;
+        *) binary_subdir=ox-desktop ;;
+    esac
+    for existing in "$packages/$actual".*; do
+        if [ -f "$existing/.ready" ] && [ -x "$existing/$binary_subdir/ox-desktop" ]; then
+            desktop_binary_dir="$existing/$binary_subdir"
+            return
+        fi
+    done
+    desktop_stage="$(mktemp -d "$packages/$actual.XXXXXX")"
+    if [ "$os" = Darwin ]; then
+        ditto -x -k "$work/$asset" "$desktop_stage"
+        codesign --verify --strict --deep "$desktop_stage/OX Desktop.app"
+    else
+        tar -xzf "$work/$asset" -C "$desktop_stage"
+    fi
+    desktop_binary_dir="$desktop_stage/$binary_subdir"
+    helper_version="$("$desktop_binary_dir/ox" --version)" || die "the packaged ox could not start."
+    desktop_version="$("$desktop_binary_dir/ox-desktop" --version)" || die "the packaged OX Desktop could not start."
+    [ "${desktop_version#ox-desktop }" = "${helper_version#ox }" ] || die "the packaged desktop and CLI versions differ."
+    if [ -x "$desktop_binary_dir/ox-host" ]; then
+        [ "$("$desktop_binary_dir/ox-host" --version)" = "ox-host ${helper_version#ox }" ] || die "the packaged host and CLI versions differ."
+    fi
+    touch "$desktop_stage/.ready"
+    desktop_stage=""
+}
+
+replace_link() {
+    # Rename over the link itself, including Finder's link to a directory.
+    if [ -d "$2" ] && [ ! -L "$2" ]; then
+        die "Cannot replace the existing directory at $2."
+    fi
+    ln -s "$1" "$2.ox-link.$$"
+    if [ "$os" = Darwin ]; then mv -fh "$2.ox-link.$$" "$2"; else mv -fT "$2.ox-link.$$" "$2"; fi
+}
+
+install_desktop_entry() {
+    replace_link "$desktop_binary_dir/ox-desktop" "$install_dir/ox-desktop"
+    if [ -x "$desktop_binary_dir/ox-host" ]; then replace_link "$desktop_binary_dir/ox-host" "$install_dir/ox-host"; fi
+    if [ "$os" = Darwin ]; then
+        bundle="${desktop_binary_dir%/Contents/MacOS}"
+        mkdir -p "$HOME/Applications"
+        if [ -d "$HOME/Applications/OX Desktop.app" ] && [ ! -L "$HOME/Applications/OX Desktop.app" ]; then
+            info "Kept the existing Finder bundle. The new bundle is at $bundle."
+        else
+            replace_link "$bundle" "$HOME/Applications/OX Desktop.app"
+        fi
+    else
+        data="${XDG_DATA_HOME:-$HOME/.local/share}"
+        icon_dir="$data/icons/hicolor/1024x1024/apps"
+        mkdir -p "$data/applications" "$icon_dir"
+        replace_link "$desktop_binary_dir/ox-desktop.png" "$icon_dir/dev.ox.desktop.png"
+        # Desktop-entry quoting has two layers. Escape field codes and special
+        # characters so graphical launches also work with custom install paths.
+        OX_GUI_EXEC="$install_dir/ox-desktop" awk '
+            /^Exec=/ {
+                path = ENVIRON["OX_GUI_EXEC"]
+                printf "Exec=\""
+                for (i=1; i<=length(path); ++i) {
+                    ch=substr(path,i,1)
+                    if (ch=="%") printf "%%%%"
+                    else if (ch=="\\") { for (j=0; j<4; ++j) printf "%c", 92 }
+                    else {
+                        if (ch=="\"" || ch=="$" || ch=="`") printf "\\\\"
+                        printf "%s", ch
+                    }
+                }
+                print "\""
+                next
+            }
+            { print }
+        ' "$desktop_binary_dir/dev.ox.desktop.desktop" > "$data/applications/dev.ox.desktop.desktop.tmp.$$"
+        mv -f "$data/applications/dev.ox.desktop.desktop.tmp.$$" "$data/applications/dev.ox.desktop.desktop"
+    fi
+    info "Installed OX Desktop at $install_dir/ox-desktop"
+}
+
 main() {
     setup_colours
+    desktop=0
     channel="${OX_CHANNEL:-}"
     for argument in "$@"; do
         case "$argument" in
+            --desktop) desktop=1 ;;
             --dev) channel="dev" ;;
             --stable) channel="stable" ;;
             -h | --help)
@@ -267,6 +355,14 @@ main() {
     check_glibc
     pick_tools
     asset="ox-${target}.tar.gz"
+    if [ "$desktop" = 1 ]; then
+        case "$target" in
+            x86_64-*-linux-gnu) asset=ox-desktop-linux-x86_64.tar.gz ;;
+            aarch64-*-linux-gnu) asset=ox-desktop-linux-aarch64.tar.gz ;;
+            x86_64-apple-darwin) asset=ox-desktop-macos-x86_64.zip ;;
+            aarch64-apple-darwin) asset=ox-desktop-macos-arm64.zip ;;
+        esac
+    fi
 
     work="$(mktemp -d "${TMPDIR:-/tmp}/ox-install.XXXXXX")" || die "could not create a temporary directory."
     trap cleanup EXIT
@@ -317,10 +413,16 @@ main() {
         die "checksum mismatch for ${asset} (expected ${expected}, got ${actual}). Nothing was installed."
     fi
 
-    mkdir "$work/unpacked"
-    tar -xzf "$work/${asset}" -C "$work/unpacked" || die "could not unpack ${asset}."
-    [ -f "$work/unpacked/ox" ] || die "${asset} does not contain the ox binary."
-    chmod 755 "$work/unpacked/ox"
+    if [ "$desktop" = 1 ]; then
+        prepare_desktop
+        source_binary="$desktop_binary_dir/ox"
+    else
+        mkdir "$work/unpacked"
+        tar -xzf "$work/${asset}" -C "$work/unpacked" || die "could not unpack ${asset}."
+        source_binary="$work/unpacked/ox"
+        [ -f "$source_binary" ] || die "${asset} does not contain the ox binary."
+        chmod 755 "$source_binary"
+    fi
 
     step "Installing to ${install_dir}/ox"
     mkdir -p "$install_dir" || die "could not create ${install_dir}."
@@ -330,7 +432,7 @@ main() {
     # Stage inside the destination directory so the final rename is atomic and
     # a running ox keeps its old file until it exits.
     staged="${install_dir}/.ox-install.$$"
-    cp "$work/unpacked/ox" "$staged" || die "could not write to ${install_dir}. Set OX_INSTALL_DIR to a directory you own."
+    cp "$source_binary" "$staged" || die "could not write to ${install_dir}. Set OX_INSTALL_DIR to a directory you own."
     chmod 755 "$staged"
     if ! mv -f "$staged" "${install_dir}/ox"; then
         rm -f "$staged"
@@ -350,14 +452,19 @@ main() {
 
     info ""
     info "${green}Installed ${installed}${reset} ${dim}(${install_dir}/ox)${reset}"
+    if [ "$desktop" = 1 ]; then install_desktop_entry; fi
     path_hint
     info ""
     info "Next step:"
     info ""
-    info "  ${bold}ox setup${reset}"
+    if [ "$desktop" = 1 ]; then info "  ${bold}ox desktop .${reset}"; else info "  ${bold}ox setup${reset}"; fi
     info ""
     if [ "$channel" = "dev" ] && [ -z "${OX_INSTALL_BASE_URL:-}" ]; then
-        info "${dim}This is a development build. ox update keeps it on the dev channel.${reset}"
+        if [ "$desktop" = 1 ]; then
+            info "${dim}To update the app, host and CLI together, rerun the installer with --dev --desktop.${reset}"
+        else
+            info "${dim}This is a development build. ox update keeps it on the dev channel.${reset}"
+        fi
     fi
 }
 

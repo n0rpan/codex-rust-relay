@@ -9,6 +9,8 @@ Get started
   ox                 First run: guided setup, then your client opens
   ox codex           Open Codex and pick a model
   ox claude          Open Claude Code and pick a model
+  ox desktop [dir]   Open the project in OX Desktop
+  ox host <action>   Install, inspect or uninstall the per-user session host
 
 If something is off
   ox doctor          Check everything. The last line is the next command to run
@@ -30,6 +32,9 @@ API sessions use a separate ox client profile, so your own Codex and Claude Code
 settings and history stay untouched.";
 
 const DESKTOP: &str = "\
+OX Desktop
+  ox desktop [dir] opens the native workbench. Use --desktop with the OX installer.
+
 Connect a desktop app to ox
 
 1. On the machine that will host ox, run ox setup and ox doctor.
@@ -147,7 +152,7 @@ ChatGPT API credits exclude Codex usage authenticated with an API key.
 See https://developers.openai.com/api/docs/guides/chatgpt-api-credits.
 
 Claude subscription in Claude Code
-  ox login claude                     Open Claude Code's native sign-in
+  ox login claude [status]            Open Claude Code's native sign-in or check its account
   ox claude --native [args...]         Start Claude Code with its own settings
 
 Subscription sessions use your usual client profile. The installed clients manage

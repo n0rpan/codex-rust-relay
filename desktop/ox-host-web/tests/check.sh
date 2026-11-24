@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Linux mobile acceptance uses Chromium and its matching chromedriver; the Rust tests run on macOS too.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/../../.." && pwd)
+cd "$root"
+cargo test --profile "${OX_TEST_CARGO_PROFILE:-dev}" --manifest-path desktop/Cargo.toml --locked -p ox-host-web --features server --lib
+npx --yes --package typescript@5.9.3 tsc --noEmit --allowJs --checkJs --target es2023 \
+    --module esnext --moduleResolution bundler desktop/ox-host-web/assets/{wire,model}.js
+harness=$(cargo test --profile "${OX_TEST_CARGO_PROFILE:-dev}" --manifest-path desktop/Cargo.toml --locked -p ox-host-web --features server --lib \
+    --no-run --message-format=json | jq -r 'select(.profile.test and .target.name=="ox_host_web" and .executable!=null) | .executable')
+profile=${OX_TEST_CARGO_PROFILE:-dev}
+if [[ "$profile" == dev ]]; then profile=debug; fi
+export OX_TEST_SETTINGS_OX="${OX_TEST_OX_BIN:-$root/desktop/target/$profile/ox}"
+if [[ ! -x "$OX_TEST_SETTINGS_OX" ]]; then
+    cargo build --locked --manifest-path Cargo.toml --bin ox --profile "${OX_TEST_CARGO_PROFILE:-dev}"
+    export OX_TEST_SETTINGS_OX="$root/target/$profile/ox"
+fi
+python3 desktop/ox-host-web/tests/browser.py "$harness"

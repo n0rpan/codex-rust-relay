@@ -1,0 +1,965 @@
+"""Exercise pairing, actions, reconnect and revocation in an isolated Chromium phone viewport.
+
+Pass the Rust unit test executable produced by cargo test -p ox-host-web --features server --no-run.
+The TLS forwarder mimics Serve's identity injection. Uses no real Tailscale account or profile.
+"""
+
+import argparse
+from contextlib import ExitStack
+import http.client
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import socketserver
+import ssl
+import subprocess
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+
+
+def wait(fn, seconds=12):
+    until = time.monotonic() + seconds
+    error = None
+    while time.monotonic() < until:
+        try:
+            result = fn()
+            if result:
+                return result
+        except (OSError, ValueError, KeyError) as exc:
+            error = exc
+        time.sleep(0.06)
+    raise AssertionError(f"Timed out ({type(error).__name__})")
+
+
+def admin(directory, action):
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(4)
+        client.connect(str(directory / "remote-admin.sock"))
+        client.sendall(json.dumps(action).encode() + b"\n")
+        reply = json.loads(client.makefile("rb").readline())
+        assert "Ok" in reply, reply.get("Err")
+        return reply["Ok"]
+
+
+class ThreadedTCP(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+
+
+class Forward(socketserver.StreamRequestHandler):
+    """TLS-to-loopback proxy, accepting no client-supplied identity."""
+
+    def handle(self):
+        headers = []
+        first = self.rfile.readline(8192)
+        if not first:
+            return
+        length = 0
+        upgrade = False
+        while line := self.rfile.readline(8192):
+            if line == b"\r\n":
+                break
+            name, value = line.decode("latin1").split(":", 1)
+            if name.lower() == "content-length":
+                length = int(value)
+            if name.lower() == "upgrade":
+                upgrade = True
+            if name.lower() in ("connection", "tailscale-user-login"):
+                continue
+            headers.append(line)
+        with socket.create_connection(
+            ("127.0.0.1", self.server.backend), timeout=10
+        ) as upstream:
+            connection = "upgrade" if upgrade else "close"
+            upstream.sendall(
+                first
+                + b"".join(headers)
+                + f"Connection: {connection}\r\nTailscale-User-Login: phone@example.test\r\n\r\n".encode()
+                + self.rfile.read(length)
+            )
+            upstream.settimeout(None)
+            if upgrade:
+
+                def back():
+                    try:
+                        while data := self.request.recv(65536):
+                            upstream.sendall(data)
+                    except OSError:
+                        pass
+                    finally:
+                        try:
+                            upstream.shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+
+                threading.Thread(target=back, daemon=True).start()
+            try:
+                while data := upstream.recv(65536):
+                    self.request.sendall(data)
+            except OSError:
+                pass
+
+
+def build_report_items():
+    def message(turn, key, role, text, detail=None):
+        return {"turn": turn, "id": key, "role": role, "text": text, "revision": 1, "detail": detail or {}}
+
+    def command(turn, key, name):
+        directory = f"/workspace/sample/{name}/target"
+        argv = f"/usr/bin/bash -c 'du -sh {directory}/debug/deps {directory}/release/deps {directory}/debug/incremental'"
+        output = f"{name} build artifacts\n" + "\n".join(f"{i} MiB  {directory}/debug/build/package-{i}" for i in range(80))
+        item = {"command": argv, "status": "completed", "aggregated_output": output, "exit_code": 0, "cwd": "/workspace/sample"}
+        return message(turn, key, "tool", argv + "\n" + output,
+                       {"item": {"CommandExecution": item}, "output": output, "status": "completed", "exit": 0})
+
+    return [
+        message("disk", "prompt", "user", "Which Rust build folders use the most disk space?"),
+        command("disk", "a", "orchard"), command("disk", "b", "garden"), command("disk", "c", "meadow"),
+        message("disk", "answer", "assistant",
+                "## Disk usage\n\n**Build artifacts** in `target/debug` account for most of the used space.\n\n"
+                "| Folder | Size |\n| --- | ---: |\n| Dependencies | 12 GiB |\n| Incremental | 4 GiB |"),
+        message("follow", "prompt", "user", "What about the other workspaces?"),
+        command("follow", "a", "coast"), command("follow", "b", "river"),
+        message("follow", "answer", "assistant", "Both workspaces fit on the current volume."),
+    ]
+
+
+class Host(socketserver.StreamRequestHandler):
+    def handle(self):
+        def send(value):
+            self.wfile.write(json.dumps(value).encode() + b"\n")
+
+        f = self.server
+        sequence = 20
+        try:
+            for data in self.rfile:
+                frame = json.loads(data)
+                if frame["type"] == "hello":
+                    send(
+                        {
+                            "type": "hello",
+                            "version": 1,
+                            "routes": [f.scope["route"]],
+                            "projects": [f.scope["project"]],
+                            "capabilities": ["snapshot", "resume", "actions"],
+                        }
+                    )
+                elif frame["type"] == "discover":
+                    send(
+                        {
+                            "type": "discovered",
+                            "scope": f.scope,
+                            "rows": f.sessions,
+                            "id": frame["id"],
+                        }
+                    )
+                    send({"type": "discovered_end", "id": frame["id"], "errors": []})
+                elif frame["type"] == "subscribe":
+                    f.connections.append(self.request)
+                    f.resumes.append(frame.get("after"))
+                    item = {
+                        "role": "assistant",
+                        "text": "Connected phone",
+                        "turn": "t",
+                        "id": "m",
+                        "revision": 1,
+                        "detail": {},
+                    }
+                    ask = {
+                        "id": "a",
+                        "thread": "parent",
+                        "title": "Approve test tool",
+                        "detail": "Fixture action",
+                        "choices": ["Allow", "Deny"],
+                        "questions": [],
+                        "token": "fixture-ask-token",
+                    }
+                    state = {
+                        "scope": f.scope,
+                        "connection": "ready",
+                        "capabilities": f.caps,
+                        "sessions": f.sessions,
+                        "asks": [] if f.answered else [ask],
+                        "transcripts": {"parent": {"items": [item], "detail": {}},
+                                        "disk-report": {"items": f.report_items, "detail": {}}},
+                        "detail": f.detail,
+                    }
+                    scopes=[state]
+                    if frame.get("scope") is None:
+                        for ident,runtime,billing in [
+                            ("codex-source","codex","subscription"),
+                            ("api-source","claude",{"api":"fixture/demo"}),
+                            ("codex-api-source","codex",{"api":"fixture/demo"})]:
+                            scope=dict(f.scope,route={"runtime":runtime,"billing":billing})
+                            idle=dict(f.sessions[0],id=ident,title=ident,status="idle",capabilities=["open"],updated_at=0)
+                            active=dict(idle,id=ident+"-running",status="running",capabilities=["open","stop"])
+                            scopes.append(dict(state,scope=scope,sessions=[idle,active],asks=[],transcripts={}))
+                    send(
+                        {
+                            "type": "snapshot",
+                            "cursor": {"epoch": "fixture", "seq": 10},
+                            "scopes": scopes,
+                        }
+                    )
+                    change = {
+                        "kind": "append",
+                        "thread": "parent",
+                        "turn": "t",
+                        "id": "m",
+                        "text": " · streamed",
+                        "revision": 2,
+                    }
+                    for _ in range(2):
+                        send(
+                            {
+                                "type": "delta",
+                                "scope": f.scope,
+                                "cursor": {"epoch": "fixture", "seq": 11},
+                                "changes": [change],
+                            }
+                        )
+                elif frame["type"] == "act":
+                    assert frame["scope"] == f.scope
+                    if "answer_ask" in frame["action"]:
+                        assert (
+                            frame["approval"] == "fixture-ask-token" and not f.answered
+                        )
+                        f.answered = True
+                        send(
+                            {
+                                "type": "delta",
+                                "scope": f.scope,
+                                "cursor": {"epoch": "fixture", "seq": 12},
+                                "changes": [{"kind": "asks", "asks": []}],
+                            }
+                        )
+                    action = frame["action"]
+                    changes = []
+                    if "set_access" in action or "set_next_access" in action:
+                        owner, mode = action.get("set_access", [None, action.get("set_next_access")])
+                        if mode == "plan":
+                            send({"type": "error", "id": frame["id"], "message": "Mode disabled by native policy."})
+                            continue
+                        f.mode_requested.set()
+                        assert f.confirm_mode.wait(10)
+                        if owner:
+                            target = next(r for r in f.sessions if r["id"] == owner)
+                            target["detail"]["access"] = mode
+                            changes.append({"kind":"session", "session":target})
+                        else:
+                            f.detail["applied_draft_access"] = mode
+                            changes.append({"kind":"state", "capabilities":f.caps, "detail":f.detail, "connection":"ready"})
+                    elif "mention" in action:
+                        owner, query = action["mention"]
+                        f.detail["mention"] = {"owner":owner, "query":query, "version":1,"paths":["src/mobile.rs"]}
+                        changes.append({"kind":"state","connection":"ready","capabilities":f.caps,"detail":f.detail})
+                    elif "model_options" in action:
+                        owner, choice = action["model_options"]
+                        target = next(r for r in f.sessions if r["id"] == owner)
+                        target["detail"]["options"].update(choice)
+                        changes.append({"kind":"session", "session":target})
+                    elif "native_command" in action:
+                        assert action["native_command"] == ["parent", "/status"]
+                        f.detail["notice"] = "Native status received"
+                        changes.append({"kind":"state","connection":"ready","capabilities":f.caps,"detail":f.detail})
+                    if changes:
+                        sequence += 1
+                        send({"type":"delta", "scope":f.scope, "cursor":{"epoch":"fixture","seq":sequence}, "changes":changes})
+                    if "send_text" in action and action["send_text"][0] is None:
+                        f.sessions.append(
+                            dict(
+                                f.sessions[0],
+                                id="new",
+                                title="Newly created phone session",
+                                parent=None,
+                            )
+                        )
+                        send(
+                            {
+                                "type": "opened",
+                                "id": frame["id"],
+                                "scope": f.scope,
+                                "thread": "new",
+                            }
+                        )
+                    if "answer_ask" in action:
+                        q = {
+                            "id": "q",
+                            "thread": "parent",
+                            "token": "question-token",
+                            "title": "Choose a database",
+                            "detail": "",
+                            "choices": [],
+                            "questions": [
+                                {
+                                    "id": "db",
+                                    "header": "Backend",
+                                    "question": "Which database?",
+                                    "isSecret": False,
+                                    "isOther": False,
+                                    "multiSelect": False,
+                                    "options": [
+                                        {
+                                            "label": "Postgres",
+                                            "description": "Relational",
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                        send(
+                            {
+                                "type": "delta",
+                                "scope": f.scope,
+                                "cursor": {"epoch": "fixture", "seq": 13},
+                                "changes": [{"kind": "asks", "asks": [q]}],
+                            }
+                        )
+                    if "answer_questions" in action:
+                        assert frame["approval"] == "question-token" and action[
+                            "answer_questions"
+                        ] == ["q", ["Postgres"]]
+                        send(
+                            {
+                                "type": "delta",
+                                "scope": f.scope,
+                                "cursor": {"epoch": "fixture", "seq": 14},
+                                "changes": [{"kind": "asks", "asks": []}],
+                            }
+                        )
+                    f.actions.append(frame["action"])
+                    send({"type": "ack", "id": frame["id"]})
+        except (OSError, ValueError):
+            pass
+
+
+def managed_server(stack, server):
+    stack.enter_context(server)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    stack.callback(server.shutdown)
+    return server
+
+
+def browser(port, method, path, data=None):
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}" + path,
+        method=method,
+        data=None if data is None else json.dumps(data).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=14) as resp:
+        return json.load(resp)["value"]
+
+
+def camera_movie(path, foreign, local):
+    # Feed the browser's native fake camera with the actual host-generated QR symbols.
+    # A blank period allows cancellation before either QR is accepted.
+    width, height = 384, 320
+    neutral = bytes([128]) * (width * height // 2)
+
+    def luma(svg):
+        image = subprocess.run(
+            [shutil.which("magick") or "convert", "svg:-", "-background", "white", "-alpha", "remove",
+             "-gravity", "center", "-extent", f"{width}x{height}", "-depth", "8", "gray:-"],
+            input=svg.encode(), capture_output=True, check=True).stdout
+        assert len(image) == width * height
+        return image
+
+    with path.open("wb") as out:
+        out.write(f"YUV4MPEG2 W{width} H{height} F5:1 Ip A1:1 C420jpeg\n".encode())
+        for frame, count in [(bytes([235]) * (width*height), 6), (luma(foreign), 13), (luma(local), 14)]:
+            for _ in range(count):
+                out.write(b"FRAME\n" + frame + neutral)
+
+
+def camera_pair(js, cdp, navigate, origin):
+    def perm(name, setting):
+        cdp("Browser.setPermission", {"permission": {"name": name}, "setting": setting, "origin": origin})
+
+    installed = cdp("Page.addScriptToEvaluateOnNewDocument", {
+        "source": "Object.defineProperty(navigator, 'standalone', {value:true})"
+    })["identifier"]
+    navigate(origin)
+    wait(lambda: js("return document.querySelector('#pair-hint').innerText.includes('Home Screen app has its own pairing')"))
+    perm("camera", "denied")
+    js("document.querySelector('#scan-pair').click()")
+    wait(lambda: js("return document.querySelector('#camera-status').innerText.includes('Camera access is off')"))
+    assert js("return !document.querySelector('#paste-pair').hidden && !document.querySelector('#scan-pair').disabled")
+    perm("camera", "granted")
+    js("document.querySelector('#scan-pair').click()")
+    wait(lambda: js("return !!(window.fixtureTrack = document.querySelector('#camera-preview').srcObject?.getVideoTracks()[0])"))
+    js("document.querySelector('#cancel-camera').click()")
+    assert js("""return fixtureTrack.readyState==='ended' && document.querySelector('#camera-panel').hidden &&
+        document.activeElement===document.querySelector('#scan-pair') && !document.querySelector('#paste-pair').hidden""")
+    js("document.querySelector('#scan-pair').click()")
+    wait(lambda: js("return document.querySelector('#camera-status').innerText.includes('something else')"))
+    assert js("return !document.querySelector('#paste-pair').hidden && location.origin===arguments[0]", origin)
+    wait(lambda: js("return document.querySelector('#paste-pair').hidden && document.activeElement.id==='device-label'"))
+    assert js("return document.querySelector('#camera-preview').srcObject===null && !document.querySelector('#pair-link').value && !location.hash")
+    return installed
+
+
+def push_guidance(js, cdp, navigate, origin, installed):
+    assert js("""return document.querySelector('#notification-setup').open &&
+        !document.querySelector('#notifications').hidden && document.querySelector('#notification-guide').innerText.includes('Allow')""")
+    # The native Chromium permission store supplies the denial. The iOS display context
+    # is emulated to exercise Home Screen vs Safari instructions in the shipped app.
+    cdp("Browser.setPermission", {"permission": {"name": "notifications"}, "setting": "denied", "origin": origin})
+    js("document.querySelector('#notifications').click()")
+    wait(lambda: js("return document.querySelector('#notification-guide').textContent.includes('iPhone Settings') && document.querySelector('#notifications').hidden"))
+    cdp("Page.removeScriptToEvaluateOnNewDocument", {"identifier": installed})
+    navigate(origin)
+    wait(lambda: js("return !document.querySelector('#catalog').hidden && !!document.querySelector('.session')"))
+    js("document.querySelector('#notification-summary').click()")
+    assert js("""const guide=document.querySelector('#notification-guide'); return document.querySelector('#notification-setup').open &&
+        guide.innerText.includes('Add to Home Screen') && guide.innerText.includes('Safari') &&
+        guide.innerText.includes('fresh pairing QR') && document.querySelector('#notifications').hidden""")
+    print("PASS native Chromium camera denial, cancel/track shutdown, foreign QR, real host QR pairing, and iPhone notification guidance in emulated Safari and Home Screen modes", flush=True)
+
+
+def paired_browser(d, state_dir, stack, camera=False):
+    assert not admin(state_dir, {"type": "status"})["enabled"]
+    public = ThreadedTCP(("127.0.0.1", 0), Forward)
+    origin = f"https://studio.fixture.ts.net:{public.server_address[1]}"
+    if camera:
+        admin(state_dir, {"type": "enable", "origin": "https://other.fixture.ts.net", "port": 0})
+        foreign = admin(state_dir, {"type": "pair", "login": "phone@example.test"})["pairing"]["qr_svg"]
+        admin(state_dir, {"type": "disable"})
+    backend = admin(state_dir, {"type": "enable", "origin": origin, "port": 0})["port"]
+    stack.callback(admin, state_dir, {"type": "disable"})
+
+    def http_request(method, path, headers, body=None):
+        c = http.client.HTTPConnection("127.0.0.1", backend, timeout=4)
+        try:
+            c.request(
+                method,
+                path,
+                body=json.dumps(body).encode() if body else None,
+                headers=headers,
+            )
+            r = c.getresponse()
+            r.read()
+            return r.status
+        finally:
+            c.close()
+
+    h = {
+        "Host": origin.removeprefix("https://"),
+        "Tailscale-User-Login": "phone@example.test",
+        "Origin": origin,
+        "Content-Type": "application/json",
+    }
+    assert http_request("POST", "/api/challenge", h, {"purpose": "connect"}) == 403
+    assert http_request("GET", "/", {"Host": h["Host"]}) == 403
+    assert (
+        http_request(
+            "POST",
+            "/api/pair",
+            dict(h, Origin="https://foreign.invalid"),
+            {"code": "unused"},
+        )
+        == 403
+    )
+    invitation = admin(state_dir, {"type": "pair", "login": "phone@example.test"})[
+        "pairing"
+    ]
+    assert invitation["expires_at"] > time.time() and "<svg" in invitation["qr_svg"]
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-new",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-x509",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=studio.fixture.ts.net",
+            "-addext",
+            "subjectAltName=DNS:studio.fixture.ts.net",
+            "-out",
+            d / "cert",
+            "-keyout",
+            d / "key",
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(d / "cert", d / "key")
+    public.socket = tls.wrap_socket(public.socket, server_side=True)
+    public.backend = backend
+    managed_server(stack, public)
+    with socket.socket() as reserve:
+        reserve.bind(("127.0.0.1", 0))
+        port = reserve.getsockname()[1]
+    driver_env = os.environ.copy()
+    movie_args = []
+    if camera:
+        movie = d / "pairing-camera.y4m"
+        camera_movie(movie, foreign, invitation["qr_svg"])
+        driver_env["OX_TEST_CAMERA_FILE"] = str(movie)
+        movie_args = ["--use-fake-device-for-media-stream", "--use-file-for-fake-video-capture=" + str(movie)]
+    driver = subprocess.Popen(
+        ["chromedriver", f"--port={port}"], env=driver_env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    stack.callback(driver.wait, 5)
+    stack.callback(driver.terminate)
+    wait(lambda: browser(port, "GET", "/status"))
+    caps = {
+        "browserName": "chrome",
+        "acceptInsecureCerts": True,
+        "goog:chromeOptions": {
+            "binary": os.environ.get("OX_TEST_CHROMIUM")
+            or shutil.which("chromium")
+            or shutil.which("google-chrome"),
+            "args": [
+                "--headless=new",
+                *movie_args,
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--no-proxy-server",
+                "--disable-background-networking",
+                "--disable-component-update",
+                f"--user-data-dir={os.environ.get('OX_TEST_CHROMIUM_PROFILE', d / 'browser')}",
+                "--host-resolver-rules=MAP studio.fixture.ts.net 127.0.0.1, MAP * ~NOTFOUND, EXCLUDE localhost",
+            ],
+            "mobileEmulation": {
+                "deviceMetrics": {
+                    "width": 390,
+                    "height": 844,
+                    "pixelRatio": 1,
+                    "touch": True,
+                },
+                "userAgent": ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 "
+                              "Version/18.0 Mobile/15E148 Safari/604.1" if camera else
+                              "Mozilla/5.0 Android Mobile Chrome/132 Safari/537.36"),
+            },
+        },
+    }
+    ident = browser(port, "POST", "/session", {"capabilities": {"alwaysMatch": caps}})[
+        "sessionId"
+    ]
+    base = "/session/" + ident
+    stack.callback(browser, port, "DELETE", base)
+
+    def js(script, *args):
+        return browser(port, "POST", base + "/execute/sync", {"script": script, "args": args})
+
+    def cdp(command, params):
+        return browser(port, "POST", base + "/goog/cdp/execute", {"cmd": command, "params": params})
+
+    def navigate(url):
+        browser(port, "POST", base + "/url", {"url": url})
+
+    if camera:
+        installed = camera_pair(js, cdp, navigate, origin)
+    else:
+        navigate(invitation["url"])
+    wait(lambda: js("return !document.getElementById('pair-form').hidden"))
+    js(
+        "document.getElementById('device-label').value='Fixture phone';document.getElementById('pair-form').requestSubmit();"
+    )
+    wait(lambda: js("return !!document.querySelector('.session')"))
+    device = next(
+        r
+        for r in admin(state_dir, {"type": "status"})["devices"]
+        if r["label"] == "Fixture phone"
+    )
+    stack.callback(admin, state_dir, {"type": "revoke", "id": device["id"]})
+    if camera:
+        push_guidance(js, cdp, navigate, origin, installed)
+    return js, port, base
+
+
+def answer_from_phone(host_socket, state_dir, thread_id, env):
+    """Pair a real mobile Chromium client to the fixture host and allow this thread's pending tool once."""
+    state_dir = Path(state_dir)
+    if not Path(host_socket).is_socket() or not state_dir.is_dir() or not thread_id:
+        raise AssertionError("Expected a running disposable session host")
+    if (
+        env.get("OX_HOST_STATE_DIR")
+        and Path(env["OX_HOST_STATE_DIR"]).resolve() != state_dir.resolve()
+    ):
+        raise AssertionError(
+            "Disposable host state does not match the supplied fixture"
+        )
+    wait(lambda: (state_dir / "remote-admin.sock").exists())
+    if admin(state_dir, {"type": "status"})["devices"]:
+        raise AssertionError("Expected a fresh disposable remote state")
+    with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+        js, _, _ = paired_browser(Path(tmp), state_dir, stack)
+        select = f"const item=[...document.querySelectorAll('.session')].find(b=>b.dataset.threadId==={json.dumps(thread_id)}); if(item){{item.click();return true}} return false;"
+        wait(lambda: js(select), 30)
+        allow = """const b=[...document.querySelectorAll('#asks .ask button')].find(b=>/^(allow once|allow tool call|allow for this turn|allow|approve)$/i.test(b.textContent.trim()));
+          if(b&&!b.disabled){b.click();return true;}return false;"""
+        wait(lambda: js(allow), 45)
+        wait(lambda: js("return !document.querySelector('#asks .ask')"), 30)
+        if not js("return document.getElementById('network').innerText==='Connected'"):
+            raise AssertionError("Mobile client disconnected during approval")
+
+
+def phone_report(js, port, base, keypress, capture, screenshot):
+    def viewport(width, height):
+        return browser(port, "POST", base + "/goog/cdp/execute", {
+            "cmd": "Emulation.setDeviceMetricsOverride",
+            "params": {"width": width, "height": height, "deviceScaleFactor": 1, "mobile": True},
+        })
+
+    def one_line(selector, width):
+        return js("""const e=document.querySelector(arguments[0]), r=new Range();
+            r.selectNodeContents(e);
+            return e.textContent.includes('Sessions') && r.getClientRects().length===1 &&
+                   document.documentElement.clientWidth===arguments[1] &&
+                   document.documentElement.scrollWidth<=arguments[1];""", selector, width)
+
+    js("document.querySelector('#home').click()")
+    wait(lambda: js("return !!document.querySelector('[data-thread-id=disk-report]')"))
+    for width in [390, 360, 320]:
+        viewport(width, 740)
+        assert one_line("#catalog h1", width), f"Sessions heading wrapped or overflowed at {width}px"
+    viewport(360, 740)
+    if screenshot:
+        capture(Path(screenshot).with_stem(Path(screenshot).stem + "-narrow-sessions"))
+    js("document.querySelector('[data-thread-id=disk-report]').click()")
+    wait(lambda: js("return document.querySelectorAll('#timeline details.tool-group').length===2"))
+    assert one_line("#conversation .back", 360)
+    metrics = js("""return [...document.querySelectorAll('#timeline details.tool-group')].map(g=>({
+        open:g.open, count:g.querySelectorAll('details.tool').length,
+        summary:g.querySelector(':scope > summary').innerText, height:g.getBoundingClientRect().height
+    }));""")
+    assert all(not g["open"] and g["count"] == 0 and g["height"] <= 76 for g in metrics), metrics
+    assert [g["summary"].strip() for g in metrics] == ["3 tool calls", "2 tool calls"], metrics
+    assert js("""const a=document.querySelector('#timeline strong')?.closest('article');
+        a?.querySelector('table')?.scrollIntoView({block:'center'});
+        const cell=a?.querySelector('td'), r=cell?.getBoundingClientRect();
+        return a?.querySelector('strong').textContent==='Build artifacts' &&
+               a.querySelector('code')?.textContent==='target/debug' &&
+               a.querySelector('table th')?.textContent==='Folder' &&
+               [...a.querySelectorAll('table td')].some(td=>td.textContent==='12 GiB') &&
+               parseFloat(getComputedStyle(a.querySelector('strong')).fontSize)>=15 &&
+               cell.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2)) &&
+               !a.innerText.includes('**Build artifacts**') && !a.innerText.includes('| ---');""")
+    first = "#timeline details.tool-group"
+    js("document.querySelector(arguments[0]).focus()", first + " > summary")
+    keypress("\ue007")
+    wait(lambda: js("return document.querySelectorAll('details.tool-group[open] details.tool').length===3"))
+    js("document.querySelector(arguments[0]).querySelectorAll('details.tool > summary')[1].focus()", first)
+    keypress("\ue007")
+    wait(lambda: js("return document.querySelector('details.tool[open] pre')?.textContent.includes('garden build artifacts')"))
+    visible = js("""const groups=[...document.querySelectorAll('details.tool-group')];
+        const tools=[...groups[0].querySelectorAll('details.tool')];
+        return [groups.map(g=>g.open), tools.map(t=>t.open), tools[1].innerText.includes('garden build artifacts'),
+                document.documentElement.scrollWidth<=360];""")
+    assert visible == [[True, False], [False, True, False], True, True], visible
+    if screenshot:
+        js("document.querySelector('details.tool[open] > summary').scrollIntoView({block:'center'})")
+        capture(Path(screenshot).with_stem(Path(screenshot).stem + "-tool"))
+    js("document.querySelector(arguments[0]).click()", first + " > summary")
+    if screenshot:
+        js("document.querySelector('#timeline strong').scrollIntoView({block:'center'})")
+        capture(Path(screenshot).with_stem(Path(screenshot).stem + "-report"))
+    assert js("""const e=document.querySelector('#draft'); e.scrollIntoView({block:'center'}); e.focus();
+        const r=e.getBoundingClientRect(), send=document.querySelector('#send').getBoundingClientRect();
+        return document.activeElement===e && e.labels.length>0 &&
+               document.elementFromPoint(r.x+r.width/2,r.y+r.height/2)===e &&
+               send.width>0 && send.right<=360 && document.documentElement.scrollWidth<=360;""")
+    js("document.querySelector('#home').click()")
+    viewport(390, 844)
+    print("PASS narrow phone catalog, independent disclosures for long commands, semantic Markdown report, and reachable composer", flush=True)
+
+
+def run(harness, screenshot=None):
+    with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+        d = Path(tmp)
+        host = socketserver.ThreadingUnixStreamServer(str(d / "mock-host.sock"), Host)
+        host.daemon_threads = True
+        host.scope = {
+            "project": str(d / "fixture"),
+            "route": {"runtime": "claude", "billing": "subscription"},
+        }
+        Path(host.scope["project"]).mkdir()
+        host.caps = ["start", "access", "model_options", "native_commands"]
+        host.confirm_mode, host.mode_requested = threading.Event(), threading.Event()
+        host.detail = {
+            "selected":"parent", "applied_draft_access":"default", "access_choices":["default","plan","bypass_permissions"],
+            "commands":{"model":"demo","methods":[],"models":{"demo":{"label":"Demo","efforts":[{"reasoningEffort":"low"},{"reasoningEffort":"high"}]}}}
+        }
+        host.sessions = [
+            {
+                "id": "parent",
+                "title": "Database connection timeouts",
+                "parent": None,
+                "status": "active",
+                "updated_at": 2,
+                "capabilities": ["open", "send", "steer", "stop", "access", "model_options", "native_commands", "attach_image", "mention"],
+                "detail": {"access":"default", "options":{"model":"demo","effort":"low"}},
+            },
+            {
+                "id": "child",
+                "parent": "parent",
+                "title": "Investigate connection pool",
+                "status": "running",
+                "updated_at": 1,
+                "capabilities": ["open", "steer", "stop"],
+                "detail": {"job": {"parent": "parent"}},
+            },
+        ]
+        host.sessions.append(dict(host.sessions[0], id="disk-report", title="Rust build disk usage",
+                                  status="idle", updated_at=0, capabilities=["open", "send"], detail={"access": "default"}))
+        host.report_items = build_report_items()
+        host.actions = []
+        host.resumes = []
+        host.connections = []
+        host.answered = False
+        managed_server(stack, host)
+        isolated=d/"home"
+        codex=isolated/".codex"
+        codex.mkdir(mode=0o700,parents=True)
+        (codex/"codeox.toml").write_text('[providers.garden]\nname="Garden"\nbase_url="https://garden.invalid/v1"\nenv_key="GARDEN_TOKEN"\nwire_api="chat_completions"\ndiscovery=false\n[[providers.garden.models]]\nid="orchard"\n')
+        service = subprocess.Popen(
+            [harness, "--exact", "fixture::browser_service", "--ignored"],
+            env=dict(os.environ, SHELL="/bin/sh", HOME=str(isolated), CODEX_HOME=str(codex), CLAUDE_CONFIG_DIR=str(isolated/".claude"), XDG_STATE_HOME=str(isolated/"state"), XDG_CONFIG_HOME=str(isolated/"config"), OX_TEST_REMOTE_DIR=str(d)),
+            stdout=subprocess.DEVNULL,
+        )
+        stack.callback(service.wait, 5)
+        stack.callback(service.terminate)
+        wait(lambda: (d / "remote-admin.sock").exists())
+        js, port, base = paired_browser(d, d, stack, camera=True)
+        assert js(
+            "return !location.hash && document.cookie==='' && !!document.querySelector('.session.nested')"
+        )
+
+        from operator_browser import check_terminal
+        check_terminal(js,admin,wait,d,host)
+        # Source silhouettes stay stable across approvals, active work, billing routes, and nesting.
+        icons=js("""return Object.fromEntries([...document.querySelectorAll('.session')].map(b=>[
+            b.dataset.threadId,[b.dataset.source,b.querySelector('.status').textContent,getComputedStyle(b,'::before').boxShadow.replace(/rgba?[(][^)]*[)]/g,'')]
+        ]));""")
+        assert icons["parent"][:2]==["claude","Needs input"] and icons["child"][0]=="worker", icons
+        for ident,source in [("codex-source","codex"),("api-source","api"),("codex-api-source","api")]:
+            assert icons[ident][:2]==[source,"idle"] and icons[ident+"-running"][:2]==[source,"running"]
+            assert icons[ident][2]==icons[ident+"-running"][2] and icons[ident][2]!="none"
+        assert len({icons[k][2] for k in ("parent","child","codex-source","api-source")})==4
+
+        def keypress(code):
+            browser(
+                port,
+                "POST",
+                base + "/actions",
+                {
+                    "actions": [
+                        {
+                            "type": "key",
+                            "id": "keyboard",
+                            "actions": [
+                                {"type": "keyDown", "value": code},
+                                {"type": "keyUp", "value": code},
+                            ],
+                        }
+                    ]
+                },
+            )
+
+        def capture(name):
+            import base64
+
+            Path(name).write_bytes(
+                base64.b64decode(browser(port, "GET", base + "/screenshot"))
+            )
+
+        js("const n=document.querySelector('#notification-setup');if(n.open)n.querySelector('summary').click();document.getElementById('home').focus()")
+        keypress("\ue004")
+        assert js(
+            "return document.activeElement===document.getElementById('new') && document.activeElement.matches(':focus-visible')"
+        ), js("return {focused:document.activeElement.id, visible:document.activeElement.matches(':focus-visible'), catalog:!document.querySelector('#catalog').hidden}")
+        assert js(
+            "return document.getElementById('new').getBoundingClientRect().height>=44 && document.documentElement.scrollWidth<=innerWidth"
+        )
+        if screenshot:
+            s = Path(screenshot)
+            js("document.activeElement.blur()")
+            capture(s.with_name(s.stem + "-sessions" + s.suffix))
+        js("const f=document.getElementById('find-sessions'); f.value='Investigate'; f.dispatchEvent(new Event('input'))")
+        wait(lambda: js("return document.querySelectorAll('.session').length===1 && document.querySelector('.session').dataset.threadId==='child'"))
+        js("const f=document.getElementById('find-sessions'); f.value=''; f.dispatchEvent(new Event('input'))")
+        wait(lambda:js("return !!document.querySelector('[data-thread-id=parent]')"))
+        js("document.querySelector('[data-thread-id=parent]').focus()")
+        keypress("\ue007")
+
+        wait(
+            lambda: js(
+                "return document.querySelector('#timeline')?.innerText.includes('Connected phone · streamed')"
+            )
+        )
+        assert js(
+            "return !document.querySelector('#timeline').innerText.includes('streamed · streamed')"
+        )
+        if screenshot:
+            capture(screenshot)
+        js("document.querySelector('#conversation .back').focus()")
+        keypress("\ue004")
+        assert js("return document.activeElement.matches('#conversation .action-menu > summary:focus-visible')")
+        keypress("\ue007")
+        keypress("\ue004")
+        assert js("return document.activeElement.id==='operator-project'")
+        keypress("\ue00c")
+        assert js("return !document.querySelector('#conversation .action-menu').open && document.activeElement.matches('.action-menu > summary')")
+        keypress("\ue004")
+        assert js("return document.activeElement.id==='access-mode' && document.activeElement.matches(':focus-visible')")
+        keypress("\ue004")
+        assert js("return document.activeElement.id==='open-settings'")
+        keypress("\ue004")
+        for _ in range(8):
+            if js("return document.activeElement.textContent==='Allow'"): break
+            keypress("\ue004")
+        assert js("return document.activeElement.textContent==='Allow' && document.activeElement.matches(':focus-visible')")
+        keypress("\ue007")
+        wait(lambda: host.answered)
+        wait(lambda: js("return !!document.querySelector('#asks input[type=radio]')"))
+        js(
+            "document.querySelector('#asks input[type=radio]').click();document.querySelector('#asks button').click()"
+        )
+        wait(lambda: {"answer_questions": ["q", ["Postgres"]]} in host.actions)
+        js(
+            "const d=document.querySelector('#draft');d.value='Please continue';d.dispatchEvent(new Event('input'));document.querySelector('#composer').requestSubmit();"
+        )
+        wait(lambda: {"send_text": ["parent", "Please continue"]} in host.actions)
+        js("const d=document.querySelector('#draft');d.value='@mob';d.dispatchEvent(new Event('input'))")
+        wait(lambda:js("return !!document.querySelector('#mention-choices button')"))
+        js("document.querySelector('#mention-choices button').click()")
+        assert js("return document.getElementById('draft').value==='@src/mobile.rs '")
+        js("""const data=new DataTransfer();
+           data.items.add(new File([Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aWQAAAABJRU5ErkJggg=='),c=>c.charCodeAt(0))], 'pixel.png',{type:'image/png'}));
+           const input=document.getElementById('attach-image'); input.files=data.files;
+           input.dispatchEvent(new Event('change'));""")
+        wait(lambda:js("return !!document.querySelector('#attached-images button')"))
+        js("document.querySelector('#composer').requestSubmit()")
+        wait(lambda:any(isinstance(a,dict) and a.get("send_images",[None])[0]=="parent" for a in host.actions))
+        wait(lambda:js("return !document.querySelector('#attached-images button')"))
+        js("document.querySelector('#stop').click()")
+        wait(lambda: {"stop": "parent"} in host.actions)
+        for conn in list(host.connections):
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        wait(lambda: any(c is not None for c in host.resumes))
+        wait(
+            lambda: js(
+                "return document.getElementById('network').innerText==='Connected'"
+            )
+        )
+        def choose(id, value):
+            js(f"const s=document.getElementById({id!r});s.value={value!r};s.dispatchEvent(new Event('change'))")
+        def mode(value):
+            choose("permission", value)
+            js("document.getElementById('apply-permission').click()")
+        js("document.getElementById('access-mode').click()")
+        mode("plan")
+        wait(lambda: js("return document.getElementById('control-status').textContent.includes('Claude · Subscription · Mode disabled')"))
+        mode("bypass_permissions")
+        wait(host.mode_requested.is_set)
+        assert js("return document.getElementById('access-mode').dataset.bypass==='false' && document.getElementById('access-mode').textContent==='Default'")
+        host.confirm_mode.set()
+        wait(lambda: js("return document.getElementById('access-mode').dataset.bypass==='true'"))
+        assert js("return document.getElementById('message').hidden && getComputedStyle(document.querySelector('#composer')).position!=='sticky'")
+        choose("session-effort", "high")
+        wait(lambda: {"model_options":["parent", {"effort":"high"}]} in host.actions)
+        wait(lambda: js("return document.getElementById('session-effort').value==='high'"))
+        js("document.getElementById('native-command-form').requestSubmit()")
+        wait(lambda: js("return document.getElementById('control-status').textContent==='Native status received'"))
+        if screenshot:
+            capture(s.with_name(s.stem+"-settings"+s.suffix))
+        js("document.getElementById('home').click()")
+        wait(lambda: js("return !!document.querySelector('[data-thread-id=child]')"))
+        js("document.querySelector('[data-thread-id=child]').click()")
+        wait(
+            lambda: js(
+                "return document.getElementById('title').textContent==='Investigate connection pool' && !document.getElementById('stop').disabled && document.getElementById('network').innerText==='Connected'"
+            )
+        )
+        js("document.getElementById('stop').click()")
+        wait(lambda: {"worker_control": ["child", "stop"]} in host.actions)
+        phone_report(js, port, base, keypress, capture, screenshot)
+        js(
+            "document.getElementById('home').click();document.getElementById('new').click();document.getElementById('new-form').requestSubmit()"
+        )
+        wait(
+            lambda: js(
+                "return document.getElementById('network').innerText==='Connected' && document.getElementById('title').innerText==='New session'"
+            )
+        )
+        js("document.getElementById('access-mode').click()")
+        mode("bypass_permissions")
+        wait(lambda: {"set_next_access":"bypass_permissions"} in host.actions)
+        wait(lambda: js("return document.getElementById('access-mode').dataset.bypass==='true'"))
+        js("document.getElementById('open-settings').click()")
+        js(
+            "const d=document.getElementById('draft');d.value='New session';d.dispatchEvent(new Event('input'));document.getElementById('composer').requestSubmit()"
+        )
+        wait(lambda: {"send_text": [None, "New session"]} in host.actions)
+        wait(
+            lambda: js(
+                "return document.getElementById('title').innerText==='Newly created phone session'"
+            )
+        )
+        from phone_settings import exercise
+        exercise(js, wait)
+
+        def settings(op):
+            return js("return import('./device.js').then(async m=>m.settingsRequest(await m.deviceKey(),"+json.dumps(op)+"))")
+        snapshot=settings({"action":"read_rows"})
+        assert any(p["id"]=="garden" for p in snapshot["registry"]["providers"])
+        laptop=settings({"action":"read_behavior"})
+        changed=dict(laptop["behavior"],reduce_motion=not laptop["behavior"]["reduce_motion"])
+        assert settings({"action":"save_behavior","revision":laptop["revision"],"behavior":changed})=={"status":"applied"}
+        assert settings({"action":"read_behavior"})["behavior"]==changed
+        assert settings({"action":"save_behavior","revision":laptop["revision"],"behavior":laptop["behavior"]})["status"]=="changed_on_disk"
+        revision=snapshot["revisions"]["favorites"]
+        assert settings({"action":"edit","revision":revision,"edit":{"section":"favorites","models":["garden/orchard"]}})=={"status":"applied"}
+        assert settings({"action":"edit","revision":revision,"edit":{"section":"favorites","models":[]}})["status"]=="changed_on_disk"
+        assert settings({"action":"read_rows"})["favorites"]==["garden/orchard"]
+        credential=next(c for c in snapshot["credentials"] if c["name"]=="GARDEN_TOKEN")
+        canary="fixture-mobile-secret-only"
+        assert settings({"action":"edit_key","name":credential["name"],"scope":credential["scope"],"value":canary,"revision":snapshot["revisions"]["keys"]})=={"status":"applied"}
+        assert canary in (codex/"ox-api-keys.json").read_text()
+        remaining=settings({"action":"read_rows"})
+        assert canary not in json.dumps(remaining) and any(k["saved"] and k["name"]=="GARDEN_TOKEN" for k in remaining["credentials"])
+        docs=settings({"action":"read_advanced"})
+        assert canary not in json.dumps(docs)
+        registry=next(x for x in docs if x["id"]=="codeox.toml")
+        assert settings({"action":"save_advanced","id":registry["id"],"revision":registry["revision"],"original":registry["text"],"text":registry["text"].replace('"Garden"','"Garden plots"')})=={"status":"applied"}
+        assert "Garden plots" in (codex/"codeox.toml").read_text()
+        paired=settings({"action":"devices"})
+        assert len(paired["devices"])==1 and paired["self"]==paired["devices"][0]["id"]
+        invitation=settings({"action":"pair_device"})
+        assert "#pair=" in invitation["url"] and "<svg" in invitation["qr_svg"]
+        device = admin(d, {"type": "status"})["devices"][0]
+        assert settings({"action":"revoke_device","id":device["id"]})=={"status":"applied"}
+        wait(lambda: js("return !document.getElementById('pair').hidden"))
+        assert not admin(d, {"type": "status"})["devices"]
+        assert js("return import('./device.js').then(async m=>m.settingsRequest(await m.deviceKey(),{action:'read_rows'}).then(()=>false,e=>e.status===403))")
+        secret=invitation["url"].split("#pair=")[1]
+        assert js("return import('./device.js').then(m=>m.pair("+json.dumps(secret)+",'Revoked invite').then(()=>false,e=>e.status===403))")
+        print(
+            "PASS mobile pairing, live stream, ask and question, steer, stop, child controls, new session, resume and revocation",
+            flush=True,
+        )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("harness", type=Path)
+    parser.add_argument("--screenshot", type=Path)
+    args = parser.parse_args()
+    run(args.harness.resolve(), args.screenshot)

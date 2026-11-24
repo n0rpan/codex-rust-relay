@@ -1,0 +1,769 @@
+//! A Claude billing route owns a catalog and an independent stock process for each
+//! open session. The session key and launch generation accompany every callback.
+mod events;
+mod history;
+
+use super::{Connection, Profile, Store, ThreadRow, catalog::now_secs};
+use crate::{
+    changed::Changed,
+    claude::{
+        self as wire,
+        catalog::{Bindings, Origin, Profiles},
+    },
+    links::{
+        self, LinkEvent,
+        claude::{self as pipe, Session},
+    },
+    runtime::{Access, Billing, RequestId, Runtime},
+    transcript::item::{Content, Item},
+};
+use serde_json::{Value, json};
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    fmt,
+    fs::File,
+    io::{self, Read},
+    path::PathBuf,
+    sync::Arc,
+    thread,
+};
+
+pub const SUBSCRIPTION_PROVIDER: &str = "claude-subscription";
+pub const API_PROVIDER: &str = "claude-ox-api";
+
+pub struct Launcher {
+    pub ox: PathBuf,
+    pub path: OsString,
+    pub profiles: Profiles,
+    pub index: PathBuf,
+    pub aliases: Vec<String>,
+}
+
+pub struct Project {
+    launcher: Arc<Launcher>,
+    deliver: Arc<dyn Fn(LinkEvent) + Send + Sync>,
+    sessions: HashMap<String, Process>,
+    catalog: HashMap<String, ThreadRow>,
+    asks: HashMap<RequestId, (String, wire::Permission)>,
+    blank: Option<String>,
+    serial: u64,
+}
+#[derive(Default)]
+struct Process {
+    generation: u64,
+    events: events::EventState,
+    handoff: Option<super::commands::Handoff>,
+    link: Option<pipe::Link>,
+    initialized: bool,
+    capabilities: Option<crate::slash::Capabilities>,
+    mode: Option<Access>,
+    controls: HashMap<String, Control>,
+    first: Option<(String, String)>,
+}
+enum Control {
+    Mode(Access),
+    Model(String),
+    Interrupt,
+}
+
+pub struct Update {
+    owner: String,
+    generation: u64,
+    data: Data,
+}
+impl fmt::Debug for Update {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClaudeUpdate")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+enum Data {
+    Connected(pipe::Link),
+    Stock(pipe::Event),
+    History(history::Batch),
+    Failed(String),
+}
+impl Update {
+    pub(crate) fn unblocks(&self) -> bool {
+        !matches!(
+            self.data,
+            Data::History(_)
+                | Data::Stock(pipe::Event::Frame(
+                    wire::Event::Delta { .. } | wire::Event::Item { .. }
+                ))
+        )
+    }
+}
+
+fn new_id() -> io::Result<String> {
+    let mut bytes = [0; 16];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    bytes[6] = (bytes[6] & 15) | 64;
+    bytes[8] = (bytes[8] & 63) | 128;
+    let n = u128::from_be_bytes(bytes);
+    Ok(format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        n >> 96,
+        (n >> 80) & 0xffff,
+        (n >> 64) & 0xffff,
+        (n >> 48) & 0xffff,
+        n & 0xffffffffffff
+    ))
+}
+fn session_key(billing: &Billing, id: &str) -> String {
+    let scope = match billing {
+        Billing::Subscription => "subscription",
+        Billing::Api(_) => "api",
+    };
+    format!("claude:{scope}:{id}")
+}
+fn stock_id(key: &str) -> io::Result<&str> {
+    key.split(':')
+        .nth(2)
+        .filter(|id| wire::catalog::valid_session_id(id))
+        .ok_or_else(|| io::Error::other("Invalid Claude session ID"))
+}
+fn child_key(root: &str, tool: &str) -> String {
+    format!("{root}/{tool}")
+}
+fn row(profile: &Profile, id: String, title: String, updated_at: i64) -> ThreadRow {
+    ThreadRow {
+        id,
+        name: None,
+        generated_title: None,
+        preview: title,
+        cwd: profile.project.clone(),
+        model_provider: profile.provider.clone(),
+        model: match &profile.route.billing {
+            Billing::Api(alias) => Some(alias.clone()),
+            Billing::Subscription => None,
+        },
+        agent_nickname: None,
+        updated_at,
+        parent_thread_id: None,
+        worker: false,
+        unread: false,
+        status: None,
+        activity_order: 0,
+    }
+}
+/// Read only session metadata in both native profiles. A client is spawned when a user opens a session.
+pub fn saved_rows(profiles: &Profiles, index: &std::path::Path) -> io::Result<Vec<ThreadRow>> {
+    let aliases = Bindings::new(index.into()).aliases(&profiles.api)?;
+    Ok(profiles
+        .all()?
+        .into_iter()
+        .map(|s| saved_row(s, &aliases))
+        .collect())
+}
+
+fn saved_row(
+    saved: wire::catalog::Session,
+    aliases: &HashMap<(PathBuf, String), String>,
+) -> ThreadRow {
+    let api = saved.origin == Origin::Api;
+    let billing = if api {
+        Billing::Api(String::new())
+    } else {
+        Billing::Subscription
+    };
+    let id = session_key(&billing, &saved.id);
+    let model = if api {
+        aliases
+            .get(&(saved.project.clone(), saved.id))
+            .cloned()
+            .or(saved.model)
+    } else {
+        None
+    };
+    let profile = Profile {
+        project: saved.project,
+        route: Runtime::Claude.route(None),
+        provider: if api {
+            API_PROVIDER
+        } else {
+            SUBSCRIPTION_PROVIDER
+        }
+        .into(),
+    };
+    let mut result = row(&profile, id, saved.preview, saved.updated_at);
+    result.name = saved.native_title;
+    result.model = model;
+    result
+}
+
+impl Launcher {
+    fn catalog(&self, profile: &Profile) -> io::Result<HashMap<String, ThreadRow>> {
+        let aliases = Bindings::new(self.index.clone()).aliases(&self.profiles.api)?;
+        let mut rows = HashMap::new();
+        for saved in self.profiles.list(&profile.project)? {
+            // A UUID in both profiles belongs to the explicitly selected billing route.
+            let saved = if saved.origin == Origin::Ambiguous {
+                self.profiles.session(
+                    &profile.project,
+                    &saved.id,
+                    if profile.route.is_api() {
+                        Origin::Api
+                    } else {
+                        Origin::Subscription
+                    },
+                )?
+            } else {
+                saved
+            };
+            let row = saved_row(saved, &aliases);
+            rows.insert(row.id.clone(), row);
+        }
+        Ok(rows)
+    }
+}
+
+impl ThreadRow {
+    pub fn saved_claude_api(&self) -> Option<bool> {
+        match self.model_provider.as_str() {
+            SUBSCRIPTION_PROVIDER => Some(false),
+            API_PROVIDER => Some(true),
+            _ => None,
+        }
+    }
+
+    pub fn saved_runtime_route(&self, aliases: &[String]) -> Option<crate::runtime::Route> {
+        match self.model_provider.as_str() {
+            SUBSCRIPTION_PROVIDER => Some(Runtime::Claude.route(None)),
+            API_PROVIDER => self
+                .model
+                .as_ref()
+                .filter(|model| aliases.contains(model))
+                .map(|alias| Runtime::Claude.route(Some(alias.clone()))),
+            _ => None,
+        }
+    }
+    pub fn needs_claude_alias(&self) -> bool {
+        self.model_provider == API_PROVIDER && self.model.is_none()
+    }
+}
+impl Access {
+    fn mode(self) -> Option<&'static str> {
+        match self {
+            Self::Default => Some("default"),
+            Self::Auto => Some("auto"),
+            Self::Plan => Some("plan"),
+            Self::AcceptEdits => Some("acceptEdits"),
+            Self::BypassPermissions => Some("bypassPermissions"),
+            _ => None,
+        }
+    }
+    fn from_mode(name: &str) -> Option<Self> {
+        Self::choices(Runtime::Claude)
+            .iter()
+            .copied()
+            .find(|a| a.mode() == Some(name))
+    }
+}
+impl Store {
+    pub fn is_session_scoped(&self) -> bool {
+        if self.remote().is_some() {
+            return self.profile.route.runtime == Runtime::Claude;
+        }
+        matches!(self.link, links::Link::Claude(_))
+    }
+    pub(super) fn prepare_claude_draft(&mut self) -> io::Result<()> {
+        if self.claude().blank.is_none() {
+            let owner = self.spawn_claude(Session::New(new_id()?), None, false)?;
+            self.claude_mut().blank = Some(owner);
+        }
+        Ok(())
+    }
+    pub(super) fn claude_applied_access(&self, id: Option<&str>) -> Option<Access> {
+        let project = self.claude();
+        let owner = id.or(project.blank.as_deref())?;
+        let session = project.sessions.get(owner)?;
+        session.link.as_ref()?;
+        session.mode
+    }
+    pub(super) fn claude_can_submit(&self, id: Option<&str>) -> bool {
+        let project = self.claude();
+        let owner = id.or(project.blank.as_deref());
+        owner
+            .and_then(|k| project.sessions.get(k))
+            .is_some_and(|p| p.initialized && p.link.is_some() && p.handoff.is_none())
+            && !self.claude_settings_pending(id)
+    }
+    pub(super) fn claude_settings_pending(&self, id: Option<&str>) -> bool {
+        let p = self.claude();
+        id.or(p.blank.as_deref())
+            .and_then(|k| p.sessions.get(k))
+            .is_some_and(|s| {
+                s.controls
+                    .values()
+                    .any(|c| matches!(c, Control::Mode(_) | Control::Model(_)))
+            })
+    }
+    pub(super) fn handing_off_claude(&self) -> bool {
+        self.is_session_scoped() && self.claude().sessions.values().any(|p| p.handoff.is_some())
+    }
+    pub(super) fn release_claude(
+        &mut self,
+        id: &str,
+        handoff: super::commands::Handoff,
+    ) -> io::Result<()> {
+        let p = self
+            .claude_mut()
+            .sessions
+            .get_mut(id)
+            .ok_or_else(|| io::Error::other("Open the Claude session before handing it off"))?;
+        p.handoff = Some(handoff);
+        p.link.take();
+        Ok(())
+    }
+    fn finish_claude_handoff(&mut self, id: &str) -> bool {
+        let Some(handoff) = self
+            .claude_mut()
+            .sessions
+            .get_mut(id)
+            .and_then(|p| p.handoff.take())
+        else {
+            return false;
+        };
+        self.claude_mut().sessions.remove(id);
+        self.handoff_ready = Some(handoff);
+        self.changed.mark(Changed::NOTICE);
+        true
+    }
+    pub(super) fn claude_palette(&self, query: &str) -> Vec<ThreadRow> {
+        let q = query.to_lowercase();
+        self.claude()
+            .catalog
+            .values()
+            .filter_map(|row| {
+                let mut row = row.clone();
+                self.catalog.titles.decorate(&mut row);
+                (row.title().to_lowercase().contains(&q) || row.preview.to_lowercase().contains(&q))
+                    .then_some(row)
+            })
+            .collect()
+    }
+    pub(super) fn claude_next_mode(&mut self, mode: Access) -> io::Result<bool> {
+        if let Some(id) = self.claude().blank.clone() {
+            self.claude_mode(&id, mode)?;
+            return Ok(true);
+        }
+        // A reconnect can show a new local composer after the original host draft
+        // was consumed. Prepare the explicit mode so stock can confirm it.
+        self.next_preset = Some(mode);
+        self.prepare_claude_draft()?;
+        Ok(true)
+    }
+    pub(super) fn claude_caps(&self, owner: Option<&str>) -> crate::slash::Capabilities {
+        let p = self.claude();
+        owner
+            .or(p.blank.as_deref())
+            .and_then(|k| p.sessions.get(k.split('/').next()?))
+            .and_then(|s| s.capabilities.clone())
+            .unwrap_or_else(|| self.commands.schema.clone().unwrap_or_default())
+    }
+    pub fn open_claude(
+        profile: Profile,
+        launcher: Launcher,
+        deliver: impl Fn(LinkEvent) + Send + Sync + 'static,
+    ) -> io::Result<Self> {
+        let catalog = launcher.catalog(&profile)?;
+        let project = Project {
+            launcher: Arc::new(launcher),
+            deliver: Arc::new(deliver),
+            catalog,
+            sessions: Default::default(),
+            asks: Default::default(),
+            blank: None,
+            serial: 0,
+        };
+        let mut store = Self::with_link(profile, links::Link::Claude(Box::new(project)));
+        store.claude_list();
+        let id = new_id()?;
+        let owner = store.spawn_claude(Session::New(id), None, false)?;
+        store.claude_mut().blank = Some(owner);
+        Ok(store)
+    }
+    fn claude(&self) -> &Project {
+        match &self.link {
+            links::Link::Claude(p) => p,
+            _ => unreachable!("Claude integration"),
+        }
+    }
+    fn claude_mut(&mut self) -> &mut Project {
+        match &mut self.link {
+            links::Link::Claude(p) => p,
+            _ => unreachable!("Claude integration"),
+        }
+    }
+    pub(super) fn claude_list(&mut self) {
+        self.catalog.clear();
+        let mut rows = self.claude_palette(&self.query);
+        rows.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+        for row in rows {
+            self.catalog.insert(row);
+        }
+        self.catalog_revision += 1;
+        self.changed.mark(Changed::THREADS);
+    }
+    fn remember_claude(&mut self, row: ThreadRow) {
+        self.claude_mut()
+            .catalog
+            .insert(row.id.clone(), row.clone());
+        self.record_row(row);
+    }
+    fn spawn_claude(
+        &mut self,
+        session: Session,
+        first: Option<(String, String)>,
+        confirm_missing_alias: bool,
+    ) -> io::Result<String> {
+        let id = match &session {
+            Session::New(id) | Session::Resume(id) | Session::Fork { id, .. } => id,
+        }
+        .clone();
+        let owner = session_key(&self.profile.route.billing, &id);
+        if self.claude().sessions.contains_key(&owner) {
+            return Ok(owner);
+        }
+        let profile = self.profile.clone();
+        // A draft preset belongs only to the new session it was chosen for.
+        let preset = match &session {
+            Session::New(_) => self.next_preset.take(),
+            Session::Resume(_) | Session::Fork { .. } => None,
+        };
+        let mode = preset
+            .and_then(Access::mode)
+            .unwrap_or("default")
+            .to_owned();
+        let p = self.claude_mut();
+        p.serial += 1;
+        let generation = p.serial;
+        let launcher = p.launcher.clone();
+        let receive = p.deliver.clone();
+        let key = owner.clone();
+        p.sessions.insert(
+            owner.clone(),
+            Process {
+                generation,
+                first,
+                ..Default::default()
+            },
+        );
+        let alive = p.sessions[&owner].events.lifetime();
+        let history_owner = owner.clone();
+        thread::spawn(move || {
+            let emit = move |data| {
+                receive(LinkEvent::Claude(Update {
+                    owner: key.clone(),
+                    generation,
+                    data,
+                }))
+            };
+            let emit = Arc::new(emit);
+            let start = || -> io::Result<()> {
+                let index = Bindings::new(launcher.index.clone());
+                let source = match &session {
+                    Session::Resume(id) => Some(id),
+                    Session::Fork { source, .. } => Some(source),
+                    _ => None,
+                };
+                if let Some(source) = source {
+                    let origin = if profile.route.is_api() {
+                        Origin::Api
+                    } else {
+                        Origin::Subscription
+                    };
+                    let saved = launcher
+                        .profiles
+                        .session(&profile.project, source, origin)?;
+                    if let Billing::Api(alias) = &profile.route.billing {
+                        let bound = index
+                            .alias(&profile.project, &launcher.profiles.api, source)?
+                            .or(saved.model.clone());
+                        match bound.as_deref() {
+                            Some(bound) if bound == alias => (),
+                            None if confirm_missing_alias => (),
+                            _ => {
+                                return Err(io::Error::other(
+                                    "Confirm the original OX API alias before resuming this session",
+                                ));
+                            }
+                        }
+                        index.bind(&profile.project, &launcher.profiles.api, source, alias)?;
+                    }
+                    history::load(&profile, &history_owner, &saved, &alive, |batch| {
+                        emit(Data::History(batch))
+                    })?;
+                }
+                if let Billing::Api(alias) = &profile.route.billing {
+                    index.bind(&profile.project, &launcher.profiles.api, &id, alias)?
+                }
+                let output = emit.clone();
+                let link = pipe::Link::spawn(
+                    pipe::Launch {
+                        ox: launcher.ox.clone(),
+                        path: launcher.path.clone(),
+                        project: profile.project,
+                        billing: profile.route.billing,
+                        session,
+                        permission_mode: mode,
+                    },
+                    move |event| output(Data::Stock(event)),
+                )?;
+                emit(Data::Connected(link));
+                Ok(())
+            };
+            if let Err(e) = start() {
+                emit(Data::Failed(e.to_string()));
+            }
+        });
+        Ok(owner)
+    }
+    pub(super) fn claude_open(&mut self, id: &str) -> io::Result<()> {
+        self.claude_open_alias(id, false)
+    }
+    pub(super) fn claude_open_alias(&mut self, id: &str, confirm: bool) -> io::Result<()> {
+        if id.contains('/') {
+            return Ok(());
+        }
+        let raw = stock_id(id)?.to_owned();
+        self.transcripts.entry(id.into()).or_default().loading = true;
+        self.spawn_claude(Session::Resume(raw), None, confirm)?;
+        Ok(())
+    }
+    pub(super) fn claude_submit(
+        &mut self,
+        id: Option<&str>,
+        command: Option<&str>,
+    ) -> io::Result<()> {
+        if !self.can_send(id) || id.is_some_and(|s| s.contains('/')) {
+            return Err(io::Error::other(
+                "Open a ready parent Claude session to send",
+            ));
+        }
+        let text = command.unwrap_or_else(|| self.draft(id)).to_owned();
+        if text.trim().is_empty() {
+            return Err(io::Error::other("Enter a message"));
+        }
+        if !self.draft_images(id).is_empty() {
+            return Err(io::Error::other(
+                "Remove the attachment before submitting to Claude Code",
+            ));
+        }
+        let new_conversation = id.is_none() && command.is_none();
+        let message = new_id()?;
+        let owner = match id {
+            Some(id) => id.to_owned(),
+            None => match self.claude_mut().blank.take() {
+                Some(id) => id,
+                None => self.spawn_claude(Session::New(new_id()?), None, false)?,
+            },
+        };
+        if new_conversation {
+            self.first_title_prompt(&owner, &text);
+        }
+        if !self.claude().catalog.contains_key(&owner) {
+            let new = row(
+                &self.profile,
+                owner.clone(),
+                text.trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(120)
+                    .collect(),
+                now_secs(),
+            );
+            self.remember_claude(new);
+        }
+        self.selected = Some(owner.clone());
+        self.selection += 1;
+        self.claude_mut()
+            .sessions
+            .get_mut(&owner)
+            .ok_or_else(|| io::Error::other("Reconnect the session before sending"))?
+            .first = Some((message, text));
+        self.flush_claude(&owner)?;
+        if id.is_none() {
+            self.host_opened = Some(owner.clone());
+        }
+        if command.is_none() {
+            self.edit(id, String::new());
+        }
+        Ok(())
+    }
+    fn flush_claude(&mut self, owner: &str) -> io::Result<()> {
+        let Some(process) = self.claude_mut().sessions.get_mut(owner) else {
+            return Ok(());
+        };
+        let (Some(_), true) = (&process.link, process.initialized) else {
+            return Ok(());
+        };
+        let transcript = self.transcripts.entry(owner.into()).or_default();
+        transcript.loading = false;
+        transcript.ready = true;
+        transcript.verified = true;
+        let process = self.claude_mut().sessions.get_mut(owner).unwrap();
+        let Some((id, text)) = process.first.as_ref() else {
+            return Ok(());
+        };
+        process
+            .link
+            .as_ref()
+            .unwrap()
+            .send_user(id, vec![json!({"type":"text","text":text})])?;
+        let (id, text) = process.first.take().unwrap();
+        process.events.sent(&id, &text);
+        let transcript = self.transcripts.get_mut(owner).unwrap();
+        let turn = transcript
+            .active_turn
+            .get_or_insert_with(|| id.clone())
+            .clone();
+        transcript.observe_item(
+            turn,
+            id,
+            Item::UserMessage {
+                content: vec![Content {
+                    text: Some(text),
+                    path: None,
+                }],
+            },
+            true,
+            None,
+        );
+        self.changed.transcript(owner);
+        self.changed.mark(Changed::THREADS);
+        Ok(())
+    }
+    pub(super) fn claude_stop(&mut self, id: &str) -> io::Result<()> {
+        let process = self
+            .claude_mut()
+            .sessions
+            .get_mut(id)
+            .ok_or_else(|| io::Error::other("No active Claude session"))?;
+        let link = process
+            .link
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Waiting for Claude Code"))?;
+        let request = link.interrupt()?;
+        process.controls.insert(request, Control::Interrupt);
+        Ok(())
+    }
+    pub(super) fn claude_mode(&mut self, id: &str, mode: Access) -> io::Result<()> {
+        let process = self
+            .claude_mut()
+            .sessions
+            .get_mut(id)
+            .ok_or_else(|| io::Error::other("Open a Claude session first"))?;
+        let link = process
+            .link
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Waiting for Claude Code"))?;
+        let request = link.set_mode(
+            mode.mode()
+                .ok_or_else(|| io::Error::other("Unsupported permission mode"))?,
+        )?;
+        process.controls.insert(request, Control::Mode(mode));
+        Ok(())
+    }
+    pub(super) fn claude_choose(
+        &mut self,
+        id: Option<&str>,
+        choice: super::routes_thread::Choice,
+    ) -> io::Result<()> {
+        let super::routes_thread::Choice::Model(model) = choice else {
+            return Err(io::Error::other("Unsupported Claude session setting"));
+        };
+        let owner = id
+            .or(self.claude().blank.as_deref())
+            .ok_or_else(|| io::Error::other("Open a Claude session first"))?
+            .to_owned();
+        if self.profile.route.is_api() {
+            return Err(io::Error::other(
+                "Start a new Claude session to change its billing alias",
+            ));
+        }
+        let p = self
+            .claude_mut()
+            .sessions
+            .get_mut(&owner)
+            .ok_or_else(|| io::Error::other("Claude session has closed"))?;
+        let link = p
+            .link
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Waiting for Claude Code"))?;
+        let request = link.set_model(&model)?;
+        p.controls.insert(request, Control::Model(model));
+        Ok(())
+    }
+    pub(super) fn claude_fork(&mut self, id: &str) -> io::Result<()> {
+        let source = stock_id(id)?.to_owned();
+        let owner = self.spawn_claude(
+            Session::Fork {
+                source,
+                id: new_id()?,
+            },
+            None,
+            false,
+        )?;
+        let title = self
+            .catalog
+            .get(id)
+            .map_or("Claude session", ThreadRow::title);
+        self.remember_claude(row(
+            &self.profile,
+            owner.clone(),
+            format!("Fork of {title}"),
+            now_secs(),
+        ));
+        self.selected = Some(owner.clone());
+        self.selection += 1;
+        self.host_opened = Some(owner.clone());
+        self.transcripts.entry(owner).or_default().loading = true;
+        Ok(())
+    }
+    pub(super) fn claude_response(&mut self, id: &RequestId, answer: Value) -> io::Result<()> {
+        let (owner, ask) = self
+            .claude()
+            .asks
+            .get(id)
+            .ok_or_else(|| io::Error::other("Claude request has expired"))?;
+        self.claude()
+            .sessions
+            .get(owner)
+            .and_then(|p| p.link.as_ref())
+            .ok_or_else(|| io::Error::other("Claude session has closed"))?
+            .respond(&ask.request_id, answer)?;
+        self.claude_mut().asks.remove(id);
+        Ok(())
+    }
+    pub(super) fn claude_questions(&mut self, id: &RequestId, values: &[String]) -> io::Result<()> {
+        let (_, ask) = self
+            .claude()
+            .asks
+            .get(id)
+            .ok_or_else(|| io::Error::other("Claude request has expired"))?;
+        if values.len() != ask.questions.len() {
+            return Err(io::Error::other("Answer every question"));
+        }
+        let values = ask
+            .questions
+            .iter()
+            .zip(values)
+            .map(|(q, v)| (q.id.clone(), v.clone()))
+            .collect();
+        let answer = ask.answer(&values)?;
+        self.claude_response(id, answer)
+    }
+    pub fn terminal_session_id<'a>(&self, id: &'a str) -> io::Result<&'a str> {
+        if self.profile.route.runtime == Runtime::Claude {
+            stock_id(id)
+        } else {
+            Ok(id)
+        }
+    }
+}

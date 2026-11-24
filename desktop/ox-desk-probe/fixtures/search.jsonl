@@ -1,0 +1,7 @@
+{"expect":{"method":"initialize"},"capture":"i"}
+{"send":{"result":{}},"replyTo":"i"}
+{"expect":{"method":"initialized"}}
+{"expect":{"method":"thread/list"},"capture":"initial"}
+{"expect":{"method":"thread/list","params":{"cwd":"/synthetic","modelProviders":[],"sortKey":"updated_at","sourceKinds":["cli","vscode","exec","appServer","subAgent","subAgentThreadSpawn","subAgentReview","subAgentCompact","subAgentOther"],"limit":50,"cursor":null,"searchTerm":"linux"}},"capture":"search"}
+{"send":{"result":{"data":[{"id":"match","cwd":"/synthetic","modelProvider":"codeox","model":"fixture/demo","preview":"Linux build","updatedAt":5}]}},"replyTo":"search"}
+{"send":{"result":{"data":[],"nextCursor":"stale"}},"replyTo":"initial"}

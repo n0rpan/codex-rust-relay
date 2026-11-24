@@ -1,14 +1,17 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::task::AbortHandle;
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::AbortHandle,
+};
 
 use crate::provider::RelayError;
 
@@ -19,7 +22,6 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 pub(super) struct Jobs {
-    next: u64,
     entries: BTreeMap<u64, Job>,
 }
 
@@ -28,6 +30,8 @@ pub(super) struct Jobs {
 pub(super) struct Start {
     runtime: Runtime,
     mode: Mode,
+    #[serde(skip)]
+    host_parent: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     task: String,
@@ -35,14 +39,14 @@ pub(super) struct Start {
     workspace_write: bool,
 }
 
-#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum Runtime {
     Codex,
     Claude,
 }
 
-#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum Mode {
     Session,
@@ -56,12 +60,29 @@ pub(super) struct JobId {
     job_id: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Steer {
+    job_id: u64,
+    text: String,
+}
+
+struct Instruction {
+    text: String,
+    reply: oneshot::Sender<Result<Value, String>>,
+}
+
 struct Job {
+    sender: mpsc::Sender<Instruction>,
     state: Arc<Mutex<State>>,
     task: AbortHandle,
 }
 
 struct State {
+    runtime: Runtime,
+    mode: Mode,
+    can_steer: bool,
+    messages: VecDeque<Value>,
     status: &'static str,
     native_session: Option<String>,
     progress: String,
@@ -71,9 +92,21 @@ struct State {
 }
 
 impl State {
-    fn snapshot(&self, job_id: u64) -> Value {
+    fn record(&mut self, role: &str, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.messages.len() == 32 {
+            self.messages.pop_front();
+        }
+        self.messages
+            .push_back(json!({"role":role,"text":&text[..text.floor_char_boundary(4096)]}));
+    }
+
+    fn summary(&self, job_id: u64) -> Value {
         json!({
-            "job_id": job_id,
+            "job_id": job_id, "mode":self.mode, "runtime":self.runtime,
+            "can_steer": self.can_steer && self.status == "running",
             "status": self.status,
             "model": self.model,
             "native_session": self.native_session,
@@ -82,9 +115,45 @@ impl State {
             "error": self.error,
         })
     }
+    fn snapshot(&self, job_id: u64) -> Value {
+        let mut result = self.summary(job_id);
+        result["messages"] = json!(self.messages);
+        result
+    }
 }
 
 impl Jobs {
+    pub(super) fn list(&self) -> Value {
+        json!({"jobs":self.entries.iter().map(|(id,job)|job.state.lock().unwrap().summary(*id)).collect::<Vec<_>>()})
+    }
+
+    pub(super) fn steer(
+        &self,
+        request: Steer,
+        secrets: &[String],
+    ) -> Result<oneshot::Receiver<Result<Value, String>>, String> {
+        let job = self
+            .entries
+            .get(&request.job_id)
+            .ok_or("Unknown worker in this OX launch.")?;
+        let state = job.state.lock().unwrap();
+        if state.status != "running" || !state.can_steer {
+            return Err("This worker is not accepting input.".into());
+        }
+        let text = request.text.trim();
+        if text.is_empty() || text.len() > MAX_TEXT {
+            return Err("Send a nonempty worker message of at most 24 KiB.".into());
+        }
+        let (reply, received) = oneshot::channel();
+        job.sender
+            .try_send(Instruction {
+                text: clean(text, secrets),
+                reply,
+            })
+            .map_err(|_| "Worker input is busy or closed.")?;
+        Ok(received)
+    }
+
     pub(super) fn start(
         &mut self,
         request: Start,
@@ -111,13 +180,26 @@ impl Jobs {
         {
             self.entries.remove(&id);
         }
-        let command = request
-            .command(home, cwd, &secrets)
+        let mut command = request
+            .command(home, cwd)
             .map_err(|error| error.to_string())?;
-        self.next += 1;
-        let id = self.next;
+        // Worker IDs appear in archived transcripts. Never recycle a small counter on reconnect.
+        let id = loop {
+            let candidate = getrandom::u64().map_err(|e| e.to_string())? & ((1u64 << 52) - 1);
+            if candidate > 0 && !self.entries.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        if let Some(parent) = &request.host_parent {
+            command.env("OX_HOST_WORKER_PARENT", format!("ox:{parent}:{id}"));
+        }
+        let (sender, instructions) = mpsc::channel(4);
         let state = Arc::new(Mutex::new(State {
             status: "running",
+            can_steer: false,
+            runtime: request.runtime,
+            mode: request.mode,
+            messages: VecDeque::new(),
             model: request
                 .model
                 .clone()
@@ -127,14 +209,20 @@ impl Jobs {
             result: None,
             error: None,
         }));
+        state
+            .lock()
+            .unwrap()
+            .record("user", &clean(&request.task, &secrets));
         let initial = state.lock().unwrap().snapshot(id);
         let handle = tokio::spawn({
             let state = Arc::clone(&state);
             async move {
-                let result = match request.mode {
-                    Mode::Goal => run_goal(command, &request, &state, &secrets).await,
-                    Mode::Session | Mode::Workflow => {
-                        run_session(command, request.runtime, request.mode, &state, &secrets).await
+                let result = match request.runtime {
+                    Runtime::Codex => {
+                        run_codex(command, &request, &state, &secrets, instructions).await
+                    }
+                    Runtime::Claude => {
+                        run_claude(command, &request, &state, &secrets, instructions).await
                     }
                 };
                 let mut state = state.lock().unwrap();
@@ -153,6 +241,7 @@ impl Jobs {
         self.entries.insert(
             id,
             Job {
+                sender,
                 state,
                 task: handle.abort_handle(),
             },
@@ -190,6 +279,19 @@ impl Drop for Jobs {
 }
 
 impl Start {
+    pub(super) async fn authorize(
+        &mut self,
+        cwd: &Path,
+    ) -> Result<Option<crate::host_lifetime::Grant>, String> {
+        let grant = crate::host_lifetime::authorize(
+            cwd,
+            self.workspace_write,
+            self.runtime == Runtime::Claude,
+        )
+        .await?;
+        self.host_parent = grant.as_ref().map(|g| g.parent.clone());
+        Ok(grant)
+    }
     fn validate(&self) -> Result<(), String> {
         if self.task.trim().is_empty() || self.task.len() > 32 * 1024 {
             return Err("Provide a task of up to 32 KiB.".into());
@@ -215,8 +317,7 @@ impl Start {
         Ok(())
     }
 
-    fn command(&self, home: &Path, cwd: &Path, secrets: &[String]) -> Result<Command, RelayError> {
-        let task = crate::upstream::redact(self.task.trim(), secrets);
+    fn command(&self, home: &Path, cwd: &Path) -> Result<Command, RelayError> {
         let mut command = if let Some(model) = &self.model {
             let mut command = Command::new(std::env::current_exe()?);
             let client = match self.runtime {
@@ -234,8 +335,15 @@ impl Start {
                     "Run ox login claude on this host to use a Claude subscription worker.".into(),
                 );
             }
-            crate::native::claude_account_command(home)?
+            if crate::host_lifetime::hosted() {
+                let mut wrapper = Command::new(std::env::current_exe()?);
+                wrapper.args(["claude", "--subscription"]);
+                wrapper
+            } else {
+                crate::native::claude_account_command(home)?
+            }
         };
+        crate::host_lifetime::inherit(&mut command, self.workspace_write);
         command
             .current_dir(cwd)
             .env("CODEX_HOME", home)
@@ -247,42 +355,15 @@ impl Start {
         #[cfg(unix)]
         command.process_group(0);
         match (self.runtime, self.mode) {
-            (Runtime::Codex, Mode::Goal) => {
+            (Runtime::Codex, mode) => {
+                if mode == Mode::Goal {
+                    command.args(["--enable", "goals"]);
+                }
                 command
-                    .args([
-                        "--enable",
-                        "goals",
-                        "--no-daemon",
-                        "app-server",
-                        "--listen",
-                        "stdio://",
-                    ])
+                    .args(["--no-daemon", "app-server", "--listen", "stdio://"])
                     .stdin(Stdio::piped());
             }
-            (Runtime::Codex, _) => {
-                command
-                    .args([
-                        "--ask-for-approval",
-                        "never",
-                        "--no-daemon",
-                        "exec",
-                        "--json",
-                        "--skip-git-repo-check",
-                        "--sandbox",
-                        self.sandbox(),
-                        "--",
-                    ])
-                    .arg(task.as_ref())
-                    .stdin(Stdio::null());
-            }
             (Runtime::Claude, mode) => {
-                let task = if mode == Mode::Workflow {
-                    format!(
-                        "Run this task as a Claude Code workflow using your Workflow tool. If the tool is unavailable, explain that and stop. Objective:\n{task}"
-                    )
-                } else {
-                    task.into_owned()
-                };
                 let tools = if self.workspace_write {
                     "Read,Glob,Grep,Edit,Write,Bash,Workflow"
                 } else {
@@ -297,6 +378,8 @@ impl Start {
                 command
                     .args([
                         "--print",
+                        "--input-format",
+                        "stream-json",
                         "--output-format",
                         "stream-json",
                         "--verbose",
@@ -314,10 +397,8 @@ impl Start {
                         } else {
                             "Read,Glob,Grep"
                         },
-                        "--",
                     ])
-                    .arg(task)
-                    .stdin(Stdio::null());
+                    .stdin(Stdio::piped());
             }
         }
         Ok(command)
@@ -343,7 +424,7 @@ impl WorkerProcess {
     fn spawn(mut command: Command) -> Result<Self, RelayError> {
         let child = command
             .spawn()
-            .map_err(|_| "Could not start the installed worker client.")?;
+            .map_err(|error| format!("Could not start the installed worker client: {error}"))?;
         Ok(Self {
             group: child.id(),
             child,
@@ -365,75 +446,98 @@ impl Drop for WorkerProcess {
     }
 }
 
-async fn run_session(
-    command: Command,
-    runtime: Runtime,
-    mode: Mode,
-    state: &Mutex<State>,
-    secrets: &[String],
-) -> Result<&'static str, RelayError> {
-    let mut process = WorkerProcess::spawn(command)?;
-    let mut lines = process.output();
-    let mut used_workflow = false;
-    while let Some(line) = lines.next_line().await? {
-        if let Ok(event) = serde_json::from_str::<Value>(&line) {
-            if mode == Mode::Workflow && event["type"] == "assistant" {
-                used_workflow |= event["message"]["content"]
-                    .as_array()
-                    .is_some_and(|blocks| {
-                        blocks
-                            .iter()
-                            .any(|block| block["type"] == "tool_use" && block["name"] == "Workflow")
-                    });
-            }
-            relay_progress(&event, runtime, state, secrets);
-        }
-    }
-    let success = process.child.wait().await?.success();
-    process.group = None;
-    if !success {
-        return Err(
-            "The worker client exited with an error. Check its session or run ox doctor.".into(),
-        );
-    }
-    if mode == Mode::Workflow && !used_workflow {
-        return Err("Claude Code did not run the Workflow tool. Check the selected model, Claude Code version, and workflow permissions.".into());
-    }
-    Ok("completed")
-}
-
-fn relay_progress(event: &Value, runtime: Runtime, state: &Mutex<State>, secrets: &[String]) {
-    let mut state = state.lock().unwrap();
-    let (session, result, progress) = match runtime {
-        Runtime::Codex => {
-            let item = &event["item"];
-            let text = (item["type"] == "agent_message")
-                .then(|| item["text"].as_str())
-                .flatten();
-            (event["thread_id"].as_str(), text, event["type"].as_str())
-        }
-        Runtime::Claude => (
-            event["session_id"].as_str(),
-            event["result"].as_str(),
-            event["type"].as_str(),
-        ),
-    };
-    if let Some(id) = session {
-        state.native_session = Some(clean(id, secrets));
-    }
-    if let Some(text) = result {
-        state.result = Some(clean(text, secrets));
-    }
-    if let Some(kind) = progress {
-        state.progress = clean(kind, secrets);
-    }
-}
-
-async fn run_goal(
+async fn run_claude(
     command: Command,
     request: &Start,
     state: &Mutex<State>,
     secrets: &[String],
+    mut instructions: mpsc::Receiver<Instruction>,
+) -> Result<&'static str, RelayError> {
+    let mut process = WorkerProcess::spawn(command)?;
+    let mut lines = process.output();
+    let mut input = process.child.stdin.take().expect("worker stdin is piped");
+    let user_message = |text: &str| json!({"type":"user","message":{"role":"user","content":text},"parent_tool_use_id":null,"session_id":""});
+    let task = clean(request.task.trim(), secrets);
+    let task = if request.mode == Mode::Workflow {
+        format!(
+            "Run this task as a Claude Code workflow using your Workflow tool. If the tool is unavailable, explain that and stop. Objective:\n{task}"
+        )
+    } else {
+        task
+    };
+    write_rpc(&mut input, user_message(&task)).await?;
+    let mut used_workflow = false;
+    let mut pending = 1usize;
+    while pending > 0 {
+        let line = tokio::select! {
+            Some(message) = instructions.recv() => {
+                if message.reply.is_closed() { continue; }
+                write_rpc(&mut input, user_message(&message.text)).await?;
+                pending += 1;
+                state.lock().unwrap().record("user", &message.text);
+                let _ = message.reply.send(Ok(json!({"accepted":true})));
+                continue;
+            }
+            line = lines.next_line() => line?,
+        };
+        let line = line.ok_or("Claude Code closed before returning a result.")?;
+        let Ok(event) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let mut state = state.lock().unwrap();
+        if let Some(id) = event["session_id"].as_str() {
+            state.native_session = Some(clean(id, secrets));
+        }
+        if let Some(kind) = event["type"].as_str() {
+            state.progress = clean(kind, secrets);
+        }
+        match event["type"].as_str() {
+            Some("assistant") => {
+                for block in event["message"]["content"].as_array().into_iter().flatten() {
+                    if block["type"] == "tool_use" {
+                        used_workflow |= block["name"] == "Workflow";
+                    }
+                    if block["type"] == "text"
+                        && let Some(text) = block["text"].as_str()
+                    {
+                        state.record("assistant", &clean(text, secrets));
+                    }
+                }
+            }
+            Some("result") => {
+                if event["is_error"] == true {
+                    return Err("Claude Code reported a worker error.".into());
+                }
+                if let Some(text) = event["result"].as_str() {
+                    state.result = Some(clean(text, secrets));
+                }
+                pending -= 1;
+            }
+            _ => {}
+        }
+        state.can_steer = pending > 0;
+    }
+    drop(input);
+    if request.mode == Mode::Workflow && !used_workflow {
+        return Err("Claude Code did not run the Workflow tool. Check the selected model, Claude Code version, and workflow permissions.".into());
+    }
+    // Closing input lets the client flush its final session state before leaving the process group.
+    if let Ok(status) = tokio::time::timeout(Duration::from_secs(5), process.child.wait()).await {
+        let status = status?;
+        process.group = None;
+        if !status.success() {
+            return Err("Claude Code exited with an error after its result.".into());
+        }
+    }
+    Ok("completed")
+}
+
+async fn run_codex(
+    command: Command,
+    request: &Start,
+    state: &Mutex<State>,
+    secrets: &[String],
+    mut instructions: mpsc::Receiver<Instruction>,
 ) -> Result<&'static str, RelayError> {
     let mut process = WorkerProcess::spawn(command)?;
     let mut lines = process.output();
@@ -447,7 +551,7 @@ async fn run_goal(
         &mut lines,
         1,
         "initialize",
-        json!({"clientInfo":{"name":"ox-worker","version": crate::VERSION}}),
+        json!({"clientInfo":{"name":"ox-worker","version":crate::VERSION}}),
     )
     .await?;
     write_rpc(&mut input, json!({"method":"initialized"})).await?;
@@ -456,51 +560,100 @@ async fn run_goal(
         &mut lines,
         2,
         "thread/start",
-        json!({
-            "model": request.model,
-            "sandbox": request.sandbox(),
-            "approvalPolicy": "never",
-        }),
+        json!({"model":request.model,"sandbox":request.sandbox(),"approvalPolicy":"never"}),
     )
     .await?;
     let thread = session["thread"]["id"]
         .as_str()
         .ok_or("Codex returned no worker session ID.")?;
     state.lock().unwrap().native_session = Some(clean(thread, secrets));
-    rpc(
-        &mut input,
-        &mut lines,
-        3,
-        "thread/goal/set",
-        json!({
-            "threadId": thread,
-            "objective": crate::upstream::redact(request.task.trim(), secrets),
-            "status": "active",
-        }),
-    )
-    .await?;
+    let task = clean(request.task.trim(), secrets);
+    let (method, params) = if request.mode == Mode::Goal {
+        (
+            "thread/goal/set",
+            json!({"threadId":thread,"objective":task,"status":"active"}),
+        )
+    } else {
+        (
+            "turn/start",
+            json!({"threadId":thread,"input":[{"type":"text","text":task}]}),
+        )
+    };
+    // Consume notifications and replies on the same loop, including ones arriving before the start reply.
+    write_rpc(&mut input, json!({"id":3,"method":method,"params":params})).await?;
+    let mut turn = None::<String>;
     let mut terminal = None;
-    let mut in_turn = false;
-    while let Some(line) = lines.next_line().await? {
+    let mut seq = 3u64;
+    let mut sending = BTreeMap::<u64, Instruction>::new();
+    let mut awaiting_start = true;
+    let start_timeout = tokio::time::sleep(RPC_TIMEOUT);
+    tokio::pin!(start_timeout);
+    loop {
+        let line = tokio::select! {
+            _ = &mut start_timeout, if awaiting_start => return Err(format!("Codex did not answer {method}.").into()),
+            Some(message) = instructions.recv() => {
+                if message.reply.is_closed() { continue; }
+                let Some(active) = turn.as_ref() else {
+                    let _ = message.reply.send(Err("The worker turn has ended.".into()));
+                    continue;
+                };
+                seq += 1;
+                let params = json!({"threadId":thread, "expectedTurnId":active, "input":[{"type":"text", "text":message.text}]});
+                write_rpc(&mut input, json!({"id":seq, "method":"turn/steer", "params":params})).await?;
+                sending.insert(seq, message);
+                continue;
+            }
+            line = lines.next_line() => line?,
+        };
+        let line = line.ok_or("Codex closed before the worker finished.")?;
         let Ok(event) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
         deny_approval(&mut input, &event).await?;
-        let params = &event["params"];
+        if event.get("method").is_none()
+            && let Some(id) = event["id"].as_u64()
+        {
+            if id == 3 {
+                if event.get("error").is_some() {
+                    return Err(format!("Codex rejected {method}.").into());
+                }
+                awaiting_start = false;
+            }
+            if let Some(message) = sending.remove(&id) {
+                let accepted = if event.get("result").is_some() {
+                    state.lock().unwrap().record("user", &message.text);
+                    Ok(json!({"accepted":true}))
+                } else {
+                    Err("Codex rejected the instruction for this worker turn.".into())
+                };
+                let _ = message.reply.send(accepted);
+            }
+            continue;
+        }
+        let p = &event["params"];
+        if p["threadId"].as_str() != Some(thread) {
+            continue;
+        }
+        let mut state = state.lock().unwrap();
         match event["method"].as_str() {
-            Some("turn/started") => in_turn = true,
+            Some("turn/started") => {
+                turn = p["turn"]["id"].as_str().map(str::to_owned);
+                state.can_steer = turn.is_some();
+                state.progress = "Working".into();
+            }
             Some("turn/completed") => {
-                in_turn = false;
-                if params["turn"]["status"] == "failed" {
-                    return Err(
-                        "A Codex goal turn failed. Resume the worker session to see its error."
-                            .into(),
-                    );
+                turn = None;
+                state.can_steer = false;
+                if p["turn"]["status"] == "failed" {
+                    return Err("The Codex worker turn failed.".into());
+                }
+                if request.mode != Mode::Goal {
+                    terminal = Some("completed");
                 }
             }
             Some("thread/goal/updated") => {
-                let status = params["goal"]["status"].as_str().unwrap_or("active");
-                state.lock().unwrap().progress = format!("Goal {status}");
+                let status = p["goal"]["status"].as_str().unwrap_or("active");
+                state.progress = format!("Goal {status}");
                 terminal = match status {
                     "complete" => Some("completed"),
                     "blocked" | "paused" | "usageLimited" | "budgetLimited" => Some("stopped"),
@@ -508,20 +661,28 @@ async fn run_goal(
                 };
             }
             Some("item/completed") => {
-                let item = &params["item"];
+                let item = &p["item"];
                 if item["type"] == "agentMessage"
                     && let Some(text) = item["text"].as_str()
                 {
-                    state.lock().unwrap().result = Some(clean(text, secrets));
+                    let text = clean(text, secrets);
+                    state.record("assistant", &text);
+                    state.result = Some(text);
+                } else if let Some(name) = item["type"]
+                    .as_str()
+                    .filter(|n| !matches!(*n, "reasoning" | "userMessage"))
+                {
+                    state.record("tool", &clean(name, secrets));
                 }
             }
             _ => {}
         }
-        if !in_turn && let Some(status) = terminal {
+        if turn.is_none()
+            && let Some(status) = terminal
+        {
             return Ok(status);
         }
     }
-    Err("Codex app-server exited before the goal stopped.".into())
 }
 
 async fn rpc(

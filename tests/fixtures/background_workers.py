@@ -62,6 +62,20 @@ def mcp_probe():
     assert status["result"] == "background workflow complete", status
     print("MCP started an actual Claude Code workflow and collected its result.", flush=True)
 
+    running = call("start_ox_worker", {"runtime":"claude", "mode":"session",
+                                        "model":"messages/claude-sonnet-5", "task":"Check the worker inbox."})
+    ref = {"job_id": running["job_id"]}
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if any(j["job_id"] == ref["job_id"] and j["can_steer"] for j in call("list_ox_workers", {})["jobs"]):
+            break
+        time.sleep(0.1)
+    assert call("steer_ox_worker", {**ref, "text":"Return the steering marker."})["accepted"]
+    status = wait_for_job(call, ref)
+    assert status["result"] == "worker steering received", status
+    assert any(row["role"] == "user" and "steering marker" in row["text"] for row in status["messages"]), status
+    print("A live Claude worker accepted a follow-up and returned its answer.", flush=True)
+
     edit = call("start_ox_worker", {
         "runtime": "claude", "mode": "session", "model": "messages/claude-sonnet-5",
         "task": EDIT, "workspace_write": True,
@@ -145,6 +159,8 @@ class Vendor(http.server.BaseHTTPRequestHandler):
 
     def messages(self, request):
         inputs = json.dumps(request["messages"])
+        if "Check the worker inbox." in inputs and "Return the steering marker." not in inputs:
+            time.sleep(1)
         if EDIT in inputs and "toolu_fixture_edit" not in inputs:
             assert any(tool.get("name") == "Write" for tool in request.get("tools", []))
             block = {"type": "tool_use", "id": "toolu_fixture_edit", "name": "Write", "input": {}}
@@ -165,6 +181,8 @@ class Vendor(http.server.BaseHTTPRequestHandler):
             block = {"type": "text", "text": ""}
             delta = {"type": "text_delta",
                      "text": "background workflow complete" if WORKFLOW in inputs else "workflow agent marker"}
+            if "Return the steering marker." in inputs:
+                delta["text"] = "worker steering received"
             stop = "end_turn"
         self.stream([
             {"type": "message_start", "message": {"id": "msg_bg", "type": "message", "role": "assistant",

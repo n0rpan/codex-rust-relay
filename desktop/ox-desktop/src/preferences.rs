@@ -1,0 +1,1178 @@
+//! Native OX settings and first-run account connection.
+mod about;
+mod advanced;
+pub mod behavior;
+mod forms;
+mod key_field;
+mod remote;
+use crate::{
+    appearance::Palette,
+    platform,
+    settings::{
+        self, Credential, Settings,
+        model::{self, Cell, Edit, Key, Values},
+        protocol::Request,
+    },
+};
+use forms::{CONNECTION, Fields, LEGACY, MODEL, Provider, Registry, SEARCH};
+use gpui::{prelude::*, *};
+use gpui_component::input::{Input, InputState};
+use std::path::PathBuf;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Remote,
+    Accounts,
+    Advanced,
+    Behavior,
+    Providers,
+    Search,
+    Favorites,
+    Credentials,
+    Legacy,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Connection,
+    Options,
+    Models,
+}
+
+struct KeyField {
+    credential: Credential,
+    input: Entity<key_field::KeyField>,
+}
+struct Legacy {
+    model: Entity<InputState>,
+    fields: Fields,
+    id: String,
+    initial_model: String,
+}
+
+pub struct Preferences {
+    focus: FocusHandle,
+    about: Entity<about::About>,
+    remote: Option<Entity<remote::Remote>>,
+    advanced: Option<advanced::Advanced>,
+    project: PathBuf,
+    prefer_providers: bool,
+    settings: Settings,
+    page: Page,
+    section: Section,
+    selected: Option<usize>,
+    model: Option<usize>,
+    registry: Option<Registry>,
+    legacy: Option<Legacy>,
+    favorites: Vec<String>,
+    alias: Entity<InputState>,
+    keys: Vec<KeyField>,
+    busy: bool,
+    message: String,
+    error: bool,
+    loading_models: bool,
+    scroll: ScrollHandle,
+    search_revision: String,
+    conflict: Option<(Page, String)>,
+}
+
+impl Preferences {
+    pub fn new(project: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let alias = forms::input("", "provider/model", window, cx);
+        cx.subscribe(&alias, |_, _, _: &gpui_component::input::InputEvent, cx| {
+            cx.notify()
+        })
+        .detach();
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+        let mut ui = Self {
+            focus,
+            advanced: None,
+            about: cx.new(about::About::new),
+            remote: None,
+            project,
+            prefer_providers: false,
+            settings: Settings::default(),
+            page: Page::Providers,
+            section: Section::Connection,
+            selected: None,
+            model: None,
+            registry: None,
+            legacy: None,
+            favorites: vec![],
+            alias,
+            keys: vec![],
+            busy: false,
+            message: String::new(),
+            error: false,
+            loading_models: false,
+            scroll: ScrollHandle::new(),
+            search_revision: String::new(),
+            conflict: None,
+        };
+        ui.reload(window, cx);
+        ui
+    }
+    pub fn providers(project: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut view = Self::new(project, window, cx);
+        view.prefer_providers = true;
+        view
+    }
+
+    fn goto(&mut self, page: Page, cx: &mut Context<Self>) {
+        self.remote = (page == Page::Remote)
+            .then(|| cx.new(|cx| remote::Remote::new(self.project.clone(), cx)));
+        self.page = page;
+        self.scroll.set_offset(point(px(0.), px(0.)));
+        cx.notify();
+    }
+    fn report(&mut self, result: Result<(), String>, success: &str, cx: &mut Context<Self>) {
+        match result {
+            Ok(()) => {
+                self.message = success.into();
+                self.error = false
+            }
+            Err(e) => {
+                self.message = e;
+                self.error = true
+            }
+        }
+        cx.notify();
+    }
+    fn reload(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        cx.notify();
+        cx.spawn_in(w, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async { settings::load() })
+                .await;
+            let _ = view.update_in(cx, |s, w, cx| {
+                s.busy = false;
+                match result {
+                    Ok(data) => {
+                        s.conflict = None;
+                        s.install(data, None, w, cx);
+                    }
+                    Err(e) => s.report(Err(e), "", cx),
+                }
+            });
+        })
+        .detach();
+    }
+    fn install(
+        &mut self,
+        mut data: Settings,
+        page: Option<Page>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let all = page.is_none();
+        let advanced = page == Some(Page::Advanced);
+        // A text save can change several native forms at once. Refresh each clean
+        // form and keep any unsaved native draft on its original revision.
+        let registry = self.registry.as_ref();
+        let providers = all
+            || page == Some(Page::Providers)
+            || advanced
+                && registry.is_none_or(
+                    |r| matches!(r.edit(cx), Ok(Edit::Providers { changes }) if changes.is_empty()),
+                );
+        let search = all
+            || page == Some(Page::Search)
+            || advanced
+                && registry.is_none_or(|r| {
+                    r.search
+                        .patch(&[SEARCH], false, cx)
+                        .is_ok_and(|p| p.is_empty())
+                });
+        let favorites = all
+            || page == Some(Page::Favorites)
+            || advanced && self.favorites == self.settings.favorites;
+        let legacy = all
+            || page == Some(Page::Legacy)
+            || advanced
+                && self.legacy.as_ref().is_none_or(|l| {
+                    l.model.read(cx).value().trim() == l.initial_model
+                        && l.fields
+                            .patch(&[LEGACY], false, cx)
+                            .is_ok_and(|p| p.is_empty())
+                });
+        if providers || search {
+            match (providers, self.registry.as_mut(), data.registry.take()) {
+                (false, Some(draft), Some(rows)) => {
+                    draft.search = Fields::new(rows.search, &[SEARCH], w, cx);
+                }
+                (_, previous, Some(rows)) => {
+                    let mut loaded = Registry::new(rows, w, cx);
+                    if !search && let Some(draft) = previous {
+                        std::mem::swap(&mut loaded.search, &mut draft.search);
+                    }
+                    self.registry = Some(loaded);
+                }
+                (_, _, None) => self.registry = None,
+            }
+        }
+        if search {
+            self.search_revision = data.revisions.registry.clone();
+        }
+        if providers {
+            self.selected = None;
+            self.model = None;
+            self.section = Section::Connection;
+        } else {
+            data.revisions.registry = self.settings.revisions.registry.clone();
+        }
+        if favorites {
+            self.favorites.clone_from(&data.favorites);
+        } else {
+            data.favorites.clone_from(&self.settings.favorites);
+            data.revisions.favorites = self.settings.revisions.favorites.clone()
+        }
+        if legacy {
+            self.legacy = data.legacy.take().map(|l| {
+                let initial_model = l.model.as_ref().map(forms::display).unwrap_or_default();
+                Legacy {
+                    id: l.id,
+                    model: forms::input(&initial_model, "Default model ID", w, cx),
+                    initial_model,
+                    fields: Fields::new(l.fields, &[LEGACY], w, cx),
+                }
+            })
+        } else {
+            data.revisions.legacy = self.settings.revisions.legacy.clone()
+        }
+        if !all && page != Some(Page::Credentials) {
+            data.revisions.keys = self.settings.revisions.keys.clone();
+        }
+        let mut old = std::mem::take(&mut self.keys);
+        self.keys = data
+            .credentials
+            .iter()
+            .map(|c| KeyField {
+                credential: c.clone(),
+                input: old
+                    .iter()
+                    .position(|k| k.credential.name == c.name && k.credential.scope == c.scope)
+                    .map(|i| old.remove(i).input)
+                    .unwrap_or_else(|| cx.new(key_field::KeyField::new)),
+            })
+            .collect();
+        if all && data.api_provider.is_none() && !self.prefer_providers {
+            self.goto(Page::Accounts, cx)
+        }
+        let message = data.issues.join("\n");
+        self.error = !message.is_empty();
+        self.message = message;
+        self.settings = data;
+        cx.notify()
+    }
+    fn submit(
+        &mut self,
+        request: Request,
+        after: Option<Page>,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy {
+            return;
+        }
+        let page = self.page;
+        self.busy = true;
+        self.message.clear();
+        cx.notify();
+        cx.spawn_in(w, async move |view, cx| {
+            let (request, result) = cx.background_executor().spawn(async move {
+                let result = settings::apply(&request);
+                (request, result)
+            }).await;
+            let _ = view.update_in(cx, |s, w, cx| {
+                s.busy = false;
+                if !matches!(&result, Ok(Ok(_))) {
+                    s.restore_key(request, cx);
+                }
+                match result {
+                    Ok(Ok(data)) => {
+                        s.conflict = None;
+                        s.install(data, Some(page), w, cx);
+                        if let Some(next) = after { s.goto(next, cx); }
+                        if !s.error {
+                            let success = if page == Page::Credentials { "Credential updated." } else { "Changes saved." };
+                            s.report(Ok(()), success, cx);
+                        }
+                    }
+                    Ok(Err(revision)) => {
+                        s.conflict = Some((page, revision));
+                        s.report(Err("Changed on disk. Your draft is still here. Save again to apply your edits to the new revision, or discard the draft and reload.".into()), "", cx);
+                    }
+                    Err(message) => s.report(Err(message), "", cx),
+                }
+            });
+        }).detach();
+    }
+    fn restore_key(&self, request: Request, cx: &mut Context<Self>) {
+        if let Request::EditKey {
+            name,
+            scope,
+            value: Some(value),
+            ..
+        } = request
+            && let Some(field) = self
+                .keys
+                .iter()
+                .find(|k| k.credential.name == name && k.credential.scope == scope)
+        {
+            field.input.update(cx, |f, cx| f.restore(value, cx));
+        }
+    }
+    fn revision(&self, page: Page) -> String {
+        if let Some((p, r)) = &self.conflict
+            && *p == page
+        {
+            return r.clone();
+        }
+        match page {
+            Page::Providers => &self.settings.revisions.registry,
+            Page::Search => &self.search_revision,
+            Page::Favorites => &self.settings.revisions.favorites,
+            Page::Legacy => &self.settings.revisions.legacy,
+            Page::Credentials => &self.settings.revisions.keys,
+            Page::Remote | Page::Accounts | Page::Behavior | Page::Advanced => {
+                return String::new();
+            }
+        }
+        .clone()
+    }
+    fn save(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        let draft = (|| -> Result<Edit, String> {
+            Ok(match self.page {
+                Page::Providers => self
+                    .registry
+                    .as_ref()
+                    .ok_or("Could not read providers.")?
+                    .edit(cx)?,
+                Page::Search => Edit::Search {
+                    fields: self
+                        .registry
+                        .as_ref()
+                        .ok_or("Could not read search settings.")?
+                        .search
+                        .patch(&[SEARCH], false, cx)?,
+                },
+                Page::Legacy => {
+                    let l = self.legacy.as_ref().ok_or("No legacy provider selected.")?;
+                    let mut fields = l.fields.patch(&[LEGACY], false, cx)?;
+                    let model = l.model.read(cx).value().trim().to_owned();
+                    if model != l.initial_model {
+                        fields.insert(Key::Model, (!model.is_empty()).then_some(Cell::Text(model)));
+                    }
+                    Edit::Legacy {
+                        id: l.id.clone(),
+                        fields,
+                    }
+                }
+                Page::Favorites => Edit::Favorites {
+                    models: self.favorites.clone(),
+                },
+                _ => return Err("Select a settings page.".into()),
+            })
+        })();
+        match draft {
+            Ok(edit) => {
+                let next = (self.page == Page::Providers && self.selected.is_some())
+                    .then_some(Page::Credentials);
+                self.submit(
+                    Request::Edit {
+                        revision: self.revision(self.page),
+                        edit,
+                    },
+                    next,
+                    w,
+                    cx,
+                )
+            }
+            Err(e) => self.report(Err(e), "", cx),
+        }
+    }
+    fn add_provider(
+        &mut self,
+        mut row: model::ProviderRow,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(registry) = self.registry.as_mut() else {
+            return;
+        };
+        let base = row.id.clone();
+        let mut n = 2;
+        while registry
+            .providers
+            .iter()
+            .any(|p| p.id.read(cx).value().as_ref() == row.id)
+        {
+            row.id = format!("{base}-{n}");
+            n += 1;
+        }
+        if row.id != base {
+            row.fields.insert(
+                Key::CredentialEnv,
+                Cell::Text(format!(
+                    "{}_API_KEY",
+                    row.id.to_uppercase().replace('-', "_")
+                )),
+            );
+        }
+        registry.providers.push(Provider::new(row, true, w, cx));
+        self.selected = Some(registry.providers.len() - 1);
+        self.model = None;
+        self.section = Section::Connection;
+        self.goto(Page::Providers, cx);
+    }
+    fn key(&mut self, i: usize, remove: bool, w: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let Some(k) = self.keys.get(i) else { return };
+        let req = Request::EditKey {
+            revision: self.revision(Page::Credentials),
+            name: k.credential.name.clone(),
+            scope: k.credential.scope.clone(),
+            value: (!remove).then(|| k.input.update(cx, |f, cx| f.take(cx))),
+        };
+        self.submit(req, None, w, cx)
+    }
+    fn test_provider(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(provider) = self.registry.as_ref().and_then(|r| r.providers.get(i)) else {
+            return;
+        };
+        let Some(id) = provider.original.clone() else {
+            self.report(Err("Save this provider before testing.".into()), "", cx);
+            return;
+        };
+        if !matches!(provider.edit(cx), Ok(None)) {
+            self.report(
+                Err("Save your provider changes before testing.".into()),
+                "",
+                cx,
+            );
+            return;
+        }
+        let revision = self.settings.revisions.registry.clone();
+        self.busy = true;
+        self.message.clear();
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result =
+                cx.background_executor()
+                    .spawn(async move {
+                        settings::request::<usize>(Request::TestProvider { id, revision })
+                    })
+                    .await;
+            let _ = view.update(cx, |s, cx| {
+                s.busy = false;
+                match result {
+                    Ok(n) => s.report(
+                        Ok(()),
+                        &format!("Connection succeeded. {n} coding models returned."),
+                        cx,
+                    ),
+                    Err(e) => s.report(Err(e), "", cx),
+                }
+            });
+        })
+        .detach();
+    }
+    fn fetch_models(&mut self, cx: &mut Context<Self>) {
+        if self.loading_models {
+            return;
+        }
+        self.loading_models = true;
+        cx.spawn(async move |s, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async { settings::discover_models() })
+                .await;
+            let _ = s.update(cx, |s, cx| {
+                s.loading_models = false;
+                match result {
+                    Ok(models) => {
+                        s.settings.models = models;
+                        s.report(Ok(()), "Model catalog updated.", cx)
+                    }
+                    Err(e) => s.report(Err(e), "", cx),
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+    fn account_view(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let card = |title: &str, sub: &str| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .p_4()
+                .border_1()
+                .border_color(rgb(p.line))
+                .rounded_lg()
+                .bg(rgb(p.panel))
+                .child(div().text_lg().child(title.to_owned()))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(p.muted))
+                        .child(sub.to_owned()),
+                )
+        };
+        let codex = match self.settings.chatgpt_account.as_deref() {
+            Some("configured_keyring") => "Codex checks your system keyring when a session opens.",
+            Some(_) => "A native Codex sign-in is saved on this computer.",
+            None => "Use your ChatGPT plan with stock Codex.",
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(card("ChatGPT", codex).child(div().child(button(
+                "chatgpt-sign-in",
+                "Sign in with ChatGPT",
+                true,
+                p,
+                cx.listener(|s, _, _, cx| {
+                    let result = platform::launch_chatgpt_login(&s.project);
+                    s.report(
+                        result,
+                        "Complete sign-in in the terminal, then return to your session.",
+                        cx,
+                    );
+                }),
+            ))))
+            .child(
+                card(
+                    "API provider",
+                    "Choose a provider and add its key to use API models in Codex.",
+                )
+                .child(div().child(button(
+                    "setup-api",
+                    "Configure provider",
+                    false,
+                    p,
+                    cx.listener(|s, _, _, cx| {
+                        s.selected = None;
+                        s.goto(Page::Providers, cx)
+                    }),
+                ))),
+            )
+            .child(
+                card(
+                    "Claude Code",
+                    if self.settings.claude_account {
+                        "A native Claude sign-in is saved on this computer."
+                    } else {
+                        "Use your Claude subscription in the installed Claude Code terminal."
+                    },
+                )
+                .child(div().child(button(
+                    "claude-sign-in",
+                    "Sign in with Claude",
+                    false,
+                    p,
+                    cx.listener(|s, _, _, cx| {
+                        let result = platform::launch_claude_login(&s.project);
+                        s.report(result, "Complete Claude Code sign-in in the terminal.", cx);
+                    }),
+                ))),
+            )
+            .child(self.about.clone())
+    }
+    fn providers_view(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let mut view = div().flex().flex_col().gap_4();
+        let Some(registry) = &self.registry else {
+            return view.child("The provider file could not be loaded.");
+        };
+        if let Some(i) = self.selected
+            && let Some(provider) = registry.providers.get(i)
+        {
+            let mut sections = div().flex().gap_2().flex_wrap();
+            for (s, title) in [
+                (Section::Connection, "Connection"),
+                (Section::Options, "Adapter options"),
+                (Section::Models, "Models"),
+            ] {
+                if s == Section::Options && provider.wire_fields(cx).is_empty() {
+                    continue;
+                }
+                sections = sections.child(button(
+                    title,
+                    title,
+                    self.section == s,
+                    p,
+                    cx.listener(move |v, _, _, cx| {
+                        v.section = s;
+                        v.scroll.set_offset(point(px(0.), px(0.)));
+                        cx.notify()
+                    }),
+                ));
+            }
+            view = view
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(button(
+                            "all-providers",
+                            "‹  All providers",
+                            false,
+                            p,
+                            cx.listener(|v, _, _, cx| {
+                                v.selected = None;
+                                v.model = None;
+                                cx.notify()
+                            }),
+                        ))
+                        .child(button(
+                            "save-provider",
+                            "Save provider",
+                            true,
+                            p,
+                            cx.listener(|s, _, w, cx| s.save(w, cx)),
+                        )),
+                )
+                .child(sections)
+                .child(div().child(button(
+                    "test-provider",
+                    "Test saved connection",
+                    false,
+                    p,
+                    cx.listener(move |s, _, _, cx| s.test_provider(i, cx)),
+                )));
+            match self.section {
+                Section::Connection => {
+                    view = view
+                        .child(input_row("Provider ID", &provider.id, p))
+                        .child(provider.fields.render(CONNECTION, "provider", p, cx))
+                }
+                Section::Options => {
+                    view = view.child(provider.fields.render(
+                        provider.wire_fields(cx),
+                        "adapter",
+                        p,
+                        cx,
+                    ))
+                }
+                Section::Models => {
+                    if let Some(m) = self.model
+                        && let Some(model) = provider.models.get(m)
+                    {
+                        return view
+                            .child(button(
+                                "all-models",
+                                "‹  Model list",
+                                false,
+                                p,
+                                cx.listener(|s, _, _, cx| {
+                                    s.model = None;
+                                    cx.notify()
+                                }),
+                            ))
+                            .child(model.render(MODEL, "model", p, cx))
+                            .child(div().child(button(
+                                "remove-model",
+                                "Remove model from draft",
+                                false,
+                                p,
+                                cx.listener(move |s, _, _, cx| {
+                                    if let Some(r) = s.registry.as_mut() {
+                                        r.providers[i].models.remove(m);
+                                    }
+                                    s.model = None;
+                                    cx.notify()
+                                }),
+                            )));
+                    }
+                    for (m, model) in provider.models.iter().enumerate() {
+                        let name = model.value(Key::Id, cx);
+                        view = view.child(button(
+                            ("model", m),
+                            if name.is_empty() {
+                                "Untitled model".into()
+                            } else {
+                                name
+                            },
+                            false,
+                            p,
+                            cx.listener(move |s, _, _, cx| {
+                                s.model = Some(m);
+                                cx.notify()
+                            }),
+                        ));
+                    }
+                    view = view.child(div().child(button(
+                        "add-model",
+                        "Add model",
+                        false,
+                        p,
+                        cx.listener(move |s, _, w, cx| {
+                            let models = &mut s.registry.as_mut().unwrap().providers[i].models;
+                            models.push(Fields::new(Values::new(), &[MODEL], w, cx));
+                            s.model = Some(models.len() - 1);
+                            cx.notify();
+                        }),
+                    )));
+                }
+            }
+            view.child(div().child(button(
+                "remove-provider",
+                "Remove provider from draft",
+                false,
+                p,
+                cx.listener(move |s, _, _, cx| {
+                    s.registry.as_mut().unwrap().providers.remove(i);
+                    s.selected = None;
+                    s.model = None;
+                    s.report(
+                        Ok(()),
+                        "Provider removed from draft. Save changes to apply.",
+                        cx,
+                    );
+                }),
+            )))
+        } else {
+            if !registry.providers.is_empty() {
+                view = view.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(div().text_lg().child("Configured providers"))
+                        .child(button(
+                            "save-routes",
+                            "Save changes",
+                            true,
+                            p,
+                            cx.listener(|s, _, w, cx| s.save(w, cx)),
+                        )),
+                );
+            } else if !self.settings.revisions.registry.is_empty() {
+                view = view.child(div().child(button(
+                    "save-empty",
+                    "Save changes",
+                    true,
+                    p,
+                    cx.listener(|s, _, w, cx| s.save(w, cx)),
+                )));
+            }
+            for (i, provider) in registry.providers.iter().enumerate() {
+                let id = provider.id.read(cx).value().to_string();
+                let title = provider.fields.value(Key::Name, cx);
+                view = view.child(
+                    div()
+                        .id(("provider", i))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(p.line))
+                        .bg(rgb(p.panel))
+                        .p_3()
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(rgb(p.hover)))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(if title.is_empty() {
+                            id
+                        } else {
+                            format!("{title}  ·  {id}")
+                        })
+                        .child(div().text_sm().text_color(rgb(p.muted)).child("Edit  ›"))
+                        .on_click(cx.listener(move |s, _, _, cx| {
+                            s.selected = Some(i);
+                            s.section = Section::Connection;
+                            s.model = None;
+                            cx.notify()
+                        })),
+                );
+            }
+            let mut presets = div().flex().flex_wrap().gap_2();
+            for (i, (name, template)) in self.settings.presets.iter().enumerate() {
+                let template = template.clone();
+                presets = presets.child(button(
+                    ("new-provider", i),
+                    name.clone(),
+                    false,
+                    p,
+                    cx.listener(move |s, _, w, cx| s.add_provider(template.clone(), w, cx)),
+                ));
+            }
+            view.child(div().text_lg().child("Add provider"))
+                .child(presets)
+        }
+    }
+    fn credentials_view(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let mut view = div().flex().flex_col().gap_3();
+        if self.keys.is_empty() {
+            return view
+                .child("Save a provider connection to add its API key.")
+                .child(div().child(button(
+                    "configure-keys",
+                    "Add provider",
+                    true,
+                    p,
+                    cx.listener(|s, _, _, cx| s.goto(Page::Providers, cx)),
+                )));
+        }
+        for (i, k) in self.keys.iter().enumerate() {
+            let c = &k.credential;
+            let status = match (c.configured, c.environment, c.saved) {
+                (false, _, _) => "Inactive destination",
+                (_, true, true) => "Environment key overrides saved key",
+                (_, true, false) => "Using environment key",
+                (_, false, true) => "Saved locally",
+                _ => "Key required",
+            };
+            let mut row = div().flex().items_center().flex_wrap().gap_2();
+            if c.configured {
+                row = row
+                    .child(div().min_w(px(160.)).flex_1().child(k.input.clone()))
+                    .child(button(
+                        ("key-save", i),
+                        "Save key",
+                        true,
+                        p,
+                        cx.listener(move |s, _, w, cx| s.key(i, false, w, cx)),
+                    ));
+            }
+            if c.saved {
+                row = row.child(button(
+                    ("key-remove", i),
+                    "Remove",
+                    false,
+                    p,
+                    cx.listener(move |s, _, w, cx| s.key(i, true, w, cx)),
+                ));
+            }
+            view = view.child(
+                div()
+                    .p_4()
+                    .bg(rgb(p.panel))
+                    .rounded_lg()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(c.name.clone())
+                            .child(div().text_sm().text_color(rgb(p.muted)).child(status)),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(p.muted))
+                            .child(c.scope.clone()),
+                    )
+                    .child(row),
+            );
+        }
+        view
+    }
+    fn favorites_view(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let mut view = div().flex().flex_col().gap_3().child(
+            div()
+                .flex()
+                .justify_between()
+                .items_center()
+                .child("Starred models")
+                .child(button(
+                    "save-favorites",
+                    "Save favorites",
+                    true,
+                    p,
+                    cx.listener(|s, _, w, cx| s.save(w, cx)),
+                )),
+        );
+        for (i, alias) in self.favorites.iter().enumerate() {
+            let mut actions = div().flex().gap_1();
+            if i > 0 {
+                actions = actions.child(button(
+                    ("up", i),
+                    "↑",
+                    false,
+                    p,
+                    cx.listener(move |s, _, _, cx| {
+                        s.favorites.swap(i, i - 1);
+                        cx.notify()
+                    }),
+                ));
+            }
+            if i + 1 < self.favorites.len() {
+                actions = actions.child(button(
+                    ("down", i),
+                    "↓",
+                    false,
+                    p,
+                    cx.listener(move |s, _, _, cx| {
+                        s.favorites.swap(i, i + 1);
+                        cx.notify()
+                    }),
+                ));
+            }
+            actions = actions.child(button(
+                ("unstar", i),
+                "Remove",
+                false,
+                p,
+                cx.listener(move |s, _, _, cx| {
+                    s.favorites.remove(i);
+                    cx.notify()
+                }),
+            ));
+            view = view.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(alias.clone())
+                    .child(actions),
+            );
+        }
+        view = view.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().flex_1().child(Input::new(&self.alias)))
+                .child(button(
+                    "add-favorite",
+                    "Add alias",
+                    false,
+                    p,
+                    cx.listener(|s, _, w, cx| {
+                        let alias = s.alias.read(cx).value().trim().to_owned();
+                        if alias.is_empty() {
+                            s.report(Err("Enter a model alias.".into()), "", cx);
+                            return;
+                        }
+                        if !s.favorites.contains(&alias) {
+                            s.favorites.push(alias);
+                        }
+                        s.alias.update(cx, |field, cx| field.set_value("", w, cx));
+                        cx.notify();
+                    }),
+                )),
+        );
+        view = view.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child("Available models")
+                .child(button(
+                    "refresh-catalog",
+                    if self.loading_models {
+                        "Loading…"
+                    } else {
+                        "Refresh catalog"
+                    },
+                    false,
+                    p,
+                    cx.listener(|s, _, _, cx| s.fetch_models(cx)),
+                )),
+        );
+        let filter = self.alias.read(cx).value().to_lowercase();
+        // The entry is both a filter and a way to add valid models absent from a catalog.
+        for (i, alias) in self
+            .settings
+            .models
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.to_lowercase().contains(&filter) && !self.favorites.contains(m))
+            .take(50)
+        {
+            let alias = alias.clone();
+            view = view.child(button(
+                ("star-model", i),
+                format!("＋  {alias}"),
+                false,
+                p,
+                cx.listener(move |s, _, _, cx| {
+                    if !s.favorites.contains(&alias) {
+                        s.favorites.push(alias.clone())
+                    }
+                    cx.notify()
+                }),
+            ));
+        }
+        view
+    }
+}
+
+fn input_row(label: &'static str, input: &Entity<InputState>, p: Palette) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_3()
+        .child(
+            div()
+                .w(px(162.))
+                .text_sm()
+                .text_color(rgb(p.muted))
+                .child(label),
+        )
+        .child(div().flex_1().min_w_0().child(Input::new(input)))
+}
+fn button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    active: bool,
+    p: Palette,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    crate::kit::button(p, id, label, active, true, on_click)
+}
+
+impl Render for Preferences {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::app::guard(cx, |cx| self.draw(cx).into_any_element())
+    }
+}
+
+impl Preferences {
+    fn draw(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = Palette::get(cx);
+        let mut header = div()
+            .p_5()
+            .pb_3()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .border_b_1()
+            .border_color(rgb(p.line))
+            .child(div().text_2xl().child("Settings"));
+        let mut tabs = div().flex().flex_wrap().gap_1();
+        for (page, title) in [
+            (Page::Accounts, "Accounts"),
+            (Page::Remote, "Remote access"),
+            (Page::Providers, "Providers"),
+            (Page::Credentials, "Credentials"),
+            (Page::Search, "Search"),
+            (Page::Favorites, "Favorites"),
+            (Page::Behavior, "Appearance & input"),
+            (Page::Legacy, "Legacy"),
+            (Page::Advanced, "Advanced"),
+        ] {
+            if page == Page::Legacy && self.legacy.is_none() {
+                continue;
+            }
+            tabs = tabs.child(button(
+                title,
+                title,
+                page == self.page,
+                p,
+                cx.listener(move |s, _, w, cx| {
+                    if page == Page::Advanced {
+                        s.open_advanced(w, cx)
+                    } else {
+                        s.goto(page, cx)
+                    }
+                }),
+            ));
+        }
+        header = header.child(tabs);
+        if !self.message.is_empty() {
+            header = header.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(if self.error { p.error } else { p.muted }))
+                    .child(self.message.clone())
+                    .when(self.error, |notice| {
+                        notice.child(crate::kit::copy_message(
+                            p,
+                            "copy-settings-error",
+                            &self.message,
+                        ))
+                    }),
+            )
+        }
+        let content = if self.busy {
+            div().child("Loading settings…")
+        } else {
+            match self.page {
+                Page::Remote => div().children(self.remote.clone()),
+                Page::Accounts => self.account_view(p, cx),
+                Page::Advanced => self.advanced_page(p, cx),
+                Page::Behavior => self.behavior_page(p, cx),
+                Page::Providers => self.providers_view(p, cx),
+                Page::Credentials => self.credentials_view(p, cx),
+                Page::Favorites => self.favorites_view(p, cx),
+                Page::Search => {
+                    let mut view = div()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .child(div().text_lg().child("Web search"));
+                    if let Some(registry) = &self.registry {
+                        view = view
+                            .child(registry.search.render(SEARCH, "brave", p, cx))
+                            .child(div().child(button(
+                                "save-search",
+                                "Save search settings",
+                                true,
+                                p,
+                                cx.listener(|s, _, w, cx| s.save(w, cx)),
+                            )))
+                    }
+                    view
+                }
+                Page::Legacy => {
+                    let mut view = div().flex().flex_col().gap_4();
+                    if let Some(l) = &self.legacy {
+                        view = view
+                            .child(div().text_lg().child(format!("Legacy · {}", l.id)))
+                            .child(input_row("Default model", &l.model, p))
+                            .child(l.fields.render(LEGACY, "legacy", p, cx))
+                            .child(div().child(button(
+                                "save-legacy",
+                                "Save connection",
+                                true,
+                                p,
+                                cx.listener(|s, _, w, cx| s.save(w, cx)),
+                            )));
+                    }
+                    view
+                }
+            }
+        };
+        let mut body = div()
+            .id("settings-body")
+            .track_scroll(&self.scroll)
+            .overflow_y_scroll()
+            .min_h_0()
+            .flex_1()
+            .p_5()
+            .child(content);
+        if self.error && !self.busy && self.page != Page::Advanced {
+            body = body.child(div().mt_4().child(button(
+                "reload-settings",
+                "Discard drafts and reload",
+                false,
+                p,
+                cx.listener(|s, _, w, cx| s.reload(w, cx)),
+            )))
+        }
+        div()
+            .track_focus(&self.focus)
+            .size_full()
+            .bg(rgb(p.bg))
+            .text_color(rgb(p.fg))
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(body)
+    }
+}

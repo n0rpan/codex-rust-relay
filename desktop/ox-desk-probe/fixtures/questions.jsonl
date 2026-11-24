@@ -1,0 +1,15 @@
+{"expect":{"method":"initialize"},"capture":"init"}
+{"send":{"result":{}},"replyTo":"init"}
+{"expect":{"method":"initialized"}}
+{"expect":{"method":"account/read"},"capture":"account"}
+{"send":{"result":{"account":{"type":"chatgpt"}}},"replyTo":"account"}
+{"expect":{"method":"thread/list"},"capture":"list"}
+{"send":{"result":{"data":[]}},"replyTo":"list"}
+{"send":{"id":15,"method":"mcpServer/elicitation/request","params":{"mode":"url","serverName":"fixture","threadId":"a"}}}
+{"expect":{"id":15,"error":{"code":-32601,"message":"This desktop cannot render the requested form"}}}
+{"send":{"id":"cancelled","method":"item/fileChange/requestApproval","params":{"itemId":"file","turnId":"1","threadId":"a"}}}
+{"send":{"method":"serverRequest/resolved","params":{"threadId":"a","requestId":"cancelled"}}}
+{"send":{"id":2,"method":"item/tool/requestUserInput","params":{"threadId":"a","turnId":"1","questions":[{"header":"Target","id":"one","question":"Which target?","options":[{"label":"Linux","description":"Both architectures"}]},{"header":"Build","id":"two","question":"Build label","isSecret":false}]}}}
+{"expect":{"id":2,"result":{"answers":{"one":{"answers":["Linux"]},"two":{"answers":["candidate"]}}}}}
+{"send":{"id":"2","method":"item/commandExecution/requestApproval","params":{"threadId":"b","turnId":"2","command":"pwd","cwd":"/synthetic","availableDecisions":["decline","cancel"]}}}
+{"expect":{"id":"2","result":{"decision":"decline"}}}

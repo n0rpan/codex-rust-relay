@@ -277,6 +277,53 @@ pub(crate) fn claude_config_override() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn native_claude_profile() -> Option<PathBuf> {
+    claude_config_override()
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude")))
+}
+
+fn relay_profile_root(home: &Path) -> Result<PathBuf, RelayError> {
+    let home = match home.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::path::absolute(home)?,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(home.join("ox-clients"))
+}
+
+pub(crate) fn codex_profiles(
+    home: &Path,
+) -> Result<crate::settings_protocol::CodexProfiles, RelayError> {
+    let native = std::path::absolute(home)?;
+    let relay = relay_profile_root(home)?.join("codex");
+    // The native client creates a rollout directory for saved conversations.
+    // An empty installation does not need a catalog-only app-server.
+    let existing = |p: PathBuf| p.join("sessions").is_dir().then_some(p);
+    Ok(crate::settings_protocol::CodexProfiles {
+        subscription: existing(native),
+        api: existing(relay),
+    })
+}
+
+pub(crate) fn claude_profiles(
+    home: &Path,
+) -> Result<crate::settings_protocol::ClaudeProfiles, RelayError> {
+    let subscription =
+        std::path::absolute(native_claude_profile().ok_or("set CLAUDE_CONFIG_DIR or HOME")?)?;
+    let api = relay_profile_root(home)?.join("claude");
+    require_separate_claude_profiles(&subscription, &api)?;
+    Ok(crate::settings_protocol::ClaudeProfiles { subscription, api })
+}
+
+fn require_separate_claude_profiles(subscription: &Path, api: &Path) -> Result<(), RelayError> {
+    if std::path::absolute(subscription)? == api
+        || matches!((subscription.canonicalize(), api.canonicalize()), (Ok(a), Ok(b)) if a == b)
+    {
+        return Err("select separate native and OX API Claude configuration directories".into());
+    }
+    Ok(())
+}
+
 /// Stock clients can save `/model` selections back into their user files.
 /// Give each relay client a persistent home so model changes and resumes stay
 /// in that profile even if ox or its child is interrupted.
@@ -297,14 +344,17 @@ pub(crate) fn relay_client_home(
         ),
         ClientKind::Claude => (
             "claude",
-            claude_config_override().or_else(|| {
-                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude"))
-            }),
+            native_claude_profile(),
             &["settings.json", "CLAUDE.md"],
         ),
     };
-    let root = codex_home.canonicalize()?.join("ox-clients");
+    let root = relay_profile_root(codex_home)?;
     let profile = root.join(name);
+    if client == ClientKind::Claude
+        && let Some(native) = source.as_deref()
+    {
+        require_separate_claude_profiles(native, &profile)?;
+    }
     for directory in [&root, &profile] {
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
@@ -789,7 +839,7 @@ fn write_settings(document: &SettingsMap) -> Result<ClaudeLaunchSettings, RelayE
 /// overridden by `--settings`. If they select a backend, transport, credential,
 /// or model, routing the session through the relay is impossible, so fail with
 /// an explicit diagnostic rather than launch a session the relay never sees.
-fn ensure_no_managed_override(args: &[OsString]) -> Result<(), RelayError> {
+pub(crate) fn ensure_no_managed_override(args: &[OsString]) -> Result<(), RelayError> {
     for arg in args {
         let Some(text) = arg.to_str() else {
             continue;
@@ -898,6 +948,16 @@ fn inspect_managed_settings(path: &Path) -> Result<(), RelayError> {
             path.display()
         )
     })?;
+    if value["apiKeyHelper"]
+        .as_str()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return Err(format!(
+            "managed Claude settings {} configure an API key helper",
+            path.display()
+        )
+        .into());
+    }
     let Some(env) = value.get("env").and_then(Value::as_object) else {
         return Ok(());
     };

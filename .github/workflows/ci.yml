@@ -434,13 +434,13 @@ jobs:
       - name: Start the updater tests in the background
         run: |
           set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/update-tests"
-          nohup bash -c '
-            CARGO_TARGET_DIR=target/update-tests \
-              cargo test --locked --offline --target "$1" --bin ox update::tests
-            echo "$?" > "$2/status"
-          ' bash "${{ matrix.target }}" "${RUNNER_TEMP}/update-tests" \
-            > "${RUNNER_TEMP}/update-tests/log" 2>&1 &
+          mkdir -p "${RUNNER_TEMP}/update-tests" target/update-tests
+          nohup bash -s -- "${{ matrix.target }}" "${RUNNER_TEMP}/update-tests" \
+            > "${RUNNER_TEMP}/update-tests/log" 2>&1 <<'UPDATER' &
+          CARGO_TARGET_DIR=target/update-tests \
+            cargo test --locked --offline --target "$1" --bin ox update::tests
+          echo "$?" > "$2/status"
+          UPDATER
 
       - name: Build the release binary offline against the lockfile
         timeout-minutes: 25
@@ -561,13 +561,23 @@ jobs:
           # The archives are already gzip-compressed.
           compression-level: 0
 
+  desktop-release:
+    name: Build matching desktop packages
+    needs: version
+    if: >-
+      (github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    uses: ./.github/workflows/desktop.yml
+    with:
+      build_version: ${{ needs.version.outputs.version }}
+
   publish-dev:
     name: Publish the rolling dev pre-release
     # Every push to main, and a manual run on main to repair a missing release.
     if: >-
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [version, verify, release]
+    needs: [version, verify, release, desktop-release]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -606,6 +616,8 @@ jobs:
 
           gh run download "${GITHUB_RUN_ID}" --repo "${repo}" --pattern 'ox-*' --dir dist
           files=(install.sh)
+          source desktop/ci/release-assets.sh
+          append_desktop_assets
           for platform in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
             directory="dist/ox-${platform}"
             executable="ox-${VERSION}-${platform}"
@@ -635,7 +647,14 @@ jobs:
             echo "curl -fsSL https://raw.githubusercontent.com/${repo}/main/install.sh | sh -s -- --dev"
             echo '```'
             echo
-            echo "Already running ox? Use \`ox update --dev\`."
+            echo "For OX Desktop, install or update the app, host and CLI together:"
+            echo
+            echo '```sh'
+            echo "curl -fsSL https://raw.githubusercontent.com/${repo}/main/install.sh | sh -s -- --dev --desktop"
+            echo "ox desktop ."
+            echo '```'
+            echo
+            echo "To update the standalone CLI, use \`ox update --dev\`."
           } > "${notes}"
 
           # Stage everything in a draft first. Uploads are the slow, failure
@@ -713,7 +732,7 @@ jobs:
   publish:
     name: Publish a tagged release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [version, verify, release]
+    needs: [version, verify, release, desktop-release]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -742,6 +761,8 @@ jobs:
           fi
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'ox-*' --dir dist
           files=(install.sh)
+          source desktop/ci/release-assets.sh
+          append_desktop_assets
           for platform in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
             directory="dist/ox-${platform}"
             executable="ox-${VERSION}-${platform}"

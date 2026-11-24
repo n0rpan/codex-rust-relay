@@ -1,0 +1,6 @@
+{"expect":{"method":"thread/list"},"capture":"listing"}
+{"expect":{"method":"turn/interrupt","params":{"threadId":"agent","turnId":"turn"}},"capture":"stop"}
+{"send":{"result":{}},"replyTo":"stop"}
+{"send":{"method":"future/ask","id":"opaque","params":{}}}
+{"expect":{"id":"opaque","error":{"code":-32601,"message":"Unsupported request"}}}
+{"send":{"result":{"data":[],"nextCursor":null}},"replyTo":"listing"}

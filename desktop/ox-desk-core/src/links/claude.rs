@@ -1,0 +1,305 @@
+//! One stock Claude Code process per session. OX selects the native account or relay.
+use crate::claude::{Account, ControlReply, Decoder, Event as Frame};
+pub use crate::runtime::Billing;
+use serde_json::{Value, json};
+use std::{
+    ffi::OsString,
+    io,
+    path::PathBuf,
+    process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+};
+
+mod process;
+pub const INIT_ID: &str = "ox-init";
+
+pub struct Launch {
+    pub ox: PathBuf,
+    pub path: OsString,
+    pub project: PathBuf,
+    pub billing: Billing,
+    pub session: Session,
+    pub permission_mode: String,
+}
+#[derive(Clone, Debug)]
+pub enum Session {
+    New(String),
+    Resume(String),
+    Fork { source: String, id: String },
+}
+impl Session {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::New(id) | Self::Resume(id) | Self::Fork { id, .. } => id,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Event {
+    Frame(Frame),
+    SignInRequired,
+    Closed { reason: String },
+}
+
+impl Launch {
+    fn command(&self) -> Command {
+        let mut cmd = Command::new(&self.ox);
+        cmd.current_dir(&self.project)
+            .env("PATH", &self.path)
+            .arg("claude");
+        if std::env::var_os("OX_HOST_LIFETIME_SOCKET").is_some() {
+            let tag = match self.billing {
+                Billing::Api(_) => "api",
+                Billing::Subscription => "subscription",
+            };
+            let route = crate::runtime::Route {
+                runtime: crate::runtime::Runtime::Claude,
+                billing: self.billing.clone(),
+            };
+            cmd.env(
+                "OX_HOST_WORKER_ROUTE",
+                serde_json::to_string(&route).expect("serializable billing route"),
+            )
+            .env(
+                "OX_HOST_WORKER_PARENT",
+                format!("claude:{tag}:{}", self.session.id()),
+            );
+        }
+        match &self.billing {
+            Billing::Subscription => {
+                cmd.arg("--subscription");
+            }
+            Billing::Api(alias) => {
+                cmd.args(["--model", alias]);
+            }
+        }
+        cmd.args([
+            "-p",
+            "--verbose",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--include-partial-messages",
+            "--replay-user-messages",
+            "--permission-prompt-tool",
+            "stdio",
+            "--permission-mode",
+            &self.permission_mode,
+        ]);
+        cmd.arg(if self.permission_mode == "bypassPermissions" {
+            "--dangerously-skip-permissions"
+        } else {
+            "--allow-dangerously-skip-permissions"
+        });
+        match &self.session {
+            Session::New(id) => {
+                cmd.args(["--session-id", id]);
+            }
+            Session::Resume(id) => {
+                cmd.args(["--resume", id]);
+            }
+            Session::Fork { source, id } => {
+                cmd.args(["--resume", source, "--fork-session", "--session-id", id]);
+            }
+        }
+        cmd
+    }
+}
+
+pub struct Link {
+    process: process::Process,
+    ready: Arc<AtomicBool>,
+    session_id: String,
+    billing: Billing,
+    seq: AtomicU64,
+}
+
+impl Link {
+    pub fn spawn(
+        launch: Launch,
+        receive: impl Fn(Event) + Send + Sync + 'static,
+    ) -> io::Result<Self> {
+        let ready = Arc::new(AtomicBool::new(false));
+        let initialized = ready.clone();
+        let billing = launch.billing.clone();
+        let session_id = launch.session.id().to_owned();
+        let project = launch.project.canonicalize()?;
+        let receive = Arc::new(receive);
+        let output = receive.clone();
+        let mut decoder = Decoder::default();
+        let process = process::Process::spawn(
+            launch.command(),
+            move |line| {
+                for frame in decoder.decode(line)? {
+                    if let Frame::ControlReply(reply) = &frame
+                        && reply.request_id == INIT_ID
+                    {
+                        if let Err(error) = verify_initialization(reply, &billing) {
+                            if billing == Billing::Subscription
+                                && error.kind() == io::ErrorKind::PermissionDenied
+                            {
+                                output(Event::SignInRequired);
+                            }
+                            return Err(error);
+                        }
+                        initialized.store(true, Ordering::Release);
+                    }
+                    if !initialized.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    if let Frame::Init(init) = &frame
+                        && (init.session_id != session_id
+                            || std::path::Path::new(&init.cwd).canonicalize()? != project)
+                    {
+                        return Err(io::Error::other(
+                            "Claude Code opened a different project or session",
+                        ));
+                    }
+                    output(Event::Frame(frame));
+                }
+                Ok(())
+            },
+            ready.clone(),
+            move |reason, needs_login| {
+                if needs_login {
+                    receive(Event::SignInRequired);
+                }
+                receive(Event::Closed { reason });
+            },
+        )?;
+        process.send(
+            json!({"type":"control_request","request_id":INIT_ID,"request":{
+                "subtype":"initialize","forwardSubagentText":true
+            }}),
+        )?;
+        Ok(Self {
+            process,
+            ready,
+            session_id: launch.session.id().to_owned(),
+            billing: launch.billing,
+            seq: AtomicU64::new(1),
+        })
+    }
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+    pub fn send_user(&self, uuid: &str, content: Vec<Value>) -> io::Result<()> {
+        self.send(
+            json!({"type":"user","uuid":uuid,"session_id":self.session_id,
+            "parent_tool_use_id":Value::Null,"message":{"role":"user","content":content}}),
+        )
+    }
+    pub fn interrupt(&self) -> io::Result<String> {
+        self.control(json!({"subtype":"interrupt"}))
+    }
+    pub fn set_mode(&self, mode: &str) -> io::Result<String> {
+        self.control(json!({"subtype":"set_permission_mode","mode":mode}))
+    }
+    pub fn set_model(&self, model: &str) -> io::Result<String> {
+        if let Billing::Api(alias) = &self.billing
+            && alias != model
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Open the selected OX API route to change its billing alias",
+            ));
+        }
+        self.control(json!({"subtype":"set_model","model":model}))
+    }
+    fn control(&self, request: Value) -> io::Result<String> {
+        let id = format!("ox-{}", self.seq.fetch_add(1, Ordering::Relaxed));
+        self.send(json!({"type":"control_request","request_id":id,"request":request}))?;
+        Ok(id)
+    }
+    pub fn respond(&self, id: &str, payload: Value) -> io::Result<()> {
+        self.send(json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":payload}}))
+    }
+    pub fn reject_request(&self, id: &str, message: &str) -> io::Result<()> {
+        self.send(json!({"type":"control_response","response":{"subtype":"error","request_id":id,"error":message}}))
+    }
+    fn send(&self, value: Value) -> io::Result<()> {
+        if !self.ready.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Claude Code is connecting",
+            ));
+        }
+        self.process.send(value)
+    }
+}
+
+pub fn minimum() -> &'static str {
+    include_str!("../../../gate.toml")
+        .split_once("[claude]")
+        .expect("Claude gate section")
+        .1
+        .lines()
+        .map(str::trim)
+        .find_map(|s| {
+            s.strip_prefix("minimum_version = ")?
+                .strip_prefix('"')?
+                .strip_suffix('"')
+        })
+        .expect("Claude version floor")
+}
+fn version(s: &str) -> Option<([u32; 3], bool)> {
+    let s = s.split('+').next()?;
+    let (numbers, pre) = s.split_once('-').map_or((s, false), |(n, _)| (n, true));
+    let mut p = numbers.split('.');
+    let n = [
+        p.next()?.parse().ok()?,
+        p.next()?.parse().ok()?,
+        p.next()?.parse().ok()?,
+    ];
+    p.next().is_none().then_some((n, pre))
+}
+
+fn verify_initialization(reply: &ControlReply, billing: &Billing) -> io::Result<()> {
+    let required = version(minimum()).expect("valid Claude version floor").0;
+    let caps = reply
+        .capabilities()
+        .ok_or_else(|| io::Error::other("Claude Code did not initialize the stream controls"))?;
+    let actual = caps.claude_code_version.as_deref().and_then(version);
+    if !actual.is_some_and(|(n, pre)| n > required || n == required && !pre) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "OX Desktop requires Claude Code {} or later. Check claude --version.",
+                minimum()
+            ),
+        ));
+    }
+    if !matches_account(billing, &caps.account) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Claude Code reported a different billing route",
+        ));
+    }
+    Ok(())
+}
+fn matches_account(billing: &Billing, account: &Account) -> bool {
+    if account.api_provider.as_deref() != Some("firstParty")
+        || account
+            .api_key_source
+            .as_deref()
+            .is_some_and(|s| s != "none")
+    {
+        return false;
+    }
+    let source = account.token_source.as_deref();
+    match billing {
+        Billing::Subscription => {
+            matches!(source, None | Some("none"))
+                && account
+                    .subscription_type
+                    .as_deref()
+                    .is_some_and(|s| !s.is_empty())
+        }
+        Billing::Api(_) => source == Some("ANTHROPIC_AUTH_TOKEN"),
+    }
+}

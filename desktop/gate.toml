@@ -1,0 +1,18 @@
+[codex]
+minimum_version = "0.171.0"
+request_timeout_ms = 90000
+
+[linux]
+cold_start_p90_ms = 300
+idle_cpu_percent = 0.5
+visible_context_switches_per_s_target = 2
+hidden_frames = 0
+hidden_wakeups_per_minute_target = 12
+gui_rss_mib = 150
+stream_frame_p95_ms = 16
+history_tail_ms = 150
+stop_latency_frames = 1
+credential_leaks = 0
+
+[claude]
+minimum_version = "2.1.331"
