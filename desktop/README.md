@@ -11,7 +11,7 @@ ox desktop .
 
 Run the launch command from the project you want to open, or pass a directory such as `ox desktop ~/Work/my-project`. The installer verifies the archive checksum, installs `ox`, `ox-desktop` and `ox-host` under `~/.local/bin` by default, and adds **OX Desktop** to your Linux launcher or macOS **~/Applications**. Follow the installer's PATH hint if your shell cannot find `ox`.
 
-For an update, run the same installer command again. `ox update --dev` updates the standalone CLI. The desktop installer updates the whole package and keeps existing settings and native histories. An already running host keeps its current binary until its process exits. After current turns finish, signing out of the OS and back in picks up the new host. Check installed versions with `ox --version`, `ox-desktop --version` and `ox-host --version`.
+For an update, run the same installer command again. `ox update --dev` updates the standalone CLI. The desktop installer updates the whole package and keeps existing settings and native histories. If the session host is running, the installer restarts it on the new version: running turns finish first (for up to 10 minutes), new turns wait for the new host, and connected desktops and phones reconnect on their own. `ox host restart` does the same by hand. Check installed versions with `ox --version`, `ox-desktop --version` and `ox-host --version`, and the running host with `ox host doctor`.
 
 ## Open your first session
 
@@ -25,7 +25,7 @@ Use **Test saved connection** to list coding models at one provider’s endpoint
 
 ## Keep sessions running and pair a phone
 
-Desktop starts the packaged OX session host on first use. Close and reopen the window to reconnect to an active turn or pending request. Run `ox host status` to see whether the host is running, the local socket and state paths, and whether it starts at login. Run `ox host install` to start it at login through systemd on Linux or launchd on macOS. Use `ox host uninstall` to remove that login service.
+Desktop starts the packaged OX session host on first use. Close and reopen the window to reconnect to an active turn or pending request. Run `ox host status` to see whether the host is running, the local socket and state paths, and whether it starts at login. Run `ox host install` to start it at login through systemd on Linux or launchd on macOS. Use `ox host uninstall` to remove that login service; sessions, pairings and Codex and Claude Code data stay. `ox host uninstall --purge` also deletes OX's host state. `ox host doctor` checks the host, Tailscale Serve, paired devices and the stock clients, and names the fix for anything blocking.
 
 1. Connect the laptop and phone to Tailscale. In **Settings → Remote access** on the laptop, select **Enable Tailscale Serve**. If Serve asks for administrator access, choose **Run in OX terminal**, check the command and run it. Type your password at the terminal prompt. OX checks the resulting mapping before it offers a pairing QR.
 2. Open the private HTTPS Serve address on your phone. On iPhone, use Safari’s **Share → Add to Home Screen**, enable **Open as Web App** if shown, then open OX from its icon. The Home Screen app has its own device key. If you already paired in Safari, create a fresh pairing QR on the laptop. [Apple’s Home Screen instructions](https://support.apple.com/guide/iphone/iphea86e5236/ios)
