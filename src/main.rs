@@ -2429,7 +2429,8 @@ env_key = "ALPHA_KEY"
         let hidden = catalog["models"]
             .as_array()
             .unwrap()
-            .iter().find(|model| model["slug"] == "bundled-default")
+            .iter()
+            .find(|model| model["slug"] == "bundled-default")
             .expect("bundled models are shadowed");
         assert_eq!(hidden["visibility"], "hide");
         assert_eq!(hidden["supported_in_api"], false);

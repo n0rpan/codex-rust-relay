@@ -1946,9 +1946,11 @@ fn sha256(path: &Path) -> Option<String> {
             continue;
         };
         if let Some(first) = text.split_whitespace().next()
-            && first.len() == 64 && first.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Some(first.to_ascii_lowercase());
-            }
+            && first.len() == 64
+            && first.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return Some(first.to_ascii_lowercase());
+        }
     }
     None
 }
