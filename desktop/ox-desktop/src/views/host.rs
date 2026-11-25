@@ -78,9 +78,11 @@ fn new_route_gate(
     chatgpt_account: bool,
 ) -> Result<(), &'static str> {
     use ox_desk_core::runtime::Runtime;
+    // Any catalog model may open (stars and the configured list only order choices);
+    // `ox --model` validates the alias at launch and names the fix if it is unknown.
+    let _ = models;
     match &route.billing {
-        Billing::Api(alias) if models.contains(alias) => Ok(()),
-        Billing::Api(_) => Err("Add this model in Settings → Models first."),
+        Billing::Api(_) => Ok(()),
         Billing::Subscription if route.runtime == Runtime::Codex && !chatgpt_account => {
             Err("Sign in to ChatGPT in Settings → Accounts first.")
         }
@@ -2077,9 +2079,12 @@ mod route_gate_tests {
     }
 
     #[test]
-    fn api_routes_need_a_configured_alias() {
+    fn any_catalog_alias_opens_without_being_configured_or_starred() {
         let api = Runtime::Codex.route(Some("fixture/demo".into()));
         assert!(new_route_gate(&api, &["fixture/demo".into()], false).is_ok());
-        assert!(new_route_gate(&api, &[], false).is_err());
+        // A discovery-only model is not in the configured list yet; it still opens.
+        assert!(new_route_gate(&api, &[], false).is_ok());
+        let claude = Runtime::Claude.route(Some("fixture/demo".into()));
+        assert!(new_route_gate(&claude, &[], false).is_ok());
     }
 }

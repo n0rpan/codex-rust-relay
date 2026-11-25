@@ -723,10 +723,13 @@ def reuse(f):
     wait(lambda: f.stats()["discovery_pending"] == 0 and len(f.events("spawn")) == 1)
     before_open = len(f.events("spawn")) + len(f.events("helper"))
     f.agent("fixture-model")
-    wait(lambda: f.stats()["pane"] == 1 and f.stats()["connected"] and len(f.events("spawn")) == 2)
+    f.wait_for(
+        "the fixture-model route pane to open and connect",
+        lambda: f.stats()["pane"] == 1 and f.stats()["connected"] and len(f.events("spawn")) == 2,
+    )
     cold_route_spawns = len(f.events("spawn")) + len(f.events("helper")) - before_open
     f.agent("codex")
-    wait(lambda: f.stats()["pane"] == 0)
+    f.wait_for("the codex pane to be active again", lambda: f.stats()["pane"] == 0)
     base = len(f.events("spawn")) + len(f.events("helper"))
     for i in range(20):
         f.click(first)
