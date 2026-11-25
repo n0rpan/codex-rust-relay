@@ -237,6 +237,21 @@ path_hint() {
 }
 
 # Keep the GUI, session host and gateway together in one immutable installation.
+# OX Desktop links the system's X11, Wayland, Vulkan and audio libraries. A
+# desktop install has them; a minimal or server install may not.
+die_missing_libraries() {
+    missing=""
+    if command -v ldd >/dev/null 2>&1; then
+        missing="$(ldd "$1" 2>/dev/null | awk '/not found/ {print $1}' | tr '\n' ' ')"
+    fi
+    if [ -n "$missing" ]; then
+        die "OX Desktop needs system libraries that are not installed: ${missing}
+  On Ubuntu or Debian: sudo apt install libxkbcommon-x11-0 libxkbcommon0 libwayland-client0 libvulkan1 mesa-vulkan-drivers libasound2t64 libfontconfig1
+  Then run the installer again. The terminal-only CLI (without --desktop) needs none of these."
+    fi
+    die "the packaged OX Desktop could not start."
+}
+
 prepare_desktop() {
     packages="$install_dir/.ox-desktop"
     mkdir -p "$packages"
@@ -259,7 +274,7 @@ prepare_desktop() {
     fi
     desktop_binary_dir="$desktop_stage/$binary_subdir"
     helper_version="$("$desktop_binary_dir/ox" --version)" || die "the packaged ox could not start."
-    desktop_version="$("$desktop_binary_dir/ox-desktop" --version)" || die "the packaged OX Desktop could not start."
+    desktop_version="$("$desktop_binary_dir/ox-desktop" --version)" || die_missing_libraries "$desktop_binary_dir/ox-desktop"
     [ "${desktop_version#ox-desktop }" = "${helper_version#ox }" ] || die "the packaged desktop and CLI versions differ."
     if [ -x "$desktop_binary_dir/ox-host" ]; then
         [ "$("$desktop_binary_dir/ox-host" --version)" = "ox-host ${helper_version#ox }" ] || die "the packaged host and CLI versions differ."

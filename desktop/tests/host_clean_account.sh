@@ -95,6 +95,31 @@ host_pid() {
     as_user "$ox" host doctor 2>/dev/null | sed -n 's/.*host: running, .* pid \([0-9]*\),.*/\1/p'
 }
 
+if [ "$os" = Linux ]; then
+    # A minimal machine may lack the GUI libraries OX Desktop links. The
+    # installer must say which, and install cleanly once they are present.
+    unpacked=$(mktemp -d)
+    tar -xzf "$stage"/ox-desktop-linux-*.tar.gz -C "$unpacked"
+    if ldd "$unpacked/ox-desktop/ox-desktop" | grep -q "not found"; then
+        echo "== without the desktop libraries the installer names them"
+        if as_user sh -c "cd /tmp && OX_INSTALL_BASE_URL=file://$stage sh $stage/install.sh --desktop" > "$stage/minimal.log" 2>&1; then
+            fail "the installer succeeded although OX Desktop cannot start"
+        fi
+        cat "$stage/minimal.log"
+        grep -q "needs system libraries that are not installed" "$stage/minimal.log" ||
+            fail "the installer did not name the missing libraries"
+        # The same packages the installer's message suggests.
+        libs="libxkbcommon-x11-0 libxkbcommon0 libwayland-client0 libvulkan1 mesa-vulkan-drivers libasound2t64 libfontconfig1"
+        # shellcheck disable=SC2086
+        sudo apt-get install -y -q -o Acquire::Retries=3 $libs >/dev/null ||
+            { sudo apt-get update -q >/dev/null && sudo apt-get install -y -q $libs >/dev/null; }
+    fi
+    if ldd "$unpacked/ox-desktop/ox-desktop" | grep "not found"; then
+        fail "the libraries the installer suggests do not cover OX Desktop"
+    fi
+    rm -rf "$unpacked"
+fi
+
 echo "== install as a new account ($user)"
 as_user sh -c "cd /tmp && OX_INSTALL_BASE_URL=file://$stage sh $stage/install.sh --desktop"
 as_user "$ox" --version
