@@ -122,6 +122,6 @@ How to continue (any agent or a human):
 | Date | Wave | State | Commit | Notes |
 |---|---|---|---|---|
 | 2026-11-25 | 0 dogfood fixes | done | 767c454 | rebased on c8ff6a1 (#8 CI hardening) |
-| 2026-11-25 | 1 bugs 1–5, 7, 12 + polish wave 1 | done | (this commit) | Reviewed by Claude: phone deny styling moved from :last-of-type to a `deny` class by label. Follow-ups: phone settings.css still has literal light colours; phone Stop should be disabled rather than hidden in app.js (~906); desktop filter chips have no counts yet; truncated Anthropic tool item gets no output_item.done (by design, never enters history); ox-host-web tests need `--features server`. Human check pending: approvals card, Stop slot, phone stacked decisions, light theme status bar. |
-| | 2 session control + bugs 6, 8–11 + polish wave 2 | todo | — | |
+| 2026-11-25 | 1 bugs 1–5, 7, 12 + polish wave 1 | done | dd93b86 | Reviewed by Claude: phone deny styling moved from :last-of-type to a `deny` class by label. Follow-ups: phone settings.css still has literal light colours; phone Stop should be disabled rather than hidden in app.js (~906); desktop filter chips have no counts yet; truncated Anthropic tool item gets no output_item.done (by design, never enters history); ox-host-web tests need `--features server`. Human check pending: approvals card, Stop slot, phone stacked decisions, light theme status bar. |
+| 2026-11-25 | 2 session control + bugs 6, 8–11 + polish wave 2 | in progress | — | |
 | | 3 polish waves 3–4 + lows | todo | — | |
