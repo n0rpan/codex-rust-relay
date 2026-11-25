@@ -1497,20 +1497,35 @@ impl Engine {
             &mut live.state.asks,
             &mut changes,
         );
-        if let Some(sessions) = changes.iter_mut().find_map(|c| {
-            if let Change::Sessions { sessions } = c {
-                Some(sessions)
-            } else {
-                None
+        for change in &mut changes {
+            if live.recovered.is_empty() {
+                break;
             }
-        }) {
-            live.recovered.retain(|old| {
-                !sessions
-                    .iter()
-                    .any(|r| r.id == old.id && r.detail["owned"] == true)
-            });
-            restore(sessions, &live.recovered);
-            live.state.sessions.clone_from(sessions);
+            match change {
+                Change::Sessions { sessions } => {
+                    live.recovered.retain(|old| {
+                        !sessions
+                            .iter()
+                            .any(|r| r.id == old.id && r.detail["owned"] == true)
+                    });
+                    restore(sessions, &live.recovered);
+                    live.state.sessions.clone_from(sessions);
+                }
+                Change::Session { session } => {
+                    if session.detail["owned"] == true {
+                        live.recovered.retain(|old| old.id != session.id);
+                    } else if let Some(old) = live.recovered.iter().find(|old| old.id == session.id)
+                    {
+                        restore_row(session, old);
+                        if let Some(row) =
+                            live.state.sessions.iter_mut().find(|r| r.id == session.id)
+                        {
+                            row.clone_from(session);
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
         if live
             .state
@@ -1577,34 +1592,7 @@ impl Engine {
                     | Change::Retired { .. }
             )
         }) {
-            // Rows the host owned before a restart stay saved until the live runtime owns
-            // them again: a single-row update from a freshly opened route lists them as
-            // discovered, and must not drop their ownership or the access they resume with.
-            // Only the rows and asks are saved, so copy no transcripts.
-            let mut saved = ScopeState {
-                scope: live.state.scope.clone(),
-                connection: String::new(),
-                capabilities: vec![],
-                asks: live.state.asks.clone(),
-                transcripts: Default::default(),
-                detail: Value::Null,
-                sessions: live.state.sessions.clone(),
-            };
-            for old in &live.recovered {
-                match saved.sessions.iter_mut().find(|r| r.id == old.id) {
-                    Some(row) if row.detail["owned"] != true => {
-                        row.detail["owned"] = true.into();
-                        for key in ["resume_access", "worker_marks", "origin"] {
-                            if row.detail[key].is_null() && !old.detail[key].is_null() {
-                                row.detail[key] = old.detail[key].clone();
-                            }
-                        }
-                    }
-                    Some(_) => {}
-                    None => saved.sessions.push(old.clone()),
-                }
-            }
-            self.ledger.update(SavedScope::from_state(&saved))?;
+            self.ledger.update(SavedScope::from_state(&live.state))?;
         }
         self.broadcast(scope, changes)?;
         if let Some((id, frame)) = handoff {
@@ -2761,13 +2749,24 @@ fn live_detail_after_drop(recovered: &ScopeState) -> Value {
 fn restore(rows: &mut Vec<wire::SessionView>, recovered: &[wire::SessionView]) {
     for saved in recovered {
         if let Some(row) = rows.iter_mut().find(|r| r.id == saved.id) {
-            if row.detail["owned"] != true && saved.status == "interrupted" {
-                row.status.clone_from(&saved.status);
-            }
-            row.detail["owned"] = true.into();
-            row.detail["recovered"] = true.into();
+            restore_row(row, saved);
         } else {
             rows.push(saved.clone());
+        }
+    }
+}
+
+// Until the runtime owns the session again, its catalog only describes the journal.
+// Keep the interrupted run and its launch metadata in snapshots and single-row updates.
+fn restore_row(row: &mut wire::SessionView, saved: &wire::SessionView) {
+    if row.detail["owned"] != true && saved.status == "interrupted" {
+        row.status.clone_from(&saved.status);
+    }
+    row.detail["owned"] = true.into();
+    row.detail["recovered"] = true.into();
+    for key in ["resume_access", "worker_marks", "origin"] {
+        if row.detail[key].is_null() && !saved.detail[key].is_null() {
+            row.detail[key] = saved.detail[key].clone();
         }
     }
 }
