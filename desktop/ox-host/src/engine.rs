@@ -20,7 +20,7 @@ use ox_desk_core::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     io,
     path::{Path, PathBuf},
     sync::mpsc::{Receiver, RecvTimeoutError, SyncSender},
@@ -1997,49 +1997,7 @@ impl Engine {
             if threads.is_empty() {
                 continue;
             }
-            let claude = scope.route.runtime == ox_desk_core::runtime::Runtime::Claude;
-            let groups: Vec<Vec<String>> = if claude {
-                threads.into_iter().map(|t| vec![t]).collect()
-            } else {
-                vec![threads]
-            };
-            for group in groups {
-                let seen = |t: &String| live.tracker.threads.get(t).copied();
-                let started = group
-                    .iter()
-                    .filter_map(seen)
-                    .map(|s| s.started)
-                    .min()
-                    .unwrap_or(live.tracker.scope.started);
-                let last = group
-                    .iter()
-                    .filter_map(seen)
-                    .map(|s| s.last_unix)
-                    .max()
-                    .unwrap_or(live.tracker.scope.last_unix);
-                let worker = group.iter().all(|t| self.workers.get(scope, t).is_some());
-                out.push(ProcessView {
-                    kind: if worker {
-                        "worker"
-                    } else if claude {
-                        "claude"
-                    } else {
-                        "codex"
-                    }
-                    .into(),
-                    scope: scope.clone(),
-                    project: scope.project.clone(),
-                    route: scope.route.label(),
-                    model: group
-                        .first()
-                        .map(|t| live.store.options(Some(t)).model)
-                        .filter(|m| !m.is_empty()),
-                    started_at: started,
-                    last_activity: last,
-                    running: group.iter().any(|t| live.store.thread_busy(t)),
-                    threads: group,
-                });
-            }
+            out.extend(self.scope_rows(scope, live, threads));
         }
         out.sort_by(|a, b| {
             b.started_at
@@ -2047,6 +2005,89 @@ impl Engine {
                 .then_with(|| a.threads.cmp(&b.threads))
         });
         out
+    }
+    /// The process rows for one route's live threads: one per Claude session, one per Codex scope.
+    fn scope_rows(&self, scope: &Scope, live: &Live, threads: Vec<String>) -> Vec<ProcessView> {
+        let mut out = Vec::new();
+        let claude = scope.route.runtime == ox_desk_core::runtime::Runtime::Claude;
+        let groups: Vec<Vec<String>> = if claude {
+            threads.into_iter().map(|t| vec![t]).collect()
+        } else {
+            vec![threads]
+        };
+        for group in groups {
+            let seen = |t: &String| live.tracker.threads.get(t).copied();
+            let started = group
+                .iter()
+                .filter_map(seen)
+                .map(|s| s.started)
+                .min()
+                .unwrap_or(live.tracker.scope.started);
+            let last = group
+                .iter()
+                .filter_map(seen)
+                .map(|s| s.last_unix)
+                .max()
+                .unwrap_or(live.tracker.scope.last_unix);
+            let worker = group.iter().all(|t| self.workers.get(scope, t).is_some());
+            out.push(ProcessView {
+                kind: if worker {
+                    "worker"
+                } else if claude {
+                    "claude"
+                } else {
+                    "codex"
+                }
+                .into(),
+                scope: scope.clone(),
+                project: scope.project.clone(),
+                route: scope.route.label(),
+                model: group
+                    .first()
+                    .map(|t| live.store.options(Some(t)).model)
+                    .filter(|m| !m.is_empty()),
+                started_at: started,
+                last_activity: last,
+                running: group.iter().any(|t| self.thread_busy(scope, t)),
+                threads: group,
+            });
+        }
+        out
+    }
+    /// Whether ending `thread` in `scope` would interrupt work: its own turn, approval,
+    /// sign-in or terminal, a launch still opening for it, or a busy host-owned worker
+    /// it started on any scope, at any depth. The reaper and the process list share this.
+    fn thread_busy(&self, scope: &Scope, thread: &str) -> bool {
+        let mut stack = vec![(scope.clone(), thread.to_owned())];
+        let mut seen = HashSet::new();
+        while let Some((s, t)) = stack.pop() {
+            if !seen.insert((s.clone(), t.clone())) {
+                continue;
+            }
+            let launching = self.running.values().any(|l| {
+                l.launching.as_ref().is_some_and(|launch| {
+                    launch.origin.parent.scope.as_ref() == Some(&s)
+                        && launch.origin.parent.session.as_deref() == Some(t.as_str())
+                })
+            });
+            if launching {
+                return true;
+            }
+            if let Some(live) = self.running.get(&s)
+                && (live.store.thread_busy(&t)
+                    || live.store.in_terminal(&t)
+                    || live.launching.is_some()
+                    || live.confirming.is_some())
+            {
+                return true;
+            }
+            stack.extend(
+                self.workers
+                    .children_of(&s, &t)
+                    .map(|(cs, cid)| (cs.clone(), cid.to_owned())),
+            );
+        }
+        false
     }
     /// End one thread's process and the host-owned workers it started. The thread
     /// stays in the catalog; selecting it again resumes it.
@@ -2175,16 +2216,7 @@ impl Engine {
                 let Some(seen) = live.tracker.threads.get(&thread) else {
                     continue;
                 };
-                let workers_busy = self.workers.children_of(scope, &thread).any(|(s, child)| {
-                    self.running
-                        .get(s)
-                        .is_some_and(|l| l.store.thread_busy(child))
-                });
-                let busy = live.store.thread_busy(&thread)
-                    || workers_busy
-                    || live.launching.is_some()
-                    || live.confirming.is_some()
-                    || live.store.in_terminal(&thread);
+                let busy = self.thread_busy(scope, &thread);
                 if reapable(now.saturating_duration_since(seen.last), self.idle, busy) {
                     due.push((scope.clone(), thread));
                 }
@@ -4551,6 +4583,48 @@ mod tests {
                 tracker: Tracker::new(),
                 held_handoff: None,
             }
+        }
+
+        #[test]
+        fn a_parent_stays_running_while_a_worker_it_started_is_busy() {
+            let root = tempfile::tempdir().unwrap();
+            let (parent, worker) = scopes(root.path());
+            let running_of_parent = |worker_turn: &[&str]| {
+                let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+                let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+                engine.running.insert(
+                    parent.clone(),
+                    live(
+                        &parent,
+                        vec![view(&parent, "a", "idle", "workspace")],
+                        &[],
+                        vec![],
+                    )
+                    .0,
+                );
+                engine.running.insert(
+                    worker.clone(),
+                    live(
+                        &worker,
+                        vec![view(&worker, "w", "running", "read_only")],
+                        worker_turn,
+                        vec![],
+                    )
+                    .0,
+                );
+                engine.workers.stamp(
+                    &worker,
+                    "w",
+                    origin(workers_parent(&parent, "a"), Ceiling::Read),
+                );
+                let live = &engine.running[&parent];
+                let rows = engine.scope_rows(&parent, live, vec!["a".into()]);
+                rows.first().expect("parent row").running
+            };
+            // The parent's own turn is done, but its worker is mid-turn on another scope.
+            assert!(running_of_parent(&["w"]));
+            // Both idle: the parent is not running.
+            assert!(!running_of_parent(&[]));
         }
 
         #[test]

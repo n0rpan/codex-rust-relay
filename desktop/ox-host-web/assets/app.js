@@ -509,8 +509,13 @@ function endRow(p) {
   freshProcesses((list) => {
     endChecking = false;
     if (!list) return;
+    // Several Claude sessions can share a scope, so the row must match its thread set too.
     const key = JSON.stringify(p.scope);
-    const fresh = list.find((q) => JSON.stringify(q.scope) === key);
+    const threads = [...p.threads].sort().join("\n");
+    const fresh = list.find(
+      (q) =>
+        JSON.stringify(q.scope) === key && [...q.threads].sort().join("\n") === threads,
+    );
     if (!fresh) {
       notice("That session has already ended.");
       return;
