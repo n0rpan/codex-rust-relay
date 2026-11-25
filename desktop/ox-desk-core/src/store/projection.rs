@@ -161,8 +161,10 @@ impl Store {
                 caps.push(if running { "steer" } else { "send" }.into());
                 self.composer_caps(Some(id), &mut caps);
             } else if self.can_resume_send(id) {
-                // An ended thread keeps its composer: a send reopens it.
+                // An ended thread keeps its composer: a send reopens it, so what the
+                // composer could attach before the reap stays attachable.
                 caps.push("send".into());
+                self.composer_caps(Some(id), &mut caps);
             }
             if running {
                 caps.push("stop".into());
@@ -194,7 +196,11 @@ impl Store {
             if self.can_manage_thread(id) {
                 caps.push("fork".into());
                 if self.can_edit_thread_metadata() {
-                    caps.extend(["archive".into(), "rename".into()]);
+                    // Codex accepts a rename from a non-owner but refuses Archive.
+                    if !self.is_native_live(id) {
+                        caps.push("archive".into());
+                    }
+                    caps.push("rename".into());
                 }
             }
             if self.can_generate_title(id) {
@@ -216,7 +222,7 @@ impl Store {
         };
         let detail = json!({"row":r,"worker":r.worker,"unread":r.unread,"order":r.activity_order.to_string(),"generated":r.generated_title,
             "owned":t.is_some(),"native_live":self.is_native_live(id).then(||self.native_app()),"changing":self.changing_options(id),"terminal":self.in_terminal(id),"sending":self.sending(Some(id)),
-            "route":self.thread_route(Some(id)),"options":t.map(|_|self.options(Some(id))),"access":self.applied_access(Some(id)),"command_caps":(self.is_session_scoped() && t.is_some()).then(||self.command_caps(Some(id)))});
+            "route":self.thread_route(Some(id)),"options":t.map(|_|self.options(Some(id))),"access":self.applied_access(Some(id)),"resume_access":self.resume_access.get(id),"command_caps":(self.is_session_scoped() && t.is_some()).then(||self.command_caps(Some(id)))});
         let mut detail = detail;
         let mut parent = r.parent_thread_id.clone();
         if let Some((nest, extra)) = self.host_annotations.get(id) {

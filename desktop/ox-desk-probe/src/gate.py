@@ -306,13 +306,36 @@ if len(sys.argv) == 2 and "Tailscale" in sys.argv[1]:
                     },
                 },
             ]
-            (project / (ident + ".jsonl")).write_text(
-                "".join(json.dumps(r) + "\n" for r in rows)
-            )
+            journal = project / (ident + ".jsonl")
+            journal.write_text("".join(json.dumps(r) + "\n" for r in rows))
+            # A journal written in the last 90 s belongs to a running native client and the
+            # session opens read-only. These are saved sessions, so make them old.
+            old = time.time() - 3600
+            os.utime(journal, (old, old))
 
     def stats(self, reset=False):
         self.client.sendto(b"reset" if reset else b"snapshot", self.sock)
-        return json.loads(self.client.recv(65536))
+        return json.loads(self.client.recv(1 << 20))
+
+    def control(self, label):
+        """A laid-out, enabled control by id or label, or None. Icon buttons carry no word to OCR."""
+        return next((c for c in self.stats().get("layout", [])
+                     if label in (c["id"], c["label"]) and c["enabled"]), None)
+
+    def press(self, label):
+        """Click a marked control inside the app (no OS pointer), so it works on X11 and Wayland."""
+        self.client.sendto(b"press " + label.encode(), self.sock)
+        reply = json.loads(self.client.recv(1 << 20))
+        if "error" in reply:
+            raise RuntimeError(f"press {label!r}: {reply['error']}")
+
+    def agent(self, query):
+        """Switch the active window's route with the sidebar AGENT picker: open it, filter, Enter."""
+        self.press("billing-route")
+        time.sleep(.3)
+        self.x("type", query)
+        time.sleep(.2)
+        self.x("key", "Return")
 
     def sample(self):
         desktop = json.loads(subprocess.check_output([probe, str(self.proc.pid)]))
@@ -368,7 +391,7 @@ if len(sys.argv) == 2 and "Tailscale" in sys.argv[1]:
             elif argv[0] == "key":
                 if argv[1] in ("ctrl+a", "ctrl+l", "ctrl+Return"):
                     subprocess.run(["wtype", "-s", "120", "-M", "ctrl", "-k", argv[1].split("+")[1], "-m", "ctrl"], check=True)
-                elif argv[1] in ("Up", "Down", "Home", "End"):
+                elif argv[1] in ("Up", "Down", "Home", "End", "Return"):
                     subprocess.run(["wtype", "-s", "120", "-k", argv[1]], check=True)
                 else:
                     raise ValueError(argv)
@@ -581,12 +604,12 @@ def streaming(f):
     if "G10" in selected:
         f.admin("busy")
         wait(lambda: f.stats()["visible_turn"])
-        stop = wait(lambda: f.words().get("stop") or f.words(scale=2).get("stop"))
+        wait(lambda: f.control("stop-turn"))
         search = wait(lambda: f.words().get("search"))
         f.click(search)
         f.x("type", "hold")
         wait(lambda: f.events("list-held"))
-        f.click(stop)
+        f.press("stop-turn")
         end = wait(lambda: f.events("stop-read"))
         elapsed = (end[-1]["ns"] - f.stats()["stop_ns"])/1e6
         # Stop must reach the runtime promptly; 250 ms catches a hang, the frame
@@ -622,11 +645,12 @@ def recovery(f):
     wait(lambda: "preserve" in f.words())
     disconnect()
     wait(lambda: not f.stats()["connected"])
-    words = wait(lambda: words if "closed" in (words := f.words()) else None)
-    button = words.get("reconnect", (315, words["closed"][1] + 30))
+    # The recovery screen words its message ("The session host stopped"), so wait for the
+    # Reconnect button itself rather than any one word.
+    wait(lambda: f.control("retry-connection"))
     time.sleep(.5)
     automatic = len(f.events("spawn")) - 1
-    f.click(button)
+    f.press("retry-connection")
     wait(lambda: len(f.events("spawn")) == 3 and len(f.events("history-reply")) == 3)
     survived = "preserve" in f.words()
     record("reconnect", automatic == 1 and survived and not f.events("send"), automatic_restarts=automatic,
@@ -638,15 +662,12 @@ def reuse(f):
     first = words["0000"]
     search = words["search"]
     new_button = (search[0], search[1] - 40)
-    billing = (search[0], search[1] - 80)
     wait(lambda: f.stats()["discovery_pending"] == 0 and len(f.events("spawn")) == 1)
     before_open = len(f.events("spawn")) + len(f.events("helper"))
-    f.click(billing)
-    f.click((billing[0] + 42, billing[1] + 62))
+    f.agent("fixture-model")
     wait(lambda: f.stats()["pane"] == 1 and f.stats()["connected"] and len(f.events("spawn")) == 2)
     cold_route_spawns = len(f.events("spawn")) + len(f.events("helper")) - before_open
-    f.click(billing)
-    f.click((billing[0] + 42, billing[1] + 31))
+    f.agent("codex")
     wait(lambda: f.stats()["pane"] == 0)
     base = len(f.events("spawn")) + len(f.events("helper"))
     for i in range(20):
@@ -661,10 +682,7 @@ def reuse(f):
     first_route_spawns = 0
     for i in range(20):
         target = 1 - i % 2
-        f.click(billing)
-        # Open menu is anchored below the billing button. Its items are in
-        # subscription/API order regardless of the active checkmark.
-        f.click((billing[0] + 42, billing[1] + (62 if target else 31)))
+        f.agent("fixture-model" if target else "codex")
         wait(lambda: f.stats()["pane"] == target)
         if i == 0:
             wait(lambda: len(f.events("spawn")) == 2)
@@ -682,10 +700,9 @@ def saved_layout(f):
     f.start(30, 1, routes=True)
     # A new window creates only its selected route. Use the same billing picker
     # as the route-reuse gate to create both panes before saving their layout.
-    x, y = wait(lambda: f.words().get("search"))
+    wait(lambda: f.words().get("search"))
     for target in (1, 0):
-        f.click((x, y - 80))
-        f.click((x + 42, y - 80 + (62 if target else 31)))
+        f.agent("fixture-model" if target else "codex")
         wait(lambda: f.stats()["pane"] == target and f.stats()["connected"])
     f.click(wait(lambda: f.words().get("0000")))
     selected = wait(lambda: f.stats()["selected_thread"])
@@ -739,7 +756,7 @@ def saved_layout(f):
 def remote_access(f):
     # The GUI talks to the real packaged host and a private synthetic Serve CLI.
     # Every domain and identity here is local test data.
-    f.click(wait(lambda: f.words().get("settings")))
+    f.press("settings")
     f.click(wait(lambda: f.words().get("remote")))
     f.click(wait(lambda: f.words().get("enable")))
     mapping = Path(f.env["HOME"]) / "fixture-serve.json"
@@ -764,7 +781,7 @@ def remote_access(f):
 def secure_key(f):
     import secrets
     since = int(time.time())
-    f.click(wait(lambda: f.words().get("settings")))
+    f.press("settings")
     f.click(wait(lambda: f.words().get("credentials")))
     words = wait(lambda: w if "enter" in (w := f.words()) else None)
     f.click(words["enter"])
@@ -903,7 +920,8 @@ def claude_gate(f):
     f.x("key", "ctrl+Return")
     wait(lambda: len(f.events("claude-user")) == 5)
     wait(lambda: f.stats()["visible_turn"])
-    f.click(wait(lambda: f.words().get("stop") or f.words(scale=2).get("stop")))
+    wait(lambda: f.control("stop-turn"))
+    f.press("stop-turn")
     stop = wait(lambda: f.events("claude-stop-read"))[-1]
     elapsed = (stop["ns"] - f.stats()["stop_ns"]) / 1e6
     started = f.events("claude-stream-start")

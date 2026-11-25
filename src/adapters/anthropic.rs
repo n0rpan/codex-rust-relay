@@ -1547,6 +1547,7 @@ impl ResponseTranslator {
                         kind: BlockKind::Tool {
                             call_id: call_id.to_owned(),
                             name: name.to_owned(),
+                            saw_json: !initial.is_empty(),
                             arguments: initial.clone(),
                             item_id: item_id.clone(),
                         },
@@ -1696,10 +1697,14 @@ impl ResponseTranslator {
                 }
                 (
                     BlockKind::Tool {
-                        arguments, item_id, ..
+                        arguments,
+                        item_id,
+                        saw_json,
+                        ..
                     },
                     "input_json_delta",
                 ) => {
+                    *saw_json = true;
                     let partial =
                         required_string(delta, "partial_json", "content_block_delta.delta")?;
                     arguments.push_str(partial);
@@ -1819,7 +1824,9 @@ impl ResponseTranslator {
                     name,
                     arguments,
                     item_id,
+                    saw_json,
                 } => StopAction::Tool {
+                    saw_json: *saw_json,
                     item_id: item_id.clone(),
                     call_id: call_id.clone(),
                     name: name.clone(),
@@ -1876,6 +1883,7 @@ impl ResponseTranslator {
                 call_id,
                 name,
                 arguments,
+                saw_json,
             } => {
                 let arguments = if arguments.trim().is_empty() {
                     "{}".to_owned()
@@ -1901,6 +1909,13 @@ impl ResponseTranslator {
                         state.invalid_tool.get_or_insert(message);
                     }
                     None => {
+                        if !saw_json {
+                            // No JSON delta ever arrived: either a genuine
+                            // no-argument call or a cut before the first
+                            // delta. message_stop decides once the stop
+                            // reason is known.
+                            self.state_mut()?.unproven.push(index);
+                        }
                         let item = json!({
                             "id": item_id,
                             "type": "function_call",
@@ -2004,6 +2019,15 @@ impl ResponseTranslator {
             // incomplete. Otherwise the invalid arguments are a stream error.
             if let (Some(message), false) = (state.invalid_tool.take(), truncated) {
                 return Err(message);
+            }
+            if truncated {
+                for index in std::mem::take(&mut state.unproven) {
+                    if let Some(item) = state.completed.remove(&index)
+                        && let Some(call_id) = item.get("call_id").and_then(Value::as_str)
+                    {
+                        state.tool_ids.retain(|id| id != call_id);
+                    }
+                }
             }
             let tool_ids = state.tool_ids.clone();
             let model = configured_model.unwrap_or_else(|| state.model.clone());
@@ -2199,6 +2223,9 @@ struct StreamState {
     /// First tool_use block whose arguments were not a JSON object. Decided at
     /// message_stop: an error for ordinary stops, a dropped call when truncated.
     invalid_tool: Option<String>,
+    /// Tool blocks closed without any JSON delta; dropped when the turn was
+    /// truncated because the cut may have preceded their arguments.
+    unproven: Vec<usize>,
 }
 
 impl StreamState {
@@ -2216,6 +2243,7 @@ impl StreamState {
             completed: BTreeMap::new(),
             tool_ids: Vec::new(),
             invalid_tool: None,
+            unproven: Vec::new(),
         }
     }
 }
@@ -2237,6 +2265,7 @@ enum BlockKind {
         name: String,
         arguments: String,
         item_id: String,
+        saw_json: bool,
     },
     Thinking {
         text: String,
@@ -2277,6 +2306,7 @@ enum StopAction {
         call_id: String,
         name: String,
         arguments: String,
+        saw_json: bool,
     },
     Thinking {
         item_id: String,

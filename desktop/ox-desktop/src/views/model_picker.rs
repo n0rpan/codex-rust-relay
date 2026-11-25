@@ -337,6 +337,8 @@ pub(super) struct ModelPicker {
     loading: bool,
     notice: Option<String>,
     show_older: bool,
+    /// Star writes started and not yet finished.
+    pending_stars: usize,
     /// The runtime API rows run with; none hides the control.
     runtime: Option<Runtime>,
     /// Whether any API provider is configured; assumed until settings load.
@@ -390,6 +392,7 @@ impl ModelPicker {
             loading: false,
             notice: None,
             show_older: false,
+            pending_stars: 0,
             runtime: None,
             providers: true,
             handoff: false,
@@ -412,6 +415,12 @@ impl ModelPicker {
 
     pub(super) fn with_discovered_new_session(mut self) -> Self {
         self.discovered_new_session = true;
+        self
+    }
+
+    /// Also list the full discovered catalog, not only the settings' static and starred aliases.
+    pub(super) fn with_catalog(mut self, cx: &mut Context<Self>) -> Self {
+        self.refresh(cx);
         self
     }
 
@@ -515,24 +524,35 @@ impl ModelPicker {
         if id.starts_with(PLAN_PREFIX) {
             return;
         }
-        let mut favorites = self.favorites.clone();
-        match favorites.iter().position(|f| f == id) {
-            Some(index) => {
-                favorites.remove(index);
-            }
-            None => favorites.push(id.to_owned()),
-        }
-        let task = cx.background_spawn(async move { write_favorites(favorites) });
+        // The click is a delta against what the row shows now, which already includes the
+        // clicks still being written, so a fast double click on one row is add then remove.
+        let add = !self.favorites.iter().any(|f| f == id);
+        self.favorites = apply_delta(&self.favorites, id, add);
+        self.pending_stars += 1;
+        let id = id.to_owned();
+        let task = cx.background_spawn(async move { write_star(&id, add) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
+                this.pending_stars -= 1;
                 match result {
                     Ok(saved) => {
-                        this.favorites = saved.clone();
+                        // Later clicks are still in flight: their optimistic state stands until
+                        // the last write reports the saved list.
+                        if this.pending_stars == 0 {
+                            this.favorites = saved.clone();
+                        }
                         this.notice = None;
                         cx.emit(ModelPickerEvent::Starred(saved));
                     }
-                    Err(error) => this.notice = Some(error),
+                    Err(error) => {
+                        this.notice = Some(error);
+                        if this.pending_stars == 0
+                            && let Ok(s) = settings::load()
+                        {
+                            this.favorites = s.favorites;
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -692,23 +712,68 @@ pub(super) fn provider_note(id: &str) -> String {
     }
 }
 
-/// Persist the favourites with the same edit the Favorites page uses. A stale revision is
-/// reloaded and retried once.
-fn write_favorites(favorites: Vec<String>) -> Result<Vec<String>, String> {
-    let mut revision = settings::load()?.revisions.favorites;
-    for _ in 0..2 {
-        let request = Request::Edit {
-            revision: revision.clone(),
-            edit: model::Edit::Favorites {
-                models: favorites.clone(),
-            },
-        };
-        match settings::apply(&request)? {
-            Ok(saved) => return Ok(saved.favorites),
-            Err(_) => revision = settings::load()?.revisions.favorites,
+/// Add or remove one alias in a favourites list, keeping the others and their order. Adding a
+/// starred alias or removing an absent one changes nothing.
+pub(super) fn apply_delta(list: &[String], id: &str, add: bool) -> Vec<String> {
+    let mut next: Vec<String> = list.iter().filter(|f| *f != id).cloned().collect();
+    if add {
+        match list.iter().position(|f| f == id) {
+            Some(index) => next.insert(index, id.to_owned()),
+            None => next.push(id.to_owned()),
+        }
+    }
+    next
+}
+
+/// The favourites document as the picker writes it: read the freshest list and revision,
+/// replace the list against that revision.
+pub(super) trait Favorites {
+    fn read(&mut self) -> Result<(Vec<String>, String), String>;
+    /// `Ok(None)`: the revision is stale.
+    fn write(&mut self, revision: &str, list: Vec<String>) -> Result<Option<Vec<String>>, String>;
+}
+
+/// Apply one star as a delta on the freshest list. A stale revision re-reads and applies the
+/// same delta again, so overlapping stars from other windows are kept.
+pub(super) fn star_delta(
+    store: &mut impl Favorites,
+    id: &str,
+    add: bool,
+) -> Result<Vec<String>, String> {
+    for _ in 0..8 {
+        let (list, revision) = store.read()?;
+        let next = apply_delta(&list, id, add);
+        if next == list {
+            return Ok(list);
+        }
+        if let Some(saved) = store.write(&revision, next)? {
+            return Ok(saved);
         }
     }
     Err("Starred models changed elsewhere. Try again.".into())
+}
+
+struct Settings;
+impl Favorites for Settings {
+    fn read(&mut self) -> Result<(Vec<String>, String), String> {
+        let s = settings::load()?;
+        Ok((s.favorites, s.revisions.favorites))
+    }
+    fn write(&mut self, revision: &str, list: Vec<String>) -> Result<Option<Vec<String>>, String> {
+        let request = Request::Edit {
+            revision: revision.to_owned(),
+            edit: model::Edit::Favorites { models: list },
+        };
+        Ok(settings::apply(&request)?.ok().map(|saved| saved.favorites))
+    }
+}
+
+/// Writes in one window go one at a time, each reading the list the previous one saved.
+static STAR_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn write_star(id: &str, add: bool) -> Result<Vec<String>, String> {
+    let _serial = STAR_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    star_delta(&mut Settings, id, add)
 }
 
 impl Render for ModelPicker {
@@ -829,7 +894,99 @@ impl Render for ModelPicker {
 
 #[cfg(test)]
 mod tests {
-    use super::{Entry, Footer, Row, api_entry, arrange, dedup, footer, model_rows};
+    use super::{
+        Entry, Favorites, Footer, Row, api_entry, apply_delta, arrange, dedup, footer, model_rows,
+        star_delta,
+    };
+    use std::{cell::RefCell, rc::Rc};
+
+    /// A favourites document shared by several windows. `race` runs once between a read and
+    /// the next write, standing for another window saving in that gap.
+    type Race = Box<dyn FnOnce(&mut (Vec<String>, u32))>;
+    #[derive(Clone, Default)]
+    struct Doc {
+        state: Rc<RefCell<(Vec<String>, u32)>>,
+        race: Rc<RefCell<Vec<Race>>>,
+        conflicts: Rc<RefCell<u32>>,
+    }
+    impl Favorites for Doc {
+        fn read(&mut self) -> Result<(Vec<String>, String), String> {
+            let s = self.state.borrow();
+            Ok((s.0.clone(), s.1.to_string()))
+        }
+        fn write(
+            &mut self,
+            revision: &str,
+            list: Vec<String>,
+        ) -> Result<Option<Vec<String>>, String> {
+            let race = self.race.borrow_mut().pop();
+            if let Some(race) = race {
+                race(&mut self.state.borrow_mut());
+            }
+            let mut s = self.state.borrow_mut();
+            if s.1.to_string() != revision {
+                *self.conflicts.borrow_mut() += 1;
+                return Ok(None);
+            }
+            *s = (list.clone(), s.1 + 1);
+            Ok(Some(list))
+        }
+    }
+    fn list(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn delta_keeps_order_and_is_idempotent() {
+        let base = list(&["a", "b", "c"]);
+        assert_eq!(apply_delta(&base, "d", true), list(&["a", "b", "c", "d"]));
+        assert_eq!(apply_delta(&base, "b", true), base);
+        assert_eq!(apply_delta(&base, "b", false), list(&["a", "c"]));
+        assert_eq!(apply_delta(&base, "z", false), base);
+    }
+
+    #[test]
+    fn overlapping_clicks_on_different_models_both_land() {
+        let doc = Doc::default();
+        // Click two reads the list before click one saves, then both write.
+        doc.race.borrow_mut().push(Box::new(|s| {
+            s.0.push("two".into());
+            s.1 += 1;
+        }));
+        let saved = star_delta(&mut doc.clone(), "one", true).unwrap();
+        assert_eq!(saved, list(&["two", "one"]));
+        assert_eq!(*doc.conflicts.borrow(), 1);
+        let saved = star_delta(&mut doc.clone(), "two", false).unwrap();
+        assert_eq!(saved, list(&["one"]));
+    }
+
+    #[test]
+    fn two_windows_unstar_and_star_independently() {
+        let doc = Doc::default();
+        *doc.state.borrow_mut() = (list(&["a", "b"]), 4);
+        // Window two removes "a" while window one is adding "c" against the old revision.
+        doc.race.borrow_mut().push(Box::new(|s| {
+            s.0.retain(|f| f != "a");
+            s.1 += 1;
+        }));
+        let saved = star_delta(&mut doc.clone(), "c", true).unwrap();
+        assert_eq!(saved, list(&["b", "c"]));
+        assert_eq!(doc.state.borrow().0, saved);
+    }
+
+    #[test]
+    fn a_persistent_conflict_gives_up_with_a_message() {
+        struct Never;
+        impl Favorites for Never {
+            fn read(&mut self) -> Result<(Vec<String>, String), String> {
+                Ok((vec![], "1".into()))
+            }
+            fn write(&mut self, _: &str, _: Vec<String>) -> Result<Option<Vec<String>>, String> {
+                Ok(None)
+            }
+        }
+        assert!(star_delta(&mut Never, "a", true).is_err());
+    }
 
     fn entry(id: &str) -> Entry {
         Entry::alias(id)

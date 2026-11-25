@@ -51,6 +51,22 @@ pub fn snapshot(ox: &Path, path: &OsStr) -> Result<Snapshot, String> {
     Ok(settings)
 }
 
+/// `base` (the settings snapshot's static and starred aliases, starred first) followed by every
+/// other alias the providers list. Stars only order the list; a discovered alias that nobody
+/// starred is as usable as any other.
+pub fn merge_catalog(base: &[String], discovered: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut all = base.to_vec();
+    let mut seen: std::collections::HashSet<String> = all.iter().cloned().collect();
+    all.extend(discovered.into_iter().filter(|m| seen.insert(m.clone())));
+    all
+}
+
+/// The full catalog behind `base`. Discovery asks the providers, so a failure keeps `base`.
+pub fn catalog(ox: &Path, path: &OsStr, base: &[String]) -> Vec<String> {
+    let discovered: Vec<String> = request(ox, path, Request::Models).unwrap_or_default();
+    merge_catalog(base, discovered)
+}
+
 /// Both the settings port and native runtime jobs use the same companion and child PATH.
 pub(crate) fn process(ox: &Path, path: &OsStr) -> Command {
     let mut cmd = Command::new(ox);

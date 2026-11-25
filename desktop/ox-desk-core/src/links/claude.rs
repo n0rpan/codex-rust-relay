@@ -23,6 +23,9 @@ pub struct Launch {
     pub billing: Billing,
     pub session: Session,
     pub permission_mode: String,
+    /// A worker launch carries the shared worker contract (tools, sandbox
+    /// settings); an ordinary session passes `None`.
+    pub contract: Option<crate::claude_worker_contract::Contract>,
 }
 #[derive(Clone, Debug)]
 pub enum Session {
@@ -96,6 +99,9 @@ impl Launch {
         } else {
             "--allow-dangerously-skip-permissions"
         });
+        if let Some(contract) = &self.contract {
+            cmd.args(contract.args());
+        }
         match &self.session {
             Session::New(id) => {
                 cmd.args(["--session-id", id]);
@@ -342,5 +348,53 @@ fn matches_account(billing: &Billing, account: &Account) -> bool {
                     .is_some_and(|s| !s.is_empty())
         }
         Billing::Api(_) => source == Some("ANTHROPIC_AUTH_TOKEN"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claude_worker_contract::Contract;
+
+    fn args(billing: Billing, contract: Option<Contract>) -> Vec<String> {
+        let launch = Launch {
+            ox: "ox".into(),
+            path: "/usr/bin".into(),
+            project: "/".into(),
+            billing,
+            session: Session::New("id".into()),
+            permission_mode: "acceptEdits".into(),
+            contract,
+        };
+        launch
+            .command()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The hosted launch carries exactly the policy arguments the standalone
+    /// builder passes, for both billing routes; an ordinary session carries none.
+    #[test]
+    fn hosted_write_launch_matches_the_shared_contract() {
+        for sandboxed in [true, false] {
+            let contract = Contract::with_support(true, false, sandboxed);
+            for billing in [Billing::Subscription, Billing::Api("alias".into())] {
+                let hosted = args(billing.clone(), Some(contract));
+                let policy = contract.args();
+                assert!(
+                    hosted.windows(policy.len()).any(|w| w == policy.as_slice()),
+                    "{hosted:?}"
+                );
+                assert_eq!(hosted.iter().any(|a| a == "--settings"), sandboxed);
+                let tools = hosted.iter().position(|a| a == "--tools").unwrap();
+                assert_eq!(hosted[tools + 1].contains("Bash"), sandboxed);
+                let plain = args(billing, None);
+                assert!(!plain.iter().any(|a| a == "--tools" || a == "--settings"));
+            }
+        }
+        let mode = args(Billing::Subscription, None);
+        let at = mode.iter().position(|a| a == "--permission-mode").unwrap();
+        assert_eq!(mode[at + 1], "acceptEdits");
     }
 }

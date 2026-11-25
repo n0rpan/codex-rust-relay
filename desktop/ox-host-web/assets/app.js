@@ -1337,6 +1337,11 @@ $("new").onclick = () => {
   options($("project"), projects, projects);
   options($("route"), routes, routes.map(routesLabel));
   page("create");
+  loadModelChoices().then(() => {
+    const keep = $("route").value;
+    options($("route"), routes, routes.map(routesLabel));
+    if (keep !== "") $("route").value = keep;
+  });
 };
 let browseSequence = 0,
   folderPage,
@@ -1540,11 +1545,22 @@ function handoffRoutes() {
   if (keep !== "" && routes[+keep]?.runtime === runtime) select.value = keep;
   handoffNotice();
 }
+// The route the handoff form currently targets. An empty selection (no route of
+// the chosen runtime is configured) is no route, never index 0 of another runtime.
+const handoffTarget = () => {
+  const index = $("handoff-route").value;
+  const route = index === "" ? undefined : routes[+index];
+  return route?.runtime === $("handoff-runtime").value ? route : undefined;
+};
+const runtimeName = (r) => (r === "codex" ? "ChatGPT/Codex" : "Claude");
 function handoffNotice() {
-  const target = routes[+$("handoff-route").value],
+  const target = handoffTarget(),
     source = selected?.scope?.route;
   const line = $("handoff-provider");
-  if (target && source && provider(target) !== provider(source)) {
+  if (!target) {
+    line.textContent = `No ${runtimeName($("handoff-runtime").value)} model or subscription is configured on this host. Choose another runtime or sign in on the host.`;
+    line.hidden = false;
+  } else if (source && provider(target) !== provider(source)) {
     line.textContent = `This handoff sends the carried conversation to ${provider(target)} (${routesLabel(target)}).`;
     line.hidden = false;
   } else line.hidden = true;
@@ -1580,8 +1596,13 @@ $("handoff-cancel").onclick = () => ($("handoff-form").hidden = true);
 $("handoff-form").onsubmit = (e) => {
   e.preventDefault();
   if (!selected?.id) return;
-  const route = routes[+$("handoff-route").value];
-  if (!route) return;
+  const route = handoffTarget();
+  if (!route) {
+    notice(
+      `No ${runtimeName($("handoff-runtime").value)} model or subscription is configured on this host.`,
+    );
+    return;
+  }
   const mode = $("handoff-mode").value;
   const request = $("handoff-request").value.trim();
   if (!request) {
@@ -1645,6 +1666,13 @@ async function loadModelChoices() {
   } catch {
     // The route list alone still works.
   }
+  try {
+    // The full discovered catalog: stars only order, any model can be used.
+    const found = await settingsRequest(key, { action: "models" });
+    if (Array.isArray(found)) known = [...known, ...found];
+  } catch {
+    // Discovery needs the providers; the starred and configured models still work.
+  }
   const clean = (list) => [
     ...new Set(list.filter((m) => typeof m === "string" && m)),
   ];
@@ -1654,8 +1682,20 @@ async function loadModelChoices() {
     starred,
     all: clean([...starred, ...known, ...fromRoutes]),
   };
+  addCatalogRoutes();
   fillWorkerModels();
   handoffRoutes();
+}
+// Routes are only appended, so the indexes the forms hold stay valid.
+function addCatalogRoutes() {
+  const have = new Set(routes.map((r) => `${r.runtime} ${r.billing?.api ?? ""}`));
+  for (const runtime of ["codex", "claude"]) {
+    if (!routes.some((r) => r.runtime === runtime)) continue;
+    for (const m of modelChoices.all) {
+      if (have.has(`${runtime} ${m}`)) continue;
+      routes.push({ runtime, billing: { api: m } });
+    }
+  }
 }
 // The model the worker sheet should start from: the parent session's route, set when
 // the sheet opens (desktop worker_sheet.rs Choice::new). Cleared when the runtime changes.
@@ -1787,6 +1827,16 @@ $("worker-form").onsubmit = (e) => {
   }
   const runtime = $("worker-runtime").value,
     permission = $("worker-permission").value;
+  // No model chosen means the runtime's subscription, which must be configured.
+  if (
+    !workerModelValue() &&
+    !routes.some((r) => r.runtime === runtime && r.billing === "subscription")
+  ) {
+    notice(
+      `${runtimeName(runtime)} has no subscription configured on this host. Choose an OX API model or sign in on the host.`,
+    );
+    return;
+  }
   const start = {
     parent: selected.id,
     runtime,

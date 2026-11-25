@@ -47,6 +47,11 @@ impl Store {
         if !self.can_manage_thread(id) {
             return Err(io::Error::other("Select an idle thread to change it"));
         }
+        if matches!(op, ThreadOperation::Archive) && self.is_native_live(id) {
+            return Err(io::Error::other(
+                "Another client is running this thread; it can't be archived from here",
+            ));
+        }
         if self.is_session_scoped() {
             return match op {
                 ThreadOperation::Fork => self.claude_fork(id),

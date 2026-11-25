@@ -111,6 +111,7 @@ impl Store {
         let t = self.transcripts.entry(owner.into()).or_default();
         t.access = mode;
         t.error = None;
+        self.resume_access.remove(owner);
         t.model = model;
         self.state = Connection::Ready;
         self.changed.mark(Changed::CONNECTION);
@@ -825,6 +826,8 @@ mod tests {
             catalog: Default::default(),
             asks: Default::default(),
             blank: None,
+            worker: None,
+            worker_blank: None,
             serial: 2,
             native: Default::default(),
         };
@@ -886,6 +889,58 @@ mod tests {
         s.apply(event);
         assert_eq!(s.draft(Some(&a)), "back again");
         assert!(!s.claude().sessions.contains_key(&a));
+    }
+    /// A host reaps an idle route and reopens it for the next send: the new store is still
+    /// connecting, its catalog holds the saved row and no process exists for it yet.
+    #[test]
+    fn a_connecting_claude_store_resumes_a_saved_row_on_the_first_send() {
+        let (mut s, a, _b) = fixture();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        s.claude_mut().deliver = Arc::new(move |event| {
+            let _ = tx.lock().unwrap().send(event);
+        });
+        s.claude_mut().sessions.remove(&a);
+        s.mark_ended(&a);
+        assert_eq!(s.state, Connection::Connecting);
+        assert!(s.can_compose(Some(&a)));
+        s.edit(Some(&a), "after the reap".into());
+        s.submit(Some(&a)).unwrap();
+        assert_eq!(
+            s.claude().sessions[&a].first.as_ref().map(|f| f.1.as_str()),
+            Some("after the reap")
+        );
+        assert_eq!(s.draft(Some(&a)), "");
+        // The saved session is missing in this fixture, so the launch fails and the
+        // message comes back to the composer exactly once.
+        let event = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        s.apply(event);
+        assert_eq!(s.draft(Some(&a)), "after the reap");
+        assert!(rx.try_recv().is_err());
+    }
+    /// A send that reopens an ended session runs its first turn in the access mode the
+    /// user had chosen, whether they ended the session or the host reaped the route
+    /// (the replacement store is seeded through `restore_ended`). Opening the session from
+    /// the list is a fresh start and keeps `default`.
+    #[test]
+    fn a_resumed_send_keeps_the_access_mode_but_opening_from_the_list_does_not() {
+        let (mut s, a, b) = fixture();
+        s.claude_mut().deliver = Arc::new(|_| ());
+        for k in [&a, &b] {
+            s.claude_mut().sessions.remove(k);
+            s.restore_ended(k, "Session", 1, Some(Access::Plan));
+        }
+        s.edit(Some(&a), "go on".into());
+        s.submit(Some(&a)).unwrap();
+        assert_eq!(s.claude().sessions[&a].launch_mode, "plan");
+        s.claude_open(&b).unwrap();
+        assert_eq!(s.claude().sessions[&b].launch_mode, "default");
+        // A resume that fails keeps the mode for the retry.
+        s.claude_mut().sessions.remove(&a);
+        s.mark_ended(&a);
+        s.edit(Some(&a), "again".into());
+        s.submit(Some(&a)).unwrap();
+        assert_eq!(s.claude().sessions[&a].launch_mode, "plan");
     }
     #[test]
     fn a_later_init_after_cd_keeps_the_session_but_a_first_init_elsewhere_does_not() {

@@ -18,9 +18,6 @@ pub(crate) async fn dispatch(args: &[OsString], home: &Path) -> Option<Result<u8
         [client, mode, rest @ ..] if client == "codex" && mode == "--chatgpt" => {
             Some(launch_chatgpt(rest, home, None).await)
         }
-        [client, mode] if client == "claude" && mode == "--subscription" => {
-            Some(launch_subscription(ClientKind::Claude, home, None).await)
-        }
         [client, mode, args @ ..] if client == "claude" && mode == "--subscription" => {
             Some(launch_claude_subscription(args, home).await)
         }
@@ -50,9 +47,9 @@ pub(crate) async fn launch_subscription(
 ) -> Result<u8, RelayError> {
     match client {
         ClientKind::Codex => launch_chatgpt(&[], home, relay).await,
-        ClientKind::Claude => {
-            launch_session(claude_account_command(home)?, &[], home, client, relay).await
-        }
+        // The same checked settings overlay as every other subscription launch, so
+        // a user or project settings file cannot point the session at another origin.
+        ClientKind::Claude => launch_claude_subscription_with(&[], home, relay).await,
     }
 }
 
@@ -206,6 +203,16 @@ async fn check_claude_subscription(home: &Path) -> Result<(), RelayError> {
 }
 
 async fn launch_claude_subscription(args: &[OsString], home: &Path) -> Result<u8, RelayError> {
+    launch_claude_subscription_with(args, home, None).await
+}
+
+/// Every Claude subscription launch, with or without further arguments, goes
+/// through the checked account and settings overlay here.
+async fn launch_claude_subscription_with(
+    args: &[OsString],
+    home: &Path,
+    relay: Option<crate::workers::Relay>,
+) -> Result<u8, RelayError> {
     if args.iter().any(|arg| {
         let name = arg.to_string_lossy();
         matches!(
@@ -224,9 +231,18 @@ async fn launch_claude_subscription(args: &[OsString], home: &Path) -> Result<u8
         &args,
         home,
         ClientKind::Claude,
-        None,
+        relay,
     )
     .await
+}
+
+/// The subscription command for a standalone worker, with the same checked
+/// settings overlay (the worker's sandbox document is merged into it).
+pub(crate) fn claude_subscription_worker_command(
+    home: &Path,
+    sandbox: bool,
+) -> Result<Command, RelayError> {
+    checked_claude_command(home, sandbox)
 }
 
 pub(crate) fn title_generation() -> bool {
@@ -465,4 +481,31 @@ pub(crate) async fn launch(mut command: Command) -> Result<u8, RelayError> {
         crate::client_launch_error(&client, error)
     })?;
     Ok(status.code().unwrap_or(1) as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every subscription launch carries one checked overlay that blanks the
+    /// routing env, so user or project settings cannot choose another origin.
+    #[test]
+    fn subscription_worker_command_uses_the_checked_overlay() {
+        let home = std::env::temp_dir().join("ox-native-overlay-test");
+        for sandbox in [false, true] {
+            let command = claude_subscription_worker_command(&home, sandbox).unwrap();
+            let args: Vec<_> = command
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(args.iter().filter(|a| *a == "--settings").count(), 1);
+            let at = args.iter().position(|a| a == "--settings").unwrap();
+            let settings: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
+            assert_eq!(settings["env"]["ANTHROPIC_BASE_URL"], "");
+            assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "");
+            assert_eq!(settings["apiKeyHelper"], "");
+            assert_eq!(settings["sandbox"]["enabled"] == true, sandbox);
+        }
+    }
 }

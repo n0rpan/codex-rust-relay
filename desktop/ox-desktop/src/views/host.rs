@@ -655,6 +655,21 @@ impl Host {
             });
         })
         .detach();
+        // Any catalog model can be used, starred or not: the discovered aliases follow the
+        // settings' own so saved history on an unstarred alias reopens and routes list it.
+        let task = cx.background_spawn(async { settings::discover_models() });
+        cx.spawn(async move |this, cx| {
+            if let Ok(found) = task.await {
+                let _ = this.update(cx, |s, cx| {
+                    let merged = ox_desk_core::ports::ox::merge_catalog(&s.models, found);
+                    if merged != s.models {
+                        s.models = merged;
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
     }
     fn compact(&self, window: &Window) -> bool {
         needs_drawer(window.viewport_size().width, self.sidebar_width)

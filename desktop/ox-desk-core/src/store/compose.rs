@@ -17,6 +17,11 @@ pub(super) struct Draft {
     sent: Option<SentInput>,
 }
 impl Draft {
+    /// What a delivered copy of this draft looks like in a transcript: trimmed text and
+    /// the number of attachments.
+    pub(super) fn signature(&self) -> (String, usize) {
+        (self.text.trim().to_owned(), self.images.len())
+    }
     pub(super) fn restore_before(mut self, newer: &mut Draft) {
         if !self.text.is_empty() && !newer.text.is_empty() {
             self.text.push('\n');
@@ -163,7 +168,9 @@ impl Store {
             && !self.in_terminal(id)
             && !self.sending(Some(id))
             && self.catalog.get(id).is_some()
-            && !(self.is_session_scoped() && (id.contains('/') || self.state != Connection::Ready))
+            // A Claude route still connecting can start the resumed process itself: it
+            // never waits on the blank draft process, so a reaped route's first send works.
+            && !(self.is_session_scoped() && id.contains('/'))
     }
     /// Reopen an ended thread and keep the draft to send once it is ready. Claude resumes
     /// with the message as the process's first input; Codex resumes, then `flush_resume_sends`
@@ -483,6 +490,13 @@ impl Store {
         if self.state != Connection::Ready {
             return Err(io::Error::other("Reconnect to end this session"));
         }
+        // Another client holds the writer lock: OX only views it, so there is nothing of
+        // OX's to end (an unsubscribe would only answer notLoaded).
+        if self.is_native_live(id) {
+            return Err(io::Error::other(
+                "Another client is running this thread; OX only follows it",
+            ));
+        }
         if !self
             .transcripts
             .get(id)
@@ -508,6 +522,13 @@ impl Store {
         t.active_turn = None;
         t.error = None;
         self.ended_threads.insert(id.into());
+        // A Read, Resume or History still in flight must not reopen the thread when its
+        // reply lands after the End: a sibling keeps this scope's runtime up, so nothing
+        // else would close it again. The Unsubscribe below follows them on the wire.
+        self.pending.retain(|_, (_, p)| {
+            !matches!(p, Pending::Read(x) | Pending::Resume(x) | Pending::History(x)
+                if x.as_str() == id)
+        });
         self.changed.transcript(id);
         self.changed.mark(Changed::THREADS);
         self.request(Call::Unsubscribe(id.into()), Pending::Unsubscribe)
@@ -523,7 +544,9 @@ impl Store {
         }
         self.transcripts
             .iter()
-            .filter(|(id, t)| (t.ready || t.loading) && !self.terminal_threads.contains(*id))
+            .filter(|(id, t)| {
+                (t.ready || t.loading) && !t.native_live && !self.terminal_threads.contains(*id)
+            })
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -545,6 +568,45 @@ impl Store {
             self.ended_threads.insert(id.into());
         }
     }
+    /// Restore a thread the host knew before it reaped or replaced this route's runtime.
+    /// The thread is ended (a send resumes it) even when discovery has not listed it:
+    /// Codex gets a minimal row in this project and route, whose resume verifies identity
+    /// with the server. `access` is the Claude mode the user had chosen.
+    pub fn restore_ended(
+        &mut self,
+        id: &str,
+        title: &str,
+        updated_at: i64,
+        access: Option<crate::runtime::Access>,
+    ) {
+        if self.remote().is_some() {
+            return;
+        }
+        self.ended_threads.insert(id.into());
+        if let Some(access) = access {
+            self.resume_access.insert(id.into(), access);
+        }
+        if !self.is_session_scoped() && self.catalog.get(id).is_none() {
+            self.catalog.insert(crate::codex::history::ThreadRow {
+                worker: false,
+                parent_thread_id: None,
+                agent_nickname: None,
+                id: id.into(),
+                cwd: self.profile.project.clone(),
+                model_provider: self.profile.provider.clone(),
+                model: None,
+                name: (!title.trim().is_empty()).then(|| title.to_owned()),
+                preview: String::new(),
+                generated_title: None,
+                updated_at,
+                status: None,
+                unread: false,
+                activity_order: 0,
+            });
+            self.catalog_revision += 1;
+            self.changed.mark(Changed::THREADS);
+        }
+    }
     /// The live process was ended and nothing has started it again. The row stays
     /// in the catalog; selecting it resumes the thread. A remote client reads the
     /// host's `ended` capability.
@@ -562,9 +624,9 @@ impl Store {
         if self.is_session_scoped() {
             return self.claude_has_live(id);
         }
-        self.transcripts
-            .get(id)
-            .is_some_and(|t| (t.ready || t.loading) && !self.terminal_threads.contains(id))
+        self.transcripts.get(id).is_some_and(|t| {
+            (t.ready || t.loading) && !t.native_live && !self.terminal_threads.contains(id)
+        })
     }
     /// Something in this thread would be lost by ending it now.
     pub fn thread_busy(&self, id: &str) -> bool {
@@ -952,6 +1014,151 @@ mod tests {
         assert_eq!(store.draft(Some(&id)), "");
     }
 
+    /// The host reaped the route and reopened it for a send: the replacement store is
+    /// connecting, and the thread (fresh, so absent from discovery) exists only as a
+    /// recovered id.
+    #[test]
+    fn a_connecting_codex_store_resumes_a_recovered_thread_absent_from_discovery() {
+        let mut store = ready();
+        store.state = Connection::Connecting;
+        store.restore_ended("fresh", "Fresh thread", 7, None);
+        assert!(store.can_compose(Some("fresh")));
+        // The send arrives while the runtime is still connecting.
+        store.edit(Some("fresh"), "after the reap".into());
+        store.submit(Some("fresh")).unwrap();
+        assert!(store.sending(Some("fresh")));
+        assert_eq!(
+            store.draft(Some("fresh")),
+            "after the reap",
+            "kept until delivery"
+        );
+        // The route comes up and lists the project; discovery does not know the thread.
+        store.connected().unwrap();
+        let list = store
+            .pending
+            .iter()
+            .find_map(|(id, (_, p))| matches!(p, Pending::List { .. }).then_some(*id))
+            .expect("first listing");
+        store.apply(LinkEvent::Frame(Frame::Reply {
+            id: RequestId::Number(list),
+            result: Ok(Reply::Threads(crate::codex::history::ThreadPage {
+                data: vec![],
+                next_cursor: None,
+            })),
+        }));
+        assert!(store.catalog.get("fresh").is_some(), "the listing keeps it");
+        assert!(
+            store
+                .pending
+                .values()
+                .any(|(_, p)| matches!(p, Pending::Read(t) if t == "fresh"))
+        );
+        let t = store.transcripts.get_mut("fresh").unwrap();
+        t.loading = false;
+        t.ready = true;
+        t.verified = true;
+        store.drain(vec![], std::time::Instant::now());
+        let delivered = store
+            .pending
+            .values()
+            .filter(|(_, p)| matches!(p, Pending::Compose(Operation::Account(s) | Operation::Send(s)) if s.owner.as_deref() == Some("fresh")))
+            .count();
+        assert_eq!(delivered, 1, "exactly one delivery");
+        assert_eq!(store.draft(Some("fresh")), "");
+    }
+
+    /// End with a sibling keeping the runtime up: a Read, Resume or History that was
+    /// already in flight must not bring the ended thread back when its reply lands.
+    #[test]
+    fn replies_in_flight_when_a_codex_thread_ends_do_not_reopen_it() {
+        let mut store = ready();
+        let t = store.transcripts.entry("gone".into()).or_default();
+        t.ready = true;
+        t.verified = true;
+        for (n, p) in [
+            Pending::Read("gone".into()),
+            Pending::Resume("gone".into()),
+            Pending::History("gone".into()),
+            Pending::Read("sibling".into()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store.pending.insert(
+                900 + n as i64,
+                (
+                    std::time::Instant::now() + std::time::Duration::from_secs(60),
+                    p,
+                ),
+            );
+        }
+        store.end_session("gone").unwrap();
+        assert!(
+            store.pending.values().all(|(_, p)| !matches!(
+                p,
+                Pending::Read(t) | Pending::Resume(t) | Pending::History(t) if t == "gone"
+            )),
+            "late replies for the ended thread are dropped"
+        );
+        assert!(
+            store
+                .pending
+                .values()
+                .any(|(_, p)| matches!(p, Pending::Read(t) if t == "sibling")),
+            "other threads keep their requests"
+        );
+        assert!(!store.has_live_session("gone"));
+    }
+
+    #[test]
+    fn a_recovered_thread_on_the_api_route_is_delivered_once_without_an_account_check() {
+        let mut store = ready();
+        store.profile.route = crate::runtime::Runtime::Codex.route(Some("alias".into()));
+        store.state = Connection::Connecting;
+        store.restore_ended("fresh", "Fresh", 1, None);
+        store.edit(Some("fresh"), "api send".into());
+        store.submit(Some("fresh")).unwrap();
+        store.connected().unwrap();
+        let t = store.transcripts.get_mut("fresh").unwrap();
+        t.loading = false;
+        t.ready = true;
+        t.verified = true;
+        store.drain(vec![], std::time::Instant::now());
+        let sends: Vec<_> = store
+            .pending
+            .values()
+            .filter(|(_, p)| matches!(p, Pending::Compose(_)))
+            .collect();
+        assert_eq!(sends.len(), 1, "exactly one delivery");
+        assert!(matches!(sends[0].1, Pending::Compose(Operation::Send(_))));
+    }
+
+    #[test]
+    fn an_image_only_draft_resumes_an_ended_codex_thread_and_the_ended_row_keeps_attach_image() {
+        let mut store = ready();
+        store.restore_ended("pics", "Pictures", 1, None);
+        let view = store.host_snapshot(&crate::host_protocol::Scope {
+            project: store.profile.project.clone(),
+            route: store.profile.route.clone(),
+        });
+        let caps = &view
+            .sessions
+            .iter()
+            .find(|s| s.id == "pics")
+            .unwrap()
+            .capabilities;
+        assert!(caps.iter().any(|c| c == "send") && caps.iter().any(|c| c == "ended"));
+        assert!(caps.iter().any(|c| c == "attach_image"), "{caps:?}");
+        store.attach_image(Some("pics"), ImageInput::File("/tmp/shot.png".into()));
+        store.submit(Some("pics")).unwrap();
+        assert!(store.sending(Some("pics")), "an image alone is a message");
+        assert_eq!(
+            store.draft_images(Some("pics")).len(),
+            1,
+            "kept until delivery"
+        );
+    }
+
     #[test]
     fn a_failed_resume_keeps_the_message_in_the_composer() {
         let mut store = ready();
@@ -1003,6 +1210,89 @@ mod tests {
         );
         assert_eq!(store.native_app(), "Codex");
         assert!(store.native_live_hint().contains("running in Codex"));
+    }
+
+    #[test]
+    fn a_viewed_codex_thread_offers_only_what_a_viewer_can_own() {
+        let mut store = ready();
+        let id = "thread-viewed".to_owned();
+        let row: crate::codex::history::ThreadRow = serde_json::from_value(serde_json::json!({
+            "id": id, "cwd": store.profile.project, "modelProvider": "openai"
+        }))
+        .unwrap();
+        store.catalog.insert(row);
+        store.selected = Some(id.clone());
+        store.transcripts.entry(id.clone()).or_default().loading = true;
+        store.failed(
+            Pending::Resume(id.clone()),
+            format!("thread {id} already has an active writer"),
+        );
+        // The rollout read lands: the viewer now has a ready transcript.
+        let page: crate::codex::history::TurnPage = serde_json::from_value(serde_json::json!({
+            "data": [], "nextCursor": null
+        }))
+        .unwrap();
+        store.history_page(&id, page);
+        let t = store.transcripts.get_mut(&id).unwrap();
+        t.ready = true;
+        t.loading = false;
+        assert!(store.is_native_live(&id));
+        // Not a process OX owns: no End, not counted, not reaped as a process.
+        assert!(!store.has_live_session(&id) && !store.can_end_session(&id));
+        assert!(store.live_threads().is_empty());
+        assert!(store.end_session(&id).is_err());
+        assert!(
+            store
+                .pending
+                .values()
+                .all(|(_, p)| !matches!(p, Pending::Unsubscribe)),
+            "no unsubscribe is sent for a thread OX does not hold"
+        );
+        // Fork stays; Archive is refused by Codex for a non-owner, Rename is accepted.
+        assert!(store.can_manage_thread(&id));
+        assert!(
+            store
+                .manage_thread(&id, crate::store::ThreadOperation::Archive)
+                .is_err()
+        );
+        let scope = crate::host_protocol::Scope {
+            project: store.profile.project.clone(),
+            route: store.profile.route.clone(),
+        };
+        let view = store.host_snapshot(&scope);
+        let caps = &view
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap()
+            .capabilities;
+        assert!(caps.iter().any(|c| c == "fork") && caps.iter().any(|c| c == "rename"));
+        assert!(
+            !caps
+                .iter()
+                .any(|c| c == "archive" || c == "end" || c == "send"),
+            "{caps:?}"
+        );
+    }
+
+    #[test]
+    fn an_outstanding_native_read_does_not_leave_an_overdue_deadline() {
+        let mut store = ready();
+        let id = "thread-slow";
+        store.hold_native_read_for_test(id);
+        let overdue = |s: &Store| {
+            s.next_deadline()
+                .is_some_and(|at| at <= std::time::Instant::now())
+        };
+        assert!(
+            !overdue(&store),
+            "the host must sleep, not spin, on a slow read"
+        );
+        store.refresh_native(std::time::Instant::now(), false);
+        assert!(!overdue(&store));
+        // Once the read is answered the probe is due again at once.
+        store.pending.clear();
+        assert!(overdue(&store));
     }
 
     #[test]

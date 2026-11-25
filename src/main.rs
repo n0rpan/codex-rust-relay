@@ -11,6 +11,7 @@ mod claude_gateway;
 mod claude_request;
 mod claude_response;
 mod claude_search;
+mod claude_worker_contract;
 mod clients;
 mod daemon;
 mod desktop_launch;

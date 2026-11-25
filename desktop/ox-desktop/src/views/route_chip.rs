@@ -26,18 +26,6 @@ pub(super) struct Picker {
     /// Only the model picker is a searchable shared `ModelPicker`.
     models: Option<(Entity<ModelPicker>, Subscription)>,
 }
-/// Entries for a model list that is not the composer's (worker and hand-off sheets): API aliases
-/// value first, the provider in the note.
-pub(super) fn model_entries(caps: &Capabilities) -> Vec<model_picker::Entry> {
-    caps.models
-        .iter()
-        .map(|(id, m)| model_picker::Entry {
-            rank: m.rank,
-            recommended: m.is_default,
-            ..model_picker::api_entry(id)
-        })
-        .collect()
-}
 /// Whether `id` is the model the session runs now. Claude's symbolic `default` is current while
 /// the stream reports the model it resolves to.
 fn is_current_model(caps: &Capabilities, current: &str, id: &str) -> bool {

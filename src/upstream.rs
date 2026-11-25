@@ -149,6 +149,7 @@ pub async fn translated(
         terminal_sent: false,
         failed: false,
         finish_grace: FINISH_GRACE,
+        finish_deadline: None,
     };
     let body = stream::unfold(state, |mut state| async move {
         loop {
@@ -360,6 +361,10 @@ struct SseState {
     /// Bound on the wait for the next upstream chunk once a finish_reason has
     /// arrived. Unbounded before that.
     finish_grace: Duration,
+    /// When the grace period ends. Fixed the first time the stream is seen
+    /// finished, so keepalive comments cannot renew it; only the final usage
+    /// chunk is expected inside the window.
+    finish_deadline: Option<tokio::time::Instant>,
 }
 
 impl SseState {
@@ -370,7 +375,10 @@ impl SseState {
             return;
         }
         let next = if self.translator.has_finish_reason() {
-            match tokio::time::timeout(self.finish_grace, self.upstream.next()).await {
+            let deadline = *self
+                .finish_deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + self.finish_grace);
+            match tokio::time::timeout_at(deadline, self.upstream.next()).await {
                 Ok(next) => next,
                 Err(_) => {
                     // The answer is complete; the upstream just never closed. Drop the
@@ -713,6 +721,7 @@ mod tests {
             terminal_sent: false,
             failed: false,
             finish_grace: FINISH_GRACE,
+            finish_deadline: None,
         };
         state.pump().await;
         assert!(state.failed && state.done);
@@ -743,6 +752,7 @@ mod tests {
             terminal_sent: false,
             failed: false,
             finish_grace: Duration::from_millis(20),
+            finish_deadline: None,
         }
     }
 
@@ -769,6 +779,54 @@ mod tests {
             text.push_str(std::str::from_utf8(&chunk).unwrap());
         }
         assert!(text.contains("event: response.completed\n"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn heartbeats_after_finish_reason_do_not_renew_the_grace_deadline() {
+        let heartbeats = stream::unfold((), |()| async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Some((Ok(Bytes::from_static(b": keep-alive\n\n")), ()))
+        });
+        let upstream = stream::iter([Ok(Bytes::from_static(FINISH_CHUNK))])
+            .chain(heartbeats)
+            .boxed();
+        let mut state = chat_state(upstream);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !state.done {
+                state.pump().await;
+            }
+        })
+        .await
+        .expect("heartbeats must not keep a finished response open");
+        assert!(state.terminal_sent && !state.failed);
+    }
+
+    #[tokio::test]
+    async fn the_final_usage_chunk_still_lands_inside_the_grace_window() {
+        let usage = Bytes::from_static(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+        );
+        let late_usage = stream::once(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok::<_, reqwest::Error>(usage)
+        });
+        let upstream = stream::iter([Ok(Bytes::from_static(FINISH_CHUNK))])
+            .chain(late_usage)
+            .chain(stream::pending())
+            .boxed();
+        let mut state = chat_state(upstream);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !state.done {
+                state.pump().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut text = String::new();
+        while let Some(chunk) = state.queue.pop_front() {
+            text.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        assert!(text.contains("\"total_tokens\":5"), "{text}");
     }
 
     #[tokio::test]

@@ -804,7 +804,7 @@ fn new_session_id() -> Result<String, RelayError> {
 /// The settings document a write worker passes so Claude Code's own sandbox
 /// confines its shell to the workspace. Bash is auto-allowed only inside it.
 pub(crate) fn claude_sandbox_document() -> Value {
-    serde_json::json!({"sandbox": {"enabled": true, "autoAllowBashIfSandboxed": true}})
+    crate::claude_worker_contract::sandbox_document()
 }
 
 /// Subscription launches own their authentication settings, so they accept

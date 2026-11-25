@@ -109,6 +109,8 @@ impl Workbench {
         }
         let view = cx.weak_entity();
         let edit_metadata = manage && store.can_edit_thread_metadata();
+        // Codex refuses Archive from a client that does not hold the thread.
+        let archivable = edit_metadata && !store.is_native_live(&id);
         let can_generate = manage && store.can_generate_title(&id);
         Some(
             crate::kit::icon(
@@ -178,7 +180,7 @@ impl Workbench {
                     let _ =
                         fork.update(cx, |s, cx| s.action(cx, Action::ForkThread(target.clone())));
                 })))
-                .when(edit_metadata, |menu|menu.item(
+                .when(archivable, |menu|menu.item(
                     PopupMenuItem::new("Archive thread…").on_click(move |_, _, cx| {
                         let _ = archive.update(cx, |s, cx| {
                             if s.store

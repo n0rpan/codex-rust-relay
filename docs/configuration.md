@@ -709,7 +709,8 @@ Approve the tool call when your client prompts.
 
 `start_ox_worker` returns a job ID. Ask for status or the result with
 `ox_worker_status`, or ask to stop it with `cancel_ox_worker`. Jobs run between
-tool calls and have no ox wall-clock limit. Without a running OX session host
+tool calls. Workers have no time or count limit by default; set `OX_WORKER_MAX_MINUTES` or
+`OX_WORKER_MAX_PER_PARENT` (positive; unset or 0 means no limit) to add one. Without a running OX session host
 they stop when the parent ox launch exits. When the session host is running
 (OX Desktop or `ox host install`), it owns the worker as an ordinary session:
 the worker keeps running after you close the terminal, its approvals reach

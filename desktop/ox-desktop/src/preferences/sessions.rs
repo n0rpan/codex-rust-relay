@@ -34,6 +34,22 @@ pub(super) fn missing_sandbox_tools(path: Option<&std::ffi::OsStr>) -> Vec<&'sta
         .collect()
 }
 
+/// A positive limit as the host reads it; unset, zero or unparsable means none.
+pub(super) fn worker_limit(setting: Option<&str>) -> Option<u64> {
+    setting
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+}
+
+pub(super) fn limits_text(minutes: Option<u64>, per_parent: Option<u64>) -> String {
+    if minutes.is_none() && per_parent.is_none() {
+        return "none (set OX_WORKER_MAX_MINUTES / OX_WORKER_MAX_PER_PARENT to add one)".to_owned();
+    }
+    let minutes = minutes.map_or("no time limit".to_owned(), |m| format!("{m} min each"));
+    let count = per_parent.map_or("no count limit".to_owned(), |c| format!("{c} per session"));
+    format!("{minutes}, {count}")
+}
+
 pub(super) fn sandbox_text(missing: &[&str]) -> String {
     if missing.is_empty() {
         "Ready (bwrap and socat found).".to_owned()
@@ -58,7 +74,7 @@ impl Preferences {
                 .child(
                     div()
                         .text_size(p.text(Step::Ui))
-                        .text_color(rgb(if label.starts_with("Worker") && !missing.is_empty() {
+                        .text_color(rgb(if label == "Worker sandbox" && !missing.is_empty() {
                             p.warning
                         } else {
                             p.fg
@@ -84,6 +100,15 @@ impl Preferences {
                  To change this, set OX_HOST_IDLE_MINUTES (0 turns it off) before starting OX.",
             ))
             .child(fact(
+                "Worker limits",
+                limits_text(
+                    worker_limit(std::env::var("OX_WORKER_MAX_MINUTES").ok().as_deref()),
+                    worker_limit(std::env::var("OX_WORKER_MAX_PER_PARENT").ok().as_deref()),
+                ),
+                "Workers may run for days. Both limits are opt-in environment variables set \
+                 before starting OX.",
+            ))
+            .child(fact(
                 "Worker sandbox",
                 sandbox_text(&missing),
                 "Write workers use bwrap and socat to isolate their commands. This is a status \
@@ -94,7 +119,9 @@ impl Preferences {
 
 #[cfg(test)]
 mod tests {
-    use super::{idle_minutes, idle_text, missing_sandbox_tools, sandbox_text};
+    use super::{
+        idle_minutes, idle_text, limits_text, missing_sandbox_tools, sandbox_text, worker_limit,
+    };
 
     #[test]
     fn session_facts_read_naturally() {
@@ -108,5 +135,8 @@ mod tests {
         assert_eq!(missing, ["bwrap", "socat"]);
         assert!(sandbox_text(&missing).contains("bwrap and socat"));
         assert!(sandbox_text(&[]).starts_with("Ready"));
+        assert_eq!(worker_limit(Some("0")), None);
+        assert!(limits_text(None, None).starts_with("none"));
+        assert_eq!(limits_text(Some(90), Some(2)), "90 min each, 2 per session");
     }
 }

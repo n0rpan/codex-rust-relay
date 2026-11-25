@@ -862,7 +862,7 @@ fn tools() -> Value {
             },
             {
                 "name": "start_ox_worker",
-                "description": "Start a background coding job in this project and return its job ID at once. Choose by fit: a Codex goal for one long objective with a checkable stop condition; a Claude workflow for work Claude Code splits into steps with its Workflow tool and subagents; a session for ordinary coding on either runtime. Task up to 32 KiB. Each job stops after max_minutes (default 240, or OX_WORKER_MAX_MINUTES), and one session runs at most 4 workers at once (OX_WORKER_MAX_PER_PARENT). A write worker starting while another writes in the same project returns a warning: consider a separate git worktree. Without the OX session host they stop when this launch exits. Inherit uses your mode only with the session host; without it, inherit is read. Lower with permission_mode, never raise it. classifier and yolo need the session host, which asks a person to accept a YOLO worker (status waiting_for_operator) unless YOLO was granted.",
+                "description": "Start a background coding job in this project and return its job ID at once. Choose by fit: a Codex goal for one long objective with a checkable stop condition; a Claude workflow for work Claude Code splits into steps with its Workflow tool and subagents; a session for ordinary coding on either runtime. Task up to 32 KiB. There is no time or count limit by default; set max_minutes per job, or OX_WORKER_MAX_MINUTES and OX_WORKER_MAX_PER_PARENT, to add one. A write worker starting while another writes in the same project returns a warning: consider a separate git worktree. Without the OX session host they stop when this launch exits. Inherit uses your mode only with the session host; without it, inherit is read. Lower with permission_mode, never raise it. classifier and yolo need the session host, which asks a person to accept a YOLO worker (status waiting_for_operator) unless YOLO was granted.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -871,7 +871,7 @@ fn tools() -> Value {
                         "model": {"type": "string", "description": "Exact ox API model alias. Leave out only for a Claude subscription worker."},
                         "task": {"type": "string", "description": "The job objective, desired validation, and stopping condition."},
                         "permission_mode": {"enum": ["inherit", "read", "write", "classifier", "yolo"], "default": "inherit", "description": "read: no shell or writes. write: sandboxed shell plus workspace writes (the sandbox may block network; use classifier for broader access). classifier: Codex Auto-review / Claude Auto. yolo: Codex YOLO / Claude bypass. Above your mode is refused."},
-                        "max_minutes": {"type": "integer", "minimum": 1, "maximum": 10080, "description": "Wall-clock limit for this worker in minutes. Default 240 (OX_WORKER_MAX_MINUTES)."},
+                        "max_minutes": {"type": "integer", "minimum": 1, "maximum": 10080, "description": "Optional wall-clock limit for this worker in minutes. No limit by default (OX_WORKER_MAX_MINUTES sets one)."},
                         "workspace_write": {"type": "boolean", "description": "Deprecated: false means read, true means write. Use permission_mode."},
                     },
                     "required": ["runtime", "mode", "task"],

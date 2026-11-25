@@ -86,6 +86,25 @@ impl Transcript {
     pub fn prepended(&self) -> usize {
         self.prepended
     }
+    /// How many user messages carry exactly this text and number of attachments. A client
+    /// compares it before and after a send it could not confirm to see whether the host
+    /// took the message.
+    pub fn user_messages(&self, text: &str, attachments: usize) -> usize {
+        self.entries
+            .values()
+            .filter(|e| match &e.item {
+                Item::UserMessage { content } => {
+                    let said: Vec<_> = content
+                        .iter()
+                        .filter_map(|c| c.text.as_deref())
+                        .collect::<Vec<_>>();
+                    said.join("\n").trim() == text
+                        && content.iter().filter(|c| c.text.is_none()).count() == attachments
+                }
+                _ => false,
+            })
+            .count()
+    }
     pub fn is_ready(&self) -> bool {
         self.ready && self.verified
     }

@@ -26,7 +26,14 @@ pub struct Remote {
     pub(super) schema: bool,
     pub(super) options: HashMap<String, routes_thread::Options>,
     pub(super) draft_access: Option<Access>,
-    pending: HashMap<String, (Option<String>, Option<compose::Draft>)>,
+    /// Input sent but not yet acknowledged by the host: the owner, the draft it came from
+    /// and how many identical user messages the transcript held when it was sent.
+    pending: HashMap<String, (Option<String>, Option<compose::Draft>, usize)>,
+    /// Input a replacement replica got back from its predecessor because the host never
+    /// acknowledged it. The host may still have received it, so it waits in the composer
+    /// until the transcript shows it (then it is cleared) and is never sent again for
+    /// the user.
+    unconfirmed: Vec<Unconfirmed>,
     pub(super) origins: HashMap<String, crate::origin::Origin>,
     /// Host marks on a session: handoffs from it and its YOLO grant.
     pub(super) marks: HashMap<String, Value>,
@@ -36,6 +43,12 @@ pub struct Remote {
     /// Rows the catalog held before a fresh snapshot replaced it, and the
     /// loaded length at the last page request made to get back to them.
     pub(super) restore: Option<(usize, Option<usize>)>,
+}
+struct Unconfirmed {
+    owner: Option<String>,
+    text: String,
+    attachments: usize,
+    seen: usize,
 }
 impl Remote {
     pub(super) fn can(&self, id: &str, cap: &str) -> bool {
@@ -80,6 +93,7 @@ impl Store {
             await_new: None,
             restore: None,
             pending: HashMap::new(),
+            unconfirmed: vec![],
             origins: HashMap::new(),
             marks: HashMap::new(),
         };
@@ -151,7 +165,7 @@ impl Store {
     }
     pub(super) fn pending_input(&self, owner: Option<&str>) -> bool {
         self.remote()
-            .is_some_and(|r| r.pending.values().any(|(id, _)| id.as_deref() == owner))
+            .is_some_and(|r| r.pending.values().any(|(id, ..)| id.as_deref() == owner))
     }
     fn send_input(
         &mut self,
@@ -165,7 +179,16 @@ impl Store {
         } else {
             None
         };
-        self.remote_mut().pending.insert(id.clone(), (owner, draft));
+        let seen = draft
+            .as_ref()
+            .zip(owner.as_deref().and_then(|o| self.transcripts.get(o)))
+            .map_or(0, |(d, t)| {
+                let (text, attachments) = d.signature();
+                t.user_messages(&text, attachments)
+            });
+        self.remote_mut()
+            .pending
+            .insert(id.clone(), (owner, draft, seen));
         Ok(id)
     }
     /// Send an action that has no approval token and return its request id.
@@ -400,12 +423,14 @@ impl Store {
                     self.apply_scope(scope)?;
                 }
                 self.continue_restore();
+                self.reconcile_unconfirmed();
             }
             Server::Delta { changes, .. } => {
                 for change in changes {
                     self.apply_change(change)?;
                 }
                 self.continue_restore();
+                self.reconcile_unconfirmed();
             }
             Server::Ack { id } => {
                 if let Some(thread) = self.remote_mut().unconfirmed_options.remove(&id) {
@@ -423,7 +448,7 @@ impl Store {
                 {
                     self.changed.transcript(&thread);
                 }
-                if let Some((owner, Some(draft))) =
+                if let Some((owner, Some(draft), _)) =
                     id.and_then(|id| self.remote_mut().pending.remove(&id))
                 {
                     draft.restore_before(self.drafts.entry(owner).or_default());
@@ -439,6 +464,76 @@ impl Store {
             _ => (),
         }
         Ok(())
+    }
+    /// The replacement of a dead replica carries what the old one had not finished:
+    /// the paging target, and input the host never acknowledged (the connection closed
+    /// before or after the host took it, so delivery is unknown).
+    pub(super) fn recover_replica(&mut self, previous: &mut Self) {
+        let kept = previous
+            .remote()
+            .and_then(|r| r.restore)
+            .map_or(0, |(t, _)| t);
+        let loaded = previous.threads().len().max(kept);
+        if loaded > 0 {
+            self.remote_mut().restore = Some((loaded, None));
+        }
+        let Link::Host(old) = &mut previous.link else {
+            return;
+        };
+        let mut unsent: Vec<_> = std::mem::take(&mut old.pending).into_values().collect();
+        // Input the old replica was already holding back for the same reason.
+        let waiting = std::mem::take(&mut old.unconfirmed);
+        self.remote_mut().unconfirmed = waiting;
+        unsent.sort_by_key(|(_, _, seen)| *seen);
+        let mut restored = false;
+        for (owner, draft, seen) in unsent {
+            let Some(draft) = draft else { continue };
+            let (text, attachments) = draft.signature();
+            draft.restore_before(self.drafts.entry(owner.clone()).or_default());
+            self.remote_mut().unconfirmed.push(Unconfirmed {
+                owner,
+                text,
+                attachments,
+                seen,
+            });
+            restored = true;
+        }
+        if restored {
+            self.notice = Some(
+                "The connection dropped while sending. Your message is back in the composer; check the conversation before sending it again.".into(),
+            );
+            self.changed.mark(Changed::NOTICE);
+        }
+    }
+    /// A restored message the host did take shows up in its thread as a new identical
+    /// user message: clear the composer copy so it is not sent twice. Whatever the
+    /// transcript does not show stays, the safe side of an unknown delivery.
+    fn reconcile_unconfirmed(&mut self) {
+        let waiting = std::mem::take(&mut self.remote_mut().unconfirmed);
+        for u in waiting {
+            let still_unsent = self
+                .drafts
+                .get(&u.owner)
+                .is_some_and(|d| d.signature() == (u.text.clone(), u.attachments));
+            if !still_unsent {
+                continue;
+            }
+            let delivered = u
+                .owner
+                .as_deref()
+                .and_then(|o| self.transcripts.get(o))
+                .is_some_and(|t| t.is_ready() && t.user_messages(&u.text, u.attachments) > u.seen);
+            if delivered {
+                self.drafts.remove(&u.owner);
+                self.notice = None;
+                self.changed.mark(Changed::NOTICE);
+                if let Some(o) = &u.owner {
+                    self.changed.transcript(o);
+                }
+            } else {
+                self.remote_mut().unconfirmed.push(u);
+            }
+        }
     }
     /// A fresh snapshot carries only the host's own loaded catalog. When that is
     /// shorter than what this client had paged in (the host evicted a slow
@@ -1032,5 +1127,191 @@ mod local_command_tests {
         );
         store.apply_host(delta(vec![])).unwrap();
         assert_eq!(*asked.lock().unwrap(), 4);
+    }
+
+    fn profile() -> Profile {
+        Profile {
+            project: "/p".into(),
+            route: Route::CODEX_SUBSCRIPTION,
+            provider: "openai".into(),
+        }
+    }
+    fn snapshot(seq: u64, sessions: Vec<SessionView>) -> Server {
+        Server::Snapshot {
+            cursor: crate::host_protocol::Cursor {
+                epoch: "e".into(),
+                seq,
+            },
+            scopes: vec![scope_state(sessions)],
+        }
+    }
+    /// A store over a real unix socket whose peer (the host) is gone: the writer thread
+    /// fails like `open_store`'s and reports the close. The store had paged in 150 rows
+    /// and sent a message with an image that never reached the host.
+    fn store_whose_host_closed_the_socket() -> Store {
+        use std::io::Write;
+        let (client, host) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(String, Action)>(16);
+        let (closed, closes) = std::sync::mpsc::channel::<String>();
+        let writer = std::thread::spawn(move || {
+            let mut out = client;
+            for (id, action) in rx {
+                let mut frame = serde_json::to_vec(&(id, &action)).unwrap();
+                frame.push(b'\n');
+                if let Err(e) = out.write_all(&frame).and_then(|_| out.flush()) {
+                    let _ = closed.send(e.to_string());
+                    return;
+                }
+            }
+        });
+        let seq = std::sync::atomic::AtomicU64::new(0);
+        let mut old = Store::remote_client(profile(), move |action, _| {
+            let n = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let id = format!("a-{n}");
+            tx.try_send((id.clone(), action))
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            Ok(id)
+        });
+        let mut rows = page(0, 150);
+        rows[0].capabilities = vec!["send".into()];
+        old.apply_host(snapshot(1, rows)).unwrap();
+        old.cursor = Some("more".into());
+        old.select_replica("t00000");
+        // Shutdown, not just drop: a process forked by a parallel test may briefly hold a copy.
+        host.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(host);
+        old.edit(Some("t00000"), "do not lose me".into());
+        old.attach_image(
+            Some("t00000"),
+            crate::mentions::ImageInput::File("/tmp/shot.png".into()),
+        );
+        old.submit(Some("t00000")).unwrap();
+        assert!(old.sending(Some("t00000")));
+        assert_eq!(
+            old.draft(Some("t00000")),
+            "",
+            "pending, not in the composer"
+        );
+        let reason = closes
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        old.apply(LinkEvent::Closed {
+            reason,
+            stderr_tail: vec![],
+        });
+        writer.join().unwrap();
+        old
+    }
+    fn counting_replica() -> (Store, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let more = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = more.clone();
+        let store = Store::remote_client(profile(), move |action, _| {
+            match action {
+                Action::MoreThreads => counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                // A resend of the input would be a duplicate.
+                Action::SendText(..) | Action::SendImages(..) => panic!("auto-sent {action:?}"),
+                _ => 0,
+            };
+            Ok("n".into())
+        });
+        (store, more)
+    }
+    #[test]
+    fn a_replacement_replica_repages_and_keeps_input_the_host_never_acknowledged() {
+        let mut old = store_whose_host_closed_the_socket();
+        let (mut fresh, more) = counting_replica();
+        fresh.recover_from(&mut old);
+        assert_eq!(fresh.draft(Some("t00000")), "do not lose me");
+        assert_eq!(fresh.draft_images(Some("t00000")).len(), 1);
+        assert!(
+            !fresh.sending(Some("t00000")),
+            "nothing is sent for the user"
+        );
+        assert!(
+            fresh
+                .notice()
+                .is_some_and(|n| n.contains("check the conversation"))
+        );
+        // The host's replacement snapshot is shorter than what the old store had paged in.
+        fresh.apply_host(snapshot(1, page(0, 50))).unwrap();
+        assert_eq!(fresh.threads().len(), 50);
+        assert_eq!(more.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for n in 1..3 {
+            let changes = page(n * 50, n * 50 + 50)
+                .into_iter()
+                .map(|session| Change::Session { session })
+                .collect();
+            fresh
+                .apply_host(Server::Delta {
+                    cursor: crate::host_protocol::Cursor {
+                        epoch: "e".into(),
+                        seq: 1 + n as u64,
+                    },
+                    scope: crate::host_protocol::Scope {
+                        project: "/p".into(),
+                        route: Route::CODEX_SUBSCRIPTION,
+                    },
+                    changes,
+                })
+                .unwrap();
+        }
+        assert_eq!(fresh.threads().len(), 150, "back to the old length");
+        assert_eq!(more.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(fresh.draft(Some("t00000")), "do not lose me");
+    }
+    /// The host took the message but its acknowledgement was lost with the socket. The
+    /// replacement's transcript shows it, so the restored composer copy is dropped
+    /// instead of waiting to be sent twice; a transcript without it keeps the copy.
+    #[test]
+    fn a_message_the_host_received_is_reconciled_by_its_echo() {
+        let echo = |text: &str| {
+            let mut scope = scope_state(page(0, 150));
+            scope.sessions[0].capabilities = vec!["send".into()];
+            scope.transcripts.insert(
+                "t00000".into(),
+                crate::host_protocol::Timeline {
+                    items: vec![TimelineItem {
+                        turn: "turn-1".into(),
+                        id: "item-1".into(),
+                        role: "user".into(),
+                        text: text.into(),
+                        revision: 1,
+                        detail: serde_json::to_value(Item::UserMessage {
+                            content: vec![
+                                crate::transcript::item::Content {
+                                    text: Some(text.into()),
+                                    path: None,
+                                },
+                                crate::transcript::item::Content {
+                                    text: None,
+                                    path: Some("/tmp/shot.png".into()),
+                                },
+                            ],
+                        })
+                        .unwrap(),
+                    }],
+                    detail: serde_json::json!({"ready": true}),
+                },
+            );
+            Server::Snapshot {
+                cursor: crate::host_protocol::Cursor {
+                    epoch: "e".into(),
+                    seq: 1,
+                },
+                scopes: vec![scope],
+            }
+        };
+        let mut old = store_whose_host_closed_the_socket();
+        let (mut fresh, _) = counting_replica();
+        fresh.recover_from(&mut old);
+        fresh.apply_host(echo("something else")).unwrap();
+        assert_eq!(
+            fresh.draft(Some("t00000")),
+            "do not lose me",
+            "delivery unknown: preserved"
+        );
+        fresh.apply_host(echo("do not lose me")).unwrap();
+        assert_eq!(fresh.draft(Some("t00000")), "");
+        assert!(fresh.draft_images(Some("t00000")).is_empty());
     }
 }

@@ -42,20 +42,34 @@ pub(crate) struct Marks {
     /// A caution recorded at launch, such as another write worker in the same project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    /// How the worker's latest run ended, kept so a parent can still read its answer once
+    /// the route's process is gone or the host restarted. Only the final answer, never the
+    /// transcript, which stays in the runtime's own history. Cleared when a new turn starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<Last>,
+    /// Unix seconds when the current run began: the launch, or the operator's latest
+    /// continuation. Expiry measures this, not the original launch.
+    #[serde(default)]
+    pub run_started_at: i64,
+}
+/// The recorded end of a worker's latest run.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Last {
+    /// `completed` or `failed`.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
-/// The default wall-clock limit of a worker, in minutes.
-pub(crate) const DEFAULT_MAX_MINUTES: u32 = 240;
-/// The default number of workers one parent may run at once.
-pub(crate) const DEFAULT_MAX_PER_PARENT: usize = 4;
-
-/// A positive number from an environment variable, or `default`.
-pub(crate) fn env_limit(name: &str, default: u64) -> u64 {
+/// A worker limit from an environment variable. Unset, zero or unparsable means no
+/// limit: workers may run for days, and a limit is opt-in.
+pub(crate) fn env_limit(name: &str) -> Option<u64> {
     std::env::var(name)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(default)
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +119,7 @@ impl Registry {
                 origin,
                 marks: Marks {
                     started_at: crate::durable::unix_now(),
+                    run_started_at: crate::durable::unix_now(),
                     ..Marks::default()
                 },
             },
@@ -343,6 +358,20 @@ pub(crate) struct Operators {
     pub connected: usize,
 }
 
+/// True for a finished Workflow-mode Claude worker whose transcript has no Workflow tool call.
+fn workflow_unrun(mode: ox_desk_core::origin::WorkerMode, timeline: Option<&Timeline>) -> bool {
+    let Some(t) = timeline.filter(|_| mode == ox_desk_core::origin::WorkerMode::Workflow) else {
+        return false;
+    };
+    let used = t
+        .items
+        .iter()
+        .any(|i| i.role == "tool" && i.text == "Workflow");
+    ox_desk_core::claude_worker_contract::Contract::with_support(false, true, false)
+        .check_workflow(used)
+        .is_err()
+}
+
 pub(crate) fn status(
     entry: &Entry,
     id: &str,
@@ -355,7 +384,7 @@ pub(crate) fn status(
     let o = &entry.origin;
     let row = view.map_or("interrupted", |v| v.status.as_str());
     let finished = timeline.is_some_and(|t| !t.detail["last_finished"].is_null());
-    let status = if entry.marks.cancelled {
+    let mut status = if entry.marks.cancelled {
         "cancelled"
     } else {
         match row {
@@ -366,10 +395,28 @@ pub(crate) fn status(
             "failed" => "failed",
             "interrupted" | "Last seen running" => "interrupted",
             _ if !live => "interrupted",
+            // A Workflow worker completes only if it called the Workflow tool.
+            _ if finished && workflow_unrun(o.mode, timeline) => "failed",
             _ if finished || timeline.is_none() => "completed",
             _ => "running",
         }
     };
+    // The route closed or the host restarted after the run ended: answer from the
+    // recorded end instead of reporting the finished worker as interrupted.
+    let recorded = entry
+        .marks
+        .last
+        .as_ref()
+        .filter(|_| !entry.marks.cancelled && !matches!(row, "running" | "needs_input"));
+    if status == "interrupted"
+        && let Some(last) = recorded
+    {
+        status = if last.status == "failed" {
+            "failed"
+        } else {
+            "completed"
+        };
+    }
     let progress = match row {
         "needs_input" => "Waiting for the operator to answer a request",
         "running" => "Working",
@@ -378,22 +425,27 @@ pub(crate) fn status(
         }
         _ => "",
     };
-    let result = timeline.and_then(|t| {
-        t.items
-            .iter()
-            .rev()
-            .find(|i| i.role == "assistant")
-            .map(|i| i.text[..i.text.floor_char_boundary(24 * 1024)].to_owned())
-    });
+    let result = timeline
+        .and_then(|t| {
+            t.items
+                .iter()
+                .rev()
+                .find(|i| i.role == "assistant")
+                .map(|i| i.text[..i.text.floor_char_boundary(24 * 1024)].to_owned())
+        })
+        .or_else(|| recorded.and_then(|l| l.result.clone()));
     let error = if entry.marks.expired {
         Some(format!(
             "Worker stopped after {} minutes (time limit).",
-            entry.marks.max_minutes.unwrap_or(DEFAULT_MAX_MINUTES)
+            entry.marks.max_minutes.unwrap_or_default()
         ))
+    } else if status == "failed" && workflow_unrun(o.mode, timeline) {
+        Some(ox_desk_core::claude_worker_contract::WORKFLOW_NOT_RUN.to_owned())
     } else {
         timeline
             .and_then(|t| t.detail["error"].as_str())
             .map(str::to_owned)
+            .or_else(|| recorded.and_then(|l| l.error.clone()))
     };
     let elapsed = (entry.marks.started_at > 0)
         .then(|| (crate::durable::unix_now() - entry.marks.started_at).max(0));
@@ -718,6 +770,59 @@ mod tests {
         assert!(owns(&terminal(Some("s1"), "l2"), &t));
         assert!(!owns(&terminal(Some("s2"), "l2"), &t));
         assert!(!owns(&terminal(None, "l2"), &t));
+    }
+
+    #[test]
+    fn workflow_worker_completes_only_after_the_workflow_tool_ran() {
+        use ox_desk_core::host_protocol::TimelineItem;
+        let mut origin = worker(Level::Write, Runtime::Claude);
+        origin.mode = WorkerMode::Workflow;
+        let entry = Entry {
+            origin,
+            marks: Marks::default(),
+        };
+        let view = SessionView {
+            id: "w".into(),
+            title: String::new(),
+            parent: None,
+            status: "idle".into(),
+            updated_at: 0,
+            capabilities: vec![],
+            detail: Value::Null,
+        };
+        let item = |role: &str, text: &str| TimelineItem {
+            turn: "t".into(),
+            id: text.into(),
+            role: role.into(),
+            text: text.into(),
+            revision: 1,
+            detail: Value::Null,
+        };
+        let run = |items| {
+            let t = Timeline {
+                items,
+                detail: json!({"last_finished":"t"}),
+            };
+            status(
+                &entry,
+                "w",
+                "w",
+                Some(&view),
+                Some(&t),
+                true,
+                Operators::default(),
+            )
+        };
+        let text_only = run(vec![item("assistant", "done")]);
+        assert_eq!(text_only["status"], "failed");
+        assert!(
+            text_only["error"]
+                .as_str()
+                .unwrap()
+                .contains("Workflow tool")
+        );
+        let used = run(vec![item("tool", "Workflow"), item("assistant", "done")]);
+        assert_eq!(used["status"], "completed");
     }
 
     #[test]

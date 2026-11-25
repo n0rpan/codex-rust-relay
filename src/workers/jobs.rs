@@ -15,17 +15,12 @@ use tokio::{
 
 use crate::provider::RelayError;
 
-const MAX_RUNNING: usize = 4;
-/// Default wall-clock limit of one worker, in minutes.
-const DEFAULT_MAX_MINUTES: u64 = 240;
-
-/// A positive number from an environment variable, or `default`.
-fn env_limit(name: &str, default: u64) -> u64 {
+/// A worker limit from an environment variable. Unset or zero means no limit.
+fn env_limit(name: &str) -> Option<u64> {
     std::env::var(name)
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(default)
 }
 const MAX_RETAINED: usize = 24;
 const MAX_TEXT: usize = 24 * 1024;
@@ -132,7 +127,7 @@ struct State {
     error: Option<String>,
     model: String,
     started: std::time::Instant,
-    max_minutes: u64,
+    max_minutes: Option<u64>,
     warning: Option<String>,
 }
 
@@ -202,6 +197,16 @@ impl Jobs {
         Ok(received)
     }
 
+    /// Whether the opt-in worker count limit is reached. No limit never is.
+    fn slots_full(&self, cap: Option<u64>) -> bool {
+        cap.is_some_and(|cap| {
+            self.entries
+                .values()
+                .filter(|job| !job.task.is_finished())
+                .count()
+                >= cap as usize
+        })
+    }
     pub(super) fn start(
         &mut self,
         request: Start,
@@ -211,21 +216,15 @@ impl Jobs {
     ) -> Result<Value, String> {
         request.validate()?;
         request.writes()?;
-        if self
-            .entries
-            .values()
-            .filter(|job| !job.task.is_finished())
-            .count()
-            >= env_limit("OX_WORKER_MAX_PER_PARENT", MAX_RUNNING as u64) as usize
-        {
+        if self.slots_full(env_limit("OX_WORKER_MAX_PER_PARENT")) {
             return Err("All background worker slots are in use. Wait for one to finish or cancel one. The limit is OX_WORKER_MAX_PER_PARENT.".into());
         }
         let writes = request.writes()?;
         let warning = self.write_overlap(writes);
-        let max_minutes = request.max_minutes.map_or_else(
-            || env_limit("OX_WORKER_MAX_MINUTES", DEFAULT_MAX_MINUTES),
-            u64::from,
-        );
+        let max_minutes = request
+            .max_minutes
+            .map(u64::from)
+            .or_else(|| env_limit("OX_WORKER_MAX_MINUTES"));
         if self.entries.len() >= MAX_RETAINED
             && let Some(id) = self
                 .entries
@@ -257,11 +256,10 @@ impl Jobs {
                 .clone()
                 .unwrap_or_else(|| "Claude subscription".to_owned()),
             native_session: None,
-            progress: if request.claude_shell_unsandboxed() {
-                "Starting the stock client without a shell: Claude Code's sandbox needs bwrap and socat on Linux, so this write worker can edit files but not run commands.".to_owned()
-            } else {
-                "Starting the stock client".to_owned()
-            },
+            progress: request
+                .claude_fallback_notice()
+                .unwrap_or("Starting the stock client")
+                .to_owned(),
             result: None,
             error: None,
             started: std::time::Instant::now(),
@@ -286,14 +284,18 @@ impl Jobs {
                         }
                     }
                 };
-                let result =
-                    match tokio::time::timeout(Duration::from_secs(max_minutes * 60), work).await {
-                        Ok(result) => result,
-                        Err(_) => Err(format!(
-                            "Worker stopped after {max_minutes} minutes (time limit)."
-                        )
-                        .into()),
-                    };
+                let result = match max_minutes {
+                    None => work.await,
+                    Some(minutes) => {
+                        match tokio::time::timeout(Duration::from_secs(minutes * 60), work).await {
+                            Ok(result) => result,
+                            Err(_) => Err(format!(
+                                "Worker stopped after {minutes} minutes (time limit)."
+                            )
+                            .into()),
+                        }
+                    }
+                };
                 let mut state = state.lock().unwrap();
                 if state.status == "cancelled" {
                     return;
@@ -427,6 +429,9 @@ impl Start {
     }
 
     fn command(&self, home: &Path, cwd: &Path) -> Result<Command, RelayError> {
+        // A no-host subscription worker carries its sandbox settings inside the
+        // checked account overlay, so the contract's own --settings is dropped.
+        let mut overlay = false;
         let mut command = if let Some(model) = &self.model {
             let mut command = Command::new(std::env::current_exe()?);
             let client = match self.runtime {
@@ -449,7 +454,9 @@ impl Start {
                 wrapper.args(["claude", "--subscription"]);
                 wrapper
             } else {
-                crate::native::claude_account_command(home)?
+                overlay = true;
+                let sandboxed = self.claude_contract()?.sandboxed;
+                crate::native::claude_subscription_worker_command(home, sandboxed)?
             }
         };
         command
@@ -473,16 +480,8 @@ impl Start {
                     .args(["--no-daemon", "app-server", "--listen", "stdio://"])
                     .stdin(Stdio::piped());
             }
-            (Runtime::Claude, mode) => {
-                let writes = self.writes()?;
-                let sandboxed = writes && claude_sandbox_supported(std::env::consts::OS, on_path);
-                let (tools, allowed) = claude_tools(writes, sandboxed, mode == Mode::Workflow);
-                if !writes {
-                    command.args([
-                        "--disallowedTools",
-                        "Bash,Edit,Write,MultiEdit,NotebookEdit",
-                    ]);
-                }
+            (Runtime::Claude, _) => {
+                let contract = self.claude_contract()?;
                 command.args([
                     "--print",
                     "--input-format",
@@ -491,29 +490,34 @@ impl Start {
                     "stream-json",
                     "--verbose",
                     "--permission-mode",
-                    if writes { "acceptEdits" } else { "dontAsk" },
-                    "--tools",
-                    tools,
-                    "--allowedTools",
-                    allowed,
+                    contract.permission_mode(),
                 ]);
-                if sandboxed {
-                    // Stock Claude Code merges this with the account settings ox builds.
-                    let sandbox = crate::clients::claude_sandbox_document().to_string();
-                    command.args(["--settings", sandbox.as_str()]);
+                // Stock Claude Code merges the sandbox settings with the account settings ox builds.
+                let mut policy = contract.args();
+                if overlay && let Some(at) = policy.iter().position(|a| a == "--settings") {
+                    policy.drain(at..=at + 1);
                 }
+                command.args(policy);
                 command.stdin(Stdio::piped());
             }
         }
         Ok(command)
     }
 
-    /// True when a Claude write worker starts without Bash because Claude
+    /// The shared Claude worker contract for this request.
+    fn claude_contract(&self) -> Result<crate::claude_worker_contract::Contract, RelayError> {
+        Ok(crate::claude_worker_contract::Contract::detect(
+            self.writes()?,
+            self.mode == Mode::Workflow,
+        ))
+    }
+
+    /// Set when a Claude write worker starts without Bash because Claude
     /// Code's sandbox cannot run here. The start notice says so.
-    pub(super) fn claude_shell_unsandboxed(&self) -> bool {
-        self.runtime == Runtime::Claude
-            && self.writes().unwrap_or(false)
-            && !claude_sandbox_supported(std::env::consts::OS, on_path)
+    pub(super) fn claude_fallback_notice(&self) -> Option<&'static str> {
+        (self.runtime == Runtime::Claude)
+            .then(|| self.claude_contract().ok()?.fallback_notice())
+            .flatten()
     }
 
     fn sandbox(&self) -> &'static str {
@@ -522,40 +526,6 @@ impl Start {
         } else {
             "read-only"
         }
-    }
-}
-
-/// Claude Code's sandbox needs bwrap and socat on Linux. It is verified only
-/// there, so other platforms fall back to edits without a shell.
-fn claude_sandbox_supported(os: &str, on_path: impl Fn(&str) -> bool) -> bool {
-    os == "linux" && on_path("bwrap") && on_path("socat")
-}
-
-/// Whether an executable of this name is on PATH. A directory scan, no spawn.
-fn on_path(name: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
-}
-
-/// The `--tools` and `--allowedTools` lists for a Claude worker. Bash is offered
-/// only to a write worker whose sandbox is running; read workers never get it.
-fn claude_tools(writes: bool, sandboxed: bool, workflow: bool) -> (&'static str, &'static str) {
-    match (writes, sandboxed, workflow) {
-        (true, true, false) => (
-            "Read,Glob,Grep,Edit,Write,Bash,Workflow",
-            "Read,Glob,Grep,Bash",
-        ),
-        (true, true, true) => (
-            "Read,Glob,Grep,Edit,Write,Bash,Workflow",
-            "Read,Glob,Grep,Bash,Workflow",
-        ),
-        (true, false, false) => ("Read,Glob,Grep,Edit,Write,Workflow", "Read,Glob,Grep"),
-        (true, false, true) => (
-            "Read,Glob,Grep,Edit,Write,Workflow",
-            "Read,Glob,Grep,Workflow",
-        ),
-        (false, _, false) => ("Read,Glob,Grep,Workflow", "Read,Glob,Grep"),
-        (false, _, true) => ("Read,Glob,Grep,Workflow", "Read,Glob,Grep,Workflow"),
     }
 }
 
@@ -674,8 +644,8 @@ async fn run_claude(
     if let Some(error) = turn_failure {
         return Err(error.into());
     }
-    if request.mode == Mode::Workflow && !used_workflow {
-        return Err("Claude Code did not run the Workflow tool. Check the selected model, Claude Code version, and workflow permissions.".into());
+    if request.runtime == Runtime::Claude {
+        request.claude_contract()?.check_workflow(used_workflow)?;
     }
     // Closing input lets the client flush its final session state before leaving the process group.
     if let Ok(status) = tokio::time::timeout(Duration::from_secs(5), process.child.wait()).await {
@@ -978,7 +948,10 @@ mod worker_contract_tests {
             "runtime": "claude", "mode": "session", "task": "fix it",
             "model": "fixture", "permission_mode": "write"
         }));
-        let sandboxed = claude_sandbox_supported(std::env::consts::OS, on_path);
+        let sandboxed = crate::claude_worker_contract::sandbox_supported(
+            std::env::consts::OS,
+            crate::claude_worker_contract::on_path,
+        );
         let command = request.command(Path::new("/"), Path::new("/")).unwrap();
         let args = args_of(&command);
         assert_eq!(value_after(&args, "--permission-mode"), "acceptEdits");
@@ -1013,54 +986,6 @@ mod worker_contract_tests {
             "Bash,Edit,Write,MultiEdit,NotebookEdit"
         );
         assert!(!args.iter().any(|arg| arg == "--settings"));
-    }
-
-    #[test]
-    fn claude_sandbox_needs_bwrap_and_socat_on_linux() {
-        let with = |names: &'static [&'static str]| move |name: &str| names.contains(&name);
-        assert!(claude_sandbox_supported("linux", with(&["bwrap", "socat"])));
-        assert!(!claude_sandbox_supported("linux", with(&["bwrap"])));
-        assert!(!claude_sandbox_supported("linux", with(&["socat"])));
-        assert!(!claude_sandbox_supported(
-            "macos",
-            with(&["bwrap", "socat"])
-        ));
-        assert!(!claude_sandbox_supported(
-            "windows",
-            with(&["bwrap", "socat"])
-        ));
-    }
-
-    #[test]
-    fn claude_write_tools_offer_bash_only_when_sandboxed() {
-        assert_eq!(
-            claude_tools(true, true, false),
-            (
-                "Read,Glob,Grep,Edit,Write,Bash,Workflow",
-                "Read,Glob,Grep,Bash"
-            )
-        );
-        assert_eq!(
-            claude_tools(true, true, true),
-            (
-                "Read,Glob,Grep,Edit,Write,Bash,Workflow",
-                "Read,Glob,Grep,Bash,Workflow"
-            )
-        );
-        // Without the sandbox a write worker edits files but has no shell.
-        assert_eq!(
-            claude_tools(true, false, false),
-            ("Read,Glob,Grep,Edit,Write,Workflow", "Read,Glob,Grep")
-        );
-        // Read workers never get Bash, sandboxed or not.
-        assert_eq!(
-            claude_tools(false, false, false),
-            ("Read,Glob,Grep,Workflow", "Read,Glob,Grep")
-        );
-        assert_eq!(
-            claude_tools(false, true, false),
-            ("Read,Glob,Grep,Workflow", "Read,Glob,Grep")
-        );
     }
 
     /// A fake Codex app-server that answers the RPCs, reports the turn as completed,
@@ -1106,7 +1031,7 @@ printf flushed > "$MARKER"
             error: None,
             model: "fixture".into(),
             started: std::time::Instant::now(),
-            max_minutes: 240,
+            max_minutes: None,
             warning: None,
         });
         let (_instructions, receiver) = mpsc::channel::<Instruction>(1);
@@ -1153,7 +1078,7 @@ printf '%s\n' '{"type":"result","is_error":true,"result":"overloaded right now"}
             error: None,
             model: "fixture".into(),
             started: std::time::Instant::now(),
-            max_minutes: 240,
+            max_minutes: None,
             warning: None,
         });
         let (_instructions, receiver) = mpsc::channel::<Instruction>(1);
@@ -1180,7 +1105,7 @@ printf '%s\n' '{"type":"result","is_error":true,"result":"overloaded right now"}
                 error: None,
                 model: String::new(),
                 started: std::time::Instant::now(),
-                max_minutes: 240,
+                max_minutes: None,
                 warning: None,
             })),
             task: task.abort_handle(),
@@ -1189,18 +1114,14 @@ printf '%s\n' '{"type":"result","is_error":true,"result":"overloaded right now"}
     }
 
     #[tokio::test]
-    async fn a_parent_cannot_run_more_workers_than_the_cap() {
+    async fn an_opt_in_cap_limits_workers_and_no_cap_does_not() {
         let mut jobs = Jobs::default();
         for id in 1..=4 {
             jobs.entries.insert(id, pending_job(false));
         }
-        let request = start(json!({
-            "runtime": "claude", "mode": "session", "task": "x", "model": "m"
-        }));
-        let error = jobs
-            .start(request, Path::new("/"), Path::new("/"), Arc::new(vec![]))
-            .unwrap_err();
-        assert!(error.contains("OX_WORKER_MAX_PER_PARENT"), "{error}");
+        assert!(!jobs.slots_full(None), "no limit by default");
+        assert!(!jobs.slots_full(Some(5)));
+        assert!(jobs.slots_full(Some(4)));
     }
 
     #[tokio::test]

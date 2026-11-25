@@ -91,6 +91,11 @@ pub struct Store {
     ended_threads: HashSet<String>,
     /// Ended threads a message is waiting on: reopened, and the draft is sent once ready.
     resume_sends: HashSet<String>,
+    /// The Claude access mode an ended session had when its process went away, whether
+    /// this client ended it or the host reaped the idle route. A send that reopens the
+    /// session starts it in that mode; opening it from the list does not (see
+    /// `claude_resume_send`).
+    resume_access: HashMap<String, crate::runtime::Access>,
     child_threads: HashMap<String, (String, PathBuf)>,
     next_preset: Option<crate::codex::access::Access>,
     selection: u64,
@@ -178,6 +183,7 @@ impl Store {
             terminal_threads: Default::default(),
             ended_threads: Default::default(),
             resume_sends: Default::default(),
+            resume_access: Default::default(),
             child_threads: Default::default(),
             next_preset: None,
             selection: 0,
@@ -241,6 +247,7 @@ impl Store {
                 self.selected.clone_from(&previous.selected);
                 self.front = previous.front;
                 self.query.clone_from(&previous.query);
+                self.recover_replica(previous);
             }
             return;
         }
@@ -250,6 +257,7 @@ impl Store {
         self.child_threads = std::mem::take(&mut previous.child_threads);
         self.terminal_threads = std::mem::take(&mut previous.terminal_threads);
         self.ended_threads = previous.ended_threads.clone();
+        self.resume_access = std::mem::take(&mut previous.resume_access);
         self.authorized_models = std::mem::take(&mut previous.authorized_models);
         self.next_options = previous.next_options.take();
         self.selected = previous.selected.clone();
@@ -678,6 +686,11 @@ impl Store {
                             // Rows the listing returned stay, and so do the workers of those
                             // parents (they live in subdirectories the page loop skips).
                             let mut retained = self.created_while_listing.clone();
+                            // A thread the host knows but discovery has not listed yet
+                            // (a fresh one, or one reaped before it was indexed) stays
+                            // resumable by a send.
+                            retained.extend(self.ended_threads.iter().cloned());
+                            retained.extend(self.resume_sends.iter().cloned());
                             retained.extend(
                                 page.data
                                     .iter()

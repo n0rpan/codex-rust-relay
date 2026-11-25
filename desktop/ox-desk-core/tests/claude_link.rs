@@ -53,6 +53,7 @@ fn spawn(
             billing,
             session,
             permission_mode: mode.into(),
+            contract: None,
         },
         move |e| {
             let _ = tx.send(e);

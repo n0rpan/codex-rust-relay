@@ -200,7 +200,16 @@ pub fn translate_request_with(
     }
     match request.get("input") {
         Some(Value::String(text)) => messages.push(json!({"role": "user", "content": text})),
-        Some(Value::Array(items)) => push_input_items(items, options, &mut messages)?,
+        Some(Value::Array(items)) => {
+            // DeepSeek-style thinking modes reject a tool-bearing request whose
+            // earlier assistant turns lost their reasoning_content, and ignore it
+            // otherwise, so it is replayed only when tools are present.
+            let with_tools = request
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| !tools.is_empty());
+            push_input_items(items, options, with_tools, &mut messages)?
+        }
         Some(Value::Null) | None => return Err("the response request is missing input".into()),
         Some(_) => return Err("input must be a string or an array of input items".into()),
     }
@@ -318,9 +327,13 @@ fn reject_non_streaming(request: &Map<String, Value>) -> Result<(), String> {
 fn push_input_items(
     items: &[Value],
     options: &AdapterOptions,
+    replay_reasoning: bool,
     messages: &mut Vec<Value>,
 ) -> Result<(), String> {
-    let mut pending_images = Vec::new();
+    // Images returned by tool calls, grouped by the call that produced them.
+    let mut pending_images: Vec<(String, Vec<Value>)> = Vec::new();
+    let mut call_names: std::collections::HashMap<String, String> = Default::default();
+    let mut pending_reasoning: Option<String> = None;
     for (position, item) in items.iter().enumerate() {
         let item = item
             .as_object()
@@ -331,7 +344,17 @@ fn push_input_items(
             None => return Err(format!("input item {position} needs a type")),
         };
         match kind {
-            "message" => push_message(item, position, options, messages)?,
+            "message" => {
+                push_message(item, position, options, messages)?;
+                let assistant = messages
+                    .last()
+                    .is_some_and(|message| message["role"] == "assistant");
+                if assistant {
+                    attach_reasoning(messages, &mut pending_reasoning);
+                } else {
+                    pending_reasoning = None;
+                }
+            }
             "function_call" => {
                 let call_id = item
                     .get("call_id")
@@ -346,6 +369,8 @@ fn push_input_items(
                     .and_then(Value::as_str)
                     .ok_or_else(|| format!("input item {position} needs arguments"))?;
                 push_function_call(messages, call_id, name, arguments);
+                call_names.insert(call_id.to_owned(), name.to_owned());
+                attach_reasoning(messages, &mut pending_reasoning);
             }
             "function_call_output" => {
                 // Codex injects goal context as a namespaced pseudo-tool result
@@ -372,7 +397,9 @@ fn push_input_items(
                 // Chat Completions tool messages are text-only. Images a tool returned
                 // (Codex view_image, screenshots) follow as one user message after the
                 // last tool result of the turn, so every tool_call still answers first.
-                pending_images.extend(images);
+                if !images.is_empty() {
+                    pending_images.push((call_id.to_owned(), images));
+                }
                 let next_is_output = items
                     .get(position + 1)
                     .and_then(Value::as_object)
@@ -383,15 +410,35 @@ fn push_input_items(
                 if !next_is_output && !pending_images.is_empty() {
                     let mut content = vec![json!({
                         "type": "text",
-                        "text": "Images returned by the tool calls above:"
+                        "text": "Images returned by the tool calls above, grouped by call:"
                     })];
-                    content.append(&mut pending_images);
+                    for (call_id, mut images) in std::mem::take(&mut pending_images) {
+                        let label = match call_names.get(&call_id) {
+                            Some(name) => format!("Images from tool call {call_id} ({name}):"),
+                            None => format!("Images from tool call {call_id}:"),
+                        };
+                        content.push(json!({"type": "text", "text": label}));
+                        content.append(&mut images);
+                    }
                     messages.push(json!({"role": "user", "content": content}));
                 }
             }
             // Reasoning is replayable only against the store that produced it, so
             // it is dropped rather than forwarded as a bogus assistant message.
-            "reasoning" => {}
+            // The one exception is this adapter's own envelope, which carries a
+            // Chat Completions `reasoning_content` back to its assistant turn.
+            "reasoning" => {
+                if replay_reasoning
+                    && let Some(text) = item
+                        .get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .and_then(|raw| raw.strip_prefix(CHAT_REASONING_PREFIX))
+                {
+                    pending_reasoning
+                        .get_or_insert_with(String::new)
+                        .push_str(text);
+                }
+            }
             other => {
                 return Err(format!(
                     "the {other} input item type is not supported by the chat completions adapter"
@@ -400,6 +447,23 @@ fn push_input_items(
         }
     }
     Ok(())
+}
+
+/// Prefix of a Responses reasoning item's `encrypted_content` that wraps a Chat
+/// Completions `reasoning_content` string for replay on the next request.
+pub const CHAT_REASONING_PREFIX: &str = "codeox.chat.reasoning.v1:";
+
+/// Move reasoning waiting for an assistant turn onto the assistant message at the
+/// tail of `messages`.
+fn attach_reasoning(messages: &mut [Value], pending: &mut Option<String>) {
+    let Some(text) = pending.take() else { return };
+    if let Some(message) = messages.last_mut().and_then(Value::as_object_mut) {
+        let merged = match message.get("reasoning_content").and_then(Value::as_str) {
+            Some(existing) => format!("{existing}{text}"),
+            None => text,
+        };
+        message.insert("reasoning_content".into(), json!(merged));
+    }
 }
 
 /// A `function_call_output` that stands in for tool output Codex holds itself
@@ -860,9 +924,31 @@ struct ToolState {
     announced: bool,
 }
 
+struct ReasoningState {
+    item_id: String,
+    output_index: usize,
+    text: String,
+}
+
+impl ReasoningState {
+    fn value(&self, status: &str) -> Value {
+        let mut item = json!({
+            "id": self.item_id,
+            "type": "reasoning",
+            "status": status,
+            "summary": [],
+        });
+        if status == "completed" {
+            item["encrypted_content"] = json!(format!("{CHAT_REASONING_PREFIX}{}", self.text));
+        }
+        item
+    }
+}
+
 enum StreamItem {
     Message(MessageState),
     Tool(ToolState),
+    Reasoning(ReasoningState),
 }
 
 impl MessageState {
@@ -1033,6 +1119,12 @@ impl ResponseTranslator {
         delta: &Map<String, Value>,
         events: &mut Vec<Value>,
     ) -> Result<(), String> {
+        match delta.get("reasoning_content") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(text)) if text.is_empty() => {}
+            Some(Value::String(text)) => self.push_reasoning(text, events),
+            Some(_) => return Err("a delta reasoning_content value must be a string".into()),
+        }
         match delta.get("content") {
             None | Some(Value::Null) => {}
             // An empty delta carries no text; opening a part for it would leave a
@@ -1058,12 +1150,35 @@ impl ResponseTranslator {
         // Deprecated single-call delta, still emitted by some compatible servers.
         // It carries no ID, so the adapter generates a stable one for the response.
         if let Some(function) = delta.get("function_call").filter(|call| !call.is_null()) {
-            let call_id = format!("call_compat_{}", self.compat_calls);
+            let call_id = format!("call_compat_{}_{}", self.response_id, self.compat_calls);
             self.compat_calls += 1;
             let wrapped = json!({"index": 0, "id": call_id, "function": function.clone()});
             self.push_tool_call(&wrapped, events)?;
         }
         Ok(())
+    }
+
+    fn push_reasoning(&mut self, text: &str, events: &mut Vec<Value>) {
+        if let Some(StreamItem::Reasoning(reasoning)) = self
+            .items
+            .iter_mut()
+            .find(|item| matches!(item, StreamItem::Reasoning(_)))
+        {
+            reasoning.text.push_str(text);
+            return;
+        }
+        let output_index = self.next_output_index;
+        self.next_output_index += 1;
+        let reasoning = ReasoningState {
+            item_id: format!("rs_{}_{output_index}", self.response_id),
+            output_index,
+            text: text.to_owned(),
+        };
+        let mut added = Map::new();
+        added.insert("output_index".into(), json!(output_index));
+        added.insert("item".into(), reasoning.value("in_progress"));
+        events.push(self.event("response.output_item.added", added));
+        self.items.push(StreamItem::Reasoning(reasoning));
     }
 
     fn push_part(&mut self, kind: PartKind, text: &str, events: &mut Vec<Value>) {
@@ -1094,7 +1209,7 @@ impl ResponseTranslator {
         let (item_id, output_index, content_index, part_added) = {
             let message = match &mut self.items[position] {
                 StreamItem::Message(message) => message,
-                StreamItem::Tool(_) => unreachable!("position matched a message item"),
+                _ => unreachable!("position matched a message item"),
             };
             let existing = message.parts.iter().position(|part| part.kind == kind);
             let content_index = match existing {
@@ -1169,11 +1284,11 @@ impl ResponseTranslator {
                 Some(self.fallback_call_id(tool.output_index)),
             ),
             StreamItem::Tool(tool) => (tool.output_index, None),
-            StreamItem::Message(_) => unreachable!("announce_tool is only called for tool items"),
+            _ => unreachable!("announce_tool is only called for tool items"),
         };
         let tool = match &mut self.items[index] {
             StreamItem::Tool(tool) => tool,
-            StreamItem::Message(_) => unreachable!("announce_tool is only called for tool items"),
+            _ => unreachable!("announce_tool is only called for tool items"),
         };
         if let Some(fallback) = fallback {
             tool.call_id = fallback;
@@ -1229,7 +1344,7 @@ impl ResponseTranslator {
         {
             let tool = match &mut self.items[position] {
                 StreamItem::Tool(tool) => tool,
-                StreamItem::Message(_) => unreachable!("position matched a tool item"),
+                _ => unreachable!("position matched a tool item"),
             };
             // The first non-empty upstream ID wins, so later chunks that repeat or
             // omit it cannot change the ID the client already saw.
@@ -1268,7 +1383,7 @@ impl ResponseTranslator {
         {
             let tool = match &mut self.items[position] {
                 StreamItem::Tool(tool) => tool,
-                StreamItem::Message(_) => unreachable!("position matched a tool item"),
+                _ => unreachable!("position matched a tool item"),
             };
             if tool.announced && tool.emitted < tool.arguments.len() {
                 pending = Some((
@@ -1297,7 +1412,7 @@ impl ResponseTranslator {
         if !complete_tools {
             // A partial call must not become an executable Codex tool item.
             self.items
-                .retain(|item| matches!(item, StreamItem::Message(_)));
+                .retain(|item| !matches!(item, StreamItem::Tool(_)));
         }
         if let Some(tool) = self.items.iter().find_map(|item| match item {
             StreamItem::Tool(tool) if !tool.announced && tool.name.is_empty() => Some(tool),
@@ -1349,6 +1464,13 @@ impl ResponseTranslator {
                     item_done.insert("item".into(), message.value("completed"));
                     events.push(self.event("response.output_item.done", item_done));
                     self.output.push(message.value("completed"));
+                }
+                StreamItem::Reasoning(reasoning) => {
+                    let mut item_done = Map::new();
+                    item_done.insert("output_index".into(), json!(reasoning.output_index));
+                    item_done.insert("item".into(), reasoning.value("completed"));
+                    events.push(self.event("response.output_item.done", item_done));
+                    self.output.push(reasoning.value("completed"));
                 }
                 StreamItem::Tool(tool) => {
                     let mut done = Map::new();

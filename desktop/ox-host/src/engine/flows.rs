@@ -89,10 +89,21 @@ impl Engine {
 
     /// Refuse a worker start when this parent already runs the maximum number of workers.
     pub(super) fn check_worker_cap(&self, parent: &ParentRef) -> Result<(), String> {
-        let cap = crate::workers::env_limit(
-            "OX_WORKER_MAX_PER_PARENT",
-            crate::workers::DEFAULT_MAX_PER_PARENT as u64,
-        ) as usize;
+        self.check_worker_cap_with(
+            parent,
+            crate::workers::env_limit("OX_WORKER_MAX_PER_PARENT").map(|c| c as usize),
+        )
+    }
+
+    /// The cap check with the limit given. No limit by default: it is opt-in.
+    pub(super) fn check_worker_cap_with(
+        &self,
+        parent: &ParentRef,
+        cap: Option<usize>,
+    ) -> Result<(), String> {
+        let Some(cap) = cap else {
+            return Ok(());
+        };
         let started = self
             .workers
             .jobs()
@@ -140,6 +151,52 @@ impl Engine {
             })
     }
 
+    /// Record how each worker's latest run ended, from the live store, while the
+    /// answer is still readable. The record is only the final answer: the transcript
+    /// stays in the runtime's own history. A run in progress clears it. Returns whether
+    /// any record changed, so the caller can republish the rows that carry it.
+    pub(super) fn capture_finals(&mut self, scope: &Scope) -> bool {
+        let Some(live) = self.running.get(scope) else {
+            return false;
+        };
+        let ready = live.store.state() == &Connection::Ready;
+        let operators = self.operators();
+        let mut updates: Vec<(String, Option<crate::workers::Last>)> = Vec::new();
+        for (id, entry) in self.workers.in_scope(scope) {
+            if entry.origin.relation != Relation::Worker || entry.marks.cancelled {
+                continue;
+            }
+            let view = live.state.sessions.iter().find(|v| v.id == id);
+            let timeline = live.state.transcripts.get(id);
+            let native = id.rsplit(':').next().unwrap_or(id);
+            let status =
+                crate::workers::status(entry, id, native, view, timeline, ready, operators);
+            let next = match status["status"].as_str() {
+                Some("completed" | "failed") if timeline.is_some() => {
+                    Some(Some(crate::workers::Last {
+                        status: status["status"].as_str().unwrap_or("completed").to_owned(),
+                        result: status["result"].as_str().map(str::to_owned),
+                        error: status["error"].as_str().map(str::to_owned),
+                    }))
+                }
+                Some("running" | "waiting_for_operator") => Some(None),
+                _ => None,
+            };
+            if let Some(next) = next
+                && entry.marks.last != next
+            {
+                updates.push((id.to_owned(), next));
+            }
+        }
+        let changed = !updates.is_empty();
+        for (id, last) in updates {
+            if let Some(entry) = self.workers.get_mut(scope, &id) {
+                entry.marks.last = last;
+            }
+        }
+        changed
+    }
+
     /// Stop workers that ran past their wall-clock limit.
     pub(super) fn expire_workers(&mut self) -> io::Result<()> {
         let now = crate::durable::unix_now();
@@ -150,9 +207,16 @@ impl Engine {
                 let m = &e.marks;
                 !m.expired
                     && !m.cancelled
-                    && m.started_at > 0
-                    && m.max_minutes
-                        .is_some_and(|max| now - m.started_at >= i64::from(max) * 60)
+                    && m.max_minutes.is_some_and(|max| {
+                        // The current run's start: a continued worker is measured from
+                        // its continuation, not from the original launch.
+                        let began = if m.run_started_at > 0 {
+                            m.run_started_at
+                        } else {
+                            m.started_at
+                        };
+                        began > 0 && now - began >= i64::from(max) * 60
+                    })
             })
             .filter(|(_, _, e)| self.worker_active(e.origin.job_id))
             .map(|(s, id, _)| (s.clone(), id.to_owned()))

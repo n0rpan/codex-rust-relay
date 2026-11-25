@@ -412,7 +412,7 @@ fn maps_image_parts_only_for_user_messages() {
     assert_eq!(roles, ["assistant", "tool", "tool", "user", "user"]);
     assert_eq!(messages[1]["content"], "[image attached below]");
     assert_eq!(
-        messages[3]["content"][1],
+        messages[3]["content"][2],
         json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}})
     );
 
@@ -963,10 +963,10 @@ fn maps_legacy_function_call_deltas() {
     assert_eq!(
         completed["response"]["output"],
         json!([{
-            "id": "fc_call_compat_0",
+            "id": "fc_call_compat_resp_test_0",
             "type": "function_call",
             "status": "completed",
-            "call_id": "call_compat_0",
+            "call_id": "call_compat_resp_test_0",
             "name": "shell",
             "arguments": "{\"x\":1}"
         }])
@@ -1440,4 +1440,174 @@ fn still_requires_a_call_id_for_real_tool_outputs() {
     ]});
     let error = translate_request(&input, "m").unwrap_err();
     assert!(error.contains("needs a call_id"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// Tool-result images keep their originating call
+// ---------------------------------------------------------------------------
+
+fn screenshot_request(a: &[&str], b: &[&str]) -> Value {
+    let output = |urls: &[&str]| {
+        let mut parts = vec![json!({"type": "input_text", "text": "screenshots"})];
+        parts.extend(
+            urls.iter()
+                .map(|url| json!({"type": "input_image", "image_url": url})),
+        );
+        Value::Array(parts)
+    };
+    json!({"input": [
+        {"type": "function_call", "call_id": "left", "name": "take_screens", "arguments": "{}"},
+        {"type": "function_call", "call_id": "right", "name": "take_screens", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "left", "output": output(a)},
+        {"type": "function_call_output", "call_id": "right", "output": output(b)}
+    ]})
+}
+
+#[test]
+fn image_grouping_across_tool_calls_survives_translation() {
+    let first = translate_request(&screenshot_request(&["1"], &["2", "3"]), "m").unwrap();
+    let second = translate_request(&screenshot_request(&["1", "2"], &["3"]), "m").unwrap();
+    assert_ne!(first["messages"], second["messages"]);
+
+    let user = first["messages"].as_array().unwrap().last().unwrap();
+    let parts = user["content"].as_array().unwrap();
+    let shape: Vec<String> = parts
+        .iter()
+        .map(|part| match part["type"].as_str().unwrap() {
+            "text" => part["text"].as_str().unwrap().to_owned(),
+            _ => part["image_url"]["url"].as_str().unwrap().to_owned(),
+        })
+        .collect();
+    assert_eq!(
+        &shape[1..],
+        [
+            "Images from tool call left (take_screens):",
+            "1",
+            "Images from tool call right (take_screens):",
+            "2",
+            "3"
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Legacy function_call ids and reasoning_content
+// ---------------------------------------------------------------------------
+
+#[test]
+fn legacy_function_call_ids_are_scoped_to_their_response() {
+    let mut ids = Vec::new();
+    for response in ["resp_a", "resp_b"] {
+        let mut translator = ResponseTranslator::new(response, "m", 0);
+        let mut chunk = finish_chunk("function_call");
+        chunk["choices"][0]["delta"] =
+            json!({"function_call": {"name": "read", "arguments": "{}"}});
+        push(&mut translator, &chunk);
+        let events = translator.finish().unwrap();
+        ids.push(events.last().unwrap()["response"]["output"][0]["call_id"].clone());
+    }
+    assert_ne!(ids[0], ids[1]);
+}
+
+/// Mimics DeepSeek thinking mode: with tools in the request, every earlier
+/// assistant turn that used reasoning must come back with reasoning_content.
+fn strict_deepseek(body: &Value, reasoning_turns: usize) -> Result<(), String> {
+    if body.get("tools").is_none() {
+        return Ok(());
+    }
+    let with = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .filter(|m| {
+            m["reasoning_content"]
+                .as_str()
+                .is_some_and(|t| !t.is_empty())
+        })
+        .count();
+    if with == reasoning_turns {
+        Ok(())
+    } else {
+        Err(format!(
+            "400: reasoning_content must be passed back ({with}/{reasoning_turns})"
+        ))
+    }
+}
+
+#[test]
+fn reasoning_content_round_trips_across_two_tool_turns_against_a_strict_fixture() {
+    let tools = json!([{"type": "function", "name": "read", "parameters": {"type": "object"}}]);
+    let mut history = vec![json!({"type": "message", "role": "user", "content": "go"})];
+
+    for (turn, response) in ["resp_1", "resp_2"].into_iter().enumerate() {
+        let body = translate_request(&json!({"input": history, "tools": tools}), "m").unwrap();
+        strict_deepseek(&body, turn).expect("strict fixture rejects the request");
+
+        let mut translator = ResponseTranslator::new(response, "m", 0);
+        let mut events = push(
+            &mut translator,
+            &chunk(json!({"reasoning_content": "think "})),
+        );
+        events.extend(push(
+            &mut translator,
+            &chunk(json!({"reasoning_content": "hard"})),
+        ));
+        events.extend(push(
+            &mut translator,
+            &chunk(
+                json!({"tool_calls": [{"index": 0, "id": format!("call_{turn}"),
+                "function": {"name": "read", "arguments": "{}"}}]}),
+            ),
+        ));
+        events.extend(push(&mut translator, &finish_chunk("tool_calls")));
+        events.extend(translator.push_event("message", "[DONE]").unwrap());
+        assert_eq!(
+            of_kind(&events, "response.output_item.added")[0]["item"]["type"],
+            "reasoning"
+        );
+        let output = events.last().unwrap()["response"]["output"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[1]["type"], "function_call");
+        for item in output {
+            let mut item = item;
+            item.as_object_mut().unwrap().remove("status");
+            history.push(item);
+        }
+        history.push(json!({"type": "function_call_output", "call_id": format!("call_{turn}"), "output": "ok"}));
+    }
+
+    let body = translate_request(&json!({"input": history, "tools": tools}), "m").unwrap();
+    strict_deepseek(&body, 2).expect("two reasoning turns replayed");
+    let assistants: Vec<&Value> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .collect();
+    assert_eq!(assistants[0]["reasoning_content"], "think hard");
+    assert_eq!(assistants[0]["tool_calls"][0]["id"], "call_0");
+    assert_eq!(assistants[1]["tool_calls"][0]["id"], "call_1");
+
+    // Without tools the field is not sent.
+    let body = translate_request(&json!({"input": history}), "m").unwrap();
+    assert!(
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m.get("reasoning_content").is_none())
+    );
+
+    // Dropping the reasoning items is what the strict fixture rejects.
+    let stripped: Vec<Value> = history
+        .iter()
+        .filter(|i| i["type"] != "reasoning")
+        .cloned()
+        .collect();
+    let body = translate_request(&json!({"input": stripped, "tools": tools}), "m").unwrap();
+    assert!(strict_deepseek(&body, 2).is_err());
 }

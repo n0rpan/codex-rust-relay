@@ -85,6 +85,20 @@ pub struct Origin {
 }
 
 impl Origin {
+    /// The shared worker contract a hosted Claude Write worker starts under, as
+    /// the standalone builder does: sandbox settings, Bash, the edits-only
+    /// fallback and the Workflow rule. Other workers keep the ordinary launch.
+    pub fn claude_contract(
+        &self,
+        mode: WorkerMode,
+    ) -> Option<crate::claude_worker_contract::Contract> {
+        (self.runtime == Runtime::Claude
+            && self.relation == Relation::Worker
+            && self.requested == Ceiling::Write)
+            .then(|| {
+                crate::claude_worker_contract::Contract::detect(true, mode == WorkerMode::Workflow)
+            })
+    }
     /// The stamp a fork of this session carries. It can only keep or narrow the ceiling.
     pub fn fork(&self, source: &str) -> Self {
         Self {
@@ -124,7 +138,7 @@ pub struct WorkerStart {
     /// An operator start whose client showed the YOLO confirmation.
     #[serde(default)]
     pub yolo_confirmed: bool,
-    /// Wall-clock limit in minutes. Absent means the host default (`OX_WORKER_MAX_MINUTES`, 4 hours).
+    /// Wall-clock limit in minutes. Absent means no limit unless the host sets `OX_WORKER_MAX_MINUTES`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_minutes: Option<u32>,
 }

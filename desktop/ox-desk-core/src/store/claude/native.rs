@@ -4,7 +4,7 @@
 use super::*;
 use crate::claude::live;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -16,7 +16,8 @@ pub(super) struct Native {
     live: HashSet<String>,
     /// Sessions OX has driven in this run: their journal age says nothing about a
     /// foreign client, so only a foreign process names them.
-    pub(super) ox_seen: HashSet<String>,
+    /// The journal's modification time when OX took the session over.
+    pub(super) ox_seen: HashMap<String, Option<SystemTime>>,
     next: Option<Instant>,
 }
 #[derive(Default)]
@@ -57,9 +58,12 @@ impl Store {
             return None;
         }
         if !self.is_session_scoped() {
+            // While a read is outstanding the probe cannot run, so its deadline is not
+            // re-armed: an overdue timer would spin the host loop until the reply lands.
             return self
                 .selected
                 .as_ref()
+                .filter(|id| !self.native_request_outstanding(id))
                 .and_then(|id| self.transcripts.get(id))
                 .filter(|t| t.native_live)
                 .and_then(|t| t.native_next);
@@ -89,6 +93,16 @@ impl Store {
             Origin::Api => &p.launcher.profiles.api,
             _ => &p.launcher.profiles.subscription,
         }));
+        // Current Claude Code keeps a registry of its live clients. When it exists it is
+        // authoritative: a journal written moments ago (a fixture, a terminal client that
+        // just closed) says nothing without a live registered pid. Only an older Claude
+        // Code, with no registry, falls back to the journal's age.
+        let registry = match origin {
+            Origin::Api => &p.launcher.profiles.api,
+            _ => &p.launcher.profiles.subscription,
+        }
+        .join("sessions")
+        .is_dir();
         let now = SystemTime::now();
         let mut found = HashSet::new();
         for key in p.catalog.keys().filter(|k| !k.contains('/')) {
@@ -97,14 +111,21 @@ impl Store {
                 continue;
             }
             let Ok(raw) = stock_id(key) else { continue };
-            // A recent write only means "someone else" when OX did not write it: this run's
-            // sessions are known, and an earlier OX host (before an upgrade) left its
-            // headless `sdk-cli` entrypoint on the last row.
+            // A recent write means "someone else" when the journal's last row came from a
+            // client other than OX's headless one. OX's own earlier runs (before an
+            // upgrade) left `sdk-cli` on the last row. A session OX drove in this run is
+            // only masked until the journal moves past what OX found: a stock
+            // `claude --continue` has no session id on its command line, so a fresh
+            // `cli` row after OX let go is what names it.
             let profiles = &p.launcher.profiles;
-            let fresh = !p.native.ox_seen.contains(key)
-                && profiles
-                    .modified(&self.profile.project, raw, origin)
-                    .is_ok_and(|m| live::is_fresh(m, now))
+            let modified = profiles.modified(&self.profile.project, raw, origin).ok();
+            let moved_since_ox = match p.native.ox_seen.get(key) {
+                Some(Some(baseline)) => modified.is_some_and(|m| m > *baseline),
+                Some(None) | None => true,
+            };
+            let fresh = !registry
+                && moved_since_ox
+                && modified.is_some_and(|m| live::is_fresh(m, now))
                 && profiles
                     .last_entrypoint(&self.profile.project, raw, origin)
                     .as_deref()
@@ -408,6 +429,8 @@ mod tests {
             catalog: Default::default(),
             asks: Default::default(),
             blank: None,
+            worker: None,
+            worker_blank: None,
             serial: 0,
             native: Default::default(),
         };
@@ -532,6 +555,8 @@ mod tests {
             catalog: Default::default(),
             asks: Default::default(),
             blank: None,
+            worker: None,
+            worker_blank: None,
             serial: 0,
             native: Default::default(),
         };
@@ -657,5 +682,106 @@ mod tests {
         assert!(r.store.is_viewer(&r.key), "re-attached to the live journal");
         pump_kinds(&mut r.store, &r.rx);
         assert_eq!(r.store.transcript(&r.key).unwrap().len(), 4);
+    }
+
+    fn append_as(rig: &Rig, entrypoint: &str, text: &str) {
+        let row = row_json("user", &rig.project, text).replace(
+            "\"entrypoint\":\"cli\"",
+            &format!("\"entrypoint\":\"{entrypoint}\""),
+        );
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&rig.journal)
+            .unwrap();
+        std::io::Write::write_all(&mut f, row.as_bytes()).unwrap();
+        f.set_modified(SystemTime::now()).unwrap();
+    }
+
+    #[test]
+    fn a_stock_continue_after_ox_ended_its_session_is_the_newest_owner() {
+        let mut r = rig(2);
+        // OX drove the session and ended it; its journal is as OX left it.
+        let baseline = SystemTime::now() - Duration::from_secs(600);
+        std::fs::File::options()
+            .append(true)
+            .open(&r.journal)
+            .unwrap()
+            .set_modified(baseline)
+            .unwrap();
+        r.store
+            .claude_mut()
+            .native
+            .ox_seen
+            .insert(r.key.clone(), Some(baseline));
+        // OX's own headless write is fresh but is not a foreign owner.
+        append_as(&r, live::HEADLESS_ENTRYPOINT, "reply written by OX");
+        assert!(!r.store.native_live_now(&r.key));
+        // `claude --continue` has no id on its argv: only its journal row names it.
+        append_as(&r, "cli", "typed into stock claude --continue");
+        assert!(r.store.native_live_now(&r.key));
+        assert!(
+            r.store.claude_resume_send(&r.key).is_err(),
+            "no second writer"
+        );
+    }
+
+    #[test]
+    fn a_registry_makes_a_fresh_unregistered_journal_not_live() {
+        let mut r = rig(2);
+        append_as(&r, "cli", "written seconds ago by a closed terminal");
+        let sessions = r
+            .store
+            .claude()
+            .launcher
+            .profiles
+            .subscription
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // The registry exists and names no live owner of this session.
+        assert!(!r.store.native_live_now(&r.key));
+        // A stale entry whose pid is gone does not count either.
+        std::fs::write(
+            sessions.join("4294967295.json"),
+            json!({"pid":4294967295u64,"sessionId":ID,"entrypoint":"cli"}).to_string(),
+        )
+        .unwrap();
+        assert!(!r.store.native_live_now(&r.key));
+        // Without a registry directory the journal's age still decides.
+        let mut old = rig(2);
+        append_as(&old, "cli", "fresh");
+        assert!(old.store.native_live_now(&old.key));
+    }
+
+    #[test]
+    fn a_quiet_registered_terminal_client_owns_the_session_despite_ox_history() {
+        let mut r = rig(2);
+        let baseline = SystemTime::now() - Duration::from_secs(600);
+        std::fs::File::options()
+            .append(true)
+            .open(&r.journal)
+            .unwrap()
+            .set_modified(baseline)
+            .unwrap();
+        r.store
+            .claude_mut()
+            .native
+            .ox_seen
+            .insert(r.key.clone(), Some(baseline));
+        assert!(!r.store.native_live_now(&r.key), "nobody else has it");
+        // A live stock process registered the session; its journal is quiet.
+        let sessions = r
+            .store
+            .claude()
+            .launcher
+            .profiles
+            .subscription
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("{}.json", std::process::id())),
+            json!({"pid":std::process::id(),"sessionId":ID,"entrypoint":"cli"}).to_string(),
+        )
+        .unwrap();
+        assert!(r.store.native_live_now(&r.key));
     }
 }

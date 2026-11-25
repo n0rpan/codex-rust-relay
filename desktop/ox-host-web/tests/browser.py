@@ -945,6 +945,15 @@ def run(harness, screenshot=None):
         wait(lambda: any(isinstance(a, dict) and a.get("start_handoff", {}).get("source") == "child"
                          and a["start_handoff"]["mode"] == "inherit" and not a["start_handoff"]["yolo_confirmed"]
                          and a["start_handoff"]["request"] == "Carry on elsewhere" for a in host.actions))
+        # A runtime with no configured route never falls back to index 0 of another runtime.
+        starts = lambda: sum(1 for a in host.actions if isinstance(a, dict) and "start_handoff" in a)
+        before = starts()
+        js("document.getElementById('continue-in').click();document.getElementById('handoff-route').replaceChildren();"
+           "document.getElementById('handoff-request').value='Nowhere';document.getElementById('handoff-form').requestSubmit()")
+        wait(lambda: js("return document.getElementById('message').textContent.includes('is configured on this host')"))
+        time.sleep(0.3)
+        assert starts() == before, "an empty route selection must not start a handoff"
+        js("document.getElementById('handoff-cancel').click()")
         # The handoff marker and the folded block appear only on a handoff target's first user message.
         def bubbles(thread, title):
             js("document.getElementById('home').click()")

@@ -71,6 +71,19 @@ impl Prepared {
             && self.inputs == route_inputs()
     }
 }
+#[derive(Default)]
+struct CatalogCache {
+    key: Option<(PathBuf, Option<[Option<FileIdentity>; 4]>)>,
+    at: Option<std::time::Instant>,
+    models: Vec<String>,
+    loading: bool,
+}
+static CATALOG: std::sync::Mutex<CatalogCache> = std::sync::Mutex::new(CatalogCache {
+    key: None,
+    at: None,
+    models: Vec::new(),
+    loading: false,
+});
 #[derive(Clone)]
 pub(crate) struct RuntimeConfig {
     pub ox: PathBuf,
@@ -153,7 +166,11 @@ impl RuntimeConfig {
         let before = route_inputs();
         let s = ox::snapshot(&self.ox, &self.path).map_err(io::Error::other)?;
         let after = route_inputs();
-        let routes = Runtime::routes(&s.models)
+        // Stars only order: the snapshot's static and starred aliases first, then every other
+        // catalog alias. Discovery asks the providers, so it runs off the caller's thread and
+        // the list fills in once it lands.
+        let models = self.catalog(&s.models, after);
+        let routes = Runtime::routes(&models)
             .filter(|r| {
                 r.is_api()
                     || match r.runtime {
@@ -163,13 +180,42 @@ impl RuntimeConfig {
             })
             .collect();
         Ok(Prepared {
-            alias: s.models,
+            alias: models,
             provider: s.api_provider,
             routes,
             yolo_grant_projects: s.yolo_grant_projects,
             inputs: if before == after { after } else { None },
             when: std::time::Instant::now(),
         })
+    }
+    /// `base` followed by the cached discovered catalog; stale or missing entries start a
+    /// background refresh (one at a time) and never block the caller.
+    fn catalog(&self, base: &[String], inputs: Option<[Option<FileIdentity>; 4]>) -> Vec<String> {
+        const FRESH: std::time::Duration = std::time::Duration::from_secs(120);
+        let mut cache = CATALOG.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (self.ox.clone(), inputs);
+        let usable = cache.key.as_ref() == Some(&key);
+        let fresh = usable && cache.at.is_some_and(|at| at.elapsed() < FRESH);
+        if !fresh && !cache.loading && inputs.is_some() {
+            cache.loading = true;
+            let (ox, path) = (self.ox.clone(), self.path.clone());
+            let key = key.clone();
+            std::thread::spawn(move || {
+                let found: Vec<String> =
+                    ox::request(&ox, &path, Request::Models).unwrap_or_default();
+                let mut cache = CATALOG.lock().unwrap_or_else(|e| e.into_inner());
+                *cache = CatalogCache {
+                    key: Some(key),
+                    at: Some(std::time::Instant::now()),
+                    models: found,
+                    loading: false,
+                };
+            });
+        }
+        ox_desk_core::ports::ox::merge_catalog(
+            base,
+            if usable { cache.models.clone() } else { vec![] },
+        )
     }
     pub(crate) fn open(
         &self,
@@ -294,4 +340,123 @@ pub(crate) fn canonical_scope(scope: Scope) -> io::Result<Scope> {
         return Err(io::Error::other("Select a project directory"));
     }
     Ok(Scope { project, ..scope })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ox_desk_core::settings_protocol::{VERSION, model::Snapshot};
+    use std::os::unix::fs::PermissionsExt;
+
+    const STOCK: &str = "stock/model";
+    const UNSTARRED: &str = "fixture/unstarred-only";
+
+    fn script(path: &std::path::Path, body: &str) {
+        std::fs::write(path, format!("#!/usr/bin/env python3\n{body}")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A fixture provider: settings list only the stock alias, discovery also lists an
+    /// unstarred alias that no stock id shares. A fake Codex app-server holds saved history on it.
+    fn fixture(dir: &std::path::Path) -> RuntimeConfig {
+        let snapshot = Snapshot {
+            version: VERSION,
+            models: vec![STOCK.into()],
+            api_provider: Some("codeox".into()),
+            claude_account: true,
+            chatgpt_account: Some("me".into()),
+            ..Default::default()
+        };
+        let home = dir.join("api-home");
+        std::fs::create_dir_all(&home).unwrap();
+        script(
+            &dir.join("ox"),
+            &format!(
+                r#"import json, sys
+req = json.load(sys.stdin)
+a = req["action"]
+if a == "read_rows": print({snap:?})
+elif a == "models": print(json.dumps(["{STOCK}", "{UNSTARRED}"]))
+elif a == "codex_profiles": print(json.dumps({{"subscription": None, "api": "{home}"}}))
+else: sys.exit("unsupported")
+"#,
+                snap = serde_json::to_string(&snapshot).unwrap(),
+                home = home.display(),
+            ),
+        );
+        script(
+            &dir.join("codex"),
+            &format!(
+                r#"import json, sys
+def reply(r, result): print(json.dumps({{"id": r["id"], "result": result}}), flush=True)
+for line in sys.stdin:
+    r = json.loads(line)
+    m = r.get("method")
+    if m == "initialize": reply(r, {{"userAgent": "codex/0.171.0"}})
+    elif m == "thread/list":
+        reply(r, {{"data": [{{"id": "saved", "cwd": "/work/project", "modelProvider": "codeox", "model": "{UNSTARRED}"}}], "nextCursor": None}})
+"#
+            ),
+        );
+        RuntimeConfig {
+            ox: dir.join("ox"),
+            path: std::env::join_paths([dir, std::path::Path::new("/usr/bin"), "/bin".as_ref()])
+                .unwrap(),
+            desktop: dir.join("state"),
+        }
+    }
+
+    #[test]
+    fn an_unstarred_catalog_alias_is_a_route_everywhere_and_reopens_saved_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = fixture(dir.path());
+        let route = |runtime: Runtime| runtime.route(Some(UNSTARRED.into()));
+        // Start, worker and hand-off targets come from the host's routes. The catalog lands
+        // from the background discovery; the next prepare lists it without any star.
+        let mut routes = vec![];
+        for _ in 0..100 {
+            let prepared = config.prepare().unwrap();
+            routes = prepared.routes;
+            if routes.contains(&route(Runtime::Codex)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        for runtime in [Runtime::Codex, Runtime::Claude] {
+            assert!(
+                routes.contains(&route(runtime)),
+                "{runtime:?} lacks the alias"
+            );
+        }
+        // The starred order stays first: the stock alias precedes the discovered one.
+        let at = |r: Route| routes.iter().position(|x| *x == r).unwrap();
+        assert!(at(route(Runtime::Codex).clone()) > at(Runtime::Codex.route(Some(STOCK.into()))));
+
+        // "Restart": a fresh discovery of saved history, nothing starred.
+        let mut found = vec![];
+        let errors = ox_desk_core::native_catalog::discover(
+            &config.ox,
+            &config.path,
+            &dir.path().join("claude-routes.json"),
+            &dir.path().join("titles"),
+            |scope, views| {
+                found.push((scope, views));
+                true
+            },
+        );
+        let (scope, views) = found
+            .iter()
+            .find(|(s, _)| s.route.runtime == Runtime::Codex)
+            .unwrap_or_else(|| panic!("no Codex history: {errors:?}"));
+        assert_eq!(scope.route, route(Runtime::Codex));
+        assert_eq!(views[0].capabilities, ["open"]);
+        // Claude's saved row validates against the same full catalog.
+        let row: ox_desk_core::store::ThreadRow = serde_json::from_value(serde_json::json!({
+            "id": "c", "cwd": "/work/project", "modelProvider": ox_desk_core::store::claude::API_PROVIDER, "model": UNSTARRED
+        }))
+        .unwrap();
+        let full = ox_desk_core::ports::ox::catalog(&config.ox, &config.path, &[STOCK.into()]);
+        assert_eq!(row.saved_runtime_route(&[STOCK.into()]), None);
+        assert_eq!(row.saved_runtime_route(&full), Some(route(Runtime::Claude)));
+    }
 }

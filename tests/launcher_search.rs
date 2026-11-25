@@ -275,6 +275,10 @@ fn native_sign_in_and_launch_use_stock_clients() {
             &fake_bin.0,
             &[
                 ("FAKE_CODEX_LOGIN_STATUS", status),
+                (
+                    "FAKE_CLAUDE_STATUS",
+                    r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}"#,
+                ),
                 ("OPENAI_API_KEY", "must-not-use-api-key"),
                 ("OPENAI_BASE_URL", "https://fixture-openai.invalid/v1"),
                 ("OPENAI_API_BASE", "https://fixture-openai.invalid/v1"),
@@ -316,7 +320,16 @@ fn native_sign_in_and_launch_use_stock_clients() {
     for &(args, forwarded) in cases {
         let output = run(args, "Logged in using ChatGPT");
         assert!(output.status.success(), "{:?}", output.stderr);
-        let received = read(&capture.0.join("run-args"));
+        let mut received = read(&capture.0.join("run-args"));
+        if args == ["claude", "--subscription"] {
+            // Even with no further arguments the launch carries the checked settings overlay.
+            let mut lines = received.splitn(3, '\n');
+            assert_eq!(lines.next(), Some("--settings"));
+            let overlay: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+            assert_eq!(overlay["env"]["ANTHROPIC_BASE_URL"], "");
+            assert_eq!(overlay["apiKeyHelper"], "");
+            received = lines.next().unwrap().to_owned();
+        }
         match forwarded.split_once("{uuid}") {
             Some((before, after)) => {
                 let id = received

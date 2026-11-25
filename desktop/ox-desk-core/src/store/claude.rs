@@ -48,6 +48,11 @@ pub struct Project {
     catalog: HashMap<String, ThreadRow>,
     asks: HashMap<RequestId, (String, wire::Permission)>,
     blank: Option<String>,
+    /// The worker contract the next new session starts with; one launch consumes it.
+    worker: Option<crate::claude_worker_contract::Contract>,
+    /// The process started under that contract for one worker launch. It is kept apart
+    /// from `blank`, so no other send can take it, and no worker can take a normal blank.
+    worker_blank: Option<String>,
     serial: u64,
     native: native::Native,
 }
@@ -65,6 +70,9 @@ struct Process {
     mode: Option<Access>,
     controls: HashMap<String, Control>,
     first: Option<(String, String)>,
+    /// The permission mode this process was launched with.
+    #[cfg_attr(not(test), allow(dead_code))]
+    launch_mode: String,
     /// Read-only view of a journal a stock client is writing right now: no process.
     viewer: Option<native::Viewer>,
 }
@@ -274,6 +282,15 @@ impl Access {
             .find(|a| a.mode() == Some(name))
     }
 }
+/// A launch's dedicated worker process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerBlank {
+    None,
+    Starting,
+    Ready,
+    /// The process failed to start or exited before the first send.
+    Lost,
+}
 impl Store {
     pub fn is_session_scoped(&self) -> bool {
         if self.remote().is_some() {
@@ -287,6 +304,69 @@ impl Store {
             self.claude_mut().blank = Some(owner);
         }
         Ok(())
+    }
+    /// A session-scoped Claude route whose blank draft was consumed by a send and
+    /// whose next one is not prepared yet. Choosing the next access prepares it, so a
+    /// launch can proceed from here instead of waiting for a draft nobody will start.
+    pub fn claude_blank_missing(&self) -> bool {
+        self.state == Connection::Ready
+            && matches!(self.link, links::Link::Claude(_))
+            && self.claude().blank.is_none()
+    }
+    /// Start a dedicated process under the shared worker contract for one launch.
+    /// The warm blank is left alone: only `send_on_worker_blank` ever uses this process,
+    /// so a send from any other session keeps getting a normal draft.
+    pub fn stage_claude_worker(
+        &mut self,
+        contract: crate::claude_worker_contract::Contract,
+    ) -> io::Result<()> {
+        if !matches!(self.link, links::Link::Claude(_)) {
+            return Ok(());
+        }
+        self.drop_claude_worker();
+        let preset = self.next_preset.take();
+        self.claude_mut().worker = Some(contract);
+        let spawned = self.spawn_claude(Session::New(new_id()?), None, false);
+        self.next_preset = preset;
+        let owner = spawned?;
+        self.claude_mut().worker_blank = Some(owner);
+        Ok(())
+    }
+    /// Where the worker's dedicated process stands.
+    pub fn claude_worker_state(&self) -> WorkerBlank {
+        if !matches!(self.link, links::Link::Claude(_)) {
+            return WorkerBlank::None;
+        }
+        let p = self.claude();
+        match p.worker_blank.as_deref() {
+            None => WorkerBlank::None,
+            Some(k) => match p.sessions.get(k) {
+                None => WorkerBlank::Lost,
+                Some(s) if s.initialized && s.link.is_some() => WorkerBlank::Ready,
+                Some(_) => WorkerBlank::Starting,
+            },
+        }
+    }
+    /// Send a launch's first turn on its dedicated process and nowhere else.
+    pub fn send_on_worker_blank(&mut self, action: crate::actions::Action) -> io::Result<()> {
+        let Some(owner) = self.claude_mut().worker_blank.take() else {
+            return Err(io::Error::other("The worker's runtime is not prepared"));
+        };
+        let normal = self.claude_mut().blank.replace(owner);
+        let result = self.dispatch(action);
+        // The send consumed the dedicated process; the normal draft stays as it was.
+        let p = self.claude_mut();
+        p.blank = normal;
+        result.map(|_| ())
+    }
+    /// Close a dedicated process its launch did not use.
+    pub fn drop_claude_worker(&mut self) {
+        if let links::Link::Claude(p) = &mut self.link {
+            p.worker = None;
+            if let Some(owner) = p.worker_blank.take() {
+                p.sessions.remove(&owner);
+            }
+        }
     }
     pub(super) fn claude_applied_access(&self, id: Option<&str>) -> Option<Access> {
         let project = self.claude();
@@ -389,6 +469,8 @@ impl Store {
             sessions: Default::default(),
             asks: Default::default(),
             blank: None,
+            worker: None,
+            worker_blank: None,
             serial: 0,
             native: Default::default(),
         };
@@ -433,6 +515,17 @@ impl Store {
         first: Option<(String, String)>,
         confirm_missing_alias: bool,
     ) -> io::Result<String> {
+        self.spawn_claude_in(session, first, confirm_missing_alias, None)
+    }
+    /// `resume_mode` starts a resumed session in a chosen access mode; a new session
+    /// takes its preset and any other resume starts in `default`.
+    fn spawn_claude_in(
+        &mut self,
+        session: Session,
+        first: Option<(String, String)>,
+        confirm_missing_alias: bool,
+        resume_mode: Option<Access>,
+    ) -> io::Result<String> {
         let id = match &session {
             Session::New(id) | Session::Resume(id) | Session::Fork { id, .. } => id,
         }
@@ -441,17 +534,39 @@ impl Store {
         if self.claude().sessions.contains_key(&owner) {
             return Ok(owner);
         }
-        self.claude_mut().native.ox_seen.insert(owner.clone());
+        // The journal as OX found it: only a write after this, by a client that is not
+        // OX's headless one, names a foreign owner.
+        let baseline = stock_id(&owner).ok().and_then(|raw| {
+            let origin = if self.profile.route.is_api() {
+                Origin::Api
+            } else {
+                Origin::Subscription
+            };
+            self.claude()
+                .launcher
+                .profiles
+                .modified(&self.profile.project, raw, origin)
+                .ok()
+        });
+        self.claude_mut()
+            .native
+            .ox_seen
+            .insert(owner.clone(), baseline);
         let profile = self.profile.clone();
         // A draft preset belongs only to the new session it was chosen for.
         let preset = match &session {
             Session::New(_) => self.next_preset.take(),
+            Session::Resume(_) => resume_mode,
+            Session::Fork { .. } => None,
+        };
+        let contract = match &session {
+            Session::New(_) => self.claude_mut().worker.take(),
             Session::Resume(_) | Session::Fork { .. } => None,
         };
-        let mode = preset
-            .and_then(Access::mode)
-            .unwrap_or("default")
-            .to_owned();
+        let mode = contract
+            .map(|c| c.permission_mode().to_owned())
+            .or_else(|| preset.and_then(Access::mode).map(str::to_owned))
+            .unwrap_or_else(|| "default".to_owned());
         let p = self.claude_mut();
         p.serial += 1;
         let generation = p.serial;
@@ -463,6 +578,7 @@ impl Store {
             Process {
                 generation,
                 first,
+                launch_mode: mode.clone(),
                 ..Default::default()
             },
         );
@@ -524,6 +640,7 @@ impl Store {
                         billing: profile.route.billing,
                         session,
                         permission_mode: mode,
+                        contract,
                     },
                     move |event| output(Data::Stock(event)),
                 )?;
@@ -565,7 +682,12 @@ impl Store {
         }
         let text = self.draft(Some(id)).to_owned();
         let raw = stock_id(id)?.to_owned();
-        self.spawn_claude(Session::Resume(raw), Some((new_id()?, text)), false)?;
+        // A send continues the conversation the user was having, so its first turn runs
+        // in the access mode they had chosen, also after the host reaped the idle route
+        // behind their back. Opening the session from the list is a fresh start and keeps
+        // `default`, as does a session that never had a chosen mode.
+        let mode = self.resume_access.get(id).copied();
+        self.spawn_claude_in(Session::Resume(raw), Some((new_id()?, text)), false, mode)?;
         self.ended_threads.remove(id);
         let t = self.transcripts.entry(id.into()).or_default();
         t.loading = true;
@@ -716,6 +838,11 @@ impl Store {
         if project.blank.as_deref() == Some(id) || !project.sessions.contains_key(id) {
             return Err(io::Error::other("No active Claude session"));
         }
+        if project.sessions[id].viewer.is_some() {
+            return Err(io::Error::other(
+                "Another client is running this session; OX only follows it",
+            ));
+        }
         if project.sessions[id].handoff.is_some() {
             return Err(io::Error::other("This session is opening in a terminal"));
         }
@@ -724,6 +851,9 @@ impl Store {
             .sessions
             .remove(id)
             .expect("checked above");
+        if let Some(mode) = p.mode.filter(|_| p.link.is_some()) {
+            self.resume_access.insert(id.into(), mode);
+        }
         let mut unsent: Vec<_> = p
             .events
             .take_awaiting_echo()
@@ -761,17 +891,40 @@ impl Store {
     pub(super) fn claude_has_live(&self, id: &str) -> bool {
         let project = self.claude();
         project.blank.as_deref() != Some(id)
+            && project.worker_blank.as_deref() != Some(id)
             && project.sessions.get(id).is_some_and(|p| p.viewer.is_none())
     }
     pub(super) fn claude_is_blank(&self, id: &str) -> bool {
         self.claude().blank.as_deref() == Some(id)
+    }
+    /// Every OS process this store owns: the live sessions, and for Claude the warm blank
+    /// draft too. `live_threads` leaves the blank out because it is not a session to end
+    /// or reap, but the process list still has to show the process the host keeps.
+    pub fn process_threads(&self) -> Vec<String> {
+        let mut ids = self.live_threads();
+        if self.remote().is_none()
+            && self.is_session_scoped()
+            && let Some(blank) = self.claude().blank.as_deref()
+            && self
+                .claude()
+                .sessions
+                .get(blank)
+                .is_some_and(|p| p.viewer.is_none() && (p.link.is_some() || !p.initialized))
+        {
+            ids.push(blank.to_owned());
+        }
+        ids
     }
     pub(super) fn claude_live(&self) -> Vec<String> {
         let project = self.claude();
         let mut ids: Vec<String> = project
             .sessions
             .iter()
-            .filter(|(k, p)| project.blank.as_deref() != Some(k.as_str()) && p.viewer.is_none())
+            .filter(|(k, p)| {
+                project.blank.as_deref() != Some(k.as_str())
+                    && project.worker_blank.as_deref() != Some(k.as_str())
+                    && p.viewer.is_none()
+            })
             .map(|(k, _)| k.clone())
             .collect();
         ids.sort();

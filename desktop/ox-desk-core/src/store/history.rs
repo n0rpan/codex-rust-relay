@@ -333,6 +333,30 @@ impl Store {
         self.changed.transcript(&id);
     }
 
+    /// Fixture for host tests: the selected thread is held by another Codex client, its
+    /// probe is overdue, and the read it sent is still waiting for the runtime.
+    #[doc(hidden)]
+    pub fn hold_native_read_for_test(&mut self, id: &str) {
+        let t = self.transcripts.entry(id.into()).or_default();
+        t.native_live = true;
+        t.native_next = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+        self.selected = Some(id.into());
+        self.pending.insert(
+            -1,
+            (
+                std::time::Instant::now() + std::time::Duration::from_secs(90),
+                Pending::Read(id.into()),
+            ),
+        );
+    }
+
+    /// A read, resume or history request for the thread is still waiting for Codex.
+    pub(super) fn native_request_outstanding(&self, id: &str) -> bool {
+        self.pending.values().any(|(_, p)| {
+            matches!(p, Pending::Read(x) | Pending::Resume(x) | Pending::History(x) if x == id)
+        })
+    }
+
     /// Probe the selected natively-held Codex thread every few seconds: a resume that is
     /// accepted means the other client closed it; one that is refused refreshes the view.
     pub(super) fn refresh_native_codex(&mut self, now: std::time::Instant) {
@@ -343,10 +367,7 @@ impl Store {
             .transcripts
             .get(&id)
             .is_some_and(|t| t.native_live && t.native_next.is_some_and(|at| now >= at));
-        let busy = self.pending.values().any(|(_, p)| {
-            matches!(p, Pending::Read(x) | Pending::Resume(x) | Pending::History(x) if x == &id)
-        });
-        if !due || busy || self.state != Connection::Ready {
+        if !due || self.native_request_outstanding(&id) || self.state != Connection::Ready {
             return;
         }
         if let Some(t) = self.transcripts.get_mut(&id) {

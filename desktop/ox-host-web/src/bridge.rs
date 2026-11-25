@@ -120,7 +120,15 @@ impl Access {
     }
     /// Whether a scope may be subscribed: listed in the hello, or discovered on this host.
     fn reachable(&self, app: &App, scope: &Scope) -> bool {
-        (self.projects.contains(&scope.project) && self.routes.contains(&scope.route))
+        // Any catalog model may run, starred or not, so a host that lists API routes for a
+        // runtime accepts that runtime's other aliases: the host validates the alias at launch.
+        (self.projects.contains(&scope.project)
+            && (self.routes.contains(&scope.route)
+                || (scope.route.is_api()
+                    && self
+                        .routes
+                        .iter()
+                        .any(|r| r.is_api() && r.runtime == scope.route.runtime))))
             || app.discovered.lock().unwrap().contains(scope)
     }
     /// A request that passed auth but was refused for its content: the request id, if it has
