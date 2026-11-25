@@ -98,6 +98,8 @@ pub(super) struct Discovery {
     removed: HashMap<Scope, HashMap<PathBuf, HashSet<String>>>,
     /// Parents whose child rows are folded away, by project and thread id.
     pub collapsed: HashSet<(PathBuf, String)>,
+    /// Day groups the user folded in the sidebar.
+    pub folded_days: HashSet<Option<chrono::NaiveDate>>,
     /// Each indexed child's parent, by project and thread id, from the last index.
     pub parents: HashMap<(PathBuf, String), (PathBuf, String)>,
 }
@@ -149,6 +151,13 @@ type Key = (PathBuf, Scope, String, String);
 impl Discovery {
     pub(super) fn all(&self) -> impl Iterator<Item = &Saved> {
         self.hosted.iter().map(|h| &h.saved).chain(&self.rows)
+    }
+    /// Fold or unfold one day group of the sidebar.
+    pub(super) fn toggle_day(&mut self, day: Option<chrono::NaiveDate>) {
+        if !self.folded_days.remove(&day) {
+            self.folded_days.insert(day);
+        }
+        self.revision += 1;
     }
     /// Fold or unfold a parent's children in the sidebar.
     pub(super) fn toggle(&mut self, project: PathBuf, id: String) {
@@ -480,6 +489,13 @@ impl Host {
         total
     }
 
+    fn catalog_row(&self, id: &str, project: &Path, cx: &App) -> Option<(ThreadRow, Scope)> {
+        self.catalog.iter().find_map(|entry| {
+            let (row, path, scope) = self.located_entry(*entry, cx)?;
+            (row.id == id && path == project).then(|| (row.clone(), scope))
+        })
+    }
+
     /// Open a session from the sidebar index, unfolding its parent if needed.
     pub(super) fn open_thread(
         &mut self,
@@ -514,10 +530,14 @@ impl Host {
             self.discovery.revision += 1;
             self.index_catalog(cx);
         }
-        let found = self.catalog.iter().find_map(|entry| {
-            let (row, path, scope) = self.located_entry(*entry, cx)?;
-            (row.id == id && path == project.as_path()).then(|| (row.clone(), scope))
-        });
+        let mut found = self.catalog_row(&id, &project, cx);
+        // The target may sit in a folded day group: open the groups and look again.
+        if found.is_none() && !self.discovery.folded_days.is_empty() {
+            self.discovery.folded_days.clear();
+            self.discovery.revision += 1;
+            self.index_catalog(cx);
+            found = self.catalog_row(&id, &project, cx);
+        }
         if let Some((row, scope)) = found {
             self.activate_row(project, scope, row, window, cx);
         }
@@ -669,12 +689,24 @@ impl Host {
         let mut catalog = Vec::new();
         let mut previous = None;
         let mut ordinal = 0;
+        let mut per_day: HashMap<Option<chrono::NaiveDate>, usize> = HashMap::new();
+        for (_, timestamp, _) in &roots {
+            *per_day.entry(session_day(*timestamp)).or_default() += 1;
+        }
         for (key, timestamp, loc) in roots {
             let day = session_day(timestamp);
+            let folded = self.discovery.folded_days.contains(&day);
             if previous != Some(day) {
-                catalog.push(CatalogEntry::Day(day));
+                catalog.push(CatalogEntry::Day {
+                    day,
+                    count: per_day.get(&day).copied().unwrap_or_default(),
+                    folded,
+                });
             }
             previous = Some(day);
+            if folded {
+                continue;
+            }
             let mut stack = vec![(key, loc, timestamp, 0)];
             while let Some((key, loc, timestamp, depth)) = stack.pop() {
                 catalog.push(CatalogEntry::Thread {

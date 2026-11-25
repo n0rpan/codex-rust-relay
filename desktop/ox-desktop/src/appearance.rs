@@ -216,6 +216,16 @@ impl Palette {
         step.px(self.text_base)
     }
 
+    /// The third text tier (bright `fg`, `muted`, quiet): section labels, ages and hints.
+    pub fn quiet(self) -> u32 {
+        mix(self.muted, self.nav, 38)
+    }
+
+    /// A calm raised surface for quiet controls on the sidebar or a panel.
+    pub fn surface(self) -> u32 {
+        mix(self.nav, self.fg, 7)
+    }
+
     #[cfg(any(target_os = "linux", test))]
     fn parse(text: &str) -> Option<Self> {
         let doc = text.parse::<DocumentMut>().ok()?;

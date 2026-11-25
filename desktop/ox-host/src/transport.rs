@@ -17,6 +17,7 @@ use std::{
 pub(crate) type Packet = Arc<[u8]>;
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 const QUEUE_BYTES: usize = 16 * 1024 * 1024;
+const QUEUE_FRAMES: usize = 256;
 pub(crate) fn encode(frame: &Server) -> io::Result<Packet> {
     let mut bytes = serde_json::to_vec(frame)?;
     bytes.push(b'\n');
@@ -30,15 +31,29 @@ pub(crate) struct Peer {
 }
 impl Peer {
     pub(crate) fn send(&self, packet: Packet) -> bool {
+        self.send_for(packet, "reply")
+    }
+    /// Queue a packet; a subscriber too slow to take it is cut off and told to
+    /// reconnect from its cursor. The eviction goes to the host error log
+    /// (shown by `ox host doctor`), so a desktop that reloads its catalog can
+    /// be traced to it.
+    pub(crate) fn send_for(&self, packet: Packet, what: &str) -> bool {
         let n = packet.len();
         let old = self.queued.fetch_add(n, Ordering::Relaxed);
-        if (old == 0 || old.saturating_add(n) <= QUEUE_BYTES)
-            && self.writer.try_send(packet).is_ok()
-        {
+        let over_bytes = old != 0 && old.saturating_add(n) > QUEUE_BYTES;
+        if !over_bytes && self.writer.try_send(packet).is_ok() {
             return true;
         }
         self.queued.fetch_sub(n, Ordering::Relaxed);
         let _ = self.stop.shutdown(Shutdown::Both);
+        let reason = if over_bytes {
+            format!("queue over {} MiB", QUEUE_BYTES >> 20)
+        } else {
+            format!("queue over {QUEUE_FRAMES} frames")
+        };
+        ox_host_service::errlog::record(&format!(
+            "evicted a slow subscriber ({what}): {reason}, {old} bytes queued; it must reconnect"
+        ));
         false
     }
 }
@@ -89,7 +104,7 @@ pub(crate) fn attach(stream: UnixStream, id: u64, events: SyncSender<Message>) -
     same_user(&stream)?;
     let read = stream.try_clone()?;
     let write = stream.try_clone()?;
-    let (writer, rx) = mpsc::sync_channel::<Packet>(256);
+    let (writer, rx) = mpsc::sync_channel::<Packet>(QUEUE_FRAMES);
     let queued = Arc::new(AtomicUsize::new(0));
     let backlog = queued.clone();
     events
@@ -156,4 +171,19 @@ pub(crate) fn test_peer() -> (Peer, mpsc::Receiver<Packet>) {
         },
         rx,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_subscriber_that_never_reads_is_evicted_at_the_frame_limit() {
+        let (peer, _frames) = test_peer();
+        let packet: Packet = vec![b'x'; 8].into();
+        for _ in 0..QUEUE_FRAMES {
+            assert!(peer.send_for(packet.clone(), "test"));
+        }
+        assert!(!peer.send_for(packet, "test"), "frame 257 evicts");
+    }
 }

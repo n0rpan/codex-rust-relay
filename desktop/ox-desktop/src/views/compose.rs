@@ -138,20 +138,8 @@ impl Workbench {
             {
                 "Send an instruction to this worker…".to_owned()
             } else {
-                match &store.profile().route.billing {
-                    ox_desk_core::runtime::Billing::Api(alias) => {
-                        let model = store.options(owner.as_deref()).model;
-                        let model = if model.is_empty() {
-                            alias.clone()
-                        } else {
-                            model
-                        };
-                        format!("Ask {model} ({}) about this project…", store.runtime_name())
-                    }
-                    ox_desk_core::runtime::Billing::Subscription => {
-                        format!("Ask {} about this project…", store.runtime_name())
-                    }
-                }
+                // The model and route show in the chips below; the placeholder teaches.
+                "Ask anything · @ files · / commands".to_owned()
             };
             let editor = cx.new(|cx| {
                 TextareaState::new(window, cx)
@@ -238,12 +226,16 @@ impl Workbench {
                 "YOLO + workers".to_owned()
             }
             (Some(_), Some(m)) if granted => {
-                format!("{} · YOLO allowed for workers", m.label())
+                format!("{} · YOLO allowed for workers", permission_value(m))
             }
             (Some(_), None) if granted => "YOLO allowed for workers".to_owned(),
-            (None, Some(m)) => format!("Next thread · {}", m.label()),
-            (_, Some(m)) => m.label().to_owned(),
-            _ => "Default".to_owned(),
+            (_, Some(m)) => permission_value(m),
+            _ => "Default permissions".to_owned(),
+        };
+        let access_hint = if key.is_none() {
+            format!("Permissions for the next thread: {value}")
+        } else {
+            format!("Permissions: {value}")
         };
         if effective.is_some_and(Access::bypasses_permissions)
             && p.motion
@@ -266,12 +258,13 @@ impl Workbench {
         let access = crate::kit::chip(
             p,
             "access-preset",
-            "Permissions",
+            "",
             value,
             false,
             key.map_or_else(|| store.can_send(None), |id| store.can_change_access(id)),
             |_, _, _| {},
         )
+        .tooltip(access_hint)
         .dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
             for &preset in presets {
                 let id = owner.clone();
@@ -344,16 +337,55 @@ impl Workbench {
         } else {
             vec![]
         };
-        let owner = selected.clone();
+        // One fixed 28 px submit slot: ↑ sends (or steers, or runs a command); while a
+        // turn runs and nothing is typed it becomes ■ Stop, so nothing ever moves.
+        let stops = running
+            && selected.is_some()
+            && draft.trim().is_empty()
+            && store.draft_images(key).is_empty();
+        let submit = if stops {
+            let stop_owner = selected.clone();
+            crate::kit::icon_button(
+                p,
+                "stop-turn",
+                "",
+                format!("Stop · {}", stop_key()),
+                cx.listener(move |s, _, _, cx| {
+                    if let Some(id) = stop_owner.clone() {
+                        s.action(cx, DeskAction::Stop(id))
+                    }
+                }),
+            )
+            .bg(rgb(p.raised))
+            .child(gpui::div().size(px(10.)).bg(rgb(p.fg)))
+        } else {
+            let send_owner = selected.clone();
+            crate::kit::icon(
+                p,
+                "send-message",
+                gpui_component::IconName::ArrowUp,
+                send,
+                enabled,
+                cx.listener(move |s, _, _, cx| s.send_input(send_owner.as_deref(), cx)),
+            )
+            .when(enabled, |b| {
+                b.bg(rgb(p.accent))
+                    .text_color(rgb(p.on_accent))
+                    .hover(move |h| h.bg(rgb(crate::appearance::mix(p.accent, p.fg, 14))))
+            })
+            .when(!enabled, |b| b.bg(rgb(p.raised)).text_color(rgb(p.quiet())))
+        };
         let native = key.filter(|id| store.is_native_live(id)).map(str::to_owned);
         let editor_for_menu = editor.clone();
         col()
             .flex_shrink_0()
-            .gap_2()
-            .p_3()
-            .rounded_sm()
-            .border_t_2()
-            .border_color(rgb(crate::appearance::mix(p.line, p.accent, 46)))
+            .gap(px(crate::kit::SPACE_M))
+            .pt(px(crate::kit::SPACE_M))
+            .pb(px(crate::kit::SPACE_M))
+            .px(px(crate::kit::SPACE_M))
+            .rounded(px(crate::kit::OVERLAY_RADIUS))
+            .border_1()
+            .border_color(rgb(p.line))
             .bg(rgb(p.panel))
             .when(!suggestions.is_empty(), |panel| {
                 let mut choices = row().gap_1().flex_wrap();
@@ -421,17 +453,16 @@ impl Workbench {
             .child(
                 row()
                     .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .when(width < px(760.), |controls| {
-                        controls.flex_col().items_stretch()
-                    })
+                    .gap(px(crate::kit::SPACE_XS))
                     .child(
                         row()
+                            .flex_1()
                             .min_w_0()
                             .flex_wrap()
                             .items_center()
-                            .gap_2()
+                            .gap(px(crate::kit::SPACE_XS))
+                            // Chip text lines up with the textarea's text inset.
+                            .pl(px(2.))
                             .children(model_controls)
                             .child(access)
                             .when(effective.is_some_and(Access::bypasses_permissions), |r| {
@@ -441,48 +472,23 @@ impl Workbench {
                                 })
                             }),
                     )
-                    .child(
-                        row()
-                            .flex_shrink_0()
-                            .justify_end()
-                            .gap_2()
-                            // Stop keeps a fixed slot and is disabled while idle, so the
-                            // send button never moves when a turn starts or ends.
-                            .child(div().w(px(72.)).flex().justify_end().child(button(
-                                p,
-                                "stop-turn",
-                                "Stop",
-                                false,
-                                running && selected.is_some(),
-                                cx.listener(move |s, _, _, cx| {
-                                    if let Some(id) = selected.clone() {
-                                        s.action(cx, DeskAction::Stop(id))
-                                    }
-                                }),
-                            )))
-                            .child(
-                                button(
-                                    p,
-                                    "send-message",
-                                    send,
-                                    true,
-                                    enabled,
-                                    cx.listener(move |s, _, _, cx| {
-                                        s.send_input(owner.as_deref(), cx)
-                                    }),
-                                )
-                                .rounded(px(3.))
-                                .min_w(px(68.))
-                                .border_b_2()
-                                .border_color(rgb(
-                                    crate::appearance::mix(
-                                        p.panel,
-                                        p.accent,
-                                        if enabled { 65 } else { 24 },
-                                    ),
-                                )),
-                            ),
-                    ),
+                    .child(submit),
             )
+    }
+}
+
+/// The permission chip's value: the mode alone, with "Default" spelled out.
+fn permission_value(mode: Access) -> String {
+    match mode {
+        Access::Default => "Default permissions".to_owned(),
+        other => other.label().to_owned(),
+    }
+}
+
+fn stop_key() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⌘⇧X"
+    } else {
+        "Ctrl Shift X"
     }
 }

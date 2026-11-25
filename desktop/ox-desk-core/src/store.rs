@@ -388,6 +388,7 @@ impl Store {
                 return Ok(());
             }
             self.query = query.clone();
+            self.remote_mut().restore = None;
             return self.forward(crate::actions::Action::SearchThreads(query));
         }
         if self.query == query {

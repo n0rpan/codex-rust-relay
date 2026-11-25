@@ -10,13 +10,13 @@ mod shortcuts;
 use super::model_picker::{self, ModelPicker, ModelPickerEvent};
 use super::running::Running;
 use super::workbench::{CatalogChanged, Workbench};
-use crate::kit::{DropdownMenu, PopupMenuItem, SPACE_S, SPACE_XS};
+use crate::kit::{DropdownMenu, PopupMenuItem, SPACE_M, SPACE_S, SPACE_XS};
 use crate::{
     activity, appearance::Palette, col, kit::button, platform, row, settings, small,
     workspace_state::LastWorkspace,
 };
 use gpui::{prelude::FluentBuilder, *};
-use gpui_component::{FocusTrapElement, button::ButtonVariants};
+use gpui_component::FocusTrapElement;
 use ox_desk_core::actions::Action as DeskAction;
 use ox_desk_core::runtime::{Billing, Runtime};
 use ox_desk_core::store::{Connection, Route, ThreadRow};
@@ -24,7 +24,12 @@ use std::{ops::Range, path::PathBuf, time::Instant};
 
 #[derive(Clone, Copy)]
 enum CatalogEntry {
-    Day(Option<chrono::NaiveDate>),
+    /// A day group header: its root-thread count and whether it is folded.
+    Day {
+        day: Option<chrono::NaiveDate>,
+        count: usize,
+        folded: bool,
+    },
     Thread {
         loc: Location,
         timestamp: i64,
@@ -123,6 +128,8 @@ pub struct Host {
     measure_from: Option<gpui::FrameDurationSnapshot>,
     _probe: Option<platform::probe::Socket>,
     message: Option<String>,
+    /// Set when first-run onboarding opened Providers: models known then; a newly saved one becomes the route.
+    provider_onboarding: Option<Vec<String>>,
 }
 const MIN_THREAD_WIDTH: f32 = 600.;
 const DIVIDER_WIDTH: f32 = 5.;
@@ -145,7 +152,8 @@ impl Host {
         let layout = saved_layouts.for_project(&project);
         let route = layout
             .active_route(&project)
-            .unwrap_or_else(|| recent.route(&project));
+            .or_else(|| recent.saved_route(&project))
+            .unwrap_or_else(super::onboarding::first_launch_route);
         recent.remember(&project, &route);
         let message = LastWorkspace::save(&project, &route)
             .err()
@@ -212,6 +220,7 @@ impl Host {
             choose_route: None,
             stats,
             message,
+            provider_onboarding: None,
         };
         host.restore_layout(layout, window, cx);
         host.start_discovery(cx);
@@ -457,6 +466,19 @@ impl Host {
                             });
                         }
                         s.native_account = native_account;
+                        if s.provider_onboarding.is_some() && s.preferences.is_none() {
+                            let before = s.provider_onboarding.take().unwrap_or_default();
+                            if let Some(model) =
+                                s.models.iter().find(|m| !before.contains(m)).cloned()
+                            {
+                                let owner = s.panes[s.active].clone();
+                                let (project, route) = {
+                                    let o = owner.read(cx);
+                                    (o.project.clone(), o.api_route(model))
+                                };
+                                s.open(project, route, window, cx);
+                            }
+                        }
                     }
                     Err(error) => s.message = Some(error),
                 }
@@ -524,6 +546,111 @@ impl Host {
         self.panes[self.active].update(cx, |p, cx| p.set_front(self.preferences.is_none(), cx));
         cx.notify();
     }
+    /// Open Settings on its Remote access page, or move an open Settings there.
+    fn show_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preferences.is_none() {
+            self.show_settings(window, cx);
+        }
+        if let Some(view) = &self.preferences {
+            view.update(cx, |view, cx| view.open_remote(cx));
+        }
+    }
+
+    /// The sidebar footer: an icon rail on the keyline, and the one running indicator.
+    fn sidebar_footer(
+        &self,
+        p: Palette,
+        running_count: usize,
+        running_open: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let settings_label = if self.preferences.is_some() {
+            "Back to thread"
+        } else {
+            "Settings"
+        };
+        let pane = self.panes[self.active].downgrade();
+        let usage = gpui_component::popover::Popover::new("sidebar-usage")
+            .anchor(Anchor::BottomLeft)
+            .trigger(crate::kit::icon(
+                p,
+                "sidebar-usage-button",
+                gpui_component::IconName::ChartPie,
+                "Usage",
+                true,
+                |_, _, _| {},
+            ))
+            .content(move |_, window, cx| {
+                pane.read_with(cx, |view, _| view.usage_details(p, window, &pane))
+                    .unwrap_or_else(|_| div().into_any_element())
+            });
+        let running = self.running.clone();
+        row()
+            .flex_shrink_0()
+            .h(px(44.))
+            .px(px(crate::kit::GUTTER))
+            .gap(px(SPACE_XS))
+            .child(
+                crate::kit::icon(
+                    p,
+                    "settings",
+                    gpui_component::IconName::Settings,
+                    settings_label,
+                    true,
+                    cx.listener(|s, _, w, cx| s.show_settings(w, cx)),
+                )
+                .when(self.preferences.is_some(), |b| b.text_color(rgb(p.accent))),
+            )
+            .child(crate::kit::icon(
+                p,
+                "remote-access",
+                gpui_component::IconName::Globe,
+                "Remote access",
+                true,
+                cx.listener(|s, _, w, cx| s.show_remote(w, cx)),
+            ))
+            .child(usage)
+            .child(div().flex_1())
+            .when(running_count > 0, |footer| {
+                footer.child(
+                    crate::kit::nav_row(
+                        "running-toggle",
+                        format!(
+                            "{running_count} running, {}",
+                            if running_open { "hide" } else { "show" }
+                        ),
+                        crate::kit::ICON_SIZE,
+                        true,
+                        move |_, _, cx| {
+                            running.update(cx, |r, cx| {
+                                r.open = !r.open;
+                                cx.notify();
+                            })
+                        },
+                    )
+                    .w_auto()
+                    .child(
+                        row()
+                            .gap(px(SPACE_S))
+                            .child(div().size(px(6.)).rounded_full().bg(rgb(p.success)))
+                            .child(
+                                div()
+                                    .text_size(p.text(Step::Meta))
+                                    .text_color(rgb(p.muted))
+                                    .child(format!("{running_count} running")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(p.text(Step::Label))
+                                    .text_color(rgb(p.quiet()))
+                                    .child(if running_open { "▾" } else { "▴" }),
+                            ),
+                    ),
+                )
+            })
+    }
+
     fn pane(
         project: PathBuf,
         route: Route,
@@ -553,13 +680,28 @@ impl Host {
         cx.subscribe_in(
             &pane,
             window,
-            |s, owner, _: &super::onboarding::ConfigureProvider, window, cx| {
+            |s, owner, event: &super::onboarding::SwitchRoute, window, cx| {
                 let project = owner.read(cx).project.clone();
-                owner.update(cx, |p, cx| p.set_front(false, cx));
-                s.preferences = Some(
-                    cx.new(|cx| crate::preferences::Preferences::providers(project, window, cx)),
-                );
-                cx.notify();
+                let route = match &event.0 {
+                    Some(route) => route.clone(),
+                    None => match s.models.first() {
+                        Some(model) => owner.read(cx).api_route(model.clone()),
+                        None => {
+                            s.provider_onboarding = Some(s.models.clone());
+                            return s.open_providers(owner, window, cx);
+                        }
+                    },
+                };
+                s.open(project, route, window, cx);
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &pane,
+            window,
+            |s, owner, _: &super::onboarding::ConfigureProvider, window, cx| {
+                s.provider_onboarding = Some(s.models.clone());
+                s.open_providers(owner, window, cx);
             },
         )
         .detach();
@@ -596,6 +738,18 @@ impl Host {
         )
         .detach();
         pane
+    }
+    fn open_providers(
+        &mut self,
+        owner: &Entity<Workbench>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let project = owner.read(cx).project.clone();
+        owner.update(cx, |p, cx| p.set_front(false, cx));
+        self.preferences =
+            Some(cx.new(|cx| crate::preferences::Preferences::providers(project, window, cx)));
+        cx.notify();
     }
     fn switch(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.close_drawer(window, cx);
@@ -699,33 +853,53 @@ impl Host {
         })
         .detach();
     }
-    /// Status filters as chips. Each chip toggles the same `is:` token the search box accepts.
-    fn filter_chips(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        const CHIPS: [(&str, &str, &str); 3] = [
-            ("filter-running", "is:running", "Running"),
-            ("filter-waiting", "is:waiting", "Needs you"),
-            ("filter-finished", "is:finished", "Finished"),
+    /// The status filter as one quiet icon menu in the search row. Each choice sets the
+    /// same `is:` token the search box accepts; "All" clears it.
+    fn filter_menu(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        const CHOICES: [(&str, &str); 4] = [
+            ("", "All"),
+            ("is:running", "Running"),
+            ("is:waiting", "Needs you"),
+            ("is:finished", "Finished"),
         ];
         let current = self.filter.read(cx).value().to_string();
-        // One compact row of equal segments that always fits the sidebar.
-        let mut chips = crate::kit::row().gap_1().px_1().flex_nowrap().min_w_0();
-        for (id, token, label) in CHIPS {
-            let filter = self.filter.clone();
-            let active = current.split_whitespace().any(|word| word == token);
-            chips = chips.child(
-                div().flex_1().min_w_0().child(
-                    crate::kit::button(p, id, label, active, true, move |_, window, cx| {
+        let active = CHOICES
+            .iter()
+            .skip(1)
+            .find(|(token, _)| current.split_whitespace().any(|word| word == *token))
+            .copied();
+        let label = match active {
+            Some((_, name)) => format!("Filter threads: {name}"),
+            None => "Filter threads".to_owned(),
+        };
+        let filter = self.filter.clone();
+        crate::kit::icon(
+            p,
+            "thread-filter",
+            gpui_component::IconName::Settings2,
+            label,
+            true,
+            |_, _, _| {},
+        )
+        .size(px(24.))
+        .when(active.is_some(), |b| b.text_color(rgb(p.accent)))
+        .dropdown_menu(move |mut menu, _, _| {
+            for (token, name) in CHOICES {
+                let filter = filter.clone();
+                let checked = match active {
+                    Some((current, _)) => current == token,
+                    None => token.is_empty(),
+                };
+                menu = menu.item(PopupMenuItem::new(name).checked(checked).on_click(
+                    move |_, window, cx| {
                         let value = filter.read(cx).value().to_string();
-                        let next = toggle_status_filter(&value, token);
+                        let next = select_status_filter(&value, token);
                         filter.update(cx, |field, cx| field.set_value(next, window, cx));
-                    })
-                    .w_full()
-                    .px_0p5()
-                    .text_size(p.text(Step::Meta)),
-                ),
-            );
-        }
-        chips
+                    },
+                ));
+            }
+            menu
+        })
     }
     fn search(&mut self, query: String, cx: &mut Context<Self>) {
         for pane in &self.panes {
@@ -911,23 +1085,58 @@ impl Host {
                     }
                     (depth, timestamp)
                 }
-                CatalogEntry::Day(day) => {
+                CatalogEntry::Day { day, count, folded } => {
+                    let title = day_label(day, now.date_naive());
+                    let label = format!(
+                        "{title}, {count} {}",
+                        if count == 1 { "thread" } else { "threads" }
+                    );
                     rows.push(
                         div()
-                            .h(px(39.))
+                            .w(width)
+                            .h(px(crate::kit::ROW_HEIGHT))
+                            .px(px(crate::kit::GUTTER))
                             .flex()
-                            .items_end()
-                            .px_3()
-                            .pb_1()
-                            .gap_2()
-                            .child(div().w(px(13.)).h(px(2.)).mb(px(7.)).bg(rgb(p.accent)))
+                            .flex_col()
+                            .justify_end()
                             .child(
-                                div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_size(p.text(Step::Ui))
-                                    .child(day_label(day, now.date_naive())),
+                                crate::kit::nav_row(
+                                    SharedString::from(format!("day-{title}")),
+                                    label,
+                                    24.,
+                                    true,
+                                    cx.listener(move |s, _, _, cx| {
+                                        s.discovery.toggle_day(day);
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(
+                                    row()
+                                        .w_full()
+                                        .gap(px(SPACE_S))
+                                        .child(
+                                            div()
+                                                .text_size(p.text(Step::Meta))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(rgb(p.quiet()))
+                                                .child(title),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_family(crate::appearance::LABEL_FONT)
+                                                .text_size(p.text(Step::Label))
+                                                .text_color(rgb(p.quiet()))
+                                                .child(count.to_string()),
+                                        )
+                                        .child(div().flex_1())
+                                        .child(
+                                            div()
+                                                .text_size(p.text(Step::Label))
+                                                .text_color(rgb(p.quiet()))
+                                                .child(if folded { "▸" } else { "▾" }),
+                                        ),
+                                ),
                             )
-                            .child(div().flex_1().h(px(1.)).mb(px(7.)).bg(rgb(p.line)))
                             .into_any_element(),
                     );
                     continue;
@@ -985,11 +1194,7 @@ impl Host {
             };
             let model = crate::kit::ListRow {
                 cartridge,
-                title: if depth > 0 {
-                    format!("↳ {}", t.title())
-                } else {
-                    t.title().into()
-                },
+                title: t.title().into(),
                 route: {
                     let mut route = if !t.worker && t.parent_thread_id.is_some() {
                         format!("Subagent · {badge}")
@@ -1017,61 +1222,65 @@ impl Host {
                 selected: active.project == project
                     && scope.matches(&active.route)
                     && active.store.as_ref().and_then(|s| s.selected()) == Some(&t.id),
+                depth,
             };
-            // The disclosure is a sibling of the row, so it folds without selecting.
-            let disclosure = match tree.as_ref().filter(|tree| tree.children > 0) {
-                Some(_) => {
-                    let glyph = if folded { "▸" } else { "▾" };
-                    gpui::div()
-                        .id(SharedString::from(format!(
-                            "fold-{}-{}-{}",
-                            fold_key.0.display(),
-                            scope.api,
-                            fold_key.1
-                        )))
-                        .w(px(16.))
-                        .h(px(37.))
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .text_size(p.text(Step::Label))
-                        .text_color(rgb(p.fg))
-                        .child(glyph)
-                        .on_click(cx.listener(move |s, _, _, cx| {
-                            s.discovery.toggle(fold_key.0.clone(), fold_key.1.clone());
-                            cx.notify();
-                        }))
-                        .into_any_element()
-                }
-                None => gpui::div().w(px(16.)).flex_none().into_any_element(),
-            };
+            // The disclosure is a sibling of the row in the gutter, so it folds without
+            // selecting and the row keeps the sidebar keyline.
+            let disclosure = tree.as_ref().filter(|tree| tree.children > 0).map(|tree| {
+                let glyph = if folded { "▸" } else { "▾" };
+                let label = format!(
+                    "{} {} worker{}",
+                    if folded { "Show" } else { "Hide" },
+                    tree.children,
+                    if tree.children == 1 { "" } else { "s" }
+                );
+                gpui::div()
+                    .id(SharedString::from(format!(
+                        "fold-{}-{}-{}",
+                        fold_key.0.display(),
+                        scope.api,
+                        fold_key.1
+                    )))
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .w(px(crate::kit::GUTTER))
+                    .h(px(crate::kit::ROW_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .text_size(p.text(Step::Label))
+                    .text_color(rgb(p.quiet()))
+                    .hover(move |d| d.text_color(rgb(p.fg)))
+                    .child(glyph)
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx)
+                    })
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        s.discovery.toggle(fold_key.0.clone(), fold_key.1.clone());
+                        cx.notify();
+                    }))
+            });
             rows.push(
                 gpui::div()
                     .w(width)
-                    .flex()
-                    .items_center()
-                    .pl(px(6. + depth.min(4) as f32 * 12.))
-                    .child(disclosure)
-                    .child(
-                        model
-                            .render(
-                                p,
-                                SharedString::from(format!(
-                                    "thread-{}-{}-{}",
-                                    project.display(),
-                                    scope.api,
-                                    t.id
-                                )),
-                                cx.listener(move |s, _, window, cx| {
-                                    window.focus(&s.list_focus, cx);
-                                    s.activate_row(project.clone(), scope, row.clone(), window, cx);
-                                }),
-                            )
-                            .flex_1()
-                            .min_w_0(),
-                    )
+                    .relative()
+                    .px(px(crate::kit::GUTTER))
+                    .child(model.render(
+                        p,
+                        SharedString::from(format!(
+                            "thread-{}-{}-{}",
+                            project.display(),
+                            scope.api,
+                            t.id
+                        )),
+                        cx.listener(move |s, _, window, cx| {
+                            window.focus(&s.list_focus, cx);
+                            s.activate_row(project.clone(), scope, row.clone(), window, cx);
+                        }),
+                    ))
+                    .children(disclosure)
                     .into_any_element(),
             );
         }
@@ -1144,7 +1353,10 @@ impl Host {
             .as_ref()
             .is_some_and(|s| s.state() == &Connection::Ready);
         let count = self.catalog.len();
-        let running = self.running.read(cx).summary();
+        let (running_count, running_open) = {
+            let running = self.running.read(cx);
+            (running.process_count(), running.open)
+        };
         // The route menu lists the two subscriptions and starred aliases; everything else is
         // one row away in the searchable picker.
         let starred_routes: Vec<Route> = self
@@ -1155,50 +1367,38 @@ impl Host {
             .collect();
         let host = cx.weak_entity();
         let directory = project.clone();
-        let route = button(
-            p,
-            "billing-route",
-            format!("{current}  ▾"),
-            false,
-            true,
-            |_, _, _| {},
-        )
-        .ghost()
-        .border_0()
-        .justify_start()
-        .h(px(26.))
-        .w_full()
-        .dropdown_menu(move |mut menu, _, _| {
-            let subscriptions = ox_desk_core::runtime::Runtime::routes(&[]);
-            for route in subscriptions.chain(starred_routes.iter().cloned()) {
+        let route = picker_row(p, "billing-route", "AGENT", current.clone())
+            .tooltip(format!("Agent and billing · {current}"))
+            .dropdown_menu(move |mut menu, _, _| {
+                let subscriptions = ox_desk_core::runtime::Runtime::routes(&[]);
+                for route in subscriptions.chain(starred_routes.iter().cloned()) {
+                    let host = host.clone();
+                    let directory = directory.clone();
+                    let starred = matches!(&route.billing, Billing::Api(_));
+                    let label = route.label();
+                    menu = menu.item(
+                        PopupMenuItem::element(move |_, _| {
+                            crate::kit::row()
+                                .w_full()
+                                .gap_1()
+                                .child(crate::kit::star_column(p, starred))
+                                .child(label.clone())
+                        })
+                        .checked(route == saved_route)
+                        .on_click(move |_, window, cx| {
+                            let _ = host.update(cx, |s, cx| {
+                                s.open(directory.clone(), route.clone(), window, cx)
+                            });
+                        }),
+                    );
+                }
                 let host = host.clone();
-                let directory = directory.clone();
-                let starred = matches!(&route.billing, Billing::Api(_));
-                let label = route.label();
-                menu = menu.item(
-                    PopupMenuItem::element(move |_, _| {
-                        crate::kit::row()
-                            .w_full()
-                            .gap_1()
-                            .child(crate::kit::star_column(p, starred))
-                            .child(label.clone())
-                    })
-                    .checked(route == saved_route)
-                    .on_click(move |_, window, cx| {
-                        let _ = host.update(cx, |s, cx| {
-                            s.open(directory.clone(), route.clone(), window, cx)
-                        });
-                    }),
-                );
-            }
-            let host = host.clone();
-            menu.item(PopupMenuItem::separator())
-                .item(
+                menu.item(PopupMenuItem::separator()).item(
                     PopupMenuItem::new("All models…").on_click(move |_, window, cx| {
                         let _ = host.update(cx, |s, cx| s.open_all_models(window, cx));
                     }),
                 )
-        });
+            });
         let label = project
             .file_name()
             .unwrap_or_default()
@@ -1231,62 +1431,51 @@ impl Host {
             })
             .map(|r| (r.project.clone(), self.recent.route(&r.project)))
             .collect();
-        let picker = button(
-            p,
-            "project-picker",
-            format!("▱  {label}  ▾"),
-            false,
-            true,
-            |_, _, _| {},
-        )
-        .ghost()
-        .border_0()
-        .justify_start()
-        .h(px(26.))
-        .w_full()
-        .dropdown_menu(move |mut menu, _, _| {
-            for (index, path, route, asks) in &projects {
-                let index = *index;
+        let picker = picker_row(p, "project-picker", "PROJECT", label.clone())
+            .tooltip(project.display().to_string())
+            .dropdown_menu(move |mut menu, _, _| {
+                for (index, path, route, asks) in &projects {
+                    let index = *index;
+                    let host = host.clone();
+                    let label = if *asks > 0 {
+                        format!("{path} · {route} · {asks} waiting")
+                    } else {
+                        format!("{path} · {route}")
+                    };
+                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        let _ = host.update(cx, |s, cx| s.switch(index, window, cx));
+                    }));
+                }
+                for (directory, route) in &recent {
+                    let host = host.clone();
+                    let directory = directory.clone();
+                    let route = route.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(directory.display().to_string()).on_click(
+                            move |_, window, cx| {
+                                let _ = host.update(cx, |s, cx| {
+                                    let route = route.clone();
+                                    s.with_project_dir(
+                                        directory.clone(),
+                                        true,
+                                        window,
+                                        cx,
+                                        move |s, project, window, cx| {
+                                            s.open(project, route, window, cx)
+                                        },
+                                    );
+                                });
+                            },
+                        ),
+                    );
+                }
                 let host = host.clone();
-                let label = if *asks > 0 {
-                    format!("{path} · {route} · {asks} waiting")
-                } else {
-                    format!("{path} · {route}")
-                };
-                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                    let _ = host.update(cx, |s, cx| s.switch(index, window, cx));
-                }));
-            }
-            for (directory, route) in &recent {
-                let host = host.clone();
-                let directory = directory.clone();
-                let route = route.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(directory.display().to_string()).on_click(
-                        move |_, window, cx| {
-                            let _ = host.update(cx, |s, cx| {
-                                let route = route.clone();
-                                s.with_project_dir(
-                                    directory.clone(),
-                                    true,
-                                    window,
-                                    cx,
-                                    move |s, project, window, cx| {
-                                        s.open(project, route, window, cx)
-                                    },
-                                );
-                            });
-                        },
-                    ),
-                );
-            }
-            let host = host.clone();
-            menu.item(
-                PopupMenuItem::new("Open project…").on_click(move |_, window, cx| {
-                    let _ = host.update(cx, |s, cx| s.pick_project(window, cx));
-                }),
-            )
-        });
+                menu.item(
+                    PopupMenuItem::new("Open project…").on_click(move |_, window, cx| {
+                        let _ = host.update(cx, |s, cx| s.pick_project(window, cx));
+                    }),
+                )
+            });
         let mut background = Vec::new();
         let mut background_waiting = 0;
         for (index, other) in self
@@ -1299,21 +1488,25 @@ impl Host {
             let waiting = other.store.as_ref().map_or(0, |s| s.asks().len());
             if waiting > 0 {
                 background_waiting += waiting;
-                background.push(button(
-                    p,
-                    ("waiting", index),
-                    format!(
-                        "{waiting} waiting · {}",
-                        other
-                            .project
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                    ),
-                    false,
-                    true,
-                    cx.listener(move |s, _, window, cx| s.switch(index, window, cx)),
-                ));
+                background.push(
+                    crate::kit::toolbar_button(
+                        p,
+                        ("waiting", index),
+                        format!(
+                            "{waiting} waiting · {}",
+                            other
+                                .project
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                        ),
+                        true,
+                        cx.listener(move |s, _, window, cx| s.switch(index, window, cx)),
+                    )
+                    .w_full()
+                    .justify_start()
+                    .text_color(rgb(p.warning)),
+                );
             }
         }
         let threads_label = if background_waiting > 0 {
@@ -1323,50 +1516,50 @@ impl Host {
         };
         let sidebar_width =
             px(self.sidebar_width as f32).min(window.viewport_size().width - px(36.));
+        let gutter = px(crate::kit::GUTTER);
+        let new_session_key = if cfg!(target_os = "macos") {
+            "⌘N"
+        } else {
+            "Ctrl N"
+        };
         let sidebar = col()
             .w(sidebar_width)
             .flex_shrink_0()
             .h_full()
             .bg(rgb(p.nav))
-            .gap_2()
+            // Signature header: the sky runs edge to edge, the OX mark and the borderless
+            // command button sit on the keyline.
             .child(
                 row()
                     .relative()
                     .overflow_hidden()
-                    .h(px(62.))
+                    .h(px(56.))
                     .flex_shrink_0()
-                    .p_3()
-                    .gap_2()
+                    .px(gutter)
+                    .gap(px(SPACE_S))
                     .justify_between()
                     .child(activity::horizon(p, &crate::sky::now(cx)))
-                    .child(row().gap_2().child(activity::marquee(p, hot, false)))
-                    .child(self.palette_button(cx))
-                    .when(compact, |bar| {
-                        bar.child(crate::kit::icon_button(
-                            p,
-                            "close-threads",
-                            "×",
-                            "Close threads",
-                            cx.listener(|s, _, w, cx| s.close_drawer(w, cx)),
-                        ))
-                    }),
+                    .child(activity::marquee(p, hot, false))
+                    .child(row().gap(px(SPACE_XS)).child(self.palette_button(cx)).when(
+                        compact,
+                        |bar| {
+                            bar.child(crate::kit::icon_button(
+                                p,
+                                "close-threads",
+                                "×",
+                                "Close threads",
+                                cx.listener(|s, _, w, cx| s.close_drawer(w, cx)),
+                            ))
+                        },
+                    )),
             )
+            .child(col().pt(px(SPACE_M)).px(gutter).child(picker).child(route))
             .child(
-                col()
-                    .mx_2()
-                    .px_1()
-                    .border_l_2()
-                    .border_color(rgb(p.line))
-                    .child(picker)
-                    .child(route),
-            )
-            .child(
-                div().px_2().child(
-                    button(
-                        p,
+                div().pt(px(SPACE_M)).px(gutter).child(
+                    crate::kit::nav_row(
                         "new-session",
-                        "▶   New session",
-                        true,
+                        "New session",
+                        crate::kit::CONTROL_HEIGHT,
                         pane_ready,
                         cx.listener(|s, _, window, cx| {
                             s.close_drawer(window, cx);
@@ -1375,77 +1568,114 @@ impl Host {
                             cx.notify();
                         }),
                     )
-                    .w_full(),
+                    .bg(rgb(p.surface()))
+                    .tooltip(format!("New session · {new_session_key}"))
+                    .child(
+                        row()
+                            .w_full()
+                            .gap(px(SPACE_S))
+                            .child(
+                                gpui_component::Icon::new(gpui_component::IconName::Plus)
+                                    .size(px(14.))
+                                    .text_color(rgb(p.muted)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_size(p.text(Step::Ui))
+                                    .text_color(rgb(p.fg))
+                                    .child("New session"),
+                            )
+                            .child(
+                                div()
+                                    .font_family(crate::appearance::LABEL_FONT)
+                                    .text_size(p.text(Step::Label))
+                                    .text_color(rgb(p.quiet()))
+                                    .child(new_session_key),
+                            ),
+                    ),
                 ),
             )
             .child(
-                div()
-                    .px_2()
-                    .child(gpui_component::input::Input::new(&self.filter)),
+                div().pt(px(SPACE_S)).px(gutter).child(
+                    gpui_component::input::Input::new(&self.filter)
+                        .prefix(
+                            gpui_component::Icon::new(gpui_component::IconName::Search)
+                                .size(px(14.))
+                                .text_color(rgb(p.quiet())),
+                        )
+                        .suffix(self.filter_menu(p, cx)),
+                ),
             )
-            .child(self.filter_chips(p, cx))
             .when_some(self.choose_route.clone(), |sidebar, (project, row)| {
                 let host = cx.weak_entity();
                 let aliases = self.models.clone();
                 sidebar.child(
-                    button(
-                        p,
-                        "select-saved-model",
-                        if row.needs_claude_alias() {
-                            "Choose the billing alias to resume"
-                        } else {
-                            "Start new API session"
-                        },
-                        true,
-                        true,
-                        |_, _, _| {},
-                    )
-                    .dropdown_menu(move |mut menu, _, _| {
-                        for alias in &aliases {
-                            let project = project.clone();
-                            let resume = row.needs_claude_alias();
-                            let route = if resume {
-                                ox_desk_core::runtime::Runtime::Claude.route(Some(alias.clone()))
+                    div().pt(px(SPACE_S)).px(gutter).child(
+                        button(
+                            p,
+                            "select-saved-model",
+                            if row.needs_claude_alias() {
+                                "Choose the billing alias to resume"
                             } else {
-                                Route::codex_api(alias.clone())
-                            };
-                            let row = row.clone();
-                            let host = host.clone();
-                            let label = if resume {
-                                format!("Resume using {alias}")
-                            } else {
-                                format!("New session · {alias}")
-                            };
-                            menu = menu.item(PopupMenuItem::new(label).on_click(
-                                move |_, window, cx| {
-                                    let _ = host.update(cx, |s, cx| {
-                                        let project = project.clone();
-                                        if resume {
+                                "Start new API session"
+                            },
+                            true,
+                            true,
+                            |_, _, _| {},
+                        )
+                        .w_full()
+                        .dropdown_menu(move |mut menu, _, _| {
+                            for alias in &aliases {
+                                let project = project.clone();
+                                let resume = row.needs_claude_alias();
+                                let route = if resume {
+                                    ox_desk_core::runtime::Runtime::Claude
+                                        .route(Some(alias.clone()))
+                                } else {
+                                    Route::codex_api(alias.clone())
+                                };
+                                let row = row.clone();
+                                let host = host.clone();
+                                let label = if resume {
+                                    format!("Resume using {alias}")
+                                } else {
+                                    format!("New session · {alias}")
+                                };
+                                menu = menu.item(PopupMenuItem::new(label).on_click(
+                                    move |_, window, cx| {
+                                        let _ = host.update(cx, |s, cx| {
+                                            let project = project.clone();
+                                            if resume {
+                                                s.open(project, route.clone(), window, cx);
+                                                s.choose_route = None;
+                                                s.panes[s.active].update(cx, |pane, cx| {
+                                                    pane.select_catalog(row.clone(), true, cx)
+                                                });
+                                                return;
+                                            }
                                             s.open(project, route.clone(), window, cx);
-                                            s.choose_route = None;
                                             s.panes[s.active].update(cx, |pane, cx| {
-                                                pane.select_catalog(row.clone(), true, cx)
+                                                pane.action(cx, DeskAction::NewDraft)
                                             });
-                                            return;
-                                        }
-                                        s.open(project, route.clone(), window, cx);
-                                        s.panes[s.active].update(cx, |pane, cx| {
-                                            pane.action(cx, DeskAction::NewDraft)
                                         });
-                                    });
-                                },
-                            ));
-                        }
-                        menu
-                    }),
+                                    },
+                                ));
+                            }
+                            menu
+                        }),
+                    ),
                 )
             })
-            .children(background)
+            .when(!background.is_empty(), |sidebar| {
+                sidebar.child(div().pt(px(SPACE_S)).px(gutter).children(background))
+            })
             .child(
                 div()
                     .id("thread-navigation")
                     .track_focus(&self.list_focus)
                     .on_key_down(cx.listener(Self::navigate))
+                    .mt(px(SPACE_XS))
                     .flex()
                     .flex_col()
                     .flex_1()
@@ -1465,50 +1695,14 @@ impl Host {
                     ),
             )
             .child(self.running.clone())
-            .child(
-                // Footer: settings on the left, running count and host status on the right.
-                row()
-                    .flex_shrink_0()
-                    .flex_wrap()
-                    .justify_between()
-                    .gap(px(SPACE_S))
-                    .px(px(SPACE_S))
-                    .py(px(SPACE_XS))
-                    .border_t_1()
-                    .border_color(rgb(p.line))
-                    .child(button(
-                        p,
-                        "settings",
-                        if self.preferences.is_some() {
-                            "Back to thread"
-                        } else {
-                            "Settings"
-                        },
-                        false,
-                        true,
-                        cx.listener(|s, _, w, cx| s.show_settings(w, cx)),
-                    ))
-                    .child(
-                        row()
-                            .gap(px(SPACE_S))
-                            .min_w_0()
-                            .child(small(p, running))
-                            .child(
-                                gpui::div()
-                                    .w(px(8.))
-                                    .h(px(8.))
-                                    .flex_shrink_0()
-                                    .bg(rgb(if pane_ready { p.success } else { p.warning })),
-                            ),
-                    ),
-            )
+            .child(self.sidebar_footer(p, running_count, running_open, window, cx))
             .when_some(
                 // The pane header already shows its own connection error: say it once.
                 self.message.clone().filter(|m| {
                     self.panes[self.active].read(cx).visible_error() != Some(m.as_str())
                 }),
                 |d, m| {
-                    d.child(crate::kit::banner(
+                    d.child(div().px(gutter).pb(px(SPACE_S)).child(crate::kit::banner(
                         p,
                         "host-error",
                         "host-error-dismiss",
@@ -1517,7 +1711,7 @@ impl Host {
                             s.message = None;
                             cx.notify();
                         }),
-                    ))
+                    )))
                 },
             );
         let (side, drawer) = if inline {
@@ -1592,11 +1786,10 @@ impl Host {
                                 .bg(rgb(p.nav))
                                 .child(activity::horizon(p, &crate::sky::now(cx)))
                                 .child(activity::marquee(p, hot, true))
-                                .child(button(
+                                .child(crate::kit::toolbar_button(
                                     p,
                                     "show-threads",
                                     threads_label,
-                                    false,
                                     true,
                                     cx.listener(|s, _, w, cx| s.toggle_sidebar(w, cx)),
                                 ))
@@ -1633,40 +1826,68 @@ mod responsive_tests {
     }
 }
 
-/// Turns one `is:` status token on or off. Only one status filter applies at a time.
-fn toggle_status_filter(value: &str, token: &str) -> String {
-    let words: Vec<&str> = value.split_whitespace().collect();
-    if words.contains(&token) {
-        return words
-            .into_iter()
-            .filter(|word| *word != token)
-            .collect::<Vec<_>>()
-            .join(" ");
-    }
-    let mut next: Vec<&str> = words
-        .into_iter()
+/// A sidebar picker on the keyline: a quiet micro label, the value and a caret.
+fn picker_row(
+    p: Palette,
+    id: &'static str,
+    label: &'static str,
+    value: String,
+) -> gpui_component::button::Button {
+    crate::kit::nav_row(
+        id,
+        format!("{} {value}", label.to_lowercase()),
+        crate::kit::ICON_SIZE,
+        true,
+        |_, _, _| {},
+    )
+    .child(
+        row()
+            .w_full()
+            .min_w_0()
+            .gap(px(SPACE_S))
+            .child(crate::kit::micro_label(p, label).w(px(56.)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(p.text(Step::Ui))
+                    .text_color(rgb(p.fg))
+                    .child(value),
+            )
+            .child(crate::kit::caret(p)),
+    )
+}
+
+/// Sets the one `is:` status filter to `token`, keeping the search text. An empty token
+/// clears the status filter ("All").
+fn select_status_filter(value: &str, token: &str) -> String {
+    let mut next: Vec<&str> = value
+        .split_whitespace()
         .filter(|word| !word.starts_with("is:"))
         .collect();
-    next.push(token);
+    if !token.is_empty() {
+        next.push(token);
+    }
     next.join(" ")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::toggle_status_filter;
+    use super::select_status_filter;
 
     #[test]
-    fn status_chips_toggle_one_filter_and_keep_text() {
-        assert_eq!(toggle_status_filter("", "is:running"), "is:running");
+    fn status_filter_menu_sets_one_filter_and_keeps_text() {
+        assert_eq!(select_status_filter("", "is:running"), "is:running");
         assert_eq!(
-            toggle_status_filter("fix bug", "is:waiting"),
+            select_status_filter("fix bug", "is:waiting"),
             "fix bug is:waiting"
         );
         assert_eq!(
-            toggle_status_filter("is:running fix", "is:waiting"),
+            select_status_filter("is:running fix", "is:waiting"),
             "fix is:waiting"
         );
-        assert_eq!(toggle_status_filter("is:running fix", "is:running"), "fix");
+        assert_eq!(select_status_filter("is:running fix", ""), "fix");
     }
 }
 

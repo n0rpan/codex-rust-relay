@@ -30,6 +30,9 @@ pub fn ids_in_processes() -> HashSet<String> {
     ids
 }
 
+/// The entrypoint a headless OX-style client writes into every journal row.
+pub const HEADLESS_ENTRYPOINT: &str = "sdk-cli";
+
 /// The session ids in one NUL-separated argv, when it is a `claude` invocation.
 pub fn cmdline_ids(raw: &[u8]) -> Vec<String> {
     let args: Vec<&str> = raw
@@ -44,7 +47,8 @@ pub fn cmdline_ids(raw: &[u8]) -> Vec<String> {
             .and_then(|n| n.to_str())
             .is_some_and(|n| n == "claude" || n == "claude.exe")
     });
-    if !is_claude {
+    // OX drives Claude headlessly; a terminal session never has stream-json on its argv.
+    if !is_claude || args.contains(&"stream-json") {
         return Vec::new();
     }
     args.iter()
@@ -74,6 +78,17 @@ mod tests {
         );
         assert!(cmdline_ids(&argv(&["vim", ID])).is_empty());
         assert!(cmdline_ids(&argv(&["claude", "--continue"])).is_empty());
+        // A process OX launched is not a foreign client.
+        assert!(
+            cmdline_ids(&argv(&[
+                "claude",
+                "--resume",
+                ID,
+                "--input-format",
+                "stream-json"
+            ]))
+            .is_empty()
+        );
     }
 
     #[test]

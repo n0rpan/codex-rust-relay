@@ -33,6 +33,9 @@ pub struct Remote {
     /// The request that opens the session this client is waiting for. Only its
     /// own `Opened` selects, and only its own `Error` stops the wait.
     pub(super) await_new: Option<String>,
+    /// Rows the catalog held before a fresh snapshot replaced it, and the
+    /// loaded length at the last page request made to get back to them.
+    pub(super) restore: Option<(usize, Option<usize>)>,
 }
 impl Remote {
     pub(super) fn can(&self, id: &str, cap: &str) -> bool {
@@ -75,6 +78,7 @@ impl Store {
             draft_access: None,
             options: HashMap::new(),
             await_new: None,
+            restore: None,
             pending: HashMap::new(),
             origins: HashMap::new(),
             marks: HashMap::new(),
@@ -104,7 +108,7 @@ impl Store {
             None
         }
     }
-    fn remote_mut(&mut self) -> &mut Remote {
+    pub(super) fn remote_mut(&mut self) -> &mut Remote {
         match &mut self.link {
             Link::Host(r) => r,
             _ => unreachable!("remote state requires a host subscription"),
@@ -395,11 +399,13 @@ impl Store {
                 for scope in scopes {
                     self.apply_scope(scope)?;
                 }
+                self.continue_restore();
             }
             Server::Delta { changes, .. } => {
                 for change in changes {
                     self.apply_change(change)?;
                 }
+                self.continue_restore();
             }
             Server::Ack { id } => {
                 if let Some(thread) = self.remote_mut().unconfirmed_options.remove(&id) {
@@ -434,7 +440,31 @@ impl Store {
         }
         Ok(())
     }
+    /// A fresh snapshot carries only the host's own loaded catalog. When that is
+    /// shorter than what this client had paged in (the host evicted a slow
+    /// client past its replay window, or restarted), page back up to the old
+    /// length instead of making the user scroll through every page again.
+    fn continue_restore(&mut self) {
+        let loaded = self.threads().len();
+        let more = self.cursor.is_some();
+        let Some((target, asked)) = self.remote().and_then(|r| r.restore) else {
+            return;
+        };
+        if loaded >= target || !more {
+            self.remote_mut().restore = None;
+            return;
+        }
+        // One request per loaded length: a page in flight is not asked for twice.
+        if asked == Some(loaded) {
+            return;
+        }
+        self.remote_mut().restore = Some((target, Some(loaded)));
+        if self.forward(Action::MoreThreads).is_err() {
+            self.remote_mut().restore = None;
+        }
+    }
     fn apply_scope(&mut self, s: ScopeState) -> io::Result<()> {
+        let before = self.threads().len();
         self.transcripts.clear();
         self.apply_change(Change::State {
             connection: s.connection,
@@ -444,6 +474,10 @@ impl Store {
         self.apply_change(Change::Sessions {
             sessions: s.sessions,
         })?;
+        if before > self.threads().len() && self.cursor.is_some() {
+            let kept = self.remote().and_then(|r| r.restore).map_or(0, |(t, _)| t);
+            self.remote_mut().restore = Some((before.max(kept), None));
+        }
         self.apply_change(Change::Asks { asks: s.asks })?;
         for (thread, timeline) in s.transcripts {
             self.apply_change(Change::Transcript { thread, timeline })?;
@@ -886,5 +920,117 @@ mod local_command_tests {
             })
             .unwrap();
         assert!(!store.opening_thread(), "its own error stops the wait");
+    }
+
+    fn page(from: usize, to: usize) -> Vec<SessionView> {
+        (from..to)
+            .map(|n| SessionView {
+                id: format!("t{n:05}"),
+                title: format!("T{n}"),
+                parent: None,
+                updated_at: 0,
+                status: "idle".into(),
+                capabilities: vec![],
+                detail: serde_json::json!({
+                    "row": {"id": format!("t{n:05}"), "cwd": "/p", "modelProvider": "openai",
+                        "model": null, "name": null, "preview": format!("T{n}"),
+                        "updatedAt": 0, "status": null, "parentThreadId": null,
+                        "agentNickname": null},
+                    "order": (100_000 - n).to_string(),
+                }),
+            })
+            .collect()
+    }
+    fn scope_state(sessions: Vec<SessionView>) -> ScopeState {
+        let route = Route::CODEX_SUBSCRIPTION;
+        ScopeState {
+            scope: crate::host_protocol::Scope {
+                project: "/p".into(),
+                route,
+            },
+            connection: "ready".into(),
+            capabilities: vec![],
+            sessions,
+            asks: vec![],
+            transcripts: Default::default(),
+            detail: serde_json::json!({"more": true}),
+        }
+    }
+    #[test]
+    fn a_fresh_snapshot_keeps_the_paged_in_catalog_length() {
+        use std::sync::{Arc, Mutex};
+        let asked = Arc::new(Mutex::new(0usize));
+        let counter = asked.clone();
+        let mut store = Store::remote_client(
+            Profile {
+                project: "/p".into(),
+                route: Route::CODEX_SUBSCRIPTION,
+                provider: "openai".into(),
+            },
+            move |action, _| {
+                if matches!(action, Action::MoreThreads) {
+                    *counter.lock().unwrap() += 1;
+                }
+                Ok("sent".into())
+            },
+        );
+        let snapshot = |sessions| Server::Snapshot {
+            cursor: crate::host_protocol::Cursor {
+                epoch: "e".into(),
+                seq: 1,
+            },
+            scopes: vec![scope_state(sessions)],
+        };
+        let delta = |changes| Server::Delta {
+            cursor: crate::host_protocol::Cursor {
+                epoch: "e".into(),
+                seq: 2,
+            },
+            scope: crate::host_protocol::Scope {
+                project: "/p".into(),
+                route: Route::CODEX_SUBSCRIPTION,
+            },
+            changes,
+        };
+        store.apply_host(snapshot(page(0, 50))).unwrap();
+        for n in 1..5 {
+            let rows = page(n * 50, n * 50 + 50);
+            store
+                .apply_host(delta(
+                    rows.into_iter()
+                        .map(|session| Change::Session { session })
+                        .collect(),
+                ))
+                .unwrap();
+        }
+        assert_eq!(store.threads().len(), 250);
+        assert_eq!(*asked.lock().unwrap(), 0);
+        // The client fell behind the replay window: the host sends a fresh snapshot.
+        store.apply_host(snapshot(page(0, 50))).unwrap();
+        assert_eq!(store.threads().len(), 50, "the snapshot itself is short");
+        assert_eq!(*asked.lock().unwrap(), 1, "asks for the next page at once");
+        // A delta that is not a page does not ask again while the page is in flight.
+        store.apply_host(delta(vec![])).unwrap();
+        assert_eq!(*asked.lock().unwrap(), 1);
+        for n in 1..5 {
+            let rows = page(n * 50, n * 50 + 50);
+            store
+                .apply_host(delta(
+                    rows.into_iter()
+                        .map(|session| Change::Session { session })
+                        .collect(),
+                ))
+                .unwrap();
+        }
+        let ids: Vec<_> = store.threads().iter().map(|r| r.id.clone()).collect();
+        assert_eq!(ids.len(), 250, "no row lost or duplicated");
+        assert_eq!(ids[249], "t00249");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            4,
+            "one request per missing page, then stop"
+        );
+        store.apply_host(delta(vec![])).unwrap();
+        assert_eq!(*asked.lock().unwrap(), 4);
     }
 }

@@ -111,14 +111,14 @@ impl Workbench {
         let edit_metadata = manage && store.can_edit_thread_metadata();
         let can_generate = manage && store.can_generate_title(&id);
         Some(
-            crate::kit::toolbar_button(
+            crate::kit::icon(
                 p,
                 "thread-menu",
+                gpui_component::IconName::Ellipsis,
                 "Thread actions",
                 true,
                 |_, _, _| {},
             )
-            .icon(gpui_component::IconName::Ellipsis)
             .dropdown_menu(move |menu, _, _| {
                 let rename = view.clone();
                 let owner = id.clone();

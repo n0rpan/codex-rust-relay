@@ -82,7 +82,7 @@ def run(gui, codex, claude, root, failure_image=None):
                 window.wait(lambda s: s["connected"] and s["selected_thread"] == thread, "imported relay session")
                 window.word("Default", after_x=220, bottom=True)
                 assert len(vendor.requests) == calls_before_refresh, "Refreshing or resuming generated a model request"
-                window.word("actions", click=True, after_x=220)
+                window.press("Thread actions")  # An icon button: no visible word to OCR.
                 window.word("Generate", click=True)
                 window.word("Orchard")
                 assert len(vendor.requests) == calls_before_refresh + 1, "Expected one title request"

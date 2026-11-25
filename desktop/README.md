@@ -13,6 +13,10 @@ Run the launch command from the project you want to open, or pass a directory su
 
 For an update, run the same installer command again. `ox update --dev` updates the standalone CLI. The desktop installer updates the whole package and keeps existing settings and native histories. If the session host is running, the installer restarts it on the new version: running turns finish first (for up to 10 minutes), new turns wait for the new host, and connected desktops and phones reconnect on their own. `ox host restart` does the same by hand. Check installed versions with `ox --version`, `ox-desktop --version` and `ox-host --version`, and the running host with `ox host doctor`.
 
+## First run
+
+On a fresh install, OX Desktop looks for the official `codex` and `claude` CLIs and a local sign-in for each (it only checks that the files exist). It starts on the route that is ready: Claude Code if only Claude is signed in, Codex if only Codex is, your default (Codex) if both are, or the first saved API model if neither is. If something is missing, the card in the middle shows the next step: a Codex, Claude Code or API key switch, then **Install**, **Update** or **Sign in**, plus **Configure an API provider** and, when the other CLI is installed, **Use installed … instead**. OX runs the official CLIs on your computer, also for API models. While you install or sign in, the card checks every couple of seconds and opens the workspace by itself. **Check connection** is the fallback. Saving a provider switches the window to its first new model. When the project is your home directory, **Choose project folder…** opens the folder picker.
+
 ## Open your first session
 
 Install the stock CLI for the routes you want to use. The supported floors are Codex 0.171.0 and Claude Code 2.1.331. Open an existing thread from the sidebar, or choose **New session** and send a prompt with Enter.

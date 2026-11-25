@@ -154,20 +154,16 @@ impl Host {
         } else {
             "Ctrl K"
         };
-        button(
-            Palette::get(cx),
+        let p = Palette::get(cx);
+        crate::kit::icon_button(
+            p,
             "command-palette",
             ">_",
-            false,
-            true,
+            format!("Commands · {shortcut}"),
             cx.listener(|s, _, window, cx| s.show_palette(window, cx)),
         )
-        .ghost()
-        .border_0()
-        .p_0()
-        .bg(rgb(Palette::get(cx).nav))
-        .w(px(30.))
-        .tooltip(format!("Commands · {shortcut}"))
+        .text_color(rgb(p.fg))
+        .font_family(crate::appearance::LABEL_FONT)
     }
     fn show_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_drawer(window, cx);

@@ -331,7 +331,9 @@ pub fn marquee(p: Palette, hot: bool, compact: bool) -> impl IntoElement {
 
 pub use ox_desk_core::cartridge::Cartridge;
 
-pub fn cartridge(p: Palette, kind: Cartridge, selected: bool) -> impl IntoElement {
+/// A provider glyph: full colour while `vivid` (the active or streaming thread), otherwise
+/// a quiet monochrome tint so the list reads calm.
+pub fn cartridge(p: Palette, kind: Cartridge, vivid: bool) -> impl IntoElement {
     let pattern = kind.pixels();
     let color = match kind {
         Cartridge::Codex => p.accent,
@@ -339,10 +341,10 @@ pub fn cartridge(p: Palette, kind: Cartridge, selected: bool) -> impl IntoElemen
         Cartridge::Api => crate::appearance::mix(p.fg, p.accent, 48),
         Cartridge::Worker => p.muted,
     };
-    let ink = if selected {
+    let ink = if vivid {
         color
     } else {
-        crate::appearance::mix(color, p.muted, 32)
+        crate::appearance::mix(crate::appearance::mix(color, p.muted, 60), p.nav, 35)
     };
     canvas(
         |_, _, _| (),

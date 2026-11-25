@@ -852,7 +852,7 @@ impl Engine {
             && let Some(cursor) = after
             && let Some(mut frames) = self.replay.after(scope.as_ref(), &cursor)
         {
-            replayed = Some(frames.all(|p| client.peer.send(p)));
+            replayed = Some(frames.all(|p| client.peer.send_for(p, "replay")));
         }
         match replayed {
             Some(true) => return self.deliver_held_handoff(id, scope.as_ref()),
@@ -2155,6 +2155,7 @@ impl Engine {
     /// Ending a parent ends its host-owned workers: launches still opening are
     /// aborted and running ones are cancelled and ended.
     fn end_children(&mut self, scope: &Scope, thread: &str) -> io::Result<()> {
+        self.withdraw_asks_under(scope, thread)?;
         let launches: Vec<u64> = self
             .running
             .values()
@@ -2321,8 +2322,9 @@ impl Engine {
                     scope: scope.clone(),
                     changes: catalog,
                 })?;
-                self.clients
-                    .retain(|_, c| !catalog_only(c) || c.peer.send(packet.clone()));
+                self.clients.retain(|_, c| {
+                    !catalog_only(c) || c.peer.send_for(packet.clone(), "catalog watch")
+                });
             }
         }
         let packet = encode(&Server::Delta {
@@ -2331,9 +2333,10 @@ impl Engine {
             changes,
         })?;
         self.replay.append(scope.clone(), packet.clone());
+        let what = format!("{} {}", scope.project.display(), scope.route.label());
         self.clients.retain(|_, c| match c.subscription.as_ref() {
-            Some(Some(s)) if s == scope => c.peer.send(packet.clone()),
-            Some(None) if !c.catalog => c.peer.send(packet.clone()),
+            Some(Some(s)) if s == scope => c.peer.send_for(packet.clone(), &what),
+            Some(None) if !c.catalog => c.peer.send_for(packet.clone(), &what),
             _ => true,
         });
         Ok(())
@@ -2559,6 +2562,7 @@ fn restore(rows: &mut Vec<wire::SessionView>, recovered: &[wire::SessionView]) {
 
 #[cfg(test)]
 mod tests {
+    use super::flows::ENDED_PARENT;
     use super::*;
     use ox_desk_core::{codex::frame::Frame, links::codex, runtime::Route, store::Profile};
 
@@ -4240,6 +4244,74 @@ mod tests {
             assert!(
                 !engine.running.contains_key(&worker),
                 "nothing is relaunched"
+            );
+        }
+
+        /// A live parent asks for a YOLO worker; the operator has not answered yet.
+        fn waiting_yolo_request(engine: &mut Engine, parent: &Scope, worker: &Scope) -> u64 {
+            with_parent(engine, parent, "yolo");
+            engine
+                .running
+                .insert(worker.clone(), live(worker, vec![], &[], vec![]).0);
+            let (done, result) = std::sync::mpsc::sync_channel(1);
+            let mut s = inherit(Runtime::Codex);
+            s.yolo_confirmed = true;
+            engine
+                .launch(thread(parent, "a"), s, Replier::Channel(done))
+                .unwrap();
+            let waiting = result.try_recv().unwrap().unwrap();
+            assert_eq!(waiting["status"], "waiting_for_operator");
+            let job = waiting["job_id"].as_u64().unwrap();
+            assert!(engine.asking.contains_key(&job));
+            job
+        }
+
+        #[test]
+        fn ending_the_parent_withdraws_its_worker_yolo_request_and_a_late_answer_is_refused() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker, _) = routes(root.path());
+            let job = waiting_yolo_request(&mut engine, &parent, &worker);
+            // The fixture store has no live process to end, so run the step that follows the end.
+            engine.end_children(&parent, "a").unwrap();
+            assert!(!engine.asking.contains_key(&job), "ask withdrawn");
+            assert!(engine.ledger.data.asking.is_empty(), "ledger cleared");
+            let outcome = engine
+                .ledger
+                .data
+                .outcomes
+                .iter()
+                .find(|o| o.origin.job_id == job)
+                .expect("a cancelled outcome");
+            assert_eq!(outcome.status, "cancelled");
+            assert_eq!(outcome.message, ENDED_PARENT);
+            // A late answer cannot start the worker.
+            assert!(engine.answer_yolo(7, &parent, job, 0).is_err());
+            assert!(
+                engine.running[&worker].launching.is_none(),
+                "nothing started"
+            );
+        }
+
+        #[test]
+        fn a_yolo_answer_is_refused_once_its_parent_session_is_no_longer_live() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker, _) = routes(root.path());
+            let job = waiting_yolo_request(&mut engine, &parent, &worker);
+            // The parent's route goes away without the end path running.
+            engine.running.remove(&parent);
+            let refused = engine.answer_yolo(7, &parent, job, 0).unwrap_err();
+            assert_eq!(refused.to_string(), ENDED_PARENT);
+            assert!(
+                !engine.asking.contains_key(&job),
+                "the stale ask is withdrawn"
+            );
+            assert!(
+                engine.running[&worker].launching.is_none(),
+                "nothing started"
             );
         }
 

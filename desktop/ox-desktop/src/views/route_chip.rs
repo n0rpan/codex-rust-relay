@@ -247,21 +247,19 @@ impl Workbench {
         let p = Palette::get(cx);
         let settings = store.options(owner);
         let enabled = store.can_send(owner);
+        // Value only: the runtime name is in the AGENT picker and the tooltip.
+        let runtime = store.profile().route.runtime.name();
         let route = match &store.profile().route.billing {
-            Billing::Subscription if settings.model.is_empty() => format!(
-                "{} · {} plan",
-                store.profile().route.runtime.name(),
-                store.profile().route.runtime.account()
-            ),
+            Billing::Subscription if settings.model.is_empty() => {
+                format!("{} plan", store.profile().route.runtime.account())
+            }
             Billing::Subscription => format!(
-                "{} · {} plan · {}",
-                store.profile().route.runtime.name(),
+                "{} plan · {}",
                 store.profile().route.runtime.account(),
                 settings.model
             ),
             Billing::Api(original) => format!(
-                "{} · API · {}",
-                store.profile().route.runtime.name(),
+                "API · {}",
                 if settings.model.is_empty() {
                     original
                 } else {
@@ -286,10 +284,10 @@ impl Workbench {
         .into_iter()
         .enumerate()
         {
-            let label = if value.is_empty() {
-                name.to_owned()
-            } else {
-                format!("{name} · {value}")
+            let label = match (kind, value.is_empty()) {
+                (Kind::Model, _) => format!("Model · {runtime} · {value}"),
+                (_, true) => name.to_owned(),
+                (_, false) => format!("{name} · {value}"),
             };
             if store.has_command_schema() {
                 let caps = store.command_caps(owner);
@@ -311,7 +309,7 @@ impl Workbench {
                 crate::kit::chip(
                     p,
                     ("model-setting", index),
-                    name,
+                    if kind == Kind::Model { "" } else { name },
                     value,
                     opened.is_some(),
                     enabled,

@@ -228,6 +228,16 @@ impl Engine {
             .filter(|a| a.origin.parent.scope.as_ref() == Some(scope))
             .ok_or_else(|| io::Error::other("This YOLO request was already answered."))?;
         let mut origin = a.origin.clone();
+        // The worker starts only for a parent that is still live.
+        let parent_live = a.origin.parent.session.as_deref().is_some_and(|t| {
+            self.running
+                .get(scope)
+                .is_some_and(|l| l.store.catalog_row(t).is_some() && !l.store.is_ended(t))
+        });
+        if !parent_live {
+            self.withdraw_with(job, ENDED_PARENT)?;
+            return Err(io::Error::other(ENDED_PARENT));
+        }
         match answer {
             crate::yolo::Answer::Decline => {
                 self.asking.remove(&job);
@@ -817,6 +827,13 @@ impl Engine {
     }
     /// A parent may withdraw its own YOLO request before the operator answers.
     pub(super) fn withdraw(&mut self, job_id: u64) -> io::Result<Option<Value>> {
+        self.withdraw_with(
+            job_id,
+            "The parent withdrew the request before the operator answered.",
+        )
+    }
+    /// Withdraw a pending YOLO request, recording `message` as why it was cancelled.
+    fn withdraw_with(&mut self, job_id: u64, message: &str) -> io::Result<Option<Value>> {
         let Some(a) = self.asking.remove(&job_id) else {
             return Ok(None);
         };
@@ -826,7 +843,7 @@ impl Engine {
             d.outcomes.push(Outcome {
                 origin,
                 status: "cancelled".into(),
-                message: "The parent withdrew the request before the operator answered.".into(),
+                message: message.into(),
             });
         })?;
         if let Some(parent) = a
@@ -840,7 +857,65 @@ impl Engine {
         }
         Ok(Some(json!({"job_id": job_id, "status": "cancelled"})))
     }
+    /// Withdraw every pending YOLO request whose parent is this session or one of its
+    /// workers (at any depth), so an ended session leaves no request to answer.
+    pub(super) fn withdraw_asks_under(&mut self, scope: &Scope, thread: &str) -> io::Result<()> {
+        let mut parents = vec![(scope.clone(), thread.to_owned())];
+        let mut next = 0;
+        while next < parents.len() {
+            let (s, t) = parents[next].clone();
+            let kids: Vec<(Scope, String)> = self
+                .workers
+                .children_of(&s, &t)
+                .map(|(cs, cid)| (cs.clone(), cid.to_owned()))
+                .collect();
+            for kid in kids {
+                if !parents.contains(&kid) {
+                    parents.push(kid);
+                }
+            }
+            next += 1;
+        }
+        let under = |o: &Origin| match (o.parent.scope.as_ref(), o.parent.session.as_deref()) {
+            (Some(s), Some(t)) => parents.iter().any(|(ps, pt)| ps == s && pt == t),
+            _ => false,
+        };
+        let jobs: Vec<u64> = self
+            .asking
+            .iter()
+            .filter(|(_, a)| under(&a.origin))
+            .map(|(job, _)| *job)
+            .collect();
+        for job in jobs {
+            self.withdraw_with(job, ENDED_PARENT)?;
+        }
+        // A request recorded in the ledger but not held in memory is cancelled too.
+        let stale: Vec<Origin> = self
+            .ledger
+            .data
+            .asking
+            .iter()
+            .filter(|o| under(o))
+            .cloned()
+            .collect();
+        if !stale.is_empty() {
+            self.ledger.change(|d| {
+                d.asking.retain(|o| !under(o));
+                for origin in stale {
+                    d.outcomes.push(Outcome {
+                        origin,
+                        status: "cancelled".into(),
+                        message: ENDED_PARENT.into(),
+                    });
+                }
+            })?;
+        }
+        Ok(())
+    }
 }
+
+/// Why a YOLO request is refused or cancelled once the session that asked for it is gone.
+pub(super) const ENDED_PARENT: &str = "The session that asked for this worker has ended.";
 
 enum Step {
     Wait(Reading),

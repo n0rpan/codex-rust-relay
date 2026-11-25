@@ -4,6 +4,40 @@
 
 OX does not replace either client. It starts the official `codex` and `claude` CLIs, points them at the billing route you pick, and keeps their sessions running in a small per-user host so you can close the window, follow a turn from your phone, and pick it up again. Plain `codex` and `claude` keep working exactly as before.
 
+## Install and first run
+
+You need macOS 11 or later, or Linux with glibc 2.39 or later (x86-64 or ARM64). One command on both:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh -s -- --desktop
+cd ~/Work/my-project && ox desktop .
+```
+
+OX Desktop opens on the project folder you pass (launched from the application menu it opens your home directory and offers **Choose project folder…**). On first launch it checks which official CLI is installed and signed in, and starts on that one. OX runs the official `codex` and `claude` CLIs on your computer, also for API models, so install at least one:
+
+| You have | Install the CLI | Then |
+| --- | --- | --- |
+| ChatGPT plan | `npm install -g @openai/codex@latest` (Codex 0.171.0 or later; the same command upgrades it) | `codex login`, or **Sign in** in the app |
+| Claude plan | `curl -fsSL https://claude.ai/install.sh \| bash` (Claude Code 2.1.331 or later; `claude update` upgrades it) | `claude`, then `/login`, or **Sign in** in the app |
+| Any model through an API key | One of the two CLIs above | `ox setup` (Anthropic, OpenAI, OpenRouter or a local server), then pick the model in OX |
+
+The desktop can install or update Codex for you from its first-run card, and links to the Claude Code guide. If a CLI is missing or signed out, the card also lets you switch to the other one or add an API provider. Details: [Codex](https://developers.openai.com/codex/cli/), [Claude Code](https://code.claude.com/docs/en/quickstart).
+
+### macOS notes
+
+The installer verifies the download's SHA-256 checksum, installs `ox`, `ox-desktop` and `ox-host` in `~/.local/bin`, and puts **OX Desktop** in `~/Applications`. If your shell cannot find `ox`, add the line the installer prints to your shell profile. If Gatekeeper asks, allow the app in **System Settings → Privacy & Security**.
+
+### Linux notes
+
+The same installer adds **OX Desktop** to your application launcher. It runs on Wayland or X11 with a Vulkan driver.
+
+### First session
+
+1. **Connect.** The first-run card has a Codex, Claude Code and API key switch. It checks again by itself while you install or sign in. Later, choose the runtime and billing route in the header. To add an API model, open **Settings → Accounts → Configure provider**, or run `ox setup`. A saved provider becomes the active route.
+2. **Send a prompt.** Choose **New session**, type, press Enter. Existing Codex and Claude Code sessions from your terminal appear in the sidebar.
+3. **Keep it running.** Run `ox host install` so the session host starts at login. Close the window during a turn; reopen it and the turn is still there.
+4. **Check the setup.** `ox host doctor` checks the host, Tailscale Serve, paired devices and the stock client versions, and names the fix for anything that blocks.
+
 ## What OX is
 
 - **The relay (`ox`).** One small binary between the stock clients and your model provider. Add a provider key once and both clients get the same models, picker and web search. Any model in either client: a Claude model in Codex, a GPT model in Claude Code, OpenRouter or a self-hosted model in both. [Relay and CLI](docs/relay.md)
@@ -13,35 +47,6 @@ OX does not replace either client. It starts the official `codex` and `claude` C
 - **Workers.** A session can start a background Codex goal, Claude Code workflow or plain session as a separate job, on an API model or a subscription. Workers appear under their parent on both screens. Without the session host, workers start read-only unless the main agent asks for write, and classifier or YOLO workers are refused.
 - **Handoffs.** Continue a conversation in another runtime, billing route or model (`/handoff claude:<alias> …` or **Continue in…**). The new session receives the real recent messages, not a summary, and can read the rest of the source.
 - **One mode model.** Every permission preset maps to one of four levels: read (Codex Read only, Claude Plan), write (Workspace, Accept edits), classifier (Auto-review, Auto) and YOLO (YOLO, bypass permissions). Workers and handoffs start at their source's level or lower. Agents can lower a child's mode but never raise it. A YOLO child waits for you to accept it on a paired device, unless you stored a grant. [Mode model](docs/design/desktop/host-notes.md#permission-modes-for-workers-and-handoffs)
-
-## Install and first run
-
-You need macOS 11 or later, or Linux with glibc 2.39 or later (x86-64 or ARM64), and the stock client you want to use: [Codex](https://developers.openai.com/codex/cli/) 0.171.0 or later and/or [Claude Code](https://code.claude.com/docs/en/quickstart) 2.1.331 or later.
-
-### macOS
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh -s -- --desktop
-cd ~/Work/my-project && ox desktop .
-```
-
-The installer verifies the download's SHA-256 checksum, installs `ox`, `ox-desktop` and `ox-host` in `~/.local/bin`, and puts **OX Desktop** in `~/Applications`. If your shell cannot find `ox`, add the line the installer prints to your shell profile. If Gatekeeper asks, allow the app in **System Settings → Privacy & Security**.
-
-### Linux
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh -s -- --desktop
-cd ~/Work/my-project && ox desktop .
-```
-
-The same installer adds **OX Desktop** to your application launcher. It runs on Wayland or X11 with a Vulkan driver.
-
-### First session
-
-1. **Pick a route.** In the header, choose the runtime (Codex or Claude Code) and billing route. Subscription routes use your existing `codex` or `claude` sign-in. To use an API model, open **Settings → Accounts → Configure provider**, or run `ox setup` in a terminal.
-2. **Send a prompt.** Choose **New session**, type, press Enter. Existing Codex and Claude Code sessions from your terminal appear in the sidebar.
-3. **Keep it running.** Run `ox host install` so the session host starts at login. Close the window during a turn; reopen it and the turn is still there.
-4. **Check the setup.** `ox host doctor` checks the host, Tailscale Serve, paired devices and the stock client versions, and names the fix for anything that blocks.
 
 ### Pair a phone
 

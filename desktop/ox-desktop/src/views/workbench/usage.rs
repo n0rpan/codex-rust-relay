@@ -109,7 +109,12 @@ impl Workbench {
         )
     }
 
-    fn usage_details(&self, p: Palette, window: &Window, view: &WeakEntity<Self>) -> AnyElement {
+    pub(in crate::views) fn usage_details(
+        &self,
+        p: Palette,
+        window: &Window,
+        view: &WeakEntity<Self>,
+    ) -> AnyElement {
         let Some(store) = self.store.as_ref() else {
             return div().into_any_element();
         };

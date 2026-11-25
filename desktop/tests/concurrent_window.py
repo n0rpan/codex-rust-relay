@@ -108,11 +108,26 @@ def run(gui, stock, root):
                 def click(x, y):
                     command("xdotool", "mousemove", "--window", window, str(x), str(y), "click", "1")
 
+                def press(label):
+                    """Click an icon control by its accessible label through the layout probe;
+                    icon buttons carry no visible word for OCR."""
+                    end = time.monotonic() + 12
+                    while time.monotonic() < end:
+                        probe.sendto(b"snapshot", child["OX_DESK_STATS_SOCKET"])
+                        view = json.loads(probe.recv(1 << 20))
+                        for control in view.get("layout", []):
+                            if (control["window"] == "OX Desktop" and label in (control["label"], control["id"])
+                                    and control["enabled"]):
+                                click(control["x"] + control["w"] // 2, control["y"] + control["h"] // 2)
+                                return
+                        time.sleep(.06)
+                    raise AssertionError(f"No enabled {label!r} control in the window")
+
                 def wait_view(predicate):
                     end = time.monotonic() + 12
                     while time.monotonic() < end:
                         probe.sendto(b"snapshot", child["OX_DESK_STATS_SOCKET"])
-                        view = json.loads(probe.recv(16384))
+                        view = json.loads(probe.recv(1 << 20))
                         if predicate(view):
                             return view
                         time.sleep(.06)
@@ -175,7 +190,7 @@ def run(gui, stock, root):
                 enter("Confirm the worker follow-up.")
                 assert http.followup_requested.wait(10), "Stock worker did not receive the follow-up from its composer"
                 wait_view(lambda s: s["selected_thread"] == worker and s["selected_requests"] and s["visible_turn"])
-                click(*word("stop"))
+                press("stop-turn")
                 wait_view(lambda s: s["selected_thread"] == worker and not s["visible_turn"])
                 click(*word("once"))  # Alpha parent's remaining approval
                 click(*word("alpha", sidebar=True))
@@ -204,11 +219,11 @@ def run(gui, stock, root):
                 click(*word("here"))
                 word("complete")
                 original = argv[-1]
-                click(*word("actions"))
+                press("thread-menu")
                 click(*word("fork"))
                 fork = wait_view(lambda s: s["selected_thread"] and s["selected_thread"] != original)["selected_thread"]
                 word("complete")
-                click(*word("actions"))
+                press("thread-menu")
                 click(*word("rename"))
                 word("cancel")
                 command("xdotool", "key", "ctrl+a")
@@ -223,10 +238,10 @@ def run(gui, stock, root):
                         time.sleep(.06)
                     else:
                         raise AssertionError(f"Rename did not reach stock Codex: {result['thread']['name']!r}")
-                click(*word("actions"))
+                press("thread-menu")
                 click(*word("archive"))
                 click(*word("cancel"))
-                click(*word("actions"))
+                press("thread-menu")
                 click(*word("archive"))
                 # The confirmation precedes Cancel in keyboard focus order.
                 x, y = word("cancel")

@@ -484,9 +484,17 @@ def scroll_catalog(f):
     # reloaded the catalog from its first page and paged all 5,000 threads again.
     started = time.monotonic()
     stats = f.stats()
+    trace, traced = [], started
     while stats["furthest_row"] < 5000 and time.monotonic() < started + 150:
         f.x("click", "--repeat", "100", "--delay", "5", "5")
         stats = f.stats()
+        # A catalog_len that falls back (issue 9) is a reset to the first page.
+        if time.monotonic() - traced >= 0.5:
+            traced = time.monotonic()
+            trace.append((round(traced - started, 1), stats["furthest_row"], stats["catalog_len"]))
+    resets = sum(1 for a, b in zip(trace, trace[1:]) if b[2] < a[2])
+    if resets:
+        print(f"G6 trace (s, furthest_row, catalog_len), {resets} reset(s): {trace}", file=sys.stderr)
     seconds = round(time.monotonic() - started, 1)
     # Count only the GPUI visible range and its overscan. Window height gives an
     # independent upper bound since every button alone consumes 32 logical pixels.

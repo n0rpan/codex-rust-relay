@@ -89,11 +89,18 @@ impl Store {
                 continue;
             }
             let Ok(raw) = stock_id(key) else { continue };
+            // A recent write only means "someone else" when OX did not write it: this run's
+            // sessions are known, and an earlier OX host (before an upgrade) left its
+            // headless `sdk-cli` entrypoint on the last row.
+            let profiles = &p.launcher.profiles;
             let fresh = !p.native.ox_seen.contains(key)
-                && p.launcher
-                    .profiles
+                && profiles
                     .modified(&self.profile.project, raw, origin)
-                    .is_ok_and(|m| live::is_fresh(m, now));
+                    .is_ok_and(|m| live::is_fresh(m, now))
+                && profiles
+                    .last_entrypoint(&self.profile.project, raw, origin)
+                    .as_deref()
+                    != Some(live::HEADLESS_ENTRYPOINT);
             if fresh || processes.contains(raw) {
                 found.insert(key.clone());
             }
@@ -288,7 +295,7 @@ mod tests {
         } else {
             json!([{"type":"text","text":text}])
         };
-        json!({"type":kind,"uuid":uuid,"cwd":project,"sessionId":ID,"message":{"role":kind,"id":uuid,"content":content}})
+        json!({"type":kind,"uuid":uuid,"cwd":project,"sessionId":ID,"entrypoint":"cli","message":{"role":kind,"id":uuid,"content":content}})
             .to_string()
             + "\n"
     }
@@ -391,6 +398,24 @@ mod tests {
         store.refresh_native(Instant::now(), true);
         pump(&mut store, &rx);
         assert!(store.transcript(&key).unwrap().len() > before);
+
+        // A journal OX's own headless client wrote last is never a foreign session, however
+        // fresh (an earlier host drove it before an upgrade).
+        let mut row = serde_json::from_str::<Value>(&row_json("user", &project, "ours")).unwrap();
+        row["entrypoint"] = "sdk-cli".into();
+        std::io::Write::write_all(&mut f, format!("{row}\n").as_bytes()).unwrap();
+        f.set_modified(SystemTime::now()).unwrap();
+        store.refresh_native(Instant::now(), true);
+        assert!(!store.is_native_live(&key));
+        pump(&mut store, &rx);
+        let mut row = row;
+        row["entrypoint"] = "cli".into();
+        row["uuid"] = "00000000-0000-4000-8000-000000000999".into();
+        std::io::Write::write_all(&mut f, format!("{row}\n").as_bytes()).unwrap();
+        f.set_modified(SystemTime::now()).unwrap();
+        store.refresh_native(Instant::now(), true);
+        assert!(store.is_native_live(&key));
+        pump(&mut store, &rx);
 
         // It goes quiet and the process is gone: OX owns it again and a send resumes it.
         f.set_modified(SystemTime::now() - Duration::from_secs(600))

@@ -1,6 +1,6 @@
-//! The "RUNNING" section pinned under the sidebar: the live processes the session
-//! host runs, with per-row End and an "End all idle" action. It polls the host while
-//! the sidebar shows it, and again right after every End.
+//! The live sessions the session host runs, behind the sidebar footer's one
+//! "● N running" toggle: per-row End (on hover or focus) and an "End all idle" action.
+//! It polls the host while the sidebar shows it, and again right after every End.
 use crate::appearance::Step;
 use crate::{
     appearance::Palette,
@@ -110,19 +110,15 @@ pub struct Running {
     confirm: Option<Target>,
     /// Set by the sidebar each time it draws. Polling stops while the panel is hidden.
     pub(super) shown: bool,
+    /// The list is expanded above the sidebar footer.
+    pub(super) open: bool,
     _poll: Task<()>,
 }
 
 impl Running {
-    /// The one count for "RUNNING · n": every live host process, busy or idle. The
-    /// panel header and the sidebar footer both read it, so they cannot disagree.
+    /// The one count for the footer's "● n running": every live host process, busy or idle.
     pub fn process_count(&self) -> usize {
         self.processes.len()
-    }
-
-    /// The "RUNNING · n" label shared by the panel header and the sidebar footer.
-    pub fn summary(&self) -> String {
-        format!("RUNNING · {}", self.process_count())
     }
 
     pub fn new(cx: &mut Context<Self>) -> Self {
@@ -156,6 +152,7 @@ impl Running {
             end_error: None,
             confirm: None,
             shown: false,
+            open: false,
             _poll: poll,
         }
     }
@@ -173,6 +170,7 @@ impl Running {
                 s.loading = false;
                 match result {
                     Ok(processes) => {
+                        s.open &= !processes.is_empty();
                         s.processes = processes;
                         s.loaded = true;
                         s.error = None;
@@ -287,14 +285,16 @@ impl Render for Running {
             let confirm_target = target.clone();
             let end_target = target;
             let row_view = view.clone();
+            let group = SharedString::from(format!("running-row-{i}"));
             let line = row()
+                .group(group.clone())
                 .gap_2()
                 .items_start()
                 .min_w_0()
                 .child(
                     div()
-                        .mt(px(5.))
-                        .size(px(7.))
+                        .mt(px(6.))
+                        .size(px(6.))
                         .flex_shrink_0()
                         .rounded_full()
                         .bg(rgb(if process.running {
@@ -355,16 +355,31 @@ impl Render for Running {
                             },
                         )),
                 )
-                .child(toolbar_button(
-                    p,
-                    ElementId::from(format!("running-end-{i}")),
-                    "End",
-                    end_enabled && !confirming,
-                    move |_, _, cx| {
-                        let target = end_target.clone();
-                        let _ = row_view.update(cx, |s, cx| s.end_row(target, busy, cx));
-                    },
-                ));
+                .child(
+                    // End shows on row hover or keyboard focus; it stays a tab stop.
+                    div()
+                        .flex_shrink_0()
+                        .when(!confirming, |d| {
+                            d.opacity(0.)
+                                .group_hover(group.clone(), |s| s.opacity(1.))
+                                .in_focus(|s| s.opacity(1.))
+                        })
+                        .child(
+                            toolbar_button(
+                                p,
+                                ElementId::from(format!("running-end-{i}")),
+                                "End",
+                                end_enabled && !confirming,
+                                move |_, _, cx| {
+                                    let target = end_target.clone();
+                                    let _ =
+                                        row_view.update(cx, |s, cx| s.end_row(target, busy, cx));
+                                },
+                            )
+                            .h(px(24.))
+                            .tooltip("End this session"),
+                        ),
+                );
             let confirm_view = view.clone();
             let keep_view = view.clone();
             col().gap_1().child(line).when(confirming, |c| {
@@ -408,28 +423,34 @@ impl Render for Running {
 
         let header_view = view.clone();
         let dismiss_view = view.clone();
-        col()
+        if !self.open || (count == 0 && self.end_error.is_none()) {
+            return div().id("running-panel");
+        }
+        div()
+            .id("running-panel")
+            .flex()
+            .flex_col()
             .flex_shrink_0()
-            .px_2()
-            .py_2()
+            .px(px(crate::kit::GUTTER))
+            .pt(px(crate::kit::SPACE_S))
             .gap_1()
-            .border_t_1()
-            .border_color(rgb(p.line))
             .child(
                 row()
                     .justify_between()
                     .min_w_0()
-                    .child(small(p, self.summary()))
-                    .child(button(
-                        p,
-                        "running-end-idle",
-                        "End all idle",
-                        false,
-                        idle > 0 && !self.ending,
-                        move |_, _, cx| {
-                            let _ = header_view.update(cx, |s, cx| s.end_all_idle(cx));
-                        },
-                    )),
+                    .child(crate::kit::micro_label(p, "LIVE SESSIONS"))
+                    .child(
+                        toolbar_button(
+                            p,
+                            "running-end-idle",
+                            "End all idle",
+                            idle > 0 && !self.ending,
+                            move |_, _, cx| {
+                                let _ = header_view.update(cx, |s, cx| s.end_all_idle(cx));
+                            },
+                        )
+                        .h(px(24.)),
+                    ),
             )
             // Without a running host (local-only desktop) there is nothing to list:
             // say so quietly instead of repeating a red error every poll.

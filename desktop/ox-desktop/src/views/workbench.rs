@@ -1,5 +1,6 @@
 //! A workbench owns the visible state for one project and billing route.
 use crate::appearance::Step;
+use crate::kit::{SPACE_S, SPACE_XS};
 use crate::platform::open_store;
 use crate::{activity, appearance::Palette, col, platform, row};
 use gpui::{prelude::FluentBuilder, *};
@@ -752,11 +753,7 @@ impl Workbench {
                 .store
                 .as_ref()
                 .is_some_and(|s| s.state() == &Connection::Ready && s.selected().is_none());
-        let transcript = if ready {
-            self.empty_state(p, cx)
-        } else {
-            self.transcript_panel(cx)
-        };
+        let transcript = (!ready).then(|| self.transcript_panel(cx));
         let controls = self.thread_menu(cx);
         let review_toggle = self.review_toggle(cx);
         let inline_request = self.pane_width < px(825.);
@@ -774,6 +771,23 @@ impl Workbench {
             self.pane_width
         };
         let composer = self.composer(detail_width, window, cx);
+        let terminal = (status == "Connected").then(|| {
+            let project = self.project.clone();
+            crate::kit::icon(
+                p,
+                "open-terminal",
+                gpui_component::IconName::SquareTerminal,
+                "Open a terminal in this project",
+                true,
+                cx.listener(move |s, _, _, cx| {
+                    if let Err(error) = crate::terminal::open(project.clone(), None, |_, _| {}, cx)
+                    {
+                        s.launch_error = Some(error);
+                        cx.notify();
+                    }
+                }),
+            )
+        });
         let (inline_sheet, side_sheet) = if inline_request {
             (asks, None)
         } else {
@@ -795,6 +809,11 @@ impl Workbench {
                             row()
                                 .gap_2()
                                 .justify_between()
+                                .items_start()
+                                .flex_shrink_0()
+                                // Text and icons share the transcript's content edges.
+                                .px(px(crate::kit::SPACE_M))
+                                .pb(px(SPACE_S))
                                 .when(detail_width < px(500.), |header| {
                                     header.flex_col().items_start()
                                 })
@@ -803,45 +822,51 @@ impl Workbench {
                                         .min_w_0()
                                         .max_w_full()
                                         .when(detail_width >= px(500.), |col| col.flex_1())
-                                        .when_some(title, |col, title| {
-                                            col.child(
-                                                div()
-                                                    .id("current-thread-title")
-                                                    .text_size(p.text(Step::Title))
-                                                    .truncate()
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .child(title.clone())
-                                                    .tooltip(move |window, cx| {
-                                                        gpui_component::tooltip::Tooltip::new(
-                                                            title.clone(),
-                                                        )
-                                                        .build(window, cx)
-                                                    }),
-                                            )
-                                        })
-                                        .when(status != "Connected", |view| {
-                                            view.child(crate::small(p, status.clone()))
-                                        })
-                                        .when(status == "Connected", |view| {
+                                        .child({
                                             let project = self
                                                 .project
                                                 .file_name()
                                                 .unwrap_or_default()
-                                                .to_string_lossy();
-                                            view.child(
-                                                row()
-                                                    .gap_2()
-                                                    .child(
-                                                        div().w(px(5.)).h(px(5.)).bg(rgb(p.accent)),
-                                                    )
-                                                    .child(crate::small(
-                                                        p,
-                                                        format!(
-                                                            "{project} / {}",
-                                                            self.route.label()
-                                                        ),
-                                                    )),
-                                            )
+                                                .to_string_lossy()
+                                                .into_owned();
+                                            let leaf = title
+                                                .clone()
+                                                .unwrap_or_else(|| "New session".into());
+                                            row()
+                                                .h(px(crate::kit::ICON_SIZE))
+                                                .min_w_0()
+                                                .gap(px(SPACE_S))
+                                                .text_size(p.text(Step::Ui))
+                                                .child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .text_color(rgb(p.muted))
+                                                        .child(project),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .text_color(rgb(p.quiet()))
+                                                        .child("/"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("current-thread-title")
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .text_color(rgb(p.fg))
+                                                        .child(leaf.clone())
+                                                        .tooltip(move |window, cx| {
+                                                            gpui_component::tooltip::Tooltip::new(
+                                                                leaf.clone(),
+                                                            )
+                                                            .build(window, cx)
+                                                        }),
+                                                )
+                                        })
+                                        .when(status != "Connected", |view| {
+                                            view.child(crate::small(p, status.clone()))
                                         })
                                         .when_some(self.worker_crumb(p, cx), |view, crumb| {
                                             view.child(crumb)
@@ -851,8 +876,9 @@ impl Workbench {
                                     row()
                                         .flex_wrap()
                                         .min_w_0()
-                                        .gap_2()
+                                        .gap(px(SPACE_XS))
                                         .children(review_toggle)
+                                        .children(terminal)
                                         .children(controls),
                                 ),
                         )
@@ -925,13 +951,27 @@ impl Workbench {
                                 )
                             },
                         )
-                        .child(transcript)
-                        .children(activity_status)
-                        .children(self.workers_line(p, cx))
-                        .children(launch)
-                        .children(inline_sheet)
-                        .child(composer)
-                        .children(usage),
+                        .children(transcript)
+                        .map(|view| {
+                            // One centred column holds the composer and what belongs to it:
+                            // 680 px under the empty-state greeting, 760 px docked.
+                            let dock = col()
+                                .w_full()
+                                .max_w(px(if ready { 680. } else { 760. }))
+                                .gap(px(SPACE_S))
+                                .children(activity_status)
+                                .children(self.workers_line(p, cx))
+                                .children(launch)
+                                .children(inline_sheet)
+                                .child(composer)
+                                .children(usage);
+                            let dock = row().w_full().justify_center().child(dock);
+                            if ready {
+                                view.child(self.empty_state(p, dock))
+                            } else {
+                                view.child(dock.flex_shrink_0().pt(px(SPACE_S)))
+                            }
+                        }),
                 )
             })
             .on_mouse_move(cx.listener(|s, event: &MouseMoveEvent, window, cx| {

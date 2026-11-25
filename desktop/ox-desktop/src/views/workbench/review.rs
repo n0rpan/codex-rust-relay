@@ -5,7 +5,7 @@ use crate::{
     appearance::Palette,
     kit::{button, col, row, small},
 };
-use gpui::*;
+use gpui::{prelude::FluentBuilder, *};
 use ox_desk_core::actions::Action;
 use std::collections::HashMap;
 mod patch;
@@ -37,17 +37,24 @@ impl Workbench {
         let store = self.store.as_ref()?;
         let owner = store.selected()?;
         store.transcript(owner)?;
+        let p = Palette::get(cx);
+        let open = self.review.open;
         Some(
-            button(
-                Palette::get(cx),
+            crate::kit::icon(
+                p,
                 "toggle-review",
+                if open {
+                    gpui_component::IconName::PanelRightClose
+                } else {
+                    gpui_component::IconName::PanelRightOpen
+                },
                 "Changes & plan",
-                self.review.open,
                 true,
                 cx.listener(|s, _, _, cx| {
                     s.toggle_review(cx);
                 }),
             )
+            .when(open, |b| b.bg(rgb(p.hover)).text_color(rgb(p.fg)))
             .into_any_element(),
         )
     }

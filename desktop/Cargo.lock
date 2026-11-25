@@ -4731,6 +4731,7 @@ dependencies = [
  "futures-lite",
  "getrandom 0.3.4",
  "gpui-component",
+ "gpui-kit-assets",
  "gpui-pre",
  "gpui-pre-platform",
  "libc",

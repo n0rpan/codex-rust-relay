@@ -425,6 +425,42 @@ impl Profiles {
         Err(io::ErrorKind::NotFound.into())
     }
 
+    /// The `entrypoint` the last conversation row was written by: `sdk-cli` for a headless
+    /// stream-json client such as OX, `cli` for a terminal. Read from the journal tail, so
+    /// it survives restarts of whoever drove the session.
+    pub fn last_entrypoint(&self, project: &Path, id: &str, origin: Origin) -> Option<String> {
+        let profile = match origin {
+            Origin::Subscription => &self.subscription,
+            Origin::Api => &self.api,
+            Origin::Ambiguous => return None,
+        };
+        if !valid_session_id(id) {
+            return None;
+        }
+        let dir = candidates(profile, project).ok()?.into_iter().find(|d| {
+            fs::symlink_metadata(d.join(format!("{id}.jsonl"))).is_ok_and(|m| m.is_file())
+        })?;
+        let mut file = open_transcript(&dir.join(format!("{id}.jsonl"))).ok()?;
+        let len = file.metadata().ok()?.len();
+        let start = len.saturating_sub(SAMPLE);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut tail = BufReader::new(file);
+        if start > 0 {
+            tail.skip_until(b'\n').ok()?;
+        }
+        let mut last = None;
+        let _ = records(tail, |row| {
+            if is_message(&row)
+                && row["sessionId"] == id
+                && let Some(entry) = row["entrypoint"].as_str()
+            {
+                last = Some(entry.to_owned());
+            }
+            Ok(())
+        });
+        last
+    }
+
     pub fn session(&self, project: &Path, id: &str, origin: Origin) -> io::Result<Session> {
         if !valid_session_id(id) {
             return Err(io::Error::new(

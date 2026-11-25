@@ -1,29 +1,18 @@
 //! The friendly empty state: what the main area shows before any thread is selected.
+//! Composer first: the ox, the greeting and the project, then the composer itself.
 use super::Workbench;
 use crate::appearance::{Palette, Step};
-use crate::kit::{button, col, row, small};
+use crate::kit::{SPACE_L, col};
 use gpui::{prelude::FluentBuilder, *};
-use ox_desk_core::actions::Action as DeskAction;
 
 /// Ask the host to open its folder picker, so a user with no thread can open a project.
 pub(in crate::views) struct OpenProject;
 impl EventEmitter<OpenProject> for Workbench {}
 
 impl Workbench {
-    /// Put `text` in the new-session composer and focus it.
-    fn prefill_composer(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(editor) = self.editors.get(&None) {
-            editor.update(cx, |e, cx| {
-                if !text.is_empty() {
-                    e.set_value(text, window, cx);
-                }
-                e.focus(window, cx);
-            });
-        }
-    }
-
-    /// The empty main area: the ox and three ways to begin.
-    pub(super) fn empty_state(&mut self, p: Palette, cx: &mut Context<Self>) -> Div {
+    /// The empty main area: the ox above "What shall we work on?", the project name and
+    /// `dock`, the centred composer column. Typing in it starts the new session.
+    pub(super) fn empty_state(&mut self, p: Palette, dock: Div) -> Div {
         let project = self
             .project
             .file_name()
@@ -34,49 +23,25 @@ impl Workbench {
             .min_h_0()
             .items_center()
             .justify_center()
-            .gap_3()
+            .px(px(SPACE_L))
             .child(crate::activity::ox(p, 0, 4.))
             .child(
                 div()
-                    .text_size(p.text(Step::Title))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .mt(px(SPACE_L))
+                    .text_size(p.text(Step::Title) * 1.1)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(p.fg))
                     .child("What shall we work on?"),
             )
             .when_some(project, |view, name| {
-                view.child(small(p, format!("Project: {name}")))
+                view.child(
+                    div()
+                        .mt(px(4.))
+                        .text_size(p.text(Step::Meta))
+                        .text_color(rgb(p.muted))
+                        .child(name),
+                )
             })
-            .child(
-                row()
-                    .flex_wrap()
-                    .justify_center()
-                    .gap_2()
-                    .child(button(
-                        p,
-                        "empty-new-session",
-                        "New session",
-                        true,
-                        true,
-                        cx.listener(|s, _, window, cx| {
-                            s.action(cx, DeskAction::NewDraft);
-                            s.prefill_composer("", window, cx);
-                        }),
-                    ))
-                    .child(button(
-                        p,
-                        "empty-start-worker",
-                        "Start worker",
-                        false,
-                        true,
-                        cx.listener(|s, _, window, cx| s.prefill_composer("/worker ", window, cx)),
-                    ))
-                    .child(button(
-                        p,
-                        "empty-open-project",
-                        "Open project…",
-                        false,
-                        true,
-                        cx.listener(|_, _, _, cx| cx.emit(OpenProject)),
-                    )),
-            )
+            .child(div().mt(px(24.)).w_full().child(dock))
     }
 }

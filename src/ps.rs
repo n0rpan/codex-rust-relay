@@ -137,13 +137,47 @@ pub(crate) fn run_end(args: &[OsString]) -> Result<u8, RelayError> {
         }
     }
     host.subscribe_all()?;
-    for session in &targets {
+    let code = end_each(
+        &targets,
+        width,
+        |session| host.end(&session.scope, &session.thread, session.running),
+        &mut io::stdout(),
+        &mut io::stderr(),
+    )?;
+    Ok(code)
+}
+
+/// Whether a host refusal means the session is already gone. Ending a parent ends its
+/// workers too, so a bulk selection often names a worker the host has just ended.
+fn is_already_ended(message: &str) -> bool {
+    message.contains("no live process") || message.contains("no live session")
+}
+
+/// Ends each selected session in order and returns the exit code: 1 when a session could
+/// not be ended for a real reason. An already-ended session counts as done, and any other
+/// failure is reported for that session while the rest still end.
+fn end_each(
+    targets: &[Session],
+    width: usize,
+    mut end: impl FnMut(&Session) -> Result<(), RelayError>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> io::Result<u8> {
+    let mut failed = false;
+    for session in targets {
         let shown = id_prefix(&session.thread, width);
-        host.end(&session.scope, &session.thread, session.running)
-            .map_err(|e| format!("could not end {shown}: {e}"))?;
-        println!("ended {shown} ({})", session.label);
+        match end(session) {
+            Ok(()) => writeln!(out, "ended {shown} ({})", session.label)?,
+            Err(e) if is_already_ended(&e.to_string()) => {
+                writeln!(out, "already ended {shown} ({})", session.label)?;
+            }
+            Err(e) => {
+                failed = true;
+                writeln!(err, "could not end {shown}: {e}")?;
+            }
+        }
     }
-    Ok(0)
+    Ok(u8::from(failed))
 }
 
 fn parse_end_args(args: &[OsString]) -> Result<EndArgs, RelayError> {
@@ -541,6 +575,69 @@ mod tests {
 
     fn os(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
+    }
+
+    fn session(thread: &str) -> Session {
+        Session {
+            thread: thread.into(),
+            scope: json!({"project": "/home/oscar/Work/ox", "route": {}}),
+            label: "codex".into(),
+            running: true,
+        }
+    }
+
+    #[test]
+    fn a_worker_already_ended_with_its_parent_does_not_abort_the_bulk_end() {
+        let targets = [
+            session("aaaa1111"),
+            session("bbbb2222"),
+            session("cccc3333"),
+            session("dddd4444"),
+        ];
+        // The parent's end also ends worker bbbb; the host then refuses that one.
+        let mut replies: std::collections::VecDeque<Result<(), RelayError>> = [
+            Ok(()),
+            Err("This session has no live process to end.".into()),
+            Err("This session is busy. Confirm ending it, which cancels its running work.".into()),
+            Ok(()),
+        ]
+        .into();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = end_each(
+            &targets,
+            8,
+            |_| replies.pop_front().expect("one reply per target"),
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert!(replies.is_empty(), "every target was tried");
+        assert_eq!(code, 1, "a real error makes the command fail");
+        let out = String::from_utf8(out).unwrap();
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(
+            out,
+            "ended aaaa1111 (codex)\nalready ended bbbb2222 (codex)\nended dddd4444 (codex)\n"
+        );
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(err.starts_with("could not end cccc3333: "), "{err}");
+    }
+
+    #[test]
+    fn ending_only_already_ended_sessions_succeeds() {
+        let targets = [session("aaaa1111"), session("bbbb2222")];
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = end_each(
+            &targets,
+            8,
+            |_| Err("This session has no live process to end.".into()),
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(err.is_empty());
+        assert_eq!(String::from_utf8(out).unwrap().lines().count(), 2);
     }
 
     #[test]

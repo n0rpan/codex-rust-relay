@@ -150,6 +150,13 @@ impl LastWorkspace {
             .and_then(|p| Self::read(&p).ok())
             .unwrap_or_else(Self::previous)
     }
+    /// The route saved for this project, if the user has ever opened it.
+    pub fn saved_route(&self, project: &Path) -> Option<Route> {
+        self.recent
+            .iter()
+            .find(|r| r.project == project)
+            .map(|r| r.runtime.route(r.api_model.clone()))
+    }
     pub fn route(&self, project: &Path) -> Route {
         self.recent
             .iter()
