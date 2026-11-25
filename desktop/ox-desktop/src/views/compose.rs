@@ -270,7 +270,7 @@ impl Workbench {
                 let id = owner.clone();
                 let view = view.clone();
                 menu = menu.item(
-                    PopupMenuItem::new(preset.label())
+                    crate::kit::menu_item(preset.label())
                         .checked(mode == Some(preset))
                         .on_click(move |_, _, cx| {
                             let _ = view.update(cx, |s, cx| {
@@ -298,7 +298,7 @@ impl Workbench {
                             "YOLO is allowed for workers and handoffs started here.",
                         ))
                         .item(
-                            PopupMenuItem::new("Revoke YOLO for workers and handoffs").on_click(
+                            crate::kit::menu_item("Revoke YOLO for workers and handoffs").on_click(
                                 move |_, _, cx| {
                                     let _ = view.update(cx, |s, cx| {
                                         if let Some(id) = &id {
@@ -314,7 +314,7 @@ impl Workbench {
                             "Lets workers and handoffs start in YOLO without asking.",
                         ))
                         .item(
-                            PopupMenuItem::new("Allow YOLO for workers and handoffs").on_click(
+                            crate::kit::menu_item("Allow YOLO for workers and handoffs").on_click(
                                 move |_, _, cx| {
                                     let _ = view.update(cx, |s, cx| {
                                         if let Some(id) = &id {

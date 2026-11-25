@@ -2,7 +2,7 @@ use super::Workbench;
 use crate::views::worker_sheet::LaunchKind;
 use crate::{
     appearance::Palette,
-    kit::{DropdownMenu, PopupMenuItem, button, field},
+    kit::{DropdownMenu, button, field},
     row,
 };
 use gpui::{prelude::FluentBuilder, *};
@@ -136,7 +136,7 @@ impl Workbench {
                 let worker = view.clone();
                 let handoff = view.clone();
                 menu.when(edit_metadata, |menu| menu.item(
-                    PopupMenuItem::new("Rename thread").on_click(move |_, window, cx| {
+                    crate::kit::menu_item("Rename thread").on_click(move |_, window, cx| {
                         let _ = rename.update(cx, |s, cx| {
                             let Some(store) = &s.store else { return };
                             if !store.can_manage_thread(&owner) {
@@ -157,11 +157,11 @@ impl Workbench {
                     }),
                 ))
                 .when(can_generate, |menu| menu.item(
-                    PopupMenuItem::new("Generate title").on_click(move |_, _, cx| {
+                    crate::kit::menu_item("Generate title").on_click(move |_, _, cx| {
                         let _ = naming.update(cx, |s, cx| s.action(cx, Action::GenerateTitle(unnamed.clone())));
                     }),
                 ))
-                .when(manage, |menu| menu.item(PopupMenuItem::new("Find in transcript").on_click(move |_,w,cx| {
+                .when(manage, |menu| menu.item(crate::kit::menu_item("Find in transcript").on_click(move |_,w,cx| {
                     let _ = find.update(cx,|s,cx|s.find_in_transcript(w,cx));
                 })))
                 .map(|mut menu| {
@@ -170,18 +170,18 @@ impl Workbench {
                     }
                     for (title, expand) in [("Expand all details",Some(true)),("Fold all details",Some(false)),("Show / hide thinking",None)] {
                         let view = view.clone();
-                        menu = menu.item(PopupMenuItem::new(title).on_click(move |_,_,cx| {
+                        menu = menu.item(crate::kit::menu_item(title).on_click(move |_,_,cx| {
                             let _ = view.update(cx,|s,cx|s.transcript_folding(expand,cx));
                         }));
                     }
                     menu
                 })
-                .when(manage, |menu| menu.item(PopupMenuItem::new("Fork thread").on_click(move |_, _, cx| {
+                .when(manage, |menu| menu.item(crate::kit::menu_item("Fork thread").on_click(move |_, _, cx| {
                     let _ =
                         fork.update(cx, |s, cx| s.action(cx, Action::ForkThread(target.clone())));
                 })))
                 .when(archivable, |menu|menu.item(
-                    PopupMenuItem::new("Archive thread…").on_click(move |_, _, cx| {
+                    crate::kit::menu_item("Archive thread…").on_click(move |_, _, cx| {
                         let _ = archive.update(cx, |s, cx| {
                             if s.store
                                 .as_ref()
@@ -194,17 +194,17 @@ impl Workbench {
                     }),
                 ))
                 .when(can_launch, |menu| menu.item(
-                    PopupMenuItem::new("Start worker…").on_click(move |_, _, cx| {
+                    crate::kit::menu_item("Start worker…").on_click(move |_, _, cx| {
                         let _ = worker.update(cx, |s, cx| s.request_launch(LaunchKind::Worker, cx));
                     }),
                 ))
                 .when(can_launch, |menu| menu.item(
-                    PopupMenuItem::new("Continue in…").on_click(move |_, _, cx| {
+                    crate::kit::menu_item("Continue in…").on_click(move |_, _, cx| {
                         let _ = handoff.update(cx, |s, cx| s.request_launch(LaunchKind::Handoff, cx));
                     }),
                 ))
                 .when(can_end, |menu| menu.item(
-                    PopupMenuItem::new("End session").on_click(move |_, _, cx| {
+                    crate::kit::menu_item("End session").on_click(move |_, _, cx| {
                         let _ = end.update(cx, |s, cx| s.request_end(ended.clone(), cx));
                     }),
                 ))

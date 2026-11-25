@@ -5,8 +5,8 @@
 //! screen with OCR. Without that variable every entry point returns after one
 //! atomic load: no element is added, no lock is taken and nothing allocates.
 use gpui::{
-    App, Bounds, ElementId, ParentElement, Pixels, Point, SharedString, Styled, Window, WindowId,
-    canvas,
+    App, Bounds, ElementId, IntoElement, ParentElement, Pixels, Point, SharedString, Styled,
+    Window, WindowId, canvas,
 };
 use gpui_component::button::Button;
 use serde::Serialize;
@@ -79,18 +79,34 @@ pub fn mark(button: Button, id: &ElementId, label: &SharedString, enabled: bool)
     if !active() {
         return button;
     }
-    let id = id.to_string();
-    let label = label.clone();
-    button.child(
-        canvas(
-            move |bounds, window, _: &mut App| record(window, id, label, enabled, bounds),
-            |_, _, _, _| {},
-        )
-        .absolute()
-        .top_0()
-        .left_0()
-        .size_full(),
+    button.child(probe_canvas(id.to_string(), label.clone(), enabled))
+}
+
+/// The same mark for any element that can hold a child, such as a list row or a menu
+/// item. The element needs no position of its own: the mark fills its parent's box.
+pub fn mark_element<E: ParentElement>(
+    mut element: E,
+    id: &ElementId,
+    label: &SharedString,
+    enabled: bool,
+) -> E {
+    if active() {
+        element.extend(Some(
+            probe_canvas(id.to_string(), label.clone(), enabled).into_any_element(),
+        ));
+    }
+    element
+}
+
+fn probe_canvas(id: String, label: SharedString, enabled: bool) -> impl IntoElement {
+    canvas(
+        move |bounds, window, _: &mut App| record(window, id, label, enabled, bounds),
+        |_, _, _, _| {},
     )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
 }
 
 fn record(window: &Window, id: String, label: SharedString, enabled: bool, b: Bounds<Pixels>) {

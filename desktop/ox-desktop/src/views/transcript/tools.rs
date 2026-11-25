@@ -2,7 +2,7 @@
 use super::{TranscriptView, Workbench, cards};
 use crate::{
     appearance::Palette,
-    kit::{PopupMenuItem, button, field},
+    kit::{button, field},
     row,
 };
 use gpui::{prelude::FluentBuilder, *};
@@ -123,12 +123,12 @@ pub(super) fn copy_menu(mut menu: PopupMenu, t: &Transcript, key: &ItemKey) -> P
     let text = entry_text(entry).into_owned();
     let blocks = code_blocks(&text);
     menu = menu.item(
-        PopupMenuItem::new("Copy message").on_click(move |_, _, cx| {
+        crate::kit::menu_item("Copy message").on_click(move |_, _, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
         }),
     );
     for (label, value) in blocks {
-        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+        menu = menu.item(crate::kit::menu_item(label).on_click(move |_, _, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(value.clone()))
         }));
     }

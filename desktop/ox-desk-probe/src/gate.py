@@ -212,6 +212,28 @@ class Fixture:
             raise
         return None
 
+    def wait_for(self, what, fn, timeout=12):
+        """wait(), but a timeout first says what was awaited and what the app showed."""
+        try:
+            return wait(fn, timeout)
+        except TimeoutError:
+            self.log.flush()
+            print(f"::group::Timed out waiting for {what}", file=sys.stderr)
+            try:
+                view = self.stats()
+                layout = [f"{c['id']}={c['label']!r}{'' if c['enabled'] else ' (disabled)'}"
+                          for c in view.pop("layout", [])]
+                print("stats:", json.dumps(view)[:2000], file=sys.stderr)
+                print("controls:", "; ".join(layout)[:3000], file=sys.stderr)
+            except Exception as stats_error:
+                print(f"stats unavailable: {stats_error!r}", file=sys.stderr)
+            try:
+                print("--- app.log\n" + (self.root / "app.log").read_text()[-3000:], file=sys.stderr)
+            except OSError as read_error:
+                print(f"--- app.log: {read_error}", file=sys.stderr)
+            print("::endgroup::", file=sys.stderr)
+            raise
+
     def remote_setup(self, stage):
         fixture = stage / "fixture-bin"
         fixture.mkdir()
@@ -338,6 +360,11 @@ if len(sys.argv) == 2 and "Tailscale" in sys.argv[1]:
         """A laid-out, enabled control by id or label, or None. Icon buttons carry no word to OCR."""
         return next((c for c in self.stats().get("layout", [])
                      if label in (c["id"], c["label"]) and c["enabled"]), None)
+
+    def search_pos(self):
+        """Centre of the sidebar's thread search field in window pixels, from the layout probe."""
+        c = self.control("thread-search")
+        return (c["x"] + c["w"] // 2, c["y"] + c["h"] // 2) if c else None
 
     def press(self, label):
         """Click a marked control inside the app (no OS pointer), so it works on X11 and Wayland."""
@@ -619,10 +646,18 @@ def streaming(f):
                present_interval_p95_ms=end["present_interval_p95_ns"]/1e6,
                drains=end["drains"]-start["drains"], frames=end["frames_drawn"], typed_draft_visible=typed)
     if "G10" in selected:
+        # With text in the composer the submit slot is Send; it turns into Stop only for an
+        # empty draft. G7 leaves its typed draft behind, so clear it first.
+        if f.stats().get("draft"):
+            f.click((475, 645))
+            f.x("key", "ctrl+a")
+            f.x("key", "BackSpace")
+            f.wait_for("an empty composer draft", lambda: not f.stats().get("draft"))
         f.admin("busy")
-        wait(lambda: f.stats()["visible_turn"])
-        wait(lambda: f.control("stop-turn"))
-        search = wait(lambda: f.words().get("search"))
+        f.wait_for("the busy turn to show", lambda: f.stats()["visible_turn"])
+        f.wait_for("the Stop control (shown only while a turn runs and the draft is empty)",
+                   lambda: f.control("stop-turn"))
+        search = f.wait_for("the thread search field", f.search_pos)
         f.click(search)
         f.x("type", "hold")
         wait(lambda: f.events("list-held"))

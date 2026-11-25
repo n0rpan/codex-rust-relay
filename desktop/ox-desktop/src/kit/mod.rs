@@ -178,6 +178,24 @@ pub fn input(editor: &gpui::Entity<gpui_component::input::InputState>) -> gpui::
 
 pub use gpui_component::menu::{DropdownMenu, PopupMenuItem};
 
+/// A menu item the layout probe can find and press by its label. Without the probe it
+/// is the plain label item.
+pub fn menu_item(label: impl Into<SharedString>) -> PopupMenuItem {
+    let label: SharedString = label.into();
+    if !crate::platform::layout_probe::active() {
+        return PopupMenuItem::new(label);
+    }
+    let id: ElementId = SharedString::from(format!("menu-item {label}")).into();
+    PopupMenuItem::element(move |_, _| {
+        crate::platform::layout_probe::mark_element(
+            gpui::div().child(label.clone()),
+            &id,
+            &label,
+            true,
+        )
+    })
+}
+
 pub fn row() -> gpui::Div {
     gpui::div().flex().flex_row().items_center()
 }
@@ -369,6 +387,7 @@ impl ListRow {
     ) -> gpui::Div {
         use gpui::prelude::FluentBuilder;
         let hint = format!("{}\n{}", self.title, self.secondary());
+        let name = SharedString::from(self.title.clone());
         let running = self.status == Some("Running");
         let marker = match self.status {
             Some("Needs you") => Some(p.warning),
@@ -419,7 +438,8 @@ impl ListRow {
                         .child(self.age),
                 )
             });
-        let button = Button::new(id)
+        let id = id.into();
+        let button = Button::new(id.clone())
             .ghost()
             .tab_stop(true)
             .w_full()
@@ -430,6 +450,7 @@ impl ListRow {
             .child(track)
             .tooltip(hint)
             .on_click(click);
+        let button = crate::platform::layout_probe::mark(button, &id, &name, true);
         col().h(px(ROW_HEIGHT)).justify_center().child(button)
     }
 }

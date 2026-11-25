@@ -123,6 +123,22 @@ def run(gui, stock, root):
                         time.sleep(.06)
                     raise AssertionError(f"No enabled {label!r} control in the window")
 
+                def press_choice(*needles):
+                    """Press the picker row (model or setting choice) whose probe label contains a needle."""
+                    end = time.monotonic() + 12
+                    seen = []
+                    while time.monotonic() < end:
+                        probe.sendto(b"snapshot", child["OX_DESK_STATS_SOCKET"])
+                        layout = json.loads(probe.recv(1 << 20)).get("layout", [])
+                        seen = [(c["id"], c["label"]) for c in layout if c["id"].startswith(("model-row", "model-choice"))]
+                        for control in layout:
+                            if (control["id"].startswith(("model-row", "model-choice")) and control["enabled"]
+                                    and any(n in control["label"].casefold() for n in needles)):
+                                press(control["id"])
+                                return
+                        time.sleep(.06)
+                    raise AssertionError(f"No picker row matching {needles}; the layout has {seen}")
+
                 def wait_view(predicate):
                     end = time.monotonic() + 12
                     while time.monotonic() < end:
@@ -214,13 +230,13 @@ def run(gui, stock, root):
                 # Chip ids are model-setting-0 (model), -1 (effort), -2 (speed).
                 expect_label("model-setting-0", "demo")
                 press("model-setting-0")
-                click(*word("orchard"))
+                press_choice("orchard", "alternate")
                 expect_label("model-setting-0", "alternate")
                 press("model-setting-0")
-                click(*word("meadow"))
+                press_choice("meadow", "demo")
                 expect_label("model-setting-0", "demo")
                 press("model-setting-1")
-                click(*word("high"))
+                press_choice("high")
                 expect_label("model-setting-1", "high")
                 wait_view(lambda s: s["selected_thread"] == beta_thread)
                 enter("/speed default")

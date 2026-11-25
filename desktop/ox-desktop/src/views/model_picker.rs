@@ -600,8 +600,10 @@ impl ModelPicker {
                 let plan = entry.is_plan();
                 let star = *starred;
                 let active = selected == Some(ix);
-                kit::row()
-                    .id(("model-row", ix))
+                let probe_id: gpui::ElementId = ("model-row", ix).into();
+                let probe_label: SharedString = format!("{} · {}", entry.label, id).into();
+                let row = kit::row()
+                    .id(probe_id.clone())
                     .h(px(ROW_HEIGHT))
                     .px_2()
                     .gap_1()
@@ -675,7 +677,8 @@ impl ModelPicker {
                                 cx.emit(ModelPickerEvent::HandOff(id.clone()));
                             }),
                         ))
-                    })
+                    });
+                crate::platform::layout_probe::mark_element(row, &probe_id, &probe_label, true)
                     .into_any_element()
             }
         }

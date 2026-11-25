@@ -10,7 +10,7 @@ mod shortcuts;
 use super::model_picker::{self, ModelPicker, ModelPickerEvent};
 use super::running::Running;
 use super::workbench::{CatalogChanged, Workbench};
-use crate::kit::{DropdownMenu, PopupMenuItem, SPACE_M, SPACE_S, SPACE_XS};
+use crate::kit::{DropdownMenu, SPACE_M, SPACE_S, SPACE_XS};
 use crate::{
     activity, appearance::Palette, col, kit::button, platform, row, settings, small,
     workspace_state::LastWorkspace,
@@ -1080,7 +1080,7 @@ impl Host {
                     Some((current, _)) => current == token,
                     None => token.is_empty(),
                 };
-                menu = menu.item(PopupMenuItem::new(name).checked(checked).on_click(
+                menu = menu.item(crate::kit::menu_item(name).checked(checked).on_click(
                     move |_, window, cx| {
                         let value = filter.read(cx).value().to_string();
                         let next = select_status_filter(&value, token);
@@ -1601,16 +1601,17 @@ impl Host {
                     } else {
                         format!("{path} · {route}")
                     };
-                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                        let _ = host.update(cx, |s, cx| s.switch(index, window, cx));
-                    }));
+                    menu =
+                        menu.item(crate::kit::menu_item(label).on_click(move |_, window, cx| {
+                            let _ = host.update(cx, |s, cx| s.switch(index, window, cx));
+                        }));
                 }
                 for (directory, route) in &recent {
                     let host = host.clone();
                     let directory = directory.clone();
                     let route = route.clone();
                     menu = menu.item(
-                        PopupMenuItem::new(directory.display().to_string()).on_click(
+                        crate::kit::menu_item(directory.display().to_string()).on_click(
                             move |_, window, cx| {
                                 let _ = host.update(cx, |s, cx| {
                                     let route = route.clone();
@@ -1630,7 +1631,7 @@ impl Host {
                 }
                 let host = host.clone();
                 menu.item(
-                    PopupMenuItem::new("Open project…").on_click(move |_, window, cx| {
+                    crate::kit::menu_item("Open project…").on_click(move |_, window, cx| {
                         let _ = host.update(cx, |s, cx| s.pick_project(window, cx));
                     }),
                 )
@@ -1757,13 +1758,20 @@ impl Host {
             )
             .child(
                 div().pt(px(SPACE_S)).px(gutter).child(
-                    gpui_component::input::Input::new(&self.filter)
-                        .prefix(
-                            gpui_component::Icon::new(gpui_component::IconName::Search)
-                                .size(px(14.))
-                                .text_color(rgb(p.quiet())),
-                        )
-                        .suffix(self.filter_menu(p, cx)),
+                    crate::platform::layout_probe::mark_element(
+                        div().child(
+                            gpui_component::input::Input::new(&self.filter)
+                                .prefix(
+                                    gpui_component::Icon::new(gpui_component::IconName::Search)
+                                        .size(px(14.))
+                                        .text_color(rgb(p.quiet())),
+                                )
+                                .suffix(self.filter_menu(p, cx)),
+                        ),
+                        &"thread-search".into(),
+                        &"Search threads".into(),
+                        true,
+                    ),
                 ),
             )
             .when_some(self.choose_route.clone(), |sidebar, (project, row)| {
@@ -1801,7 +1809,7 @@ impl Host {
                                 } else {
                                     format!("New session · {alias}")
                                 };
-                                menu = menu.item(PopupMenuItem::new(label).on_click(
+                                menu = menu.item(crate::kit::menu_item(label).on_click(
                                     move |_, window, cx| {
                                         let _ = host.update(cx, |s, cx| {
                                             let project = project.clone();
