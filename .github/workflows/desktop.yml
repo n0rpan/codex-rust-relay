@@ -261,8 +261,11 @@ jobs:
             ${{ runner.temp }}/mac-window.log
             ${{ runner.temp }}/mac-window-unavailable.json
       # Keep compiled dependencies even when the application itself fails to build.
+      # Only main, tags and nightly runs write the cache: pull request entries
+      # would fill the repository's cache quota and evict main's, and every run
+      # restores from main.
       - name: Cache native dependency build
-        if: "!cancelled() && steps.deps.outputs.cache-hit != 'true' && steps.deps.outputs.cache-primary-key != ''"
+        if: "!cancelled() && github.event_name != 'pull_request' && steps.deps.outputs.cache-hit != 'true' && steps.deps.outputs.cache-primary-key != ''"
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |

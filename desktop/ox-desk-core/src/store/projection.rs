@@ -304,8 +304,8 @@ impl Store {
                 .map(|r| self.session_view(r))
                 .collect();
             if sessions != state.sessions {
-                state.sessions = sessions.clone();
-                out.push(Change::Sessions { sessions });
+                out.extend(session_changes(&state.sessions, &sessions));
+                state.sessions = sessions;
             }
         }
         for id in changed.dirty_threads() {
@@ -422,5 +422,74 @@ impl Store {
             title: title.into(),
             event,
         }
+    }
+}
+
+/// The changes that turn `old` into `new`. A page of older threads only appends
+/// rows, so when every old row keeps its place, send just the appended and
+/// edited rows: each client inserts an unknown row at the end, in order. Any
+/// other change (a removal or a reorder) sends the whole list. Re-sending the
+/// whole list for every page made catalog traffic grow with the square of its
+/// length, tens of megabytes for 5,000 threads. A desktop that fell behind
+/// reloaded its catalog from the first page and paged everything again (the
+/// G6 gate's intermittent failure).
+fn session_changes(old: &[SessionView], new: &[SessionView]) -> Vec<Change> {
+    let appended_only = new.len() >= old.len()
+        && old
+            .iter()
+            .zip(new)
+            .all(|(before, after)| before.id == after.id);
+    if !appended_only || old.is_empty() {
+        return vec![Change::Sessions {
+            sessions: new.to_vec(),
+        }];
+    }
+    new.iter()
+        .enumerate()
+        .filter(|(i, row)| old.get(*i) != Some(*row))
+        .map(|(_, row)| Change::Session {
+            session: row.clone(),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod session_change_tests {
+    use super::*;
+
+    fn row(id: &str, title: &str) -> SessionView {
+        SessionView {
+            id: id.into(),
+            title: title.into(),
+            parent: None,
+            updated_at: 0,
+            status: "idle".into(),
+            capabilities: vec![],
+            detail: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn a_new_page_sends_only_its_rows_and_anything_else_sends_the_list() {
+        let first = vec![row("a", "A"), row("b", "B")];
+        let paged = vec![row("a", "A"), row("b", "B"), row("c", "C"), row("d", "D")];
+        let ids = |changes: Vec<Change>| -> Vec<String> {
+            changes
+                .into_iter()
+                .map(|c| match c {
+                    Change::Session { session } => session.id,
+                    Change::Sessions { sessions } => format!("all:{}", sessions.len()),
+                    _ => "other".into(),
+                })
+                .collect()
+        };
+        assert_eq!(ids(session_changes(&first, &paged)), ["c", "d"]);
+        let renamed = vec![row("a", "A"), row("b", "B2"), row("c", "C")];
+        assert_eq!(ids(session_changes(&first, &renamed)), ["b", "c"]);
+        let reordered = vec![row("b", "B"), row("a", "A")];
+        assert_eq!(ids(session_changes(&first, &reordered)), ["all:2"]);
+        let removed = vec![row("a", "A")];
+        assert_eq!(ids(session_changes(&first, &removed)), ["all:1"]);
+        assert_eq!(ids(session_changes(&[], &first)), ["all:2"]);
     }
 }
