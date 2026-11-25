@@ -71,6 +71,21 @@ impl Store {
     pub fn select_from_catalog(&mut self, row: ThreadRow) -> io::Result<()> {
         self.select_catalog_origin(row, false)
     }
+    /// Add a catalog row without opening the thread, so a send can resume a thread the
+    /// freshly reopened route has not listed yet.
+    pub fn adopt_catalog_row(&mut self, row: ThreadRow) -> io::Result<()> {
+        if self.remote().is_some() || row.worker || self.catalog.get(&row.id).is_some() {
+            return Ok(());
+        }
+        self.check_route(&row)?;
+        self.record_lineage(&row);
+        if self.listing {
+            self.created_while_listing.insert(row.id.clone());
+        }
+        self.catalog.insert(row);
+        self.catalog_revision += 1;
+        Ok(())
+    }
     pub fn select_catalog_origin(&mut self, row: ThreadRow, confirm_alias: bool) -> io::Result<()> {
         if self.remote().is_some() {
             let a = if confirm_alias {

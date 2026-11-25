@@ -925,13 +925,17 @@ impl Engine {
             store.recover_from(&mut previous.store);
         }
         annotate(&self.workers, &self.ledger.data, scope, &mut store);
-        let mut state = store.host_snapshot(scope);
         let recovered = self
             .cold
             .remove(scope)
             .or(prior)
             .map(|old| old.sessions)
             .unwrap_or_default();
+        // Threads the host had no process for stay resumable by a send.
+        for saved in &recovered {
+            store.mark_ended(&saved.id);
+        }
+        let mut state = store.host_snapshot(scope);
         restore(&mut state.sessions, &recovered);
         let mut changes = vec![
             Change::State {
@@ -1163,6 +1167,16 @@ impl Engine {
             _ => None,
         };
         let fork = matches!(action, Action::ForkThread(_));
+        // A send to a thread this reopened route has not listed yet: add its row first, so
+        // the store can resume the thread and deliver the message.
+        if operator_turn
+            && let Some(t) = &target
+            && !live.store.has_live_session(t)
+            && live.store.catalog_row(t).is_none()
+            && let Some(row) = from_catalog(t)
+        {
+            live.store.adopt_catalog_row(row)?;
+        }
         live.store.dispatch(action)?;
         if fork && let (Some(origin), Some(source)) = (&origin, &target) {
             live.fork_origin = Some(origin.fork(source));

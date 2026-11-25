@@ -219,7 +219,17 @@ impl Store {
             }
             Event::Init(init) => {
                 let cwd = Path::new(&init.cwd);
-                if cwd != self.profile.project
+                let first = !std::mem::replace(
+                    &mut self
+                        .claude_mut()
+                        .sessions
+                        .get_mut(owner)
+                        .unwrap()
+                        .project_checked,
+                    true,
+                );
+                if first
+                    && cwd != self.profile.project
                     && cwd
                         .canonicalize()
                         .ok()
@@ -779,6 +789,7 @@ mod tests {
                 Process {
                     generation: 2,
                     initialized: true,
+                    project_checked: false,
                     ..Default::default()
                 },
             );
@@ -799,6 +810,68 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap()
+    }
+    #[test]
+    fn sending_to_an_ended_session_resumes_it_with_the_message_as_first_input() {
+        let (mut s, a, _b) = fixture();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        s.claude_mut().deliver = Arc::new(move |event| {
+            let _ = tx.lock().unwrap().send(event);
+        });
+        s.state = Connection::Ready;
+        s.end_session(&a).unwrap();
+        assert!(s.is_ended(&a) && !s.can_send(Some(&a)) && s.can_compose(Some(&a)));
+        s.edit(Some(&a), "back again".into());
+        s.submit(Some(&a)).unwrap();
+        // A Resume process now exists and holds the message until it initialises.
+        let process = &s.claude().sessions[&a];
+        assert!(!process.initialized);
+        assert_eq!(
+            process.first.as_ref().map(|f| f.1.as_str()),
+            Some("back again")
+        );
+        assert!(!s.is_ended(&a) && s.has_live_session(&a));
+        assert!(s.transcript(&a).unwrap().is_loading());
+        assert_eq!(s.draft(Some(&a)), "");
+        // The fixture has no saved session to resume, so the launch fails (proving the
+        // Resume path ran). The unsent message returns to the composer, not lost.
+        let event = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        s.apply(event);
+        assert_eq!(s.draft(Some(&a)), "back again");
+        assert!(!s.claude().sessions.contains_key(&a));
+    }
+    #[test]
+    fn a_later_init_after_cd_keeps_the_session_but_a_first_init_elsewhere_does_not() {
+        let (mut s, a, b) = fixture();
+        let init = |cwd: &str| {
+            decode(
+                json!({"type":"system","subtype":"init","session_id":A,"uuid":"u",
+                "model":"m","permissionMode":"default","slash_commands":[],"tools":[],"cwd":cwd}),
+            )
+        };
+        // Claude Code repeats init each turn with the Bash tool's current directory.
+        update(
+            &mut s,
+            &a,
+            2,
+            Data::Stock(pipe::Event::Frame(init("/fixture"))),
+        )
+        .unwrap();
+        update(
+            &mut s,
+            &a,
+            2,
+            Data::Stock(pipe::Event::Frame(init("/fixture/sub"))),
+        )
+        .unwrap();
+        assert!(s.claude().sessions.contains_key(&a));
+        // The first init of a session must still be in the project.
+        let elsewhere = decode(
+            json!({"type":"system","subtype":"init","session_id":B,"uuid":"u",
+            "model":"m","permissionMode":"default","slash_commands":[],"tools":[],"cwd":"/elsewhere"}),
+        );
+        assert!(update(&mut s, &b, 2, Data::Stock(pipe::Event::Frame(elsewhere))).is_err());
     }
     #[test]
     fn palette_shows_only_headless_builtins_and_advertised_custom_skills() {

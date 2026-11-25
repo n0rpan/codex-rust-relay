@@ -30,8 +30,6 @@ pub(super) struct Choice {
     /// An OX API alias, or none for the runtime's subscription.
     pub model: Option<String>,
     pub permission: ModeRequest,
-    /// The person ticked "I understand" for YOLO. Cleared whenever the permission changes.
-    pub acknowledged: bool,
     pub error: Option<String>,
 }
 
@@ -46,7 +44,6 @@ impl Choice {
                 Billing::Subscription => None,
             },
             permission: ModeRequest::Inherit,
-            acknowledged: false,
             error: None,
         }
     }
@@ -124,20 +121,16 @@ pub(super) fn model_or_none(model: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Whether a start counts as YOLO-confirmed. YOLO needs the explicit acknowledgement; choosing
-/// the chip alone is not enough.
-pub(super) fn yolo_confirmed(permission: ModeRequest, acknowledged: bool) -> Result<bool, String> {
-    match permission {
-        ModeRequest::Level(Level::Yolo) if acknowledged => Ok(true),
-        ModeRequest::Level(Level::Yolo) => Err("Confirm YOLO before starting.".into()),
-        _ => Ok(false),
-    }
+/// Whether a start counts as YOLO-confirmed. A human choosing YOLO in the clearly labelled
+/// control is the consent (the consequence line stays under it); only an agent asking for YOLO
+/// needs a human tap, and that path does not come through these sheets.
+pub(super) fn yolo_confirmed(permission: ModeRequest) -> bool {
+    permission == ModeRequest::Level(Level::Yolo)
 }
 
-/// Sets the permission and clears any YOLO acknowledgement, so a new choice must be confirmed.
+/// Sets the permission and clears any validation message.
 pub(super) fn set_permission(choice: &mut Choice, permission: ModeRequest) {
     choice.permission = permission;
-    choice.acknowledged = false;
     choice.error = None;
 }
 
@@ -147,7 +140,6 @@ pub(super) fn worker_start(
     runtime: Runtime,
     mode: WorkerMode,
     permission: ModeRequest,
-    acknowledged: bool,
     model: Option<&str>,
     task: &str,
 ) -> Result<WorkerStart, String> {
@@ -155,7 +147,7 @@ pub(super) fn worker_start(
     if task.is_empty() {
         return Err("Write the task for the worker.".into());
     }
-    let yolo = yolo_confirmed(permission, acknowledged)?;
+    let yolo = yolo_confirmed(permission);
     let start = WorkerStart {
         parent: owner.to_owned(),
         runtime,
@@ -284,11 +276,6 @@ impl Workbench {
         self.set_launch_choice(|c| set_permission(c, request), cx);
     }
 
-    /// Ticks or unticks the YOLO acknowledgement on the open launch.
-    pub(super) fn toggle_launch_acknowledged(&mut self, cx: &mut Context<Self>) {
-        self.set_launch_choice(|c| c.acknowledged = !c.acknowledged, cx);
-    }
-
     pub(super) fn set_launch_mode(&mut self, mode: WorkerMode, cx: &mut Context<Self>) {
         if let Some(Launch::Worker(draft)) = self.launch.as_mut()
             && mode_allowed(draft.choice.runtime, mode)
@@ -352,7 +339,6 @@ impl Workbench {
                     c.runtime,
                     draft.mode,
                     c.permission,
-                    c.acknowledged,
                     c.model.as_deref(),
                     &task,
                 )
@@ -576,20 +562,6 @@ impl Workbench {
             );
         }
         body = body.child(self.permission_row(p, &choice, cx));
-        if choice.permission == ModeRequest::Level(Level::Yolo) {
-            body = body.child(button(
-                p,
-                "launch-yolo-ack",
-                if choice.acknowledged {
-                    "✓ I understand workers can run anything without asking"
-                } else {
-                    "I understand workers can run anything without asking"
-                },
-                choice.acknowledged,
-                true,
-                cx.listener(|s, _, _, cx| s.toggle_launch_acknowledged(cx)),
-            ));
-        }
         match launch {
             Launch::Worker(draft) => {
                 body = body.child(field(p, "Task", Textarea::new(&draft.task)));
@@ -606,7 +578,6 @@ impl Workbench {
                     .child(error.clone()),
             );
         }
-        let yolo_unconfirmed = yolo_confirmed(choice.permission, choice.acknowledged).is_err();
         let footer = row()
             .justify_end()
             .gap_2()
@@ -622,7 +593,7 @@ impl Workbench {
                 "launch-submit",
                 submit,
                 true,
-                !yolo_unconfirmed,
+                true,
                 cx.listener(|s, _, _, cx| s.submit_launch(cx)),
             ));
         let frame = col()
@@ -682,7 +653,6 @@ mod tests {
                 Runtime::Claude,
                 WorkerMode::Session,
                 ModeRequest::Inherit,
-                false,
                 None,
                 task,
             )
@@ -692,13 +662,12 @@ mod tests {
     }
 
     #[test]
-    fn task_is_trimmed_and_yolo_needs_acknowledgement() {
+    fn task_is_trimmed_and_choosing_yolo_is_the_confirmation() {
         let start = worker_start(
             "s1",
             Runtime::Claude,
             WorkerMode::Session,
             ModeRequest::Level(Level::Yolo),
-            true,
             Some("  "),
             "  fix the build \n",
         )
@@ -708,50 +677,26 @@ mod tests {
         assert!(start.yolo_confirmed);
         assert_eq!(start.permission, Some(ModeRequest::Level(Level::Yolo)));
         assert_eq!(start.parent, "s1");
-        let unconfirmed = worker_start(
-            "s1",
-            Runtime::Claude,
-            WorkerMode::Session,
-            ModeRequest::Level(Level::Yolo),
-            false,
-            None,
-            "fix the build",
-        );
-        assert_eq!(unconfirmed.unwrap_err(), "Confirm YOLO before starting.");
     }
 
     #[test]
-    fn yolo_gate_requires_the_acknowledgement_only_for_yolo() {
-        assert_eq!(
-            yolo_confirmed(ModeRequest::Level(Level::Yolo), true),
-            Ok(true)
-        );
-        assert_eq!(
-            yolo_confirmed(ModeRequest::Level(Level::Yolo), false),
-            Err("Confirm YOLO before starting.".into())
-        );
-        assert_eq!(
-            yolo_confirmed(ModeRequest::Level(Level::Read), false),
-            Ok(false)
-        );
-        assert_eq!(yolo_confirmed(ModeRequest::Inherit, false), Ok(false));
+    fn yolo_is_confirmed_only_when_yolo_is_chosen() {
+        assert!(yolo_confirmed(ModeRequest::Level(Level::Yolo)));
+        assert!(!yolo_confirmed(ModeRequest::Level(Level::Read)));
+        assert!(!yolo_confirmed(ModeRequest::Inherit));
     }
 
     #[test]
-    fn changing_permission_clears_the_yolo_acknowledgement() {
+    fn changing_permission_clears_the_error() {
         let mut choice = Choice {
             owner: "s1".into(),
             runtime: Runtime::Claude,
             model: None,
             permission: ModeRequest::Level(Level::Yolo),
-            acknowledged: true,
             error: Some("old".into()),
         };
         set_permission(&mut choice, ModeRequest::Level(Level::Classifier));
-        assert!(!choice.acknowledged);
         assert_eq!(choice.error, None);
-        set_permission(&mut choice, ModeRequest::Level(Level::Yolo));
-        assert!(yolo_confirmed(choice.permission, choice.acknowledged).is_err());
     }
 
     #[test]
@@ -761,7 +706,6 @@ mod tests {
             Runtime::Codex,
             WorkerMode::Session,
             ModeRequest::Inherit,
-            false,
             None,
             "task",
         );
@@ -771,7 +715,6 @@ mod tests {
             Runtime::Claude,
             WorkerMode::Goal,
             ModeRequest::Inherit,
-            false,
             None,
             "task",
         );
@@ -781,7 +724,6 @@ mod tests {
             Runtime::Codex,
             WorkerMode::Goal,
             ModeRequest::Inherit,
-            false,
             Some("gpt-x"),
             "task",
         )

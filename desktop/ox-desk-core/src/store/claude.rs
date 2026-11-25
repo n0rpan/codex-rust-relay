@@ -56,6 +56,9 @@ struct Process {
     handoff: Option<super::commands::Handoff>,
     link: Option<pipe::Link>,
     initialized: bool,
+    /// The first `system/init` matched the project. Later ones report the Bash
+    /// tool's current directory, which follows `cd`, so only the first is checked.
+    project_checked: bool,
     capabilities: Option<crate::slash::Capabilities>,
     mode: Option<Access>,
     controls: HashMap<String, Control>,
@@ -532,6 +535,29 @@ impl Store {
         let raw = stock_id(id)?.to_owned();
         self.transcripts.entry(id.into()).or_default().loading = true;
         self.spawn_claude(Session::Resume(raw), None, confirm)?;
+        Ok(())
+    }
+    /// Resume an ended Claude session with the draft as its first input, so the message
+    /// goes out as soon as the process is initialised.
+    pub(super) fn claude_resume_send(&mut self, id: &str) -> io::Result<()> {
+        let row = self
+            .catalog
+            .get(id)
+            .ok_or_else(|| io::Error::other("Thread is outside this catalog"))?
+            .clone();
+        self.check_route(&row)?;
+        let text = self.draft(Some(id)).to_owned();
+        let raw = stock_id(id)?.to_owned();
+        self.spawn_claude(Session::Resume(raw), Some((new_id()?, text)), false)?;
+        self.ended_threads.remove(id);
+        let t = self.transcripts.entry(id.into()).or_default();
+        t.loading = true;
+        t.error = None;
+        self.selected = Some(id.into());
+        self.selection += 1;
+        self.edit(Some(id), String::new());
+        self.changed.transcript(id);
+        self.changed.mark(Changed::THREADS | Changed::CONNECTION);
         Ok(())
     }
     pub(super) fn claude_submit(

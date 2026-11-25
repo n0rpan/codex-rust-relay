@@ -147,7 +147,7 @@ async fn login(account: Option<&str>, args: &[OsString], home: &Path) -> Result<
 // Exposed to the desktop as a stable, non-identifying failure marker.
 const CLAUDE_SIGN_IN: &str = "no Claude subscription sign-in found. Run ox login claude first";
 
-fn checked_claude_command(home: &Path) -> Result<Command, RelayError> {
+fn checked_claude_command(home: &Path, sandbox: bool) -> Result<Command, RelayError> {
     crate::clients::ensure_no_managed_override(&[])?;
     let mut command = claude_account_command(home)?;
     // Stock settings outrank its inherited environment. Preserve permissions,
@@ -176,13 +176,16 @@ fn checked_claude_command(home: &Path) -> Result<Command, RelayError> {
         serde_json::to_value(&native_dir)?,
     );
     command.env("CLAUDE_CONFIG_DIR", native_dir);
-    let settings = serde_json::json!({"env":env,"apiKeyHelper":""});
+    let mut settings = serde_json::json!({"env":env,"apiKeyHelper":""});
+    if sandbox {
+        settings["sandbox"] = crate::clients::claude_sandbox_document()["sandbox"].clone();
+    }
     command.arg("--settings").arg(settings.to_string());
     Ok(command)
 }
 
 async fn check_claude_subscription(home: &Path) -> Result<(), RelayError> {
-    let mut command = checked_claude_command(home)?;
+    let mut command = checked_claude_command(home, false)?;
     command
         .args(["auth", "status", "--json"])
         .stdin(Stdio::null());
@@ -207,15 +210,18 @@ async fn launch_claude_subscription(args: &[OsString], home: &Path) -> Result<u8
         let name = arg.to_string_lossy();
         matches!(
             name.split('=').next(),
-            Some("--settings" | "--managed-settings" | "--bare")
+            Some("--managed-settings" | "--bare")
         )
     }) {
         return Err("subscription launches own their authentication settings".into());
     }
+    // Only the exact sandbox document may ride along; it is merged into the
+    // settings this launch builds, so it cannot replace the account settings.
+    let (args, sandbox) = crate::clients::take_subscription_sandbox(args)?;
     check_claude_subscription(home).await?;
     launch_session(
-        checked_claude_command(home)?,
-        args,
+        checked_claude_command(home, sandbox)?,
+        &args,
         home,
         ClientKind::Claude,
         None,

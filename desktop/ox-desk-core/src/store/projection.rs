@@ -160,6 +160,9 @@ impl Store {
             if self.can_send(Some(id)) {
                 caps.push(if running { "steer" } else { "send" }.into());
                 self.composer_caps(Some(id), &mut caps);
+            } else if self.can_resume_send(id) {
+                // An ended thread keeps its composer: a send reopens it.
+                caps.push("send".into());
             }
             if running {
                 caps.push("stop".into());

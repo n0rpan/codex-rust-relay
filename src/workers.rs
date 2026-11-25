@@ -867,7 +867,7 @@ fn tools() -> Value {
                         "mode": {"enum": ["session", "goal", "workflow"]},
                         "model": {"type": "string", "description": "Exact ox API model alias. Leave out only for a Claude subscription worker."},
                         "task": {"type": "string", "description": "The job objective, desired validation, and stopping condition."},
-                        "permission_mode": {"enum": ["inherit", "read", "write", "classifier", "yolo"], "default": "inherit", "description": "inherit (default) or a lower level. read: Codex Read only / Claude Plan. write: Codex Workspace / Claude Accept edits. classifier: Codex Auto-review / Claude Auto. yolo: Codex YOLO / Claude bypass. Above your own mode is refused."},
+                        "permission_mode": {"enum": ["inherit", "read", "write", "classifier", "yolo"], "default": "inherit", "description": "inherit (default) or a lower level. read: Codex Read only / Claude Plan. write: sandboxed shell plus workspace writes on both runtimes (Codex Workspace; Claude Accept edits with Claude Code's sandbox, which may restrict network access, so a task needing broader access should use classifier). Where Claude Code's sandbox cannot run (Linux without bwrap and socat), a Claude write worker gets edits only and its progress says so. classifier: Codex Auto-review / Claude Auto. yolo: Codex YOLO / Claude bypass. Above your own mode is refused."},
                         "workspace_write": {"type": "boolean", "description": "Deprecated: false means read, true means write. Use permission_mode."},
                     },
                     "required": ["runtime", "mode", "task"],

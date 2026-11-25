@@ -760,9 +760,16 @@ The main agent can lower it with `start_ox_worker`'s `permission_mode`
 that would start in YOLO or bypass waits until you accept it in OX Desktop or
 on a paired phone, unless you granted YOLO for that session's workers and
 handoffs. Without a host, workers start with read access, and write access
-when you tell the main agent a worker may edit files. Client permissions still
-apply, including to shell commands. Give concurrent writers separate working
-directories by starting their parent sessions there. The main session and
+when you tell the main agent a worker may edit files. A write worker gets a
+sandboxed shell and can write the workspace on both runtimes: Codex uses its
+Workspace sandbox, and Claude Code runs Bash under its own sandbox with
+`autoAllowBashIfSandboxed`, so commands inside the workspace need no prompt
+while writes outside it fail. The sandbox may restrict network access; a task
+that needs broader access should use the classifier level instead. Claude Code's
+sandbox needs `bwrap` and `socat` on Linux. Without them a Claude write worker
+gets edits only, and its progress says so. Read workers have no shell on either
+runtime. Give concurrent writers separate working directories by starting their
+parent sessions there. The main session and
 its built-in subagents use your subscription. The worker bills the API provider
 you picked or the Claude subscription you requested.
 

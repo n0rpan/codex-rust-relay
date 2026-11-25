@@ -113,7 +113,7 @@ impl Workbench {
         let running = key
             .and_then(|id| store.transcript(id))
             .is_some_and(|t| t.active_turn().is_some());
-        let enabled = store.can_send(key)
+        let enabled = store.can_compose(key)
             && !self.image_work.contains_key(&selected)
             && (store.draft_images(key).is_empty()
                 || draft.trim_start().starts_with('/')

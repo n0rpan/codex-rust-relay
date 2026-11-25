@@ -12,7 +12,7 @@ pub(super) struct HandoffDraft {
 
 /// Builds the start the sheet sends. It applies the same checks as `/handoff`.
 pub(super) fn handoff_start(choice: &Choice, request: &str) -> Result<HandoffStart, String> {
-    let yolo = yolo_confirmed(choice.permission, choice.acknowledged)?;
+    let yolo = yolo_confirmed(choice.permission);
     let start = HandoffStart {
         source: choice.owner.clone(),
         runtime: choice.runtime,
@@ -38,7 +38,6 @@ mod tests {
             runtime,
             model: model.map(str::to_owned),
             permission,
-            acknowledged: true,
             error: None,
         }
     }
@@ -64,18 +63,6 @@ mod tests {
         assert_eq!(start.model, None);
         assert_eq!(start.mode, ModeRequest::Level(Level::Read));
         assert!(!start.yolo_confirmed);
-        let unconfirmed = handoff_start(
-            &Choice {
-                acknowledged: false,
-                ..choice(
-                    Runtime::Codex,
-                    Some("alias"),
-                    ModeRequest::Level(Level::Yolo),
-                )
-            },
-            "go",
-        );
-        assert_eq!(unconfirmed.unwrap_err(), "Confirm YOLO before starting.");
     }
 
     #[test]

@@ -121,9 +121,11 @@ impl Store {
         if let Some(remote) = self.remote() {
             return remote.sending.contains(id.unwrap_or("")) || self.pending_input(id);
         }
-        self.drafts
-            .get(&id.map(str::to_owned))
-            .is_some_and(|d| d.sent.is_some())
+        id.is_some_and(|id| self.resume_sends.contains(id))
+            || self
+                .drafts
+                .get(&id.map(str::to_owned))
+                .is_some_and(|d| d.sent.is_some())
     }
     pub fn can_send(&self, id: Option<&str>) -> bool {
         if let Some(remote) = self.remote() {
@@ -143,6 +145,96 @@ impl Store {
                         .get(id)
                         .is_some_and(|t| t.ready && t.verified)
             })
+    }
+    /// The composer is usable: the thread can take a message now, or it is ended and a
+    /// send reopens it first. Ending or reaping a process never disables the composer.
+    pub fn can_compose(&self, id: Option<&str>) -> bool {
+        self.can_send(id) || id.is_some_and(|id| self.can_resume_send(id))
+    }
+    /// An ended thread (no live process) that a send can reopen. Local stores only; a
+    /// remote client reads the host's `send` capability instead.
+    pub(super) fn can_resume_send(&self, id: &str) -> bool {
+        self.remote().is_none()
+            && self.ended_threads.contains(id)
+            && matches!(self.state, Connection::Ready | Connection::Connecting)
+            && !self.has_live_session(id)
+            && !self.in_terminal(id)
+            && !self.sending(Some(id))
+            && self.catalog.get(id).is_some()
+            && !(self.is_session_scoped() && (id.contains('/') || self.state != Connection::Ready))
+    }
+    /// Reopen an ended thread and keep the draft to send once it is ready. Claude resumes
+    /// with the message as the process's first input; Codex resumes, then `flush_resume_sends`
+    /// submits the draft when the thread is verified.
+    fn resume_and_send(&mut self, id: &str) -> io::Result<()> {
+        let draft = self.drafts.get(&Some(id.to_owned()));
+        let text = draft.map_or("", |d| d.text.as_str());
+        let has_images = draft.is_some_and(|d| !d.images.is_empty());
+        if text.trim().is_empty() && !has_images {
+            return Err(io::Error::other("Enter a message"));
+        }
+        if self.is_session_scoped() {
+            if has_images {
+                return Err(io::Error::other(
+                    "Remove the attachment before submitting to Claude Code",
+                ));
+            }
+            return self.claude_resume_send(id);
+        }
+        if text.trim_start().starts_with('/') {
+            return Err(io::Error::other("Open this command in stock Codex"));
+        }
+        self.ended_threads.remove(id);
+        self.resume_sends.insert(id.into());
+        let opened = if self.state == Connection::Ready {
+            self.open_catalog_id(id)
+        } else {
+            // The runtime is still connecting; `connected` reopens what is listed here.
+            self.selection += 1;
+            self.selected = Some(id.into());
+            self.reopen.push(id.into());
+            self.mark_loading(id);
+            Ok(())
+        };
+        if let Err(error) = opened {
+            self.resume_sends.remove(id);
+            self.ended_threads.insert(id.into());
+            return Err(error);
+        }
+        self.changed.transcript(id);
+        self.changed.mark(Changed::THREADS);
+        Ok(())
+    }
+    /// Submit drafts waiting on a reopened thread once it can take them. A reopen that
+    /// failed drops the wait and leaves the draft in the composer.
+    pub(super) fn flush_resume_sends(&mut self) {
+        if self.resume_sends.is_empty() {
+            return;
+        }
+        let waiting: Vec<String> = self.resume_sends.iter().cloned().collect();
+        for id in waiting {
+            self.resume_sends.remove(&id);
+            if self.can_send(Some(&id)) {
+                if let Err(error) = self.submit(Some(&id)) {
+                    self.notice = Some(error.to_string());
+                    self.changed.mark(Changed::NOTICE);
+                }
+                continue;
+            }
+            let t = self.transcripts.get(&id);
+            let opening = matches!(self.state, Connection::Connecting)
+                || t.is_some_and(|t| t.loading || (t.ready && !t.verified));
+            if opening && t.is_none_or(|t| t.error.is_none()) {
+                self.resume_sends.insert(id);
+            } else {
+                self.ended_threads.insert(id.clone());
+                self.notice = Some(
+                    "The thread did not resume. Your message is still in the composer.".into(),
+                );
+                self.changed.mark(Changed::NOTICE);
+                self.changed.transcript(&id);
+            }
+        }
     }
     pub(crate) fn send_client_message(
         &mut self,
@@ -191,6 +283,11 @@ impl Store {
             return self
                 .dispatch_remote(crate::actions::Action::Submit(id.map(str::to_owned)))
                 .map(|_| ());
+        }
+        if let Some(thread) = id
+            && self.can_resume_send(thread)
+        {
+            return self.resume_and_send(thread);
         }
         if self.is_session_scoped() {
             return self.claude_submit(id, None);
@@ -428,6 +525,13 @@ impl Store {
             return remote.can(id, "end");
         }
         self.has_live_session(id)
+    }
+    /// Mark a thread as having no live process (the host seeds this for a route it reopened
+    /// after reaping it), so a send to it resumes it.
+    pub fn mark_ended(&mut self, id: &str) {
+        if self.remote().is_none() {
+            self.ended_threads.insert(id.into());
+        }
     }
     /// The live process was ended and nothing has started it again. The row stays
     /// in the catalog; selecting it resumes the thread. A remote client reads the
@@ -785,5 +889,73 @@ mod tests {
         store.remove_image(None, 0);
         assert_eq!(store.draft_images(None)[0].label(), "second.png");
         assert!(store.draft_images(Some("another-thread")).is_empty());
+    }
+
+    #[test]
+    fn sending_to_an_ended_codex_thread_reopens_it_then_delivers_the_message() {
+        let mut store = ready();
+        let id = "thread-ended".to_owned();
+        let row: crate::codex::history::ThreadRow = serde_json::from_value(serde_json::json!({
+            "id": id, "cwd": store.profile.project, "modelProvider": "openai", "preview": "hi"
+        }))
+        .unwrap();
+        store.catalog.insert(row);
+        let t = store.transcripts.entry(id.clone()).or_default();
+        t.ready = true;
+        t.verified = true;
+        store.end_session(&id).unwrap();
+        // The composer stays usable, and a plain send is accepted rather than refused.
+        assert!(store.is_ended(&id) && !store.can_send(Some(&id)));
+        assert!(store.can_compose(Some(&id)));
+        store.edit(Some(&id), "back again".into());
+        store.submit(Some(&id)).unwrap();
+        assert!(store.sending(Some(&id)), "the message waits for the resume");
+        assert!(!store.is_ended(&id), "live again, so no ended marker");
+        assert_eq!(store.draft(Some(&id)), "back again");
+        assert!(
+            store
+                .pending
+                .values()
+                .any(|(_, p)| matches!(p, Pending::Read(t) if t == &id)),
+            "the thread is read and resumed"
+        );
+        // Still resuming: nothing is sent yet.
+        store.drain(vec![], std::time::Instant::now());
+        assert!(store.sending(Some(&id)));
+        // Once the thread is verified and ready the queued message is submitted.
+        let t = store.transcripts.get_mut(&id).unwrap();
+        t.loading = false;
+        t.ready = true;
+        t.verified = true;
+        store.drain(vec![], std::time::Instant::now());
+        assert!(
+            store.pending.values().any(|(_, p)| matches!(
+                p,
+                Pending::Compose(Operation::Account(s)) if s.owner.as_deref() == Some(id.as_str())
+            )),
+            "the draft is submitted"
+        );
+        assert_eq!(store.draft(Some(&id)), "");
+    }
+
+    #[test]
+    fn a_failed_resume_keeps_the_message_in_the_composer() {
+        let mut store = ready();
+        let id = "thread-gone".to_owned();
+        let row: crate::codex::history::ThreadRow = serde_json::from_value(serde_json::json!({
+            "id": id, "cwd": store.profile.project, "modelProvider": "openai"
+        }))
+        .unwrap();
+        store.catalog.insert(row);
+        store.mark_ended(&id);
+        store.edit(Some(&id), "keep me".into());
+        store.submit(Some(&id)).unwrap();
+        let t = store.transcripts.get_mut(&id).unwrap();
+        t.loading = false;
+        t.error = Some("gone".into());
+        store.drain(vec![], std::time::Instant::now());
+        assert!(!store.sending(Some(&id)));
+        assert_eq!(store.draft(Some(&id)), "keep me");
+        assert!(store.is_ended(&id));
     }
 }

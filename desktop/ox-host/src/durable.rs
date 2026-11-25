@@ -169,7 +169,8 @@ impl SavedScope {
                     parent: s.parent.clone(),
                     updated_at: s.updated_at,
                     status: if s.active { "interrupted" } else { "idle" }.into(),
-                    capabilities: vec![],
+                    // No process is open, so the thread shows Ended and a send reopens it.
+                    capabilities: vec!["open".into(), "send".into(), "ended".into()],
                     detail: serde_json::json!({"owned":true,"recovered":true,"worker":s.origin.is_some(),
                         "origin":s.origin,"worker_marks":s.marks}),
                 })
@@ -492,7 +493,8 @@ mod tests {
         let restored = db.data.scopes[0].recover();
         assert_eq!(restored.sessions[0].status, "interrupted");
         assert_eq!(restored.sessions[0].parent.as_deref(), Some("parent"));
-        assert!(restored.sessions[0].capabilities.is_empty());
+        // A recovered row has no process: it shows Ended and a send reopens it.
+        assert_eq!(restored.sessions[0].capabilities, ["open", "send", "ended"]);
         assert!(restored.asks.is_empty());
         assert!(restored.transcripts.is_empty());
         assert_eq!(restored.detail["retired_approvals"], 1);

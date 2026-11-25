@@ -89,6 +89,8 @@ pub struct Store {
     /// Threads whose live process this client ended. Cleared lazily: a thread
     /// that is live again is not reported as ended.
     ended_threads: HashSet<String>,
+    /// Ended threads a message is waiting on: reopened, and the draft is sent once ready.
+    resume_sends: HashSet<String>,
     child_threads: HashMap<String, (String, PathBuf)>,
     next_preset: Option<crate::codex::access::Access>,
     selection: u64,
@@ -175,6 +177,7 @@ impl Store {
             handoff_ready: None,
             terminal_threads: Default::default(),
             ended_threads: Default::default(),
+            resume_sends: Default::default(),
             child_threads: Default::default(),
             next_preset: None,
             selection: 0,
@@ -522,6 +525,7 @@ impl Store {
             self.apply(event);
         }
         self.tick(now);
+        self.flush_resume_sends();
         std::mem::take(&mut self.changed)
     }
 

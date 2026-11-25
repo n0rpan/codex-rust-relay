@@ -230,7 +230,11 @@ impl Jobs {
                 .clone()
                 .unwrap_or_else(|| "Claude subscription".to_owned()),
             native_session: None,
-            progress: "Starting the stock client".to_owned(),
+            progress: if request.claude_shell_unsandboxed() {
+                "Starting the stock client without a shell: Claude Code's sandbox needs bwrap and socat on Linux, so this write worker can edit files but not run commands.".to_owned()
+            } else {
+                "Starting the stock client".to_owned()
+            },
             result: None,
             error: None,
         }));
@@ -413,43 +417,45 @@ impl Start {
             }
             (Runtime::Claude, mode) => {
                 let writes = self.writes()?;
-                // Write workers run in Accept edits mode, which approves file edits but
-                // not shell commands. Offering Bash would tell the model it can run
-                // commands that print mode always denies, so it is left out here.
-                let tools = if writes {
-                    "Read,Glob,Grep,Edit,Write,Workflow"
-                } else {
-                    "Read,Glob,Grep,Workflow"
-                };
+                let sandboxed = writes && claude_sandbox_supported(std::env::consts::OS, on_path);
+                let (tools, allowed) = claude_tools(writes, sandboxed, mode == Mode::Workflow);
                 if !writes {
                     command.args([
                         "--disallowedTools",
                         "Bash,Edit,Write,MultiEdit,NotebookEdit",
                     ]);
                 }
-                command
-                    .args([
-                        "--print",
-                        "--input-format",
-                        "stream-json",
-                        "--output-format",
-                        "stream-json",
-                        "--verbose",
-                        "--permission-mode",
-                        if writes { "acceptEdits" } else { "dontAsk" },
-                        "--tools",
-                        tools,
-                        "--allowedTools",
-                        if mode == Mode::Workflow {
-                            "Read,Glob,Grep,Workflow"
-                        } else {
-                            "Read,Glob,Grep"
-                        },
-                    ])
-                    .stdin(Stdio::piped());
+                command.args([
+                    "--print",
+                    "--input-format",
+                    "stream-json",
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
+                    "--permission-mode",
+                    if writes { "acceptEdits" } else { "dontAsk" },
+                    "--tools",
+                    tools,
+                    "--allowedTools",
+                    allowed,
+                ]);
+                if sandboxed {
+                    // Stock Claude Code merges this with the account settings ox builds.
+                    let sandbox = crate::clients::claude_sandbox_document().to_string();
+                    command.args(["--settings", sandbox.as_str()]);
+                }
+                command.stdin(Stdio::piped());
             }
         }
         Ok(command)
+    }
+
+    /// True when a Claude write worker starts without Bash because Claude
+    /// Code's sandbox cannot run here. The start notice says so.
+    pub(super) fn claude_shell_unsandboxed(&self) -> bool {
+        self.runtime == Runtime::Claude
+            && self.writes().unwrap_or(false)
+            && !claude_sandbox_supported(std::env::consts::OS, on_path)
     }
 
     fn sandbox(&self) -> &'static str {
@@ -458,6 +464,40 @@ impl Start {
         } else {
             "read-only"
         }
+    }
+}
+
+/// Claude Code's sandbox needs bwrap and socat on Linux. It is verified only
+/// there, so other platforms fall back to edits without a shell.
+fn claude_sandbox_supported(os: &str, on_path: impl Fn(&str) -> bool) -> bool {
+    os == "linux" && on_path("bwrap") && on_path("socat")
+}
+
+/// Whether an executable of this name is on PATH. A directory scan, no spawn.
+fn on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+}
+
+/// The `--tools` and `--allowedTools` lists for a Claude worker. Bash is offered
+/// only to a write worker whose sandbox is running; read workers never get it.
+fn claude_tools(writes: bool, sandboxed: bool, workflow: bool) -> (&'static str, &'static str) {
+    match (writes, sandboxed, workflow) {
+        (true, true, false) => (
+            "Read,Glob,Grep,Edit,Write,Bash,Workflow",
+            "Read,Glob,Grep,Bash",
+        ),
+        (true, true, true) => (
+            "Read,Glob,Grep,Edit,Write,Bash,Workflow",
+            "Read,Glob,Grep,Bash,Workflow",
+        ),
+        (true, false, false) => ("Read,Glob,Grep,Edit,Write,Workflow", "Read,Glob,Grep"),
+        (true, false, true) => (
+            "Read,Glob,Grep,Edit,Write,Workflow",
+            "Read,Glob,Grep,Workflow",
+        ),
+        (false, _, false) => ("Read,Glob,Grep,Workflow", "Read,Glob,Grep"),
+        (false, _, true) => ("Read,Glob,Grep,Workflow", "Read,Glob,Grep,Workflow"),
     }
 }
 
@@ -878,18 +918,34 @@ mod worker_contract_tests {
     }
 
     #[test]
-    fn write_claude_workers_are_not_offered_bash() {
+    fn write_claude_workers_get_bash_only_inside_the_sandbox() {
         let request = start(json!({
             "runtime": "claude", "mode": "session", "task": "fix it",
             "model": "fixture", "permission_mode": "write"
         }));
+        let sandboxed = claude_sandbox_supported(std::env::consts::OS, on_path);
         let command = request.command(Path::new("/"), Path::new("/")).unwrap();
         let args = args_of(&command);
-        let tools = value_after(&args, "--tools");
-        // Accept edits approves file edits, not shell commands, so Bash is not offered.
-        assert_eq!(tools, "Read,Glob,Grep,Edit,Write,Workflow");
         assert_eq!(value_after(&args, "--permission-mode"), "acceptEdits");
-        assert_eq!(value_after(&args, "--allowedTools"), "Read,Glob,Grep");
+        if sandboxed {
+            assert_eq!(
+                value_after(&args, "--tools"),
+                "Read,Glob,Grep,Edit,Write,Bash,Workflow"
+            );
+            assert_eq!(value_after(&args, "--allowedTools"), "Read,Glob,Grep,Bash");
+            let settings = value_after(&args, "--settings");
+            assert_eq!(
+                serde_json::from_str::<Value>(settings).unwrap(),
+                crate::clients::claude_sandbox_document()
+            );
+        } else {
+            assert_eq!(
+                value_after(&args, "--tools"),
+                "Read,Glob,Grep,Edit,Write,Workflow"
+            );
+            assert_eq!(value_after(&args, "--allowedTools"), "Read,Glob,Grep");
+            assert!(!args.iter().any(|arg| arg == "--settings"));
+        }
 
         let read = start(json!({
             "runtime": "claude", "mode": "session", "task": "look",
@@ -900,6 +956,55 @@ mod worker_contract_tests {
         assert_eq!(
             value_after(&args, "--disallowedTools"),
             "Bash,Edit,Write,MultiEdit,NotebookEdit"
+        );
+        assert!(!args.iter().any(|arg| arg == "--settings"));
+    }
+
+    #[test]
+    fn claude_sandbox_needs_bwrap_and_socat_on_linux() {
+        let with = |names: &'static [&'static str]| move |name: &str| names.contains(&name);
+        assert!(claude_sandbox_supported("linux", with(&["bwrap", "socat"])));
+        assert!(!claude_sandbox_supported("linux", with(&["bwrap"])));
+        assert!(!claude_sandbox_supported("linux", with(&["socat"])));
+        assert!(!claude_sandbox_supported(
+            "macos",
+            with(&["bwrap", "socat"])
+        ));
+        assert!(!claude_sandbox_supported(
+            "windows",
+            with(&["bwrap", "socat"])
+        ));
+    }
+
+    #[test]
+    fn claude_write_tools_offer_bash_only_when_sandboxed() {
+        assert_eq!(
+            claude_tools(true, true, false),
+            (
+                "Read,Glob,Grep,Edit,Write,Bash,Workflow",
+                "Read,Glob,Grep,Bash"
+            )
+        );
+        assert_eq!(
+            claude_tools(true, true, true),
+            (
+                "Read,Glob,Grep,Edit,Write,Bash,Workflow",
+                "Read,Glob,Grep,Bash,Workflow"
+            )
+        );
+        // Without the sandbox a write worker edits files but has no shell.
+        assert_eq!(
+            claude_tools(true, false, false),
+            ("Read,Glob,Grep,Edit,Write,Workflow", "Read,Glob,Grep")
+        );
+        // Read workers never get Bash, sandboxed or not.
+        assert_eq!(
+            claude_tools(false, false, false),
+            ("Read,Glob,Grep,Workflow", "Read,Glob,Grep")
+        );
+        assert_eq!(
+            claude_tools(false, true, false),
+            ("Read,Glob,Grep,Workflow", "Read,Glob,Grep")
         );
     }
 
