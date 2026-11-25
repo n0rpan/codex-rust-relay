@@ -5671,27 +5671,36 @@ for line in sys.stdin:
                     "after restart".into(),
                 ))
                 .unwrap();
+            // The fork's own process may also log here, so pick the launch that
+            // resumes the worker after the restart rather than a fixed position.
+            let before = argv(&raw).len();
             fresh
                 .dispatch(Action::SendText(
                     Some(worker.clone()),
                     "after restart".into(),
                 ))
                 .unwrap();
+            let resumes = |a: &Vec<String>| {
+                a.windows(2).any(|w| w[0] == "--resume" && w[1] == raw)
+                    && !a.contains(&"--fork-session".to_owned())
+            };
             let end = Instant::now() + Duration::from_secs(10);
-            while argv(&raw).len() < 4 {
-                assert!(Instant::now() < end, "no launch after restart");
+            let restarted = loop {
+                if let Some(a) = argv(&raw).into_iter().skip(before).find(|a| resumes(a)) {
+                    break a;
+                }
+                assert!(
+                    Instant::now() < end,
+                    "no resume after restart: {:?}",
+                    argv(&raw)
+                );
                 if let Ok(e) = rx2.recv_timeout(Duration::from_millis(50)) {
                     fresh.apply(e);
                 }
-            }
-            let restarted = argv(&raw);
-            assert!(
-                has_policy(&restarted[3]),
-                "after restart: {:?}",
-                restarted[3]
-            );
+            };
+            assert!(has_policy(&restarted), "after restart: {restarted:?}");
             assert_eq!(
-                at(&restarted[3], "--permission-mode").as_deref(),
+                at(&restarted, "--permission-mode").as_deref(),
                 Some("acceptEdits")
             );
         }
