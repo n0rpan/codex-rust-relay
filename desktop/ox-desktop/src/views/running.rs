@@ -13,6 +13,7 @@ use ox_desk_core::host_protocol::{ProcessView, Scope};
 use std::{
     io,
     path::Path,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,7 +21,7 @@ use std::{
 type Target = (Scope, Vec<String>);
 
 const POLL: Duration = Duration::from_secs(5);
-/// The slower cadence while nothing is running: each poll is a full host connection.
+/// Poll less often while nothing is running.
 const POLL_EMPTY: Duration = Duration::from_secs(20);
 
 /// A compact duration such as `40s`, `12m`, `3h` or `2d`. Negative spans read as zero.
@@ -109,7 +110,8 @@ pub struct Running {
     /// A busy row whose End is waiting for the user to confirm.
     confirm: Option<Target>,
     /// Set by the sidebar each time it draws. Polling stops while the panel is hidden.
-    pub(super) shown: bool,
+    shown: bool,
+    monitor: Arc<platform::ProcessMonitor>,
     /// The list is expanded above the sidebar footer.
     pub(super) open: bool,
     _poll: Task<()>,
@@ -152,8 +154,18 @@ impl Running {
             end_error: None,
             confirm: None,
             shown: false,
+            monitor: Arc::default(),
             open: false,
             _poll: poll,
+        }
+    }
+
+    pub(super) fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
+        if self.shown != shown {
+            self.shown = shown;
+            if shown {
+                self.refresh(cx);
+            }
         }
     }
 
@@ -163,7 +175,8 @@ impl Running {
             return;
         }
         self.loading = true;
-        let task = cx.background_spawn(async { platform::list_processes() });
+        let monitor = self.monitor.clone();
+        let task = cx.background_spawn(async move { monitor.list() });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |s, cx| {
@@ -248,9 +261,10 @@ impl Running {
         if seen.is_empty() {
             return;
         }
+        let monitor = self.monitor.clone();
         self.end(
             move || {
-                let fresh = platform::list_processes().map_err(|e| e.to_string())?;
+                let fresh = monitor.list().map_err(|e| e.to_string())?;
                 Ok(still_idle(&seen, &fresh))
             },
             false,

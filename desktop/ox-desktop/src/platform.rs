@@ -1,6 +1,6 @@
 mod host_client;
 pub(crate) use host_client::{
-    CatalogEvent, CatalogWatch, HOST_NOT_RUNNING, discover, end_threads, list_processes,
+    CatalogEvent, CatalogWatch, HOST_NOT_RUNNING, ProcessMonitor, discover, end_threads,
     open_store, watch_catalog,
 };
 pub mod onboarding;

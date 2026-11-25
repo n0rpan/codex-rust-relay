@@ -1519,7 +1519,7 @@ impl Host {
         }
         let inline = !compact && self.sidebar_visible;
         let shown = inline || self.drawer_open;
-        self.running.update(cx, |r, _| r.shown = shown);
+        self.running.update(cx, |r, cx| r.set_shown(shown, cx));
         let pane_width = window.viewport_size().width
             - if inline {
                 px(self.sidebar_width as f32 + DIVIDER_WIDTH)
