@@ -86,7 +86,12 @@ pub(crate) enum HostLink {
 }
 
 impl HostLink {
-    pub(crate) fn find(cwd: &Path) -> Result<Option<Self>, String> {
+    /// `policy` applies only to a helper the host did not start: a helper the host
+    /// runs always hands its workers to that host.
+    pub(crate) fn find(
+        cwd: &Path,
+        policy: crate::provider::WorkersHost,
+    ) -> Result<Option<Self>, String> {
         if let Some(addr) = env::var_os(ENDPOINT) {
             if LEASE.get().is_none() {
                 return Err("This OX worker gateway is not attached to a live host".into());
@@ -102,6 +107,9 @@ impl HostLink {
                 scope: json!({"project": project, "route": route}),
             }));
         }
+        if policy == crate::provider::WorkersHost::Never {
+            return Ok(None);
+        }
         let socket = host_socket();
         Ok(socket
             .filter(|s| UnixStream::connect(s).is_ok())
@@ -109,24 +117,27 @@ impl HostLink {
     }
 
     /// Send one launch (`call` is None) or parent call and wait for the host's answer.
+    /// `thread` is the calling native thread reported by the stock client in the
+    /// MCP request metadata. A session-scoped helper's own session takes precedence.
     pub(crate) async fn send(
         self,
         launch: String,
         caller: Value,
+        thread: Option<String>,
         start: Option<Value>,
         call: Option<Value>,
     ) -> Result<Value, String> {
+        let hint = env::var("OX_HOST_WORKER_PARENT").ok().or(thread);
         let wait = Duration::from_secs(if start.is_some() { 80 } else { 15 });
         tokio::task::spawn_blocking(move || match self {
             Self::Hosted { addr, scope } => {
                 let body = match (start, call) {
                     (Some(mut start), _) => {
-                        start["parent"] =
-                            env::var("OX_HOST_WORKER_PARENT").unwrap_or_default().into();
+                        start["parent"] = hint.unwrap_or_default().into();
                         json!({"type":"launch","scope":scope,"launch":launch,"start":start})
                     }
                     (None, call) => json!({"type":"call","scope":scope,"launch":launch,
-                        "parent":env::var("OX_HOST_WORKER_PARENT").ok(),"call":call}),
+                        "parent":hint,"call":call}),
                 };
                 let mut socket =
                     UnixStream::connect(Path::new(&addr)).map_err(|e| e.to_string())?;

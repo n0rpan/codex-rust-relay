@@ -25,6 +25,10 @@ pub(crate) struct Marks {
     pub continued: u32,
     #[serde(default)]
     pub access: Option<Access>,
+    /// A terminal parent's native session, observed after launch and bound once
+    /// by the launch that started the worker. Never changed afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +94,9 @@ impl Registry {
             .iter()
             .filter(move |((s, _), _)| s == scope)
             .map(|((_, id), e)| (id.as_str(), e))
+    }
+    pub fn entries_mut(&mut self) -> impl Iterator<Item = (&Scope, &mut Entry)> {
+        self.sessions.iter_mut().map(|((s, _), e)| (s, e))
     }
     pub fn job_ids(&self) -> impl Iterator<Item = u64> + '_ {
         self.sessions.values().map(|e| e.origin.job_id)
@@ -179,40 +186,63 @@ pub(crate) fn operator_access(origin: &Origin, access: Access) -> Result<(), Str
     }
 }
 
-/// Parent-agent callers see only their own jobs.
-/// `parents` are the hosted sessions that could be calling.
-pub(crate) fn owns(caller: &Caller, parents: &[String], origin: &Origin) -> bool {
-    let p = &origin.parent;
+/// A parent-agent caller after identity resolution. Every parent operation,
+/// listing included, filters jobs through [`owns`] with this one value, so no
+/// operation is looser than another.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Resolved {
+    /// Exactly one hosted session, verified as active on the helper's route.
+    Hosted { scope: Scope, session: String },
+    /// A terminal launch: its private launch digest and any session it observed.
+    Terminal {
+        project: std::path::PathBuf,
+        launch: String,
+        session: Option<String>,
+    },
+}
+
+/// Whether this caller may see and control the job. A terminal launch owns what
+/// it started. A terminal session owns jobs whose parent session it is, as
+/// recorded at launch or bound later by that launch. Nothing else matches: when
+/// a launch ends without a known session, only operators control its workers.
+pub(crate) fn owns(caller: &Resolved, entry: &Entry) -> bool {
+    let p = &entry.origin.parent;
     match caller {
-        Caller::Hosted { scope, .. } => {
-            p.scope.as_ref() == Some(scope)
-                && p.session.as_ref().is_some_and(|s| parents.contains(s))
+        Resolved::Hosted { scope, session } => {
+            p.scope.as_ref() == Some(scope) && p.session.as_deref() == Some(session)
         }
-        Caller::External(c) => {
+        Resolved::Terminal {
+            project,
+            launch,
+            session,
+        } => {
             p.scope.is_none()
-                && p.project == c.project
-                && (origin.launch == c.launch
-                    || match (&p.session, &c.session) {
-                        (Some(a), Some(b)) => a == b,
-                        (None, _) => true,
-                        (Some(_), None) => false,
-                    })
+                && &p.project == project
+                && (&entry.origin.launch == launch
+                    || session.as_ref().is_some_and(|s| {
+                        p.session.as_ref() == Some(s)
+                            || entry.marks.parent_session.as_ref() == Some(s)
+                    }))
         }
-        Caller::Operator { .. } => false,
     }
 }
 
-/// List only what the calling launch or session started.
-pub(crate) fn lists(caller: &Caller, parents: &[String], origin: &Origin) -> bool {
-    match caller {
-        Caller::External(c) => {
-            origin.parent.scope.is_none()
-                && origin.parent.project == c.project
-                && (origin.launch == c.launch
-                    || origin.parent.session.is_some() && origin.parent.session == c.session)
-        }
-        _ => owns(caller, parents, origin),
-    }
+/// The non-secret digest a launch token is stored as. Catalog rows carry it, so
+/// it must not let anyone who reads a row act as that launch.
+pub(crate) fn launch_digest(kind: &str, token: &str) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(token.as_bytes());
+    let hex: String = hash[..12].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{kind}:{hex}")
+}
+
+/// Accept only a plausible native session identifier from a gateway.
+pub(crate) fn valid_session(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 pub(crate) fn parent_ref(caller: &Caller, session: Option<String>) -> ParentRef {
@@ -226,7 +256,7 @@ pub(crate) fn parent_ref(caller: &Caller, session: Option<String>) -> ParentRef 
         Caller::External(c) => ParentRef {
             project: c.project.clone(),
             scope: None,
-            session: c.session.clone(),
+            session: c.session.clone().filter(|s| valid_session(s)),
             runtime: Some(c.runtime),
         },
     }
@@ -234,8 +264,8 @@ pub(crate) fn parent_ref(caller: &Caller, session: Option<String>) -> ParentRef 
 
 pub(crate) fn launch_identity(caller: &Caller) -> String {
     match caller {
-        Caller::Hosted { launch, .. } => format!("helper:{launch}"),
-        Caller::External(c) => format!("terminal:{}", c.launch),
+        Caller::Hosted { launch, .. } => launch_digest("helper", launch),
+        Caller::External(c) => launch_digest("terminal", &c.launch),
         Caller::Operator { device, .. } => format!("operator:{device}"),
     }
 }
@@ -262,14 +292,21 @@ pub(crate) fn origin(
     }
 }
 
-/// Parse a gateway's parent-agent request. Anything outside the four tools,
-/// such as answering an approval, is refused here.
+/// Parse a gateway's request. Anything outside the four parent tools and the
+/// terminal gateway's session binding, such as answering an approval, is refused.
 pub(crate) fn parent_call(value: Value) -> Result<ParentCall, String> {
     serde_json::from_value(value)
         .map_err(|_| "A parent agent can list, inspect, steer or cancel its workers.".into())
 }
 
 /// The status a parent agent reads, built from the host's own session state.
+/// Who could answer a worker request right now.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Operators {
+    /// Desktop windows and phones currently subscribed to the host.
+    pub connected: usize,
+}
+
 pub(crate) fn status(
     entry: &Entry,
     id: &str,
@@ -277,6 +314,7 @@ pub(crate) fn status(
     view: Option<&SessionView>,
     timeline: Option<&Timeline>,
     live: bool,
+    operators: Operators,
 ) -> Value {
     let o = &entry.origin;
     let row = view.map_or("interrupted", |v| v.status.as_str());
@@ -285,7 +323,10 @@ pub(crate) fn status(
         "cancelled"
     } else {
         match row {
-            "running" | "needs_input" => "running",
+            // A host-owned worker's approvals and questions wait for a person,
+            // never for the parent. Say so, so the agent can tell its user.
+            "needs_input" => "waiting_for_operator",
+            "running" => "running",
             "failed" => "failed",
             "interrupted" | "Last seen running" => "interrupted",
             _ if !live => "interrupted",
@@ -320,11 +361,32 @@ pub(crate) fn status(
                 "note": "The human operator sent this worker instructions. Its result may reflect them as well as your task.",
             })
         });
+    let title = view.map_or("OX worker", |v| v.title.as_str());
+    let waiting = (status == "waiting_for_operator").then(|| {
+        let project = o.parent.project.display();
+        let message = if operators.connected > 0 {
+            format!(
+                "The worker is waiting for a person to answer an approval or question. It is shown in OX Desktop and on paired phones as \"{title}\" under {project}. Tell the user to answer it there."
+            )
+        } else {
+            format!(
+                "The worker is waiting for a person to answer an approval or question, and no OX Desktop window or paired phone is connected. Tell the user to open the session \"{title}\" with `ox desktop {project}` or on a paired phone, or cancel the worker."
+            )
+        };
+        json!({
+            "answer_in": ["OX Desktop", "paired phone"],
+            "desktop_command": format!("ox desktop {project}"),
+            "session_title": title,
+            "operators_connected": operators.connected,
+            "message": message,
+        })
+    });
     json!({
+        "waiting_for_operator": waiting,
         "job_id": o.job_id,
         "mode": o.mode,
         "runtime": o.runtime,
-        "can_steer": status == "running" && row == "running"
+        "can_steer": status == "running"
             && view.is_some_and(|v| v.capabilities.iter().any(|c| c == "steer")),
         "status": status,
         "model": match &o.route.billing {
@@ -532,42 +594,64 @@ mod tests {
 
     #[test]
     fn parent_agents_see_only_their_own_jobs() {
-        let o = worker(Ceiling::Read, Runtime::Codex);
-        let hosted = Caller::Hosted {
+        let entry = |o: Origin| Entry {
+            origin: o,
+            marks: Marks::default(),
+        };
+        let hosted = entry(worker(Ceiling::Read, Runtime::Codex));
+        let me = |session: &str| Resolved::Hosted {
             scope: scope(Route::CODEX_SUBSCRIPTION),
-            hint: None,
-            launch: "b".into(),
+            session: session.into(),
         };
-        assert!(owns(&hosted, &["parent".into()], &o));
-        assert!(!owns(&hosted, &["other".into()], &o));
-        let elsewhere = Caller::Hosted {
+        assert!(owns(&me("parent"), &hosted));
+        // A sibling worker on the parent's own app-server is a different session.
+        assert!(!owns(&me("w-sibling"), &hosted));
+        let elsewhere = Resolved::Hosted {
             scope: scope(Route::codex_api("x".into())),
-            hint: None,
-            launch: "b".into(),
+            session: "parent".into(),
         };
-        assert!(!owns(&elsewhere, &["parent".into()], &o));
-        let terminal = |session: Option<&str>, launch: &str| {
-            Caller::External(ExternalCaller {
-                project: "/p".into(),
-                runtime: Runtime::Claude,
-                session: session.map(Into::into),
-                launch: launch.into(),
-            })
+        assert!(!owns(&elsewhere, &hosted));
+        let terminal = |session: Option<&str>, token: &str| Resolved::Terminal {
+            project: "/p".into(),
+            launch: launch_digest("terminal", token),
+            session: session.map(Into::into),
         };
         assert!(
-            !owns(&terminal(None, "a"), &[], &o),
+            !owns(&terminal(None, "a"), &hosted),
             "hosted jobs are not terminal jobs"
         );
-        let mut t = o.clone();
+
+        // Started by launch l1 without a known session.
+        let mut o = worker(Ceiling::Read, Runtime::Codex);
+        o.parent.scope = None;
+        o.parent.session = None;
+        o.launch = launch_digest("terminal", "l1");
+        let mut started = entry(o);
+        assert!(
+            owns(&terminal(None, "l1"), &started),
+            "the launch controls its worker"
+        );
+        // Another terminal launch in the same project controls nothing, with or
+        // without a session of its own. There is no project-wide fallback.
+        assert!(!owns(&terminal(None, "l2"), &started));
+        assert!(!owns(&terminal(Some("s9"), "l2"), &started));
+        // The digest in catalog rows is not the launch token.
+        let published = started.origin.launch.clone();
+        assert!(!owns(&terminal(None, &published), &started));
+        // Once l1 binds its observed session, a resume of that session sees it.
+        started.marks.parent_session = Some("s1".into());
+        assert!(owns(&terminal(Some("s1"), "l3"), &started));
+        assert!(!owns(&terminal(Some("s2"), "l3"), &started));
+
+        // Recorded at launch: the session's resume owns it; others do not.
+        let mut t = worker(Ceiling::Read, Runtime::Codex);
         t.parent.scope = None;
         t.parent.session = Some("s1".into());
-        t.launch = "terminal:l1".into();
-        // A resumed terminal session sees its job. Another session does not.
-        assert!(owns(&terminal(Some("s1"), "l2"), &[], &t));
-        assert!(!owns(&terminal(Some("s2"), "l2"), &[], &t));
-        assert!(!owns(&terminal(None, "l2"), &[], &t));
-        assert!(lists(&terminal(Some("s1"), "l2"), &[], &t));
-        assert!(!lists(&terminal(None, "l2"), &[], &t));
+        t.launch = launch_digest("terminal", "l1");
+        let t = entry(t);
+        assert!(owns(&terminal(Some("s1"), "l2"), &t));
+        assert!(!owns(&terminal(Some("s2"), "l2"), &t));
+        assert!(!owns(&terminal(None, "l2"), &t));
     }
 
     #[test]
@@ -596,24 +680,92 @@ mod tests {
             }],
             detail: json!({"last_finished":"t"}),
         };
-        let s = status(&entry, "w", "w", Some(&view("needs_input")), None, true);
-        assert_eq!(s["status"], "running");
+        // No desktop or phone connected: the parent learns it must send the user there.
+        let s = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view("needs_input")),
+            None,
+            true,
+            Operators::default(),
+        );
+        assert_eq!(s["status"], "waiting_for_operator");
         assert_eq!(s["can_steer"], false);
-        let s = status(&entry, "w", "w", Some(&view("idle")), Some(&done), true);
+        let waiting = &s["waiting_for_operator"];
+        assert_eq!(waiting["operators_connected"], 0);
+        assert_eq!(waiting["answer_in"], json!(["OX Desktop", "paired phone"]));
+        assert_eq!(waiting["desktop_command"], "ox desktop /p");
+        assert!(
+            waiting["message"]
+                .as_str()
+                .unwrap()
+                .contains("no OX Desktop window or paired phone is connected")
+        );
+        let s = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view("needs_input")),
+            None,
+            true,
+            Operators { connected: 2 },
+        );
+        assert!(
+            s["waiting_for_operator"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("Tell the user to answer it there")
+        );
+        let s = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view("running")),
+            None,
+            true,
+            Operators::default(),
+        );
+        assert!(s["waiting_for_operator"].is_null());
+        let s = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view("idle")),
+            Some(&done),
+            true,
+            Operators::default(),
+        );
         assert_eq!(
             (s["status"].as_str(), s["result"].as_str()),
             (Some("completed"), Some("final"))
         );
         assert!(s["operator"].is_null());
         entry.marks.continued = 1;
-        let s = status(&entry, "w", "w", Some(&view("running")), Some(&done), true);
+        let s = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view("running")),
+            Some(&done),
+            true,
+            Operators::default(),
+        );
         assert_eq!(s["status"], "running");
         assert_eq!(s["operator"]["continued"], 1);
-        let s = status(&entry, "w", "w", Some(&view("interrupted")), None, false);
+        let s = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view("interrupted")),
+            None,
+            false,
+            Operators::default(),
+        );
         assert_eq!(s["status"], "interrupted");
         entry.marks.cancelled = true;
         assert_eq!(
-            status(&entry, "w", "w", None, None, false)["status"],
+            status(&entry, "w", "w", None, None, false, Operators::default())["status"],
             "cancelled"
         );
     }

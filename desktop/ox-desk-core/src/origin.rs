@@ -226,14 +226,29 @@ impl WorkerStart {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ParentCall {
     List,
-    Status { job_id: u64 },
-    Steer { job_id: u64, text: String },
-    Cancel { job_id: u64 },
+    Status {
+        job_id: u64,
+    },
+    Steer {
+        job_id: u64,
+        text: String,
+    },
+    Cancel {
+        job_id: u64,
+    },
+    /// Sent by a terminal gateway, never by the agent: the gateway observed its
+    /// own native session. The host records it once on the launch's workers so
+    /// a later resume of that session can reach them.
+    Bind {
+        session: String,
+    },
 }
 
 /// A worker gateway the host does not run, such as `ox claude` in a terminal.
-/// The host can verify only the OS user. The session is a hint from the
-/// gateway's own launch arguments.
+/// The host can verify only the OS user. `launch` is a random token private to
+/// that gateway; the host keeps only its digest. `session` is the native session
+/// the gateway has observed, from its resume arguments or the stock client's own
+/// MCP request metadata.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]

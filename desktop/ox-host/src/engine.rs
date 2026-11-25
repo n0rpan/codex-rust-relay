@@ -1183,31 +1183,103 @@ impl Engine {
             .unwrap_or_else(|| id.rsplit(':').next().unwrap_or(id));
         let ready = live.is_some_and(|l| l.store.state() == &Connection::Ready);
         Ok(crate::workers::status(
-            entry, id, native, view, timeline, ready,
+            entry,
+            id,
+            native,
+            view,
+            timeline,
+            ready,
+            self.operators(),
         ))
+    }
+    /// Resolve the caller to exactly one parent identity, or refuse. Every
+    /// parent operation uses this one result.
+    fn resolve(&self, caller: &Caller) -> Result<crate::workers::Resolved, String> {
+        use crate::workers::Resolved;
+        match caller {
+            Caller::Hosted { scope, hint, .. } => {
+                let live = self
+                    .running
+                    .get(scope)
+                    .ok_or("This OX helper's route is not open on the session host.")?;
+                let session = crate::policy::single_parent(&live.store, hint.as_deref())?;
+                Ok(Resolved::Hosted {
+                    scope: scope.clone(),
+                    session,
+                })
+            }
+            Caller::External(c) => Ok(Resolved::Terminal {
+                project: c.project.clone(),
+                launch: crate::workers::launch_digest("terminal", &c.launch),
+                session: c
+                    .session
+                    .clone()
+                    .filter(|s| crate::workers::valid_session(s)),
+            }),
+            Caller::Operator { .. } => Err("Operators act on worker sessions directly.".into()),
+        }
+    }
+    /// Publish and save changed worker marks for a scope, live or cold.
+    fn persist_marks(&mut self, scope: &Scope) -> io::Result<()> {
+        if self.running.contains_key(scope) {
+            return self.process(scope, vec![], true);
+        }
+        let Some(cold) = self.cold.get_mut(scope) else {
+            return Ok(());
+        };
+        for row in &mut cold.sessions {
+            if let Some(entry) = self.workers.get(scope, &row.id) {
+                row.detail["worker_marks"] = json!(entry.marks);
+            }
+        }
+        self.ledger.update(SavedScope::from_state(cold))
+    }
+    /// Desktop windows and phones subscribed to the host right now.
+    fn operators(&self) -> crate::workers::Operators {
+        crate::workers::Operators {
+            connected: self
+                .clients
+                .values()
+                .filter(|c| c.catalog || c.subscription.is_some())
+                .count(),
+        }
     }
     /// The parent agent's four tools. Every answer comes from host session state.
     fn parent_call(&mut self, caller: &Caller, call: ParentCall) -> Result<Value, String> {
-        let parents = match caller {
-            Caller::Hosted { scope, hint, .. } => self
-                .running
-                .get(scope)
-                .map(|l| crate::policy::active_parents(&l.store, hint.as_deref()))
-                .unwrap_or_default(),
-            _ => vec![],
-        };
-        if matches!(caller, Caller::Hosted { .. }) && parents.is_empty() {
-            return Err("No active parent session was found for this OX helper.".into());
-        }
+        let me = self.resolve(caller)?;
+        let owned = |e: &crate::workers::Entry| crate::workers::owns(&me, e);
         let job_id = match &call {
-            ParentCall::List => {
-                if parents.len() > 1 {
-                    return Err("Several sessions on this route are running. Retry when only the parent is active.".into());
+            ParentCall::Bind { session } => {
+                let crate::workers::Resolved::Terminal { launch, .. } = &me else {
+                    return Err("Only a terminal OX launch binds its session.".into());
+                };
+                if !crate::workers::valid_session(session) {
+                    return Err("Invalid native session ID.".into());
                 }
+                // Write-once, and only on workers this exact launch started.
+                let mut scopes = Vec::new();
+                for (scope, entry) in self.workers.entries_mut() {
+                    if &entry.origin.launch == launch
+                        && entry.origin.parent.session.is_none()
+                        && entry.marks.parent_session.is_none()
+                    {
+                        entry.marks.parent_session = Some(session.clone());
+                        scopes.push(scope.clone());
+                    }
+                }
+                let bound = scopes.len();
+                scopes.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+                scopes.dedup();
+                for scope in scopes {
+                    self.persist_marks(&scope).map_err(|e| e.to_string())?;
+                }
+                return Ok(json!({ "bound": bound }));
+            }
+            ParentCall::List => {
                 let mut jobs: Vec<u64> = self
                     .workers
                     .jobs()
-                    .filter(|(_, _, e)| crate::workers::lists(caller, &parents, &e.origin))
+                    .filter(|(_, _, e)| owned(e))
                     .map(|(_, _, e)| e.origin.job_id)
                     .collect();
                 jobs.sort_unstable();
@@ -1228,11 +1300,13 @@ impl Engine {
         let (scope, id) = self
             .workers
             .job(job_id)
-            .filter(|(_, _, e)| crate::workers::owns(caller, &parents, &e.origin))
+            .filter(|(_, _, e)| owned(e))
             .map(|(s, id, _)| (s.clone(), id.to_owned()))
             .ok_or("Unknown worker job for this parent session.")?;
         match call {
-            ParentCall::List | ParentCall::Status { .. } => self.job_status(job_id),
+            ParentCall::List | ParentCall::Bind { .. } | ParentCall::Status { .. } => {
+                self.job_status(job_id)
+            }
             ParentCall::Steer { text, .. } => {
                 let text = text.trim();
                 if text.is_empty() || text.len() > 24 * 1024 {
@@ -1266,7 +1340,10 @@ impl Engine {
             }
             ParentCall::Cancel { .. } => {
                 let status = self.job_status(job_id)?;
-                if status["status"] == "running" {
+                if matches!(
+                    status["status"].as_str(),
+                    Some("running" | "waiting_for_operator")
+                ) {
                     if let Some(live) = self.running.get_mut(&scope) {
                         let _ = live.store.stop(&id);
                     }
@@ -1737,14 +1814,58 @@ mod tests {
                     .unwrap_err()
                     .contains("Several sessions")
             );
-            // A job whose verified parent is one of the active sessions stays readable.
+            // Without the calling thread, every parent operation is refused, not
+            // only listing: status, steer and cancel are never looser than list.
             let o = origin(workers_parent(&parent, "a"), Ceiling::Read);
             engine.workers.stamp(&worker, "w", o);
+            for call in [
+                ParentCall::Status { job_id: 41 },
+                ParentCall::Steer {
+                    job_id: 41,
+                    text: "x".into(),
+                },
+                ParentCall::Cancel { job_id: 41 },
+            ] {
+                let err = engine.parent_call(&hosted(&parent), call).unwrap_err();
+                assert!(err.contains("Several sessions"), "{err}");
+            }
+            // With Codex's `_meta.threadId`, the caller is exact. "b" is a sibling
+            // worker on the same app-server: it sees none of a's jobs.
+            let thread = |id: &str| Caller::Hosted {
+                scope: parent.clone(),
+                hint: Some(id.into()),
+                launch: "helper".into(),
+            };
+            assert_eq!(
+                engine.parent_call(&thread("a"), ParentCall::List).unwrap()["jobs"][0]["job_id"],
+                41
+            );
             assert_eq!(
                 engine
-                    .parent_call(&hosted(&parent), ParentCall::Status { job_id: 41 })
+                    .parent_call(&thread("a"), ParentCall::Status { job_id: 41 })
                     .unwrap()["job_id"],
                 41
+            );
+            assert_eq!(
+                engine.parent_call(&thread("b"), ParentCall::List).unwrap()["jobs"],
+                json!([])
+            );
+            for call in [
+                ParentCall::Status { job_id: 41 },
+                ParentCall::Steer {
+                    job_id: 41,
+                    text: "x".into(),
+                },
+                ParentCall::Cancel { job_id: 41 },
+            ] {
+                assert!(engine.parent_call(&thread("b"), call).is_err());
+            }
+            assert!(!engine.workers.get(&worker, "w").unwrap().marks.cancelled);
+            // A thread ID that is not an active session on this route is refused.
+            assert!(
+                engine
+                    .parent_call(&thread("forged"), ParentCall::List)
+                    .is_err()
             );
             // A hint from a session-scoped helper resolves the ambiguity, and the
             // parent's read-only mode still caps the request before anything starts.
@@ -1889,8 +2010,9 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 (status["status"].as_str(), status["can_steer"].as_bool()),
-                (Some("running"), Some(false))
+                (Some("waiting_for_operator"), Some(false))
             );
+            assert!(status["waiting_for_operator"]["message"].is_string());
             let steer = engine.parent_call(
                 &caller,
                 ParentCall::Steer {
@@ -1950,6 +2072,158 @@ mod tests {
                 .unwrap();
             assert!(
                 matches!(log.lock().unwrap()[0], (Action::AnswerAsk(RequestId::Number(9), 0), Some(ref t)) if t == "native")
+            );
+        }
+
+        #[test]
+        fn terminal_workers_belong_to_their_launch_until_a_session_is_bound() {
+            let root = tempfile::tempdir().unwrap();
+            let (parent, worker) = scopes(root.path());
+            let terminal = |session: Option<&str>, launch: &str| {
+                Caller::External(ExternalCaller {
+                    project: worker.project.clone(),
+                    runtime: Runtime::Claude,
+                    session: session.map(Into::into),
+                    launch: launch.into(),
+                })
+            };
+            let mut bound = origin(workers_parent(&parent, "p"), Ceiling::Read);
+            bound.parent.scope = None;
+            bound.parent.session = None;
+            bound.launch = crate::workers::launch_digest("terminal", "token-one");
+            let mut orphan = bound.clone();
+            orphan.job_id = 42;
+            orphan.launch = crate::workers::launch_digest("terminal", "token-gone");
+            {
+                let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+                let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+                let (l, _) = live(
+                    &worker,
+                    vec![
+                        view(&worker, "w1", "running", "read_only"),
+                        view(&worker, "w2", "running", "read_only"),
+                    ],
+                    &["w1", "w2"],
+                    vec![],
+                );
+                engine.running.insert(worker.clone(), l);
+                engine.workers.stamp(&worker, "w1", bound.clone());
+                engine.workers.stamp(&worker, "w2", orphan.clone());
+                engine.process(&worker, vec![], true).unwrap();
+                // A second `ox codex` in the same repository sees and controls nothing.
+                let other = terminal(None, "token-two");
+                assert_eq!(
+                    engine.parent_call(&other, ParentCall::List).unwrap()["jobs"],
+                    json!([])
+                );
+                assert!(
+                    engine
+                        .parent_call(&other, ParentCall::Cancel { job_id: 41 })
+                        .is_err()
+                );
+                assert!(
+                    engine
+                        .parent_call(
+                            &other,
+                            ParentCall::Steer {
+                                job_id: 41,
+                                text: "x".into()
+                            }
+                        )
+                        .is_err()
+                );
+                // Its own launch controls it and binds its session once observed.
+                let own = terminal(None, "token-one");
+                assert_eq!(
+                    engine
+                        .parent_call(&own, ParentCall::Status { job_id: 41 })
+                        .unwrap()["job_id"],
+                    41
+                );
+                let reply = engine
+                    .parent_call(
+                        &own,
+                        ParentCall::Bind {
+                            session: "s1".into(),
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(reply["bound"], 1, "only this launch's workers are bound");
+                // Binding is write-once: a later claim cannot move the job.
+                engine
+                    .parent_call(
+                        &own,
+                        ParentCall::Bind {
+                            session: "s2".into(),
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    engine
+                        .workers
+                        .get(&worker, "w1")
+                        .unwrap()
+                        .marks
+                        .parent_session
+                        .as_deref(),
+                    Some("s1")
+                );
+                // A hosted caller has no binding operation.
+                let hinted = Caller::Hosted {
+                    scope: worker.clone(),
+                    hint: Some("w1".into()),
+                    launch: "h".into(),
+                };
+                assert!(
+                    engine
+                        .parent_call(
+                            &hinted,
+                            ParentCall::Bind {
+                                session: "s1".into()
+                            }
+                        )
+                        .is_err()
+                );
+            }
+            // After a host restart and the original launch's exit, a resume of s1
+            // reads its worker. The worker whose launch never learned a session
+            // is left to operators only.
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let resumed = terminal(Some("s1"), "token-three");
+            assert_eq!(
+                engine
+                    .parent_call(&resumed, ParentCall::Status { job_id: 41 })
+                    .unwrap()["job_id"],
+                41
+            );
+            assert!(
+                engine
+                    .parent_call(&resumed, ParentCall::Status { job_id: 42 })
+                    .is_err()
+            );
+            assert!(
+                engine
+                    .parent_call(
+                        &terminal(Some("s2"), "token-four"),
+                        ParentCall::Status { job_id: 41 }
+                    )
+                    .is_err()
+            );
+            assert!(
+                engine
+                    .parent_call(
+                        &terminal(None, "token-four"),
+                        ParentCall::Cancel { job_id: 42 }
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                engine.parent_call(&resumed, ParentCall::List).unwrap()["jobs"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
             );
         }
 

@@ -717,6 +717,16 @@ your desktop and paired phone, and a resumed parent can still read its status.
 The status includes the stock client's session ID when available.
 Work already written to the project stays there if you cancel.
 
+A host-owned worker's approvals and questions wait for a person in OX Desktop
+or on a paired phone, never for the main agent. `ox_worker_status` then
+reports `waiting_for_operator` with where to answer. To keep terminal workers
+inside the launch, with approvals denied as before, add this to `codeox.toml`:
+
+```toml
+[workers]
+host = "never"   # default "auto": use the session host when one is running
+```
+
 Workers start with read access in the current project. Tell the main agent
 explicitly when a worker may edit files. Client permissions still apply,
 including to shell commands. Give concurrent writers separate working

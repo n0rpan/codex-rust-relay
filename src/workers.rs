@@ -109,7 +109,13 @@ impl Relay {
             home: home.to_owned(),
             cwd: project_directory(args, client)?,
             session: session_hint(args, client),
-            launch: crate::random_token()?.chars().take(16).collect(),
+            observed: Mutex::new(None),
+            unbound: std::sync::atomic::AtomicBool::new(false),
+            host_policy: CodeoxConfig::load(&CodeoxConfig::path(home))
+                .map(|config| config.workers_host)
+                .unwrap_or_default(),
+            // Private to this launch. The host stores only a digest of it.
+            launch: crate::random_token()?,
             client,
             slots: Semaphore::new(4),
             jobs: Mutex::new(jobs::Jobs::default()),
@@ -125,6 +131,14 @@ impl Relay {
             }) => Err(result.unwrap_err().into()),
         }
     }
+}
+
+fn valid_session(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// The native session a terminal launch resumes, from its own arguments. The host
@@ -192,6 +206,11 @@ struct Service {
     home: PathBuf,
     cwd: PathBuf,
     session: Option<String>,
+    /// The native session first seen in a stock client's MCP request.
+    observed: Mutex<Option<String>>,
+    /// A host-owned worker was launched before this launch knew its session.
+    unbound: std::sync::atomic::AtomicBool,
+    host_policy: crate::provider::WorkersHost,
     launch: String,
     client: ClientKind,
     slots: Semaphore,
@@ -245,6 +264,14 @@ impl Service {
     }
 
     async fn handle(&self, request: Request<Incoming>) -> Response<RelayBody> {
+        // Stock Claude Code may name its session on outgoing requests. Treat it
+        // only as an observation of this launch's own session.
+        let header_session = request
+            .headers()
+            .get("x-claude-code-session-id")
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| valid_session(s))
+            .map(str::to_owned);
         if request.uri().path() != "/mcp" {
             return crate::error_response(StatusCode::NOT_FOUND, "Unknown worker endpoint");
         }
@@ -303,6 +330,17 @@ impl Service {
             return crate::bytes_response(StatusCode::ACCEPTED, Bytes::new(), "application/json");
         }
         let params = &call["params"];
+        // Stock Codex 0.171.0 and later put the calling thread in every tools/call
+        // `_meta.threadId`. It identifies the parent exactly on a shared app-server.
+        let thread = params["_meta"]["threadId"]
+            .as_str()
+            .filter(|s| valid_session(s))
+            .map(str::to_owned)
+            .or(header_session);
+        if method == "tools/call" {
+            self.observe(thread.as_deref()).await;
+        }
+        let thread = thread.as_deref();
         let result = match method {
             "initialize" => initialize(params),
             "ping" => json!({}),
@@ -331,7 +369,7 @@ impl Service {
                 }
                 Some("start_ox_worker") => {
                     match serde_json::from_value(params["arguments"].clone()) {
-                        Ok(request) => tool_result(self.start_job(request).await),
+                        Ok(request) => tool_result(self.start_job(request, thread).await),
                         Err(_) => {
                             return rpc_error(
                                 id.clone(),
@@ -341,7 +379,7 @@ impl Service {
                         }
                     }
                 }
-                Some("list_ox_workers") => tool_result(self.list_jobs().await),
+                Some("list_ox_workers") => tool_result(self.list_jobs(thread).await),
                 Some("steer_ox_worker") => {
                     let result = async {
                         let request: jobs::Steer =
@@ -353,6 +391,7 @@ impl Service {
                             return self
                                 .host_call(
                                     json!({"op":"steer","job_id":request.job_id,"text":text}),
+                                    thread,
                                 )
                                 .await;
                         }
@@ -378,7 +417,8 @@ impl Service {
                                 } else {
                                     "status"
                                 };
-                                self.host_call(json!({"op":op,"job_id":job.job_id})).await
+                                self.host_call(json!({"op":op,"job_id":job.job_id}), thread)
+                                    .await
                             } else {
                                 let mut jobs = self.jobs.lock().unwrap();
                                 if tool == "cancel_ox_worker" {
@@ -404,7 +444,7 @@ impl Service {
         )
     }
 
-    async fn start_job(&self, request: jobs::Start) -> Result<Value, String> {
+    async fn start_job(&self, request: jobs::Start, thread: Option<&str>) -> Result<Value, String> {
         request.validate()?;
         let app = self.app().await?;
         if let Some(model) = &request.model
@@ -417,13 +457,29 @@ impl Service {
         }
         // A running session host owns the worker, so it outlives this helper and
         // its approvals reach the human clients. Without one, run it here as before.
-        if let Some(host) = crate::host_lifetime::HostLink::find(&self.cwd)? {
+        if let Some(host) = crate::host_lifetime::HostLink::find(&self.cwd, self.host_policy)? {
             let start = request.host_start(&app.secrets);
+            let caller = self.caller(thread);
+            let unbound = caller["session"].is_null();
             let reply = host
-                .send(self.launch.clone(), self.caller(), Some(start), None)
+                .send(
+                    self.launch.clone(),
+                    caller,
+                    thread.map(str::to_owned),
+                    Some(start),
+                    None,
+                )
                 .await
                 .map_err(|e| crate::upstream::redact(&e, &app.secrets).into_owned())?;
-            return Ok(redact_value(reply, &app.secrets));
+            if unbound {
+                self.unbound
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            let mut reply = redact_value(reply, &app.secrets);
+            reply["approvals"] = json!(
+                "This worker is owned by the OX session host. Its approvals and questions go to OX Desktop and paired phones, not to you. If ox_worker_status reports waiting_for_operator, tell the user where to answer."
+            );
+            return Ok(reply);
         }
         self.jobs
             .lock()
@@ -431,33 +487,78 @@ impl Service {
             .start(request, &self.home, &self.cwd, Arc::clone(&app.secrets))
     }
 
-    fn caller(&self) -> Value {
+    /// The most exact session this launch knows for a call: the calling thread,
+    /// then the session in its own resume arguments, then the first one observed.
+    fn caller(&self, thread: Option<&str>) -> Value {
+        let session = thread
+            .map(str::to_owned)
+            .or_else(|| self.session.clone())
+            .or_else(|| self.observed.lock().unwrap().clone());
         json!({
             "project": self.cwd,
             "runtime": match self.client {
                 ClientKind::Codex => "codex",
                 ClientKind::Claude => "claude",
             },
-            "session": self.session,
+            "session": session,
             "launch": self.launch,
         })
     }
 
-    async fn host_call(&self, call: Value) -> Result<Value, String> {
+    /// Record this launch's native session the first time a request shows it,
+    /// and bind it to host-owned workers that were launched before it was known.
+    async fn observe(&self, thread: Option<&str>) {
+        let Some(thread) = thread else { return };
+        if self.session.is_some() {
+            return;
+        }
+        {
+            let mut observed = self.observed.lock().unwrap();
+            if observed.is_some() {
+                return;
+            }
+            *observed = Some(thread.to_owned());
+        }
+        if self
+            .unbound
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+            && let Ok(Some(host)) =
+                crate::host_lifetime::HostLink::find(&self.cwd, self.host_policy)
+            && matches!(host, crate::host_lifetime::HostLink::External { .. })
+        {
+            let _ = host
+                .send(
+                    self.launch.clone(),
+                    self.caller(Some(thread)),
+                    Some(thread.to_owned()),
+                    None,
+                    Some(json!({"op":"bind","session":thread})),
+                )
+                .await;
+        }
+    }
+
+    async fn host_call(&self, call: Value, thread: Option<&str>) -> Result<Value, String> {
         let app = self.app().await?;
-        let host = crate::host_lifetime::HostLink::find(&self.cwd)?
+        let host = crate::host_lifetime::HostLink::find(&self.cwd, self.host_policy)?
             .ok_or("Unknown worker job in this ox launch.")?;
         let reply = host
-            .send(self.launch.clone(), self.caller(), None, Some(call))
+            .send(
+                self.launch.clone(),
+                self.caller(thread),
+                thread.map(str::to_owned),
+                None,
+                Some(call),
+            )
             .await
             .map_err(|e| crate::upstream::redact(&e, &app.secrets).into_owned())?;
         Ok(redact_value(reply, &app.secrets))
     }
 
-    async fn list_jobs(&self) -> Result<Value, String> {
+    async fn list_jobs(&self, thread: Option<&str>) -> Result<Value, String> {
         let mut local = self.jobs.lock().unwrap().list();
-        if crate::host_lifetime::HostLink::find(&self.cwd)?.is_some() {
-            let hosted = self.host_call(json!({"op":"list"})).await?;
+        if crate::host_lifetime::HostLink::find(&self.cwd, self.host_policy)?.is_some() {
+            let hosted = self.host_call(json!({"op":"list"}), thread).await?;
             if let (Some(jobs), Some(more)) =
                 (local["jobs"].as_array_mut(), hosted["jobs"].as_array())
             {
@@ -651,7 +752,7 @@ fn tools() -> Value {
             },
             {
                 "name": "ox_worker_status",
-                "description": "Get a worker's running or terminal status, native session ID, progress, and result. Jobs keep running between tool calls.",
+                "description": "Get a worker's running or terminal status, native session ID, progress, and result. Jobs keep running between tool calls. Status waiting_for_operator means a person must answer an approval or question in OX Desktop or on a paired phone; tell the user where, using waiting_for_operator.message.",
                 "inputSchema": {"type":"object","properties":{"job_id":{"type":"integer","minimum":1}},"required":["job_id"],"additionalProperties":false},
                 "annotations": {"readOnlyHint":true,"openWorldHint":false},
             },
@@ -751,6 +852,29 @@ mod tests {
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
     }
+    #[test]
+    fn only_plausible_native_session_ids_are_observed() {
+        assert!(valid_session("019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b"));
+        assert!(!valid_session(""));
+        assert!(!valid_session("../etc"));
+        assert!(!valid_session("a b"));
+        assert!(!valid_session(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn with_workers_host_never_a_terminal_launch_keeps_workers_in_process() {
+        // Without the host's private endpoint, `never` skips host discovery even
+        // when a host socket is configured.
+        if std::env::var_os("OX_HOST_LIFETIME_SOCKET").is_none() {
+            let found = crate::host_lifetime::HostLink::find(
+                std::path::Path::new("."),
+                crate::provider::WorkersHost::Never,
+            )
+            .unwrap();
+            assert!(found.is_none());
+        }
+    }
+
     #[test]
     fn a_resumed_terminal_launch_names_its_native_session() {
         let id = "0b8d6f2e-3c41-4f0a-9e57-1d2c3b4a5f60";

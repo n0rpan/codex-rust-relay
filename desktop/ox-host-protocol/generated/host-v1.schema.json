@@ -1099,7 +1099,7 @@
     },
     "ExternalCaller": {
       "additionalProperties": false,
-      "description": "A worker gateway the host does not run, such as `ox claude` in a terminal.\nThe host can verify only the OS user. The session is a hint from the\ngateway's own launch arguments.",
+      "description": "A worker gateway the host does not run, such as `ox claude` in a terminal.\nThe host can verify only the OS user. `launch` is a random token private to\nthat gateway; the host keeps only its digest. `session` is the native session\nthe gateway has observed, from its resume arguments or the stock client's own\nMCP request metadata.",
       "properties": {
         "launch": {
           "type": "string"
@@ -1288,6 +1288,24 @@
           "required": [
             "op",
             "job_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Sent by a terminal gateway, never by the agent: the gateway observed its\nown native session. The host records it once on the launch's workers so\na later resume of that session can reach them.",
+          "properties": {
+            "op": {
+              "const": "bind",
+              "type": "string"
+            },
+            "session": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "session"
           ],
           "type": "object"
         }
