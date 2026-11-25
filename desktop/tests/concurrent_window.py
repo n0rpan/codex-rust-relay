@@ -108,12 +108,12 @@ def run(gui, stock, root):
                 def click(x, y):
                     command("xdotool", "mousemove", "--window", window, str(x), str(y), "click", "1")
 
-                def press(label):
-                    """Click an icon control by its accessible label through the layout probe;
+                def press(label, sock=child["OX_DESK_STATS_SOCKET"]):
+                    """Click a control by its id or accessible label through the layout probe;
                     icon buttons carry no visible word for OCR."""
                     end = time.monotonic() + 12
                     while time.monotonic() < end:
-                        probe.sendto(b"snapshot", child["OX_DESK_STATS_SOCKET"])
+                        probe.sendto(b"snapshot", sock)
                         view = json.loads(probe.recv(1 << 20))
                         for control in view.get("layout", []):
                             if (control["window"] == "OX Desktop" and label in (control["label"], control["id"])
@@ -257,25 +257,26 @@ def run(gui, stock, root):
         fresh = root / "fresh"
         fresh.mkdir(mode=0o700)
         fresh_env = {**child, "HOME": str(fresh), "CODEX_HOME": str(fresh / ".codex"),
-                     "XDG_STATE_HOME": str(fresh / "state")}
-        with session_host(gui.with_name("ox-host"),root,fresh_env), subprocess.Popen([gui, alpha], env=fresh_env) as app:
+                     "XDG_STATE_HOME": str(fresh / "state"),
+                     "OX_DESK_STATS_SOCKET": str(fresh / "stats")}
+        with session_host(gui.with_name("ox-host"),root,fresh_env), subprocess.Popen([gui, alpha], env=fresh_env) as app, \
+                socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as probe:
+            probe.bind(str(fresh / "probe"))
+            probe.settimeout(2)
             try:
                 window = command("xdotool", "search", "--sync", "--onlyvisible", "--pid",
                                  str(app.pid), "--name", "OX Desktop").splitlines()[-1]
                 command("xdotool", "windowfocus", window)
-                heading = word("connect")
-                configure = word("configure")
-                # The primary sign-in button sits between the last line of the
-                # account description and the secondary provider button. Its
-                # tinted label is unreadable to OCR on some Ubuntu fonts.
-                description = word("subscription", between_rows=(heading[1], configure[1]))
-                click(configure[0], (description[1] + configure[1]) // 2)
+                word("connect")
+                # The onboarding buttons carry ids: the tinted primary label is unreadable
+                # to OCR on some fonts, and the description wording is free to change.
+                press("native-sign-in", fresh_env["OX_DESK_STATS_SOCKET"])
                 terminal_file = fresh / "terminal.json"
                 end = time.monotonic() + 5
                 while not terminal_file.exists() and time.monotonic() < end:
                     time.sleep(.05)
                 assert json.loads(terminal_file.read_text())[-2:] == ["login", "chatgpt"]
-                click(*word("configure"))
+                press("setup-provider", fresh_env["OX_DESK_STATS_SOCKET"])
                 word("custom")
                 print("A fresh profile reached native sign-in and the provider settings form.")
             finally:

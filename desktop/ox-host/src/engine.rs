@@ -177,6 +177,8 @@ struct ClientState {
     prepared: Option<crate::runtime::Prepared>,
     subscription: Option<Option<Scope>>,
     catalog: bool,
+    /// A desktop window that may take a terminal handoff held for its scope.
+    terminal: bool,
 }
 struct Live {
     launching: Option<Launching>,
@@ -469,6 +471,7 @@ impl Engine {
                             prepared: None,
                             subscription: None,
                             catalog: false,
+                            terminal: false,
                         },
                     );
                 }
@@ -644,7 +647,16 @@ impl Engine {
                     },
                 )
             }
-            Client::Subscribe { scope, after } => self.subscribe(id, scope, after),
+            Client::Subscribe {
+                scope,
+                after,
+                terminal,
+            } => {
+                if let Some(client) = self.clients.get_mut(&id) {
+                    client.terminal = terminal;
+                }
+                self.subscribe(id, scope, after)
+            }
             Client::WorkerLaunch {
                 id: key,
                 mut caller,
@@ -884,6 +896,11 @@ impl Engine {
         let Some(scope) = scope else {
             return Ok(());
         };
+        // A phone, push or operator gateway subscribed to the scope must never consume a
+        // desktop's terminal handoff.
+        if !self.clients.get(&id).is_some_and(|c| c.terminal) {
+            return Ok(());
+        }
         if let Some(frame) = self
             .running
             .get_mut(scope)
@@ -2705,6 +2722,7 @@ mod tests {
                 prepared: None,
                 subscription: Some(Some(scope.clone())),
                 catalog: false,
+                terminal: false,
             },
         );
         let act = |approval: Option<String>| Client::Act {
@@ -3286,6 +3304,7 @@ mod tests {
                         prepared: None,
                         subscription: Some(Some(worker.clone())),
                         catalog: false,
+                        terminal: false,
                     },
                 );
             }
@@ -4956,7 +4975,7 @@ mod tests {
         }
 
         #[test]
-        fn a_handoff_held_for_a_gone_client_reaches_the_next_subscriber() {
+        fn a_handoff_held_for_a_gone_client_reaches_the_next_desktop_subscriber_only() {
             let root = tempfile::tempdir().unwrap();
             let (tx, _rx) = std::sync::mpsc::sync_channel(64);
             let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
@@ -4974,22 +4993,39 @@ mod tests {
                 Instant::now() + Duration::from_secs(600),
             ));
             engine.running.insert(scope.clone(), live);
-            let (peer, frames) = crate::transport::test_peer();
-            engine.clients.insert(
-                9,
-                ClientState {
-                    peer,
-                    hello: true,
-                    prepared: None,
-                    subscription: None,
-                    catalog: false,
-                },
+            let client = |terminal| {
+                let (peer, frames) = crate::transport::test_peer();
+                (
+                    ClientState {
+                        peer,
+                        hello: true,
+                        prepared: None,
+                        subscription: None,
+                        catalog: false,
+                        terminal,
+                    },
+                    frames,
+                )
+            };
+            let sent = |frames: &std::sync::mpsc::Receiver<crate::transport::Packet>| {
+                frames
+                    .try_iter()
+                    .map(|p| String::from_utf8_lossy(&p).into_owned())
+                    .collect::<Vec<_>>()
+            };
+            // A phone, push or operator subscriber of the scope never takes it.
+            let (phone, phone_frames) = client(false);
+            engine.clients.insert(8, phone);
+            engine.subscribe(8, Some(scope.clone()), None).unwrap();
+            assert!(
+                !sent(&phone_frames).iter().any(|f| f.contains("\"handoff\"")),
+                "a non-desktop subscriber received the terminal handoff"
             );
+            assert!(engine.running[&scope].held_handoff.is_some());
+            let (desktop, frames) = client(true);
+            engine.clients.insert(9, desktop);
             engine.subscribe(9, Some(scope.clone()), None).unwrap();
-            let sent: Vec<String> = frames
-                .try_iter()
-                .map(|p| String::from_utf8_lossy(&p).into_owned())
-                .collect();
+            let sent = sent(&frames);
             assert!(sent.iter().any(|f| f.contains("\"handoff\"")), "{sent:?}");
             assert!(engine.running[&scope].held_handoff.is_none());
         }
@@ -5023,6 +5059,7 @@ mod tests {
                     prepared: None,
                     subscription: None,
                     catalog: false,
+                    terminal: false,
                 },
             );
             engine.subscribe(9, None, None).unwrap();

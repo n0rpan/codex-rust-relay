@@ -20,6 +20,17 @@ use ox_desk_core::{
 use std::collections::HashSet;
 
 const OVERDRAW: f32 = 240.;
+/// The jump control shows once the view is this many viewport heights above the bottom.
+const FAR: f32 = 1.5;
+
+/// How far the view sits above the bottom, in pixels (0 when pinned to it).
+fn above_bottom(list: &ListState) -> Pixels {
+    (list.max_offset_for_scrollbar().y + list.scroll_px_offset_for_scrollbar().y).max(px(0.))
+}
+fn is_far(list: &ListState) -> bool {
+    let viewport = list.viewport_bounds().size.height;
+    viewport > px(0.) && above_bottom(list) > viewport * FAR
+}
 
 struct CachedMessage {
     key: ItemKey,
@@ -39,6 +50,10 @@ pub(super) struct TranscriptView {
     find: Option<tools::Find>,
     prepended: usize,
     following: bool,
+    /// Scrolled up more than `FAR` viewport heights from the bottom.
+    far: bool,
+    /// Items that existed the last time the view was at (or near) the bottom.
+    seen: usize,
     document_height: Pixels,
     markdown: std::collections::VecDeque<CachedMessage>,
 }
@@ -95,6 +110,75 @@ impl TranscriptView {
     }
 }
 
+/// The round "Jump to latest" control floating over the bottom-right of the transcript,
+/// with a "N new" count while content arrived below the viewport.
+fn jump_to_latest(
+    p: Palette,
+    list: ListState,
+    unseen: usize,
+    motion: bool,
+    cx: &mut Context<Workbench>,
+) -> Div {
+    div().absolute().bottom_3().right_4().child(
+        crate::row()
+            .items_center()
+            .gap_1()
+            .pl_2()
+            .when(unseen == 0, |d| d.pl_0())
+            .rounded_full()
+            .bg(rgb(p.raised))
+            .border_1()
+            .border_color(rgb(p.line_strong))
+            .when(unseen > 0, |d| {
+                d.child(
+                    div()
+                        .text_size(p.text(Step::Meta))
+                        .text_color(rgb(p.accent))
+                        .child(format!("{unseen} new")),
+                )
+            })
+            .child(
+                crate::kit::icon_button(
+                    p,
+                    "jump-latest",
+                    "↓",
+                    "Jump to latest",
+                    cx.listener(move |_, _, _, cx| {
+                        glide_to_end(list.clone(), motion, cx);
+                    }),
+                )
+                .rounded(px(14.)),
+            ),
+    )
+}
+
+/// Scroll to the newest content and resume following it. With motion this eases over a
+/// few frames; reduced motion jumps.
+fn glide_to_end(list: ListState, motion: bool, cx: &mut Context<Workbench>) {
+    if !motion {
+        list.scroll_to_end();
+        cx.notify();
+        return;
+    }
+    cx.spawn(async move |this, cx| {
+        for _ in 0..12 {
+            let left = above_bottom(&list);
+            if left < px(2.) {
+                break;
+            }
+            list.scroll_by(left * 0.35 + px(1.));
+            let _ = this.update(cx, |_, cx| cx.notify());
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(16))
+                .await;
+        }
+        // Anchor to the end so following resumes and later content stays in view.
+        list.scroll_to_end();
+        let _ = this.update(cx, |_, cx| cx.notify());
+    })
+    .detach();
+}
+
 impl Workbench {
     pub(super) fn transcript_panel(&mut self, cx: &mut Context<Self>) -> Div {
         let p = Palette::get(cx);
@@ -120,6 +204,20 @@ impl Workbench {
                     view.following = event.is_following_tail;
                     cx.notify();
                 }
+                // The list is still borrowed here: measure the distance once it is free.
+                let workbench = cx.weak_entity();
+                let watched = owner.clone();
+                cx.defer(move |cx| {
+                    let _ = workbench.update(cx, |s, cx| {
+                        if let Some(view) = s.transcript_views.get_mut(&watched) {
+                            let far = is_far(&view.list);
+                            if far != view.far {
+                                view.far = far;
+                                cx.notify();
+                            }
+                        }
+                    });
+                });
                 if event.visible_range.start <= 2
                     && !event.is_following_tail
                     && s.store
@@ -140,6 +238,8 @@ impl Workbench {
                 find: None,
                 prepended: transcript.prepended(),
                 following: true,
+                far: false,
+                seen: count,
                 document_height: px(360.),
                 markdown: Default::default(),
             }
@@ -175,7 +275,15 @@ impl Workbench {
                 });
             });
         }
+        // Pinned to the bottom (or close): new content is already in view.
+        view.far = is_far(&view.list);
+        if !view.far {
+            view.seen = count;
+        }
+        let (far, unseen) = (view.far, count.saturating_sub(view.seen));
+        let motion = p.motion;
         let list_state = view.list.clone();
+        let jump_state = view.list.clone();
         let find_bar = tools::find_bar(view, &id, p, cx);
         let banner = handoff_banner(store, &id, p, cx);
         col()
@@ -183,19 +291,6 @@ impl Workbench {
             .min_h_0()
             .children(banner)
             .children(find_bar)
-            .when(!view.following, |d| {
-                let state = view.list.clone();
-                d.child(crate::kit::icon_button(
-                    p,
-                    "jump-latest",
-                    "↓",
-                    "Jump to latest",
-                    cx.listener(move |_, _, _, cx| {
-                        state.scroll_to_end();
-                        cx.notify();
-                    }),
-                ))
-            })
             .when(transcript.is_loading(), |d| {
                 d.child(
                     crate::row()
@@ -225,14 +320,22 @@ impl Workbench {
                 ))
             })
             .child(
-                list(
-                    list_state,
-                    cx.processor(move |s, index, _, cx| {
-                        crate::app::guard(cx, |cx| s.transcript_row(&id, index, cx))
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        list(
+                            list_state,
+                            cx.processor(move |s, index, _, cx| {
+                                crate::app::guard(cx, |cx| s.transcript_row(&id, index, cx))
+                            }),
+                        )
+                        .size_full(),
+                    )
+                    .when(far, |d| {
+                        d.child(jump_to_latest(p, jump_state, unseen, motion, cx))
                     }),
-                )
-                .flex_1()
-                .min_h_0(),
             )
     }
 

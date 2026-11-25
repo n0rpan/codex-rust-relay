@@ -230,7 +230,7 @@ impl Workbench {
             }
             (Some(_), None) if granted => "YOLO allowed for workers".to_owned(),
             (_, Some(m)) => permission_value(m),
-            _ => "Default permissions".to_owned(),
+            _ => default_permission(self.route.runtime).to_owned(),
         };
         let access_hint = if key.is_none() {
             format!("Permissions for the next thread: {value}")
@@ -477,10 +477,18 @@ impl Workbench {
     }
 }
 
-/// The permission chip's value: the mode alone, with "Default" spelled out.
+/// What a runtime does when no permission mode has been chosen yet.
+fn default_permission(runtime: ox_desk_core::runtime::Runtime) -> &'static str {
+    match runtime {
+        ox_desk_core::runtime::Runtime::Claude => "Ask before edits",
+        ox_desk_core::runtime::Runtime::Codex => "Configured in Codex",
+    }
+}
+
+/// The permission chip's value: the mode alone, with Claude's "Default" spelled out.
 fn permission_value(mode: Access) -> String {
     match mode {
-        Access::Default => "Default permissions".to_owned(),
+        Access::Default => "Ask before edits".to_owned(),
         other => other.label().to_owned(),
     }
 }

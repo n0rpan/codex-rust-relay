@@ -41,6 +41,10 @@ pub enum Client {
     Subscribe {
         scope: Option<Scope>,
         after: Option<Cursor>,
+        /// The client is a desktop window that can take a terminal handoff held for its
+        /// scope. Phones and other gateways never set it, and the web bridge refuses it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        terminal: bool,
     },
     Act {
         id: String,

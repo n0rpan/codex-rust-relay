@@ -26,48 +26,86 @@ pub(super) struct Picker {
     /// Only the model picker is a searchable shared `ModelPicker`.
     models: Option<(Entity<ModelPicker>, Subscription)>,
 }
+/// Entries for a model list that is not the composer's (worker and hand-off sheets): API aliases
+/// value first, the provider in the note.
 pub(super) fn model_entries(caps: &Capabilities) -> Vec<model_picker::Entry> {
     caps.models
         .iter()
         .map(|(id, m)| model_picker::Entry {
-            id: id.clone(),
-            label: if m.label.is_empty() || m.label == *id {
-                id.clone()
-            } else {
-                format!("{} · {id}", m.label)
-            },
-            note: String::new(),
-            new_session: false,
+            rank: m.rank,
+            recommended: m.is_default,
+            ..model_picker::api_entry(id)
         })
         .collect()
 }
-/// Provider part of an alias, for the "API · provider" tag.
-fn api_provider(id: &str) -> &str {
-    id.split_once('/').map_or("OX", |(provider, _)| provider)
+/// Whether `id` is the model the session runs now. Claude's symbolic `default` is current while
+/// the stream reports the model it resolves to.
+fn is_current_model(caps: &Capabilities, current: &str, id: &str) -> bool {
+    id == current
+        || (id == "default"
+            && caps
+                .models
+                .get("default")
+                .and_then(|m| m.resolved.as_deref())
+                .is_some_and(|resolved| resolved == current))
 }
-/// The composer's Model picker: API aliases plus the subscription routes, each tagged with its
-/// runtime and what bills, and flagged when choosing it must open a new session.
-pub(super) fn composer_entries(store: &Store, owner: Option<&str>) -> Vec<model_picker::Entry> {
-    let runtime = store.profile().route.runtime;
-    let mut entries = model_entries(&store.command_caps(owner));
-    for entry in &mut entries {
-        entry.note = format!("{} · API · {}", runtime.name(), api_provider(&entry.id));
-        entry.new_session = !store.same_model_route(&entry.id);
+/// The one route value the composer's model pill and the sidebar AGENT picker both show:
+/// "<runtime> · <model>", with the runtime's default model named.
+pub(super) fn route_value(store: &Store, owner: Option<&str>) -> String {
+    let runtime = store.profile().route.runtime.name();
+    let model = store.options(owner).model;
+    if model.is_empty() {
+        return runtime.to_owned();
     }
-    let mut plans = Vec::new();
+    let name = match &store.profile().route.billing {
+        Billing::Subscription => store.command_caps(owner).model_display(&model),
+        Billing::Api(_) => ox_desk_core::slash::readable_model(&model),
+    };
+    format!("{runtime} · {name}")
+}
+/// The shared choices behind the composer's model pill and the sidebar AGENT picker: the current
+/// route is always a checked row; other routes are tagged "New session".
+pub(super) fn composer_entries(store: &Store, owner: Option<&str>) -> Vec<model_picker::Entry> {
+    let route = &store.profile().route;
+    let caps = store.command_caps(owner);
+    let current = store.options(owner).model;
+    let subscription = route.billing == Billing::Subscription;
+    let mut entries: Vec<model_picker::Entry> = caps
+        .models
+        .iter()
+        .map(|(id, m)| {
+            let mut entry = model_picker::Entry {
+                rank: m.rank,
+                recommended: m.is_default,
+                current: is_current_model(&caps, &current, id),
+                ..model_picker::api_entry(id)
+            };
+            if subscription {
+                entry.label = caps.model_display(id);
+                entry.note = format!("{} subscription", route.runtime.account());
+                entry.section = Some(format!("{} MODELS", route.runtime.name().to_uppercase()));
+            } else {
+                entry.new_session = !store.same_model_route(id);
+            }
+            entry
+        })
+        .collect();
     for rt in [Runtime::Codex, Runtime::Claude] {
-        if store.profile().route == rt.route(None) {
-            continue;
+        let here = route.runtime == rt && subscription;
+        let mut label = rt.name().to_owned();
+        if here && !current.is_empty() {
+            label = format!("{label} · {}", caps.model_display(&current));
         }
-        plans.push(model_picker::Entry {
+        entries.push(model_picker::Entry {
             id: format!("{}{}", model_picker::PLAN_PREFIX, rt.executable()),
-            label: format!("{} plan", rt.account()),
-            note: format!("{} · subscription", rt.name()),
-            new_session: true,
+            label,
+            note: format!("{} subscription", rt.account()),
+            new_session: !here,
+            current: here,
+            ..Default::default()
         });
     }
-    plans.extend(entries);
-    plans
+    entries
 }
 fn choices(caps: &Capabilities, settings: &Options, kind: Kind) -> Vec<(String, Choice)> {
     match kind {
@@ -98,11 +136,21 @@ fn choices(caps: &Capabilities, settings: &Options, kind: Kind) -> Vec<(String, 
 }
 pub(super) struct NewModelRoute(pub Route);
 impl EventEmitter<NewModelRoute> for Workbench {}
+/// The model picker asks for Settings → Providers & models.
+pub(super) struct OpenProviders;
+impl EventEmitter<OpenProviders> for Workbench {}
 
 impl Workbench {
     /// Pick a model for the owner's thread: a new session when the route changes, otherwise an
-    /// option change on the current one.
-    fn choose_model(&mut self, owner: Option<String>, id: String, cx: &mut Context<Self>) {
+    /// option change on the current one. `runtime` is the picker's "Run with" choice for API
+    /// models outside the session's own list.
+    pub(super) fn choose_model(
+        &mut self,
+        owner: Option<String>,
+        id: String,
+        runtime: Option<Runtime>,
+        cx: &mut Context<Self>,
+    ) {
         let plan = id.strip_prefix(model_picker::PLAN_PREFIX).map(|name| {
             if name == Runtime::Claude.executable() {
                 Runtime::Claude
@@ -111,17 +159,23 @@ impl Workbench {
             }
             .route(None)
         });
-        let runtime = self
-            .store
-            .as_ref()
-            .map_or(self.route.runtime, |s| s.profile().route.runtime);
-        let new_route = plan.or_else(|| {
-            self.store
-                .as_ref()
-                .is_some_and(|store| !store.same_model_route(&id))
-                .then(|| runtime.route(Some(id.clone())))
+        let current = self.store.as_ref().map(|s| s.profile().route.clone());
+        let runtime =
+            runtime.unwrap_or_else(|| current.as_ref().map_or(self.route.runtime, |r| r.runtime));
+        let in_session = self.store.as_ref().is_some_and(|store| {
+            store
+                .command_caps(owner.as_deref())
+                .models
+                .contains_key(&id)
+                && store.same_model_route(&id)
         });
-        if self.store.as_ref().and_then(|s| s.selected()) == owner.as_deref() {
+        let new_route = match plan {
+            Some(route) => (Some(&route) != current.as_ref()).then_some(route),
+            None if id.starts_with(model_picker::PLAN_PREFIX) => None,
+            None => (!in_session).then(|| runtime.route(Some(id.clone()))),
+        };
+        let unchanged_plan = id.starts_with(model_picker::PLAN_PREFIX) && new_route.is_none();
+        if !unchanged_plan && self.store.as_ref().and_then(|s| s.selected()) == owner.as_deref() {
             if let Some(route) = new_route {
                 cx.emit(NewModelRoute(route));
             } else {
@@ -133,6 +187,23 @@ impl Workbench {
         }
         self.model_picker = None;
         cx.notify();
+    }
+    /// Open the hand-off sheet with the route a picker row stands for.
+    fn hand_off_to(
+        &mut self,
+        id: &str,
+        runtime: Option<Runtime>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (runtime, model) = match id.strip_prefix(model_picker::PLAN_PREFIX) {
+            Some(name) if name == Runtime::Claude.executable() => (Runtime::Claude, None),
+            Some(_) => (Runtime::Codex, None),
+            None => (runtime.unwrap_or(self.route.runtime), Some(id.to_owned())),
+        };
+        self.model_picker = None;
+        self.open_launch(super::worker_sheet::LaunchKind::Handoff, window, cx);
+        self.set_launch_route(runtime, model, cx);
     }
     fn choice_row(
         &self,
@@ -194,6 +265,14 @@ impl Workbench {
         .into_any_element()
     }
     fn open_model_picker(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
+        // The press that dismissed the panel from outside is also the click on its chip.
+        if self
+            .picker_dismissed
+            .take()
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(300))
+        {
+            return;
+        }
         let owner = self
             .store
             .as_ref()
@@ -214,15 +293,27 @@ impl Workbench {
                 .as_ref()
                 .map(|store| composer_entries(store, owner.as_deref()))
                 .unwrap_or_default();
-            let picker = cx.new(|cx| ModelPicker::new(entries, window, cx));
+            let runtime = self.route.runtime;
+            let picker = cx.new(|cx| {
+                ModelPicker::new(entries, window, cx)
+                    .with_runtime(runtime)
+                    .with_handoff()
+                    .with_discovered_new_session()
+            });
             let chosen_owner = owner.clone();
             let subscription = cx.subscribe_in(
                 &picker,
                 window,
-                move |s: &mut Workbench, _, event: &ModelPickerEvent, _, cx| match event {
+                move |s: &mut Workbench, picker, event: &ModelPickerEvent, window, cx| match event {
                     ModelPickerEvent::Choose(id) => {
-                        s.choose_model(chosen_owner.clone(), id.clone(), cx)
+                        let runtime = picker.read(cx).runtime();
+                        s.choose_model(chosen_owner.clone(), id.clone(), runtime, cx)
                     }
+                    ModelPickerEvent::HandOff(id) => {
+                        let runtime = picker.read(cx).runtime();
+                        s.hand_off_to(id, runtime, window, cx)
+                    }
+                    ModelPickerEvent::AddProvider => cx.emit(OpenProviders),
                     ModelPickerEvent::Close => {
                         s.model_picker = None;
                         cx.notify();
@@ -247,26 +338,7 @@ impl Workbench {
         let p = Palette::get(cx);
         let settings = store.options(owner);
         let enabled = store.can_send(owner);
-        // Value only: the runtime name is in the AGENT picker and the tooltip.
-        let runtime = store.profile().route.runtime.name();
-        let route = match &store.profile().route.billing {
-            Billing::Subscription if settings.model.is_empty() => {
-                format!("{} plan", store.profile().route.runtime.account())
-            }
-            Billing::Subscription => format!(
-                "{} plan · {}",
-                store.profile().route.runtime.account(),
-                settings.model
-            ),
-            Billing::Api(original) => format!(
-                "API · {}",
-                if settings.model.is_empty() {
-                    original
-                } else {
-                    &settings.model
-                }
-            ),
-        };
+        let route = route_value(store, owner);
         let mut chips = Vec::new();
         for (index, (kind, name, value)) in [
             (Kind::Model, "Model", route),
@@ -285,7 +357,7 @@ impl Workbench {
         .enumerate()
         {
             let label = match (kind, value.is_empty()) {
-                (Kind::Model, _) => format!("Model · {runtime} · {value}"),
+                (Kind::Model, _) => format!("Model · {value}"),
                 (_, true) => name.to_owned(),
                 (_, false) => format!("{name} · {value}"),
             };
@@ -332,6 +404,11 @@ impl Workbench {
                     .border_1()
                     .border_color(rgb(p.line))
                     .occlude()
+                    .on_mouse_down_out(cx.listener(|s, _, _, cx| {
+                        s.model_picker = None;
+                        s.picker_dismissed = Some(std::time::Instant::now());
+                        cx.notify();
+                    }))
                     .on_key_down(cx.listener(|s, e: &KeyDownEvent, _, cx| {
                         if e.keystroke.key == "escape" {
                             s.model_picker = None;
@@ -373,17 +450,6 @@ impl Workbench {
                         panel = panel.child(list.h(px((count.min(6) * 32) as f32)).w_full());
                     }
                 }
-                panel = panel.child(button(
-                    p,
-                    "close-model-picker",
-                    "Close",
-                    false,
-                    true,
-                    cx.listener(|s, _, _, cx| {
-                        s.model_picker = None;
-                        cx.notify();
-                    }),
-                ));
                 chip = chip.child(
                     deferred(
                         anchored()

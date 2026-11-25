@@ -5,7 +5,8 @@
 //! screen with OCR. Without that variable every entry point returns after one
 //! atomic load: no element is added, no lock is taken and nothing allocates.
 use gpui::{
-    App, Bounds, ElementId, ParentElement, Pixels, SharedString, Styled, Window, WindowId, canvas,
+    App, Bounds, ElementId, ParentElement, Pixels, Point, SharedString, Styled, Window, WindowId,
+    canvas,
 };
 use gpui_component::button::Button;
 use serde::Serialize;
@@ -31,6 +32,8 @@ struct Control {
     enabled: bool,
     /// Visible part in device pixels from the window's top-left corner.
     bounds: [i32; 4],
+    /// Centre of the visible part in logical pixels, where `press` clicks.
+    centre: Point<Pixels>,
 }
 
 pub fn active() -> bool {
@@ -111,8 +114,39 @@ fn record(window: &Window, id: String, label: SharedString, enabled: bool, b: Bo
             label,
             enabled,
             bounds,
+            centre: visible.center(),
         });
     }
+}
+
+/// Resolves `press <query>`: exact id, then exact label, then case-insensitive label.
+/// Several matches at the first level that matches are an error naming the candidates.
+pub fn find(query: &str) -> Result<(WindowId, Point<Pixels>), String> {
+    let windows = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    let all: Vec<(&Frame, &Control)> = windows
+        .iter()
+        .flat_map(|f| f.controls.iter().map(move |c| (f, c)))
+        .collect();
+    let levels: [&dyn Fn(&Control) -> bool; 3] =
+        [&|c| c.id == query, &|c| c.label.as_ref() == query, &|c| {
+            c.label.eq_ignore_ascii_case(query)
+        }];
+    for level in levels {
+        let hits: Vec<_> = all.iter().filter(|(_, c)| level(c)).collect();
+        match hits.as_slice() {
+            [] => continue,
+            [(f, c)] if c.enabled => return Ok((f.window, c.centre)),
+            [(_, c)] => return Err(format!("control {:?} is disabled", c.id)),
+            many => {
+                let names: Vec<_> = many
+                    .iter()
+                    .map(|(f, c)| format!("{} [{}] in {}", c.label, c.id, f.title))
+                    .collect();
+                return Err(format!("ambiguous {query:?}: {}", names.join("; ")));
+            }
+        }
+    }
+    Err(format!("no control matches {query:?}"))
 }
 
 /// `{"windows": [...], "layout": [...]}` for the stats snapshot.

@@ -23,6 +23,9 @@ pub(super) struct Native {
 pub(super) struct Viewer {
     loaded: Option<SystemTime>,
     pub(super) loading: bool,
+    /// Where the last read stopped; `None` until the first full read finishes (or after
+    /// a failure), so the next tick reads from the start.
+    follower: Option<Box<history::Follower>>,
 }
 
 impl Store {
@@ -80,7 +83,12 @@ impl Store {
         } else {
             Origin::Subscription
         };
-        let processes = live::ids_in_processes();
+        let mut processes = live::ids_in_processes();
+        // A terminal client registers itself; that holds while it is quiet for minutes.
+        processes.extend(live::ids_in_registry(match origin {
+            Origin::Api => &p.launcher.profiles.api,
+            _ => &p.launcher.profiles.subscription,
+        }));
         let now = SystemTime::now();
         let mut found = HashSet::new();
         for key in p.catalog.keys().filter(|k| !k.contains('/')) {
@@ -133,6 +141,15 @@ impl Store {
         for id in viewers {
             self.follow_native(&id);
         }
+        // A viewer that was let go while the other client was quiet comes back when its
+        // journal is live again, so the open transcript keeps following.
+        if let Some(id) = self.selected.clone()
+            && !id.contains('/')
+            && self.claude().native.live.contains(&id)
+            && !self.claude().sessions.contains_key(&id)
+        {
+            let _ = self.view_native(&id);
+        }
         if changed {
             self.changed.mark(Changed::THREADS);
         }
@@ -166,6 +183,20 @@ impl Store {
         let moved = modified != viewer.loaded;
         let live = self.claude().native.live.contains(id);
         if moved {
+            // The row's age follows the journal.
+            if let Some(secs) = modified
+                .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+            {
+                if let Some(row) = self.claude_mut().catalog.get_mut(id) {
+                    row.updated_at = row.updated_at.max(secs);
+                }
+                if let Some(row) = self.catalog.get_mut(id) {
+                    row.updated_at = row.updated_at.max(secs);
+                }
+                self.catalog_revision += 1;
+                self.changed.mark(Changed::THREADS);
+            }
             self.start_view_load(id);
         } else if !live {
             self.leave_native(id);
@@ -217,6 +248,7 @@ impl Store {
         let Some(viewer) = process.viewer.as_mut() else {
             return;
         };
+        let mut follower = viewer.follower.take();
         viewer.loading = true;
         viewer.loaded = launcher
             .profiles
@@ -231,16 +263,26 @@ impl Store {
                     data,
                 }))
             };
-            let loaded = launcher
-                .profiles
-                .session(&profile.project, &raw, origin)
-                .and_then(|saved| {
-                    history::load(&profile, &key, &saved, &alive, |batch| {
-                        emit(Data::History(batch))
+            // Only the appended bytes when this viewer already holds the journal's state.
+            let resumed = match follower.as_mut() {
+                Some(f) => f.advance(&alive, |tail| emit(Data::Tail(tail))),
+                None => Ok(false),
+            };
+            let loaded = match resumed {
+                Ok(true) => Ok(follower),
+                Ok(false) => launcher
+                    .profiles
+                    .session(&profile.project, &raw, origin)
+                    .and_then(|saved| {
+                        history::Follower::load(&profile, &key, saved, &alive, |batch| {
+                            emit(Data::History(batch))
+                        })
                     })
-                });
+                    .map(|f| Some(Box::new(f))),
+                Err(e) => Err(e),
+            };
             emit(match loaded {
-                Ok(()) => Data::Viewed,
+                Ok(f) => Data::Viewed(f),
                 Err(e) => Data::Failed(e.to_string()),
             });
         });
@@ -259,7 +301,7 @@ impl Store {
             .mark(Changed::THREADS | Changed::CONNECTION | Changed::ASK);
     }
 
-    pub(super) fn viewed(&mut self, owner: &str) {
+    pub(super) fn viewed(&mut self, owner: &str, follower: Option<Box<history::Follower>>) {
         if let Some(v) = self
             .claude_mut()
             .sessions
@@ -267,6 +309,7 @@ impl Store {
             .and_then(|s| s.viewer.as_mut())
         {
             v.loading = false;
+            v.follower = follower;
         }
     }
     pub(super) fn is_viewer(&self, owner: &str) -> bool {
@@ -288,7 +331,10 @@ mod tests {
     fn row_json(kind: &str, project: &std::path::Path, text: &str) -> String {
         let uuid = format!(
             "00000000-0000-4000-8000-{:012}",
-            text.len() * 7 + kind.len()
+            text.bytes().fold(kind.len() as u64, |h, b| h
+                .wrapping_mul(131)
+                .wrapping_add(b as u64))
+                % 1_000_000_000_000
         );
         let content = if kind == "user" {
             json!(text)
@@ -306,7 +352,7 @@ mod tests {
             let LinkEvent::Claude(update) = event else {
                 panic!("claude link only")
             };
-            let done = matches!(update.data, Data::Viewed | Data::Failed(_));
+            let done = matches!(update.data, Data::Viewed(_) | Data::Failed(_));
             store.claude_event(update).unwrap();
             if done {
                 break;
@@ -425,5 +471,191 @@ mod tests {
         store.refresh_native(Instant::now(), true);
         assert!(!store.is_native_live(&key));
         assert!(store.is_ended(&key) && store.can_compose(Some(&key)));
+    }
+
+    struct Rig {
+        store: Store,
+        rx: mpsc::Receiver<LinkEvent>,
+        journal: PathBuf,
+        project: PathBuf,
+        key: String,
+        _root: tempfile::TempDir,
+    }
+    fn rig(rows: usize) -> Rig {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().canonicalize().unwrap().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let profiles = Profiles {
+            subscription: root.path().join("native"),
+            api: root.path().join("relay"),
+        };
+        let dir = profiles.subscription.join("projects").join(
+            project
+                .to_string_lossy()
+                .replace(|c: char| !c.is_ascii_alphanumeric(), "-"),
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal = dir.join(format!("{ID}.jsonl"));
+        let mut body = String::new();
+        for n in 0..rows {
+            body += &row_json(
+                if n % 2 == 0 { "user" } else { "assistant" },
+                &project,
+                &format!("message number {n}"),
+            );
+        }
+        std::fs::write(&journal, body).unwrap();
+        let profile = Profile {
+            project: project.clone(),
+            route: Route {
+                runtime: Runtime::Claude,
+                billing: Billing::Subscription,
+            },
+            provider: SUBSCRIPTION_PROVIDER.into(),
+        };
+        let key = session_key(&profile.route.billing, ID);
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let launcher = Launcher {
+            ox: PathBuf::new(),
+            path: Default::default(),
+            profiles,
+            index: PathBuf::new(),
+            aliases: vec![],
+        };
+        let project_state = Project {
+            launcher: Arc::new(launcher),
+            deliver: Arc::new(move |e| {
+                let _ = tx.lock().unwrap().send(e);
+            }),
+            sessions: Default::default(),
+            catalog: Default::default(),
+            asks: Default::default(),
+            blank: None,
+            serial: 0,
+            native: Default::default(),
+        };
+        let mut store = Store::with_link(profile, links::Link::Claude(Box::new(project_state)));
+        store.state = Connection::Ready;
+        store.remember_claude(row(&store.profile, key.clone(), "hello".into(), 1));
+        store.claude_list();
+        store.select(&key).unwrap();
+        Rig {
+            store,
+            rx,
+            journal,
+            project,
+            key,
+            _root: root,
+        }
+    }
+    /// Apply one read; report whether any full-history batch was delivered.
+    fn pump_kinds(store: &mut Store, rx: &mpsc::Receiver<LinkEvent>) -> (bool, bool) {
+        let (mut full, mut tail) = (false, false);
+        loop {
+            let LinkEvent::Claude(update) = rx.recv_timeout(Duration::from_secs(20)).unwrap()
+            else {
+                panic!("claude link only")
+            };
+            full |= matches!(update.data, Data::History(_));
+            tail |= matches!(update.data, Data::Tail(_));
+            let done = matches!(update.data, Data::Viewed(_) | Data::Failed(_));
+            store.claude_event(update).unwrap();
+            if done {
+                return (full, tail);
+            }
+        }
+    }
+    fn append(rig: &Rig, kind: &str, text: &str, age: u64) {
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&rig.journal)
+            .unwrap();
+        std::io::Write::write_all(&mut f, row_json(kind, &rig.project, text).as_bytes()).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(age))
+            .unwrap();
+    }
+
+    #[test]
+    fn appended_rows_are_parsed_alone_and_appear_without_a_full_read() {
+        let mut r = rig(4);
+        assert_eq!(pump_kinds(&mut r.store, &r.rx), (true, false));
+        let before = r.store.transcript(&r.key).unwrap().len();
+        append(&r, "assistant", "a brand new reply", 0);
+        r.store.refresh_native(Instant::now(), true);
+        assert_eq!(pump_kinds(&mut r.store, &r.rx), (false, true));
+        assert_eq!(r.store.transcript(&r.key).unwrap().len(), before + 1);
+
+        // A line the writer has not finished is left for the next tick, then completes once.
+        let half = row_json("user", &r.project, "split in two");
+        let (a, b) = half.split_at(half.len() / 2);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&r.journal)
+            .unwrap();
+        std::io::Write::write_all(&mut f, a.as_bytes()).unwrap();
+        f.set_modified(SystemTime::now() + Duration::from_secs(3))
+            .unwrap();
+        r.store.refresh_native(Instant::now(), true);
+        assert_eq!(pump_kinds(&mut r.store, &r.rx), (false, false));
+        std::io::Write::write_all(&mut f, b.as_bytes()).unwrap();
+        f.set_modified(SystemTime::now() + Duration::from_secs(4))
+            .unwrap();
+        r.store.refresh_native(Instant::now(), true);
+        assert_eq!(pump_kinds(&mut r.store, &r.rx), (false, true));
+        assert_eq!(r.store.transcript(&r.key).unwrap().len(), before + 2);
+
+        // A truncated journal is read again from the start.
+        std::fs::write(&r.journal, row_json("user", &r.project, "fresh start")).unwrap();
+        std::fs::File::options()
+            .append(true)
+            .open(&r.journal)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(8))
+            .unwrap();
+        r.store.refresh_native(Instant::now(), true);
+        assert!(pump_kinds(&mut r.store, &r.rx).0);
+        assert_eq!(r.store.transcript(&r.key).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_large_journal_follows_within_one_tick() {
+        let mut r = rig(20_000);
+        assert!(pump_kinds(&mut r.store, &r.rx).0);
+        append(&r, "assistant", "the newest message", 0);
+        let started = Instant::now();
+        r.store.refresh_native(started, true);
+        assert_eq!(pump_kinds(&mut r.store, &r.rx), (false, true));
+        assert!(
+            started.elapsed() < EVERY,
+            "follow took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(r.store.transcript(&r.key).unwrap().len(), 20_001);
+    }
+
+    #[test]
+    fn a_journal_that_keeps_growing_is_followed_past_the_quiet_heuristic() {
+        let mut r = rig(2);
+        pump_kinds(&mut r.store, &r.rx);
+        // Written, but the stamp looks 10 minutes old: the age rule says not live.
+        append(&r, "assistant", "still working", 600);
+        r.store.refresh_native(Instant::now(), true);
+        assert!(!r.store.is_native_live(&r.key));
+        assert!(
+            pump_kinds(&mut r.store, &r.rx).1,
+            "the new row still arrives"
+        );
+        assert!(r.store.is_viewer(&r.key));
+
+        // Quiet and unmoved: let go. When it writes again the open thread re-attaches.
+        r.store.refresh_native(Instant::now(), true);
+        assert!(!r.store.is_viewer(&r.key));
+        append(&r, "user", "back again", 0);
+        r.store.refresh_native(Instant::now(), true);
+        assert!(r.store.is_native_live(&r.key));
+        assert!(r.store.is_viewer(&r.key), "re-attached to the live journal");
+        pump_kinds(&mut r.store, &r.rx);
+        assert_eq!(r.store.transcript(&r.key).unwrap().len(), 4);
     }
 }

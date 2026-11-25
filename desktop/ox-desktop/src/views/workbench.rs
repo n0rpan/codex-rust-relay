@@ -76,6 +76,8 @@ pub struct Workbench {
     pub(super) pane_width: Pixels,
     resizing_review: bool,
     pub(super) model_picker: Option<super::route_chip::Picker>,
+    /// When an outside press last closed the model panel.
+    pub(super) picker_dismissed: Option<std::time::Instant>,
     thread_edit: Option<thread_menu::ThreadEdit>,
     pub(super) launch_request: Option<super::worker_sheet::LaunchKind>,
     pub(super) launch: Option<super::worker_sheet::Launch>,
@@ -183,6 +185,7 @@ impl Workbench {
             pane_width: window.viewport_size().width,
             resizing_review: false,
             model_picker: None,
+            picker_dismissed: None,
             launch_request: None,
             launch: None,
             launch_picker: None,

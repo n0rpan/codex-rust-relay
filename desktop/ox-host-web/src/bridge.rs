@@ -204,7 +204,9 @@ impl Access {
             }
             // A read-only listing of the host's live processes, answered by `Server::Processes`.
             Client::ListProcesses { id } if self.ready && id.len() <= 96 && !id.is_empty() => true,
-            Client::Subscribe { scope, .. } if self.ready => {
+            Client::Subscribe {
+                scope, terminal, ..
+            } if self.ready && !terminal => {
                 if scope.as_ref().is_some_and(|s| !self.reachable(app, s)) {
                     return false;
                 }
@@ -364,14 +366,16 @@ mod tests {
             &app,
             &Client::Subscribe {
                 scope: Some(other.clone()),
-                after: None
+                after: None,
+                terminal: false,
             }
         ));
         assert!(a.permit(
             &app,
             &Client::Subscribe {
                 scope: Some(scope.clone()),
-                after: None
+                after: None,
+                terminal: false,
             }
         ));
         let act = |s: Scope, action, approval| Client::Act {
@@ -451,7 +455,8 @@ mod tests {
             &app,
             &Client::Subscribe {
                 scope: Some(scope.clone()),
-                after: None
+                after: None,
+                terminal: false,
             }
         ));
         let act = |action, approval: Option<String>| Client::Act {
@@ -580,7 +585,8 @@ mod tests {
             &app,
             &Client::Subscribe {
                 scope: Some(scope.clone()),
-                after: None
+                after: None,
+                terminal: false,
             }
         ));
 
@@ -629,6 +635,7 @@ mod tests {
         let subscribe = |s: &Scope| Client::Subscribe {
             scope: Some(s.clone()),
             after: None,
+            terminal: false,
         };
         let mut unlisted = scope.clone();
         unlisted.project = "/unlisted".into();
@@ -725,7 +732,8 @@ mod tests {
             &app,
             &Client::Subscribe {
                 scope: Some(scope.clone()),
-                after: None
+                after: None,
+                terminal: false,
             }
         ));
         assert!(!a.permit(&app, &act(other, Action::EndSession("thread".into()), None)));

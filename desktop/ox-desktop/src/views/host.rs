@@ -93,6 +93,8 @@ pub struct Host {
     _palette_keys: Subscription,
     /// The searchable all-models picker, opened from the route menu.
     model_picker: Option<(Entity<ModelPicker>, Subscription)>,
+    /// The open picker is the AGENT picker (the composer's choices), not the all-models list.
+    agent_picker: bool,
     /// Runtime the all-models picker routes to. Claude Code is offered only when aliases exist,
     /// as the route menu's Claude alias routes were.
     model_runtime: Runtime,
@@ -194,6 +196,7 @@ impl Host {
             saved_layouts,
             _palette_keys: Self::palette_keys(window, cx),
             model_picker: None,
+            agent_picker: false,
             model_runtime: Runtime::Codex,
             filter,
             filter_task: None,
@@ -240,6 +243,31 @@ impl Host {
         };
         cx.spawn_in(window, async move |this, cx| {
             while let Ok(sample) = requests.recv_async().await {
+                // Input runs outside the Host update: a click handler updates Host itself.
+                if let Some(input) = &sample.input {
+                    let reply = cx
+                        .update(|window, cx| Self::probe_input(input, window, cx))
+                        .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
+                    let _ = sample.reply.send(reply);
+                    // A hidden window gets no frame callbacks, so lay out every window now:
+                    // the control registry and hit testing then reflect what the input did.
+                    let _ = cx.update(|window, cx| {
+                        {
+                            let pending = window.draw(cx);
+                            pending.clear(cx);
+                        }
+                        let main = window.window_handle().window_id();
+                        for other in cx.windows() {
+                            if other.window_id() != main {
+                                let _ = other.update(cx, |_, window, cx| {
+                                    let pending = window.draw(cx);
+                                    pending.clear(cx);
+                                });
+                            }
+                        }
+                    });
+                    continue;
+                }
                 if this
                     .update_in(cx, |s, window, cx| {
                         let stats = s.snapshot(window, cx);
@@ -265,6 +293,82 @@ impl Host {
         })
         .detach();
         Some(socket)
+    }
+    /// Runs a probe `press`/`key` in-process and returns `{"ok":true}` or `{"error":...}`.
+    fn probe_input(input: &platform::probe::Input, window: &mut Window, cx: &mut App) -> String {
+        use gpui::{
+            Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput,
+        };
+        let result = match input {
+            platform::probe::Input::Press(query) => {
+                platform::layout_probe::find(query).map(|(target, position)| {
+                    let click = move |window: &mut Window, cx: &mut App| {
+                        let modifiers = Modifiers::default();
+                        window.dispatch_event(
+                            PlatformInput::MouseMove(MouseMoveEvent {
+                                position,
+                                pressed_button: None,
+                                modifiers,
+                            }),
+                            cx,
+                        );
+                        window.dispatch_event(
+                            PlatformInput::MouseDown(MouseDownEvent {
+                                button: MouseButton::Left,
+                                position,
+                                modifiers,
+                                click_count: 1,
+                                first_mouse: false,
+                            }),
+                            cx,
+                        );
+                        window.dispatch_event(
+                            PlatformInput::MouseUp(MouseUpEvent {
+                                button: MouseButton::Left,
+                                position,
+                                modifiers,
+                                click_count: 1,
+                            }),
+                            cx,
+                        );
+                    };
+                    if window.window_handle().window_id() == target {
+                        click(window, cx);
+                    } else if let Some(other) =
+                        cx.windows().into_iter().find(|w| w.window_id() == target)
+                    {
+                        let _ = other.update(cx, |_, window, cx| click(window, cx));
+                    }
+                })
+            }
+            platform::probe::Input::Key(key) => {
+                // Test-only path: the leak is one short string per probe command.
+                match gpui::Keystroke::parse(Box::leak(key.clone().into_boxed_str())) {
+                    Ok(keystroke) => {
+                        let active = cx.active_window();
+                        match active {
+                            Some(other)
+                                if other.window_id() != window.window_handle().window_id() =>
+                            {
+                                let _ = other.update(cx, |_, window, cx| {
+                                    window.dispatch_keystroke(keystroke, cx)
+                                });
+                            }
+                            _ => {
+                                window.dispatch_keystroke(keystroke, cx);
+                            }
+                        }
+                        Ok(())
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+        };
+        match result {
+            Ok(()) => serde_json::json!({"ok": true}),
+            Err(error) => serde_json::json!({"error": error}),
+        }
+        .to_string()
     }
     fn snapshot(&self, window: &Window, cx: &App) -> String {
         let mut frames = window.frame_duration_snapshot();
@@ -342,7 +446,7 @@ impl Host {
         let entries: Vec<_> = self
             .models
             .iter()
-            .map(|id| model_picker::Entry::alias(id))
+            .map(|id| model_picker::api_entry(id))
             .collect();
         let picker = cx.new(|cx| ModelPicker::new(entries, window, cx));
         let subscription = cx.subscribe_in(
@@ -356,9 +460,16 @@ impl Host {
                     s.open(project, route, window, cx);
                 }
                 ModelPickerEvent::Starred(favorites) => s.favorite_models = favorites.clone(),
+                ModelPickerEvent::HandOff(_) => {}
+                ModelPickerEvent::AddProvider => {
+                    s.model_picker = None;
+                    let pane = s.panes[s.active].clone();
+                    s.open_providers(&pane, window, cx);
+                }
                 ModelPickerEvent::Close => s.model_picker = None,
             },
         );
+        self.agent_picker = false;
         self.model_picker = Some((picker.clone(), subscription));
         picker.update(cx, |p, cx| p.set_loading(true, cx));
         let task = cx.background_spawn(async { settings::discover_models() });
@@ -367,9 +478,7 @@ impl Host {
             picker.update(cx, |p, cx| {
                 match result {
                     Ok(ids) => p.set_entries(
-                        ids.iter()
-                            .map(|id| model_picker::Entry::alias(id))
-                            .collect(),
+                        ids.iter().map(|id| model_picker::api_entry(id)).collect(),
                         cx,
                     ),
                     Err(error) => p.set_notice(Some(error), cx),
@@ -378,6 +487,64 @@ impl Host {
             });
         })
         .detach();
+        cx.notify();
+    }
+    /// The AGENT picker: the composer's model choices, shown over the window.
+    fn open_agent_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.model_picker.take().is_some() && self.agent_picker {
+            self.agent_picker = false;
+            cx.notify();
+            return;
+        }
+        let pane = self.panes[self.active].clone();
+        let (entries, runtime, owner) = {
+            let workbench = pane.read(cx);
+            let Some(store) = &workbench.store else {
+                return self.open_all_models(window, cx);
+            };
+            let owner = store.selected().map(str::to_owned);
+            (
+                super::route_chip::composer_entries(store, owner.as_deref()),
+                store.profile().route.runtime,
+                owner,
+            )
+        };
+        let picker = cx.new(|cx| {
+            ModelPicker::new(entries, window, cx)
+                .with_runtime(runtime)
+                .with_discovered_new_session()
+        });
+        let subscription = cx.subscribe_in(
+            &picker,
+            window,
+            move |s: &mut Host, picker, event: &ModelPickerEvent, window, cx| match event {
+                ModelPickerEvent::Choose(id) => {
+                    let runtime = picker.read(cx).runtime();
+                    s.model_picker = None;
+                    s.agent_picker = false;
+                    let id = id.clone();
+                    let owner = owner.clone();
+                    s.panes[s.active]
+                        .update(cx, |pane, cx| pane.choose_model(owner, id, runtime, cx));
+                    cx.notify();
+                }
+                ModelPickerEvent::Starred(favorites) => s.favorite_models = favorites.clone(),
+                ModelPickerEvent::HandOff(_) => {}
+                ModelPickerEvent::AddProvider => {
+                    s.model_picker = None;
+                    s.agent_picker = false;
+                    let pane = s.panes[s.active].clone();
+                    s.open_providers(&pane, window, cx);
+                }
+                ModelPickerEvent::Close => {
+                    s.model_picker = None;
+                    s.agent_picker = false;
+                    cx.notify();
+                }
+            },
+        );
+        self.agent_picker = true;
+        self.model_picker = Some((picker, subscription));
         cx.notify();
     }
     fn model_overlay(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
@@ -432,7 +599,7 @@ impl Host {
                         .border_color(rgb(p.line_strong))
                         .occlude()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(runtimes)
+                        .children((!self.agent_picker).then_some(runtimes))
                         .child(picker.clone()),
                 ),
         )
@@ -721,6 +888,14 @@ impl Host {
                         cx.notify();
                     }
                 }
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &pane,
+            window,
+            |s, owner, _: &super::route_chip::OpenProviders, window, cx| {
+                s.open_providers(owner, window, cx);
             },
         )
         .detach();
@@ -1357,47 +1532,16 @@ impl Host {
             let running = self.running.read(cx);
             (running.process_count(), running.open)
         };
-        // The route menu lists the two subscriptions and starred aliases; everything else is
-        // one row away in the searchable picker.
-        let starred_routes: Vec<Route> = self
-            .favorite_models
-            .iter()
-            .filter(|alias| self.models.contains(alias))
-            .map(|alias| Route::codex_api(alias.clone()))
-            .collect();
+        // The AGENT picker shows and offers what the composer's model pill does.
+        let value = pane.store.as_ref().map_or_else(
+            || current.clone(),
+            |s| super::route_chip::route_value(s, s.selected()),
+        );
         let host = cx.weak_entity();
-        let directory = project.clone();
-        let route = picker_row(p, "billing-route", "AGENT", current.clone())
-            .tooltip(format!("Agent and billing · {current}"))
-            .dropdown_menu(move |mut menu, _, _| {
-                let subscriptions = ox_desk_core::runtime::Runtime::routes(&[]);
-                for route in subscriptions.chain(starred_routes.iter().cloned()) {
-                    let host = host.clone();
-                    let directory = directory.clone();
-                    let starred = matches!(&route.billing, Billing::Api(_));
-                    let label = route.label();
-                    menu = menu.item(
-                        PopupMenuItem::element(move |_, _| {
-                            crate::kit::row()
-                                .w_full()
-                                .gap_1()
-                                .child(crate::kit::star_column(p, starred))
-                                .child(label.clone())
-                        })
-                        .checked(route == saved_route)
-                        .on_click(move |_, window, cx| {
-                            let _ = host.update(cx, |s, cx| {
-                                s.open(directory.clone(), route.clone(), window, cx)
-                            });
-                        }),
-                    );
-                }
-                let host = host.clone();
-                menu.item(PopupMenuItem::separator()).item(
-                    PopupMenuItem::new("All models…").on_click(move |_, window, cx| {
-                        let _ = host.update(cx, |s, cx| s.open_all_models(window, cx));
-                    }),
-                )
+        let route = picker_row(p, "billing-route", "AGENT", value.clone())
+            .tooltip(format!("Agent and model · {value}"))
+            .on_click(move |_, window, cx| {
+                let _ = host.update(cx, |s, cx| s.open_agent_picker(window, cx));
             });
         let label = project
             .file_name()

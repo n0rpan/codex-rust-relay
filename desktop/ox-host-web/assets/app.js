@@ -1103,6 +1103,42 @@ function transcript(items, handoffTarget = false) {
   timelineRows = nextRows;
 }
 
+// "Jump to latest": shown once the reader is well above the bottom, with a count of what
+// arrived meanwhile. At the bottom, new content keeps the view pinned there.
+const jumpLatest = (() => {
+  const gap = () =>
+    document.documentElement.scrollHeight - innerHeight - scrollY;
+  const reduced = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+  let seen = 0,
+    last = 0;
+  const sync = () => {
+    const b = $("jump-latest");
+    b.onclick ??= () =>
+      scrollTo({
+        top: document.documentElement.scrollHeight,
+        behavior: reduced() ? "instant" : "smooth",
+      });
+    const far = !$("conversation").hidden && gap() > innerHeight * 1.5;
+    if (!far) seen = last;
+    b.hidden = !far;
+    const fresh = Math.max(0, last - seen);
+    b.textContent = fresh ? `↓ ${fresh} new` : "↓";
+    b.setAttribute(
+      "aria-label",
+      fresh ? `Jump to latest, ${fresh} new` : "Jump to latest",
+    );
+  };
+  addEventListener("scroll", sync, { passive: true });
+  return {
+    pinned: () => scrollY > 2 && gap() < 80,
+    update(count, pinned) {
+      last = count;
+      if (pinned) scrollTo(0, document.documentElement.scrollHeight);
+      sync();
+    },
+  };
+})();
+
 function conversation() {
   if (!selected) return;
   const { scope, id } = selected,
@@ -1151,10 +1187,12 @@ function conversation() {
   const inputCaps = id ? caps : (s?.capabilities ?? []);
   updateExtras(s, inputCaps, detailLink, id);
   showReview(timeline?.detail?.reviews);
+  const pinnedBottom = jumpLatest.pinned();
   transcript(
     timeline?.items || [],
     !!origin?.handoff && !timeline?.detail?.older,
   );
+  jumpLatest.update(timeline?.items?.length ?? 0, pinnedBottom);
   $("older").hidden = !timeline?.detail?.older;
   $("older").onclick = () => detailLink.act({ load_older: id });
   $("start-worker").hidden = !id || !caps.includes("open");

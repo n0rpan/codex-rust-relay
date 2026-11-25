@@ -83,8 +83,14 @@ impl Store {
                 batch.apply(self, &owner);
                 Ok(())
             }
-            Data::Viewed => {
-                self.viewed(&owner);
+            Data::Tail(tail) => {
+                if self.is_viewer(&owner) {
+                    tail.apply(self);
+                }
+                Ok(())
+            }
+            Data::Viewed(follower) => {
+                self.viewed(&owner, follower);
                 Ok(())
             }
             Data::Stock(pipe::Event::Frame(event)) => self.claude_frame(&owner, event),
@@ -253,6 +259,16 @@ impl Store {
                 let p = self.claude_mut().sessions.get_mut(owner).unwrap();
                 p.mode = mode;
                 if let Some(caps) = &mut p.capabilities {
+                    // The stream reports the concrete model the symbolic default resolves to.
+                    if caps.model == "default" && init.model != "default" {
+                        if let Some(info) = Arc::make_mut(&mut caps.models).get_mut("default") {
+                            info.resolved = Some(init.model.clone());
+                        }
+                        let name = caps.model_display("default");
+                        if let Some(info) = Arc::make_mut(&mut caps.models).get_mut("default") {
+                            info.label = name;
+                        }
+                    }
                     caps.model = init.model.clone();
                     let offered: HashSet<_> = init
                         .slash_commands
@@ -568,18 +584,33 @@ impl Store {
                     }
                 }
                 Billing::Subscription => {
-                    for model in native.models {
-                        if model.value == "default" {
+                    for (rank, model) in native.models.into_iter().enumerate() {
+                        let is_default = model.value == "default";
+                        if is_default {
                             caps.model = model.value.clone();
                         }
                         models.insert(
                             model.value,
                             ModelInfo {
                                 label: model.display_name,
+                                rank: Some(rank as u32),
+                                is_default,
+                                resolved: model.resolved_model,
                                 ..Default::default()
                             },
                         );
                     }
+                }
+            }
+            // The symbolic default is listed under the model it resolves to.
+            if caps
+                .models
+                .get("default")
+                .is_some_and(|m| m.resolved.is_some())
+            {
+                let name = caps.model_display("default");
+                if let Some(info) = Arc::make_mut(&mut caps.models).get_mut("default") {
+                    info.label = name;
                 }
             }
             let mode = native

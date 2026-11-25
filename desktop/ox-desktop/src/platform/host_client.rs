@@ -111,6 +111,7 @@ pub(crate) fn open_store(
         &Client::Subscribe {
             scope: Some(scope.clone()),
             after: None,
+            terminal: true,
         },
     )?;
     let client = getrandom::u64().map_err(io::Error::other)?;
@@ -237,6 +238,7 @@ pub(crate) fn end_threads(scope: Scope, threads: Vec<String>, force: bool) -> io
         &Client::Subscribe {
             scope: Some(scope.clone()),
             after: None,
+            terminal: false,
         },
     )?;
     let nonce = getrandom::u64().map_err(io::Error::other)?;

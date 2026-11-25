@@ -30,6 +30,48 @@ pub fn ids_in_processes() -> HashSet<String> {
     ids
 }
 
+/// Sessions a running stock client registered under `<profile>/sessions/<pid>.json`.
+/// A terminal client has no session id on its command line, so this is the signal that
+/// still holds while it thinks or runs a long tool without writing its journal. Only a
+/// live pid counts, and never OX's own headless entrypoint.
+pub fn ids_in_registry(profile: &std::path::Path) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let Ok(entries) = std::fs::read_dir(profile.join("sessions")) else {
+        return ids;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(&path) else {
+            continue;
+        };
+        if let Some(id) = registered_id(&raw)
+            && std::path::Path::new("/proc")
+                .join(registered_pid(&raw))
+                .exists()
+        {
+            ids.insert(id);
+        }
+    }
+    ids
+}
+fn registered_pid(raw: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| v["pid"].as_u64())
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "0".into())
+}
+/// The session id of one registry file, unless it belongs to a headless client.
+pub fn registered_id(raw: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    let id = v["sessionId"].as_str()?;
+    (super::catalog::valid_session_id(id) && v["entrypoint"].as_str() != Some(HEADLESS_ENTRYPOINT))
+        .then(|| id.to_owned())
+}
+
 /// The entrypoint a headless OX-style client writes into every journal row.
 pub const HEADLESS_ENTRYPOINT: &str = "sdk-cli";
 
@@ -63,6 +105,14 @@ pub fn cmdline_ids(raw: &[u8]) -> Vec<String> {
 mod tests {
     use super::*;
     const ID: &str = "01234567-abcd-4567-abcd-0123456789ab";
+
+    #[test]
+    fn a_registry_file_names_its_interactive_session_only() {
+        let row = |entry: &str| format!(r#"{{"pid":1,"sessionId":"{ID}","entrypoint":"{entry}"}}"#);
+        assert_eq!(registered_id(row("cli").as_bytes()).as_deref(), Some(ID));
+        assert_eq!(registered_id(row("sdk-cli").as_bytes()), None);
+        assert_eq!(registered_id(b"{"), None);
+    }
 
     #[test]
     fn only_claude_processes_name_sessions() {

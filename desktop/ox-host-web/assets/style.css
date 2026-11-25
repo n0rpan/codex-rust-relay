@@ -497,6 +497,22 @@ form > .primary {
   background: var(--panel);
   border-radius: 3px;
 }
+.jump-latest {
+  position: absolute;
+  right: 0.72rem;
+  bottom: calc(100% + 0.6rem);
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 0.8rem;
+  border-radius: 22px;
+  border: 1px solid var(--line-strong);
+  background: var(--raised);
+  color: var(--ink);
+  box-shadow: 0 2px 8px var(--shadow);
+}
+.jump-latest[hidden] {
+  display: none;
+}
 #composer textarea {
   width: 100%;
   display: block;

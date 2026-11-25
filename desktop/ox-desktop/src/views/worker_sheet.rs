@@ -186,10 +186,12 @@ fn permission_label(request: ModeRequest, runtime: Runtime) -> String {
     }
 }
 
-fn subscription_label(runtime: Runtime) -> &'static str {
-    match runtime {
-        Runtime::Codex => "ChatGPT plan",
-        Runtime::Claude => "Claude plan",
+/// "Claude subscription", with the runtime's default model when this session's runtime reports it.
+fn subscription_label(runtime: Runtime, default: Option<String>) -> String {
+    let account = format!("{} subscription", runtime.account());
+    match default {
+        Some(name) => format!("{account} · {name}"),
+        None => account,
     }
 }
 
@@ -266,6 +268,17 @@ impl Workbench {
         cx.notify();
     }
 
+    /// Point the open sheet at a runtime and API alias (none: its subscription).
+    pub(super) fn set_launch_route(
+        &mut self,
+        runtime: Runtime,
+        model: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_launch_runtime(runtime, cx);
+        self.set_launch_choice(|c| c.model = model, cx);
+    }
+
     pub(super) fn set_launch_runtime(&mut self, runtime: Runtime, cx: &mut Context<Self>) {
         self.set_launch_choice(|c| c.runtime = runtime, cx);
         if let Some(Launch::Worker(draft)) = self.launch.as_mut()
@@ -324,7 +337,8 @@ impl Workbench {
                     s.launch_picker = None;
                     cx.notify();
                 }
-                ModelPickerEvent::Starred(_) => {}
+                ModelPickerEvent::Starred(_) | ModelPickerEvent::HandOff(_) => {}
+                ModelPickerEvent::AddProvider => cx.emit(super::route_chip::OpenProviders),
             },
         );
         self.launch_picker = Some((kind, picker, subscription));
@@ -395,16 +409,29 @@ impl Workbench {
         // A Codex worker needs an OX API model; a handoff may use either subscription.
         let subscription_ok = kind == LaunchKind::Handoff || choice.runtime == Runtime::Claude;
         let model_label = match &choice.model {
-            Some(model) => format!("{} · API · {model}", choice.runtime.name()),
+            Some(model) => format!(
+                "{} · {}",
+                choice.runtime.name(),
+                ox_desk_core::slash::readable_model(model)
+            ),
             None => "Choose a model…".into(),
         };
+        let default = self
+            .store
+            .as_ref()
+            .filter(|s| s.profile().route.runtime == choice.runtime)
+            .and_then(|store| {
+                let caps = store.command_caps(Some(&choice.owner));
+                let id = caps.default_model()?.to_owned();
+                Some(caps.model_display(&id))
+            });
         let chips = row()
             .gap_2()
             .flex_wrap()
             .child(button(
                 p,
                 "launch-subscription",
-                subscription_label(choice.runtime),
+                subscription_label(choice.runtime, default),
                 choice.model.is_none(),
                 subscription_ok,
                 cx.listener(|s, _, _, cx| s.choose_launch_model(None, cx)),

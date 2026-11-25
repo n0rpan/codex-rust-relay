@@ -158,13 +158,13 @@ pub fn caret(p: Palette) -> gpui::Div {
 }
 
 /// A tiny pixel-font caps label ("PROJECT", "AGENT") in the quiet text tier.
-pub fn micro_label(p: Palette, text: &'static str) -> gpui::Div {
+pub fn micro_label(p: Palette, text: impl Into<SharedString>) -> gpui::Div {
     gpui::div()
         .flex_shrink_0()
         .font_family(LABEL_FONT)
         .text_size(p.text(Step::Label) * 0.84)
         .text_color(rgb(p.quiet()))
-        .child(text)
+        .child(text.into())
 }
 
 /// A text input on the control grid: 32 px tall with the control radius.

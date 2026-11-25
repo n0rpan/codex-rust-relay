@@ -45,6 +45,7 @@ impl Lease {
             &Client::Subscribe {
                 scope: Some(scope.clone()),
                 after: None,
+                terminal: false,
             },
         )
         .await?;

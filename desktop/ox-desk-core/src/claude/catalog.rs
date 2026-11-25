@@ -212,6 +212,42 @@ fn records(mut reader: impl BufRead, mut f: impl FnMut(Value) -> io::Result<()>)
     }
 }
 
+/// Like `records`, but only complete lines count (a writer may be mid-line), and the
+/// offset just past the last one is returned (`whole`: a finished file whose last line has no newline counts too) so a later read can resume there.
+fn records_at(
+    mut reader: impl BufRead,
+    start: u64,
+    whole: bool,
+    mut f: impl FnMut(Value) -> io::Result<()>,
+) -> io::Result<u64> {
+    let mut line = Vec::new();
+    let mut at = start;
+    loop {
+        line.clear();
+        if reader
+            .by_ref()
+            .take(MAX_RECORD as u64 + 1)
+            .read_until(b'\n', &mut line)?
+            == 0
+        {
+            return Ok(at);
+        }
+        if line.len() > MAX_RECORD {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Claude transcript record exceeds 64 MiB",
+            ));
+        }
+        if line.last() != Some(&b'\n') && !whole {
+            return Ok(at);
+        }
+        at += line.len() as u64;
+        if let Ok(value) = serde_json::from_slice(&line) {
+            f(value)?;
+        }
+    }
+}
+
 fn inspect(
     path: PathBuf,
     id: &str,
@@ -506,7 +542,28 @@ impl Session {
         }
         let children = self.path.with_extension("").join("subagents");
         let mut visited = std::collections::HashSet::new();
-        self.replay(&self.path, None, &children, &mut visited, &mut consume)
+        self.replay(&self.path, None, &children, &mut visited, 0, &mut consume)
+            .map(drop)
+    }
+
+    /// Replay the main journal from `start` (a line boundary this method returned before),
+    /// consuming only complete lines. `None` when the file shrank or was replaced since
+    /// (the caller starts over); otherwise the next offset and the file's identity.
+    pub fn history_from(
+        &self,
+        start: u64,
+        identity: Option<u64>,
+        visited: &mut std::collections::HashSet<String>,
+        mut consume: impl FnMut(Value) -> io::Result<()>,
+    ) -> io::Result<Option<(u64, u64)>> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = open_transcript(&self.path)?.metadata()?;
+        if meta.len() < start || identity.is_some_and(|i| i != meta.ino()) {
+            return Ok(None);
+        }
+        let children = self.path.with_extension("").join("subagents");
+        let end = self.replay(&self.path, None, &children, visited, start, &mut consume)?;
+        Ok(Some((end, meta.ino())))
     }
 
     fn replay(
@@ -515,10 +572,16 @@ impl Session {
         child: Option<(&str, &str)>,
         children: &Path,
         visited: &mut std::collections::HashSet<String>,
+        start: u64,
         consume: &mut dyn FnMut(Value) -> io::Result<()>,
-    ) -> io::Result<()> {
-        let mut confirmed = false;
-        records(BufReader::new(open_transcript(path)?), |mut row| {
+    ) -> io::Result<u64> {
+        // A resumed read has seen the first row already.
+        let mut confirmed = start > 0;
+        let mut file = open_transcript(path)?;
+        if start > 0 {
+            file.seek(SeekFrom::Start(start))?;
+        }
+        records_at(BufReader::new(file), start, child.is_some(), |mut row| {
             if !matches!(row["type"].as_str(), Some("user" | "assistant"))
                 || row["sessionId"] != self.id
             {
@@ -587,7 +650,7 @@ impl Session {
                         serde_json::json!({"type":"system","subtype":"task_started","task_type":"local_agent","task_id":agent,
                         "session_id":self.id,"tool_use_id":tool,"description":description,"parent_tool_use_id":child.map(|(_,tool)|tool)}),
                     )?;
-                    self.replay(&path, Some((&agent, &tool)), children, visited, consume)?;
+                    self.replay(&path, Some((&agent, &tool)), children, visited, 0, consume)?;
                 }
             }
             Ok(())

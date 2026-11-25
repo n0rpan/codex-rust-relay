@@ -286,7 +286,15 @@ export class SessionControls {
             id.split("/")[0] === billing.api.split("/")[0])));
     const modelRows = Object.entries(models)
       .filter(([k]) => compatible(k))
-      .map(([k, v]) => [k, v.label && v.label !== k ? v.label + " · " + k : k]);
+      .map(([k, v]) => [
+        k,
+        // The default entry's label already names the model it resolves to.
+        v.label && v.label !== k
+          ? k === "default"
+            ? v.label
+            : v.label + " · " + k
+          : k,
+      ]);
     const edit =
       this.enabled("model_options") &&
       !own.changing &&

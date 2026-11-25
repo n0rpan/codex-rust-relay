@@ -19,6 +19,15 @@ pub struct ModelInfo {
     pub efforts: Vec<Effort>,
     pub default_effort: Option<String>,
     pub default_tier: Option<String>,
+    /// Position in the runtime's own model list: that order is its preferred one.
+    #[serde(default)]
+    pub rank: Option<u32>,
+    /// The runtime marks this entry as its default model.
+    #[serde(default)]
+    pub is_default: bool,
+    /// The concrete model id a symbolic entry such as Claude's `default` resolves to.
+    #[serde(default)]
+    pub resolved: Option<String>,
 }
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Options {

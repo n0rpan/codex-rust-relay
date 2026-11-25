@@ -46,6 +46,7 @@ pub(crate) fn watch_catalog() -> io::Result<(CatalogWatch, flume::Receiver<Catal
                     Client::Subscribe {
                         scope: None,
                         after: None,
+                        terminal: false,
                     }
                 };
                 write_frame(&mut stream, &request)?;

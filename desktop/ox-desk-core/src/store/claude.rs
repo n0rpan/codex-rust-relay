@@ -90,7 +90,10 @@ enum Data {
     Connected(pipe::Link),
     Stock(pipe::Event),
     History(history::Batch),
-    Viewed,
+    /// Appended journal rows of a read-only viewer, to apply in place.
+    Tail(history::Tail),
+    /// A viewer's read finished; the follower resumes from where it stopped.
+    Viewed(Option<Box<history::Follower>>),
     Failed(String),
 }
 impl Update {
@@ -98,6 +101,7 @@ impl Update {
         !matches!(
             self.data,
             Data::History(_)
+                | Data::Tail(_)
                 | Data::Stock(pipe::Event::Frame(
                     wire::Event::Delta { .. } | wire::Event::Item { .. }
                 ))
