@@ -54,6 +54,29 @@ def run_reviewed_fixture(window, marker, expected):
         window.command("xdotool", "windowfocus", window.id)
 
 
+def open_transcript_find(window, attempts=3):
+    """Open transcript find and wait for its field before typing a query.
+
+    The desktop matches shortcut modifiers exactly. On ubuntu-24.04-arm the
+    ctrl+f sent right after the ctrl+alt+1 answer shortcut sometimes never
+    opened the field, and the query was typed into the composer. Release any
+    modifier xdotool left down, then retry the shortcut, reporting the attempt.
+    """
+    for attempt in range(1, attempts + 1):
+        window.command("xdotool", "keyup", "ctrl", "alt", "shift", "super")
+        window.key("ctrl+f")
+        try:
+            window.word("Find", same_row="transcript")
+        except AssertionError:
+            if attempt == attempts:
+                raise
+            print(f"transcript find did not open on attempt {attempt}; retrying", flush=True)
+            continue
+        if attempt > 1:
+            print(f"transcript find opened on attempt {attempt}", flush=True)
+        return
+
+
 def local_tool_terminal(window, provider, root, project):
     import shlex
     program = root / "bin/sudo"
@@ -79,10 +102,7 @@ def local_tool_terminal(window, provider, root, project):
     assert not marker.exists()
     # Native transcript search expands the exact matching tool and scrolls it into view.
     # Earlier approvals can have another identically titled Terminal header on screen.
-    window.key("ctrl+f")
-    # Type only once the find field exists and has focus. Typing straight after
-    # the shortcut can race it and send the query to the composer instead.
-    window.word("Find", same_row="transcript")
+    open_transcript_find(window)
     window.text("fixture-failed")
     window.word("Run", same_row="terminal", click=True)
     run_reviewed_fixture(window, marker, [str(project.resolve()), "--", "fixture-failed", "two words"])
