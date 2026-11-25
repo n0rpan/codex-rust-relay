@@ -1397,3 +1397,102 @@ fn a_later_turn_extends_the_earlier_request_block_for_block() {
     assert!(later.len() > earlier.len());
     assert_eq!(later[..earlier.len()], earlier[..]);
 }
+
+// ---------------------------------------------------------------------------
+// Regression: assistant item ids must be unique across a thread
+// ---------------------------------------------------------------------------
+
+/// Codex keys transcript rows by `(turn, item_id)` and appends a row only the
+/// first time it sees a key. Ids built from the content-block `index` repeat on
+/// every response, so a later reply rewrote the earlier row in place.
+#[test]
+fn assistant_item_ids_are_unique_across_responses() {
+    // Each response carries its own upstream message id, as Anthropic does.
+    fn first_text_item_id(message_id: &str) -> String {
+        let mut translator = ResponseTranslator::with_created_at(1_700_000_000);
+        let mut start = message_start("claude-x");
+        start["message"]["id"] = json!(message_id);
+        push(&mut translator, "message_start", start);
+        push(
+            &mut translator,
+            "content_block_start",
+            json!({"index": 0, "content_block": {"type": "text", "text": ""}}),
+        );
+        push(
+            &mut translator,
+            "content_block_delta",
+            json!({"index": 0, "delta": {"type": "text_delta", "text": "hi"}}),
+        );
+        push(&mut translator, "content_block_stop", json!({"index": 0}));
+        let events = push(
+            &mut translator,
+            "message_stop",
+            json!({"type": "message_stop"}),
+        );
+        events
+            .iter()
+            .find(|event| event["type"] == "response.output_item.done")
+            .and_then(|event| event["item"]["id"].as_str())
+            .expect("a closed text item")
+            .to_owned()
+    }
+
+    let first = first_text_item_id("msg_a");
+    let second = first_text_item_id("msg_b");
+    assert_ne!(
+        first, second,
+        "two responses produced the same assistant item id {first:?}; \
+         Codex collapses them onto one transcript row"
+    );
+    assert!(first.starts_with("msg_"), "{first}");
+}
+
+// ---------------------------------------------------------------------------
+// Regression: namespaced injected context (Codex goal objectives)
+// ---------------------------------------------------------------------------
+
+/// A Codex goal injects its objective as a `function_call_output` with `name` +
+/// `namespace` and no `call_id`. It is context, not a tool answer, so it must
+/// reach the model rather than failing the turn.
+#[test]
+fn forwards_namespaced_injected_context_without_a_call_id() {
+    let request = json!({
+        "input": [
+            {"role": "user", "content": "hi"},
+            {"type": "function_call_output", "name": "goal_objective", "namespace": "agent",
+             "output": "Inspect the repo and describe the UI/UX."}
+        ],
+        "stream": true
+    });
+    let body = translate_request(&request, "claude-upstream")
+        .expect("injected context must not abort the turn");
+    let messages = body["messages"].as_array().unwrap();
+    let text = messages
+        .iter()
+        .flat_map(|message| message["content"].as_array().cloned().unwrap_or_default())
+        .filter_map(|block| block["text"].as_str().map(str::to_owned))
+        .collect::<String>();
+    assert!(text.contains("Inspect the repo"), "{messages:?}");
+    assert!(text.contains("agent.goal_objective"), "{messages:?}");
+    // No fabricated tool_use/tool_result pair.
+    assert!(
+        !serde_json::to_string(messages)
+            .unwrap()
+            .contains("tool_result"),
+        "injected context must not fabricate a tool result: {messages:?}"
+    );
+}
+
+/// A real tool result still requires its `call_id`.
+#[test]
+fn still_requires_a_call_id_for_real_tool_outputs() {
+    let request = json!({
+        "input": [
+            {"role": "user", "content": "hi"},
+            {"type": "function_call_output", "output": "orphan"}
+        ],
+        "stream": true
+    });
+    let error = translate_request(&request, "claude-upstream").unwrap_err();
+    assert!(error.contains("call_id"), "{error}");
+}

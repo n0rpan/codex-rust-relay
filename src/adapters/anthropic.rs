@@ -80,6 +80,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Map, Value, json};
 
+/// Build the `item_id` reported for a generated assistant message.
+///
+/// Codex keys transcript rows by `(turn, item_id)` and appends a row only the
+/// first time it sees a key, so an id that repeats within a turn makes every
+/// later reply rewrite the first row in place. A name built only from the
+/// Anthropic content-block `index` repeats on every response, because the index
+/// restarts at 0. Prefixing the response id keeps ids unique across a thread
+/// while staying reproducible.
+fn message_item_id(response_id: &str, index: usize) -> String {
+    format!("msg_{response_id}_{index}")
+}
+
 /// Prefix of the opaque envelope stored in a reasoning item's
 /// `encrypted_content` field.
 pub const THINKING_ENVELOPE_PREFIX: &str = "codeox.anthropic.thinking.v1:";
@@ -452,6 +464,14 @@ fn translate_input_item(
             )
         }
         Some("function_call_output") => {
+            // Codex injects goal context as a namespaced pseudo-tool result
+            // carrying `name` + `namespace` and no `call_id`. It is not a real
+            // call result, so there is no `tool_use_id` to answer; forwarding it
+            // as context keeps the objective on later turns.
+            if is_injected_context(item) {
+                push_injected_context(item, path, builder)?;
+                return Ok(());
+            }
             let call_id = required_string(item, "call_id", path)?;
             if call_id.is_empty() {
                 return Err(format!("{path}.call_id must not be empty"));
@@ -505,6 +525,45 @@ fn translate_input_item(
         )),
         Some(kind) => Err(format!("unsupported input item type \"{kind}\" at {path}")),
     }
+}
+
+/// A `function_call_output` that stands in for tool output Codex holds itself
+/// rather than a real call the model made. Codex marks these with a `namespace`
+/// and no `call_id`.
+fn is_injected_context(item: &Map<String, Value>) -> bool {
+    let namespaced = item.get("namespace").is_some_and(|value| !value.is_null());
+    let has_call_id = item
+        .get("call_id")
+        .and_then(Value::as_str)
+        .is_some_and(|call_id| !call_id.is_empty());
+    namespaced && !has_call_id
+}
+
+/// Fold an injected context item into a plain `user` turn.
+///
+/// It cannot become a `tool_result`: there is no `tool_use_id` to answer, and an
+/// invented id would be rejected upstream or answered as if the model had asked.
+fn push_injected_context(
+    item: &Map<String, Value>,
+    path: &str,
+    builder: &mut ConversationBuilder,
+) -> Result<(), String> {
+    let output = item
+        .get("output")
+        .ok_or_else(|| format!("{path}.output is required for a function_call_output item"))?;
+    let text = injected_context_text(output, path)?;
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let label = match (
+        item.get("namespace").and_then(Value::as_str),
+        item.get("name").and_then(Value::as_str),
+    ) {
+        (Some(namespace), Some(name)) => format!("{namespace}.{name}"),
+        (None, Some(name)) => name.to_owned(),
+        _ => "context".to_owned(),
+    };
+    builder.push_text("user", &format!("[{label}]\n{text}"))
 }
 
 fn translate_message_item(
@@ -627,6 +686,38 @@ fn text_blocks(text: &str) -> Vec<Value> {
         Vec::new()
     } else {
         vec![json!({ "type": "text", "text": text })]
+    }
+}
+
+/// Flatten injected context output to plain text. Only the text-bearing shapes
+/// are accepted; an injected goal objective is always text.
+fn injected_context_text(output: &Value, path: &str) -> Result<String, String> {
+    match output {
+        Value::String(text) => Ok(text.clone()),
+        Value::Null => Ok(String::new()),
+        Value::Array(parts) => {
+            let mut text = String::new();
+            for (index, part) in parts.iter().enumerate() {
+                let part_path = format!("{path}.output[{index}]");
+                if let Some(part) = part.as_str() {
+                    text.push_str(part);
+                    continue;
+                }
+                let part = expect_object(part, &part_path)?;
+                match required_string(part, "type", &part_path)? {
+                    "input_text" | "output_text" | "text" => {
+                        text.push_str(required_string(part, "text", &part_path)?);
+                    }
+                    other => {
+                        return Err(format!(
+                            "unsupported injected context content type \"{other}\" at {part_path}"
+                        ));
+                    }
+                }
+            }
+            Ok(text)
+        }
+        other => Ok(other.to_string()),
     }
 }
 
@@ -1346,7 +1437,8 @@ impl ResponseTranslator {
                 let initial =
                     string_field(content_block, "text", "content_block_start.content_block")?
                         .unwrap_or_default();
-                let item_id = format!("msg_{index}");
+                let response_id = self.state_mut()?.response_id.clone();
+                let item_id = message_item_id(&response_id, index);
                 self.state_mut()?.blocks.insert(
                     index,
                     BlockState {
