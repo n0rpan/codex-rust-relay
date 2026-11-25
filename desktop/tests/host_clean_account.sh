@@ -49,13 +49,14 @@ if [ "$os" = Linux ]; then
     # its private socket, so no D-Bus session bus is needed (the runner image
     # may not ship dbus-user-session).
     sudo systemctl start "user@$uid.service" || true
-    for _ in $(seq 1 300); do [ -S "/run/user/$uid/systemd/private" ] && break; sleep 0.1; done
-    if [ ! -S "/run/user/$uid/systemd/private" ]; then
+    # /run/user/UID is private to the new account, so look inside it as root.
+    for _ in $(seq 1 300); do sudo test -S "/run/user/$uid/systemd/private" && break; sleep 0.1; done
+    if ! sudo test -S "/run/user/$uid/systemd/private"; then
         systemctl status "user@$uid.service" --no-pager || true
         fail "systemd --user did not start for $user"
     fi
     bus=""
-    if [ -S "/run/user/$uid/bus" ]; then bus="unix:path=/run/user/$uid/bus"; fi
+    if sudo test -S "/run/user/$uid/bus"; then bus="unix:path=/run/user/$uid/bus"; fi
     as_user() {
         sudo -u "$user" env -i HOME="$home" USER="$user" LOGNAME="$user" \
             XDG_RUNTIME_DIR="/run/user/$uid" ${bus:+DBUS_SESSION_BUS_ADDRESS="$bus"} \
