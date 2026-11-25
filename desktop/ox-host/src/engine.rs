@@ -42,6 +42,30 @@ pub(crate) enum Message {
     },
     Stop,
 }
+/// A handoff target waiting for its first turn to be accepted.
+pub(crate) struct Confirming {
+    thread: String,
+    deadline: Instant,
+    launch: Launching,
+}
+
+/// Whether a new session's first turn was accepted: `Some(Ok)` once nothing is
+/// left in flight, `Some(Err)` if the runtime refused part of it (such as
+/// thread/inject_items) or it took too long, `None` while it is still being sent.
+fn first_turn(store: &Store, thread: &str, deadline: Instant) -> Option<Result<(), String>> {
+    if let Some(error) = store.transcript(thread).and_then(|t| t.error()) {
+        return Some(Err(format!(
+            "The new session was created, but its carried history or first turn was refused: {error}"
+        )));
+    }
+    if !store.sending(Some(thread)) {
+        return Some(Ok(()));
+    }
+    (deadline <= Instant::now()).then(|| {
+        Err("The new session was created, but its carried history and first turn were not confirmed in time.".to_owned())
+    })
+}
+
 /// A launch that ended, successfully or not.
 pub(crate) struct Finished {
     reply: Replier,
@@ -154,6 +178,10 @@ struct ClientState {
 struct Live {
     launching: Option<Launching>,
     fork_origin: Option<Origin>,
+    /// A Codex handoff target that exists but whose carried history and first
+    /// turn are not confirmed yet: thread/inject_items and turn/start follow
+    /// thread/start. Its launcher hears the outcome only once they do.
+    confirming: Option<Confirming>,
     opening: Option<(u64, String)>,
     terminal: Option<(u64, String)>,
     schema_started: bool,
@@ -237,6 +265,7 @@ impl Engine {
                         .next_deadline()
                         .into_iter()
                         .chain(r.launching.as_ref().map(|l| l.deadline))
+                        .chain(r.confirming.as_ref().map(|c| c.deadline))
                 })
                 .chain(self.preparing.iter().map(|p| p.deadline))
                 .chain(
@@ -270,6 +299,7 @@ impl Engine {
                         .filter(|(_, s)| {
                             s.store.next_deadline().is_some_and(|t| t <= now)
                                 || s.launching.as_ref().is_some_and(|l| l.deadline <= now)
+                                || s.confirming.as_ref().is_some_and(|c| c.deadline <= now)
                         })
                         .map(|(k, _)| k.clone())
                         .collect();
@@ -746,6 +776,7 @@ impl Engine {
             Live {
                 launching: None,
                 fork_origin: None,
+                confirming: None,
                 opening: None,
                 terminal: None,
                 schema_started: false,
@@ -1070,11 +1101,29 @@ impl Engine {
                     // The runtime did not confirm a mode inside the ceiling. Never let it run.
                     let _ = live.store.stop(thread);
                     launched = Some(Finished::new(l, Err("The runtime did not confirm a permission mode within the granted ceiling.".to_owned()), None));
+                } else if matches!(l.payload, Payload::Handoff { .. })
+                    && l.origin.runtime == ox_desk_core::runtime::Runtime::Codex
+                {
+                    // Stamp it now so no client sees it unstamped, but report the
+                    // handoff only once the carried history and request are in.
+                    self.workers.stamp(scope, thread, l.origin.clone());
+                    live.confirming = Some(Confirming {
+                        thread: thread.clone(),
+                        deadline: Instant::now() + Duration::from_secs(60),
+                        launch: l,
+                    });
                 } else {
                     self.workers.stamp(scope, thread, l.origin.clone());
                     launched = Some(Finished::new(l, Ok(()), Some(thread.clone())));
                 }
             }
+        }
+        if launched.is_none()
+            && let Some(c) = &live.confirming
+            && let Some(result) = first_turn(&live.store, &c.thread, c.deadline)
+        {
+            let c = live.confirming.take().expect("confirming");
+            launched = Some(Finished::new(c.launch, result, Some(c.thread)));
         }
         let launch_failure = launch_failure.or_else(|| {
             let l = live.launching.as_ref()?;
@@ -1925,6 +1974,7 @@ mod tests {
                 store,
                 launching: None,
                 fork_origin: None,
+                confirming: None,
                 opening: None,
                 terminal: None,
                 schema_started: true,
@@ -2080,6 +2130,7 @@ mod tests {
                     store,
                     launching: None,
                     fork_origin: None,
+                    confirming: None,
                     opening: None,
                     terminal: None,
                     schema_started: true,
@@ -3551,6 +3602,32 @@ mod tests {
                 block.contains("first request")
                     && block.contains("<message role=\"assistant\" id=\"a1\">")
             );
+        }
+
+        #[test]
+        fn a_codex_handoff_is_reported_only_after_its_history_and_first_turn_are_accepted() {
+            let root = tempfile::tempdir().unwrap();
+            let (_, target) = scopes(root.path());
+            let later = Instant::now() + Duration::from_secs(60);
+            // The runtime refused thread/inject_items: the transcript carries the error.
+            let mut refused = timeline(&[], false);
+            refused.detail["error"] = json!("thread/inject_items: invalid item");
+            let (l, _) = live_with(
+                &target,
+                vec![view(&target, "t", "idle", "workspace")],
+                vec![("t", refused)],
+                vec![],
+            );
+            let err = first_turn(&l.store, "t", later).unwrap().unwrap_err();
+            assert!(err.contains("invalid item"), "{err}");
+            // Nothing in flight and no error: the first turn was accepted.
+            let (l, _) = live_with(
+                &target,
+                vec![view(&target, "t", "running", "workspace")],
+                vec![("t", timeline(&[], true))],
+                vec![],
+            );
+            assert_eq!(first_turn(&l.store, "t", later), Some(Ok(())));
         }
 
         #[test]

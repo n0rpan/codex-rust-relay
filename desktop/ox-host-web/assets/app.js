@@ -322,7 +322,8 @@ class Link {
       this.opens.add(id);
     this.pending.set(id, cb);
     this.send(wire.act(id, this.scope, action, approval));
-    return true;
+    // The request ID; a reply for it can arrive before the acknowledgement.
+    return id;
   }
   reconnect() {
     if (this.closed) return;
@@ -1160,16 +1161,20 @@ $("handoff-form").onsubmit = (e) => {
     request: $("handoff-request").value,
     yolo_confirmed: confirmed,
   };
-  detailLink?.act({ start_handoff: start }, null, (ok, message, key) => {
-    if (!ok) notice(message || "The host refused this handoff.");
-    else {
-      if (mode === "yolo" && $("handoff-grant").checked)
-        pendingGrant = { key };
+  const grant = mode === "yolo" && $("handoff-grant").checked;
+  const key = detailLink?.act({ start_handoff: start }, null, (ok, message) => {
+    if (!ok) {
+      notice(message || "The host refused this handoff.");
+      if (pendingGrant?.key === key) pendingGrant = null;
+    } else {
       // An immediate refusal arrives as a worker_reply error; keep that notice.
       $("handoff-form").hidden = true;
       $("handoff-request").value = "";
     }
   });
+  // Register the grant before any reply is handled: on a ready route the host's
+  // handoff reply can arrive before its acknowledgement.
+  if (grant && key) pendingGrant = { key };
 };
 $("start-worker").onclick = () => {
   $("worker-models").replaceChildren(
