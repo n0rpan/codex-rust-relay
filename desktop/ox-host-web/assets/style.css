@@ -1421,3 +1421,15 @@ form > .primary {
 #yolo-grant-status p {
   color: var(--warning);
 }
+
+.native-live {
+  margin: 0 0 8px;
+  padding: 8px 12px;
+  background: var(--panel);
+  border-left: 3px solid var(--accent);
+}
+.native-live p {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 0.9em;
+}

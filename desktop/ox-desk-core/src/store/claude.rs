@@ -2,6 +2,7 @@
 //! open session. The session key and launch generation accompany every callback.
 mod events;
 mod history;
+mod native;
 
 use super::{Connection, Profile, Store, ThreadRow, catalog::now_secs};
 use crate::{
@@ -48,6 +49,7 @@ pub struct Project {
     asks: HashMap<RequestId, (String, wire::Permission)>,
     blank: Option<String>,
     serial: u64,
+    native: native::Native,
 }
 #[derive(Default)]
 struct Process {
@@ -63,6 +65,8 @@ struct Process {
     mode: Option<Access>,
     controls: HashMap<String, Control>,
     first: Option<(String, String)>,
+    /// Read-only view of a journal a stock client is writing right now: no process.
+    viewer: Option<native::Viewer>,
 }
 enum Control {
     Mode(Access),
@@ -86,6 +90,7 @@ enum Data {
     Connected(pipe::Link),
     Stock(pipe::Event),
     History(history::Batch),
+    Viewed,
     Failed(String),
 }
 impl Update {
@@ -381,6 +386,7 @@ impl Store {
             asks: Default::default(),
             blank: None,
             serial: 0,
+            native: Default::default(),
         };
         let mut store = Self::with_link(profile, links::Link::Claude(Box::new(project)));
         store.claude_list();
@@ -431,6 +437,7 @@ impl Store {
         if self.claude().sessions.contains_key(&owner) {
             return Ok(owner);
         }
+        self.claude_mut().native.ox_seen.insert(owner.clone());
         let profile = self.profile.clone();
         // A draft preset belongs only to the new session it was chosen for.
         let preset = match &session {
@@ -533,6 +540,9 @@ impl Store {
             return Ok(());
         }
         let raw = stock_id(id)?.to_owned();
+        if self.native_live_now(id) {
+            return self.view_native(id);
+        }
         self.transcripts.entry(id.into()).or_default().loading = true;
         self.spawn_claude(Session::Resume(raw), None, confirm)?;
         Ok(())
@@ -546,6 +556,9 @@ impl Store {
             .ok_or_else(|| io::Error::other("Thread is outside this catalog"))?
             .clone();
         self.check_route(&row)?;
+        if self.native_live_now(id) {
+            return Err(io::Error::other(native::HINT));
+        }
         let text = self.draft(Some(id)).to_owned();
         let raw = stock_id(id)?.to_owned();
         self.spawn_claude(Session::Resume(raw), Some((new_id()?, text)), false)?;
@@ -685,6 +698,11 @@ impl Store {
             .ok_or_else(|| io::Error::other("Waiting for Claude Code"))?;
         let request = link.interrupt()?;
         process.controls.insert(request, Control::Interrupt);
+        if let Some(t) = self.transcripts.get_mut(id)
+            && let Some(turn) = t.active_turn.clone()
+        {
+            t.stop_requested = Some(turn);
+        }
         Ok(())
     }
     /// Drop a session's process, which closes its link and kills the process
@@ -738,15 +756,19 @@ impl Store {
     }
     pub(super) fn claude_has_live(&self, id: &str) -> bool {
         let project = self.claude();
-        project.blank.as_deref() != Some(id) && project.sessions.contains_key(id)
+        project.blank.as_deref() != Some(id)
+            && project.sessions.get(id).is_some_and(|p| p.viewer.is_none())
+    }
+    pub(super) fn claude_is_blank(&self, id: &str) -> bool {
+        self.claude().blank.as_deref() == Some(id)
     }
     pub(super) fn claude_live(&self) -> Vec<String> {
         let project = self.claude();
         let mut ids: Vec<String> = project
             .sessions
-            .keys()
-            .filter(|k| project.blank.as_deref() != Some(k.as_str()))
-            .cloned()
+            .iter()
+            .filter(|(k, p)| project.blank.as_deref() != Some(k.as_str()) && p.viewer.is_none())
+            .map(|(k, _)| k.clone())
             .collect();
         ids.sort();
         ids

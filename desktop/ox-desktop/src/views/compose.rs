@@ -272,7 +272,6 @@ impl Workbench {
             key.map_or_else(|| store.can_send(None), |id| store.can_change_access(id)),
             |_, _, _| {},
         )
-        .icon(gpui_component::IconName::ChevronDown)
         .dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
             for &preset in presets {
                 let id = owner.clone();
@@ -346,6 +345,7 @@ impl Workbench {
             vec![]
         };
         let owner = selected.clone();
+        let native = key.filter(|id| store.is_native_live(id)).map(str::to_owned);
         let editor_for_menu = editor.clone();
         col()
             .flex_shrink_0()
@@ -377,6 +377,29 @@ impl Workbench {
                     );
                 }
                 panel.child(choices)
+            })
+            .when_some(native, |panel, id| {
+                panel.child(
+                    col()
+                        .id("native-live-notice")
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(p.text(Step::Meta))
+                                .text_color(rgb(p.muted))
+                                .child(store.native_live_hint()),
+                        )
+                        .child(row().child(button(
+                            p,
+                            "continue-native",
+                            "Continue in a new OX session".to_owned(),
+                            false,
+                            true,
+                            cx.listener(move |s, _, _, cx| {
+                                s.action(cx, DeskAction::ForkThread(id.clone()))
+                            }),
+                        ))),
+                )
             })
             .when_some(handoff_notice, |panel, notice| {
                 panel.child(

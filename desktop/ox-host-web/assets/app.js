@@ -46,17 +46,23 @@ const routesLabel = (r) =>
       : "Claude subscription"
     : r.runtime.replace(/^./, (x) => x.toUpperCase()) + " · " + r.billing.api;
 // Desktop status words (views/host/discovery.rs route_status, views/host.rs).
+// Same wording as the desktop (ox-desk-core store/claude/native.rs); `app` is the host's
+// `detail.native_live`: the stock client that has the session open.
+const nativeLiveText = (app) =>
+  `This conversation is running in ${app} right now. OX shows it read-only so the two don't collide. When it's closed there, you can continue it here.`;
 const statusText = (session, needsInput) =>
-  needsInput
-    ? "Needs you"
-    : session.capabilities.includes("ended")
-      ? "Ended"
-      : ({
-          running: "Running",
-          needs_input: "Needs you",
-          failed: "Error",
-          interrupted: "Interrupted",
-        })[session.status] ?? "";
+  session.capabilities.includes("native_live")
+    ? `Live in ${session.detail?.native_live ?? "Claude Code"}`
+    : needsInput
+      ? "Needs you"
+      : session.capabilities.includes("ended")
+        ? "Ended"
+        : ({
+            running: "Running",
+            needs_input: "Needs you",
+            failed: "Error",
+            interrupted: "Interrupted",
+          })[session.status] ?? "";
 const leaf = (path) => path.split("/").filter(Boolean).pop() || path;
 const keyOf = (scope, id) => scopeKey(scope) + " " + id;
 function notice(s = "") {
@@ -477,7 +483,7 @@ function drawRunning() {
   const now = Date.now() / 1000;
   $("running-empty").hidden = !(processes && !processes.length);
   $("running-loading").hidden = processes !== null;
-  const idle = (processes ?? []).filter((p) => !p.running);
+  const idle = (processes ?? []).filter((p) => !p.running && !p.draft);
   $("end-idle").disabled = endBusy || !idle.length;
   const rows = [];
   for (const p of processes ?? []) {
@@ -488,14 +494,15 @@ function drawRunning() {
     name.append(el("span", "run-dot"), leaf(p.project));
     head.append(
       name,
-      el("span", "status", p.running ? "Running" : "Idle"),
+      el("span", "status", p.running ? "Running" : p.draft ? "Ready" : "Idle"),
     );
+    if (p.draft) row.title = "Keeps Claude Code warm for new sessions";
     const facts = [
       kindLabels[p.kind] ?? p.kind,
-      p.model || p.route,
+      p.draft ? "ready (idle)" : p.model || p.route,
       p.threads.length > 1 ? p.threads.length + " sessions" : null,
       "age " + ago(now - p.started_at),
-      "idle " + ago(now - p.last_activity),
+      p.draft ? null : "idle " + ago(now - p.last_activity),
     ].filter(Boolean);
     const actions = el("div", "actions");
     const end = button("End", () => endRow(p));
@@ -576,7 +583,7 @@ $("end-idle").onclick = () => {
   freshProcesses((list) => {
     endChecking = false;
     if (!list) return;
-    const idle = list.filter((p) => !p.running);
+    const idle = list.filter((p) => !p.running && !p.draft);
     if (!idle.length) {
       notice("No idle sessions to end.");
       return;
@@ -1163,6 +1170,7 @@ function conversation() {
       running: caps.includes("stop"),
       waiting: asks.length > 0,
       failed: items[items.length - 1]?.role === "error",
+      stopped: timeline?.detail?.interrupted === true,
     });
   }
   if (selected.revealLatest && timeline?.items?.length) {
@@ -1189,6 +1197,15 @@ function conversation() {
       }
     }
   }
+  // A session another client is running is read-only here; it can be forked instead.
+  const nativeLive = !!id && caps.includes("native_live");
+  $("native-live").hidden = !nativeLive;
+  $("native-live-text").textContent = nativeLiveText(
+    row?.detail?.native_live ?? "Claude Code",
+  );
+  $("native-live-fork").hidden = !caps.includes("fork");
+  $("native-live-fork").onclick = () => detailLink?.act({ fork_thread: id });
+  $("draft").disabled = nativeLive;
   const canSend = id
     ? caps.some((c) => c === "send" || c === "steer")
     : s?.capabilities.includes("start");

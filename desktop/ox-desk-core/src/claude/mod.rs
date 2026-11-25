@@ -1,5 +1,6 @@
 //! Decode stock Claude Code stream-json and normalized, read-only history records.
 pub mod catalog;
+pub mod live;
 mod events;
 mod tasks;
 mod tools;

@@ -15,6 +15,8 @@ pub enum Change {
     TurnStarted,
     TurnCompleted {
         error: Option<String>,
+        /// The turn stopped because the user interrupted it, not because it finished.
+        interrupted: bool,
     },
     Item {
         row: ThreadItem,
@@ -87,6 +89,7 @@ impl Activity {
                     Change::TurnStarted
                 } else {
                     Change::TurnCompleted {
+                        interrupted: turn.status == "interrupted",
                         error: if turn.status == "failed" {
                             Some(
                                 turn.error

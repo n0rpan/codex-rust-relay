@@ -83,6 +83,10 @@ impl Store {
                 batch.apply(self, &owner);
                 Ok(())
             }
+            Data::Viewed => {
+                self.viewed(&owner);
+                Ok(())
+            }
             Data::Stock(pipe::Event::Frame(event)) => self.claude_frame(&owner, event),
         };
         if let Err(err) = &outcome {
@@ -374,15 +378,25 @@ impl Store {
                     self.title_after_turn(owner);
                 }
                 let t = self.transcripts.entry(owner.into()).or_default();
-                t.last_finished = t.active_turn.take().or_else(|| t.last_finished.clone());
-                if r.is_error {
+                let finished = t.active_turn.take();
+                t.interrupted = finished.is_some() && finished == t.stop_requested.take();
+                t.last_finished = finished.or_else(|| t.last_finished.clone());
+                let interrupted = t.interrupted;
+                if r.is_error && !interrupted {
                     t.error = Some(if r.errors.is_empty() {
                         format!("Claude turn ended ({})", r.subtype)
                     } else {
                         r.errors.join("\n")
                     });
                 }
-                self.claude_status(owner, if r.is_error { "systemError" } else { "idle" });
+                self.claude_status(
+                    owner,
+                    if r.is_error && !interrupted {
+                        "systemError"
+                    } else {
+                        "idle"
+                    },
+                );
                 self.claude_activity(owner);
                 self.changed.mark(Changed::THREADS);
             }
@@ -781,6 +795,7 @@ mod tests {
             asks: Default::default(),
             blank: None,
             serial: 2,
+            native: Default::default(),
         };
         let mut store = Store::with_link(profile, links::Link::Claude(Box::new(project)));
         for k in [&a, &b] {

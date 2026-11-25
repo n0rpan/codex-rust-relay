@@ -401,6 +401,30 @@ impl Profiles {
         Ok(rows)
     }
 
+    /// When the journal was last written, without reading it.
+    pub fn modified(
+        &self,
+        project: &Path,
+        id: &str,
+        origin: Origin,
+    ) -> io::Result<std::time::SystemTime> {
+        let profile = match origin {
+            Origin::Subscription => &self.subscription,
+            Origin::Api => &self.api,
+            Origin::Ambiguous => return Err(io::ErrorKind::InvalidInput.into()),
+        };
+        if !valid_session_id(id) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        for dir in candidates(profile, project)? {
+            match fs::symlink_metadata(dir.join(format!("{id}.jsonl"))) {
+                Ok(m) if m.is_file() => return m.modified(),
+                _ => (),
+            }
+        }
+        Err(io::ErrorKind::NotFound.into())
+    }
+
     pub fn session(&self, project: &Path, id: &str, origin: Origin) -> io::Result<Session> {
         if !valid_session_id(id) {
             return Err(io::Error::new(
@@ -475,8 +499,14 @@ impl Session {
                 row["parent_tool_use_id"] = Value::String(parent_tool.to_owned());
                 row["agent_id"] = Value::String(agent.to_owned());
             }
-            if !confirmed {
-                if row["cwd"].as_str().map(Path::new) != Some(&self.project) {
+            // The project is the cwd of the first conversation row of the main
+            // journal (where Claude Code started), the same rule `Header` uses.
+            // Later rows follow `cd`, and subagents run in their own directories.
+            if !confirmed
+                && child.is_none()
+                && let Some(cwd) = row["cwd"].as_str()
+            {
+                if Path::new(cwd) != self.project {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "Claude session project changed",

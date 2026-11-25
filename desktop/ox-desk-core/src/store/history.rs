@@ -234,6 +234,7 @@ impl Store {
                 ));
             }
             self.sync_title(&identity);
+            self.transcripts.entry(id.into()).or_default().read_updated = identity.updated_at;
             self.request(
                 Call::Resume {
                     thread: id.into(),
@@ -276,6 +277,9 @@ impl Store {
                 self.history_preview(id, page);
             }
             let t = self.transcripts.entry(id.into()).or_default();
+            // We hold the write lock now: whatever held it before is gone.
+            t.native_live = false;
+            t.native_next = None;
             t.model = Some(reply.model);
             t.tier = reply.service_tier;
             t.effort = reply.reasoning_effort;
@@ -291,6 +295,64 @@ impl Store {
         if let Err(err) = result {
             self.failed(Pending::Resume(id.into()), err.to_string());
         }
+    }
+
+    /// Codex allows one writer per thread. A second resume is refused with this text, which
+    /// is how OX learns that a native Codex client has the thread open right now.
+    pub(super) const WRITER_LOCK: &'static str = "already has an active writer";
+
+    /// Show the thread read-only from its rollout and keep checking until the other client
+    /// lets go; the next successful resume then makes OX the writer.
+    pub(super) fn native_locked(&mut self, id: String) {
+        let now = std::time::Instant::now();
+        let t = self.transcripts.entry(id.clone()).or_default();
+        let fresh = !t.native_live || !t.ready || t.loaded_updated != t.read_updated;
+        let was = t.native_live;
+        t.native_live = true;
+        t.native_next = Some(now + std::time::Duration::from_secs(4));
+        t.error = None;
+        t.loading = false;
+        t.verified = true;
+        if fresh {
+            // The journal moved: replace the shown history rather than splice into it.
+            let seen = t.read_updated;
+            let next = t.native_next;
+            *t = Transcript::default();
+            t.native_live = true;
+            t.native_next = next;
+            t.read_updated = seen;
+            t.loaded_updated = seen;
+            t.verified = true;
+            if let Err(err) = self.request_history(&id, None) {
+                self.transcripts.entry(id.clone()).or_default().error = Some(err.to_string());
+            }
+        }
+        if !was {
+            self.changed.mark(super::Changed::THREADS);
+        }
+        self.changed.transcript(&id);
+    }
+
+    /// Probe the selected natively-held Codex thread every few seconds: a resume that is
+    /// accepted means the other client closed it; one that is refused refreshes the view.
+    pub(super) fn refresh_native_codex(&mut self, now: std::time::Instant) {
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        let due = self
+            .transcripts
+            .get(&id)
+            .is_some_and(|t| t.native_live && t.native_next.is_some_and(|at| now >= at));
+        let busy = self.pending.values().any(|(_, p)| {
+            matches!(p, Pending::Read(x) | Pending::Resume(x) | Pending::History(x) if x == &id)
+        });
+        if !due || busy || self.state != Connection::Ready {
+            return;
+        }
+        if let Some(t) = self.transcripts.get_mut(&id) {
+            t.native_next = Some(now + std::time::Duration::from_secs(4));
+        }
+        let _ = self.request(Call::Read(id.clone()), Pending::Read(id));
     }
 
     fn history_preview(&mut self, id: &str, page: &TurnPage) {

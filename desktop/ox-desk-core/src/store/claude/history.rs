@@ -116,15 +116,22 @@ pub(super) struct Batch {
 impl Batch {
     pub(super) fn apply(self, store: &mut Store, owner: &str) {
         let snapshots = std::mem::take(&mut *self.snapshots.lock().unwrap());
+        let viewing = store.is_viewer(owner);
         let mut retired = Vec::with_capacity(snapshots.len());
         for snapshot in snapshots {
             let Snapshot {
                 id,
                 row,
-                transcript,
+                mut transcript,
                 pending,
                 ..
             } = snapshot;
+            if viewing {
+                // A foreign client owns the process: the journal is all there is to read.
+                transcript.loading = false;
+                transcript.ready = true;
+                transcript.verified = true;
+            }
             if let Some(row) = row {
                 store.remember_claude(row);
             }

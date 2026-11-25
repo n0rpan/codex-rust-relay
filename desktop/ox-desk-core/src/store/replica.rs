@@ -669,6 +669,7 @@ impl Store {
 fn apply_meta(t: &mut Transcript, d: Value) {
     t.active_turn = bits(&d["active"]);
     t.last_finished = bits(&d["last_finished"]);
+    t.interrupted = d["interrupted"] == true;
     t.ready = d["ready"] == true;
     t.verified = t.ready;
     t.loading = d["loading"] == true;

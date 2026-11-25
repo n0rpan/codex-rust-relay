@@ -177,6 +177,10 @@ pub struct ProcessView {
     pub last_activity: i64,
     /// A turn is in progress or an approval is pending, so ending would lose work.
     pub running: bool,
+    /// The blank process kept warm for new sessions (the sign-in and version probe), not a
+    /// conversation. `kind` stays `claude`. End all idle skips it, since it respawns.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub draft: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

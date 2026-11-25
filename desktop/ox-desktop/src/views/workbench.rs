@@ -616,7 +616,17 @@ impl Workbench {
             self.finale = match (self.last_turn.take(), &turn) {
                 (Some((thread, _)), None) if id == Some(thread.as_str()) => {
                     let failed = transcript.is_some_and(|t| t.error().is_some());
-                    Some((thread, if failed { Scene::GameOver } else { Scene::Done }))
+                    let stopped = transcript.is_some_and(|t| t.interrupted());
+                    Some((
+                        thread,
+                        if stopped {
+                            Scene::Stopped
+                        } else if failed {
+                            Scene::GameOver
+                        } else {
+                            Scene::Done
+                        },
+                    ))
                 }
                 _ => None,
             };

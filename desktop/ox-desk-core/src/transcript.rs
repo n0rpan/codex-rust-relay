@@ -56,7 +56,17 @@ pub struct Transcript {
     // Number of history rows inserted at the front, used to preserve the viewport.
     prepended: usize,
     pub(crate) last_finished: Option<String>,
+    /// The turn the user asked to stop, so its completion reads as stopped, not done.
+    pub(crate) stop_requested: Option<String>,
+    /// The last finished turn was interrupted by the user.
+    pub(crate) interrupted: bool,
     pub(crate) verified: bool,
+    /// Another client holds this thread's write lock (Codex refuses a second resume).
+    pub(crate) native_live: bool,
+    pub(crate) native_next: Option<std::time::Instant>,
+    /// `updatedAt` from the last metadata read, and from the read the shown history is of.
+    pub(crate) read_updated: i64,
+    pub(crate) loaded_updated: i64,
     pub(crate) before_resume: Vec<crate::codex::activity::Activity>,
 }
 
@@ -84,6 +94,10 @@ impl Transcript {
     }
     pub fn has_older(&self) -> bool {
         self.cursor.is_some()
+    }
+    /// The last turn ended because the user stopped it.
+    pub fn interrupted(&self) -> bool {
+        self.interrupted
     }
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
@@ -264,15 +278,18 @@ impl Transcript {
         use crate::codex::activity::Change;
         match event.change {
             Change::TurnStarted => {
+                self.interrupted = false;
                 self.reviews.turn(&event.turn, false);
                 if self.last_finished.as_deref() != Some(event.turn.as_str()) {
                     self.active_turn = Some(event.turn);
                 }
             }
-            Change::TurnCompleted { error } => {
+            Change::TurnCompleted { error, interrupted } => {
                 if self.active_turn.as_ref() == Some(&event.turn) {
                     self.active_turn = None;
                 }
+                self.interrupted = interrupted || self.stop_requested.as_ref() == Some(&event.turn);
+                self.stop_requested = None;
                 self.last_finished = Some(event.turn);
                 if let Some(error) = error {
                     self.error = Some(error);

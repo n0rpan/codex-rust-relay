@@ -2075,6 +2075,7 @@ impl Engine {
                 started_at: started,
                 last_activity: last,
                 running: group.iter().any(|t| self.thread_busy(scope, t)),
+                draft: claude && group.iter().all(|t| live.store.is_draft(t)),
                 threads: group,
             });
         }

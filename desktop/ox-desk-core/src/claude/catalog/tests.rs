@@ -199,3 +199,80 @@ fn global_catalog_keeps_both_origins_and_validates_each_unopened_project() {
         }
     }
 }
+
+#[test]
+fn the_project_is_the_first_rows_cwd_so_a_cd_or_a_subagent_directory_is_not_a_change() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().canonicalize().unwrap().join("home");
+    let elsewhere = root.path().canonicalize().unwrap().join("worktree");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir_all(&elsewhere).unwrap();
+    let profiles = Profiles {
+        subscription: root.path().join("native"),
+        api: root.path().join("relay"),
+    };
+    let key = project
+        .to_string_lossy()
+        .replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+    let directory = profiles.subscription.join("projects").join(key);
+    let children = directory.join(ID).join("subagents");
+    fs::create_dir_all(&children).unwrap();
+    let row = |kind: &str, cwd: &Path, id: &str, text: &str| json!({"type":kind,"cwd":cwd,"sessionId":id,"message":{"role":kind,"content":text}});
+    let journal = [
+        row("user", &project, ID, "start here"),
+        row("assistant", &project, ID, "ok"),
+        // The session ran `cd` into another directory: later rows follow it.
+        row("user", &elsewhere, ID, "now there"),
+        row("assistant", &elsewhere, ID, "done"),
+        // Another session's row in the same file is ignored whatever its cwd.
+        row("user", Path::new("/unrelated"), "77777777-aaaa-4444-bbbb-000000000000", "x"),
+        json!({"type":"user","cwd":elsewhere,"sessionId":ID,"toolUseResult":{"agentId":"a1","description":"Look"},
+            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"ok"}]}}),
+    ]
+    .map(|r| r.to_string())
+    .join("\n");
+    fs::write(directory.join(format!("{ID}.jsonl")), journal + "\n").unwrap();
+    // Subagents start in their own directory.
+    let child = json!({"type":"assistant","agentId":"a1","isSidechain":true,"sessionId":ID,"cwd":elsewhere,
+        "message":{"role":"assistant","content":[{"type":"text","text":"found"}]}});
+    fs::write(children.join("agent-a1.jsonl"), child.to_string()).unwrap();
+
+    let session = profiles
+        .session(&project, ID, Origin::Subscription)
+        .unwrap();
+    assert_eq!(session.project, project);
+    assert_eq!(profiles.list(&project).unwrap().len(), 1);
+    let mut rows = vec![];
+    session
+        .history(|r| {
+            rows.push(r);
+            Ok(())
+        })
+        .unwrap();
+    // Four main rows, the tool result, the task marker and the child's row.
+    assert_eq!(rows.len(), 7);
+    assert!(rows.iter().any(|r| r["agent_id"] == "a1"));
+
+    // The safety intent stands: a journal whose first row is in another project is rejected.
+    let other = directory.join("99999999-aaaa-4444-bbbb-000000000000.jsonl");
+    fs::write(
+        &other,
+        row(
+            "user",
+            &elsewhere,
+            "99999999-aaaa-4444-bbbb-000000000000",
+            "hi",
+        )
+        .to_string(),
+    )
+    .unwrap();
+    assert!(
+        profiles
+            .session(
+                &project,
+                "99999999-aaaa-4444-bbbb-000000000000",
+                Origin::Subscription
+            )
+            .is_err()
+    );
+}

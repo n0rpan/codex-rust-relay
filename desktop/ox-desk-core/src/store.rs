@@ -258,10 +258,11 @@ impl Store {
             .transcripts
             .iter()
             .filter(|(id, t)| {
-                !previous.ended_threads.contains(*id)
-                    && (self.selected.as_ref() == Some(*id)
-                        || t.active_turn().is_some()
-                        || t.is_loading())
+                // The selected thread always loads its history, ended or not; an
+                // ended thread that is merely open elsewhere stays closed.
+                self.selected.as_ref() == Some(*id)
+                    || (!previous.ended_threads.contains(*id)
+                        && (t.active_turn().is_some() || t.is_loading()))
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -358,7 +359,11 @@ impl Store {
         if self.remote().is_some() {
             return None;
         }
-        self.pending.values().map(|(when, _)| *when).min()
+        self.pending
+            .values()
+            .map(|(when, _)| *when)
+            .chain(self.native_deadline())
+            .min()
     }
 
     fn request(&mut self, call: Call, pending: Pending) -> io::Result<()> {
@@ -431,6 +436,7 @@ impl Store {
         if self.remote().is_some() {
             return;
         }
+        self.refresh_native(now, false);
         let expired: Vec<_> = self
             .pending
             .iter()
@@ -488,6 +494,7 @@ impl Store {
             Pending::Access(id) => {
                 self.transcripts.entry(id).or_default().error = Some(message);
             }
+            Pending::Resume(id) if message.contains(Self::WRITER_LOCK) => self.native_locked(id),
             Pending::Read(id) | Pending::Resume(id) | Pending::History(id) => {
                 let transcript = self.transcripts.entry(id).or_default();
                 transcript.loading = false;
@@ -575,10 +582,9 @@ impl Store {
                     row.status = None;
                 }
                 for (id, thread) in &mut self.transcripts {
-                    if (thread.active_turn.take().is_some()
-                        || thread.is_loading()
-                        || self.selected.as_ref() == Some(id))
-                        && !self.ended_threads.contains(id)
+                    let was_busy = thread.active_turn.take().is_some() || thread.is_loading();
+                    if self.selected.as_ref() == Some(id)
+                        || (was_busy && !self.ended_threads.contains(id))
                     {
                         self.reopen.push(id.clone());
                     }
@@ -705,7 +711,7 @@ impl Store {
             Frame::Activity(activity) => {
                 if matches!(
                     activity.change,
-                    crate::codex::activity::Change::TurnCompleted { error: None }
+                    crate::codex::activity::Change::TurnCompleted { error: None, .. }
                 ) {
                     self.title_after_turn(&activity.thread);
                 }

@@ -49,8 +49,8 @@ impl Workbench {
             .selected()
             .and_then(|id| store.transcript(id))
             .and_then(|t| t.usage.as_ref());
-        // With no thread selected there is no usage to show: only a limit warning.
-        if store.selected().is_none() {
+        // With no thread selected, or no usage data yet, only a limit warning shows.
+        if store.selected().is_none() || tokens.is_none() {
             let limit = store.usage.closest_limit(Utc::now().timestamp())?;
             return Some(
                 small(
@@ -66,10 +66,9 @@ impl Workbench {
                 .into_any_element(),
             );
         }
-        let mut label = tokens.map_or_else(
-            || "Session usage".to_string(),
-            |u| format!("{} tokens", compact(u.total.total_tokens)),
-        );
+        let mut label = tokens.map_or_else(String::new, |u| {
+            format!("{} tokens", compact(u.total.total_tokens))
+        });
         if let Some(percent) = tokens.and_then(|u| u.context_percent()) {
             label.push_str(&format!(" · {percent:.0}% context"));
         }

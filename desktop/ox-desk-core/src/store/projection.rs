@@ -73,7 +73,7 @@ fn item_view(k: &ItemKey, e: &Entry) -> TimelineItem {
     }
 }
 fn timeline_detail(t: &Transcript) -> Value {
-    json!({"active":t.active_turn(),"last_finished":t.last_finished,"error":t.error(),"ready":t.is_ready(),"loading":t.is_loading(),"older":t.has_older(),"access":t.access(),"reviews":t.reviews,"usage":t.usage,"command_notice":t.command_notice,"model":t.model,"effort":t.effort,"tier":t.tier,"unread":t.unread()})
+    json!({"active":t.active_turn(),"last_finished":t.last_finished,"interrupted":t.interrupted,"error":t.error(),"ready":t.is_ready(),"loading":t.is_loading(),"older":t.has_older(),"access":t.access(),"reviews":t.reviews,"usage":t.usage,"command_notice":t.command_notice,"model":t.model,"effort":t.effort,"tier":t.tier,"unread":t.unread()})
 }
 fn timeline(t: &Transcript) -> Timeline {
     Timeline {
@@ -167,6 +167,9 @@ impl Store {
             if running {
                 caps.push("stop".into());
             }
+            if self.is_native_live(id) {
+                caps.push("native_live".into());
+            }
             if self.has_live_session(id) {
                 caps.push("end".into());
             } else if self.is_ended(id) {
@@ -197,7 +200,9 @@ impl Store {
             if self.can_generate_title(id) {
                 caps.push("generate_title".into());
             }
-            if self.asks().iter().any(|a| a.thread.as_deref() == Some(id)) {
+            if self.is_native_live(id) {
+                "native_live"
+            } else if self.asks().iter().any(|a| a.thread.as_deref() == Some(id)) {
                 "needs_input"
             } else if running || r.status.as_ref().is_some_and(|s| s.kind == "active") {
                 "running"
@@ -210,7 +215,7 @@ impl Store {
             }
         };
         let detail = json!({"row":r,"worker":r.worker,"unread":r.unread,"order":r.activity_order.to_string(),"generated":r.generated_title,
-            "owned":t.is_some(),"changing":self.changing_options(id),"terminal":self.in_terminal(id),"sending":self.sending(Some(id)),
+            "owned":t.is_some(),"native_live":self.is_native_live(id).then(||self.native_app()),"changing":self.changing_options(id),"terminal":self.in_terminal(id),"sending":self.sending(Some(id)),
             "route":self.thread_route(Some(id)),"options":t.map(|_|self.options(Some(id))),"access":self.applied_access(Some(id)),"command_caps":(self.is_session_scoped() && t.is_some()).then(||self.command_caps(Some(id)))});
         let mut detail = detail;
         let mut parent = r.parent_thread_id.clone();

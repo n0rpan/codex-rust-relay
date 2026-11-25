@@ -140,6 +140,7 @@ impl Store {
             && id.is_none_or(|thread| !self.changing_options(thread))
             && id.is_none_or(|id| {
                 !self.in_terminal(id)
+                    && !self.is_native_live(id)
                     && self
                         .transcripts
                         .get(id)
@@ -156,6 +157,7 @@ impl Store {
     pub(super) fn can_resume_send(&self, id: &str) -> bool {
         self.remote().is_none()
             && self.ended_threads.contains(id)
+            && !self.is_native_live(id)
             && matches!(self.state, Connection::Ready | Connection::Connecting)
             && !self.has_live_session(id)
             && !self.in_terminal(id)
@@ -449,7 +451,12 @@ impl Store {
             .transcripts
             .get(id)
             .and_then(|t| t.active_turn())
-            .ok_or_else(|| io::Error::other("This thread has no active turn"))?;
+            .ok_or_else(|| io::Error::other("This thread has no active turn"))?
+            .to_owned();
+        let turn = turn.as_str();
+        if let Some(t) = self.transcripts.get_mut(id) {
+            t.stop_requested = Some(turn.to_owned());
+        }
         self.request(
             Call::Stop {
                 thread: id.into(),
@@ -519,6 +526,10 @@ impl Store {
             .filter(|(id, t)| (t.ready || t.loading) && !self.terminal_threads.contains(*id))
             .map(|(id, _)| id.clone())
             .collect()
+    }
+    /// The thread is the blank Claude process kept warm for new sessions.
+    pub fn is_draft(&self, id: &str) -> bool {
+        self.remote().is_none() && self.is_session_scoped() && self.claude_is_blank(id)
     }
     /// Whether this client can end the thread's live process (the `end` capability).
     pub fn can_end_session(&self, id: &str) -> bool {
@@ -960,5 +971,118 @@ mod tests {
         assert!(!store.sending(Some(&id)));
         assert_eq!(store.draft(Some(&id)), "keep me");
         assert!(store.is_ended(&id));
+    }
+
+    #[test]
+    fn a_codex_thread_held_by_another_client_is_read_only_and_forkable() {
+        let mut store = ready();
+        let id = "thread-native".to_owned();
+        let row: crate::codex::history::ThreadRow = serde_json::from_value(serde_json::json!({
+            "id": id, "cwd": store.profile.project, "modelProvider": "openai"
+        }))
+        .unwrap();
+        store.catalog.insert(row);
+        store.selected = Some(id.clone());
+        store.transcripts.entry(id.clone()).or_default().loading = true;
+        // Codex refuses a second writer with this text; it is not a failure of the thread.
+        store.failed(
+            Pending::Resume(id.clone()),
+            format!("thread {id} already has an active writer"),
+        );
+        let t = store.transcript(&id).unwrap();
+        assert!(t.error().is_none());
+        assert!(store.is_native_live(&id));
+        assert!(!store.can_send(Some(&id)) && !store.can_compose(Some(&id)));
+        assert!(store.can_manage_thread(&id), "forkable into a new session");
+        assert!(
+            store
+                .pending
+                .values()
+                .any(|(_, p)| matches!(p, Pending::History(t) if t == &id)),
+            "the history is read without resuming"
+        );
+        assert_eq!(store.native_app(), "Codex");
+        assert!(store.native_live_hint().contains("running in Codex"));
+    }
+
+    #[test]
+    fn an_ended_selected_thread_loads_its_history_after_a_rebuild() {
+        let mut old = ready();
+        let id = "thread-ended".to_owned();
+        let row: crate::codex::history::ThreadRow = serde_json::from_value(serde_json::json!({
+            "id": id, "cwd": old.profile.project, "modelProvider": "openai", "preview": "hi"
+        }))
+        .unwrap();
+        old.catalog.insert(row);
+        old.selected = Some(id.clone());
+        old.mark_ended(&id);
+        old.transcripts.entry(id.clone()).or_default();
+        let mut store = ready();
+        store.recover_from(&mut old);
+        assert!(store.is_ended(&id));
+        store.connected().unwrap();
+        assert!(
+            store
+                .pending
+                .values()
+                .any(|(_, p)| matches!(p, Pending::Read(t) if t == &id)),
+            "the selected ended thread is read again"
+        );
+        assert!(store.transcript(&id).unwrap().is_loading());
+        let page: crate::codex::history::TurnPage = serde_json::from_value(serde_json::json!({
+            "data": [], "nextCursor": null
+        }))
+        .unwrap();
+        store.history_page(&id, page);
+        assert!(!store.transcript(&id).unwrap().is_loading());
+        // An ended thread that is not selected stays closed.
+        let mut other = ready();
+        other.mark_ended("quiet");
+        other.transcripts.entry("quiet".into()).or_default().loading = true;
+        let mut next = ready();
+        next.recover_from(&mut other);
+        next.connected().unwrap();
+        assert!(
+            next.pending
+                .values()
+                .all(|(_, p)| !matches!(p, Pending::Read(_)))
+        );
+    }
+
+    #[test]
+    fn a_stopped_turn_completes_as_interrupted_not_done() {
+        use crate::codex::activity::{Activity, Change};
+        let mut store = ready();
+        let id = "thread-stop".to_owned();
+        let t = store.transcripts.entry(id.clone()).or_default();
+        t.ready = true;
+        t.verified = true;
+        t.active_turn = Some("turn-1".into());
+        store.stop(&id).unwrap();
+        let t = store.transcripts.get_mut(&id).unwrap();
+        t.apply_activity(Activity {
+            thread: id.clone(),
+            turn: "turn-1".into(),
+            change: Change::TurnCompleted {
+                error: None,
+                interrupted: false,
+            },
+        });
+        assert!(t.interrupted() && t.active_turn().is_none());
+        t.apply_activity(Activity {
+            thread: id.clone(),
+            turn: "turn-2".into(),
+            change: Change::TurnStarted,
+        });
+        assert!(!t.interrupted(), "a new turn clears the marker");
+        t.apply_activity(Activity {
+            thread: id,
+            turn: "turn-2".into(),
+            change: Change::TurnCompleted {
+                error: None,
+                interrupted: false,
+            },
+        });
+        assert!(!t.interrupted(), "a finished turn is done");
     }
 }

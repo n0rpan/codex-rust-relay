@@ -708,7 +708,7 @@ impl Host {
         ];
         let current = self.filter.read(cx).value().to_string();
         // One compact row of equal segments that always fits the sidebar.
-        let mut chips = crate::kit::row().gap_1().px_2().flex_nowrap().min_w_0();
+        let mut chips = crate::kit::row().gap_1().px_1().flex_nowrap().min_w_0();
         for (id, token, label) in CHIPS {
             let filter = self.filter.clone();
             let active = current.split_whitespace().any(|word| word == token);
@@ -720,7 +720,8 @@ impl Host {
                         filter.update(cx, |field, cx| field.set_value(next, window, cx));
                     })
                     .w_full()
-                    .px_1(),
+                    .px_0p5()
+                    .text_size(p.text(Step::Meta)),
                 ),
             );
         }
@@ -779,7 +780,14 @@ impl Host {
             {
                 status = Some("Needs you");
             }
-            if store.is_ended(&t.id) {
+            if store.is_native_live(&t.id) {
+                // Another client is driving it: not an error, not ended, not ours.
+                status = Some(if store.native_app() == "Codex" {
+                    "Live in Codex"
+                } else {
+                    "Live in Claude Code"
+                });
+            } else if store.is_ended(&t.id) {
                 status = status.or(Some("Ended"));
             }
             if let Some(thread) = store.transcript(&t.id) {
@@ -787,7 +795,9 @@ impl Host {
                     owner = Some(view.route.clone());
                 }
                 status = status.or_else(|| {
-                    if thread.active_turn().is_some() {
+                    if store.is_native_live(&t.id) {
+                        None
+                    } else if thread.active_turn().is_some() {
                         Some("Running")
                     } else if thread.error().is_some() {
                         Some("Error")

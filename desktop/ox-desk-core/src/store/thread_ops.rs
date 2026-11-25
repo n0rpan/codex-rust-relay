@@ -35,7 +35,8 @@ impl Store {
         if let Some(remote) = self.remote() {
             return remote.can(id, "fork");
         }
-        self.can_change_access(id)
+        // A session another client is running can still be forked into a new OX one.
+        (self.can_change_access(id) || self.is_native_live(id))
             && self.catalog.get(id).is_some_and(|r| !r.worker)
             && !self
                 .pending

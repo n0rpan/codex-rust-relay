@@ -20,6 +20,7 @@ pub enum Scene {
     Waiting,
     Done,
     GameOver,
+    Stopped,
     Fire,
 }
 
@@ -38,7 +39,7 @@ pub enum Ink {
 
 impl Scene {
     #[cfg(test)]
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Loading,
         Self::Thinking,
         Self::Typing,
@@ -52,6 +53,7 @@ impl Scene {
         Self::Waiting,
         Self::Done,
         Self::GameOver,
+        Self::Stopped,
         Self::Fire,
     ];
 
@@ -70,6 +72,7 @@ impl Scene {
             Self::Waiting => "Waiting for you · INSERT COIN",
             Self::Done => "Done · HIGH SCORE",
             Self::GameOver => "GAME OVER · turn failed",
+            Self::Stopped => "Stopped",
             Self::Fire => "YOLO",
         }
     }
@@ -84,6 +87,7 @@ impl Scene {
         match self {
             Self::Done => Some(16),
             Self::GameOver => Some(24),
+            Self::Stopped => Some(12),
             _ => None,
         }
     }
@@ -447,6 +451,12 @@ pub fn draw(scene: Scene, variant: u8, frame: u8, r: &mut impl FnMut(i32, i32, i
             r(8, 7, 4, 1, Panel);
             r(4, 10, 12, 1, Line);
         }
+        // A still stop square: neutral, no trophy and no alarm.
+        Scene::Stopped => {
+            r(7, 3, 6, 6, Line);
+            r(8, 4, 4, 4, Panel);
+            r(9, 5, 2, 2, Fg);
+        }
         Scene::Loading | Scene::Fire => {}
     }
 }
@@ -603,7 +613,7 @@ mod tests {
     #[test]
     fn only_the_finales_are_one_shot_and_waiting_only_blinks() {
         for scene in Scene::ALL {
-            let finale = matches!(scene, Scene::Done | Scene::GameOver);
+            let finale = matches!(scene, Scene::Done | Scene::GameOver | Scene::Stopped);
             assert_eq!(scene.one_shot().is_some(), finale, "{scene:?}");
         }
         assert_eq!(Scene::Waiting.tick_ms(), 500);

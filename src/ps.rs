@@ -37,6 +37,9 @@ pub(crate) struct Row {
     pub started_at: i64,
     pub last_activity: i64,
     pub running: bool,
+    /// The blank process that keeps Claude Code warm for new sessions.
+    #[serde(default)]
+    pub draft: bool,
     pub threads: Vec<String>,
     /// Echoed back verbatim in `act`, so the host sees the scope it sent.
     pub scope: Value,
@@ -103,7 +106,7 @@ pub(crate) fn run_end(args: &[OsString]) -> Result<u8, RelayError> {
             let index = resolve_prefix(&sessions, prefix)?;
             vec![sessions[index].clone()]
         }
-        Selector::Idle => sessions_of(&rows, home.as_deref(), |row| !row.running),
+        Selector::Idle => sessions_of(&rows, home.as_deref(), |row| !row.running && !row.draft),
         Selector::All => sessions,
     };
     if targets.is_empty() {
@@ -289,7 +292,14 @@ fn cells(row: &Row, now: i64, home: Option<&Path>, width: usize) -> [String; 7] 
         project_label(&row.project, home),
         human(now - row.started_at),
         human(now - row.last_activity),
-        (if row.running { "running" } else { "idle" }).to_owned(),
+        (if row.running {
+            "running"
+        } else if row.draft {
+            "ready (idle)"
+        } else {
+            "idle"
+        })
+        .to_owned(),
         row.threads
             .iter()
             .map(|t| id_prefix(t, width))
@@ -523,6 +533,7 @@ mod tests {
             started_at: 1_000,
             last_activity: 1_900,
             running,
+            draft: false,
             threads: threads.iter().map(|t| (*t).to_owned()).collect(),
             scope: json!({"project": "/home/oscar/Work/ox", "route": {}}),
         }
@@ -654,6 +665,16 @@ mod tests {
         let idle = sessions_of(&rows, None, |r| !r.running);
         let threads: Vec<&str> = idle.iter().map(|s| s.thread.as_str()).collect();
         assert_eq!(threads, ["i1", "i2"]);
+    }
+
+    #[test]
+    fn ready_draft_is_labelled_and_left_out_of_idle_selection() {
+        let mut draft = row("claude", Some("default"), false, &["d1"]);
+        draft.draft = true;
+        let rows = [draft, row("claude", None, false, &["i1"])];
+        let idle = sessions_of(&rows, None, |r| !r.running && !r.draft);
+        assert_eq!(idle.len(), 1);
+        assert_eq!(cells(&rows[0], 2_000, None, 8)[5], "ready (idle)");
     }
 
     #[test]

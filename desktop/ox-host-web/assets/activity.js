@@ -15,9 +15,10 @@ export const LABELS = {
   waiting: "Waiting for you · INSERT COIN",
   done: "Done · HIGH SCORE",
   gameover: "GAME OVER · turn failed",
+  stopped: "Stopped",
 };
 // Frames a finale plays before it leaves the line.
-const ONE_SHOT = { done: 16, gameover: 24 };
+const ONE_SHOT = { done: 16, gameover: 24, stopped: 12 };
 const KEY_FRAME = { building: 7, testing: 7, web: 7, worker: 7, thinking: 4 };
 const tickMs = (scene) => (scene === "waiting" ? 500 : 125);
 
@@ -365,6 +366,12 @@ export function draw(scene, variant, frame, r) {
         }
       });
       break;
+    case "stopped":
+      // A still stop square: neutral, no trophy and no alarm.
+      r(7, 3, 6, 6, "line");
+      r(8, 4, 4, 4, "panel");
+      r(9, 5, 2, 2, "ink");
+      break;
     case "gameover":
       // The ox is out: crossed eyes, flashing red.
       r(5, 3, 10, 6, b % 4 < 2 ? "error" : "line");
@@ -408,14 +415,14 @@ export class ActivityLine {
   }
 
   /** `session` identifies the open session; `turn` is its running turn, if any. */
-  update({ session, items, running, waiting, failed }) {
+  update({ session, items, running, waiting, failed, stopped }) {
     let scene = sceneFor(items, running, waiting);
     const last = items?.[items.length - 1];
     const turn = running ? (last?.turn ?? "") : null;
     // A turn that ends while its session is open plays one finale.
     if (session !== this.session) this.finale = null;
     else if (this.turn !== null && turn === null)
-      this.finale = failed ? "gameover" : "done";
+      this.finale = stopped ? "stopped" : failed ? "gameover" : "done";
     else if (turn !== null) this.finale = null;
     this.session = session;
     this.turn = turn;

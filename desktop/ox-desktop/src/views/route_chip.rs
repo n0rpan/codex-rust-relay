@@ -275,12 +275,12 @@ impl Workbench {
             (
                 Kind::Effort,
                 "Effort",
-                settings.effort.clone().unwrap_or_else(|| "Default".into()),
+                capitalised(settings.effort.as_deref().unwrap_or("Default")),
             ),
             (
                 Kind::Speed,
                 "Speed",
-                settings.tier.clone().unwrap_or_else(|| "Default".into()),
+                capitalised(settings.tier.as_deref().unwrap_or("Default")),
             ),
         ]
         .into_iter()
@@ -400,4 +400,13 @@ impl Workbench {
         }
         chips
     }
+}
+
+/// A chip value starts with a capital, so "default" and "Default" read the same.
+fn capitalised(value: &str) -> String {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }

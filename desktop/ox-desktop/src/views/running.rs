@@ -45,7 +45,10 @@ pub(crate) fn idle_label(now: i64, process: &ProcessView) -> String {
 
 /// The rows "End all idle" ends: every process that is not running, in host order.
 pub(crate) fn idle_rows(processes: &[ProcessView]) -> Vec<&ProcessView> {
-    processes.iter().filter(|p| !p.running).collect()
+    processes
+        .iter()
+        .filter(|p| !p.running && !p.draft)
+        .collect()
 }
 
 /// The idle rows of a fresh snapshot that were also idle in the snapshot the user saw.
@@ -53,7 +56,7 @@ pub(crate) fn idle_rows(processes: &[ProcessView]) -> Vec<&ProcessView> {
 pub(crate) fn still_idle(seen: &[Target], fresh: &[ProcessView]) -> Vec<Target> {
     fresh
         .iter()
-        .filter(|p| !p.running)
+        .filter(|p| !p.running && !p.draft)
         .filter(|p| {
             seen.iter()
                 .any(|(scope, threads)| *scope == p.scope && *threads == p.threads)
@@ -268,10 +271,15 @@ impl Render for Running {
 
         let rows = self.processes.iter().enumerate().map(|(i, process)| {
             let view = view.clone();
-            let model = process
-                .model
-                .clone()
-                .unwrap_or_else(|| process.route.clone());
+            let draft = process.draft;
+            let model = if draft {
+                "ready (idle)".to_owned()
+            } else {
+                process
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| process.route.clone())
+            };
             let end_enabled = !self.ending;
             let target: Target = (process.scope.clone(), process.threads.clone());
             let busy = process.running;
@@ -301,8 +309,17 @@ impl Render for Running {
                         .min_w_0()
                         .child(
                             row()
+                                .id(ElementId::from(format!("running-kind-{i}")))
                                 .gap_1()
                                 .min_w_0()
+                                .when(draft, |r| {
+                                    r.tooltip(move |window, cx| {
+                                        gpui_component::tooltip::Tooltip::new(
+                                            "Keeps Claude Code warm for new sessions",
+                                        )
+                                        .build(window, cx)
+                                    })
+                                })
                                 .child(
                                     div()
                                         .flex_shrink_0()
@@ -322,12 +339,20 @@ impl Render for Running {
                         )
                         .child(small(
                             p,
-                            format!(
-                                "{} · up {} · {}",
-                                project_name(&process.project),
-                                span(now.saturating_sub(process.started_at)),
-                                idle_label(now, process)
-                            ),
+                            if draft {
+                                format!(
+                                    "{} · up {}",
+                                    project_name(&process.project),
+                                    span(now.saturating_sub(process.started_at))
+                                )
+                            } else {
+                                format!(
+                                    "{} · up {} · {}",
+                                    project_name(&process.project),
+                                    span(now.saturating_sub(process.started_at)),
+                                    idle_label(now, process)
+                                )
+                            },
                         )),
                 )
                 .child(toolbar_button(
@@ -482,6 +507,7 @@ mod tests {
             started_at: 0,
             last_activity: last,
             running,
+            draft: false,
         }
     }
 
@@ -547,6 +573,20 @@ mod tests {
         // A process whose thread set changed is not the one the user saw.
         let regrouped = vec![process(&["d"], false, 0)];
         assert!(still_idle(&seen, &regrouped).is_empty());
+    }
+
+    #[test]
+    fn end_all_idle_skips_the_ready_draft_process() {
+        let mut ready = process(&["draft"], false, 0);
+        ready.draft = true;
+        let rows = [ready, process(&["a"], false, 0)];
+        let picked: Vec<_> = idle_rows(&rows).iter().map(|p| p.threads.clone()).collect();
+        assert_eq!(picked, vec![vec!["a".to_owned()]]);
+        let seen: Vec<_> = idle_rows(&rows)
+            .into_iter()
+            .map(|p| (p.scope.clone(), p.threads.clone()))
+            .collect();
+        assert_eq!(still_idle(&seen, &rows).len(), 1);
     }
 
     #[test]

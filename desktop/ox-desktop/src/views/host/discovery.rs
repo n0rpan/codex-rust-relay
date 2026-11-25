@@ -228,6 +228,11 @@ impl Discovery {
             "running" => Some("Running"),
             "failed" => Some("Error"),
             "interrupted" => Some("Interrupted"),
+            "native_live" => Some(if h.route.runtime == Runtime::Codex {
+                "Live in Codex"
+            } else {
+                "Live in Claude Code"
+            }),
             _ => None,
         };
         Some((h.route.clone(), status))

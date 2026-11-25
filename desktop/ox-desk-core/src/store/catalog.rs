@@ -296,8 +296,8 @@ impl super::Store {
         }
         let kind = match &activity.change {
             Change::TurnStarted => "active",
-            Change::TurnCompleted { error: Some(_) } => "systemError",
-            Change::TurnCompleted { error: None } => "idle",
+            Change::TurnCompleted { error: Some(_), .. } => "systemError",
+            Change::TurnCompleted { error: None, .. } => "idle",
             _ => return,
         };
         row.status = Some(Status {
