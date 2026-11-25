@@ -215,7 +215,13 @@ impl Workbench {
         } else {
             effective.or_else(|| store.next_access())
         };
+        let granted = key
+            .and_then(|id| store.session_mark(id, "yolo_grant"))
+            .is_some_and(|v| v == true);
         let label = match (key, mode) {
+            (Some(_), Some(m)) if granted && m.bypasses_permissions() => {
+                "YOLO + workers".to_owned()
+            }
             (None, Some(m)) => format!("Next thread · {}", m.label()),
             (_, Some(m)) => m.label().to_owned(),
             _ => "Permissions".into(),
@@ -234,9 +240,6 @@ impl Workbench {
         let owner = selected.clone();
         let view = cx.weak_entity();
         let presets = Access::choices(self.route.runtime);
-        let granted = key
-            .and_then(|id| store.session_mark(id, "yolo_grant"))
-            .is_some_and(|v| v == true);
         let grant_offer = key.is_some() && effective.is_some_and(Access::bypasses_permissions);
         let access = toolbar_button(
             p,
@@ -267,19 +270,45 @@ impl Workbench {
                 );
             }
             if grant_offer {
+                // The grant and its revoke share one group: the consequence is said in the menu.
                 let id = owner.clone();
                 let view = view.clone();
-                menu = menu.separator().item(
-                    PopupMenuItem::new("Also YOLO for its workers and handoffs")
-                        .checked(granted)
-                        .on_click(move |_, _, cx| {
-                            let _ = view.update(cx, |s, cx| {
-                                if let Some(id) = &id {
-                                    s.action(cx, DeskAction::YoloGrant(id.clone(), !granted));
-                                }
-                            });
-                        }),
-                );
+                menu = menu
+                    .separator()
+                    .item(PopupMenuItem::label("Workers and handoffs"));
+                if granted {
+                    menu = menu
+                        .item(PopupMenuItem::label(
+                            "YOLO is allowed for workers and handoffs started here.",
+                        ))
+                        .item(
+                            PopupMenuItem::new("Revoke YOLO for workers and handoffs").on_click(
+                                move |_, _, cx| {
+                                    let _ = view.update(cx, |s, cx| {
+                                        if let Some(id) = &id {
+                                            s.action(cx, DeskAction::YoloGrant(id.clone(), false));
+                                        }
+                                    });
+                                },
+                            ),
+                        );
+                } else {
+                    menu = menu
+                        .item(PopupMenuItem::label(
+                            "Lets workers and handoffs start in YOLO without asking.",
+                        ))
+                        .item(
+                            PopupMenuItem::new("Allow YOLO for workers and handoffs").on_click(
+                                move |_, _, cx| {
+                                    let _ = view.update(cx, |s, cx| {
+                                        if let Some(id) = &id {
+                                            s.action(cx, DeskAction::YoloGrant(id.clone(), true));
+                                        }
+                                    });
+                                },
+                            ),
+                        );
+                }
             }
             menu
         });

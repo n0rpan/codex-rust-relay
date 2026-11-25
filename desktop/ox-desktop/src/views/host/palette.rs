@@ -1,5 +1,6 @@
 use super::*;
 use crate::kit::field;
+use crate::views::worker_sheet::LaunchKind;
 use gpui_component::input::{Input, InputEvent, InputState};
 use std::collections::{HashMap, HashSet};
 
@@ -18,8 +19,13 @@ enum Target {
         owner: Option<String>,
         text: String,
     },
-    /// Start a `/handoff` for the selected session in its composer.
+    /// Open the "Continue in…" sheet for the selected session.
     Handoff {
+        pane: usize,
+        owner: String,
+    },
+    /// Open the "Start worker" sheet for the selected session.
+    Worker {
         pane: usize,
         owner: String,
     },
@@ -283,6 +289,23 @@ impl Host {
         self.reset_palette_search(cx);
         cx.notify();
     }
+    fn open_launch_sheet(
+        &mut self,
+        pane: usize,
+        owner: String,
+        kind: LaunchKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active == pane {
+            self.switch(pane, window, cx);
+            self.panes[pane].update(cx, |p, cx| {
+                if p.store.as_ref().and_then(|s| s.selected()) == Some(owner.as_str()) {
+                    p.request_launch(kind, cx);
+                }
+            });
+        }
+    }
     fn palette_items(&self, query: &str, cx: &App) -> Vec<Item> {
         let active = self.panes[self.active].read(cx);
         let project = &active.project;
@@ -311,6 +334,14 @@ impl Host {
             && store.state() == &Connection::Ready
             && !store.in_terminal(owner)
         {
+            add(
+                "Start worker…".into(),
+                "Run a task in a worker under this session · /worker codex:<model> [--mode <mode>] [--goal] <task>".into(),
+                Target::Worker {
+                    pane: self.active,
+                    owner: owner.to_owned(),
+                },
+            );
             add(
                 "Continue in…".into(),
                 "Hand off this conversation to another runtime, billing route or model · /handoff <codex|claude>[:<alias>] [--mode <mode>] <request>".into(),
@@ -595,12 +626,11 @@ impl Host {
             }
             Target::Handoff { pane, owner } => {
                 self.close_palette(window, cx);
-                if self.active == pane {
-                    self.switch(pane, window, cx);
-                    self.panes[pane].update(cx, |p, cx| {
-                        p.action(cx, DeskAction::DraftEdit(Some(owner), "/handoff ".into()))
-                    });
-                }
+                self.open_launch_sheet(pane, owner, LaunchKind::Handoff, window, cx);
+            }
+            Target::Worker { pane, owner } => {
+                self.close_palette(window, cx);
+                self.open_launch_sheet(pane, owner, LaunchKind::Worker, window, cx);
             }
             Target::EndSession { pane, owner } => {
                 self.close_palette(window, cx);

@@ -27,7 +27,7 @@
 //! | `disable_parallel_tool_use` | `parallel_tool_calls: false` |
 //! | `max_tokens` | `max_output_tokens` |
 //! | `temperature`, `top_p` | forwarded unchanged |
-//! | `stop_sequences` | `stop` |
+//! | `stop_sequences` | dropped (no Responses equivalent) |
 //! | `metadata.user_id` | `metadata.user_id` |
 //! | `output_config.effort` | `reasoning.effort` |
 //! | `output_config.format` | `text.format` (`json_schema`) |
@@ -84,9 +84,10 @@
 //! * A `tool_result`'s `is_error` flag has no Responses field; its text
 //!   content is forwarded unchanged.
 //! * `top_k` has no Responses field and is ignored.
-//! * Chat Completions cannot represent non-streaming requests or `stop`, so a
-//!   conversion produced from `stream: false` or with `stop_sequences` is only
-//!   usable against a Responses upstream.
+//! * `stop_sequences` has no Responses field, so it is dropped. Generation is
+//!   not cut at the sequence and a stop never reports `stop_sequence`.
+//! * Chat Completions cannot represent non-streaming requests, so a conversion
+//!   produced from `stream: false` is only usable against a Responses upstream.
 //! * `mcp_servers`/`container` declare provider-side tool containers and are
 //!   rejected rather than dropped. Server-side `web_search` is expected to be
 //!   normalized by the separate web-search worker into a normal function tool;
@@ -186,9 +187,8 @@ fn convert(input: &Value, upstream_model: &str, count_only: bool) -> Result<Valu
     body.insert("max_output_tokens".to_owned(), json!(max_tokens));
     insert_sampling(request, "temperature", &mut body)?;
     insert_sampling(request, "top_p", &mut body)?;
-    if let Some(stop) = translate_stop_sequences(request.get("stop_sequences"))? {
-        body.insert("stop".to_owned(), stop);
-    }
+    // `stop_sequences` is deliberately not forwarded: the Responses API has no
+    // `stop` parameter, so the field would be rejected upstream. See the gaps list.
     if let Some(metadata) = translate_metadata(request.get("metadata"))? {
         if let Some(key) = prompt_cache_key(&metadata) {
             body.insert("prompt_cache_key".to_owned(), json!(key));
@@ -285,32 +285,6 @@ fn insert_sampling(
         body.insert(field.to_owned(), value.clone());
     }
     Ok(())
-}
-
-fn translate_stop_sequences(value: Option<&Value>) -> Result<Option<Value>, String> {
-    let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Ok(None);
-    };
-    let sequences = match value {
-        Value::String(sequence) => vec![json!(sequence)],
-        Value::Array(sequences) => {
-            let mut translated = Vec::with_capacity(sequences.len());
-            for (index, sequence) in sequences.iter().enumerate() {
-                let sequence = sequence
-                    .as_str()
-                    .filter(|sequence| !sequence.is_empty())
-                    .ok_or_else(|| format!("stop_sequences[{index}] must be a non-empty string"))?;
-                translated.push(json!(sequence));
-            }
-            translated
-        }
-        _ => return Err("stop_sequences must be a string or an array of strings".to_owned()),
-    };
-    if sequences.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(Value::Array(sequences)))
-    }
 }
 
 /// A stable per-session key for the provider's prompt cache.
@@ -1623,7 +1597,8 @@ mod tests {
         assert_eq!(converted["temperature"], 0.5);
         assert_eq!(converted["top_p"], 0.9);
         assert!(converted.get("top_k").is_none());
-        assert_eq!(converted["stop"], json!(["STOP", "END"]));
+        // Responses has no `stop` field; the sequences are dropped, not forwarded.
+        assert!(converted.get("stop").is_none());
         assert_eq!(converted["service_tier"], "default");
         assert_eq!(converted["metadata"], json!({"user_id": "u"}));
         // A user ID without a session names no cache.

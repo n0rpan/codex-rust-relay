@@ -20,7 +20,7 @@ impl Engine {
     /// The grant covering a YOLO child of this session: one stored with the
     /// session or an ancestor (worker parents and handoff sources), or the
     /// project default from `[workers] yolo_grant_projects`.
-    pub(super) fn yolo_grant(&self, scope: &Scope, session: &str) -> Option<YoloAllowance> {
+    pub(super) fn yolo_grant(&mut self, scope: &Scope, session: &str) -> Option<YoloAllowance> {
         let mut current = Some((scope.clone(), session.to_owned()));
         for _ in 0..64 {
             let Some((s, id)) = current.take() else { break };
@@ -43,14 +43,23 @@ impl Engine {
                 ))
             });
         }
-        let projects = self.config.prepare().ok()?.yolo_grant_projects;
-        projects
+        self.yolo_projects()
             .iter()
             .any(|p| p == &scope.project || p.canonicalize().ok().as_ref() == Some(&scope.project))
             .then(|| YoloAllowance::Grant {
                 project: scope.project.clone(),
                 session: None,
             })
+    }
+
+    /// The project default from the settings snapshot. A failed read is retried once, and when
+    /// it still fails the last value read is kept, so a transient failure cannot deny a project
+    /// the operator already allowed.
+    fn yolo_projects(&mut self) -> Vec<PathBuf> {
+        if let Some(prepared) = (0..2).find_map(|_| self.config.prepare().ok()) {
+            self.yolo_projects = prepared.yolo_grant_projects;
+        }
+        self.yolo_projects.clone()
     }
 
     /// Hold a YOLO child for the operator and tell the parent at once.

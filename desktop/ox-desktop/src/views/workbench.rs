@@ -68,6 +68,13 @@ pub struct Workbench {
     resizing_review: bool,
     pub(super) model_picker: Option<super::route_chip::Picker>,
     thread_edit: Option<thread_menu::ThreadEdit>,
+    pub(super) launch_request: Option<super::worker_sheet::LaunchKind>,
+    pub(super) launch: Option<super::worker_sheet::Launch>,
+    pub(super) launch_picker: Option<(
+        super::worker_sheet::LaunchKind,
+        Entity<super::model_picker::ModelPicker>,
+        Subscription,
+    )>,
     pub(super) project: PathBuf,
     pub(super) route: Route,
     pub(super) front: bool,
@@ -162,6 +169,9 @@ impl Workbench {
             pane_width: window.viewport_size().width,
             resizing_review: false,
             model_picker: None,
+            launch_request: None,
+            launch: None,
+            launch_picker: None,
             front: true,
             query: String::new(),
             pending_selection: None,
@@ -473,6 +483,8 @@ impl Workbench {
             self.model_picker = None;
             self.thread_edit = None;
             self.pending_command = None;
+            self.launch = None;
+            self.launch_picker = None;
         }
         if matches!(action, DeskAction::Stop(_))
             && let Some(stats) = &mut self.stats
@@ -572,6 +584,9 @@ impl Workbench {
         if let Some(issue) = self.first_run_issue() {
             return self.onboarding(issue, cx);
         }
+        if let Some(kind) = self.launch_request.take() {
+            self.open_launch(kind, window, cx);
+        }
         let unavailable = !self.connecting
             && self.store.as_ref().is_none_or(|s| {
                 matches!(
@@ -635,6 +650,7 @@ impl Workbench {
         let review_toggle = self.review_toggle(cx);
         let inline_request = self.pane_width < px(825.);
         let asks = self.ask_sheet(inline_request, window, cx);
+        let launch = self.launch_sheet(window.viewport_size().height * 0.6, cx);
         let usage = self.usage_bar(cx);
         let review = asks.is_none().then(|| self.review_panel(cx)).flatten();
         let review_width = px(self.review_width as f32 + 5.);
@@ -789,6 +805,7 @@ impl Workbench {
                         .child(transcript)
                         .children(activity_status)
                         .children(self.workers_line(p, cx))
+                        .children(launch)
                         .children(inline_sheet)
                         .child(composer)
                         .children(usage),

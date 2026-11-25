@@ -118,9 +118,28 @@ impl Access {
         }
         Ok(())
     }
-    /// A start request that passed auth and scope but failed validation: the request id and
-    /// the reason. Protocol, auth and scope violations return `None` and still close the socket.
-    fn invalid(&self, req: &Client) -> Option<(String, String)> {
+    /// Whether a scope may be subscribed: listed in the hello, or discovered on this host.
+    fn reachable(&self, app: &App, scope: &Scope) -> bool {
+        (self.projects.contains(&scope.project) && self.routes.contains(&scope.route))
+            || app.discovered.lock().unwrap().contains(scope)
+    }
+    /// A request that passed auth but was refused for its content: the request id, if it has
+    /// one, and the reason. Those are answered with an error frame. Protocol and auth violations
+    /// return `None` and still close the socket.
+    fn invalid(&self, app: &App, req: &Client) -> Option<(Option<String>, String)> {
+        if let Client::Subscribe {
+            scope: Some(scope), ..
+        } = req
+        {
+            if !self.ready || self.reachable(app, scope) {
+                return None;
+            }
+            return Some((
+                None,
+                "This session's route is not available on this host. Check that the host can read its settings, then try again."
+                    .into(),
+            ));
+        }
         let Client::Act {
             id,
             scope,
@@ -143,7 +162,7 @@ impl Access {
             Action::StartHandoff(start) => start.validate().err()?,
             _ => return None,
         };
-        Some((id.clone(), message))
+        Some((Some(id.clone()), message))
     }
     fn permit(&mut self, app: &App, req: &Client) -> bool {
         match req {
@@ -164,10 +183,7 @@ impl Access {
             // A read-only listing of the host's live processes, answered by `Server::Processes`.
             Client::ListProcesses { id } if self.ready && id.len() <= 96 && !id.is_empty() => true,
             Client::Subscribe { scope, .. } if self.ready => {
-                if scope.as_ref().is_some_and(|s| {
-                    (!self.projects.contains(&s.project) || !self.routes.contains(&s.route))
-                        && !app.discovered.lock().unwrap().contains(s)
-                }) {
+                if scope.as_ref().is_some_and(|s| !self.reachable(app, s)) {
                     return false;
                 }
                 self.selected = scope.clone();
@@ -261,9 +277,9 @@ pub(crate) async fn session(app: App, id: String, mut ws: WebSocket) {
                         let Ok(req)=serde_json::from_str::<Client>(&s) else{break};
                         if !access.permit(&app,&req) {
                             // Answer the refused request with its reason and keep the socket open.
-                            let Some((request,message))=access.invalid(&req) else{break};
+                            let Some((request,message))=access.invalid(&app,&req) else{break};
                             if !app.state.lock().unwrap().alive(&id){break}
-                            let Ok(frame)=serde_json::to_string(&Server::Error{id:Some(request),message}) else{break};
+                            let Ok(frame)=serde_json::to_string(&Server::Error{id:request,message}) else{break};
                             if !matches!(timeout(Duration::from_secs(8),ws.send(Message::Text(frame.into()))).await,Ok(Ok(()))){break}
                             continue;
                         }
@@ -414,7 +430,7 @@ mod tests {
 
         // Before the device has said hello and subscribed, nothing is answered: close.
         let mut a = Access::default();
-        assert!(a.invalid(&blank_handoff()).is_none());
+        assert!(a.invalid(&app, &blank_handoff()).is_none());
 
         assert!(a.permit(&app, &Client::Hello { version: VERSION }));
         let hello = Server::Hello {
@@ -436,14 +452,12 @@ mod tests {
         // The refused start is a validation failure: it gets the reason keyed by its id.
         let req = blank_handoff();
         assert!(!a.permit(&app, &req));
-        let (id, message) = a.invalid(&req).expect("validation refusal is answered");
-        assert_eq!(id, "handoff-1");
+        let (id, message) = a
+            .invalid(&app, &req)
+            .expect("validation refusal is answered");
+        assert_eq!(id.as_deref(), Some("handoff-1"));
         assert_eq!(message, "Write the request for the new session.");
-        let frame = serde_json::to_value(Server::Error {
-            id: Some(id),
-            message,
-        })
-        .unwrap();
+        let frame = serde_json::to_value(Server::Error { id, message }).unwrap();
         assert_eq!(frame["type"], "error");
         assert_eq!(frame["id"], "handoff-1");
 
@@ -453,7 +467,67 @@ mod tests {
             *approval = Some("yes".into());
         }
         assert!(!a.permit(&app, &approved));
-        assert!(a.invalid(&approved).is_none());
+        assert!(a.invalid(&app, &approved).is_none());
+    }
+
+    #[test]
+    fn refused_subscribe_answers_with_an_error_and_keeps_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let app = App {
+            state: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::state::State::load(dir.path()).unwrap(),
+            )),
+            host: Default::default(),
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            discovered: Default::default(),
+        };
+        let route = Route::CODEX_SUBSCRIPTION;
+        let scope = Scope {
+            project: "/approved".into(),
+            route: route.clone(),
+        };
+        let subscribe = |s: &Scope| Client::Subscribe {
+            scope: Some(s.clone()),
+            after: None,
+        };
+        let mut unlisted = scope.clone();
+        unlisted.project = "/unlisted".into();
+
+        // Before the hello is accepted, a subscribe is a protocol violation: close, do not answer.
+        let mut a = Access::default();
+        assert!(a.invalid(&app, &subscribe(&scope)).is_none());
+
+        assert!(a.permit(&app, &Client::Hello { version: VERSION }));
+        let hello = Server::Hello {
+            version: VERSION,
+            projects: vec![scope.project.clone()],
+            routes: vec![route.clone()],
+            capabilities: vec![],
+            host: None,
+        };
+        a.host(&app, &serde_json::to_vec(&hello).unwrap()).unwrap();
+        assert!(a.permit(&app, &subscribe(&scope)));
+
+        // A scope outside the hello is refused with a reason that carries no request id.
+        let req = subscribe(&unlisted);
+        assert!(!a.permit(&app, &req));
+        let (id, message) = a
+            .invalid(&app, &req)
+            .expect("refused subscribe is answered");
+        assert_eq!(id, None);
+        assert!(message.contains("not available on this host"));
+        let frame = serde_json::to_value(Server::Error { id, message }).unwrap();
+        assert_eq!(frame["type"], "error");
+        assert!(frame.get("id").is_none_or(|v| v.is_null()));
+
+        // A discovered scope stays subscribable even when the hello does not list it.
+        app.discovered.lock().unwrap().insert(unlisted.clone());
+        assert!(a.permit(&app, &req));
     }
 
     #[test]

@@ -448,11 +448,13 @@ fn translate_input_item(
             } else {
                 raw_arguments
             };
-            let arguments: Value = serde_json::from_str(raw_arguments)
-                .map_err(|error| format!("{path}.arguments is not valid JSON: {error}"))?;
-            if !arguments.is_object() {
-                return Err(format!("{path}.arguments must encode a JSON object"));
-            }
+            // A historical call whose arguments were truncated or came from another
+            // model must not fail every later turn. Replay the raw text as an object
+            // so the upstream still sees a valid tool_use input.
+            let arguments = match serde_json::from_str::<Value>(raw_arguments) {
+                Ok(arguments) if arguments.is_object() => arguments,
+                _ => json!({"_raw": raw_arguments}),
+            };
             builder.push_tool(
                 json!({
                     "type": "tool_use",

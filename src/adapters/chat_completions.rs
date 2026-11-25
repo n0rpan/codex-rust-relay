@@ -216,19 +216,23 @@ pub fn translate_request_with(
     let mut body = Map::new();
     body.insert("model".into(), json!(upstream_model));
     body.insert("messages".into(), Value::Array(messages));
-    if !tools.is_empty() {
+    let has_tools = !tools.is_empty();
+    if has_tools {
         body.insert("tools".into(), Value::Array(tools));
     }
-    if let Some(tool_choice) = tool_choice {
-        body.insert("tool_choice".into(), tool_choice);
-    }
-    if let Some(parallel) = request.get("parallel_tool_calls") {
-        match parallel {
-            Value::Bool(_) => {
-                body.insert("parallel_tool_calls".into(), parallel.clone());
-            }
-            Value::Null => {}
-            _ => return Err("parallel_tool_calls must be a boolean".into()),
+    // Chat Completions rejects tool controls when no tools are sent. Still validate
+    // the parallel flag, but only forward the controls alongside a non-empty tools array.
+    let parallel = match request.get("parallel_tool_calls") {
+        Some(Value::Bool(parallel)) => Some(*parallel),
+        Some(Value::Null) | None => None,
+        Some(_) => return Err("parallel_tool_calls must be a boolean".into()),
+    };
+    if has_tools {
+        if let Some(tool_choice) = tool_choice {
+            body.insert("tool_choice".into(), tool_choice);
+        }
+        if let Some(parallel) = parallel {
+            body.insert("parallel_tool_calls".into(), json!(parallel));
         }
     }
     if let Some(response_format) = response_format {
@@ -1377,9 +1381,10 @@ fn finish_status(reason: &str) -> Result<(&'static str, Option<Value>), String> 
         "stop" | "tool_calls" | "function_call" => Ok(("completed", None)),
         "length" => Ok(("incomplete", Some(json!({"reason": "max_output_tokens"})))),
         "content_filter" => Ok(("incomplete", Some(json!({"reason": "content_filter"})))),
-        other => Err(format!(
-            "the chat completion finished with an unsupported finish_reason: {other}"
-        )),
+        // Providers add reasons outside the standard set (for example
+        // `insufficient_system_resource`) after a complete answer. Treat them as a
+        // normal completion so the streamed answer is not discarded.
+        _ => Ok(("completed", None)),
     }
 }
 

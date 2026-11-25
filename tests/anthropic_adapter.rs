@@ -387,6 +387,35 @@ fn rejects_hosted_tools_and_custom_tools() {
 }
 
 #[test]
+fn wraps_unparseable_historical_arguments_instead_of_failing_the_thread() {
+    // A truncated or non-object call from an earlier turn must not make every
+    // later request fail. Its raw text is replayed inside a valid tool_use input.
+    for raw in ["[1,2]", "{\"command\": \"ls", "not json"] {
+        let input = json!({
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": raw},
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+                {"role": "user", "content": "again"}
+            ],
+            "max_output_tokens": 64,
+            "stream": true
+        });
+        let body = translate_request(&input, "m").unwrap_or_else(|error| panic!("{raw}: {error}"));
+        let tool_use = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_array())
+            .flatten()
+            .find(|block| block["type"] == "tool_use")
+            .expect("the historical call is replayed");
+        assert_eq!(tool_use["id"], "call_1");
+        assert_eq!(tool_use["input"], json!({"_raw": raw}));
+    }
+}
+
+#[test]
 fn rejects_unsupported_content_and_bad_arguments() {
     let image = json!({
         "input": [{
@@ -401,16 +430,6 @@ fn rejects_unsupported_content_and_bad_arguments() {
         "stream": true
     });
     assert!(translate_request(&image, "m").is_err());
-
-    let non_object_arguments = json!({
-        "input": [
-            {"role": "user", "content": "hi"},
-            {"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "[1,2]"}
-        ],
-        "max_output_tokens": 64,
-        "stream": true
-    });
-    assert!(translate_request(&non_object_arguments, "m").is_err());
 
     let bad_name = json!({
         "input": "hi",

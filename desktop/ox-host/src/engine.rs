@@ -277,6 +277,8 @@ pub(crate) struct Engine {
     launched: u64,
     workers: Registry,
     receipts: Receipts,
+    /// Last project default read from the settings snapshot, kept for a failed read.
+    yolo_projects: Vec<PathBuf>,
     discovered: HashMap<(Scope, String), ox_desk_core::store::ThreadRow>,
     asking: BTreeMap<u64, Asking>,
     preparing: Vec<Preparing>,
@@ -326,6 +328,7 @@ impl Engine {
             launched: 0,
             workers,
             receipts: Receipts::default(),
+            yolo_projects: Vec::new(),
             discovered: Default::default(),
             asking: Default::default(),
             preparing: Default::default(),
@@ -758,8 +761,12 @@ impl Engine {
                     Err(e) => fail(e.to_string()),
                 };
                 let accepted = matches!(result, Server::Ack { .. });
-                self.receipts
-                    .insert(scope.clone(), key, generation, hash, result.clone());
+                // Only accepted actions are receipts. A refusal is often transient, so a corrected
+                // retry with the same key must run again rather than replay the refusal.
+                if accepted {
+                    self.receipts
+                        .insert(scope.clone(), key, generation, hash, result.clone());
+                }
                 if accepted && self.running.contains_key(&scope) {
                     self.process(&scope, vec![], true)?;
                     if ends {
@@ -2162,7 +2169,7 @@ impl Engine {
     }
     fn broadcast(&mut self, scope: &Scope, changes: Vec<Change>) -> io::Result<()> {
         self.replay.cursor.seq = self.ledger.next_sequence(self.replay.cursor.seq)?;
-        if self.clients.values().any(|c| c.catalog) {
+        if self.clients.values().any(catalog_only) {
             let mut catalog: Vec<_> = changes
                 .iter()
                 .filter_map(|change| match change {
@@ -2199,7 +2206,7 @@ impl Engine {
                     changes: catalog,
                 })?;
                 self.clients
-                    .retain(|_, c| !c.catalog || c.peer.send(packet.clone()));
+                    .retain(|_, c| !catalog_only(c) || c.peer.send(packet.clone()));
             }
         }
         let packet = encode(&Server::Delta {
@@ -2208,13 +2215,18 @@ impl Engine {
             changes,
         })?;
         self.replay.append(scope.clone(), packet.clone());
+        // Scope-less subscribers get only the catalog deltas above, never transcripts.
         self.clients.retain(|_, c| match c.subscription.as_ref() {
-            Some(None) => c.peer.send(packet.clone()),
             Some(Some(s)) if s == scope => c.peer.send(packet.clone()),
             _ => true,
         });
         Ok(())
     }
+}
+
+/// Clients that receive navigation metadata only: the catalog watch and scope-less subscriptions.
+fn catalog_only(client: &ClientState) -> bool {
+    client.catalog || client.subscription == Some(None)
 }
 
 // Sidebar subscribers need just the navigation metadata. Never copy a transcript,
@@ -2495,6 +2507,201 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_refused_action_retried_with_the_same_key_runs_once_it_is_valid() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = Scope {
+            project: root.path().to_owned(),
+            route: Route::CODEX_SUBSCRIPTION,
+        };
+        let config = RuntimeConfig {
+            ox: "/bin/false".into(),
+            path: "/bin".into(),
+            desktop: root.path().into(),
+        };
+        let (tx, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut engine = Engine::open(config, root.path(), tx).unwrap();
+        let link =
+            codex::Link::from_command(std::process::Command::new("/bin/cat"), |_| {}).unwrap();
+        let store = Store::open(
+            Profile {
+                project: scope.project.clone(),
+                route: scope.route.clone(),
+                provider: "openai".into(),
+            },
+            link,
+        )
+        .unwrap();
+        engine.running.insert(
+            scope.clone(),
+            Live {
+                state: store.host_snapshot(&scope),
+                store,
+                launching: None,
+                fork_origin: None,
+                confirming: None,
+                opening: None,
+                terminal: None,
+                schema_started: true,
+                recovered: vec![],
+                inbox: Inbox::new(|| {}),
+                generation: 1,
+                tokens: HashMap::new(),
+                tracker: Tracker::new(),
+                held_handoff: None,
+            },
+        );
+        let ask = LinkEvent::Frame(
+            Frame::decode(
+                br#"{"id":7,"method":"item/commandExecution/requestApproval","params":{"threadId":"a","turnId":"t","itemId":"i","command":"test"}}"#,
+                |_| None,
+            )
+            .unwrap(),
+        );
+        engine.process(&scope, vec![ask], false).unwrap();
+        let token = engine.running[&scope].state.asks[0].token.clone();
+        let (peer, frames) = crate::transport::test_peer();
+        engine.clients.insert(
+            1,
+            ClientState {
+                peer,
+                hello: true,
+                prepared: None,
+                subscription: Some(Some(scope.clone())),
+                catalog: false,
+            },
+        );
+        let act = |approval: Option<String>| Client::Act {
+            id: "retry".into(),
+            scope: scope.clone(),
+            action: Action::AnswerAsk(RequestId::Number(7), 0),
+            approval,
+        };
+        // The first attempt is refused for lack of approval; the same key with the approval must run.
+        engine.request(1, act(None)).unwrap();
+        engine.request(1, act(Some(token))).unwrap();
+        let sent: Vec<Server> = frames
+            .try_iter()
+            .map(|p| serde_json::from_slice(&p).unwrap())
+            .filter(|f| !matches!(f, Server::Delta { .. }))
+            .collect();
+        assert!(
+            matches!(sent.as_slice(), [Server::Error { .. }, Server::Ack { .. }]),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn scope_less_subscribers_get_catalog_deltas_and_never_transcripts() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = Scope {
+            project: root.path().to_owned(),
+            route: Route::CODEX_SUBSCRIPTION,
+        };
+        let config = RuntimeConfig {
+            ox: "/bin/false".into(),
+            path: "/bin".into(),
+            desktop: root.path().into(),
+        };
+        let (tx, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut engine = Engine::open(config, root.path(), tx).unwrap();
+        let mut client = |id: u64, subscription: Option<Option<Scope>>, catalog: bool| {
+            let (peer, frames) = crate::transport::test_peer();
+            engine.clients.insert(
+                id,
+                ClientState {
+                    peer,
+                    hello: true,
+                    prepared: None,
+                    subscription,
+                    catalog,
+                },
+            );
+            frames
+        };
+        let legacy = client(1, Some(None), false);
+        let watcher = client(2, None, true);
+        let scoped = client(3, Some(Some(scope.clone())), false);
+        let session = wire::SessionView {
+            id: "t".into(),
+            title: "Title".into(),
+            parent: None,
+            status: "idle".into(),
+            updated_at: 1,
+            capabilities: vec![],
+            detail: json!({"owned": true, "row": true}),
+        };
+        let transcript = Change::Transcript {
+            thread: "t".into(),
+            timeline: wire::Timeline {
+                items: vec![],
+                detail: Value::Null,
+            },
+        };
+        engine
+            .broadcast(
+                &scope,
+                vec![
+                    Change::Sessions {
+                        sessions: vec![session],
+                    },
+                    transcript,
+                ],
+            )
+            .unwrap();
+        let decode =
+            |frames: std::sync::mpsc::Receiver<crate::transport::Packet>| -> Vec<Vec<Change>> {
+                frames
+                    .try_iter()
+                    .map(|p| match serde_json::from_slice(&p).unwrap() {
+                        Server::Delta { changes, .. } => changes,
+                        other => panic!("unexpected frame {other:?}"),
+                    })
+                    .collect()
+            };
+        for frames in [decode(legacy), decode(watcher)] {
+            assert_eq!(frames.len(), 1);
+            assert!(
+                frames[0]
+                    .iter()
+                    .all(|c| !matches!(c, Change::Transcript { .. })),
+                "{frames:?}"
+            );
+            assert!(matches!(frames[0].as_slice(), [Change::Sessions { .. }]));
+        }
+        let scoped = decode(scoped);
+        assert_eq!(scoped.len(), 1);
+        assert!(
+            scoped[0]
+                .iter()
+                .any(|c| matches!(c, Change::Transcript { .. }))
+        );
+    }
+
+    #[test]
+    fn a_failed_settings_read_keeps_the_last_project_default() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = Scope {
+            project: root.path().to_owned(),
+            route: Route::CODEX_SUBSCRIPTION,
+        };
+        let config = RuntimeConfig {
+            ox: "/bin/false".into(),
+            path: "/bin".into(),
+            desktop: root.path().into(),
+        };
+        let (tx, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut engine = Engine::open(config, root.path(), tx).unwrap();
+        // Every settings read fails here, so no default has ever been seen.
+        assert!(engine.yolo_grant(&scope, "session").is_none());
+        // Once a read has succeeded, a later failure keeps honouring that default.
+        engine.yolo_projects = vec![scope.project.clone()];
+        assert!(matches!(
+            engine.yolo_grant(&scope, "session"),
+            Some(YoloAllowance::Grant { session: None, .. })
+        ));
     }
 
     mod workers {

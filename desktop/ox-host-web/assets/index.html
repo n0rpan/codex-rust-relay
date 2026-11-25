@@ -26,11 +26,16 @@
     <main>
       <section id="pair" hidden>
         <h1>Pair this device</h1>
+        <ol class="pair-steps" aria-label="Pairing steps">
+          <li id="step-scan" aria-current="step"><span class="pix-num">1</span> Scan</li>
+          <li id="step-name"><span class="pix-num">2</span> Name</li>
+          <li id="step-paired"><span class="pix-num">3</span> Paired</li>
+        </ol>
         <p id="pair-hint">
           Open Remote access in OX Desktop and scan a pairing code for your
           Tailscale account, or paste its pairing link below.
         </p>
-        <button id="scan-pair" type="button">Scan pairing QR</button>
+        <button id="scan-pair" type="button" class="primary">Scan pairing QR</button>
         <div id="camera-panel" hidden>
           <video
             id="camera-preview"
@@ -43,7 +48,7 @@
         <p id="camera-status" role="status"></p>
         <form id="pair-form">
           <div id="paste-pair">
-            <label for="pair-link">Pairing link</label
+            <label for="pair-link">Or paste a pairing link</label
             ><input
               id="pair-link"
               type="url"
@@ -52,14 +57,17 @@
               placeholder="https://…/#pair=…"
             />
           </div>
-          <label for="device-label">Device name</label
-          ><input
-            id="device-label"
-            required
-            maxlength="64"
-            autocomplete="off"
-            placeholder="My phone"
-          /><button class="primary">Pair device</button>
+          <div id="name-pair">
+            <label for="device-label">Name this device</label>
+            <input
+              id="device-label"
+              required
+              maxlength="64"
+              autocomplete="off"
+              placeholder="My phone"
+            />
+          </div>
+          <button id="pair-submit" type="submit">Pair device</button>
         </form>
       </section>
       <section id="catalog" hidden>
@@ -70,18 +78,24 @@
             <summary aria-label="More session list actions">•••</summary>
             <div>
               <button type="button" id="open-running">Running</button>
+              <button type="button" id="open-notifications" hidden>Session alerts</button>
               <button type="button" id="operator-home">Host terminal</button>
               <button id="open-phone-settings" type="button">Settings</button>
             </div>
           </details>
         </div>
-        <details id="notification-setup">
-          <summary id="notification-summary">Session notifications</summary>
-          <p id="notification-guide" role="status"></p>
-          <button id="notifications" type="button" hidden>
-            Enable notifications
+        <div id="notification-banner" hidden>
+          <details id="notification-setup">
+            <summary id="notification-summary">Get session alerts</summary>
+            <p id="notification-guide" role="status"></p>
+            <button id="notifications" type="button" hidden>
+              Enable notifications
+            </button>
+          </details>
+          <button id="notification-dismiss" type="button" class="quiet">
+            Not now
           </button>
-        </details>
+        </div>
         <input
           id="find-sessions"
           type="search"
@@ -219,22 +233,27 @@
           <summary>Changes &amp; plan</summary>
           <div id="review-content"></div>
         </details>
-        <form id="worker-form" hidden aria-label="Start worker">
+        <form id="worker-form" class="sheet" hidden aria-label="Start worker">
+          <h2 class="sheet-title">Start worker</h2>
           <label for="worker-runtime">Runtime</label>
           <select id="worker-runtime">
             <option value="codex">Codex</option>
             <option value="claude">Claude Code</option>
           </select>
-          <label for="worker-model">API model</label>
-          <input id="worker-model" list="worker-models" autocomplete="off"
-            placeholder="Leave empty for a Claude subscription worker" />
-          <datalist id="worker-models"></datalist>
-          <label for="worker-mode">Mode</label>
-          <select id="worker-mode">
-            <option value="session">Session</option>
-            <option value="goal">Codex goal</option>
-            <option value="workflow">Claude workflow</option>
-          </select>
+          <label for="worker-model">Model</label>
+          <select id="worker-model"></select>
+          <input
+            id="worker-model-free"
+            hidden
+            aria-label="Model alias"
+            placeholder="provider/model"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+          />
+          <p class="field-label" id="worker-mode-label">Mode</p>
+          <div id="worker-mode-group" class="segmented" role="radiogroup" aria-labelledby="worker-mode-label"></div>
+          <input type="hidden" id="worker-mode" value="session" />
           <label for="worker-permission">Permission mode</label>
           <select id="worker-permission">
             <option value="inherit">Inherit this session's mode</option>
@@ -243,6 +262,7 @@
             <option value="classifier">Classifier (Auto-review · Auto)</option>
             <option value="yolo">YOLO (YOLO · bypass)</option>
           </select>
+          <p id="worker-warning" class="warning-line" hidden></p>
           <label for="worker-task">Task</label>
           <textarea id="worker-task" rows="3" required></textarea>
           <div class="actions">
@@ -250,13 +270,14 @@
             ><button class="primary" id="worker-submit">Start worker</button>
           </div>
         </form>
-        <form id="handoff-form" hidden aria-label="Continue in another runtime">
+        <form id="handoff-form" class="sheet" hidden aria-label="Continue in another runtime">
+          <h2 class="sheet-title">Continue in another runtime</h2>
           <label for="handoff-runtime">Runtime</label>
           <select id="handoff-runtime">
             <option value="codex">Codex</option>
             <option value="claude">Claude Code</option>
           </select>
-          <label for="handoff-route">Route and model</label>
+          <label for="handoff-route">Model</label>
           <select id="handoff-route"></select>
           <label for="handoff-mode">Permission mode</label>
           <select id="handoff-mode">
@@ -266,10 +287,9 @@
             <option value="classifier">Classifier (Auto-review · Auto)</option>
             <option value="yolo">YOLO (YOLO · bypass)</option>
           </select>
-          <label id="handoff-grant-row" hidden
-            ><input type="checkbox" id="handoff-grant" /> Also YOLO for its workers and handoffs</label
-          >
-          <p id="handoff-provider" class="note" hidden></p>
+          <label id="handoff-grant-row" class="warning-line" hidden
+            ><input type="checkbox" id="handoff-grant" /> Also YOLO for its workers and handoffs</label>
+          <p id="handoff-provider" class="warning-line" hidden></p>
           <label for="handoff-request">Request</label>
           <textarea id="handoff-request" rows="3" required></textarea>
           <div class="actions">
@@ -280,6 +300,7 @@
         <div id="timeline" aria-label="Transcript"></div>
         <div id="asks"></div>
         <form id="composer">
+          <button type="button" id="needs-bar" class="needs-bar" hidden></button>
           <label class="sr" for="draft">Message</label
           ><textarea
             id="draft"

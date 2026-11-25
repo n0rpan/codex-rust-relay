@@ -1,8 +1,14 @@
 mod cards;
 mod tools;
 use super::workbench::Workbench;
-use crate::{appearance::Palette, col, kit::button, small};
+use crate::{
+    appearance::Palette,
+    col,
+    kit::{button, row},
+    small,
+};
 use gpui::{prelude::FluentBuilder, *};
+use gpui_component::button::Button;
 use gpui_component::text::{TextView, TextViewState};
 use gpui_component::{ActiveTheme, menu::ContextMenuExt};
 use ox_desk_core::actions::Action as DeskAction;
@@ -537,8 +543,62 @@ fn handoff_fold(
         .map(|(block, request)| (block.to_owned(), request.to_owned()))
 }
 
-/// The handoff marker at the top of a target, the marks on a source, and a
-/// session's YOLO grant with the running children it allowed.
+/// A handoff link as a card: the other session's title, the route it is on, and a state tone.
+/// Success and failure read differently at a glance; the open control is optional.
+fn handoff_card(
+    p: Palette,
+    id: impl Into<ElementId>,
+    eyebrow: &str,
+    title: String,
+    detail: String,
+    tone: u32,
+    open: Option<Button>,
+) -> AnyElement {
+    row()
+        .id(id)
+        .w_full()
+        .gap_3()
+        .p_2()
+        .border_1()
+        .border_color(rgb(p.line))
+        .bg(rgb(p.panel))
+        .child(div().w(px(3.)).min_h(px(36.)).flex_shrink_0().bg(rgb(tone)))
+        .child(
+            col()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .font_family("monospace")
+                        .text_color(rgb(tone))
+                        .child(eyebrow.to_owned()),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(p.fg))
+                        .truncate()
+                        .child(title),
+                )
+                .child(small(p, detail)),
+        )
+        .children(open)
+        .into_any_element()
+}
+
+/// The session's title when this client has it, else a readable stand-in. Never a session id.
+fn session_title(store: &ox_desk_core::store::Store, session: &str, fallback: String) -> String {
+    store
+        .catalog_row(session)
+        .map(|row| row.title().to_owned())
+        .unwrap_or(fallback)
+}
+
+/// The handoff link cards at the top of a session: where it came from, where it went, and
+/// each attempt still running or failed.
 fn handoff_banner(
     store: &ox_desk_core::store::Store,
     id: &str,
@@ -551,26 +611,33 @@ fn handoff_banner(
         && let Some(text) = ox_desk_core::handoff::marker(origin)
         && let Some(h) = &origin.handoff
     {
-        let mut line = crate::row().gap_2().flex_wrap().child(small(p, text));
-        if &h.route == route {
-            let source = h.session.clone();
-            line = line.child(button(
+        let source = h.session.clone();
+        let title = session_title(
+            store,
+            &source,
+            format!("Earlier session on {}", h.route.label()),
+        );
+        let open = (&h.route == route).then(|| {
+            button(
                 p,
                 "handoff-source",
-                "Open source",
+                "Open",
                 false,
                 true,
                 cx.listener(move |s, _, _, cx| {
                     s.action(cx, DeskAction::SelectThread(source.clone()))
                 }),
-            ));
-        } else {
-            line = line.child(small(
-                p,
-                format!("Source {} on {}", h.session, h.route.label()),
-            ));
-        }
-        lines.push(line.into_any_element());
+            )
+        });
+        lines.push(handoff_card(
+            p,
+            "handoff-source-card",
+            "CONTINUED FROM",
+            title,
+            format!("{} · {text}", h.route.label()),
+            p.line_strong,
+            open,
+        ));
     }
     let list = |key: &str| {
         store
@@ -584,12 +651,9 @@ fn handoff_banner(
         let session = to["session"].as_str().unwrap_or_default().to_owned();
         let same = serde_json::from_value::<ox_desk_core::runtime::Route>(to["route"].clone())
             .is_ok_and(|r| &r == route);
-        let mut line = crate::row()
-            .gap_2()
-            .flex_wrap()
-            .child(small(p, format!("Handed off to {label} · {session}")));
-        if same {
-            line = line.child(button(
+        let title = session_title(store, &session, format!("Continued in {label}"));
+        let open = same.then(|| {
+            button(
                 p,
                 ("handoff-target", i),
                 "Open",
@@ -598,49 +662,48 @@ fn handoff_banner(
                 cx.listener(move |s, _, _, cx| {
                     s.action(cx, DeskAction::SelectThread(session.clone()))
                 }),
-            ));
-        }
-        lines.push(line.into_any_element());
+            )
+        });
+        lines.push(handoff_card(
+            p,
+            ("handoff-target-card", i),
+            "HANDED OFF TO",
+            title,
+            label,
+            p.success,
+            open,
+        ));
     }
-    for attempt in list("handoff_attempts") {
+    for (i, attempt) in list("handoff_attempts").into_iter().enumerate() {
         let label = attempt["label"].as_str().unwrap_or("another route");
-        let text = match attempt["status"].as_str() {
-            Some("failed") => format!(
-                "Handoff to {label} failed: {}",
-                attempt["message"].as_str().unwrap_or("unknown error")
-            ),
-            _ => format!("Handing off to {label}…"),
+        let title = format!("Continue in {label}");
+        let card = if attempt["status"].as_str() == Some("failed") {
+            handoff_card(
+                p,
+                ("handoff-attempt", i),
+                "HANDOFF FAILED",
+                title,
+                attempt["message"]
+                    .as_str()
+                    .unwrap_or("unknown error")
+                    .to_owned(),
+                p.error,
+                None,
+            )
+        } else {
+            handoff_card(
+                p,
+                ("handoff-attempt", i),
+                "HANDING OFF",
+                title,
+                "Starting the new session…".into(),
+                p.accent,
+                None,
+            )
         };
-        lines.push(small(p, text).into_any_element());
+        lines.push(card);
     }
-    if store
-        .session_mark(id, "yolo_grant")
-        .is_some_and(|v| v == true)
-    {
-        let running = list("yolo_children").len();
-        let session = id.to_owned();
-        lines.push(
-            crate::row()
-                .gap_2()
-                .flex_wrap()
-                .child(small(
-                    p,
-                    format!("YOLO also allowed for this session's workers and handoffs · {running} started under it"),
-                ))
-                .child(button(
-                    p,
-                    "revoke-yolo-grant",
-                    "Revoke",
-                    false,
-                    true,
-                    cx.listener(move |s, _, _, cx| {
-                        s.action(cx, DeskAction::YoloGrant(session.clone(), false))
-                    }),
-                ))
-                .into_any_element(),
-        );
-    }
-    (!lines.is_empty()).then(|| col().gap_1().px_3().py_2().children(lines))
+    (!lines.is_empty()).then(|| col().gap_2().px_3().py_2().children(lines))
 }
 
 fn markdown(owner: &str, key: &ItemKey, text: String) -> impl IntoElement {

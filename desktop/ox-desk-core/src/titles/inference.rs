@@ -10,7 +10,7 @@ use std::{
     io::{self, Read, Write},
     os::unix::process::CommandExt,
     path::Path,
-    process::Stdio,
+    process::{ExitStatus, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -141,63 +141,65 @@ fn generate_impl(
     let payload = serde_json::to_vec(text)?;
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let read = || -> io::Result<Vec<u8>> {
-            input.write_all(&payload)?;
-            drop(input);
-            let mut bytes = Vec::new();
-            Read::by_ref(&mut output)
-                .take(65537)
-                .read_to_end(&mut bytes)?;
-            Ok(bytes)
-        };
-        let _ = tx.send(read());
+        // A client may exit without reading its whole input; its answer on stdout still counts.
+        let _ = input.write_all(&payload);
+        drop(input);
+        let mut bytes = Vec::new();
+        let read = Read::by_ref(&mut output)
+            .take(65537)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        let _ = tx.send(read);
     });
     let deadline = Instant::now() + Duration::from_secs(30);
-    let outcome = (|| -> io::Result<Option<String>> {
-        let bytes = rx
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .map_err(|_| io::Error::other("Title generation timed out"))??;
-        if bytes.len() > 65536 {
-            return Ok(None);
-        }
-        while Instant::now() < deadline {
+    let exit = (|| -> io::Result<Option<ExitStatus>> {
+        loop {
             if let Some(status) = child.try_wait()? {
-                if !status.success() {
-                    return Ok(None);
-                }
-                let title = match route.runtime {
-                    Runtime::Claude => {
-                        let body: Value = serde_json::from_slice(&bytes)?;
-                        if body["type"] != "result" || body["is_error"] != false {
-                            return Ok(None);
-                        }
-                        body["result"].as_str().and_then(concise)
-                    }
-                    Runtime::Codex => {
-                        let mut title = None;
-                        for line in bytes.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
-                            let v: Value = serde_json::from_slice(line)?;
-                            if v["type"] == "item.completed" && v["item"]["type"] == "agent_message"
-                            {
-                                title = v["item"]["text"].as_str().and_then(concise);
-                            }
-                        }
-                        title
-                    }
-                };
-                return Ok(title);
+                return Ok(Some(status));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
             }
             thread::sleep(Duration::from_millis(20));
         }
-        Err(io::Error::other("Title generation timed out"))
     })();
-    if child.try_wait()?.is_none() {
-        unsafe {
-            libc::kill(group, libc::SIGKILL);
-        }
-        let _ = child.wait();
+    // Descendants can outlive the client and keep stdout open, so the group goes on every path.
+    // Killing it also closes their pipe, which lets the reader finish below.
+    unsafe {
+        libc::kill(group, libc::SIGKILL);
     }
-    outcome
+    let _ = child.wait();
+    (|| -> io::Result<Option<String>> {
+        let Some(status) = exit? else {
+            return Err(io::Error::other("Title generation timed out"));
+        };
+        let bytes = rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| io::Error::other("Title generation timed out"))??;
+        if !status.success() || bytes.len() > 65536 {
+            return Ok(None);
+        }
+        let title = match route.runtime {
+            Runtime::Claude => {
+                let body: Value = serde_json::from_slice(&bytes)?;
+                if body["type"] != "result" || body["is_error"] != false {
+                    return Ok(None);
+                }
+                body["result"].as_str().and_then(concise)
+            }
+            Runtime::Codex => {
+                let mut title = None;
+                for line in bytes.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
+                    let v: Value = serde_json::from_slice(line)?;
+                    if v["type"] == "item.completed" && v["item"]["type"] == "agent_message" {
+                        title = v["item"]["text"].as_str().and_then(concise);
+                    }
+                }
+                title
+            }
+        };
+        Ok(title)
+    })()
 }
 pub(crate) fn generate(
     launcher: &Launcher,
@@ -211,6 +213,81 @@ pub(crate) fn generate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn process_alive(pid: i32) -> bool {
+        fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit(')')
+                .next()
+                .and_then(|rest| rest.split_whitespace().next())
+                != Some("Z")
+        })
+    }
+
+    #[test]
+    fn title_generation_returns_on_exit_and_kills_leftover_descendants() {
+        // Fake `ox` answers like a stock client, then leaves a background child holding stdout.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("descendant.pid");
+        let script = dir.path().join("ox");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nsleep 60 &\necho $! > '{}'\nprintf '%s\\n' '{{\"type\":\"result\",\"is_error\":false,\"result\":\"Fake answer title\"}}'\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let launcher = Launcher {
+            ox: script,
+            path: std::env::var_os("PATH").unwrap(),
+            directory: dir.path().to_path_buf(),
+        };
+        let route = Route {
+            runtime: Runtime::Claude,
+            billing: Billing::Api("fake-alias".into()),
+        };
+        // A parallel test's fork can briefly hold the freshly written script open
+        // (ETXTBSY), so the launch is retried a few times before failing.
+        let mut attempts = 0;
+        let (title, started) = loop {
+            let started = Instant::now();
+            match generate_impl(
+                &launcher,
+                &route,
+                "fake-model",
+                "Please debug a recurring database connection timeout",
+            ) {
+                Ok(title) => break (title, started),
+                Err(error) if attempts < 5 => {
+                    attempts += 1;
+                    let _ = error;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => panic!("title generation failed: {error}"),
+            }
+        };
+        assert_eq!(title.as_deref(), Some("Fake answer title"));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "waited for the descendant instead of the client exit"
+        );
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_alive(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !process_alive(pid),
+            "descendant {pid} survived title generation"
+        );
+    }
+
     #[test]
     #[ignore = "Requires the isolated stock title fixture"]
     fn isolated_stock_title() {

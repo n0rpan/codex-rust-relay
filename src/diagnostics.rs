@@ -89,7 +89,7 @@ async fn probe(
 ) -> Result<(Duration, Duration), RelayError> {
     let key = vendor
         .api_key(env)
-        .ok_or_else(|| vendor.unavailable_reason())?;
+        .ok_or_else(|| vendor.unavailable_reason_with(env))?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(crate::CONNECT_TIMEOUT)

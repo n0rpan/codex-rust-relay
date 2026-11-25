@@ -19,6 +19,7 @@ const MAX_RUNNING: usize = 4;
 const MAX_RETAINED: usize = 24;
 const MAX_TEXT: usize = 24 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const CODEX_FLUSH_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 pub(super) struct Jobs {
@@ -412,8 +413,11 @@ impl Start {
             }
             (Runtime::Claude, mode) => {
                 let writes = self.writes()?;
+                // Write workers run in Accept edits mode, which approves file edits but
+                // not shell commands. Offering Bash would tell the model it can run
+                // commands that print mode always denies, so it is left out here.
                 let tools = if writes {
-                    "Read,Glob,Grep,Edit,Write,Bash,Workflow"
+                    "Read,Glob,Grep,Edit,Write,Workflow"
                 } else {
                     "Read,Glob,Grep,Workflow"
                 };
@@ -645,7 +649,7 @@ async fn run_codex(
     let mut awaiting_start = true;
     let start_timeout = tokio::time::sleep(RPC_TIMEOUT);
     tokio::pin!(start_timeout);
-    loop {
+    let status = loop {
         let line = tokio::select! {
             _ = &mut start_timeout, if awaiting_start => return Err(format!("Codex did not answer {method}.").into()),
             Some(message) = instructions.recv() => {
@@ -737,9 +741,14 @@ async fn run_codex(
         if turn.is_none()
             && let Some(status) = terminal
         {
-            return Ok(status);
+            break status;
         }
-    }
+    };
+    // Closing input lets the app-server flush its final session state before the
+    // process group is killed on drop. Wait briefly, then let drop kill it.
+    drop(input);
+    let _ = tokio::time::timeout(CODEX_FLUSH_GRACE, process.child.wait()).await;
+    Ok(status)
 }
 
 async fn rpc(
@@ -843,5 +852,110 @@ mod turn_error_tests {
             turn_error(&bare, &[]).as_deref(),
             Some("Claude Code reported a worker error.")
         );
+    }
+}
+
+#[cfg(test)]
+mod worker_contract_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn start(value: Value) -> Start {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn args_of(command: &Command) -> Vec<String> {
+        command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn value_after<'a>(args: &'a [String], flag: &str) -> &'a str {
+        let index = args.iter().position(|arg| arg == flag).expect(flag);
+        &args[index + 1]
+    }
+
+    #[test]
+    fn write_claude_workers_are_not_offered_bash() {
+        let request = start(json!({
+            "runtime": "claude", "mode": "session", "task": "fix it",
+            "model": "fixture", "permission_mode": "write"
+        }));
+        let command = request.command(Path::new("/"), Path::new("/")).unwrap();
+        let args = args_of(&command);
+        let tools = value_after(&args, "--tools");
+        // Accept edits approves file edits, not shell commands, so Bash is not offered.
+        assert_eq!(tools, "Read,Glob,Grep,Edit,Write,Workflow");
+        assert_eq!(value_after(&args, "--permission-mode"), "acceptEdits");
+        assert_eq!(value_after(&args, "--allowedTools"), "Read,Glob,Grep");
+
+        let read = start(json!({
+            "runtime": "claude", "mode": "session", "task": "look",
+            "model": "fixture", "permission_mode": "read"
+        }));
+        let args = args_of(&read.command(Path::new("/"), Path::new("/")).unwrap());
+        assert_eq!(value_after(&args, "--tools"), "Read,Glob,Grep,Workflow");
+        assert_eq!(
+            value_after(&args, "--disallowedTools"),
+            "Bash,Edit,Write,MultiEdit,NotebookEdit"
+        );
+    }
+
+    /// A fake Codex app-server that answers the RPCs, reports the turn as completed,
+    /// and only writes its marker after stdin closes, as a client flushing state would.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_worker_gets_a_flush_window_after_turn_completed() {
+        const SCRIPT: &str = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-1"}}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}' ;;
+  esac
+done
+printf flushed > "$MARKER"
+"#;
+        let marker = std::env::temp_dir().join(format!("ox-codex-flush-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", SCRIPT])
+            .env("MARKER", &marker)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0);
+        let request = start(json!({
+            "runtime": "codex", "mode": "session", "task": "say hi", "model": "fixture"
+        }));
+        let state = Mutex::new(State {
+            runtime: Runtime::Codex,
+            mode: Mode::Session,
+            can_steer: false,
+            messages: VecDeque::new(),
+            status: "running",
+            native_session: None,
+            progress: String::new(),
+            result: None,
+            error: None,
+            model: "fixture".into(),
+        });
+        let (_instructions, receiver) = mpsc::channel::<Instruction>(1);
+        let status = run_codex(command, &request, &state, &[], receiver)
+            .await
+            .expect("the scripted turn completes");
+        assert_eq!(status, "completed");
+        // The worker was not killed the moment turn/completed arrived.
+        assert_eq!(
+            std::fs::read_to_string(&marker).ok().as_deref(),
+            Some("flushed")
+        );
+        let _ = std::fs::remove_file(&marker);
     }
 }

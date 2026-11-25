@@ -715,6 +715,11 @@ function showAsks(asks) {
   root.replaceChildren();
   for (const a of asks) {
     const card = el("article", "ask");
+    // A child that would run in YOLO waits here for the operator (ox-host yolo.rs).
+    if (String(a.id).startsWith("ox-yolo-")) {
+      card.classList.add("yolo");
+      card.append(el("p", "ask-kicker", "Worker waits for YOLO"));
+    }
     card.append(el("h2", "", a.title));
     if (a.detail) card.append(el("p", "", a.detail));
     const answer = (action) => {
@@ -1100,6 +1105,32 @@ function render() {
   net(live ? "Connected" : "Reconnecting", live);
   if (!$("catalog").hidden) catalog();
   if (!$("conversation").hidden) conversation();
+  updateNeedsBar();
+}
+// A sticky "needs you" bar in the composer stack whenever any session has a pending ask.
+function updateNeedsBar() {
+  const bar = $("needs-bar");
+  const seen = new Set(),
+    asks = [];
+  for (const model of [global, detailLink?.model]) {
+    for (const s of model?.scopes.values() ?? []) {
+      for (const a of s.asks ?? []) {
+        const id = scopeKey(s.scope) + " " + a.id;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        asks.push({ scope: s.scope, thread: a.thread });
+      }
+    }
+  }
+  bar.hidden = !asks.length;
+  if (!asks.length) return;
+  const n = asks.length;
+  bar.textContent = `NEEDS YOU · ${n === 1 ? "1 request" : `${n} requests`}`;
+  bar.onclick = () => {
+    const here = $("asks").firstElementChild;
+    if (here) here.scrollIntoView({ behavior: "smooth", block: "center" });
+    else open(asks[0].scope, asks[0].thread);
+  };
 }
 $("menu-stop").onclick = () => $("stop").click();
 $("menu-settings").onclick = () => $("open-settings").click();
@@ -1217,6 +1248,22 @@ const provider = (route) =>
     : route.runtime === "codex"
       ? "OpenAI (ChatGPT subscription)"
       : "Anthropic (Claude subscription)";
+function linkCard({ label, title, meta, tone = "", action }) {
+  const card = el("article", "link-card " + tone);
+  const body = el("div", "link-card-body");
+  body.append(
+    el("p", "link-card-label", label),
+    el("strong", "link-card-title", title),
+  );
+  if (meta) body.append(el("span", "meta", meta));
+  card.append(el("span", "link-card-icon"), body);
+  if (action) {
+    const b = button(action[0], action[1]);
+    b.className = "quiet link-card-action";
+    card.append(b);
+  }
+  return card;
+}
 function handoffMarks(row) {
   const box = $("handoff-marks"),
     d = row?.detail ?? {},
@@ -1232,28 +1279,34 @@ function handoffMarks(row) {
         operator: "chosen by you",
         capped: "capped below YOLO",
       }[origin.decided] ?? "unknown";
-    const p = el(
-      "p",
-      "handoff-marker",
-      `Continued from “${h.title}” · ${routesLabel(h.route)} · mode ${modeLabel(origin.started)} (${why}) · ${sel.carried ?? 0} messages carried, ${sel.omitted ?? 0} omitted`,
+    nodes.push(
+      linkCard({
+        label: "Continued from",
+        title: h.title,
+        meta: `${routesLabel(h.route)} · mode ${modeLabel(origin.started)} (${why}) · ${sel.carried ?? 0} messages carried, ${sel.omitted ?? 0} omitted`,
+        action: ["Open source", () => open(h.scope, h.session)],
+      }),
     );
-    p.append(button("Open source", () => open(h.scope, h.session)));
-    nodes.push(p);
   }
-  for (const to of d.handed_off_to ?? []) {
-    const p = el("p", "handoff-marker", `Handed off to ${to.label}`);
-    p.append(button("Open", () => open(to.scope, to.session)));
-    nodes.push(p);
-  }
+  for (const to of d.handed_off_to ?? [])
+    nodes.push(
+      linkCard({
+        label: "Handed off to",
+        title: to.label,
+        action: ["Open", () => open(to.scope, to.session)],
+      }),
+    );
   for (const a of d.handoff_attempts ?? [])
     nodes.push(
-      el(
-        "p",
-        "handoff-marker",
-        a.status === "failed"
-          ? `Handoff to ${a.label} failed: ${a.message ?? "unknown error"}`
-          : `Handing off to ${a.label}…`,
-      ),
+      a.status === "failed"
+        ? linkCard({
+            label: "Handoff failed",
+            title: a.label,
+            meta: a.message ?? "unknown error",
+            tone: "failed",
+            action: ["Retry", () => $("continue-in").click()],
+          })
+        : linkCard({ label: "Handing off", title: a.label, tone: "pending" }),
     );
   box.replaceChildren(...nodes);
   box.hidden = !nodes.length;
@@ -1292,11 +1345,25 @@ const modeLabel = (m) =>
     bypass_permissions: "bypass permissions",
   })[m] ?? "unverified";
 function handoffRoutes() {
-  const runtime = $("handoff-runtime").value;
-  const list = routes.filter((r) => r.runtime === runtime);
-  $("handoff-route").replaceChildren(
-    ...list.map((r, n) => new Option(routesLabel(r), String(routes.indexOf(r)))),
-  );
+  const runtime = $("handoff-runtime").value,
+    select = $("handoff-route"),
+    keep = select.value;
+  const list = routes.filter((r) => r.runtime === runtime),
+    rank = (r) => {
+      const i = modelChoices.starred.indexOf(r.billing?.api);
+      return i < 0 ? Infinity : i;
+    };
+  const starred = list
+      .filter((r) => rank(r) !== Infinity)
+      .sort((x, y) => rank(x) - rank(y)),
+    rest = list.filter((r) => rank(r) === Infinity);
+  const option = (r) => new Option(routesLabel(r), String(routes.indexOf(r)));
+  const groups = [];
+  if (starred.length)
+    groups.push(optgroup("Starred", starred.map(option)));
+  if (rest.length) groups.push(optgroup("All models", rest.map(option)));
+  select.replaceChildren(...groups);
+  if (keep !== "" && routes[+keep]?.runtime === runtime) select.value = keep;
   handoffNotice();
 }
 function handoffNotice() {
@@ -1313,6 +1380,7 @@ $("continue-in").onclick = () => {
   $("handoff-runtime").value =
     selected?.scope?.route?.runtime === "codex" ? "claude" : "codex";
   handoffRoutes();
+  loadModelChoices();
   $("handoff-form").hidden = false;
   $("handoff-request").focus();
 };
@@ -1369,36 +1437,123 @@ $("handoff-form").onsubmit = (e) => {
   // handoff reply can arrive before its acknowledgement.
   if (grant && key) pendingGrant = { key };
 };
-$("start-worker").onclick = () => {
-  $("worker-models").replaceChildren(
-    ...routes
-      .filter((r) => r.billing?.api)
-      .map((r) => new Option(r.billing.api)),
+// Model lists for the worker and handoff sheets: the host's starred models first,
+// then every known model and every API route the phone already has.
+let modelChoices = { starred: [], all: [] };
+const optgroup = (label, options) => {
+  const g = document.createElement("optgroup");
+  g.label = label;
+  g.append(...options);
+  return g;
+};
+async function loadModelChoices() {
+  let starred = [],
+    known = [];
+  try {
+    const rows = await settingsRequest(key, { action: "read_rows" });
+    starred = rows.favorites ?? [];
+    known = rows.models ?? [];
+  } catch {
+    // The route list alone still works.
+  }
+  const clean = (list) => [
+    ...new Set(list.filter((m) => typeof m === "string" && m)),
+  ];
+  const fromRoutes = routes.map((r) => r.billing?.api);
+  starred = clean(starred);
+  modelChoices = {
+    starred,
+    all: clean([...starred, ...known, ...fromRoutes]),
+  };
+  fillWorkerModels();
+  handoffRoutes();
+}
+function fillWorkerModels() {
+  const select = $("worker-model"),
+    current = select.value,
+    starred = modelChoices.starred,
+    rest = modelChoices.all.filter((m) => !starred.includes(m));
+  const option = (m) => new Option(m, m);
+  select.replaceChildren(
+    new Option("Subscription (default)", ""),
+    ...(starred.length ? [optgroup("Starred", starred.map(option))] : []),
+    ...(rest.length ? [optgroup("All models", rest.map(option))] : []),
   );
+  select.value = [...select.options].some((o) => o.value === current)
+    ? current
+    : "";
+  // Free text is the fallback only when the phone has no model list at all.
+  const free = !modelChoices.all.length;
+  select.hidden = free;
+  $("worker-model-free").hidden = !free;
+}
+const workerModelValue = () =>
+  ($("worker-model-free").hidden
+    ? $("worker-model").value
+    : $("worker-model-free").value.trim()) || null;
+const workerModes = {
+  session: "Session",
+  goal: "Codex goal",
+  workflow: "Claude workflow",
+};
+const modesFor = (runtime) =>
+  runtime === "codex" ? ["session", "goal"] : ["session", "workflow"];
+function renderWorkerMode() {
+  const allowed = modesFor($("worker-runtime").value);
+  if (!allowed.includes($("worker-mode").value)) $("worker-mode").value = "session";
+  const current = $("worker-mode").value;
+  $("worker-mode-group").replaceChildren(
+    ...allowed.map((m) => {
+      const b = button(workerModes[m], () => {
+        $("worker-mode").value = m;
+        renderWorkerMode();
+      });
+      b.className = "segment";
+      b.setAttribute("role", "radio");
+      b.setAttribute("aria-checked", String(m === current));
+      return b;
+    }),
+  );
+}
+function renderWorkerPermission() {
+  const yolo = $("worker-permission").value === "yolo";
+  $("worker-warning").textContent =
+    "YOLO runs this worker without asking for each step. Choosing it here confirms that.";
+  $("worker-warning").hidden = !yolo;
+}
+$("worker-runtime").onchange = renderWorkerMode;
+$("worker-permission").onchange = renderWorkerPermission;
+$("start-worker").onclick = () => {
+  fillWorkerModels();
+  renderWorkerMode();
+  renderWorkerPermission();
   $("worker-form").hidden = false;
   $("worker-task").focus();
+  loadModelChoices();
 };
 $("worker-cancel").onclick = () => ($("worker-form").hidden = true);
 $("worker-form").onsubmit = (e) => {
   e.preventDefault();
   if (!selected?.id) return;
-  const model = $("worker-model").value.trim() || null;
   const task = $("worker-task").value.trim();
   if (!task) {
     notice("Write the task for the worker.");
     return;
   }
+  const runtime = $("worker-runtime").value,
+    permission = $("worker-permission").value;
   const start = {
     parent: selected.id,
-    runtime: $("worker-runtime").value,
-    model,
-    mode: $("worker-mode").value,
+    runtime,
+    model: workerModelValue(),
+    mode: modesFor(runtime).includes($("worker-mode").value)
+      ? $("worker-mode").value
+      : "session",
     task,
-    permission: $("worker-permission").value,
-    yolo_confirmed: false,
+    permission,
+    // Choosing YOLO in the sheet is the confirmation, as for any YOLO change.
+    yolo_confirmed: permission === "yolo",
   };
-  // Choosing YOLO in the sheet is the confirmation, as for any YOLO change.
-  start.yolo_confirmed = start.permission === "yolo";
   detailLink?.act({ start_worker: start }, null, (ok, message) => {
     if (!ok) notice(message || "The host refused this worker.");
     else {
@@ -1486,8 +1641,27 @@ function notificationGuide(text, buttonLabel) {
   $("notifications").hidden = !buttonLabel;
   if (buttonLabel) $("notifications").textContent = buttonLabel;
 }
+const alertsKey = "ox-phone-alerts-dismissed";
+function alertsDismissed() {
+  try {
+    return localStorage.getItem(alertsKey) === "1";
+  } catch {
+    return false;
+  }
+}
+function setAlertsDismissed(on) {
+  try {
+    if (on) localStorage.setItem(alertsKey, "1");
+    else localStorage.removeItem(alertsKey);
+  } catch {
+    // Private windows may refuse storage; the banner then simply returns.
+  }
+}
 function notificationSetup(justPaired) {
-  if (justPaired) $("notification-setup").open = true;
+  if (justPaired) {
+    setAlertsDismissed(false);
+    $("notification-setup").open = true;
+  }
   const supportsPush =
     "serviceWorker" in navigator &&
     "Notification" in window &&
@@ -1513,7 +1687,23 @@ function notificationSetup(justPaired) {
     );
     if (Notification.permission === "granted") registerNotifications(false);
   }
+  // One-time banner until alerts are on or the user dismisses it; then it lives in the menu.
+  const granted =
+    "Notification" in window && Notification.permission === "granted";
+  const dismissed = alertsDismissed();
+  $("notification-banner").hidden = granted || dismissed;
+  $("open-notifications").hidden = granted || !dismissed;
 }
+$("notification-dismiss").onclick = () => {
+  setAlertsDismissed(true);
+  notificationSetup(false);
+};
+$("open-notifications").onclick = () => {
+  closeActionMenus();
+  setAlertsDismissed(false);
+  notificationSetup(false);
+  $("notification-setup").open = true;
+};
 let registering = false;
 async function registerNotifications(explicit) {
   if (registering) return;
@@ -1538,6 +1728,11 @@ $("notifications").onclick = () => registerNotifications(true);
 function pairingPage() {
   page("pair");
   net("Pair device");
+  const scanned = Boolean(code);
+  $("step-scan").toggleAttribute("aria-current", !scanned);
+  $("step-name").toggleAttribute("aria-current", scanned);
+  $("scan-pair").hidden = scanned;
+  $("pair-submit").classList.toggle("primary", scanned);
   $("paste-pair").hidden = Boolean(code);
   $("pair-link").required = !code;
   $("pair-hint").textContent = code

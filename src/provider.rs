@@ -84,6 +84,12 @@ pub fn process_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+/// A key the upstream can accept as a bearer token: non-empty and without any
+/// whitespace. Callers trim surrounding whitespace first.
+fn usable_key(value: &str) -> bool {
+    !value.is_empty() && !value.chars().any(char::is_whitespace)
+}
+
 /// A local store for keys pasted into the terminal setup. Scope each key to
 /// both its variable name and destination so editing a URL cannot forward it.
 #[derive(Default, serde::Deserialize, serde::Serialize)]
@@ -177,7 +183,25 @@ impl SavedKeys {
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<String> {
-        process_env(name).or_else(|| self.0.get(name).map(|key| key.value.clone()))
+        self.resolve(name, process_env(name))
+    }
+
+    /// A usable environment value (surrounding whitespace trimmed) wins. A malformed
+    /// one falls through to the saved key. With no saved key it is returned as-is so
+    /// the caller can report that the variable is set but malformed.
+    fn resolve(&self, name: &str, env_value: Option<String>) -> Option<String> {
+        let saved = || self.0.get(name).map(|key| key.value.clone());
+        match env_value {
+            None => saved(),
+            Some(value) => {
+                let trimmed = value.trim();
+                if usable_key(trimmed) {
+                    Some(trimmed.to_owned())
+                } else {
+                    saved().or(Some(value))
+                }
+            }
+        }
     }
 
     fn scoped_value(&self, name: &str, scope: &str) -> Option<String> {
@@ -489,10 +513,11 @@ impl Vendor {
     pub fn api_key(&self, env: &Env<'_>) -> Option<SecretKey> {
         let name = self.env_key.as_deref()?;
         let key = env(name)?;
-        if key.is_empty() || key.chars().any(char::is_whitespace) {
+        let key = key.trim();
+        if !usable_key(key) {
             return None;
         }
-        Some(SecretKey::new(key))
+        Some(SecretKey::new(key.to_owned()))
     }
 
     /// Build authentication for the selected upstream. The documented hosted
@@ -645,6 +670,17 @@ impl Vendor {
         match &self.env_key {
             Some(name) => format!("set {name} to enable this provider"),
             None => "no env_key is configured".to_owned(),
+        }
+    }
+
+    /// Like [`unavailable_reason`](Self::unavailable_reason), but says so when the
+    /// variable is already set and only its value was rejected.
+    pub fn unavailable_reason_with(&self, env: &Env<'_>) -> String {
+        match &self.env_key {
+            Some(name) if env(name).is_some() => format!(
+                "{name} is set but its value is not a usable key; remove spaces or line breaks from it"
+            ),
+            _ => self.unavailable_reason(),
         }
     }
 
@@ -1983,12 +2019,64 @@ base_url = "https://other.example/inference/go/openai/v1"
     }
 
     #[test]
+    fn whitespace_in_an_env_key_does_not_hide_the_saved_key() {
+        let config = two_vendors("", "");
+        let vendor = config.vendors.iter().find(|v| v.key == "alpha").unwrap();
+        // Surrounding whitespace (a trailing space or newline) is trimmed away.
+        let env = |name: &str| (name == "ALPHA_KEY").then(|| " fixture-key\n".to_owned());
+        assert_eq!(vendor.api_key(&env).unwrap().expose(), "fixture-key");
+
+        // A value that is still malformed after trimming is rejected, and the
+        // reason says the variable is set rather than naming the wrong fix.
+        let env = |name: &str| (name == "ALPHA_KEY").then(|| "fixture key".to_owned());
+        assert!(vendor.api_key(&env).is_none());
+        let reason = vendor.unavailable_reason_with(&env);
+        assert!(reason.contains("ALPHA_KEY is set"), "{reason}");
+        assert!(!reason.contains("set ALPHA_KEY to enable"), "{reason}");
+
+        // The saved-key lookup falls through a malformed env value to the saved key.
+        let saved: SavedKeys = serde_json::from_value(serde_json::json!({
+            "ALPHA_KEY": {"scope": "alpha", "value": "saved-key"}
+        }))
+        .unwrap();
+        assert_eq!(
+            saved
+                .resolve("ALPHA_KEY", Some("fixture key".to_owned()))
+                .as_deref(),
+            Some("saved-key")
+        );
+        assert_eq!(
+            saved
+                .resolve("ALPHA_KEY", Some(" env-key ".to_owned()))
+                .as_deref(),
+            Some("env-key")
+        );
+        assert_eq!(
+            saved.resolve("ALPHA_KEY", None).as_deref(),
+            Some("saved-key")
+        );
+        // With no saved key, the malformed value is still reported to the caller.
+        let none = SavedKeys::default();
+        assert_eq!(
+            none.resolve("ALPHA_KEY", Some("fixture key".to_owned()))
+                .as_deref(),
+            Some("fixture key")
+        );
+        assert_eq!(none.resolve("ALPHA_KEY", None), None);
+    }
+
+    #[test]
     fn missing_credentials_leave_the_vendor_unavailable() {
         let config = two_vendors("", "");
         let vendor = config.vendors.iter().find(|v| v.key == "alpha").unwrap();
         let env = |_: &str| None;
         assert!(vendor.api_key(&env).is_none());
         assert!(vendor.unavailable_reason().contains("ALPHA_KEY"));
+        assert!(
+            vendor
+                .unavailable_reason_with(&env)
+                .contains("set ALPHA_KEY")
+        );
         let env = |name: &str| (name == "ALPHA_KEY").then(|| "fixture-key".to_owned());
         let key = vendor.api_key(&env).unwrap();
         assert_eq!(key.expose(), "fixture-key");

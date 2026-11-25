@@ -114,8 +114,14 @@ fn translates_function_tools_with_and_without_optional_fields() {
 
 #[test]
 fn forwards_baseline_tool_choice_strings() {
+    // Tool controls are forwarded only alongside a tools array.
     for mode in ["auto", "none", "required"] {
-        let body = translate_request(&json!({"input": "hi", "tool_choice": mode}), "m").unwrap();
+        let input = json!({
+            "input": "hi",
+            "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            "tool_choice": mode
+        });
+        let body = translate_request(&input, "m").unwrap();
         assert_eq!(body["tool_choice"], mode);
     }
 }
@@ -150,6 +156,25 @@ fn rejects_hosted_tool_choices() {
     let error = translate_request(&input, "m").unwrap_err();
     assert!(error.contains("web_search_preview"), "{error}");
     assert!(error.contains("tool_choice"), "{error}");
+}
+
+#[test]
+fn drops_tool_controls_when_no_tools_remain() {
+    // Stock Codex always sends these; with every tool dropped, Chat Completions
+    // rejects them, so only the messages should reach the upstream.
+    let input = json!({"input": "hi", "tool_choice": "auto", "parallel_tool_calls": true});
+    let body = translate_request(&input, "m").unwrap();
+    assert!(body.get("tools").is_none());
+    assert!(body.get("tool_choice").is_none());
+    assert!(body.get("parallel_tool_calls").is_none());
+
+    // A bad parallel flag is still a request error, even with no tools.
+    let input = json!({"input": "hi", "parallel_tool_calls": "yes"});
+    assert!(
+        translate_request(&input, "m")
+            .unwrap_err()
+            .contains("parallel_tool_calls")
+    );
 }
 
 #[test]
@@ -1004,17 +1029,22 @@ fn reports_content_filter_as_an_incomplete_response() {
 }
 
 #[test]
-fn rejects_unknown_finish_reasons() {
+fn completes_after_an_unknown_finish_reason_without_losing_the_answer() {
+    // A provider-specific reason after a full answer must not discard the streamed text.
     let mut translator = new_translator();
-    let events = push(&mut translator, &chunk(json!({"content": "x"})));
-    assert!(!events.is_empty());
-    // The unknown reason fails as soon as it arrives, before any item is closed.
-    let error = translator
-        .push_event("message", &finish_chunk("abort").to_string())
-        .unwrap_err();
-    assert!(error.contains("abort"), "{error}");
-    assert!(!translator.is_finished());
-    assert!(translator.finish().unwrap_err().contains("finish_reason"));
+    let mut events = push(&mut translator, &chunk(json!({"content": "kept"})));
+    events.extend(push(
+        &mut translator,
+        &finish_chunk("insufficient_system_resource"),
+    ));
+    events.extend(translator.push_event("message", "[DONE]").unwrap());
+    let completed = one(&events, "response.completed");
+    assert_eq!(completed["response"]["status"], "completed");
+    assert_eq!(
+        completed["response"]["output"][0]["content"][0]["text"],
+        "kept"
+    );
+    assert!(translator.is_finished());
 }
 
 #[test]

@@ -592,7 +592,10 @@ impl Store {
             self.next_preset = None;
             self.next_options = None;
         } else {
-            self.edit(None, std::mem::take(&mut draft.text));
+            // The composer moved on. Its text and images stay together with the new chat.
+            let composer = self.drafts.entry(None).or_default();
+            composer.text = std::mem::take(&mut draft.text);
+            composer.images = std::mem::take(&mut draft.images);
         }
         let mut row = reply.thread;
         row.model = Some(reply.model.clone());
@@ -677,6 +680,46 @@ mod tests {
         assert!(error.to_string().contains("accepts text only"));
         assert_eq!(store.draft_images(None)[0].label(), "art.png");
         assert!(!store.sending(None));
+    }
+
+    #[test]
+    fn new_chat_images_stay_with_its_text_when_the_thread_opens_elsewhere() {
+        let mut store = ready();
+        let project = store.profile.project.clone();
+        let submit = Submit {
+            options: None,
+            owner: None,
+            expected_turn: None,
+            selection: store.selection,
+            command: None,
+            inject: vec![],
+        };
+        // While the thread opens, the new-chat composer gets text and an image; the operator
+        // then selects another thread, so the opened thread must not take either.
+        store.edit(None, "typed while pending".into());
+        store.attach_image(None, ImageInput::File("/tmp/next.png".into()));
+        store.selection += 1;
+        let reply: ResumedThread = serde_json::from_value(serde_json::json!({
+            "thread": {"id":"new-thread","cwd":project,"modelProvider":"openai"},
+            "modelProvider":"openai",
+            "model":"fixture/model",
+            "serviceTier":null,
+            "reasoningEffort":null,
+            "initialTurnsPage":null
+        }))
+        .unwrap();
+        store.first_send(submit, reply).unwrap();
+        assert_eq!(store.draft(None), "typed while pending");
+        assert_eq!(
+            store
+                .draft_images(None)
+                .iter()
+                .map(ImageInput::label)
+                .collect::<Vec<_>>(),
+            ["next.png"]
+        );
+        assert_eq!(store.draft(Some("new-thread")), "");
+        assert!(store.draft_images(Some("new-thread")).is_empty());
     }
 
     #[test]

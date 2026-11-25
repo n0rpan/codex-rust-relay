@@ -218,8 +218,11 @@ export class SessionControls {
         ? (modes[planned] ?? planned) + " on start"
         : "Permission mode";
     badge.dataset.bypass = String(bypass(confirmed));
+    // An active YOLO grant is part of the chip, so its state is visible without opening settings.
+    const grant = own.yolo_grant === true && bypass(confirmed);
+    badge.dataset.grant = String(grant);
     if (bypass(confirmed)) {
-      badge.textContent = "YOLO";
+      badge.textContent = grant ? "YOLO + workers" : "YOLO";
       badge.setAttribute(
         "aria-label",
         modes[confirmed] + ", change permission mode",

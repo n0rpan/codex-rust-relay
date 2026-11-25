@@ -26,7 +26,7 @@ pub(super) struct Picker {
     /// Only the model picker is a searchable shared `ModelPicker`.
     models: Option<(Entity<ModelPicker>, Subscription)>,
 }
-fn model_entries(caps: &Capabilities) -> Vec<model_picker::Entry> {
+pub(super) fn model_entries(caps: &Capabilities) -> Vec<model_picker::Entry> {
     caps.models
         .iter()
         .map(|(id, m)| model_picker::Entry {
