@@ -463,16 +463,20 @@ def scroll_catalog(f):
     positions = wait(lambda: words if "0000" in (words := f.words()) else None)
     f.x("mousemove", "--window", f.window, *positions["0000"])
     f.stats(reset=True)
-    # Scroll until the end, or until 30 seconds pass without reaching a new row.
-    # A fixed overall deadline failed on slow shared runners at row 4988 of 5000
-    # while still making steady progress.
+    # Scroll to the end. Stop after 60 seconds without a new row, or 5 minutes
+    # in all. The last catalog pages can take over 30 seconds to arrive while
+    # the list waits at its loaded end, and a fixed 150-second deadline stopped
+    # at row 4988 of 5000 on a slow shared runner that was still progressing.
+    # The time taken is recorded so a slowdown is visible without failing G6.
+    started = time.monotonic()
     stats = f.stats()
-    furthest, stalled = stats["furthest_row"], time.monotonic() + 30
-    while stats["furthest_row"] < 5000 and time.monotonic() < stalled:
+    furthest, stalled = stats["furthest_row"], started + 60
+    while stats["furthest_row"] < 5000 and time.monotonic() < min(stalled, started + 300):
         f.x("click", "--repeat", "100", "--delay", "5", "5")
         stats = f.stats()
         if stats["furthest_row"] > furthest:
-            furthest, stalled = stats["furthest_row"], time.monotonic() + 30
+            furthest, stalled = stats["furthest_row"], time.monotonic() + 60
+    seconds = round(time.monotonic() - started, 1)
     # Count only the GPUI visible range and its overscan. Window height gives an
     # independent upper bound since every button alone consumes 32 logical pixels.
     size = f.x("getwindowgeometry", "--shell", f.window)
@@ -481,7 +485,7 @@ def scroll_catalog(f):
     record("G6", stats["furthest_row"] == 5000 and stats["max_list_range"] <= budget,
            reached=stats["furthest_row"], catalog_len=stats["catalog_len"],
            maximum_rows_in_layout=stats["max_list_range"], row_budget=budget,
-           draw_p95_ms=stats["draw_p95_ns"]/1e6)
+           draw_p95_ms=stats["draw_p95_ns"]/1e6, scroll_seconds=seconds)
 
 
 def hidden(f):
