@@ -1,0 +1,357 @@
+{
+ "confirmed": [
+  {
+   "title": "Unverified thread drops the turn-completed event and keeps a stale active turn that survives reopen",
+   "file": "desktop/ox-desk-core/src/store/notifications.rs",
+   "line": 95,
+   "severity": "medium",
+   "scenario": "A thread is open on an API route with a turn in progress. Codex sends a thread settings notification whose model differs from the authorized alias (no pending option change). The Settings arm sets verified=false and ready=false but leaves transcript.active_turn set. The turn then completes. Frame::Activity (store.rs:702/717) only applies TurnCompleted when verified&&ready, or buffers it when loading; here neither holds, so the event is dropped and active_turn is never cleared. The sidebar still updates because catalog_activity (catalog.rs:284) runs first and sets the row to idle. Reopening the thread calls add_history (transcript.rs:116), which only sets active_turn for inProgress turns and never clears it, so the stale id persists. The thread then shows running with no working path: submit_operation (compose.rs:244) uses expected_turn = stale id, so every send becomes turn/steer to a finished turn, which fails and restores the draft. Stop also targets the dead turn. The thread stays unsendable until the app restarts.",
+   "evidence": "notifications.rs:95 `t.verified = false;` in Notification::Settings (mismatch or provider branch, no clearing of active_turn). store.rs:702 `if t.verified && t.ready {` / 717 `} else if t.loading {` (other events dropped). transcript.rs:116 `if !already_open && turn.status == \"inProgress\" { self.active_turn = Some(...) }` with no else branch clearing it. compose.rs:244 `expected_turn: ... active_turn.clone()`. Contrast notifications.rs:170, where Notification::Closed clears active_turn.",
+   "fix": "When marking a transcript unverified or not ready in the Settings and failed(Pending::Options) paths, also clear active_turn (and record last_finished if known), or in add_history always reconcile active_turn from the snapshot: set it when the snapshot has an inProgress turn and clear it when the snapshot shows none of the turns as inProgress.",
+   "area": "codex-appserver",
+   "upheld": 2,
+   "votes": 3,
+   "refutations": [
+    "Refuted: the claimed failure chain breaks at two guards the claim does not mention.\n\n1. The sending consequence is blocked. In notifications.rs:94-96 a mismatch sets ready=false and verified=false. transmit() (compose.rs ~line 284) rejects any send when `!t.ready || !t.verified` with \"The active turn or billing route changed before sending\". So the thread never reaches the `turn/steer` path with a stale expected_turn while it is unverified. The \"every send becomes steer to a finished turn\" step cannot happen from this state.\n\n2. The reopen path the claim relies on is rejected. The claim says reopening runs add_history (transcript.rs:116), which is what would leave the stale id in place. But checked_read (history.rs:199-202) calls verify_identity first (history.rs:173-197). That returns an error when `expected_alias(id)` is Some and `identity.model` differs from it. A thread whose live Codex model really changed (the claim's own precondition) will normally fail verify_identity, so Read errors out, checked_resume never runs, verified is never set back to true, and add_history is never reached. The thread then just shows the error \"Thread belongs to a different project, provider, or model\".\n\nWhat remains is narrower than claimed: active_turn is not cleared on the failed reopen, so the transcript may keep reporting running, and Stop may target a dead turn. That requires the stored thread model to match the authorized alias while the live Settings model differs, which is an inconsistent backend state the claim does not establish. The lost TurnCompleted while unverified is intentional gating (the code marks the thread unverified on purpose), so the reported defect is not the dropped event itself. The reproduction is not shown to be reachable, and the main user-facing consequence is blocked by existing guards, so I am not reporting it.\n\nCode paths checked: desktop/ox-desk-core/src/store/notifications.rs:60-100 and 150-180; store.rs:430-480, 545-575, 672-720; store/history.rs:130-270; transcript.rs:82-125 and 255-270; store/compose.rs:236-300; store/routes_thread.rs:99-111. Note: I did not read the current origin/main or the plan document, so I cannot answer the separate question about whether the plan is based on main."
+   ]
+  },
+  {
+   "title": "Cancel during worker launch is a silent no-op",
+   "file": "desktop/ox-host/src/engine.rs",
+   "line": 1621,
+   "severity": "medium",
+   "scenario": "A parent agent calls cancel_ox_worker for a worker whose route is still opening (the launch is in the Stage::Opening window, up to 60 s). parent_call sees workers.job(job_id) is None and unstarted_job returns the 'starting' status from running[..].launching. The Cancel arm then runs withdraw(job_id), which only removes entries from self.asking (YOLO requests). For a launching job it returns Ok(None), so unwrap_or(status) returns {status:'starting'}. Nothing is cancelled, the launch completes, and the worker runs on while the parent believes it is still starting and does not retry. The cancel reply should not report success for a job it did not stop.",
+   "evidence": "engine.rs:1613-1627: `if self.workers.job(job_id).is_none() && let Some(status) = self.unstarted_job(&me, job_id) { ... ParentCall::Cancel { .. } => Ok(self.withdraw(job_id).map_err(|e| e.to_string())?.unwrap_or(status)), ...}`. flows.rs:669-671: `pub(super) fn withdraw(...) { let Some(a) = self.asking.remove(&job_id) else { return Ok(None); };`. flows.rs:637-643 shows the 'starting' status is built from running[..].launching, which withdraw never inspects.",
+   "fix": "For a launching job, either abort the pending launch (drop its Launching/reply and stop the route launch so it never starts) and record an outcome of 'cancelled', or return an error such as 'This worker is still starting and cannot be cancelled yet; retry shortly' instead of success-shaped 'starting'. Add a regression test that cancels a launching job and asserts the worker does not start.",
+   "area": "workers-mcp",
+   "upheld": 2,
+   "votes": 3,
+   "refutations": [
+    "Refuted as a user-facing bug. (1) Reachability is very narrow. The engine's launch() stores the parent's Replier in Launching.reply and the reply waits for the native session (engine.rs ~1325-1340, doc comment on launch). A parent's start_ox_worker call is therefore blocked for the whole Opening window, so it does not learn the job_id until launch finishes. The only early return is the YOLO ask path (waiting_for_operator), and that job lives in self.asking, where withdraw() does work. Reaching the launching-state Cancel needs a second, parallel call that already holds the job_id from a list call. (2) The reply is not a false success. unstarted_job() reports status \"starting\" and the cancel returns that truthful status, not a \"cancelled\" result. The parent sees the job still starting, and the blocked start reply then reports the real running state. (3) The main gap (no way to cancel a launching job; withdraw only handles YOLO asks) is a missing feature in the same lifecycle area as the already-known bug 5 (no way to end a session process), so it duplicates known bug 5 rather than being a separate defect. Code read: engine.rs ~1325-1340, ~1600-1630, ~1660-1690; engine/flows.rs ~610-690. Not verified by running anything, per the read-only constraint. Verdict: refuted, or at most a nit."
+   ]
+  },
+  {
+   "title": "One is_error result permanently kills a Claude worker",
+   "file": "src/workers/jobs.rs",
+   "line": 551,
+   "severity": "medium",
+   "scenario": "A Claude worker is steered with a follow-up turn, or is running a normal task, and a turn ends with a result event whose is_error is true, for example an API overload, max turns, or an execution error. run_claude returns Err('Claude Code reported a worker error.') immediately. The job is marked failed, and dropping WorkerProcess SIGKILLs the whole process group. The native session is still resumable, but the parent cannot steer it again, queued instructions get 'finished before acknowledging', and later turns never run. A single recoverable turn error ends the entire worker.",
+   "evidence": "jobs.rs:548-553: `Some(\"result\") => { if event[\"is_error\"] == true { return Err(\"Claude Code reported a worker error.\".into()); } ... pending -= 1; }`. WorkerProcess::drop (jobs.rs ~481-487) calls libc::kill(-(group), SIGKILL) when the task future is dropped on return.",
+   "fix": "Treat is_error results as a failed turn rather than a dead worker: record the error text on the state, decrement pending, and keep the process alive so steer can continue, reporting failure only when the process itself exits or the operator stops it. At minimum, do not discard the process group while the native session can still accept input.",
+   "area": "workers-mcp",
+   "upheld": 2,
+   "votes": 3,
+   "refutations": [
+    "Refuted as a bug; the behaviour is a deliberate fail-fast choice, not an unhandled recoverable case.\n\n- The early return at src/workers/jobs.rs:550-551 is explicit. The error is surfaced: run_claude returns Err, the spawn wrapper in Jobs::start (jobs.rs ~244-257) sets status \"failed\" and stores the error text. It is not silent.\n- No test or design doc describes a worker continuing after an is_error result. grep over tests/ and docs/ finds nothing for \"worker error\" or worker-level error recovery, so the claim that this is a wrong assumption is unsupported. Nothing proves intent either way, but the code is explicit.\n- Claude Code retries transient API overloads internally before it emits an error result. By the time is_error reaches the relay, the turn has already failed terminally, so \"recoverable\" is doubtful for the main example.\n- Resume is not a bug of this path: the job is terminal by design, and no resume path exists for failed worker jobs.\n\nWhat remains is a product-design question (should a worker survive a failed turn?), not a defect in the code as written. I would not report it as a bug. Confidence is moderate, since I did not run Claude Code to see exactly which error subtypes set is_error."
+   ]
+  },
+  {
+   "title": "Subdirectory workers vanish on list refresh and are not rediscovered",
+   "file": "desktop/ox-desk-core/src/store/catalog.rs",
+   "line": 118,
+   "severity": "medium",
+   "scenario": "A parent thread P in project /repo spawns worker W whose cwd is /repo/sub. observed_row accepts W because its parent is known (catalog.rs ~180-190), and discovery also accepts it (workers.rs ~91, starts_with). The Codex link then reconnects, or the list is refreshed. connected() calls list_more() with cursor None (store.rs ~401). On the first page reply, store.rs ~649 calls catalog.keep(&created_while_listing), which drops W because W was not created during this listing. The page loop at store.rs ~653 only re-inserts rows with cwd == project, so W is not restored. child_threads still holds W, so the spawn-triggered check at store.rs ~693 (`!self.child_threads.contains_key(id)`) is false and discover_children is not re-run. W stays hidden until P spawns another worker, which runs discover_children and restores it.",
+   "evidence": "catalog.rs:118-130 keep() keeps only ids in the set. store.rs:649 `self.catalog.keep(&self.created_while_listing);` runs when cursor.is_none(). store.rs:653 `if row.cwd == self.profile.project` filters list rows. store.rs:693-698 the spawnAgent branch only fires for receivers not in child_threads. workers.rs:91 discovery admits cwd.starts_with(project). recover_from (store.rs:226-265) keeps child_threads but the row is lost.",
+   "fix": "Do not evict rows that are still described by child_threads, for example keep(ids) should also retain any id in self.child_threads. Alternatively, after a full first-page list, re-run discover_children for each parent that has child_threads entries so subdirectory workers are re-observed.",
+   "area": "desktop-catalog",
+   "upheld": 3,
+   "votes": 3,
+   "refutations": []
+  },
+  {
+   "title": "Tool calls with no upstream id get an empty call_id sent to Codex",
+   "file": "src/adapters/chat_completions.rs",
+   "line": 1199,
+   "severity": "medium",
+   "scenario": "A provider that never sends `id` on a tool_calls delta (some local or compatible servers). The item_id falls back to fc_<output_index>, so the announce and done events look valid, but call_id stays the empty string. The client gets a function_call item with call_id \"\". On the next turn Codex returns function_call_output with call_id \"\", and push_function_call / the tool message send tool_call_id \"\" upstream. Two parallel calls both carry \"\", so their results cannot be matched to the calls, and the upstream may reject the empty id.",
+   "evidence": "tool.item_id = if tool.call_id.is_empty() { format!(\"fc_{}\", tool.output_index) } else { format!(\"fc_{}\", tool.call_id) }; (lines 1199-1203) \u2014 the fallback is applied to item_id only. ToolState::value emits \"call_id\": self.call_id (line 887), which is never given a fallback in push_tool_call or close_items.",
+   "fix": "Generate a stable call_id when none arrives (for example call_compat-style `call_{output_index}` or a hash of response_id and output_index) and use the same value for item_id and call_id, both in the announce and in the done item.",
+   "area": "chat-resp",
+   "upheld": 3,
+   "votes": 3,
+   "refutations": []
+  },
+  {
+   "title": "Max-tokens truncation inside a tool_use block fails the stream instead of reporting incomplete",
+   "file": "src/adapters/anthropic.rs",
+   "line": 1856,
+   "severity": "high",
+   "scenario": "Relay default max_tokens is 8192 (upstream.rs DEFAULT_MAX_OUTPUT_TOKENS, since Codex sends no max_output_tokens). Claude writes a large tool call, for example a file write or apply_patch whose JSON input exceeds the cap. Anthropic sends content_block_stop for the truncated tool_use, then message_delta stop_reason=max_tokens. content_block_stop parses the partial arguments in its Tool branch and returns Err, so push_event fails and upstream.rs fail() emits response.failed with relay_stream_error. The max_tokens to response.incomplete mapping in message_stop (which Codex can act on) is never reached.",
+   "evidence": "anthropic.rs ~1856: format!(\"tool \\\"{name}\\\" streamed invalid JSON arguments: {error}\") returned via `?`; message_stop maps stop_reason max_tokens to response.incomplete with reason max_output_tokens, but only if the stream gets there. upstream.rs:373-379: Err from push_event => self.fail(&message).",
+   "fix": "In content_block_stop, do not error on unparseable tool arguments. Record the raw string and defer validation to message_stop: when stop_reason is max_tokens, emit response.incomplete (and drop or flag the truncated function_call), and only error for invalid JSON when the stop reason is tool_use or end_turn.",
+   "area": "anthropic-adapter",
+   "upheld": 3,
+   "votes": 3,
+   "refutations": []
+  },
+  {
+   "title": "One discovered model id with a space or quote aborts the whole launch",
+   "file": "src/main.rs",
+   "line": 796,
+   "severity": "medium",
+   "scenario": "A local OpenAI-compatible server (the local-first setup) lists a model whose id is a file name with a space, for example 'Qwen 2.5 Coder.gguf'. merge_models (catalog.rs:110) only drops empty ids and duplicates, so the id survives. In codeox_with, Routes::build (main.rs:789 -> provider.rs Routes::build) calls alias_for, which calls valid_model_id and rejects whitespace, quotes and backslashes. The error propagates with `?` out of codeox_with, so `ox codex` or `ox claude` exits for every provider, including the healthy ones. The bad model is usable only by its explicit alias, and the error never names it as the one to exclude.",
+   "evidence": "catalog.rs:110-133 merge_models has no id validation. provider.rs:1130-1150 alias_for returns `provider {vendor_key:?} has an invalid model id {model_id:?}`. provider.rs:1470-1476 valid_model_id rejects is_whitespace and '\"' and '\\\\'. main.rs:789 `let routes = Routes::build(&vendors, &models_by_vendor)?;` and main.rs:796 `None => provider::alias_for(&vendor.key, &spec.id, None)?`.",
+   "fix": "Skip discovered ids that fail valid_model_id, with a stderr note naming the provider and id, instead of failing the launch. Keep the hard error only for statically configured entries the user wrote.",
+   "area": "provider-catalog",
+   "upheld": 3,
+   "votes": 3,
+   "refutations": []
+  },
+  {
+   "title": "Refused worker/handoff start drops the whole phone socket instead of returning the host's error",
+   "file": "desktop/ox-host-web/src/bridge.rs",
+   "line": 232,
+   "severity": "high",
+   "scenario": "On the phone, open Start worker, set Runtime to Claude Code, Mode to Codex goal (or Runtime Codex with API model left blank, which is the default runtime), and tap Start worker. The phone's worker form (app.js ~1193-1206) does no pre-validation and sends start_worker. Host Access::permit returns false because WorkerStart::validate fails (origin.rs:196-208: 'Goal mode requires Codex...' / 'Choose an ox API model for a Codex worker.'), and session() at bridge.rs:232 then `break`s, closing the WebSocket. Every other in-flight act on that socket gets cb(false) and the banner 'Disconnected before confirmation. Check the conversation before retrying.' (app.js:294) shows. The specific validation message never reaches the phone, the reply-less refusal looks like a network failure, and the link reconnects. The same path is hit by Subscribe to an unknown scope and any other act failing permit.",
+   "evidence": "bridge.rs:169-170 `Action::StartWorker(start) => approval.is_none() && start.validate().is_ok()`, bridge.rs:232 `if !access.permit(&app,&req) || ... {break}`. app.js:1193-1206 builds start from raw form values with no validate step; index.html worker-runtime defaults to codex and mode options include goal and workflow regardless of runtime. origin.rs:196-208 defines the refusals.",
+   "fix": "When permit() refuses a client Act (and for validation failures specifically), write Server::Error{id: Some(id), message} back to the phone (using the validate() message) and keep the socket open; reserve the break for auth/protocol violations. Optionally also pre-validate runtime/mode/model combinations in the worker form so the user sees the message before submit.",
+   "area": "phone-web",
+   "upheld": 3,
+   "votes": 3,
+   "refutations": []
+  },
+  {
+   "title": "Whitespace-only handoff request or worker task is accepted by the browser and then drops the socket",
+   "file": "desktop/ox-host-web/assets/app.js",
+   "line": 1198,
+   "severity": "medium",
+   "scenario": "The Task textarea (index.html `worker-task required`) and Request textarea (`handoff-request required`) accept whitespace-only input, because the HTML required check only tests for non-empty text. The phone sends the untrimmed value. Host validate() trims it (origin.rs:193 `self.task.trim().is_empty()`; handoff.rs:689 `self.request.trim().is_empty()`), permit returns false, and bridge.rs:232 closes the socket. The user sees a generic disconnect and a refused notice, not 'Provide a task...' or 'Write the request for the new session.'",
+   "evidence": "index.html: `<textarea id=\"worker-task\" rows=\"3\" required>` and `<textarea id=\"handoff-request\" rows=\"3\" required>`. app.js handoff onsubmit sends `request: $(\"handoff-request\").value` with no trim. bridge.rs:169-170 gates on validate().is_ok(), which is false here.",
+   "fix": "Trim the text on the phone before sending and block empty submissions with a visible message. Host-side, reply with an Error instead of closing the socket (see the previous finding).",
+   "area": "phone-web",
+   "upheld": 3,
+   "votes": 3,
+   "refutations": []
+  },
+  {
+   "title": "Unrelated host errors cancel the auto-select of a session that is still opening",
+   "file": "desktop/ox-desk-core/src/store/replica.rs",
+   "line": 399,
+   "severity": "medium",
+   "scenario": "User sends the first message in a New draft (Submit(None) sets await_new = true, host starts the session). While it is still starting, any other action from the same desktop client gets a host Server::Error reply (for example a thread-starting PaletteCommand that the host refuses with 'Another session is opening on this route.', or a Stop/Rename the host rejects). apply_host's Error arm unconditionally runs remote_mut().await_new = false. When the host then sends Server::Opened for the new session, the Opened arm (line 324) sees await_new == false and skips select_replica. The new session runs in the background but the user is left on the blank draft, and the thread is not selected.",
+   "evidence": "replica.rs:386-400: `Server::Error { id, message } => { ... self.notice = Some(message); self.remote_mut().await_new = false; ... }`. replica.rs:321-330: `Server::Opened {..} if scope matches => { if self.remote().unwrap().await_new { self.select_replica(&thread); ... } }`. Host engine.rs:1199-1205 sends Opened only to the opening client, and Error replies are per request id, so the flag is cleared by replies that do not concern the opening action.",
+   "fix": "Clear await_new only when the failed request is the one that opened the session (track the opening request id in Remote, e.g. Option<String> instead of bool, and compare it with the Error id; or clear it only when the errored pending entry had owner None and was a Submit/Palette start). Leave it set for unrelated errors.",
+   "area": "replica-protocol",
+   "upheld": 3,
+   "votes": 3,
+   "refutations": []
+  },
+  {
+   "title": "Terminal handoff is dropped when the requesting client is gone, leaving the thread stuck in terminal mode",
+   "file": "desktop/ox-host/src/engine.rs",
+   "line": 1065,
+   "severity": "medium",
+   "scenario": "Desktop (or phone) sends TerminalText/Terminal for a Codex or Claude thread. The host records live.terminal = Some((client_id, key)) and starts LeaveForTerminal/release. Before the handoff is ready, that client disconnects or reconnects (the desktop reconnect loop re-subscribes with a new connection id). When the release finishes, process() runs take_handoff() (consuming handoff_ready) and then reply(client_id, Handoff) which silently drops the frame because self.clients no longer has that id (reply, line 393-398). Nothing retargets live.terminal on disconnect (Message::Disconnect at line 348 only removes the client), and a retry of the same action key hits the receipts replay path (engine.rs ~476-492), which returns the cached Ack without moving live.terminal to the new client, unlike the opening retarget. The thread stays in terminal_threads with no terminal opened; the user must find Resume here.",
+   "evidence": "engine.rs:1064-1072: `let handoff = live.store.take_handoff().and_then(|handoff| { live.terminal.take().map(|(id, key)| (id, Server::Handoff{...})) });` then `self.reply(id, frame)?` in the changes-empty branch. engine.rs:393-398: reply() removes/ignores a missing client. The receipt replay branch only retargets live.opening (engine.rs ~486-492), not live.terminal.",
+   "fix": "Retarget live.terminal to the current client in the Act receipt-replay path (as done for opening), and on Disconnect of live.terminal's client either keep the handoff in a per-scope slot for the next subscriber or re-queue it, so a Handoff is never consumed by a send to a dead client.",
+   "area": "replica-protocol",
+   "upheld": 2,
+   "votes": 3,
+   "refutations": [
+    "Refuted as a user-facing bug. (1) The handoff frame is client-local: Server::Handoff carries argv for the requesting client to launch a local stock terminal, so dropping it when that client has disconnected is the intended behaviour, not a silent loss of something anyone can act on. (2) The thread is not left invisibly stuck. The host marks it in terminal_threads (desk-core store/commands.rs:398) and publishes terminal:true in the catalog row (replica.rs:585), so every reconnected client shows the thread in terminal mode with a visible \"Resume here after closing stock <runtime>\" button (desktop/ox-desktop/src/views/workbench.rs:725-740), which calls resume_here (commands.rs:409-428) and clears the state. That is the designed recovery path, so the claimed \"stuck\" outcome is overstated. (3) The one part that is a real gap, the receipts replay at engine.rs:476-492 not retargeting live.terminal, is unverified as reachable: it depends on the desktop re-sending the same action key after reconnect, which I could not confirm in the code, and the consequence is the same recoverable Resume-here state. Per the skeptic rule, unsure means refuted. Not checked: the plan-vs-main question from the relayed user request, which is outside this task."
+   ]
+  }
+ ],
+ "contested": [
+  {
+   "title": "Parent lease cascade never fires, so hosted workers outlive a killed gateway",
+   "file": "src/host_lifetime.rs",
+   "line": 43,
+   "severity": "medium",
+   "scenario": "A hosted gateway helper H owns a worker W. W is spawned by WorkerProcess via `current_exe claude|codex` (jobs.rs:384-391), and W's supervise() registers its lease with parent = env OX_HOST_PARENT_LEASE. Nothing in the repo ever sets that variable (only read at host_lifetime.rs:13,43 and jobs.rs/isolate_stock:67), so W is registered with parent None. If H is SIGKILLed or crashes, Jobs::drop never runs, so WorkerProcess is never killed. The host retires H's lease (lease.rs retire) but W has no parent link and is not retired. W's stock Claude/Codex keeps running, potentially with write tools, until its next stdout write hits a broken pipe.",
+   "evidence": "lease.rs:119-131 retire() cascades only to entries whose parent == retired id, and lease.rs test loss_of_a_helper_retires_only_its_descendants assumes parents are set. jobs.rs:384-391 spawns the worker helper with the inherited OX_HOST_LIFETIME_SOCKET and does not set OX_HOST_PARENT_LEASE. grep for PARENT_LEASE finds only reads.",
+   "fix": "Export the gateway's own lease id (the LEASE OnceLock in host_lifetime.rs) as OX_HOST_PARENT_LEASE on every worker command built in jobs.rs command(). Add a host-side test that a SIGKILLed gateway retires its worker lease.",
+   "area": "lifecycle",
+   "upheld": 1,
+   "votes": 3,
+   "refutations": [
+    "The claimed scenario cannot happen in this tree, so the finding is refuted as unreachable. A hosted gateway (OX_HOST_LIFETIME_SOCKET set) never spawns a local WorkerProcess. In src/workers.rs start_job (about line 558), HostLink::find returns Some(Hosted) whenever the endpoint env is set, and the worker is then launched by the host via Launch. Local spawning happens only at src/workers.rs:582-585 after that check, and find() returns Err rather than None when the endpoint is set but no lease exists. So the local Command::new(current_exe) at src/workers/jobs.rs:368-391 runs only in an unhosted process, where OX_HOST_LIFETIME_SOCKET is absent, so supervise() returns early (src/host_lifetime.rs:34-36) and no worker lease is registered. The only other use of current_exe on the hosted path, jobs.rs:45-47, lives inside the same local command() builder. PARENT_LEASE is read but never set anywhere in the repo, but that matters only for host-launched workers, which the host owns and retires through its own Jobs lifecycle (desktop/ox-host/src/engine.rs, workers.rs). The lease.rs test loss_of_a_helper_retires_only_its_descendants exercises the cascade directly and does not show that a real hosted worker is affected. This is not a duplicate of bugs 1-5. Note that the unused PARENT_LEASE mechanism is at most a dead-code or design gap, not a user-facing runtime bug.",
+    "The claimed path is unreachable. In src/host_lifetime.rs, HostLink::find returns Hosted (or an error) whenever OX_HOST_LIFETIME_SOCKET is set, so a hosted gateway H never falls through to Jobs::start. src/workers.rs:557-575 (start_job) therefore always sends the worker Launch to the host, and the host owns the worker and its lease. The local WorkerProcess spawn at src/workers/jobs.rs:368-401 runs only when find() returned None, i.e. when H is not hosted, so H cannot spawn a local W that inherits the host endpoint. The hosted() wrapper branch at jobs.rs:384 is equally unreachable from H. The only lease-registering workers are host-owned ones, and those are retired through the host's own lifecycle. The claim that nothing sets OX_HOST_PARENT_LEASE is true (grep finds only reads), but with no reachable spawn of a hosted child it has no effect. The lease.rs cascade test is a unit test of Groups and does not show a live path that skips the parent link. Not a duplicate of known bugs 1-5. Refuted."
+   ]
+  },
+  {
+   "title": "Whitespace in an env key hides the saved key and names the wrong fix",
+   "file": "src/provider.rs",
+   "line": 489,
+   "severity": "medium",
+   "scenario": "A user has a valid key saved in ox-api-keys.json for provider 'openrouter'. Their shell or .env exports OPENROUTER_API_KEY with a trailing space or newline (value 'sk-or-v1-abc '). SavedKeys::get (provider.rs:179) calls process_env (provider.rs:83), which returns the non-empty env value, so the saved key is never consulted. Vendor::api_key (provider.rs:489-497) then rejects any value containing whitespace and returns None. codeox_with (main.rs ~722-733) prints 'provider openrouter: set OPENROUTER_API_KEY to enable this provider', and resolve_model returns BAD_GATEWAY with the same text. The variable is already set, so the message names the wrong fix, and the working saved key is ignored.",
+   "evidence": "provider.rs:489-497: `let key = env(name)?; if key.is_empty() || key.chars().any(char::is_whitespace) { return None; }`. provider.rs:644-648 unavailable_reason returns `set {name} to enable this provider` regardless of whether the variable is set. provider.rs:179-181: `process_env(name).or_else(|| self.0.get(name)...)` only falls back when process_env returns None, and process_env (provider.rs:83-85) filters only empty strings.",
+   "fix": "Trim the env/saved value before the whitespace check, or fall through to the saved key when the env value is rejected. Make unavailable_reason distinguish 'not set' from 'set but malformed' and say to remove the surrounding whitespace in the second case.",
+   "area": "provider-catalog",
+   "upheld": 1,
+   "votes": 3,
+   "refutations": [
+    "The code path described is accurate: process_env (src/provider.rs:83-85) filters only empty strings and does not trim, SavedKeys::get (provider.rs:179-181) only falls back when the env value is absent, and Vendor::api_key (provider.rs:489-497) returns None for whitespace. But the claim does not hold as a user-facing bug. (1) Env-over-saved precedence is deliberate: get() checks process_env first on purpose. (2) The whitespace rejection is deliberate and mirrored in bearer_from_key (provider.rs:1354). A key with a trailing space or newline is not a valid bearer token and would fail upstream auth anyway, so the saved key is not a clearly 'working' alternative the user loses. (3) The only real defect is the wording of unavailable_reason ('set NAME to enable this provider' even when NAME is set), which is a minor message issue, not a thread-killing or silent-wrong-route bug. Refuted, with moderate confidence that a reviewer might still want the message improved, but not as a bug finding.",
+    "Refuted as a user-facing bug. The code matches the claimed lines (provider.rs:83-85 process_env, :179-181 SavedKeys::get, :489-497 Vendor::api_key, :644-648 unavailable_reason), but the behaviour looks deliberate rather than a bug. (1) Env precedence over saved keys is the designed order: process_env is consulted first and the saved store is only a fallback. (2) Rejecting whitespace-containing keys is an intentional guard, repeated in bearer_from_key (provider.rs:1354) and in the header/key validation at provider.rs:1476/1485. A value like 'sk-or-v1-abc ' would be sent as an invalid bearer token and fail upstream anyway, so the saved key being skipped is the same outcome the designed precedence already yields for any env var. (3) The trigger is an unusual malformed env value (a trailing space or newline from a quoted export or .env line), not a normal shell setup. (4) The one defensible point is that the message 'set OPENROUTER_API_KEY to enable' is misleading when the variable is already set. That is a small wording issue in unavailable_reason (provider.rs:644-648, used at main.rs:730 and main.rs:1263) and not a runtime bug with a concrete wrong-route or lost-work consequence, so it does not meet the bar. Also unsure whether the saved-key fallback should apply after a malformed env value, which is a design question. Not a duplicate of known bugs 1-5."
+   ]
+  }
+ ],
+ "lows": [
+  {
+   "title": "Images attached to the new-chat composer move into the created thread's draft while text stays behind",
+   "file": "desktop/ox-desk-core/src/store/compose.rs",
+   "line": 505,
+   "severity": "low",
+   "scenario": "The user sends the first message of a new chat, then attaches an image to the new-chat composer while thread/start is pending, then switches to another thread before the reply arrives. first_send takes drafts[None] (line 505). The else branch (line 511) moves only draft.text back to the new-chat composer. Line 542 inserts the whole draft, including draft.images, under the newly created thread id. The image the user attached for the next new chat now sits in a different thread's composer, and the new-chat composer loses it.",
+   "evidence": "compose.rs:505 `let mut draft = self.drafts.remove(&None).unwrap_or_default();`; compose.rs:509-512 `} else { self.edit(None, std::mem::take(&mut draft.text)); }` (images not returned); compose.rs:542 `self.drafts.insert(s.owner.clone(), draft);`.",
+   "fix": "In the else branch, also move draft.images back to the None draft (for example, `self.drafts.entry(None).or_default().images = std::mem::take(&mut draft.images)`) before inserting the owner's draft.",
+   "area": "codex-appserver"
+  },
+  {
+   "title": "Title generation waits for stdout EOF before checking exit, and the group is not killed on success",
+   "file": "desktop/ox-desk-core/src/titles/inference.rs",
+   "line": 155,
+   "severity": "low",
+   "scenario": "The reader thread only sends after stdout EOF, and recv_timeout runs before try_wait. If the stock client exits after writing its answer but a descendant still holds the stdout pipe, the code waits the full 30s and returns None. Because try_wait then reports the exit, the kill at line 194-199 is skipped, so the descendant survives. This is unverified against real stock Claude/Codex output, which is why severity is low.",
+   "evidence": "inference.rs:155-159: `let bytes = rx.recv_timeout(deadline...)` happens before the `try_wait` loop at 163-191. Kill is guarded by `if child.try_wait()?.is_none()` at 194.",
+   "fix": "Wait on exit and EOF together. After the child exits, kill -group for any leftovers, then read what has been captured.",
+   "area": "lifecycle"
+  },
+  {
+   "title": "Codex worker is SIGKILLed right after turn/completed without a flush window",
+   "file": "src/workers/jobs.rs",
+   "line": 725,
+   "severity": "low",
+   "scenario": "run_codex returns `Ok(status)` as soon as turn/completed (or a goal update) arrives. WorkerProcess::drop then SIGKILLs the app-server group immediately, without closing stdin or waiting. run_claude explicitly waits so the client can flush session state, so this path is inconsistent. If Codex persists the final turn asynchronously, a later resume of native_session may miss the last turn. Unverified against Codex's persistence behaviour, hence low severity.",
+   "evidence": "jobs.rs:722-726 `if turn.is_none() && let Some(status) = terminal { return Ok(status); }` versus jobs.rs:566 comment `Closing input lets the client flush its final session state before leaving the process group.`",
+   "fix": "Close stdin and wait briefly for the Codex app-server to exit (as the Claude path does) before the group SIGKILL, or document why Codex needs no flush.",
+   "area": "lifecycle"
+  },
+  {
+   "title": "Refused action IDs are cached as final results",
+   "file": "desktop/ox-host/src/engine.rs",
+   "line": 598,
+   "severity": "low",
+   "scenario": "A client sends Act with key K while a transient refusal applies, such as 'Another session is opening on this route.' or 'A worker is starting on this parent.' The host stores the Err as a Server::Error receipt for (scope, K, generation, digest) at line 603. Any retry of K with the same payload in the same runtime generation returns that same refusal, even after the blocking session finishes opening. The retry only succeeds if the client mints a new key. Whether clients reuse keys on retry is not verified.",
+   "evidence": "let result = match self.act(id, &key, &scope, action, approval) { Ok(()) => Server::Ack{..}, Err(e) => fail(e.to_string()) }; let accepted = matches!(result, Server::Ack{..}); self.receipts.insert(scope.clone(), key, generation, hash, result.clone());  (receipts.rs get() returns the stored result for any equal digest)",
+   "fix": "Only cache accepted results, or cache refusals with a short expiry, so a retry after the condition clears re-runs the action. Keep the dedupe for Ack and opened receipts.",
+   "area": "host-engine"
+  },
+  {
+   "title": "YOLO project-default grant silently denied on a transient snapshot failure, and runs ox snapshot on the actor thread",
+   "file": "desktop/ox-host/src/engine/flows.rs",
+   "line": 46,
+   "severity": "low",
+   "scenario": "yolo_grant() calls self.config.prepare() synchronously on the engine actor thread, which spawns an ox snapshot subprocess. A transient failure there hits .ok()? and returns None, so a YOLO child in a project listed in [workers] yolo_grant_projects is held for an operator ask even though the project is allowed. Every YOLO check also pays for a full subprocess on the single actor thread, which blocks all clients.",
+   "evidence": "let projects = self.config.prepare().ok()?.yolo_grant_projects;  (runtime.rs prepare() calls ox::snapshot(&self.ox, &self.path) and maps errors with map_err)",
+   "fix": "Read yolo_grant_projects from the last successful Prepared (or cache it with the route inputs), and treat a failed refresh as 'use the last known value' rather than 'no grant'.",
+   "area": "host-engine"
+  },
+  {
+   "title": "Legacy catalog subscribers receive full transcript deltas, contradicting the catalog-only rule",
+   "file": "desktop/ox-host/src/engine.rs",
+   "line": 1733,
+   "severity": "low",
+   "scenario": "A client subscribed with Subscribe{scope: None} is stored as subscription Some(None). broadcast() sends it the full packet, which carries every scope's transcripts, not the catalog_row filtered version. The comment says sidebar subscribers must never get transcripts. This path is used by ox-host-web/src/push.rs:245 and by desktop catalog.rs when live_catalog is absent, so those clients receive whole transcripts for every scope. This is bandwidth and data exposure rather than a state divergence.",
+   "evidence": "self.clients.retain(|_, c| match c.subscription.as_ref() { Some(None) => c.peer.send(packet.clone()), Some(Some(s)) if s == scope => c.peer.send(packet.clone()), _ => true }); where packet = encode(&Server::Delta{ changes, .. }) with the unfiltered changes (Transcript included); comment above catalog_row: 'Never copy a transcript ... into this stream.'",
+   "fix": "For Some(None) clients, send the catalog-filtered changes (as the c.catalog path does), or subscribe push and legacy clients through WatchCatalog so they get only navigation metadata.",
+   "area": "host-engine"
+  },
+  {
+   "title": "Write-mode Claude workers are told Bash is available but cannot run it",
+   "file": "src/workers/jobs.rs",
+   "line": 434,
+   "severity": "low",
+   "scenario": "A worker started with write permission (permission_mode write, or inherit from a write-mode parent) gets --tools 'Read,Glob,Grep,Edit,Write,Bash,Workflow' but --allowedTools 'Read,Glob,Grep' and --permission-mode acceptEdits. acceptEdits auto-approves file edits but not general Bash. In print mode with no permission prompt tool, the Bash call is denied. A write worker asked to run cargo test or a build therefore fails every such call while the parent was told workers inherit its write mode. This needs confirmation against the intended policy, since the code may deliberately exclude Bash.",
+   "evidence": "jobs.rs:412-437: writes => tools \"Read,Glob,Grep,Edit,Write,Bash,Workflow\"; the non-workflow --allowedTools value is \"Read,Glob,Grep\" regardless of writes; the --permission-mode is \"acceptEdits\" when writes. The only --disallowedTools is applied when !writes.",
+   "fix": "Either add Bash to the write-mode allowed tools (optionally with a narrow Bash(...) pattern) so write workers can run builds and tests, or remove Bash from the write-mode --tools list and document that write workers cannot run shell commands. Add a test asserting the argument set for writes.",
+   "area": "workers-mcp"
+  },
+  {
+   "title": "tool_choice and parallel_tool_calls are forwarded when no tools remain",
+   "file": "src/adapters/chat_completions.rs",
+   "line": 222,
+   "severity": "low",
+   "scenario": "Stock Codex always sends tool_choice and parallel_tool_calls. When the request has no usable tools, the adapter drops `tools` (line 219 checks `!tools.is_empty()`) but still forwards `tool_choice` (line 222) and `parallel_tool_calls` (line 225). The normalizer in src/translate.rs (lines 139-146) also removes `tools` when every entry was a dropped hosted tool, and normalize_tool_choice leaves \"auto\" alone. The upstream then receives tool_choice/parallel_tool_calls with no tools. OpenAI-style Chat Completions rejects those fields when tools is absent, so the request fails with a 400 that kills the turn, even though the model could simply answer without tools.",
+   "evidence": "src/adapters/chat_completions.rs:219-231: `if !tools.is_empty() { body.insert(\"tools\"...) }`, then `if let Some(tool_choice) = tool_choice { body.insert(\"tool_choice\"...) }` and `if let Some(parallel) = request.get(\"parallel_tool_calls\") { ... body.insert(\"parallel_tool_calls\"...) }`, neither gated on tools. src/translate.rs:139-146 removes `tools` when `flat` is empty. Caveat: whether a given upstream rejects these fields without tools depends on the vendor. The behavior is verified in the code, but the upstream error text is from memory.",
+   "fix": "Only emit tool_choice and parallel_tool_calls when the translated `tools` array is non-empty, and add a unit test where tools are empty and tool_choice is \"auto\".",
+   "area": "chat-req"
+  },
+  {
+   "title": "An unrecognised finish_reason fails the turn after the answer has streamed",
+   "file": "src/adapters/chat_completions.rs",
+   "line": 1350,
+   "severity": "low",
+   "scenario": "A provider that sends a valid but non-standard finish_reason after complete output, for example DeepSeek's documented 'insufficient_system_resource', or another provider-specific value. push_event calls finish_status, which returns Err for any value outside stop/tool_calls/function_call/length/content_filter. The whole Codex turn fails with 'unsupported finish_reason', and the text and completed tool calls already streamed are discarded even though the model did finish. The error is raised before close_items, so nothing is recovered.",
+   "evidence": "fn finish_status(...) { match reason { \"stop\" | \"tool_calls\" | \"function_call\" => ..., \"length\" => ..., \"content_filter\" => ..., other => Err(format!(\"...unsupported finish_reason: {other}\")) } } (line 1350). Called from push_event (`let (status, _) = finish_status(reason)?;`) and from finalize.",
+   "fix": "Map unknown reasons to a completed or incomplete status (with the reason recorded in incomplete_details) rather than erroring, so a finished answer is delivered.",
+   "area": "chat-resp"
+  },
+  {
+   "title": "Missing [DONE] leaves the stream open after finish_reason with no idle bound",
+   "file": "src/adapters/chat_completions.rs",
+   "line": 1005,
+   "severity": "low",
+   "scenario": "The upstream sends the last delta with finish_reason 'stop' and then keeps the HTTP body open without sending [DONE] or closing. response.completed is only emitted from finalize, which runs on [DONE] or on body EOF. The translator is not terminal, so pump keeps waiting, and the downstream Codex turn never completes until the transport gives up. The stored items were already closed, so the client sees a finished message that never ends the turn. Nothing in src/upstream.rs bounds the idle time between upstream chunks (no read or idle timeout is set on the stream there).",
+   "evidence": "push_event closes items on finish_reason and sets self.finish_reason but does not set finished; finalize is only reached via [DONE] (`if data == \"[DONE]\" { return self.finalize(\"[DONE]\"); }`) or finish(). upstream.rs is_terminal() returns is_finished(), so the pump keeps reading.",
+   "fix": "Once a finish_reason has arrived, treat a short idle timeout or the next non-usage chunk as the end of the response, and emit response.completed without waiting for [DONE]. At minimum, document the expected behavior and bound the idle gap.",
+   "area": "chat-resp"
+  },
+  {
+   "title": "One malformed historical function_call arguments string fails every later request",
+   "file": "src/adapters/anthropic.rs",
+   "line": 452,
+   "severity": "low",
+   "scenario": "A function_call item in the replayed history has arguments that are not valid JSON or not an object (for example, a turn produced by another model/wire whose tool call was truncated, or a thread that switched models). translate_input_item returns Err at line 452 for this item. Because the full history is replayed every turn, the request fails with a 400 on every subsequent turn, so the thread is dead until the user starts over.",
+   "evidence": "anthropic.rs:450-456: serde_json::from_str(raw_arguments).map_err(|error| format!(\"{path}.arguments is not valid JSON: {error}\"))?; and the arguments.is_object() check right after it.",
+   "fix": "Replay an invalid arguments string as the raw text inside a tool_use input placeholder, for example {\"_raw\": <string>}, or wrap it as a text block, so one bad historical tool call does not block the whole thread.",
+   "area": "anthropic-adapter"
+  },
+  {
+   "title": "stop_sequences are forwarded as a Responses 'stop' field that the Responses wire does not accept",
+   "file": "src/claude_request.rs",
+   "line": 190,
+   "severity": "low",
+   "scenario": "An Anthropic SDK client or any Messages caller that sets stop_sequences on a Responses-wire route gets body.stop inserted by into_responses. The OpenAI Responses API has no 'stop' parameter, so the upstream is likely to return an unknown-parameter 400 that is surfaced as a failed request. Even where the upstream accepts it, a triggered stop sequence is reported as end_turn, because the Responses output never reports which sequence fired. Unverified against every Responses vendor; the module doc table (line 30) assumes a one-to-one mapping.",
+   "evidence": "src/claude_request.rs:189-191: if let Some(stop) = translate_stop_sequences(request.get(\"stop_sequences\"))? { body.insert(\"stop\".to_owned(), stop); } ; module table line 30: `stop_sequences` | `stop`.",
+   "fix": "Only emit 'stop' for the Chat Completions wire, or drop it for Responses and document the behaviour. Report stop_reason \"stop_sequence\" only when the upstream actually reports one.",
+   "area": "claude-gateway"
+  },
+  {
+   "title": "Bare --model ambiguity is not checked at launch and fails on every turn",
+   "file": "src/main.rs",
+   "line": 924,
+   "severity": "low",
+   "scenario": "Two providers, 'groq' and 'together', both list the upstream id 'llama-3.3-70b', so by_upstream holds two aliases. The user runs `ox codex --model llama-3.3-70b`. check_launch_model returns Ok immediately when the value has no '/' (main.rs:924-926), so it never calls routes.resolve. The launch proceeds, and each request then fails with 'model ... is provided by multiple providers; use a provider-qualified alias such as ...'. The user gets the fix only after the session has started, not at the command line where the flag was typed.",
+   "evidence": "main.rs:924: `let Some((prefix, rest)) = requested.split_once('/') else { return Ok(()); };`. Only the slashed branch calls routes.resolve and matches Unknown. Ambiguous and bare Unknown values pass. resolve_model (main.rs ~1229-1245) produces the per-request error.",
+   "fix": "Run routes.resolve on every explicit --model value before launch. Fail with the same ambiguity or unknown-model message that the request path gives, with the provider-qualified suggestions.",
+   "area": "provider-catalog"
+  },
+  {
+   "title": "Subscribe refused for a scope not in the hello routes silently closes the socket, leaving the session stuck on Reconnecting",
+   "file": "desktop/ox-host-web/src/bridge.rs",
+   "line": 137,
+   "severity": "low",
+   "scenario": "The bridge only lets a detail socket subscribe to routes listed in the hello (bridge.rs:137-145), unless the scope was discovered. The hello routes come from `config.prepare().ok()` (engine.rs ~418-420: `.unwrap_or_default()` on failure, so routes=[]), and prepare() can fail when ox::snapshot errors (runtime.rs:154 `map_err`). If the host cannot read its config, the phone cannot subscribe to any session outside the discovered set. Each Subscribe returns false, the socket is closed without an Error, and the phone's Link.lost() (app.js:289-305) keeps retrying every 15 s with no message explaining why. Sessions that the host catalogs as cold but whose route is no longer listed behave the same way.",
+   "evidence": "bridge.rs:137-145 `Client::Subscribe{scope,..} if self.ready => { if scope.is_some_and(|s| (!self.projects.contains(..)||!self.routes.contains(&s.route)) && !app.discovered...contains(s)) {return false;} ...}`, then bridge.rs:232 breaks on false. engine.rs ~418: `let routes = prepared.as_ref().map(|s| s.routes.clone()).unwrap_or_default();`. Reachability depends on whether the scope was discovered, so the exact trigger is not fully traced.",
+   "fix": "Return an Error message (for example 'Session route is unavailable on this host; check host configuration') on refused Subscribe instead of dropping the socket, and surface prepare() failures in the hello or an error frame rather than swallowing them with .ok().",
+   "area": "phone-web"
+  },
+  {
+   "title": "Deferred slash command silently discarded when pane is not front or selection moved",
+   "file": "desktop/ox-desktop/src/views/compose.rs",
+   "line": 85,
+   "severity": "low",
+   "scenario": "User types /status in a Codex thread while command schema is still loading (has_command_schema false or commands_loading true), presses Enter; send_input stores pending_command. The user then switches to another pane or thread before discovery finishes. The workbench pump calls finish_command_discovery on every drain (views/workbench.rs:368), and the `pending_command.take()` runs before the `self.front` and `store.selected() == owner` checks, so the pending command is removed and never executed, with no notice. The draft still holds the text, so the user sees a 'Run command' button and nothing happened.",
+   "evidence": "if let Some((owner, text)) = self.pending_command.take()\n    && self.front\n    && store.selected() == owner.as_deref()\n    && store.draft(owner.as_deref()) == text",
+   "fix": "Only take() when the guard passes, e.g. check front/selection/draft with as_ref() first and take() inside the matched branch, or keep pending_command until it runs or is explicitly cancelled, and surface a notice if it is dropped.",
+   "area": "desktop-ui-states"
+  },
+  {
+   "title": "Test saved connection replaces the whole settings form with 'Loading settings\u2026'",
+   "file": "desktop/ox-desktop/src/preferences.rs",
+   "line": 1102,
+   "severity": "low",
+   "scenario": "User opens Settings > Providers, edits nothing, and clicks 'Test saved connection'. test_provider (line 446) sets self.busy = true, and draw() at line 1102 then renders only the text 'Loading settings\u2026' in place of the provider form for the whole network round trip. The user sees a message that says settings are loading, when a connection test is running, and the form controls vanish until the test returns. Nothing is lost since the input entities persist, but the status text is misleading and the page looks broken during slow provider calls.",
+   "evidence": "let content = if self.busy {\n    div().child(\"Loading settings\u2026\")\n} else { ... }",
+   "fix": "Use busy only to disable the test/save buttons and show an in-progress label such as 'Testing connection\u2026' next to the button, keeping the form rendered.",
+   "area": "desktop-ui-states"
+  }
+ ],
+ "counts": {
+  "raw": 44,
+  "unique": 44,
+  "verified": 28,
+  "confirmed": 11
+ }
+}
