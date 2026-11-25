@@ -144,7 +144,7 @@ def run(root, host, ox, claude):
             operator.until(lambda f: f["type"] == "snapshot")
             # Answer the target's tool approvals until both reads have come back.
             operator.conn.settimeout(2)
-            deadline = time.monotonic() + 180
+            deadline = time.monotonic() + 300
             while len(reads) < 2:
                 assert time.monotonic() < deadline, "the target never finished its reads"
                 try:

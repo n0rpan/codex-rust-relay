@@ -329,8 +329,33 @@ impl Store {
                 self.remote_mut().sending.remove("");
             }
             Server::WorkerReply { result, error, .. } => {
+                let handoff = result
+                    .as_ref()
+                    .filter(|r| r["relation"] == "handoff" && error.is_none())
+                    .cloned();
+                if let Some(r) = handoff {
+                    let scope: Option<crate::host_protocol::Scope> =
+                        serde_json::from_value(r["scope"].clone()).ok();
+                    let session = r["session"].as_str().unwrap_or_default().to_owned();
+                    let label = scope
+                        .as_ref()
+                        .map_or("another route".into(), |s| s.route.label());
+                    self.notice = Some(format!("Continued in {label}."));
+                    if scope.is_some_and(|s| {
+                        s.project == self.profile.project && s.route == self.profile.route
+                    }) && self.catalog_row(&session).is_some()
+                    {
+                        self.select_replica(&session);
+                    }
+                    self.changed.mark(Changed::NOTICE | Changed::THREADS);
+                    return Ok(());
+                }
                 self.notice = Some(match (result, error) {
                     (_, Some(error)) => error,
+                    (Some(status), None) if status["status"] == "waiting_for_operator" => format!(
+                        "OX worker {} waits for you to accept YOLO on its parent session.",
+                        status["job_id"]
+                    ),
                     (Some(status), None) => format!(
                         "Started OX worker {} on {}.",
                         status["job_id"],
@@ -652,6 +677,44 @@ mod local_command_tests {
         asks::CommandApproval,
         host_protocol::{AskView, Change},
     };
+    #[test]
+    fn worker_replies_name_handoffs_and_yolo_waits() {
+        let route = crate::runtime::Runtime::Claude.route(None);
+        let mut store = Store::remote_client(
+            Profile {
+                project: "/p".into(),
+                route: route.clone(),
+                provider: "anthropic".into(),
+            },
+            |_, _| Ok("sent".into()),
+        );
+        let reply = |result: Value, error: Option<&str>| {
+            LinkEvent::Host(Box::new(Server::WorkerReply {
+                id: "k".into(),
+                result: Some(result),
+                error: error.map(Into::into),
+            }))
+        };
+        let target = crate::runtime::Runtime::Codex.route(Some("fixture/demo".into()));
+        store.apply(reply(
+            serde_json::json!({"relation":"handoff","session":"t","scope":{"project":"/p","route":target}}),
+            None,
+        ));
+        assert_eq!(store.notice(), Some("Continued in OX API · fixture/demo."));
+        store.apply(reply(
+            serde_json::json!({"status":"waiting_for_operator","job_id":9}),
+            None,
+        ));
+        assert!(store.notice().unwrap().contains("accept YOLO"));
+        store.apply(reply(
+            serde_json::json!({}),
+            Some("This session cannot be handed off yet"),
+        ));
+        assert_eq!(
+            store.notice(),
+            Some("This session cannot be handed off yet")
+        );
+    }
     #[test]
     fn terminal_handoff_sends_only_the_verified_stock_decline() {
         let project = PathBuf::from("/project");

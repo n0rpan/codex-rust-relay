@@ -1165,9 +1165,9 @@ $("handoff-form").onsubmit = (e) => {
     else {
       if (mode === "yolo" && $("handoff-grant").checked)
         pendingGrant = { key };
+      // An immediate refusal arrives as a worker_reply error; keep that notice.
       $("handoff-form").hidden = true;
       $("handoff-request").value = "";
-      notice("Starting the new session…");
     }
   });
 };
