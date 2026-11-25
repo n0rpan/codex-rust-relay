@@ -1,5 +1,6 @@
 //! Requests keep their own input entities until Codex resolves them.
 use super::workbench::Workbench;
+use crate::appearance::Step;
 use crate::{
     appearance::Palette,
     col,
@@ -20,6 +21,15 @@ fn needs_you_label(index: usize, count: usize) -> String {
         "NEEDS YOU · 1".into()
     } else {
         format!("NEEDS YOU · {} OF {count}", index + 1)
+    }
+}
+
+/// Header of the card. A worker waiting for YOLO names its wait instead of the count.
+fn card_kicker(yolo: bool, index: usize, count: usize) -> String {
+    if yolo {
+        "Worker waits for YOLO".into()
+    } else {
+        needs_you_label(index, count)
     }
 }
 
@@ -44,7 +54,7 @@ fn code_block(p: Palette, id: impl Into<ElementId>, text: String) -> Stateful<Di
         .border_color(rgb(p.line))
         .bg(rgb(p.bg))
         .font_family("monospace")
-        .text_sm()
+        .text_size(p.text(Step::Ui))
         .text_color(rgb(p.fg))
         .child(text)
 }
@@ -117,14 +127,14 @@ impl Workbench {
         body = body
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(p.text(Step::Label))
                     .text_color(rgb(p.warning))
                     .font_family("monospace")
-                    .child(needs_you_label(index, asks.len())),
+                    .child(card_kicker(ask.waits_for_yolo(), index, asks.len())),
             )
             .child(
                 div()
-                    .text_size(px(20.))
+                    .text_size(p.text(Step::Title))
                     .line_height(px(28.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(p.fg))
@@ -189,7 +199,7 @@ impl Workbench {
                 label_row = label_row.child(
                     div()
                         .font_family("monospace")
-                        .text_size(px(11.))
+                        .text_size(p.text(Step::Label))
                         .px_1()
                         .border_1()
                         .border_color(rgb(if broad { p.warning } else { p.muted }))
@@ -338,13 +348,19 @@ impl Workbench {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_broad_grant, needs_you_label};
+    use super::{card_kicker, is_broad_grant, needs_you_label};
 
     #[test]
     fn header_counts_pending_requests() {
         assert_eq!(needs_you_label(0, 1), "NEEDS YOU · 1");
         assert_eq!(needs_you_label(0, 3), "NEEDS YOU · 1 OF 3");
         assert_eq!(needs_you_label(2, 3), "NEEDS YOU · 3 OF 3");
+    }
+
+    #[test]
+    fn yolo_wait_gets_its_own_kicker() {
+        assert_eq!(card_kicker(true, 1, 3), "Worker waits for YOLO");
+        assert_eq!(card_kicker(false, 1, 3), "NEEDS YOU · 2 OF 3");
     }
 
     #[test]

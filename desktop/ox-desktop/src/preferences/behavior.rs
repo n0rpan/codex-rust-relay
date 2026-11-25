@@ -1,6 +1,7 @@
 //! Desktop-owned display and input preferences.
-use super::{Preferences, button};
+use super::Preferences;
 use crate::appearance::Palette;
+use crate::appearance::Step;
 use gpui::{prelude::*, *};
 pub use ox_desk_core::desktop_behavior::{Behavior, ThemeSource};
 pub struct Active(pub Behavior);
@@ -22,12 +23,7 @@ impl Preferences {
     ) -> Div {
         let mut controls = div().flex().gap_1().flex_wrap();
         for &(caption, next) in options {
-            controls = controls.child(button(
-                caption,
-                caption,
-                next == current,
-                p,
-                cx.listener(move |s, _, _, cx| {
+            controls = controls.child(crate::kit::button(p, caption, caption, next == current, true, cx.listener(move |s, _, _, cx| {
                     if current == next || s.busy {
                         return;
                     }
@@ -55,8 +51,7 @@ impl Preferences {
                         });
                     })
                     .detach();
-                }),
-            ));
+                })));
         }
         div()
             .flex()
@@ -65,7 +60,7 @@ impl Preferences {
             .child(
                 div()
                     .w(px(162.))
-                    .text_sm()
+                    .text_size(p.text(Step::Ui))
                     .text_color(rgb(p.muted))
                     .child(label),
             )

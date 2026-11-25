@@ -1,4 +1,5 @@
 //! Native OX settings and first-run account connection.
+use crate::appearance::Step;
 mod about;
 mod advanced;
 pub mod behavior;
@@ -16,7 +17,7 @@ use crate::{
 };
 use forms::{CONNECTION, Fields, LEGACY, MODEL, Provider, Registry, SEARCH};
 use gpui::{prelude::*, *};
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::InputState;
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +68,8 @@ pub struct Preferences {
     alias: Entity<InputState>,
     keys: Vec<KeyField>,
     busy: bool,
+    /// A starred-models autosave arrived while another save was running.
+    resave: bool,
     message: String,
     error: bool,
     loading_models: bool,
@@ -102,6 +105,7 @@ impl Preferences {
             alias,
             keys: vec![],
             busy: false,
+            resave: false,
             message: String::new(),
             error: false,
             loading_models: false,
@@ -277,6 +281,10 @@ impl Preferences {
         cx: &mut Context<Self>,
     ) {
         if self.busy {
+            // Star edits autosave; one made during a save is saved right after it.
+            if self.page == Page::Favorites && matches!(request, Request::Edit { .. }) {
+                self.resave = true;
+            }
             return;
         }
         let page = self.page;
@@ -290,6 +298,8 @@ impl Preferences {
             }).await;
             let _ = view.update_in(cx, |s, w, cx| {
                 s.busy = false;
+                let resave = std::mem::take(&mut s.resave) && s.page == Page::Favorites;
+                let local = resave.then(|| s.favorites.clone());
                 if !matches!(&result, Ok(Ok(_))) {
                     s.restore_key(request, cx);
                 }
@@ -308,6 +318,11 @@ impl Preferences {
                         s.report(Err("Changed on disk. Your draft is still here. Save again to apply your edits to the new revision, or discard the draft and reload.".into()), "", cx);
                     }
                     Err(message) => s.report(Err(message), "", cx),
+                }
+                if let Some(local) = local {
+                    // Keep the stars changed during the save and save them on the new revision.
+                    s.favorites = local;
+                    s.save(w, cx);
                 }
             });
         }).detach();
@@ -519,10 +534,10 @@ impl Preferences {
                 .border_color(rgb(p.line))
                 .rounded_lg()
                 .bg(rgb(p.panel))
-                .child(div().text_lg().child(title.to_owned()))
+                .child(div().text_size(p.text(Step::Title)).child(title.to_owned()))
                 .child(
                     div()
-                        .text_sm()
+                        .text_size(p.text(Step::Ui))
                         .text_color(rgb(p.muted))
                         .child(sub.to_owned()),
                 )
@@ -536,11 +551,12 @@ impl Preferences {
             .flex()
             .flex_col()
             .gap_3()
-            .child(card("ChatGPT", codex).child(div().child(button(
+            .child(card("ChatGPT", codex).child(div().child(crate::kit::button(
+                p,
                 "chatgpt-sign-in",
                 "Sign in with ChatGPT",
                 true,
-                p,
+                true,
                 cx.listener(|s, _, _, cx| {
                     let result = platform::launch_chatgpt_login(&s.project);
                     s.report(
@@ -555,11 +571,12 @@ impl Preferences {
                     "API provider",
                     "Choose a provider and add its key to use API models in Codex.",
                 )
-                .child(div().child(button(
+                .child(div().child(crate::kit::button(
+                    p,
                     "setup-api",
                     "Configure provider",
                     false,
-                    p,
+                    true,
                     cx.listener(|s, _, _, cx| {
                         s.selected = None;
                         s.goto(Page::Providers, cx)
@@ -575,11 +592,12 @@ impl Preferences {
                         "Use your Claude subscription in the installed Claude Code terminal."
                     },
                 )
-                .child(div().child(button(
+                .child(div().child(crate::kit::button(
+                    p,
                     "claude-sign-in",
                     "Sign in with Claude",
                     false,
-                    p,
+                    true,
                     cx.listener(|s, _, _, cx| {
                         let result = platform::launch_claude_login(&s.project);
                         s.report(result, "Complete Claude Code sign-in in the terminal.", cx);
@@ -605,11 +623,12 @@ impl Preferences {
                 if s == Section::Options && provider.wire_fields(cx).is_empty() {
                     continue;
                 }
-                sections = sections.child(button(
+                sections = sections.child(crate::kit::button(
+                    p,
                     title,
                     title,
                     self.section == s,
-                    p,
+                    true,
                     cx.listener(move |v, _, _, cx| {
                         v.section = s;
                         v.scroll.set_offset(point(px(0.), px(0.)));
@@ -623,31 +642,34 @@ impl Preferences {
                         .flex()
                         .items_center()
                         .justify_between()
-                        .child(button(
+                        .child(crate::kit::button(
+                            p,
                             "all-providers",
                             "‹  All providers",
                             false,
-                            p,
+                            true,
                             cx.listener(|v, _, _, cx| {
                                 v.selected = None;
                                 v.model = None;
                                 cx.notify()
                             }),
                         ))
-                        .child(button(
+                        .child(crate::kit::button(
+                            p,
                             "save-provider",
                             "Save provider",
                             true,
-                            p,
+                            true,
                             cx.listener(|s, _, w, cx| s.save(w, cx)),
                         )),
                 )
                 .child(sections)
-                .child(div().child(button(
+                .child(div().child(crate::kit::button(
+                    p,
                     "test-provider",
                     "Test saved connection",
                     false,
-                    p,
+                    true,
                     cx.listener(move |s, _, _, cx| s.test_provider(i, cx)),
                 )));
             match self.section {
@@ -669,22 +691,24 @@ impl Preferences {
                         && let Some(model) = provider.models.get(m)
                     {
                         return view
-                            .child(button(
+                            .child(crate::kit::button(
+                                p,
                                 "all-models",
                                 "‹  Model list",
                                 false,
-                                p,
+                                true,
                                 cx.listener(|s, _, _, cx| {
                                     s.model = None;
                                     cx.notify()
                                 }),
                             ))
                             .child(model.render(MODEL, "model", p, cx))
-                            .child(div().child(button(
+                            .child(div().child(crate::kit::button(
+                                p,
                                 "remove-model",
                                 "Remove model from draft",
                                 false,
-                                p,
+                                true,
                                 cx.listener(move |s, _, _, cx| {
                                     if let Some(r) = s.registry.as_mut() {
                                         r.providers[i].models.remove(m);
@@ -696,7 +720,8 @@ impl Preferences {
                     }
                     for (m, model) in provider.models.iter().enumerate() {
                         let name = model.value(Key::Id, cx);
-                        view = view.child(button(
+                        view = view.child(crate::kit::button(
+                            p,
                             ("model", m),
                             if name.is_empty() {
                                 "Untitled model".into()
@@ -704,18 +729,19 @@ impl Preferences {
                                 name
                             },
                             false,
-                            p,
+                            true,
                             cx.listener(move |s, _, _, cx| {
                                 s.model = Some(m);
                                 cx.notify()
                             }),
                         ));
                     }
-                    view = view.child(div().child(button(
+                    view = view.child(div().child(crate::kit::button(
+                        p,
                         "add-model",
                         "Add model",
                         false,
-                        p,
+                        true,
                         cx.listener(move |s, _, w, cx| {
                             let models = &mut s.registry.as_mut().unwrap().providers[i].models;
                             models.push(Fields::new(Values::new(), &[MODEL], w, cx));
@@ -725,11 +751,12 @@ impl Preferences {
                     )));
                 }
             }
-            view.child(div().child(button(
+            view.child(div().child(crate::kit::button(
+                p,
                 "remove-provider",
                 "Remove provider from draft",
                 false,
-                p,
+                true,
                 cx.listener(move |s, _, _, cx| {
                     s.registry.as_mut().unwrap().providers.remove(i);
                     s.selected = None;
@@ -748,21 +775,27 @@ impl Preferences {
                         .flex()
                         .items_center()
                         .justify_between()
-                        .child(div().text_lg().child("Configured providers"))
-                        .child(button(
+                        .child(
+                            div()
+                                .text_size(p.text(Step::Title))
+                                .child("Configured providers"),
+                        )
+                        .child(crate::kit::button(
+                            p,
                             "save-routes",
                             "Save changes",
                             true,
-                            p,
+                            true,
                             cx.listener(|s, _, w, cx| s.save(w, cx)),
                         )),
                 );
             } else if !self.settings.revisions.registry.is_empty() {
-                view = view.child(div().child(button(
+                view = view.child(div().child(crate::kit::button(
+                    p,
                     "save-empty",
                     "Save changes",
                     true,
-                    p,
+                    true,
                     cx.listener(|s, _, w, cx| s.save(w, cx)),
                 )));
             }
@@ -787,7 +820,12 @@ impl Preferences {
                         } else {
                             format!("{title}  ·  {id}")
                         })
-                        .child(div().text_sm().text_color(rgb(p.muted)).child("Edit  ›"))
+                        .child(
+                            div()
+                                .text_size(p.text(Step::Ui))
+                                .text_color(rgb(p.muted))
+                                .child("Edit  ›"),
+                        )
                         .on_click(cx.listener(move |s, _, _, cx| {
                             s.selected = Some(i);
                             s.section = Section::Connection;
@@ -799,15 +837,16 @@ impl Preferences {
             let mut presets = div().flex().flex_wrap().gap_2();
             for (i, (name, template)) in self.settings.presets.iter().enumerate() {
                 let template = template.clone();
-                presets = presets.child(button(
+                presets = presets.child(crate::kit::button(
+                    p,
                     ("new-provider", i),
                     name.clone(),
                     false,
-                    p,
+                    true,
                     cx.listener(move |s, _, w, cx| s.add_provider(template.clone(), w, cx)),
                 ));
             }
-            view.child(div().text_lg().child("Add provider"))
+            view.child(div().text_size(p.text(Step::Title)).child("Add provider"))
                 .child(presets)
         }
     }
@@ -816,11 +855,12 @@ impl Preferences {
         if self.keys.is_empty() {
             return view
                 .child("Save a provider connection to add its API key.")
-                .child(div().child(button(
+                .child(div().child(crate::kit::button(
+                    p,
                     "configure-keys",
                     "Add provider",
                     true,
-                    p,
+                    true,
                     cx.listener(|s, _, _, cx| s.goto(Page::Providers, cx)),
                 )));
         }
@@ -837,20 +877,22 @@ impl Preferences {
             if c.configured {
                 row = row
                     .child(div().min_w(px(160.)).flex_1().child(k.input.clone()))
-                    .child(button(
+                    .child(crate::kit::button(
+                        p,
                         ("key-save", i),
                         "Save key",
                         true,
-                        p,
+                        true,
                         cx.listener(move |s, _, w, cx| s.key(i, false, w, cx)),
                     ));
             }
             if c.saved {
-                row = row.child(button(
+                row = row.child(crate::kit::button(
+                    p,
                     ("key-remove", i),
                     "Remove",
                     false,
-                    p,
+                    true,
                     cx.listener(move |s, _, w, cx| s.key(i, true, w, cx)),
                 ));
             }
@@ -868,11 +910,16 @@ impl Preferences {
                             .items_center()
                             .justify_between()
                             .child(c.name.clone())
-                            .child(div().text_sm().text_color(rgb(p.muted)).child(status)),
+                            .child(
+                                div()
+                                    .text_size(p.text(Step::Ui))
+                                    .text_color(rgb(p.muted))
+                                    .child(status),
+                            ),
                     )
                     .child(
                         div()
-                            .text_sm()
+                            .text_size(p.text(Step::Ui))
                             .text_color(rgb(p.muted))
                             .child(c.scope.clone()),
                     )
@@ -891,55 +938,51 @@ impl Preferences {
                     .flex()
                     .justify_between()
                     .items_center()
-                    .child("Starred models")
-                    .child(button(
-                        "save-favorites",
-                        "Save starred models",
-                        true,
-                        p,
-                        cx.listener(|s, _, w, cx| s.save(w, cx)),
-                    )),
+                    .child("Starred models"),
             )
             .child(
                 div()
-                    .text_sm()
+                    .text_size(p.text(Step::Ui))
                     .text_color(rgb(p.muted))
                     .child("Starred models appear first; any model can be used."),
             );
         for (i, alias) in self.favorites.iter().enumerate() {
             let mut actions = div().flex().gap_1();
             if i > 0 {
-                actions = actions.child(button(
+                actions = actions.child(crate::kit::button(
+                    p,
                     ("up", i),
                     "↑",
                     false,
-                    p,
-                    cx.listener(move |s, _, _, cx| {
+                    true,
+                    cx.listener(move |s, _, w, cx| {
                         s.favorites.swap(i, i - 1);
-                        cx.notify()
+                        s.save(w, cx)
                     }),
                 ));
             }
             if i + 1 < self.favorites.len() {
-                actions = actions.child(button(
+                actions = actions.child(crate::kit::button(
+                    p,
                     ("down", i),
                     "↓",
                     false,
-                    p,
-                    cx.listener(move |s, _, _, cx| {
+                    true,
+                    cx.listener(move |s, _, w, cx| {
                         s.favorites.swap(i, i + 1);
-                        cx.notify()
+                        s.save(w, cx)
                     }),
                 ));
             }
-            actions = actions.child(button(
+            actions = actions.child(crate::kit::button(
+                p,
                 ("unstar", i),
                 "Remove",
                 false,
-                p,
-                cx.listener(move |s, _, _, cx| {
+                true,
+                cx.listener(move |s, _, w, cx| {
                     s.favorites.remove(i);
-                    cx.notify()
+                    s.save(w, cx)
                 }),
             ));
             view = view.child(
@@ -956,12 +999,13 @@ impl Preferences {
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(div().flex_1().child(Input::new(&self.alias)))
-                .child(button(
+                .child(div().flex_1().child(crate::kit::input(&self.alias)))
+                .child(crate::kit::button(
+                    p,
                     "add-favorite",
                     "Add alias",
                     false,
-                    p,
+                    true,
                     cx.listener(|s, _, w, cx| {
                         let alias = s.alias.read(cx).value().trim().to_owned();
                         if alias.is_empty() {
@@ -972,7 +1016,7 @@ impl Preferences {
                             s.favorites.push(alias);
                         }
                         s.alias.update(cx, |field, cx| field.set_value("", w, cx));
-                        cx.notify();
+                        s.save(w, cx);
                     }),
                 )),
         );
@@ -982,7 +1026,8 @@ impl Preferences {
                 .items_center()
                 .justify_between()
                 .child("Available models")
-                .child(button(
+                .child(crate::kit::button(
+                    p,
                     "refresh-catalog",
                     if self.loading_models {
                         "Loading…"
@@ -990,7 +1035,7 @@ impl Preferences {
                         "Refresh catalog"
                     },
                     false,
-                    p,
+                    true,
                     cx.listener(|s, _, _, cx| s.fetch_models(cx)),
                 )),
         );
@@ -1005,16 +1050,17 @@ impl Preferences {
             .take(50)
         {
             let alias = alias.clone();
-            view = view.child(button(
+            view = view.child(crate::kit::button(
+                p,
                 ("star-model", i),
                 format!("＋  {alias}"),
                 false,
-                p,
-                cx.listener(move |s, _, _, cx| {
+                true,
+                cx.listener(move |s, _, w, cx| {
                     if !s.favorites.contains(&alias) {
                         s.favorites.push(alias.clone())
                     }
-                    cx.notify()
+                    s.save(w, cx)
                 }),
             ));
         }
@@ -1030,22 +1076,12 @@ fn input_row(label: &'static str, input: &Entity<InputState>, p: Palette) -> Div
         .child(
             div()
                 .w(px(162.))
-                .text_sm()
+                .text_size(p.text(Step::Ui))
                 .text_color(rgb(p.muted))
                 .child(label),
         )
-        .child(div().flex_1().min_w_0().child(Input::new(input)))
+        .child(div().flex_1().min_w_0().child(crate::kit::input(input)))
 }
-fn button(
-    id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
-    active: bool,
-    p: Palette,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    crate::kit::button(p, id, label, active, true, on_click)
-}
-
 impl Preferences {
     /// Test-facing state of the open settings page for the desk stats probe.
     pub fn probe_state(&self, cx: &App) -> crate::platform::layout_probe::SettingsProbe {
@@ -1073,7 +1109,7 @@ impl Preferences {
             .gap_3()
             .border_b_1()
             .border_color(rgb(p.line))
-            .child(div().text_2xl().child("Settings"));
+            .child(div().text_size(p.text(Step::Display)).child("Settings"));
         let mut tabs = div().flex().flex_wrap().gap_1();
         for (page, title) in [
             (Page::Accounts, "Accounts"),
@@ -1089,11 +1125,12 @@ impl Preferences {
             if page == Page::Legacy && self.legacy.is_none() {
                 continue;
             }
-            tabs = tabs.child(button(
+            tabs = tabs.child(crate::kit::button(
+                p,
                 title,
                 title,
                 page == self.page,
-                p,
+                true,
                 cx.listener(move |s, _, w, cx| {
                     if page == Page::Advanced {
                         s.open_advanced(w, cx)
@@ -1107,7 +1144,7 @@ impl Preferences {
         if !self.message.is_empty() {
             header = header.child(
                 div()
-                    .text_sm()
+                    .text_size(p.text(Step::Ui))
                     .text_color(rgb(if self.error { p.error } else { p.muted }))
                     .child(self.message.clone())
                     .when(self.error, |notice| {
@@ -1135,15 +1172,16 @@ impl Preferences {
                         .flex()
                         .flex_col()
                         .gap_4()
-                        .child(div().text_lg().child("Web search"));
+                        .child(div().text_size(p.text(Step::Title)).child("Web search"));
                     if let Some(registry) = &self.registry {
                         view = view
                             .child(registry.search.render(SEARCH, "brave", p, cx))
-                            .child(div().child(button(
+                            .child(div().child(crate::kit::button(
+                                p,
                                 "save-search",
                                 "Save search settings",
                                 true,
-                                p,
+                                true,
                                 cx.listener(|s, _, w, cx| s.save(w, cx)),
                             )))
                     }
@@ -1153,14 +1191,19 @@ impl Preferences {
                     let mut view = div().flex().flex_col().gap_4();
                     if let Some(l) = &self.legacy {
                         view = view
-                            .child(div().text_lg().child(format!("Legacy · {}", l.id)))
+                            .child(
+                                div()
+                                    .text_size(p.text(Step::Title))
+                                    .child(format!("Legacy · {}", l.id)),
+                            )
                             .child(input_row("Default model", &l.model, p))
                             .child(l.fields.render(LEGACY, "legacy", p, cx))
-                            .child(div().child(button(
+                            .child(div().child(crate::kit::button(
+                                p,
                                 "save-legacy",
                                 "Save connection",
                                 true,
-                                p,
+                                true,
                                 cx.listener(|s, _, w, cx| s.save(w, cx)),
                             )));
                     }
@@ -1177,11 +1220,12 @@ impl Preferences {
             .p_5()
             .child(content);
         if self.error && !self.busy && self.page != Page::Advanced {
-            body = body.child(div().mt_4().child(button(
+            body = body.child(div().mt_4().child(crate::kit::button(
+                p,
                 "reload-settings",
                 "Discard drafts and reload",
                 false,
-                p,
+                true,
                 cx.listener(|s, _, w, cx| s.reload(w, cx)),
             )))
         }

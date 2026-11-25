@@ -1,6 +1,7 @@
-use super::{Palette, button};
+use super::Palette;
+use crate::appearance::Step;
 use gpui::{prelude::*, *};
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::InputState;
 use ox_desk_core::settings_protocol::model::{
     self, Cell, Changes, Key, ProviderEdit, ProviderRow, RowEdit, Values,
 };
@@ -289,7 +290,7 @@ impl Fields {
                 div()
                     .w(px(162.))
                     .flex_shrink_0()
-                    .text_sm()
+                    .text_size(p.text(Step::Ui))
                     .text_color(rgb(p.muted))
                     .child(spec.label),
             );
@@ -306,11 +307,12 @@ impl Fields {
                         "false" => "Off",
                         other => other,
                     };
-                    choices = choices.child(button(
+                    choices = choices.child(crate::kit::button(
+                        p,
                         SharedString::from(format!("{prefix}-{}-{option}", spec.key.name())),
                         caption,
                         selected,
-                        p,
+                        true,
                         cx.listener(move |_, _, window, cx| {
                             control.update(cx, |input, cx| input.set_value(option, window, cx));
                             cx.notify();
@@ -319,7 +321,7 @@ impl Fields {
                 }
                 row = row.child(choices);
             } else {
-                row = row.child(div().min_w_0().flex_1().child(Input::new(editor)));
+                row = row.child(div().min_w_0().flex_1().child(crate::kit::input(editor)));
             }
             rows = rows.child(row);
         }

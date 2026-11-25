@@ -1,5 +1,6 @@
 //! First-run actions are scoped to the project and route of the visible pane.
 use super::workbench::Workbench;
+use crate::appearance::Step;
 use crate::{activity, appearance::Palette, col, kit::button, platform, small};
 use gpui::*;
 
@@ -74,7 +75,7 @@ impl Workbench {
             .max_w(px(470.))
             .gap_3()
             .child(activity::ox(p, 0, 3.))
-            .child(div().text_2xl().child(title))
+            .child(div().text_size(p.text(Step::Display)).child(title))
             .child(small(p, note));
         match issue {
             Issue::Missing | Issue::Old(_) => {

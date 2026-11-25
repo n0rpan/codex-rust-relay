@@ -1,4 +1,5 @@
 //! A workbench owns the visible state for one project and billing route.
+use crate::appearance::Step;
 use crate::platform::open_store;
 use crate::{activity, appearance::Palette, col, platform, row};
 use gpui::{prelude::FluentBuilder, *};
@@ -696,7 +697,7 @@ impl Workbench {
                                             col.child(
                                                 div()
                                                     .id("current-thread-title")
-                                                    .text_size(px(20.))
+                                                    .text_size(p.text(Step::Title))
                                                     .truncate()
                                                     .font_weight(FontWeight::SEMIBOLD)
                                                     .child(title.clone())
@@ -726,7 +727,7 @@ impl Workbench {
                                                     .child(crate::small(
                                                         p,
                                                         format!(
-                                                            "{project}   /   {}",
+                                                            "{project} / {}",
                                                             self.route.label()
                                                         ),
                                                     )),

@@ -86,6 +86,9 @@ pub struct Store {
     commands: commands::Catalog,
     handoff_ready: Option<commands::Handoff>,
     terminal_threads: HashSet<String>,
+    /// Threads whose live process this client ended. Cleared lazily: a thread
+    /// that is live again is not reported as ended.
+    ended_threads: HashSet<String>,
     child_threads: HashMap<String, (String, PathBuf)>,
     next_preset: Option<crate::codex::access::Access>,
     selection: u64,
@@ -171,6 +174,7 @@ impl Store {
             commands: Default::default(),
             handoff_ready: None,
             terminal_threads: Default::default(),
+            ended_threads: Default::default(),
             child_threads: Default::default(),
             next_preset: None,
             selection: 0,

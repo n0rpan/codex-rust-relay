@@ -12,7 +12,7 @@ use ox_desk_core::{
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-pub(crate) const PREFIX: &str = "ox-yolo-";
+pub(crate) const PREFIX: &str = ox_desk_core::asks::YOLO_REQUEST_PREFIX;
 
 pub(crate) fn request_id(job: u64) -> RequestId {
     RequestId::Text(format!("{PREFIX}{job}"))

@@ -943,6 +943,7 @@ mod tests {
         assert!(s.claude().sessions.contains_key(&b));
         assert_eq!(s.live_threads(), vec![b.clone()]);
         assert!(!s.has_live_session(&a));
+        assert!(s.is_ended(&a) && !s.is_ended(&b));
         // Still listed, closed for sending, its unsent text back in the draft, no stale approval.
         assert!(s.catalog_row(&a).is_some());
         assert!(!s.can_send(Some(&a)));

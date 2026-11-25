@@ -1,4 +1,5 @@
 use super::*;
+use crate::appearance::Step;
 use crate::settings::protocol::Document;
 use gpui_component::input::{Textarea, TextareaState};
 
@@ -132,11 +133,12 @@ impl Preferences {
         };
         let mut tabs = div().flex().flex_wrap().gap_1();
         for (i, (doc, _)) in a.documents.iter().enumerate() {
-            tabs = tabs.child(button(
+            tabs = tabs.child(crate::kit::button(
+                p,
                 ("document", i),
                 doc.title.clone(),
                 i == a.selected,
-                p,
+                true,
                 cx.listener(move |s, _, _, cx| {
                     if s.busy {
                         return;
@@ -151,7 +153,7 @@ impl Preferences {
             ));
         }
         let mut view=div().flex().flex_col().gap_3().child(tabs)
-            .child(div().text_sm().text_color(rgb(p.muted)).child("Edit provider, search and model settings as text. Private values and unrecognized registry fields stay in the saved file."));
+            .child(div().text_size(p.text(Step::Ui)).text_color(rgb(p.muted)).child("Edit provider, search and model settings as text. Private values and unrecognized registry fields stay in the saved file."));
         if let Some((doc, field)) = a.documents.get(a.selected) {
             view = view
                 .child(doc.id.clone())
@@ -164,18 +166,20 @@ impl Preferences {
                     div()
                         .flex()
                         .gap_2()
-                        .child(button(
+                        .child(crate::kit::button(
+                            p,
                             "save-document",
                             "Save document",
                             true,
-                            p,
+                            true,
                             cx.listener(|s, _, w, cx| s.save_advanced(w, cx)),
                         ))
-                        .child(button(
+                        .child(crate::kit::button(
+                            p,
                             "reload-documents",
                             "Discard text and reload",
                             false,
-                            p,
+                            true,
                             cx.listener(|s, _, w, cx| {
                                 if s.busy {
                                     return;

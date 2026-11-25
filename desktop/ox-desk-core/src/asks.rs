@@ -66,9 +66,17 @@ pub struct Ask {
     pub questions: Vec<Question>,
     pub(crate) decisions: Vec<Decision>,
 }
+/// Request-id prefix of the approval the host raises for a worker that waits
+/// for YOLO acceptance on its parent session (see the host's yolo module).
+pub const YOLO_REQUEST_PREFIX: &str = "ox-yolo-";
+
 impl Ask {
     pub fn decisions(&self) -> &[Decision] {
         &self.decisions
+    }
+    /// Whether this approval is a worker waiting for YOLO acceptance.
+    pub fn waits_for_yolo(&self) -> bool {
+        matches!(&self.id, RequestId::Text(id) if id.starts_with(YOLO_REQUEST_PREFIX))
     }
     pub fn title(&self) -> &str {
         &self.title

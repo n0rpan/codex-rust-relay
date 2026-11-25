@@ -1,5 +1,5 @@
 use crate::preferences::behavior::{Active, Behavior, ThemeSource};
-use gpui::{App, Global, px, rgb};
+use gpui::{App, Global, Pixels, px, rgb};
 use gpui_component::{Theme, ThemeMode};
 use std::env;
 #[cfg(any(target_os = "linux", test))]
@@ -24,9 +24,63 @@ pub struct Palette {
     pub error: u32,
     pub light: bool,
     pub motion: bool,
+    /// The user's text-size preference (14 to 20, house base 16). Type steps scale with it.
+    pub text_base: u32,
 }
 
 impl Global for Palette {}
+
+/// Pixel-grid mono for labels, status chips, counters and key hints. Departure Mono is the
+/// planned face (polish plan 2.2) but is not bundled until its licence is confirmed.
+// TODO(docs/design/polish-plan.md §2.2): bundle Departure Mono once its SIL OFL licence is verified.
+pub const LABEL_FONT: &str = "monospace";
+
+/// The six type steps of the desktop scale (polish plan 2.2), in px at the house base of 16.
+/// Every step is a multiple of 2 so the scale stays on the 2 px grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Section labels, status chips, key hints. Pixel mono, caps.
+    Label,
+    /// Secondary row text, timestamps, banners.
+    Meta,
+    /// Buttons, list titles, menus.
+    Ui,
+    /// Transcript and forms.
+    Body,
+    /// Thread title, sheet title.
+    Title,
+    /// Page headings.
+    Display,
+}
+
+impl Step {
+    #[cfg(test)]
+    pub const ALL: [Step; 6] = [
+        Step::Label,
+        Step::Meta,
+        Step::Ui,
+        Step::Body,
+        Step::Title,
+        Step::Display,
+    ];
+
+    /// Size in px at the house base of 16.
+    pub const fn base_px(self) -> u32 {
+        match self {
+            Step::Label => 12,
+            Step::Meta => 12,
+            Step::Ui => 14,
+            Step::Body => 16,
+            Step::Title => 20,
+            Step::Display => 28,
+        }
+    }
+
+    /// Size in px for a user text-size base, so the preference still scales the UI.
+    pub fn px(self, base: u32) -> Pixels {
+        px(self.base_px() as f32 * base as f32 / 16.)
+    }
+}
 
 impl Default for Palette {
     fn default() -> Self {
@@ -57,6 +111,7 @@ impl Palette {
                 error: 0xa82f35,
                 light: true,
                 motion: true,
+                text_base: 16,
             }
         } else {
             Self {
@@ -77,6 +132,7 @@ impl Palette {
                 error: 0xf3a598,
                 light: false,
                 motion: true,
+                text_base: 16,
             }
         }
     }
@@ -155,6 +211,11 @@ impl Palette {
         *cx.global::<Self>()
     }
 
+    /// Pixel size of a type step at the user's text-size preference.
+    pub fn text(self, step: Step) -> Pixels {
+        step.px(self.text_base)
+    }
+
     #[cfg(any(target_os = "linux", test))]
     fn parse(text: &str) -> Option<Self> {
         let doc = text.parse::<DocumentMut>().ok()?;
@@ -209,6 +270,7 @@ impl Palette {
                 .unwrap_or(house.error),
             light,
             motion: true,
+            text_base: 16,
         })
     }
 
@@ -245,6 +307,7 @@ impl Palette {
             }
         }
         palette.motion &= !prefs.reduce_motion;
+        palette.text_base = u32::from(prefs.font_size);
         palette
     }
 
@@ -472,5 +535,24 @@ mod tests {
         assert!(t <= 0.31, "line sits {t} of the way to fg");
         assert!(contrast(loud.muted, loud.bg) >= 4.5);
         assert_eq!(loud.success, 0x00aa00);
+    }
+}
+
+#[cfg(test)]
+mod type_scale_test {
+    use super::Step;
+
+    #[test]
+    fn type_scale_is_monotonic_and_on_the_two_pixel_grid() {
+        let sizes: Vec<u32> = Step::ALL.iter().map(|s| s.base_px()).collect();
+        assert_eq!(sizes.len(), 6);
+        assert!(
+            sizes.windows(2).all(|w| w[0] <= w[1]),
+            "not monotonic: {sizes:?}"
+        );
+        assert!(
+            sizes.iter().all(|s| s % 2 == 0),
+            "off the 2 px grid: {sizes:?}"
+        );
     }
 }

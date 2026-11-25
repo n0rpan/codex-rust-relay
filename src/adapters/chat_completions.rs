@@ -920,6 +920,12 @@ impl ResponseTranslator {
         self.finished
     }
 
+    /// Whether a `finish_reason` arrived. Once it has, the upstream has said it is
+    /// done; only the transport end (or `[DONE]`) remains to be read.
+    pub fn has_finish_reason(&self) -> bool {
+        self.finish_reason.is_some()
+    }
+
     /// Handle one already-framed SSE event.
     ///
     /// `event` is the SSE `event:` name (`"message"` when the stream omits it);

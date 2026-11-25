@@ -1,4 +1,5 @@
 //! A user-operated local PTY. No host protocol, conversation or telemetry uses its input/output.
+use crate::appearance::Step;
 mod display;
 use ox_pty as pty;
 
@@ -332,7 +333,7 @@ impl Render for Panel {
                     .flex_1()
                     .overflow_hidden()
                     .font_family(FONT)
-                    .text_size(px(13.))
+                    .text_size(p.text(Step::Ui))
                     .line_height(px(LINE))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -368,7 +369,7 @@ impl Render for Panel {
                 .p_4()
                 .gap_3()
                 .track_focus(&self.focus)
-                .child(div().text_lg().child(if self.shell {
+                .child(div().text_size(p.text(Step::Title)).child(if self.shell {
                     "Open a local shell"
                 } else {
                     "Review command"

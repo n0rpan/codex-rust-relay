@@ -1107,6 +1107,19 @@ fn rejects_interrupted_streams() {
 }
 
 #[test]
+fn reports_a_finish_reason_before_the_stream_closes() {
+    // The relay bounds the wait for `[DONE]` only once the finish_reason is known.
+    let mut translator = new_translator();
+    push(&mut translator, &chunk(json!({"content": "done"})));
+    assert!(!translator.has_finish_reason());
+    push(&mut translator, &finish_chunk("stop"));
+    assert!(translator.has_finish_reason());
+    assert!(!translator.is_finished());
+    translator.finish().unwrap();
+    assert!(translator.is_finished());
+}
+
+#[test]
 fn rejects_a_tool_call_that_finished_without_a_name() {
     let mut translator = new_translator();
     push(

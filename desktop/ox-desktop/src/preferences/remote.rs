@@ -1,3 +1,4 @@
+use crate::appearance::Step;
 use crate::{
     appearance::Palette,
     kit::button,
@@ -163,7 +164,7 @@ impl Render for Remote {
             .flex()
             .flex_col()
             .gap_3()
-            .child(div().text_xl().child("Remote access"));
+            .child(div().text_size(p.text(Step::Title)).child("Remote access"));
         let permission = self.report.as_ref().and_then(|r| r.denied.as_ref());
         if let Some(msg) = self
             .message
@@ -302,7 +303,7 @@ impl Render for Remote {
                     ));
             }
             if !report.host.devices.is_empty() {
-                view = view.child(div().text_lg().child("Paired devices"));
+                view = view.child(div().text_size(p.text(Step::Title)).child("Paired devices"));
             }
             for device in &report.host.devices {
                 let id = device.id.clone();

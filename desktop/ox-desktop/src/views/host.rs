@@ -1,5 +1,6 @@
 //! One workbench per canonical project and billing route. Each owns its editors,
 //! server requests and connection for the lifetime of the window.
+use crate::appearance::Step;
 mod discovery;
 pub(super) use discovery::TreeIndex;
 use discovery::{Discovery, Location, Scope};
@@ -9,7 +10,7 @@ mod shortcuts;
 use super::model_picker::{self, ModelPicker, ModelPickerEvent};
 use super::running::Running;
 use super::workbench::{CatalogChanged, Workbench};
-use crate::kit::{DropdownMenu, PopupMenuItem};
+use crate::kit::{DropdownMenu, PopupMenuItem, SPACE_S, SPACE_XS};
 use crate::{
     activity, appearance::Palette, col, kit::button, platform, row, settings, small,
     workspace_state::LastWorkspace,
@@ -720,6 +721,9 @@ impl Host {
             {
                 status = Some("Needs you");
             }
+            if store.is_ended(&t.id) {
+                status = status.or(Some("Ended"));
+            }
             if let Some(thread) = store.transcript(&t.id) {
                 if thread.is_ready() {
                     owner = Some(view.route.clone());
@@ -855,7 +859,7 @@ impl Host {
                             .child(
                                 div()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_size(px(13.))
+                                    .text_size(p.text(Step::Ui))
                                     .child(day_label(day, now.date_naive())),
                             )
                             .child(div().flex_1().h(px(1.)).mb(px(7.)).bg(rgb(p.line)))
@@ -967,7 +971,7 @@ impl Host {
                         .items_center()
                         .justify_center()
                         .cursor_pointer()
-                        .text_size(px(11.))
+                        .text_size(p.text(Step::Label))
                         .text_color(rgb(p.fg))
                         .child(glyph)
                         .on_click(cx.listener(move |s, _, _, cx| {
@@ -1075,6 +1079,7 @@ impl Host {
             .as_ref()
             .is_some_and(|s| s.state() == &Connection::Ready);
         let count = self.catalog.len();
+        let running = self.running.read(cx).running_count();
         // The route menu lists the two subscriptions and starred aliases; everything else is
         // one row away in the searchable picker.
         let starred_routes: Vec<Route> = self
@@ -1396,8 +1401,16 @@ impl Host {
             )
             .child(self.running.clone())
             .child(
-                div().px_2().border_t_1().border_color(rgb(p.line)).child(
-                    button(
+                // Footer: settings on the left, running count and host status on the right.
+                row()
+                    .flex_shrink_0()
+                    .justify_between()
+                    .gap(px(SPACE_S))
+                    .px(px(SPACE_S))
+                    .py(px(SPACE_XS))
+                    .border_t_1()
+                    .border_color(rgb(p.line))
+                    .child(button(
                         p,
                         "settings",
                         if self.preferences.is_some() {
@@ -1408,9 +1421,19 @@ impl Host {
                         false,
                         true,
                         cx.listener(|s, _, w, cx| s.show_settings(w, cx)),
-                    )
-                    .w_full(),
-                ),
+                    ))
+                    .child(
+                        row()
+                            .gap(px(SPACE_S))
+                            .child(small(p, format!("RUNNING · {running}")))
+                            .child(
+                                gpui::div()
+                                    .w(px(8.))
+                                    .h(px(8.))
+                                    .flex_shrink_0()
+                                    .bg(rgb(if pane_ready { p.success } else { p.warning })),
+                            ),
+                    ),
             )
             .when_some(self.message.clone(), |d, m| {
                 d.child(crate::kit::banner(

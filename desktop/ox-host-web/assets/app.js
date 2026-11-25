@@ -677,7 +677,15 @@ function catalog() {
       const head = el("div", "session-top");
       head.append(
         el("span", "session-name", session.title || "Untitled session"),
-        el("span", "status", needsInput ? "Needs input" : session.status),
+        el(
+          "span",
+          "status",
+          needsInput
+            ? "Needs input"
+            : session.capabilities.includes("ended")
+              ? "Ended"
+              : session.status,
+        ),
       );
       b.append(
         head,

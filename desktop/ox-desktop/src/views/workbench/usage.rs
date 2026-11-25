@@ -1,4 +1,5 @@
 use super::Workbench;
+use crate::appearance::Step;
 use crate::{
     appearance::Palette,
     kit::{button, col, row, small},
@@ -32,7 +33,12 @@ fn metric(p: Palette, label: impl Into<SharedString>, value: impl Into<SharedStr
         .gap_3()
         .justify_between()
         .child(small(p, label))
-        .child(div().font_family("monospace").text_sm().child(value.into()))
+        .child(
+            div()
+                .font_family("monospace")
+                .text_size(p.text(Step::Ui))
+                .child(value.into()),
+        )
 }
 
 impl Workbench {
@@ -56,7 +62,7 @@ impl Workbench {
             .trigger(
                 crate::kit::toolbar_button(p, "show-usage", label, true, |_, _, _| {})
                     .compact()
-                    .text_size(px(12.)),
+                    .text_size(p.text(Step::Meta)),
             )
             .content(move |_, window, cx| {
                 view.read_with(cx, |s, _| s.usage_details(p, window, &view))
@@ -107,7 +113,12 @@ impl Workbench {
             .when_some(
                 store.selected().and_then(|id| store.catalog_row(id)),
                 |panel, thread| {
-                    panel.child(div().text_sm().truncate().child(thread.title().to_owned()))
+                    panel.child(
+                        div()
+                            .text_size(p.text(Step::Ui))
+                            .truncate()
+                            .child(thread.title().to_owned()),
+                    )
                 },
             )
             .child(small(p, store.profile().route.label()).truncate());
@@ -167,7 +178,7 @@ impl Workbench {
                     .pt_2()
                     .child(
                         div()
-                            .text_sm()
+                            .text_size(p.text(Step::Ui))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Account limits"),
                     )

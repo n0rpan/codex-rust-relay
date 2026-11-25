@@ -372,7 +372,9 @@ impl Store {
             return self.forward(crate::actions::Action::EndSession(id.into()));
         }
         if self.is_session_scoped() {
-            return self.claude_end(id);
+            self.claude_end(id)?;
+            self.ended_threads.insert(id.into());
+            return Ok(());
         }
         if self.state != Connection::Ready {
             return Err(io::Error::other("Reconnect to end this session"));
@@ -400,6 +402,7 @@ impl Store {
         t.verified = false;
         t.loading = false;
         t.error = None;
+        self.ended_threads.insert(id.into());
         self.changed.transcript(id);
         self.changed.mark(Changed::THREADS);
         self.request(Call::Unsubscribe(id.into()), Pending::Unsubscribe)
@@ -425,6 +428,15 @@ impl Store {
             return remote.can(id, "end");
         }
         self.has_live_session(id)
+    }
+    /// The live process was ended and nothing has started it again. The row stays
+    /// in the catalog; selecting it resumes the thread. A remote client reads the
+    /// host's `ended` capability.
+    pub fn is_ended(&self, id: &str) -> bool {
+        if let Some(remote) = self.remote() {
+            return remote.can(id, "ended");
+        }
+        self.ended_threads.contains(id) && !self.has_live_session(id)
     }
     /// This thread has a live process or subscription to end.
     pub fn has_live_session(&self, id: &str) -> bool {
@@ -662,6 +674,29 @@ mod tests {
         .unwrap();
         store.state = Connection::Ready;
         store
+    }
+
+    #[test]
+    fn ending_a_ready_codex_thread_unsubscribes_and_marks_it_not_ready() {
+        let mut store = ready();
+        let id = "thread-ready".to_owned();
+        let t = store.transcripts.entry(id.clone()).or_default();
+        t.ready = true;
+        t.verified = true;
+        assert!(store.can_end_session(&id));
+        store.end_session(&id).unwrap();
+        let t = store.transcripts.get(&id).unwrap();
+        assert!(!t.ready && !t.verified && !t.loading);
+        assert!(
+            store
+                .pending
+                .values()
+                .any(|(_, pending)| matches!(pending, Pending::Unsubscribe)),
+            "the host must receive the unsubscribe"
+        );
+        assert!(store.is_ended(&id));
+        assert!(!store.can_end_session(&id));
+        assert!(store.end_session(&id).is_err());
     }
 
     #[test]

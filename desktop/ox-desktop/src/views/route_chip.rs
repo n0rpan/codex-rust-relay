@@ -219,26 +219,27 @@ impl Workbench {
             ),
         };
         let mut chips = Vec::new();
-        for (index, (kind, label)) in [
-            (Kind::Model, route),
+        for (index, (kind, name, value)) in [
+            (Kind::Model, "Model", route),
             (
                 Kind::Effort,
-                settings
-                    .effort
-                    .clone()
-                    .map_or("Effort".into(), |s| format!("Effort · {s}")),
+                "Effort",
+                settings.effort.clone().unwrap_or_default(),
             ),
             (
                 Kind::Speed,
-                settings
-                    .tier
-                    .clone()
-                    .map_or("Speed".into(), |s| format!("Speed · {s}")),
+                "Speed",
+                settings.tier.clone().unwrap_or_default(),
             ),
         ]
         .into_iter()
         .enumerate()
         {
+            let label = if value.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{name} · {value}")
+            };
             if store.has_command_schema() {
                 let caps = store.command_caps(owner);
                 if (kind == Kind::Speed && !caps.speed)
@@ -256,10 +257,11 @@ impl Workbench {
                 .as_ref()
                 .filter(|p| p.owner.as_deref() == owner && p.kind == kind);
             let mut chip = div().child(
-                button(
+                crate::kit::chip(
                     p,
                     ("model-setting", index),
-                    label.clone(),
+                    name,
+                    value,
                     opened.is_some(),
                     enabled,
                     cx.listener(move |s, _, w, cx| s.open_model_picker(kind, w, cx)),
@@ -276,7 +278,7 @@ impl Workbench {
                     .overflow_y_scroll()
                     .p_2()
                     .gap_1()
-                    .rounded_md()
+                    .rounded(px(crate::kit::OVERLAY_RADIUS))
                     .bg(rgb(p.panel))
                     .border_1()
                     .border_color(rgb(p.line))

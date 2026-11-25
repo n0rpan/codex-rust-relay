@@ -1,3 +1,4 @@
+use crate::appearance::Step;
 use crate::{appearance::Palette, kit, platform::versions, version::VERSION};
 use gpui::{prelude::*, *};
 
@@ -80,7 +81,7 @@ impl About {
             .bg(rgb(p.panel))
             .child(
                 div()
-                    .text_sm()
+                    .text_size(p.text(Step::Ui))
                     .text_color(rgb(if mismatch { p.warning } else { p.fg }))
                     .child(label),
             )
@@ -96,11 +97,15 @@ impl About {
                 !self.checking && matches!(&self.companion, Ok(v) if v == VERSION),
                 cx.listener(|s, _, _, cx| s.check(cx)),
             )))
-            .children(self.notice.clone().map(|text| div().text_sm().child(text)))
+            .children(
+                self.notice
+                    .clone()
+                    .map(|text| div().text_size(p.text(Step::Ui)).child(text)),
+            )
             .child(
                 div()
                     .pt_2()
-                    .text_xs()
+                    .text_size(p.text(Step::Meta))
                     .text_color(rgb(p.muted))
                     .child("Made by Oscar"),
             )

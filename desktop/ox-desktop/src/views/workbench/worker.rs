@@ -3,6 +3,7 @@
 //! workers are still running.
 use super::{OpenThread, Workbench};
 use crate::appearance::Palette;
+use crate::appearance::Step;
 use crate::views::host::TreeIndex;
 use crate::{activity, row};
 use gpui::{prelude::FluentBuilder, *};
@@ -26,7 +27,7 @@ impl Workbench {
                 .flex_wrap()
                 .gap_2()
                 .items_center()
-                .text_size(px(13.))
+                .text_size(p.text(Step::Ui))
                 .text_color(rgb(p.fg))
                 .when_some(parent, |line, parent| {
                     line.child(

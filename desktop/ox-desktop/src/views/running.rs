@@ -1,6 +1,7 @@
 //! The "RUNNING" section pinned under the sidebar: the live processes the session
 //! host runs, with per-row End and an "End all idle" action. It polls the host while
 //! the sidebar shows it, and again right after every End.
+use crate::appearance::Step;
 use crate::{
     appearance::Palette,
     kit::{button, col, row, small, toolbar_button},
@@ -77,6 +78,11 @@ pub struct Running {
 }
 
 impl Running {
+    /// Live host processes that are mid-turn, for the sidebar footer.
+    pub fn running_count(&self) -> usize {
+        self.processes.iter().filter(|p| p.running).count()
+    }
+
     pub fn new(cx: &mut Context<Self>) -> Self {
         let poll = cx.spawn(async move |this, cx| {
             loop {
@@ -210,7 +216,7 @@ impl Render for Running {
                                 .child(
                                     div()
                                         .flex_shrink_0()
-                                        .text_size(px(12.))
+                                        .text_size(p.text(Step::Meta))
                                         .text_color(rgb(p.fg))
                                         .child(kind_label(&process.kind)),
                                 )
@@ -219,7 +225,7 @@ impl Render for Running {
                                         .flex_1()
                                         .min_w_0()
                                         .truncate()
-                                        .text_size(px(12.))
+                                        .text_size(p.text(Step::Meta))
                                         .text_color(rgb(p.muted))
                                         .child(model),
                                 ),
@@ -279,7 +285,7 @@ impl Render for Running {
             .when_some(self.error.clone().filter(|_| self.loaded), |c, message| {
                 c.child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(p.text(Step::Meta))
                         .text_color(rgb(p.error))
                         .child(message),
                 )

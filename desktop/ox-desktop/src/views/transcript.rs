@@ -1,3 +1,4 @@
+use crate::appearance::Step;
 mod cards;
 mod tools;
 use super::workbench::Workbench;
@@ -309,7 +310,7 @@ impl Workbench {
                                 .id(SharedString::from(format!("reasoning-{index}")))
                                 .cursor_pointer()
                                 .italic()
-                                .text_xs()
+                                .text_size(p.text(Step::Meta))
                                 .text_color(rgb(p.muted))
                                 .when(!expanded, |d| d.truncate())
                                 .child(body)
@@ -341,7 +342,7 @@ impl Workbench {
                                 div()
                                     .id(SharedString::from(format!("handoff-context-{index}")))
                                     .cursor_pointer()
-                                    .text_xs()
+                                    .text_size(p.text(Step::Meta))
                                     .text_color(rgb(p.muted))
                                     .child(if expanded {
                                         "Hide carried handoff context"
@@ -570,14 +571,14 @@ fn handoff_card(
                 .gap_1()
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(p.text(Step::Label))
                         .font_family("monospace")
                         .text_color(rgb(tone))
                         .child(eyebrow.to_owned()),
                 )
                 .child(
                     div()
-                        .text_size(px(13.))
+                        .text_size(p.text(Step::Ui))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(p.fg))
                         .truncate()

@@ -5,6 +5,7 @@ use super::handoff_sheet::{self, HandoffDraft};
 use super::model_picker::{ModelPicker, ModelPickerEvent};
 use super::workbench::Workbench;
 use crate::appearance::Palette;
+use crate::appearance::Step;
 use crate::kit::{button, col, icon_button, row, small, toolbar_button};
 use gpui::*;
 use gpui_component::input::{Textarea, TextareaState};
@@ -461,7 +462,7 @@ impl Workbench {
             "Permission ceiling",
             col().gap_1().child(chips).child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(p.text(Step::Meta))
                     .text_color(rgb(note_color))
                     .child(permission_note(choice.permission, runtime)),
             ),
@@ -535,7 +536,7 @@ impl Workbench {
                     .gap_1()
                     .child(
                         div()
-                            .text_size(px(15.))
+                            .text_size(p.text(Step::Body))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(p.fg))
                             .child(heading),
@@ -600,7 +601,7 @@ impl Workbench {
         if let Some(error) = &choice.error {
             body = body.child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(p.text(Step::Meta))
                     .text_color(rgb(p.error))
                     .child(error.clone()),
             );

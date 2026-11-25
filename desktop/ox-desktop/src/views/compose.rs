@@ -1,5 +1,6 @@
 use super::workbench::Workbench;
-use crate::kit::{DropdownMenu, PopupMenuItem, toolbar_button};
+use crate::appearance::Step;
+use crate::kit::{DropdownMenu, PopupMenuItem};
 use crate::{appearance::Palette, col, kit::button, row};
 use gpui::{prelude::FluentBuilder, *};
 use gpui_component::input::{InputEvent, TextareaState};
@@ -218,13 +219,13 @@ impl Workbench {
         let granted = key
             .and_then(|id| store.session_mark(id, "yolo_grant"))
             .is_some_and(|v| v == true);
-        let label = match (key, mode) {
+        let value = match (key, mode) {
             (Some(_), Some(m)) if granted && m.bypasses_permissions() => {
                 "YOLO + workers".to_owned()
             }
             (None, Some(m)) => format!("Next thread · {}", m.label()),
             (_, Some(m)) => m.label().to_owned(),
-            _ => "Permissions".into(),
+            _ => String::new(),
         };
         if effective.is_some_and(Access::bypasses_permissions)
             && p.motion
@@ -241,10 +242,12 @@ impl Workbench {
         let view = cx.weak_entity();
         let presets = Access::choices(self.route.runtime);
         let grant_offer = key.is_some() && effective.is_some_and(Access::bypasses_permissions);
-        let access = toolbar_button(
+        let access = crate::kit::chip(
             p,
             "access-preset",
-            label,
+            "Permissions",
+            value,
+            false,
             key.map_or_else(|| store.can_send(None), |id| store.can_change_access(id)),
             |_, _, _| {},
         )
@@ -358,7 +361,7 @@ impl Workbench {
                 panel.child(
                     div()
                         .id("handoff-provider-notice")
-                        .text_xs()
+                        .text_size(p.text(Step::Meta))
                         .text_color(rgb(p.muted))
                         .child(notice),
                 )

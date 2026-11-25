@@ -1,5 +1,6 @@
 //! Shared keyboard-accessible controls for the workspace and preferences.
-use crate::appearance::Palette;
+use crate::appearance::{LABEL_FONT, Palette, Step};
+use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, ClickEvent, ElementId, InteractiveElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window, px, rgb,
@@ -8,6 +9,19 @@ use gpui_component::{
     Disableable,
     button::{Button, ButtonVariant, ButtonVariants},
 };
+
+/// Control heights on the 4 px grid (polish plan 2.3): chips 24, buttons and inputs 32,
+/// list rows 40.
+pub const CHIP_HEIGHT: f32 = 24.;
+pub const CONTROL_HEIGHT: f32 = 32.;
+pub const ROW_HEIGHT: f32 = 40.;
+/// Controls get a 2 px radius. Overlays take 4 px. List rows and panels stay square.
+pub const CONTROL_RADIUS: f32 = 2.;
+pub const OVERLAY_RADIUS: f32 = 4.;
+/// Spacing steps on the 4 px grid.
+pub const SPACE_XS: f32 = 4.;
+pub const SPACE_S: f32 = 8.;
+pub const SPACE_M: f32 = 12.;
 
 pub fn button(
     palette: Palette,
@@ -26,7 +40,8 @@ pub fn button(
     let button = Button::new(id.clone())
         .with_variant(variant)
         .label(label.clone())
-        .h(px(32.))
+        .h(px(CONTROL_HEIGHT))
+        .rounded(px(CONTROL_RADIUS))
         .border_1()
         .border_color(rgb(if primary {
             palette.accent
@@ -51,13 +66,69 @@ pub fn toolbar_button(
     let button = Button::new(id.clone())
         .ghost()
         .label(label.clone())
-        .h(px(30.))
-        .rounded(px(3.))
+        .h(px(CONTROL_HEIGHT))
+        .rounded(px(CONTROL_RADIUS))
         .text_color(rgb(p.muted))
         .disabled(!enabled)
         .tab_stop(enabled)
         .on_click(click);
     crate::platform::layout_probe::mark(button, &id, &label, enabled)
+}
+
+/// The one chip (polish plan 3.1 findings 5 and 6): a 24 px control with a pixel label
+/// and an optional value. `tooltip` carries the full text when the value is truncated.
+pub fn chip(
+    p: Palette,
+    id: impl Into<ElementId>,
+    label: &'static str,
+    value: impl Into<SharedString>,
+    active: bool,
+    enabled: bool,
+    click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Button {
+    let value: SharedString = value.into();
+    Button::new(id)
+        .ghost()
+        .h(px(CHIP_HEIGHT))
+        .px(px(SPACE_S))
+        .rounded(px(CONTROL_RADIUS))
+        .border_1()
+        .border_color(rgb(if active { p.accent } else { p.line }))
+        .text_color(rgb(p.muted))
+        .disabled(!enabled)
+        .tab_stop(enabled)
+        .on_click(click)
+        .child(
+            row()
+                .gap(px(SPACE_XS))
+                .child(
+                    gpui::div()
+                        .flex_shrink_0()
+                        .font_family(LABEL_FONT)
+                        .text_size(p.text(Step::Label))
+                        .text_color(rgb(p.muted))
+                        .child(label),
+                )
+                .when(!value.is_empty(), |d| {
+                    d.child(
+                        gpui::div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(p.text(Step::Ui))
+                            .text_color(rgb(p.fg))
+                            .child(value),
+                    )
+                }),
+        )
+}
+
+/// A text input on the control grid: 32 px tall with the control radius.
+pub fn input(editor: &gpui::Entity<gpui_component::input::InputState>) -> gpui::Div {
+    gpui::div()
+        .h(px(CONTROL_HEIGHT))
+        .rounded(px(CONTROL_RADIUS))
+        .overflow_hidden()
+        .child(gpui_component::input::Input::new(editor))
 }
 
 pub use gpui_component::menu::{DropdownMenu, PopupMenuItem};
@@ -70,7 +141,7 @@ pub fn col() -> gpui::Div {
 }
 pub fn small(p: Palette, label: impl Into<SharedString>) -> gpui::Div {
     gpui::div()
-        .text_size(px(12.))
+        .text_size(p.text(Step::Meta))
         .text_color(rgb(p.muted))
         .child(label.into())
 }
@@ -84,8 +155,8 @@ pub fn banner(
 ) -> gpui::Stateful<gpui::Div> {
     row()
         .id(id)
-        .gap_2()
-        .p_2()
+        .gap(px(SPACE_S))
+        .p(px(SPACE_S))
         .border_1()
         .border_color(rgb(p.error))
         .bg(rgb(p.panel))
@@ -93,7 +164,7 @@ pub fn banner(
             gpui::div()
                 .flex_1()
                 .min_w_0()
-                .text_size(px(12.))
+                .text_size(p.text(Step::Meta))
                 .text_color(rgb(p.error))
                 .child(message.into()),
         )
@@ -133,8 +204,8 @@ pub fn sheet(p: Palette, id: &'static str) -> gpui::Stateful<gpui::Div> {
         .id(id)
         .overflow_y_scroll()
         .flex_shrink_0()
-        .gap_2()
-        .p_3()
+        .gap(px(SPACE_S))
+        .p(px(SPACE_M))
         .border_l_1()
         .border_color(rgb(p.line))
         .bg(rgb(p.panel))
@@ -196,7 +267,7 @@ impl ListRow {
         };
         let track = row()
             .w_full()
-            .h(px(37.))
+            .h(px(ROW_HEIGHT))
             .gap_2()
             .px_2()
             .border_l_2()
@@ -210,7 +281,7 @@ impl ListRow {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(14.))
+                    .text_size(p.text(Step::Ui))
                     .font_weight(if self.selected {
                         gpui::FontWeight::SEMIBOLD
                     } else {
@@ -230,13 +301,13 @@ impl ListRow {
             .when(self.status == Some("Unread"), |d| {
                 d.child(gpui::div().w(px(5.)).h(px(5.)).bg(rgb(marker)))
             });
-        col().h(px(39.)).pr_2().justify_center().child(
+        col().h(px(ROW_HEIGHT)).pr_2().justify_center().child(
             Button::new(id)
                 .ghost()
                 .tab_stop(true)
                 .w_full()
                 .p_0()
-                .h(px(37.))
+                .h(px(ROW_HEIGHT))
                 .child(track)
                 .tooltip(hint)
                 .on_click(click),

@@ -1,5 +1,6 @@
 //! Presentation of stock transcript items. Collapsed rows and expanded previews do bounded work.
 use crate::appearance::Palette;
+use crate::appearance::Step;
 use gpui::{prelude::FluentBuilder, *};
 use gpui_component::{
     ActiveTheme, WindowExt,
@@ -43,7 +44,7 @@ pub(super) fn markdown(view: TextView, project: Option<std::path::PathBuf>) -> T
                 .child(
                     div()
                         .font_family(mono.clone())
-                        .text_xs()
+                        .text_size(p.text(Step::Meta))
                         .text_color(rgb(p.muted))
                         .child(block.lang().unwrap_or_else(|| "Code".into())),
                 )
@@ -215,14 +216,19 @@ pub(super) fn header(
                         .text_color(rgb(p.muted))
                         .child(if expanded { "▾" } else { "▸" }),
                 )
-                .child(div().text_sm().flex_shrink_0().child(title))
+                .child(
+                    div()
+                        .text_size(p.text(Step::Ui))
+                        .flex_shrink_0()
+                        .child(title),
+                )
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
                         .truncate()
                         .font_family(mono.clone())
-                        .text_xs()
+                        .text_size(p.text(Step::Meta))
                         .text_color(rgb(p.muted))
                         .child(detail),
                 )
@@ -230,7 +236,7 @@ pub(super) fn header(
                     d.child(
                         div()
                             .flex_shrink_0()
-                            .text_xs()
+                            .text_size(p.text(Step::Meta))
                             .text_color(rgb(color))
                             .child(status_label),
                     )
@@ -353,7 +359,7 @@ pub(super) fn detail(
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .text_xs()
+                        .text_size(p.text(Step::Meta))
                         .text_color(rgb(p.muted))
                         .child(title),
                 )
@@ -365,7 +371,7 @@ pub(super) fn detail(
                     |d, code| {
                         d.child(
                             div()
-                                .text_xs()
+                                .text_size(p.text(Step::Meta))
                                 .flex_shrink_0()
                                 .text_color(rgb(if code == 0 { p.muted } else { p.error }))
                                 .child(format!("Exit {code}")),
@@ -394,14 +400,14 @@ pub(super) fn detail(
                 .rounded_md()
                 .p_2()
                 .font_family(mono.clone())
-                .text_sm()
+                .text_size(p.text(Step::Ui))
                 .whitespace_nowrap()
                 .child(preview.text),
         )
         .when(truncated, |d| {
             d.child(
                 div()
-                    .text_xs()
+                    .text_size(p.text(Step::Meta))
                     .pt_1()
                     .text_color(rgb(p.muted))
                     .child("Preview truncated. Copy for the full output."),

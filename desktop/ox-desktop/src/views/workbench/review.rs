@@ -1,5 +1,6 @@
 //! The review is always addressed by the selected conversation and turn.
 use super::Workbench;
+use crate::appearance::Step;
 use crate::{
     appearance::Palette,
     kit::{button, col, row, small},
@@ -90,7 +91,7 @@ impl Workbench {
             .filter(|r| r.parent_thread_id.as_deref() == Some(owner));
         for (i, child) in children.enumerate() {
             if i == 0 {
-                pane = pane.child(div().text_lg().child("Workers"));
+                pane = pane.child(div().text_size(p.text(Step::Title)).child("Workers"));
             }
             let id = child.id.clone();
             let title = child.title().to_owned();
@@ -173,7 +174,7 @@ impl Workbench {
         }
         if !review.steps.is_empty() || review.explanation.is_some() || !review.plan_text.is_empty()
         {
-            pane = pane.child(div().text_lg().child("Plan"));
+            pane = pane.child(div().text_size(p.text(Step::Title)).child("Plan"));
             if let Some(text) = &review.explanation {
                 pane = pane.child(text.clone());
             }
@@ -201,7 +202,11 @@ impl Workbench {
             pane = pane.child(
                 row()
                     .justify_between()
-                    .child(div().text_lg().child(format!("Files ({})", files.len())))
+                    .child(
+                        div()
+                            .text_size(p.text(Step::Title))
+                            .child(format!("Files ({})", files.len())),
+                    )
                     .child(button(
                         p,
                         "copy-turn-patch",
@@ -289,7 +294,7 @@ impl Workbench {
                         div()
                             .w_full()
                             .font_family("monospace")
-                            .text_size(px(12.))
+                            .text_size(p.text(Step::Meta))
                             .text_color(rgb(color))
                             .child(line),
                     );

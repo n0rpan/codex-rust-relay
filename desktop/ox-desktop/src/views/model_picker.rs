@@ -1,5 +1,6 @@
 //! The shared model picker: a search field, starred models in star order, then every model
 //! grouped by provider. Stars only order the lists; any model in the catalog can be chosen.
+use crate::appearance::Step;
 use crate::{
     appearance::Palette,
     kit::{self, small},
@@ -260,7 +261,7 @@ impl ModelPicker {
                 .px_2()
                 .flex()
                 .items_center()
-                .text_size(px(11.))
+                .text_size(p.text(Step::Label))
                 .text_color(rgb(p.muted))
                 .child(text.clone())
                 .into_any_element(),
@@ -275,7 +276,7 @@ impl ModelPicker {
                     .px_2()
                     .gap_1()
                     .w_full()
-                    .text_size(px(14.))
+                    .text_size(p.text(Step::Ui))
                     .text_color(rgb(p.fg))
                     .bg(if active {
                         rgb(p.raised)

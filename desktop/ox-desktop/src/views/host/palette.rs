@@ -1,4 +1,5 @@
 use super::*;
+use crate::appearance::Step;
 use crate::kit::field;
 use crate::views::worker_sheet::LaunchKind;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -772,7 +773,7 @@ impl Host {
                                                         .hover(|d| d.bg(rgb(p.hover)))
                                                         .child(
                                                             div()
-                                                                .text_size(px(14.))
+                                                                .text_size(p.text(Step::Ui))
                                                                 .truncate()
                                                                 .child(item.title.clone()),
                                                         )

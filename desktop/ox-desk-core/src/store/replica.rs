@@ -359,6 +359,23 @@ impl Store {
                     self.changed.mark(Changed::NOTICE | Changed::THREADS);
                     return Ok(());
                 }
+                // A worker waiting for YOLO is already an ask on this store; the
+                // notice would only repeat it. Keep it when the ask has not arrived.
+                if let Some(status) = result
+                    .as_ref()
+                    .filter(|s| error.is_none() && s["status"] == "waiting_for_operator")
+                {
+                    let ask_id = RequestId::Text(format!(
+                        "{}{}",
+                        crate::asks::YOLO_REQUEST_PREFIX,
+                        status["job_id"].to_string().trim_matches('"')
+                    ));
+                    if self.asks.iter().any(|a| a.id == ask_id) {
+                        self.notice = None;
+                        self.changed.mark(Changed::NOTICE);
+                        return Ok(());
+                    }
+                }
                 self.notice = Some(match (result, error) {
                     (_, Some(error)) => error,
                     (Some(status), None) if status["status"] == "waiting_for_operator" => format!(
@@ -720,6 +737,34 @@ mod local_command_tests {
             None,
         ));
         assert!(store.notice().unwrap().contains("accept YOLO"));
+        // Once the host's YOLO ask is on the store, the reply adds no duplicate notice.
+        store
+            .apply_change(Change::Asks {
+                asks: vec![AskView {
+                    id: RequestId::Text("ox-yolo-9".into()),
+                    token: "t".into(),
+                    thread: Some("t".into()),
+                    turn: None,
+                    item: None,
+                    choices: vec![
+                        "Accept YOLO".into(),
+                        "Start in Auto".into(),
+                        "Decline".into(),
+                    ],
+                    choice_details: vec![],
+                    command: None,
+                    title: "Start a Codex worker in YOLO?".into(),
+                    detail: String::new(),
+                    questions: vec![],
+                }],
+            })
+            .unwrap();
+        store.apply(reply(
+            serde_json::json!({"status":"waiting_for_operator","job_id":9}),
+            None,
+        ));
+        assert_eq!(store.notice(), None);
+        assert!(store.asks()[0].waits_for_yolo());
         store.apply(reply(
             serde_json::json!({}),
             Some("This session cannot be handed off yet"),
