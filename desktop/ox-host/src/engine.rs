@@ -9,10 +9,12 @@ use crate::{
 use ox_desk_core::{
     actions::Action,
     changed::Changed,
+    handoff::HandoffStart,
     host_protocol::{self as wire, Change, Client, Cursor, Scope, ScopeState, Server},
     inbox::Inbox,
     links::LinkEvent,
-    origin::{Ceiling, Origin, ParentCall, WorkerMode, WorkerStart},
+    modes::YoloAllowance,
+    origin::{Origin, ParentCall, WorkerMode, WorkerStart},
     runtime::RequestId,
     store::{Connection, Store},
 };
@@ -40,6 +42,34 @@ pub(crate) enum Message {
     },
     Stop,
 }
+/// A launch that ended, successfully or not.
+pub(crate) struct Finished {
+    reply: Replier,
+    result: Result<(), String>,
+    thread: Option<String>,
+    origin: Origin,
+    record: Option<String>,
+    detached: bool,
+}
+impl Finished {
+    fn new(l: Launching, result: Result<(), String>, thread: Option<String>) -> Self {
+        Self {
+            record: match &l.payload {
+                Payload::Handoff { record, .. } => Some(record.clone()),
+                Payload::Worker(_) => None,
+            },
+            reply: l.reply,
+            result,
+            thread,
+            origin: l.origin,
+            detached: l.detached,
+        }
+    }
+}
+pub(crate) enum Accepted {
+    Launch(Scope, Launching),
+    Ask(Asking),
+}
 pub(crate) enum Gateway {
     Launch(WorkerStart),
     Call(ParentCall),
@@ -57,13 +87,58 @@ enum Stage {
     AccessRequested,
     Sent,
 }
-/// A worker launch accepted by policy, waiting for its runtime to create the session.
-struct Launching {
+/// What a launch sends once its runtime is ready.
+pub(crate) enum Payload {
+    Worker(WorkerStart),
+    /// A handoff: the first turn (for Claude, with its context block) and the
+    /// Codex items injected before it. `record` names the ledger entry.
+    Handoff {
+        text: String,
+        items: Vec<Value>,
+        record: String,
+    },
+}
+/// A worker launch or handoff accepted by policy, waiting for its runtime to create the session.
+pub(crate) struct Launching {
     origin: Origin,
-    start: WorkerStart,
+    payload: Payload,
     reply: Replier,
     stage: Stage,
     deadline: Instant,
+    /// The launcher already has its answer (a YOLO request the operator accepted).
+    /// A failure is recorded as the job's outcome instead.
+    detached: bool,
+}
+/// A child waiting for the operator to accept YOLO.
+pub(crate) struct Asking {
+    pub(crate) origin: Origin,
+    pub(crate) start: WorkerStart,
+    pub(crate) target: Scope,
+    pub(crate) parent_title: String,
+}
+/// A handoff waiting for its source's older history to load.
+struct Preparing {
+    source: Scope,
+    start: HandoffStart,
+    reply: Replier,
+    device: String,
+    deadline: Instant,
+}
+/// A read_ox_thread call waiting for its source transcript to load.
+struct Reading {
+    scope: Scope,
+    session: String,
+    source: Box<ox_desk_core::handoff::HandoffSource>,
+    args: ReadArgs,
+    reply: Replier,
+    deadline: Instant,
+    selected: bool,
+}
+#[derive(Clone, Debug)]
+struct ReadArgs {
+    item: Option<String>,
+    after: Option<String>,
+    limit: usize,
 }
 struct ClientState {
     peer: Peer,
@@ -97,7 +172,12 @@ pub(crate) struct Engine {
     workers: Registry,
     receipts: Receipts,
     discovered: HashMap<(Scope, String), ox_desk_core::store::ThreadRow>,
+    asking: BTreeMap<u64, Asking>,
+    preparing: Vec<Preparing>,
+    reading: Vec<Reading>,
+    in_flows: bool,
 }
+mod flows;
 fn nonce() -> io::Result<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(io::Error::other)?;
@@ -124,6 +204,7 @@ impl Engine {
             }
         }
         ledger.begin(seq)?;
+        ledger.retire()?;
         Ok(Self {
             config,
             ledger,
@@ -136,6 +217,10 @@ impl Engine {
             workers,
             receipts: Receipts::default(),
             discovered: Default::default(),
+            asking: Default::default(),
+            preparing: Default::default(),
+            reading: Default::default(),
+            in_flows: false,
         })
     }
     pub(crate) fn serve(&mut self, rx: Receiver<Message>) -> io::Result<()> {
@@ -149,6 +234,8 @@ impl Engine {
                         .into_iter()
                         .chain(r.launching.as_ref().map(|l| l.deadline))
                 })
+                .chain(self.preparing.iter().map(|p| p.deadline))
+                .chain(self.reading.iter().map(|r| r.deadline))
                 .min();
             let msg = if deadline.is_some_and(|at| at <= Instant::now()) {
                 None
@@ -179,6 +266,7 @@ impl Engine {
                     for scope in due {
                         self.process(&scope, vec![], false)?;
                     }
+                    self.advance_flows()?;
                 }
                 Some(Message::Stop) => break,
                 Some(Message::Schema(scope, generation, caps)) => {
@@ -196,6 +284,9 @@ impl Engine {
                     reply,
                 }) => match request {
                     Gateway::Launch(start) => self.launch(caller, start, reply)?,
+                    Gateway::Call(call @ ParentCall::ReadThread { .. }) => {
+                        self.read_thread(&caller, call, reply)?
+                    }
                     Gateway::Call(call) => {
                         let result = self.parent_call(&caller, call);
                         self.answer(reply, result)?;
@@ -600,7 +691,7 @@ impl Engine {
         if let Some(previous) = previous {
             store.recover_from(&mut previous.store);
         }
-        annotate(&self.workers, scope, &mut store);
+        annotate(&self.workers, &self.ledger.data, scope, &mut store);
         let mut state = store.host_snapshot(scope);
         let recovered = self
             .cold
@@ -671,6 +762,28 @@ impl Engine {
             return Err(io::Error::other(
                 "Approval was already resolved or belongs to an earlier runtime",
             ));
+        }
+        if let Action::AnswerAsk(ask, choice) = &action
+            && let Some(job) = crate::yolo::job_of(ask)
+        {
+            return self.answer_yolo(id, scope, job, *choice);
+        }
+        if let Action::AnswerQuestions(ask, _) = &action
+            && crate::yolo::job_of(ask).is_some()
+        {
+            return Err(io::Error::other(
+                "Answer a YOLO request with one of its choices.",
+            ));
+        }
+        match action {
+            Action::StartHandoff(start) => return self.start_handoff(id, key, scope, start),
+            Action::YoloGrant(session, on) => return self.set_grant(scope, &session, on),
+            Action::InjectHandoff(..) => {
+                return Err(io::Error::other(
+                    "Start a handoff with its source and request.",
+                ));
+            }
+            _ => (),
         }
         if let Action::StartWorker(start) = action {
             let caller = Caller::Operator {
@@ -845,6 +958,15 @@ impl Engine {
         events: Vec<LinkEvent>,
         from_action: bool,
     ) -> io::Result<()> {
+        self.process_scope(scope, events, from_action)?;
+        self.advance_flows()
+    }
+    fn process_scope(
+        &mut self,
+        scope: &Scope,
+        events: Vec<LinkEvent>,
+        from_action: bool,
+    ) -> io::Result<()> {
         let live = self.running.get_mut(scope).expect("live scope");
         // A stock request ID may be cancelled and reused in one input batch.
         // Retire the old incarnation before considering the batch's resulting asks.
@@ -918,10 +1040,10 @@ impl Engine {
                 if !allowed {
                     // The runtime did not confirm a mode inside the ceiling. Never let it run.
                     let _ = live.store.stop(thread);
-                    launched = Some((l.reply, Err("The worker runtime did not confirm a permission mode within the granted ceiling.".to_owned()), None));
+                    launched = Some(Finished::new(l, Err("The runtime did not confirm a permission mode within the granted ceiling.".to_owned()), None));
                 } else {
-                    self.workers.stamp(scope, thread, l.origin);
-                    launched = Some((l.reply, Ok(()), Some(thread.clone())));
+                    self.workers.stamp(scope, thread, l.origin.clone());
+                    launched = Some(Finished::new(l, Ok(()), Some(thread.clone())));
                 }
             }
         }
@@ -946,11 +1068,25 @@ impl Engine {
         if let Some(error) = launch_failure
             && let Some(l) = live.launching.take()
         {
-            launched = Some((l.reply, Err(error), None));
+            launched = Some(Finished::new(l, Err(error), None));
         }
-        annotate(&self.workers, scope, &mut live.store);
+        annotate(&self.workers, &self.ledger.data, scope, &mut live.store);
+        let previous_yolo: Vec<wire::AskView> = {
+            let (yolo, native): (Vec<_>, Vec<_>) = std::mem::take(&mut live.state.asks)
+                .into_iter()
+                .partition(crate::yolo::is_request);
+            live.state.asks = native;
+            yolo
+        };
         dirty.merge(live.store.drain(vec![], Instant::now()));
         let mut changes = live.store.host_project(scope, &dirty, &mut live.state);
+        crate::yolo::merge(
+            &self.asking,
+            scope,
+            previous_yolo,
+            &mut live.state.asks,
+            &mut changes,
+        );
         if let Some(sessions) = changes.iter_mut().find_map(|c| {
             if let Change::Sessions { sessions } = c {
                 Some(sessions)
@@ -1064,16 +1200,47 @@ impl Engine {
             }
         }
     }
-    fn finish_launch(
-        &mut self,
-        scope: &Scope,
-        launched: Option<(Replier, Result<(), String>, Option<String>)>,
-    ) -> io::Result<()> {
-        let Some((reply, result, thread)) = launched else {
+    fn finish_launch(&mut self, scope: &Scope, launched: Option<Finished>) -> io::Result<()> {
+        let Some(f) = launched else {
             return Ok(());
         };
-        let result = result.and_then(|()| {
-            let thread = thread.expect("launched session");
+        if let Some(record) = &f.record {
+            let error = f.result.as_ref().err().cloned();
+            self.ledger.change(|d| match error {
+                None => d.handoffs.retain(|h| &h.id != record),
+                Some(e) => {
+                    if let Some(h) = d.handoffs.iter_mut().find(|h| &h.id == record) {
+                        h.status = "failed".into();
+                        h.message = Some(e);
+                    }
+                }
+            })?;
+            if let Some(source) = f.origin.parent.scope.clone()
+                && self.running.contains_key(&source)
+                && &source != scope
+            {
+                self.process(&source, vec![], true)?;
+            }
+            let result = f
+                .result
+                .map(|()| json!({"scope": scope, "session": f.thread, "relation": "handoff"}));
+            return self.answer(f.reply, result);
+        }
+        if f.detached
+            && let Err(e) = &f.result
+        {
+            let origin = f.origin.clone();
+            let message = e.clone();
+            self.ledger.change(|d| {
+                d.outcomes.push(crate::durable::Outcome {
+                    origin,
+                    status: "failed".into(),
+                    message,
+                })
+            })?;
+        }
+        let result = f.result.and_then(|()| {
+            let thread = f.thread.expect("launched session");
             let job = self
                 .workers
                 .get(scope, &thread)
@@ -1081,27 +1248,43 @@ impl Engine {
                 .ok_or("The worker stamp was not recorded.")?;
             self.job_status(job)
         });
-        self.answer(reply, result)
+        self.answer(f.reply, result)
     }
     /// Check policy, then hand the launch to the worker's own runtime. Nothing
-    /// starts unless every check passes. The reply waits for the native session.
+    /// starts unless every check passes. The reply waits for the native session,
+    /// or, for a YOLO child that needs the operator, returns at once with
+    /// `waiting_for_operator`.
     fn launch(&mut self, caller: Caller, start: WorkerStart, reply: Replier) -> io::Result<()> {
         match self.accept_launch(&caller, start) {
-            Ok((scope, launching)) => {
+            Ok(Accepted::Launch(scope, launching)) => {
                 let live = self.running.get_mut(&scope).expect("ensured worker scope");
                 live.launching = Some(Launching { reply, ..launching });
                 self.process(&scope, vec![], false)
             }
+            Ok(Accepted::Ask(asking)) => self.ask_yolo(asking, reply),
             Err(e) => self.answer(reply, Err(e)),
         }
     }
-    fn accept_launch(
-        &mut self,
-        caller: &Caller,
-        start: WorkerStart,
-    ) -> Result<(Scope, Launching), String> {
+    fn new_job_id(&self) -> Result<u64, String> {
+        loop {
+            let candidate = getrandom::u64().map_err(|e| e.to_string())? & ((1u64 << 52) - 1);
+            if candidate > 0
+                && !self.workers.job_ids().any(|j| j == candidate)
+                && !self.asking.contains_key(&candidate)
+                && !self
+                    .ledger
+                    .data
+                    .outcomes
+                    .iter()
+                    .any(|o| o.origin.job_id == candidate)
+            {
+                return Ok(candidate);
+            }
+        }
+    }
+    fn accept_launch(&mut self, caller: &Caller, start: WorkerStart) -> Result<Accepted, String> {
         start.validate()?;
-        let (project, parent, access, parent_origin, external) = match caller {
+        let (project, parent, access, parent_origin, external, parent_scope) = match caller {
             Caller::Hosted { scope, hint, .. } => {
                 let live = self
                     .running
@@ -1110,7 +1293,14 @@ impl Engine {
                 let parent = crate::policy::single_parent(&live.store, hint.as_deref())?;
                 let access = live.store.applied_access(Some(&parent));
                 let origin = self.workers.get(scope, &parent).map(|e| e.origin.clone());
-                (scope.project.clone(), Some(parent), access, origin, false)
+                (
+                    scope.project.clone(),
+                    Some(parent),
+                    access,
+                    origin,
+                    false,
+                    Some(scope),
+                )
             }
             Caller::Operator { scope, parent, .. } => {
                 let live = self
@@ -1130,44 +1320,80 @@ impl Engine {
                     access,
                     origin,
                     false,
+                    Some(scope),
                 )
             }
-            Caller::External(c) => (c.project.clone(), None, None, None, true),
+            Caller::External(c) => (c.project.clone(), None, None, None, true, None),
         };
-        let ceiling = crate::workers::grant(
-            access,
-            parent_origin.as_ref(),
-            external,
-            start.runtime,
-            Ceiling::of(start.write),
-        )?;
+        let source = parent_scope.and_then(|s| {
+            crate::workers::source_level(s.route.runtime, access, parent_origin.as_ref())
+        });
+        let resolved =
+            crate::workers::grant(source, external, start.mode_request(), start.runtime)?;
         let scope = canonical_scope(Scope {
             project,
             route: start.route(),
         })
         .map_err(|e| e.to_string())?;
-        self.ensure(&scope, None).map_err(|e| e.to_string())?;
-        let live = &self.running[&scope];
-        if live.opening.is_some() || live.launching.is_some() {
-            return Err("Another session is opening on the worker's route. Retry shortly.".into());
-        }
-        let job_id = loop {
-            let candidate = getrandom::u64().map_err(|e| e.to_string())? & ((1u64 << 52) - 1);
-            if candidate > 0 && !self.workers.job_ids().any(|j| j == candidate) {
-                break candidate;
+        let job_id = self.new_job_id()?;
+        let mut origin = crate::workers::origin(caller, parent.clone(), &start, job_id, resolved);
+        if resolved.level.needs_person() {
+            match caller {
+                Caller::Operator { device, .. } if start.yolo_confirmed => {
+                    origin.yolo = Some(YoloAllowance::Operator {
+                        device: device.clone(),
+                    });
+                }
+                Caller::Operator { .. } => {
+                    return Err("Confirm YOLO for this worker first. It would run without permission prompts.".into());
+                }
+                Caller::Hosted { scope: ps, .. } => {
+                    let session = parent.as_deref().expect("hosted parent");
+                    match self.yolo_grant(ps, session) {
+                        Some(grant) => origin.yolo = Some(grant),
+                        None => {
+                            let parent_title = self.running[ps]
+                                .store
+                                .catalog_row(session)
+                                .map(|r| r.title().to_owned())
+                                .unwrap_or_else(|| "OX session".into());
+                            return Ok(Accepted::Ask(Asking {
+                                origin,
+                                start,
+                                target: scope,
+                                parent_title,
+                            }));
+                        }
+                    }
+                }
+                Caller::External(_) => {
+                    return Err("A terminal launch cannot start YOLO workers.".into());
+                }
             }
-        };
-        let origin = crate::workers::origin(caller, parent, &start, job_id, ceiling);
-        Ok((
-            scope,
-            Launching {
-                origin,
-                start,
-                reply: Replier::Channel(std::sync::mpsc::sync_channel(1).0),
-                stage: Stage::Opening,
-                deadline: Instant::now() + Duration::from_secs(60),
-            },
-        ))
+        }
+        let launching = self.prepare_launch(&scope, origin, Payload::Worker(start))?;
+        Ok(Accepted::Launch(scope, launching))
+    }
+    /// Open the child's route and check that nothing else is opening there.
+    fn prepare_launch(
+        &mut self,
+        scope: &Scope,
+        origin: Origin,
+        payload: Payload,
+    ) -> Result<Launching, String> {
+        self.ensure(scope, None).map_err(|e| e.to_string())?;
+        let live = &self.running[scope];
+        if live.opening.is_some() || live.launching.is_some() {
+            return Err("Another session is opening on the target route. Retry shortly.".into());
+        }
+        Ok(Launching {
+            origin,
+            payload,
+            reply: Replier::Channel(std::sync::mpsc::sync_channel(1).0),
+            stage: Stage::Opening,
+            deadline: Instant::now() + Duration::from_secs(60),
+            detached: false,
+        })
     }
     fn job_status(&self, job_id: u64) -> Result<Value, String> {
         let (scope, id, entry) = self
@@ -1283,9 +1509,15 @@ impl Engine {
                     .map(|(_, _, e)| e.origin.job_id)
                     .collect();
                 jobs.sort_unstable();
+                let unstarted = self.unstarted_jobs(&me);
                 let jobs = jobs
                     .into_iter()
                     .filter_map(|j| self.job_status(j).ok())
+                    .chain(
+                        unstarted
+                            .into_iter()
+                            .filter_map(|j| self.unstarted_job(&me, j)),
+                    )
                     .map(|mut v| {
                         v.as_object_mut().map(|o| o.remove("messages"));
                         v
@@ -1296,7 +1528,25 @@ impl Engine {
             ParentCall::Status { job_id }
             | ParentCall::Steer { job_id, .. }
             | ParentCall::Cancel { job_id } => *job_id,
+            ParentCall::ReadThread { .. } => {
+                return Err("read_ox_thread is answered separately.".into());
+            }
         };
+        if self.workers.job(job_id).is_none()
+            && let Some(status) = self.unstarted_job(&me, job_id)
+        {
+            return match call {
+                ParentCall::Steer { .. } => Err(format!(
+                    "This worker has not started: {}.",
+                    status["status"].as_str().unwrap_or("waiting")
+                )),
+                ParentCall::Cancel { .. } => Ok(self
+                    .withdraw(job_id)
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or(status)),
+                _ => Ok(status),
+            };
+        }
         let (scope, id) = self
             .workers
             .job(job_id)
@@ -1304,9 +1554,10 @@ impl Engine {
             .map(|(s, id, _)| (s.clone(), id.to_owned()))
             .ok_or("Unknown worker job for this parent session.")?;
         match call {
-            ParentCall::List | ParentCall::Bind { .. } | ParentCall::Status { .. } => {
-                self.job_status(job_id)
-            }
+            ParentCall::List
+            | ParentCall::Bind { .. }
+            | ParentCall::Status { .. }
+            | ParentCall::ReadThread { .. } => self.job_status(job_id),
             ParentCall::Steer { text, .. } => {
                 let text = text.trim();
                 if text.is_empty() || text.len() > 24 * 1024 {
@@ -1481,7 +1732,11 @@ fn advance_launch(live: &mut Live) -> Option<String> {
     if live.store.state() != &Connection::Ready {
         return None;
     }
-    let preset = l.origin.requested.preset(l.origin.runtime);
+    let preset = l
+        .origin
+        .started
+        .unwrap_or_else(|| l.origin.requested.preset(l.origin.runtime));
+    let goal = matches!(&l.payload, Payload::Worker(w) if w.mode == WorkerMode::Goal);
     match l.stage {
         Stage::Opening if live.store.can_send(None) => {
             l.stage = Stage::AccessRequested;
@@ -1491,15 +1746,11 @@ fn advance_launch(live: &mut Live) -> Option<String> {
             advance_launch(live)
         }
         Stage::AccessRequested
-            if l.start.mode == WorkerMode::Goal
-                && (!live.store.has_command_schema() || live.store.commands_loading()) =>
+            if goal && (!live.store.has_command_schema() || live.store.commands_loading()) =>
         {
             None
         }
-        Stage::AccessRequested
-            if l.start.mode == WorkerMode::Goal
-                && !live.store.command_caps(None).supports_goal() =>
-        {
+        Stage::AccessRequested if goal && !live.store.command_caps(None).supports_goal() => {
             Some("Codex Goal mode is not enabled on the worker's route.".into())
         }
         Stage::AccessRequested
@@ -1508,11 +1759,14 @@ fn advance_launch(live: &mut Live) -> Option<String> {
                     || live.store.applied_access(None) == Some(preset)) =>
         {
             l.stage = Stage::Sent;
-            let prompt = l.start.prompt();
-            let action = if l.start.mode == WorkerMode::Goal {
-                Action::NativeCommand(None, prompt)
-            } else {
-                Action::SendText(None, prompt)
+            let action = match &mut l.payload {
+                Payload::Worker(start) if start.mode == WorkerMode::Goal => {
+                    Action::NativeCommand(None, start.prompt())
+                }
+                Payload::Worker(start) => Action::SendText(None, start.prompt()),
+                Payload::Handoff { text, items, .. } => {
+                    Action::InjectHandoff(std::mem::take(text), std::mem::take(items))
+                }
             };
             live.store.dispatch(action).err().map(|e| e.to_string())
         }
@@ -1521,15 +1775,66 @@ fn advance_launch(live: &mut Live) -> Option<String> {
 }
 
 /// Publish each session's stamp with its row. A hosted parent nests the worker
-/// across scopes through `origin.parent.scope`.
-fn annotate(workers: &Registry, scope: &Scope, store: &mut Store) {
+/// across scopes through `origin.parent.scope`; a handoff target does not nest.
+/// A handoff source lists where it was handed off to, and a session with a YOLO
+/// grant lists the running children that grant allowed.
+fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, store: &mut Store) {
+    use ox_desk_core::origin::Relation;
+    type Notes = BTreeMap<String, (Option<String>, serde_json::Map<String, Value>)>;
+    let mut out: Notes = BTreeMap::new();
     for (id, entry) in workers.in_scope(scope) {
         let o = &entry.origin;
-        store.annotate_session(
-            id,
-            o.parent.scope.as_ref().and(o.parent.session.clone()),
-            json!({"origin": o, "worker_marks": entry.marks, "worker": true}),
-        );
+        let nests = o.relation != Relation::Handoff && o.handoff.is_none();
+        let e = out.entry(id.to_owned()).or_default();
+        if nests {
+            e.0 = o.parent.scope.as_ref().and(o.parent.session.clone());
+        }
+        e.1.insert("origin".into(), json!(o));
+        e.1.insert("worker_marks".into(), json!(entry.marks));
+        e.1.insert("worker".into(), nests.into());
+    }
+    let mut push = |id: &str, key: &str, value: Value| {
+        let e = out.entry(id.to_owned()).or_default();
+        let list = e.1.entry(key.to_owned()).or_insert_with(|| json!([]));
+        if let Some(list) = list.as_array_mut() {
+            list.push(value);
+        }
+    };
+    for (s, id, entry) in workers.all() {
+        let o = &entry.origin;
+        if o.relation == Relation::Handoff
+            && let Some(h) = o.handoff.as_ref().filter(|h| &h.scope == scope)
+        {
+            push(
+                &h.session,
+                "handed_off_to",
+                json!({"scope": s, "session": id, "runtime": o.runtime, "route": o.route, "label": o.route.label()}),
+            );
+        }
+    }
+    for h in &data.handoffs {
+        if let Some(src) = h.origin.handoff.as_ref().filter(|src| &src.scope == scope) {
+            push(
+                &src.session,
+                "handoff_attempts",
+                json!({"id": h.id, "scope": h.target, "status": h.status, "message": h.message, "label": h.target.route.label()}),
+            );
+        }
+    }
+    for g in data.grants.iter().filter(|g| &g.scope == scope) {
+        let children: Vec<Value> = workers
+            .all()
+            .filter(|(_, _, e)| {
+                matches!(&e.origin.yolo, Some(YoloAllowance::Grant { session: Some(s), .. }) if s == &g.session)
+            })
+            .map(|(s, id, _)| json!({"scope": s, "session": id}))
+            .collect();
+        let e = out.entry(g.session.clone()).or_default();
+        e.1.insert("yolo_grant".into(), true.into());
+        e.1.insert("yolo_children".into(), children.into());
+    }
+    for (id, (parent, detail)) in out {
+        store.annotate_session(&id, parent, Value::Object(detail));
     }
 }
 fn key_ok(reply: &Replier) -> bool {
@@ -1636,7 +1941,7 @@ mod tests {
         use super::*;
         use ox_desk_core::{
             host_protocol::{AskView, Timeline},
-            origin::{ExternalCaller, ParentRef, Relation},
+            origin::{Ceiling, ExternalCaller, ParentRef, Relation},
             runtime::{Access, Runtime},
             store::ThreadRow,
         };
@@ -1687,6 +1992,27 @@ mod tests {
             active: &[&str],
             asks: Vec<AskView>,
         ) -> (Live, Log) {
+            let transcripts = active
+                .iter()
+                .map(|id| {
+                    (
+                        *id,
+                        Timeline {
+                            items: vec![],
+                            detail: json!({"active": "t1", "ready": true}),
+                        },
+                    )
+                })
+                .collect();
+            live_with(scope, sessions, transcripts, asks)
+        }
+        /// A runtime stand-in with the given transcripts.
+        fn live_with(
+            scope: &Scope,
+            sessions: Vec<wire::SessionView>,
+            transcripts: Vec<(&str, Timeline)>,
+            asks: Vec<AskView>,
+        ) -> (Live, Log) {
             let log: Log = Default::default();
             let record = log.clone();
             let mut store = Store::remote_client(
@@ -1700,18 +2026,6 @@ mod tests {
                     Ok("sent".into())
                 },
             );
-            let transcripts = active
-                .iter()
-                .map(|id| {
-                    (
-                        id.to_string(),
-                        Timeline {
-                            items: vec![],
-                            detail: json!({"active": "t1", "ready": true}),
-                        },
-                    )
-                })
-                .collect();
             store.apply(LinkEvent::Host(Box::new(Server::Snapshot {
                 cursor: Cursor {
                     epoch: "e".into(),
@@ -1723,7 +2037,10 @@ mod tests {
                     capabilities: vec!["start".into()],
                     sessions,
                     asks,
-                    transcripts,
+                    transcripts: transcripts
+                        .into_iter()
+                        .map(|(id, t)| (id.to_owned(), t))
+                        .collect(),
                     detail: json!({}),
                 }],
             })));
@@ -1758,6 +2075,10 @@ mod tests {
                 requested: Ceiling::Read,
                 ceiling,
                 source: None,
+                started: None,
+                decided: None,
+                yolo: None,
+                handoff: None,
             }
         }
         fn scopes(root: &Path) -> (Scope, Scope) {
@@ -1785,7 +2106,9 @@ mod tests {
                 model: Some("fixture".into()),
                 mode: WorkerMode::Session,
                 task: "check".into(),
-                write,
+                write: Some(write),
+                permission: None,
+                yolo_confirmed: false,
             }
         }
 
@@ -1887,7 +2210,7 @@ mod tests {
                     .accept_launch(&hinted, start(true))
                     .err()
                     .unwrap()
-                    .contains("ceiling")
+                    .contains("above the source")
             );
             assert!(!engine.running.contains_key(&worker));
         }
@@ -2252,10 +2575,16 @@ mod tests {
                     model: Some("fixture".into()),
                     mode: WorkerMode::Session,
                     task: "fix".into(),
-                    write: true,
+                    write: Some(true),
+                    permission: None,
+                    yolo_confirmed: false,
                 },
                 41,
-                Ceiling::Write,
+                ox_desk_core::modes::Resolved {
+                    level: Ceiling::Write,
+                    access: Access::Workspace,
+                    decision: ox_desk_core::modes::Decision::Lowered,
+                },
             );
             assert_eq!(
                 started.parent.session.as_deref(),
@@ -2416,6 +2745,815 @@ mod tests {
                 engine.parent_call(&caller, ParentCall::List).unwrap()["jobs"][0]["job_id"],
                 41
             );
+        }
+
+        fn timeline(items: &[(&str, &str, &str)], active: bool) -> Timeline {
+            Timeline {
+                items: items
+                    .iter()
+                    .map(|(id, role, text)| wire::TimelineItem {
+                        turn: format!("turn-{id}"),
+                        id: (*id).into(),
+                        role: (*role).into(),
+                        text: (*text).into(),
+                        revision: 1,
+                        detail: match *role {
+                            "user" => json!({"UserMessage": {"content": [{"text": text}]}}),
+                            "thinking" => json!({"Reasoning": {"summary": [text]}}),
+                            "tool" => json!({"item": {"CommandExecution": {
+                                "command": text, "status": "completed",
+                                "aggregated_output": "ok", "exit_code": 0}}, "exit": 0}),
+                            _ => json!({"update": false}),
+                        },
+                    })
+                    .collect(),
+                detail: if active {
+                    json!({"active": "t1", "ready": true})
+                } else {
+                    json!({"ready": true})
+                },
+            }
+        }
+        fn inherit(runtime: Runtime) -> WorkerStart {
+            WorkerStart {
+                runtime,
+                write: None,
+                ..start(false)
+            }
+        }
+        fn launched(a: Result<Accepted, String>) -> Origin {
+            match a {
+                Ok(Accepted::Launch(_, l)) => l.origin,
+                Ok(Accepted::Ask(_)) => panic!("asked the operator"),
+                Err(e) => panic!("{e}"),
+            }
+        }
+        fn routes(root: &Path) -> (Scope, Scope, Scope) {
+            let (parent, worker) = scopes(root);
+            let claude = Scope {
+                route: Runtime::Claude.route(Some("fixture".into())),
+                ..parent.clone()
+            };
+            (parent, worker, claude)
+        }
+        fn with_parent(engine: &mut Engine, parent: &Scope, access: &str) {
+            engine.running.insert(
+                parent.clone(),
+                live(
+                    parent,
+                    vec![view(parent, "a", "running", access)],
+                    &["a"],
+                    vec![],
+                )
+                .0,
+            );
+        }
+        fn thread(scope: &Scope, id: &str) -> Caller {
+            Caller::Hosted {
+                scope: scope.clone(),
+                hint: Some(id.into()),
+                launch: "helper".into(),
+            }
+        }
+
+        #[test]
+        fn workers_inherit_the_mapped_mode_lower_on_request_and_classifiers_need_no_ask() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker, claude) = routes(root.path());
+            for scope in [&worker, &claude] {
+                engine
+                    .running
+                    .insert(scope.clone(), live(scope, vec![], &[], vec![]).0);
+            }
+            use ox_desk_core::modes::{Decision, Level, ModeRequest};
+            for (access, runtime, request, expect, decided) in [
+                (
+                    "workspace",
+                    Runtime::Codex,
+                    None,
+                    Access::Workspace,
+                    Decision::Inherited,
+                ),
+                (
+                    "workspace",
+                    Runtime::Claude,
+                    None,
+                    Access::AcceptEdits,
+                    Decision::Inherited,
+                ),
+                (
+                    "workspace",
+                    Runtime::Codex,
+                    Some(Level::Read),
+                    Access::ReadOnly,
+                    Decision::Lowered,
+                ),
+                (
+                    "auto_review",
+                    Runtime::Claude,
+                    None,
+                    Access::Auto,
+                    Decision::Inherited,
+                ),
+                (
+                    "auto_review",
+                    Runtime::Codex,
+                    None,
+                    Access::AutoReview,
+                    Decision::Inherited,
+                ),
+            ] {
+                with_parent(&mut engine, &parent, access);
+                let mut s = inherit(runtime);
+                s.permission = request.map(ModeRequest::Level);
+                let o = launched(engine.accept_launch(&thread(&parent, "a"), s));
+                assert_eq!(
+                    (o.started, o.decided),
+                    (Some(expect), Some(decided)),
+                    "{access} {runtime:?}"
+                );
+                assert!(o.yolo.is_none());
+            }
+            // Old callers: workspace_write false is read, true is write, capped by the source.
+            with_parent(&mut engine, &parent, "read_only");
+            let o = launched(engine.accept_launch(&thread(&parent, "a"), start(false)));
+            assert_eq!(o.started, Some(Access::ReadOnly));
+            let err = engine
+                .accept_launch(&thread(&parent, "a"), start(true))
+                .err()
+                .unwrap();
+            assert!(err.contains("above the source"), "{err}");
+            // A request above the source is refused before anything starts.
+            let mut above = inherit(Runtime::Codex);
+            above.permission = Some(ModeRequest::Level(Level::Yolo));
+            assert!(engine.accept_launch(&thread(&parent, "a"), above).is_err());
+            // An unverified parent mode grants nothing.
+            with_parent(&mut engine, &parent, "configured");
+            assert!(
+                engine
+                    .accept_launch(&thread(&parent, "a"), inherit(Runtime::Codex))
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn a_yolo_child_waits_for_the_operator_who_accepts_one_and_declines_another() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker, _) = routes(root.path());
+            with_parent(&mut engine, &parent, "yolo");
+            engine
+                .running
+                .insert(worker.clone(), live(&worker, vec![], &[], vec![]).0);
+            let request = |engine: &mut Engine, confirmed: bool| {
+                let (done, result) = std::sync::mpsc::sync_channel(1);
+                let mut s = inherit(Runtime::Codex);
+                // An agent cannot confirm YOLO for itself.
+                s.yolo_confirmed = confirmed;
+                engine
+                    .launch(thread(&parent, "a"), s, Replier::Channel(done))
+                    .unwrap();
+                result.try_recv().unwrap().unwrap()
+            };
+            let first = request(&mut engine, true);
+            assert_eq!(first["status"], "waiting_for_operator");
+            assert_eq!(first["waiting_for_operator"]["reason"], "yolo_acceptance");
+            assert!(
+                engine.running[&worker].launching.is_none(),
+                "nothing started"
+            );
+            let job = first["job_id"].as_u64().unwrap();
+            let ask = engine.running[&parent]
+                .state
+                .asks
+                .iter()
+                .find(|a| crate::yolo::job_of(&a.id) == Some(job))
+                .cloned()
+                .expect("an operator ask on the parent session");
+            assert_eq!(ask.thread.as_deref(), Some("a"));
+            assert_eq!(
+                ask.choices,
+                ["Accept YOLO", "Start in Auto-review", "Decline"]
+            );
+            for part in [
+                "Parent: a",
+                "Runtime: Codex",
+                "Route: OX API · fixture",
+                "Model: fixture",
+                "Task: check",
+            ] {
+                assert!(ask.detail.contains(part), "{part} in {}", ask.detail);
+            }
+            assert!(!ask.token.is_empty());
+            // The parent sees waiting_for_operator and has no way to answer.
+            let status = engine
+                .parent_call(&thread(&parent, "a"), ParentCall::Status { job_id: job })
+                .unwrap();
+            assert_eq!(status["status"], "waiting_for_operator");
+            assert!(
+                engine
+                    .parent_call(
+                        &thread(&parent, "a"),
+                        ParentCall::Steer {
+                            job_id: job,
+                            text: "yes".into()
+                        }
+                    )
+                    .is_err()
+            );
+            assert!(
+                crate::workers::parent_call(json!({"op":"answer","job_id":job,"choice":0}))
+                    .is_err()
+            );
+            assert_eq!(
+                engine
+                    .parent_call(&thread(&parent, "a"), ParentCall::List)
+                    .unwrap()["jobs"][0]["status"],
+                "waiting_for_operator"
+            );
+            // A stale token is refused; the operator accepts with the live one.
+            assert!(
+                engine
+                    .act(
+                        7,
+                        "x",
+                        &parent,
+                        Action::AnswerAsk(ask.id.clone(), 0),
+                        Some("stale".into())
+                    )
+                    .is_err()
+            );
+            engine
+                .act(
+                    7,
+                    "y1",
+                    &parent,
+                    Action::AnswerAsk(ask.id.clone(), 0),
+                    Some(ask.token.clone()),
+                )
+                .unwrap();
+            let l = engine.running[&worker]
+                .launching
+                .as_ref()
+                .expect("launch after acceptance");
+            assert_eq!(l.origin.job_id, job);
+            assert_eq!(l.origin.started, Some(Access::Yolo));
+            assert!(
+                matches!(&l.origin.yolo, Some(YoloAllowance::Accepted { request, .. }) if request.ends_with(&job.to_string()))
+            );
+            assert_eq!(
+                engine
+                    .parent_call(&thread(&parent, "a"), ParentCall::Status { job_id: job })
+                    .unwrap()["status"],
+                "starting"
+            );
+            assert!(
+                !engine.running[&parent]
+                    .state
+                    .asks
+                    .iter()
+                    .any(crate::yolo::is_request)
+            );
+            // A second request is declined.
+            let second = request(&mut engine, false)["job_id"].as_u64().unwrap();
+            engine.process(&parent, vec![], true).unwrap();
+            let ask = engine.running[&parent]
+                .state
+                .asks
+                .iter()
+                .find(|a| crate::yolo::job_of(&a.id) == Some(second))
+                .cloned()
+                .unwrap();
+            engine
+                .act(
+                    7,
+                    "y2",
+                    &parent,
+                    Action::AnswerAsk(ask.id, 2),
+                    Some(ask.token),
+                )
+                .unwrap();
+            let status = engine
+                .parent_call(&thread(&parent, "a"), ParentCall::Status { job_id: second })
+                .unwrap();
+            assert_eq!(status["status"], "declined");
+            // The ledger says which acceptance allowed nothing yet, and never stores the task.
+            let saved = std::fs::read_to_string(root.path().join("ownership-v1.json")).unwrap();
+            assert!(saved.contains("declined") && !saved.contains("\"task\""));
+            // "Start in Auto-review" starts the child below YOLO.
+            let third = request(&mut engine, false)["job_id"].as_u64().unwrap();
+            engine.running.get_mut(&worker).unwrap().launching = None;
+            let ask = engine.running[&parent]
+                .state
+                .asks
+                .iter()
+                .find(|a| crate::yolo::job_of(&a.id) == Some(third))
+                .cloned()
+                .unwrap();
+            engine
+                .act(
+                    7,
+                    "y3",
+                    &parent,
+                    Action::AnswerAsk(ask.id, 1),
+                    Some(ask.token),
+                )
+                .unwrap();
+            let l = engine.running[&worker].launching.as_ref().unwrap();
+            assert_eq!(l.origin.started, Some(Access::AutoReview));
+            assert!(l.origin.yolo.is_none());
+            assert_eq!(
+                l.origin.decided,
+                Some(ox_desk_core::modes::Decision::Capped)
+            );
+        }
+
+        #[test]
+        fn a_grant_covers_descendants_and_revoking_it_makes_the_next_spawn_ask() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker, _) = routes(root.path());
+            with_parent(&mut engine, &parent, "yolo");
+            engine.running.insert(
+                worker.clone(),
+                live(
+                    &worker,
+                    vec![view(&worker, "w", "running", "yolo")],
+                    &["w"],
+                    vec![],
+                )
+                .0,
+            );
+            engine
+                .act(1, "g1", &parent, Action::YoloGrant("a".into(), true), None)
+                .unwrap();
+            let o = launched(engine.accept_launch(&thread(&parent, "a"), inherit(Runtime::Codex)));
+            assert_eq!(o.started, Some(Access::Yolo));
+            assert!(
+                matches!(&o.yolo, Some(YoloAllowance::Grant { session: Some(s), .. }) if s == "a")
+            );
+            // A YOLO worker of the granted session is covered too.
+            let mut child = origin(workers_parent(&parent, "a"), Ceiling::Yolo);
+            child.yolo = o.yolo.clone();
+            engine.workers.stamp(&worker, "w", child);
+            engine.process(&parent, vec![], true).unwrap();
+            let row = engine.running[&parent]
+                .state
+                .sessions
+                .iter()
+                .find(|r| r.id == "a")
+                .unwrap();
+            assert_eq!(row.detail["yolo_grant"], true);
+            assert_eq!(row.detail["yolo_children"][0]["session"], "w");
+            let nested =
+                launched(engine.accept_launch(&thread(&worker, "w"), inherit(Runtime::Codex)));
+            assert!(matches!(nested.yolo, Some(YoloAllowance::Grant { .. })));
+            // Revoking affects new spawns only; the running child keeps its stamp.
+            engine
+                .act(1, "g2", &parent, Action::YoloGrant("a".into(), false), None)
+                .unwrap();
+            assert!(matches!(
+                engine.accept_launch(&thread(&parent, "a"), inherit(Runtime::Codex)),
+                Ok(Accepted::Ask(_))
+            ));
+            assert!(matches!(
+                engine.accept_launch(&thread(&worker, "w"), inherit(Runtime::Codex)),
+                Ok(Accepted::Ask(_))
+            ));
+            assert_eq!(
+                engine.workers.get(&worker, "w").unwrap().origin.started,
+                None
+            );
+            assert!(
+                engine
+                    .workers
+                    .get(&worker, "w")
+                    .unwrap()
+                    .origin
+                    .yolo
+                    .is_some()
+            );
+            // The operator's own /worker needs the YOLO confirmation instead.
+            let operator = Caller::Operator {
+                scope: parent.clone(),
+                parent: "a".into(),
+                device: "client-1".into(),
+            };
+            engine.running.insert(
+                parent.clone(),
+                live_with(
+                    &parent,
+                    vec![view(&parent, "a", "idle", "yolo")],
+                    vec![("a", timeline(&[], false))],
+                    vec![],
+                )
+                .0,
+            );
+            assert!(
+                engine
+                    .accept_launch(&operator, inherit(Runtime::Codex))
+                    .err()
+                    .unwrap()
+                    .contains("Confirm YOLO")
+            );
+            let mut confirmed = inherit(Runtime::Codex);
+            confirmed.yolo_confirmed = true;
+            let o = launched(engine.accept_launch(&operator, confirmed));
+            assert!(matches!(o.yolo, Some(YoloAllowance::Operator { .. })));
+        }
+
+        #[test]
+        fn a_host_restart_declines_a_pending_yolo_request() {
+            let root = tempfile::tempdir().unwrap();
+            let (parent, worker, _) = routes(root.path());
+            let job = {
+                let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+                let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+                with_parent(&mut engine, &parent, "bypass_permissions");
+                engine
+                    .running
+                    .insert(worker.clone(), live(&worker, vec![], &[], vec![]).0);
+                let (done, result) = std::sync::mpsc::sync_channel(1);
+                // A Claude parent in bypass: the parent scope here is Codex, so use the table directly.
+                let mut s = inherit(Runtime::Codex);
+                s.permission = None;
+                engine.running.insert(
+                    parent.clone(),
+                    live(
+                        &parent,
+                        vec![view(&parent, "a", "running", "yolo")],
+                        &["a"],
+                        vec![],
+                    )
+                    .0,
+                );
+                engine
+                    .launch(thread(&parent, "a"), s, Replier::Channel(done))
+                    .unwrap();
+                result.try_recv().unwrap().unwrap()["job_id"]
+                    .as_u64()
+                    .unwrap()
+            };
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            assert!(engine.asking.is_empty() && engine.ledger.data.asking.is_empty());
+            with_parent(&mut engine, &parent, "yolo");
+            let status = engine
+                .parent_call(&thread(&parent, "a"), ParentCall::Status { job_id: job })
+                .unwrap();
+            assert_eq!(status["status"], "declined");
+            assert!(status["error"].as_str().unwrap().contains("restarted"));
+            assert!(
+                !engine.running.contains_key(&worker),
+                "nothing is relaunched"
+            );
+        }
+
+        fn claude_source(root: &Path) -> Scope {
+            Scope {
+                project: root.canonicalize().unwrap(),
+                route: Runtime::Claude.route(None),
+            }
+        }
+
+        #[test]
+        fn a_handoff_is_refused_while_the_source_is_busy_and_names_what_is_pending() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let source = claude_source(root.path());
+            let handoff = |request: &str| {
+                Action::StartHandoff(HandoffStart {
+                    source: "s".into(),
+                    runtime: Runtime::Codex,
+                    model: Some("fixture".into()),
+                    mode: Default::default(),
+                    request: request.into(),
+                    yolo_confirmed: false,
+                })
+            };
+            engine.running.insert(
+                source.clone(),
+                live_with(
+                    &source,
+                    vec![view(&source, "s", "running", "accept_edits")],
+                    vec![("s", timeline(&[("u1", "user", "hi")], true))],
+                    vec![],
+                )
+                .0,
+            );
+            let err = engine
+                .act(1, "h1", &source, handoff("next"), None)
+                .unwrap_err();
+            assert!(err.to_string().contains("running a turn"), "{err}");
+            let ask = AskView {
+                command: None,
+                id: RequestId::Number(4),
+                token: "t".into(),
+                thread: Some("s".into()),
+                turn: Some("t1".into()),
+                item: None,
+                choice_details: vec![None],
+                title: "Run cargo test".into(),
+                detail: String::new(),
+                choices: vec!["Allow".into()],
+                questions: vec![],
+            };
+            engine.running.insert(
+                source.clone(),
+                live_with(
+                    &source,
+                    vec![view(&source, "s", "needs_input", "accept_edits")],
+                    vec![("s", timeline(&[("u1", "user", "hi")], false))],
+                    vec![ask],
+                )
+                .0,
+            );
+            let err = engine
+                .act(1, "h2", &source, handoff("next"), None)
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("1 pending request: Run cargo test"),
+                "{err}"
+            );
+            assert!(engine.preparing.is_empty());
+            assert!(engine.ledger.data.handoffs.is_empty(), "nothing started");
+        }
+
+        #[test]
+        fn a_handoff_carries_real_messages_stamps_references_and_fails_on_restart() {
+            let root = tempfile::tempdir().unwrap();
+            let source = claude_source(root.path());
+            let (_, target) = scopes(root.path());
+            let items = [
+                ("u1", "user", "first request"),
+                ("c1", "tool", "cargo test"),
+                ("a1", "assistant", "tests pass"),
+                ("r1", "thinking", "private reasoning"),
+                ("u2", "user", "second request"),
+                ("a2", "assistant", "partial repl"),
+            ];
+            {
+                let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+                let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+                engine.running.insert(
+                    source.clone(),
+                    live_with(
+                        &source,
+                        vec![view(&source, "s", "idle", "accept_edits")],
+                        vec![("s", timeline(&items, false))],
+                        vec![],
+                    )
+                    .0,
+                );
+                let (l, log) = live(&target, vec![], &[], vec![]);
+                engine.running.insert(target.clone(), l);
+                engine
+                    .act(
+                        1,
+                        "h1",
+                        &source,
+                        Action::StartHandoff(HandoffStart {
+                            source: "s".into(),
+                            runtime: Runtime::Codex,
+                            model: Some("fixture".into()),
+                            mode: Default::default(),
+                            request: "now do this".into(),
+                            yolo_confirmed: false,
+                        }),
+                        None,
+                    )
+                    .unwrap();
+                engine.process(&source, vec![], true).unwrap();
+                let l = engine.running[&target]
+                    .launching
+                    .as_ref()
+                    .expect("target opening");
+                let o = &l.origin;
+                assert_eq!(o.relation, ox_desk_core::origin::Relation::Handoff);
+                assert_eq!(
+                    o.started,
+                    Some(Access::Workspace),
+                    "Accept edits maps to Workspace"
+                );
+                let h = o.handoff.as_ref().unwrap();
+                assert_eq!((h.session.as_str(), h.runtime), ("s", Runtime::Claude));
+                assert_eq!(h.selection.items, ["u1", "c1", "a1", "u2", "a2"]);
+                assert_eq!(h.selection.omitted, 0);
+                assert!(matches!(
+                    log.lock().unwrap()[0].0,
+                    Action::SetNextAccess(Access::Workspace)
+                ));
+                // The stand-in runtime confirms the preset, as a native store does.
+                let confirm = LinkEvent::Host(Box::new(Server::Delta {
+                    cursor: Cursor {
+                        epoch: "e".into(),
+                        seq: 3,
+                    },
+                    scope: target.clone(),
+                    changes: vec![Change::State {
+                        connection: "ready".into(),
+                        capabilities: vec!["start".into()],
+                        detail: json!({"next_access": "workspace"}),
+                    }],
+                }));
+                engine.process(&target, vec![confirm], false).unwrap();
+                // The target received the real messages, in order, then the request.
+                let sent = log.lock().unwrap().clone();
+                let (text, carried) = sent
+                    .iter()
+                    .find_map(|(a, _)| match a {
+                        Action::InjectHandoff(text, items) => Some((text.clone(), items.clone())),
+                        _ => None,
+                    })
+                    .expect("the first turn was sent");
+                assert_eq!(text, "now do this");
+                let texts: Vec<(String, String)> = carried
+                    .iter()
+                    .skip(1)
+                    .map(|i| {
+                        (
+                            i["role"].as_str().unwrap().into(),
+                            i["content"][0]["text"].as_str().unwrap().into(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    texts,
+                    [
+                        ("user", "first request"),
+                        ("assistant", "[Command `cargo test` exited 0]"),
+                        ("assistant", "tests pass"),
+                        ("user", "second request"),
+                        ("assistant", "partial repl"),
+                    ]
+                    .map(|(a, b)| (a.to_owned(), b.to_owned()))
+                );
+                // The ledger keeps references, never message text.
+                let saved = std::fs::read_to_string(root.path().join("ownership-v1.json")).unwrap();
+                assert!(saved.contains("\"starting\"") && saved.contains("\"u2\""));
+                for text in [
+                    "first request",
+                    "tests pass",
+                    "now do this",
+                    "private reasoning",
+                ] {
+                    assert!(!saved.contains(text), "{text} is not stored");
+                }
+            }
+            // The host restarts before the target's first turn completes: failed, never retried.
+            let (tx, rx) = std::sync::mpsc::sync_channel(64);
+            let engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            assert!(engine.running.is_empty());
+            assert!(rx.try_recv().is_err());
+            let h = &engine.ledger.data.handoffs[0];
+            assert_eq!(h.status, "failed");
+            assert!(
+                h.message
+                    .as_deref()
+                    .unwrap()
+                    .contains("Nothing was retried")
+            );
+        }
+
+        #[test]
+        fn read_ox_thread_reads_only_the_callers_own_chain_in_its_project() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let source = claude_source(root.path());
+            let (_, target) = scopes(root.path());
+            let back = Scope {
+                route: Runtime::Claude.route(Some("other".into())),
+                ..source.clone()
+            };
+            engine.running.insert(
+                source.clone(),
+                live_with(
+                    &source,
+                    vec![view(&source, "s", "idle", "default")],
+                    vec![(
+                        "s",
+                        timeline(
+                            &[("u1", "user", "first"), ("a1", "assistant", "long answer")],
+                            false,
+                        ),
+                    )],
+                    vec![],
+                )
+                .0,
+            );
+            engine.running.insert(
+                target.clone(),
+                live_with(
+                    &target,
+                    vec![
+                        view(&target, "t", "running", "workspace"),
+                        view(&target, "x", "running", "workspace"),
+                    ],
+                    vec![
+                        ("t", timeline(&[("v1", "user", "codex turn")], true)),
+                        ("x", timeline(&[], true)),
+                    ],
+                    vec![],
+                )
+                .0,
+            );
+            engine.running.insert(
+                back.clone(),
+                live_with(
+                    &back,
+                    vec![view(&back, "b", "running", "default")],
+                    vec![("b", timeline(&[], true))],
+                    vec![],
+                )
+                .0,
+            );
+            let stamp = |from: &Scope, session: &str, project: &Path| {
+                let mut o = origin(workers_parent(from, session), Ceiling::Write);
+                o.relation = ox_desk_core::origin::Relation::Handoff;
+                o.handoff = Some(Box::new(ox_desk_core::handoff::HandoffSource {
+                    scope: Scope {
+                        project: project.to_owned(),
+                        route: from.route.clone(),
+                    },
+                    session: session.into(),
+                    native: None,
+                    title: session.into(),
+                    runtime: from.route.runtime,
+                    route: from.route.clone(),
+                    source_access: None,
+                    source_level: None,
+                    decision: ox_desk_core::modes::Decision::Inherited,
+                    selection: Default::default(),
+                }));
+                o
+            };
+            let project = source.project.clone();
+            engine
+                .workers
+                .stamp(&target, "t", stamp(&source, "s", &project));
+            engine
+                .workers
+                .stamp(&back, "b", stamp(&target, "t", &project));
+            let read =
+                |engine: &mut Engine, caller: Caller, session: Option<&str>, item: Option<&str>| {
+                    let (done, result) = std::sync::mpsc::sync_channel(1);
+                    engine
+                        .read_thread(
+                            &caller,
+                            ParentCall::ReadThread {
+                                session: session.map(Into::into),
+                                item: item.map(Into::into),
+                                after: None,
+                                limit: None,
+                            },
+                            Replier::Channel(done),
+                        )
+                        .unwrap();
+                    result.try_recv().expect("answered at once")
+                };
+            // The Codex target reads an omitted item of its Claude source in full.
+            let page = read(&mut engine, thread(&target, "t"), None, Some("a1")).unwrap();
+            assert_eq!(page["items"][0]["text"], "long answer");
+            // The second handoff reads the whole chain, back to the first source.
+            let page = read(&mut engine, thread(&back, "b"), Some("s"), None).unwrap();
+            assert_eq!(page["items"][0]["text"], "first");
+            let page = read(&mut engine, thread(&back, "b"), None, None).unwrap();
+            assert_eq!(page["items"][0]["text"], "codex turn");
+            // A sibling session on the same app-server has no chain; the source itself has none.
+            assert!(
+                read(&mut engine, thread(&target, "x"), None, None)
+                    .unwrap_err()
+                    .contains("no source")
+            );
+            assert!(
+                read(&mut engine, thread(&target, "t"), Some("x"), None)
+                    .unwrap_err()
+                    .contains("not in this session's handoff chain")
+            );
+            // A source outside the caller's project is refused.
+            engine
+                .workers
+                .stamp(&target, "x", stamp(&source, "s", Path::new("/elsewhere")));
+            assert!(
+                read(&mut engine, thread(&target, "x"), None, None)
+                    .unwrap_err()
+                    .contains("outside")
+            );
+            // A terminal launch is not a hosted session.
+            let terminal = Caller::External(ExternalCaller {
+                project: project.clone(),
+                runtime: Runtime::Codex,
+                session: Some("t".into()),
+                launch: "l".into(),
+            });
+            assert!(read(&mut engine, terminal, None, None).is_err());
         }
     }
 }

@@ -290,6 +290,63 @@
         {
           "additionalProperties": false,
           "properties": {
+            "start_handoff": {
+              "$ref": "#/$defs/HandoffStart"
+            }
+          },
+          "required": [
+            "start_handoff"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "yolo_grant": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "boolean"
+                }
+              ],
+              "type": "array"
+            }
+          },
+          "required": [
+            "yolo_grant"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "inject_handoff": {
+              "maxItems": 2,
+              "minItems": 2,
+              "prefixItems": [
+                {
+                  "type": "string"
+                },
+                {
+                  "items": true,
+                  "type": "array"
+                }
+              ],
+              "type": "array"
+            }
+          },
+          "required": [
+            "inject_handoff"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
             "terminal_text": {
               "maxItems": 2,
               "minItems": 2,
@@ -1124,6 +1181,43 @@
       ],
       "type": "object"
     },
+    "HandoffStart": {
+      "additionalProperties": false,
+      "description": "An operator's request to continue a session elsewhere.",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/ModeRequest",
+          "default": "inherit"
+        },
+        "model": {
+          "description": "An OX API alias, or none for the runtime's subscription.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request": {
+          "type": "string"
+        },
+        "runtime": {
+          "$ref": "#/$defs/Runtime"
+        },
+        "source": {
+          "type": "string"
+        },
+        "yolo_confirmed": {
+          "default": false,
+          "description": "The client showed the YOLO confirmation for this start.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "source",
+        "runtime",
+        "request"
+      ],
+      "type": "object"
+    },
     "ImageInput": {
       "oneOf": [
         {
@@ -1161,6 +1255,10 @@
           "type": "object"
         }
       ]
+    },
+    "ModeRequest": {
+      "description": "What a launcher asks for. `Inherit` is the default. On the wire it is a\nstring: `inherit`, a level name or a native preset name.",
+      "type": "string"
     },
     "ModelChoice": {
       "oneOf": [
@@ -1288,6 +1386,50 @@
           "required": [
             "op",
             "job_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Read this session's own handoff sources, read-only. `session` names a\nsource in the caller's chain; absent means the nearest one. Pages by item\nID: `after` starts after that item, `item` returns one item in full.",
+          "properties": {
+            "after": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "item": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "limit": {
+              "default": null,
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "op": {
+              "const": "read_thread",
+              "type": "string"
+            },
+            "session": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "op"
           ],
           "type": "object"
         },
@@ -1931,6 +2073,17 @@
         "parent": {
           "type": "string"
         },
+        "permission": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModeRequest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The requested permission mode. Wins over `write`. Absent means inherit."
+        },
         "runtime": {
           "$ref": "#/$defs/Runtime"
         },
@@ -1938,6 +2091,16 @@
           "type": "string"
         },
         "write": {
+          "default": null,
+          "description": "Legacy access request: false is read, true is write. Absent means inherit.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "yolo_confirmed": {
+          "default": false,
+          "description": "An operator start whose client showed the YOLO confirmation.",
           "type": "boolean"
         }
       },
@@ -1945,8 +2108,7 @@
         "parent",
         "runtime",
         "mode",
-        "task",
-        "write"
+        "task"
       ],
       "type": "object"
     }

@@ -210,6 +210,10 @@ fn serve(
             };
             let request = crate::workers::parent_call(call).map(Gateway::Call);
             match request {
+                // A read may wait for the source transcript to load.
+                Ok(
+                    request @ Gateway::Call(ox_desk_core::origin::ParentCall::ReadThread { .. }),
+                ) => answer(&mut socket, &tx, caller, request, 45)?,
                 Ok(request) => answer(&mut socket, &tx, caller, request, 10)?,
                 Err(error) => reply(&mut socket, Err(error))?,
             }

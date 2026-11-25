@@ -126,6 +126,9 @@ pub struct Snapshot {
     pub claude_account: bool,
     pub presets: Vec<(String, ProviderRow)>,
     pub issues: Vec<String>,
+    /// Projects whose sessions grant YOLO to their workers and handoffs by default.
+    #[serde(default)]
+    pub yolo_grant_projects: Vec<std::path::PathBuf>,
 }
 
 // A missing original creates a row. A missing destination removes the named original.

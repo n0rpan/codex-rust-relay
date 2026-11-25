@@ -19,7 +19,9 @@ pub mod transcript;
 
 pub mod keys;
 
+pub mod handoff;
 pub mod mentions;
+pub mod modes;
 pub mod native_catalog;
 pub mod origin;
 pub mod usage;

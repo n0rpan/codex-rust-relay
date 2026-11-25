@@ -130,9 +130,12 @@ export class SessionControls {
       const value = $("permission").value;
       if ($("apply-permission").disabled || !this.allowed.includes(value))
         return;
+      // Choosing YOLO and applying it is the confirmation. The grant is offered with it.
+      const grant = id !== null && bypass(value) && $("yolo-grant").checked;
       this.apply(
         id === null ? { set_next_access: value } : { set_access: [id, value] },
         "permission",
+        grant ? () => this.ctx.act({ yolo_grant: [id, true] }, () => {}) : undefined,
       );
     };
     $("permission").onchange = () => this.render();
@@ -225,11 +228,27 @@ export class SessionControls {
       badge.removeAttribute("aria-label");
     }
     // A worker's mode stays within its recorded ceiling. The host enforces this too.
-    const ceiling = own.origin?.ceiling;
+    // A handoff target belongs to the operator and has no such bound.
+    const ceiling =
+      own.origin?.relation === "handoff" ? null : own.origin?.ceiling;
+    const order = ["read", "write", "classifier", "yolo"];
+    const levelOf = (x) =>
+      order.indexOf(
+        {
+          read_only: "read",
+          default: "read",
+          plan: "read",
+          workspace: "write",
+          accept_edits: "write",
+          auto_review: "classifier",
+          auto: "classifier",
+          yolo: "yolo",
+          bypass_permissions: "yolo",
+        }[x],
+      );
     const withinCeiling = (x) =>
-      !ceiling ||
-      ["read_only", "default", "plan"].includes(x) ||
-      (ceiling === "write" && ["workspace", "accept_edits"].includes(x));
+      !ceiling || (levelOf(x) >= 0 && levelOf(x) <= order.indexOf(ceiling));
+    $("yolo-grant-row").hidden = draft || !bypass($("permission").value);
     this.allowed = (detail.access_choices ?? []).filter(
       (x) => Object.hasOwn(modes, x) && withinCeiling(x),
     );

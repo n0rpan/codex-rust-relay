@@ -71,7 +71,7 @@ pub(crate) fn check(
     active_workers: bool,
 ) -> io::Result<()> {
     if let Action::SetAccess(id, mode) = action {
-        if let Some(origin) = origin {
+        if let Some(origin) = origin.filter(|o| o.bounds_operator()) {
             crate::workers::operator_access(origin, *mode).map_err(io::Error::other)?;
         } else if store
             .catalog_row(id)

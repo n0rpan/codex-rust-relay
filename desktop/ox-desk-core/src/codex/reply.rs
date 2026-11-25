@@ -73,7 +73,8 @@ impl Reply {
                 | Method::Settings
                 | Method::Archive
                 | Method::Rename
-                | Method::Compact,
+                | Method::Compact
+                | Method::InjectItems,
             ) => Self::Acknowledged,
             Some(Method::FindFile) => Self::Files(from_value(value)?),
             Some(Method::Features) => Self::Features(from_value(value)?),

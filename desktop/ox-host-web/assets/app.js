@@ -244,9 +244,18 @@ class Link {
       return;
     }
     if (msg.type === "worker_reply") {
+      if (!msg.error && msg.result?.relation === "handoff") {
+        notice(`Continued in ${routesLabel(msg.result.scope.route)}.`);
+        if (pendingGrant?.key === msg.id)
+          pendingGrant = { scope: msg.result.scope, id: msg.result.session };
+        open(msg.result.scope, msg.result.session);
+        return;
+      }
       notice(
         msg.error ??
-          `Started worker ${msg.result?.job_id} on ${msg.result?.model}. It appears under this session.`,
+          (msg.result?.status === "waiting_for_operator"
+            ? `Worker ${msg.result?.job_id} waits for you to accept YOLO.`
+            : `Started worker ${msg.result?.job_id} on ${msg.result?.model}. It appears under this session.`),
       );
       return;
     }
@@ -260,7 +269,7 @@ class Link {
             ? routesLabel(this.scope.route) + " · " + msg.message
             : msg.message,
         );
-      cb?.(msg.type === "ack", msg.message);
+      cb?.(msg.type === "ack", msg.message, msg.id);
       return;
     }
     if (msg.type === "snapshot" || msg.type === "delta") {
@@ -704,6 +713,14 @@ function drawToolList(group) {
   group.children = next;
 }
 
+function splitHandoff(text) {
+  const open = "<ox-handoff>\n",
+    close = "</ox-handoff>\n\n";
+  if (!text?.startsWith(open)) return null;
+  const end = text.indexOf(close);
+  return end < 0 ? null : [text.slice(0, end + close.length), text.slice(end + close.length)];
+}
+
 function transcript(items) {
   const nodes = [],
     nextRows = new Map(),
@@ -752,9 +769,19 @@ function transcript(items) {
       if (row.item !== i || row.revision !== i.revision) {
         row.item = i;
         row.revision = i.revision;
+        const carried =
+          i.role === "user" ? splitHandoff(i.text) : null;
         if (["assistant", "result", "plan"].includes(i.role))
           messageText(row.text, i.text);
-        else row.text.textContent = i.text;
+        else if (carried) {
+          // A Claude handoff target's first turn: fold the carried context.
+          const fold = el("details", "handoff-context");
+          fold.append(
+            el("summary", "", "Carried handoff context"),
+            el("pre", "", carried[0]),
+          );
+          row.text.replaceChildren(fold, document.createTextNode(carried[1]));
+        } else row.text.textContent = i.text;
         if (["user", "assistant", "result"].includes(i.role)) {
           row.label.replaceChildren(
             document.createTextNode(
@@ -801,8 +828,19 @@ function conversation() {
     " · " +
     routesLabel(row?.detail?.route || scope.route) +
     (origin
-      ? ` · worker ${origin.job_id} · ${origin.ceiling === "write" ? "workspace write" : "read-only"} ceiling`
+      ? origin.relation === "handoff"
+        ? " · handoff"
+        : ` · worker ${origin.job_id} · ${ceilingLabels[origin.ceiling] ?? origin.ceiling} ceiling`
       : "");
+  handoffMarks(row);
+  if (
+    pendingGrant?.id === id &&
+    scopeKey(pendingGrant.scope) === k &&
+    detailLink?.ready
+  ) {
+    pendingGrant = null;
+    detailLink.act({ yolo_grant: [id, true] });
+  }
   const timeline = s?.transcripts[id];
   const inputCaps = id ? caps : (s?.capabilities ?? []);
   updateExtras(s, inputCaps, detailLink, id);
@@ -811,6 +849,7 @@ function conversation() {
   $("older").hidden = !timeline?.detail?.older;
   $("older").onclick = () => detailLink.act({ load_older: id });
   $("start-worker").hidden = !id || !caps.includes("open");
+  $("continue-in").hidden = !id || !caps.includes("open");
   showAsks((s?.asks || []).filter((a) => a.thread === id));
   if (selected.revealLatest && timeline?.items?.length) {
     selected.revealLatest = false;
@@ -964,6 +1003,164 @@ $("new-form").onsubmit = async (e) => {
     notice(error.message);
   }
 };
+const ceilingLabels = {
+  read: "read-only",
+  write: "workspace write",
+  classifier: "classifier",
+  yolo: "YOLO",
+};
+let pendingGrant = null;
+const bypassMode = (m) => m === "yolo" || m === "bypass_permissions";
+// The provider that receives a route's conversation, for the one-line notice.
+const provider = (route) =>
+  route.billing?.api
+    ? `the ${route.billing.api.split("/")[0]} API provider`
+    : route.runtime === "codex"
+      ? "OpenAI (ChatGPT subscription)"
+      : "Anthropic (Claude subscription)";
+function handoffMarks(row) {
+  const box = $("handoff-marks"),
+    d = row?.detail ?? {},
+    origin = d.origin,
+    nodes = [];
+  if (origin?.relation === "handoff" && origin.handoff) {
+    const h = origin.handoff,
+      sel = h.selection ?? {};
+    const why =
+      {
+        inherited: "inherited",
+        lowered: "lowered",
+        operator: "chosen by you",
+        capped: "capped below YOLO",
+      }[origin.decided] ?? "unknown";
+    const p = el(
+      "p",
+      "handoff-marker",
+      `Continued from “${h.title}” · ${routesLabel(h.route)} · mode ${modeLabel(origin.started)} (${why}) · ${sel.carried ?? 0} messages carried, ${sel.omitted ?? 0} omitted`,
+    );
+    p.append(button("Open source", () => open(h.scope, h.session)));
+    nodes.push(p);
+  }
+  for (const to of d.handed_off_to ?? []) {
+    const p = el("p", "handoff-marker", `Handed off to ${to.label}`);
+    p.append(button("Open", () => open(to.scope, to.session)));
+    nodes.push(p);
+  }
+  for (const a of d.handoff_attempts ?? [])
+    nodes.push(
+      el(
+        "p",
+        "handoff-marker",
+        a.status === "failed"
+          ? `Handoff to ${a.label} failed: ${a.message ?? "unknown error"}`
+          : `Handing off to ${a.label}…`,
+      ),
+    );
+  box.replaceChildren(...nodes);
+  box.hidden = !nodes.length;
+  const status = $("yolo-grant-status");
+  if (d.yolo_grant === true && row) {
+    const children = d.yolo_children ?? [];
+    const p = el(
+      "p",
+      "",
+      `YOLO also allowed for this session's workers and handoffs. ${children.length} started under it keep their mode if you revoke.`,
+    );
+    p.append(
+      button("Revoke", () =>
+        detailLink?.act({ yolo_grant: [row.id, false] }, null, (ok, m) => {
+          if (!ok) notice(m || "The host refused.");
+        }),
+      ),
+    );
+    status.replaceChildren(p);
+    status.hidden = false;
+  } else {
+    status.replaceChildren();
+    status.hidden = true;
+  }
+}
+const modeLabel = (m) =>
+  ({
+    read_only: "Read only",
+    workspace: "Workspace",
+    auto_review: "Auto-review",
+    yolo: "YOLO",
+    default: "Default",
+    auto: "Auto",
+    accept_edits: "Accept edits",
+    plan: "Plan",
+    bypass_permissions: "bypass permissions",
+  })[m] ?? "unverified";
+function handoffRoutes() {
+  const runtime = $("handoff-runtime").value;
+  const list = routes.filter((r) => r.runtime === runtime);
+  $("handoff-route").replaceChildren(
+    ...list.map((r, n) => new Option(routesLabel(r), String(routes.indexOf(r)))),
+  );
+  handoffNotice();
+}
+function handoffNotice() {
+  const target = routes[+$("handoff-route").value],
+    source = selected?.scope?.route;
+  const line = $("handoff-provider");
+  if (target && source && provider(target) !== provider(source)) {
+    line.textContent = `This handoff sends the carried conversation to ${provider(target)} (${routesLabel(target)}).`;
+    line.hidden = false;
+  } else line.hidden = true;
+  $("handoff-grant-row").hidden = $("handoff-mode").value !== "yolo";
+}
+$("continue-in").onclick = () => {
+  $("handoff-runtime").value =
+    selected?.scope?.route?.runtime === "codex" ? "claude" : "codex";
+  handoffRoutes();
+  $("handoff-form").hidden = false;
+  $("handoff-request").focus();
+};
+$("handoff-runtime").onchange = handoffRoutes;
+$("handoff-route").onchange = handoffNotice;
+$("handoff-mode").onchange = handoffNotice;
+$("handoff-cancel").onclick = () => ($("handoff-form").hidden = true);
+$("handoff-form").onsubmit = (e) => {
+  e.preventDefault();
+  if (!selected?.id) return;
+  const route = routes[+$("handoff-route").value];
+  if (!route) return;
+  const mode = $("handoff-mode").value;
+  const row = detailLink?.model.scopes
+    .get(scopeKey(selected.scope))
+    ?.sessions.find((x) => x.id === selected.id);
+  const inheritsYolo =
+    mode === "inherit" &&
+    bypassMode(row?.detail?.access) &&
+    row?.detail?.yolo_grant !== true;
+  if (inheritsYolo) {
+    // Inheriting YOLO is still a YOLO start: choose it explicitly or lower it.
+    notice(
+      "This session runs in YOLO. Choose YOLO to confirm it for the new session, or a lower mode.",
+    );
+    return;
+  }
+  const confirmed = mode === "yolo";
+  const start = {
+    source: selected.id,
+    runtime: route.runtime,
+    model: route.billing?.api ?? null,
+    mode,
+    request: $("handoff-request").value,
+    yolo_confirmed: confirmed,
+  };
+  detailLink?.act({ start_handoff: start }, null, (ok, message, key) => {
+    if (!ok) notice(message || "The host refused this handoff.");
+    else {
+      if (mode === "yolo" && $("handoff-grant").checked)
+        pendingGrant = { key };
+      $("handoff-form").hidden = true;
+      $("handoff-request").value = "";
+      notice("Starting the new session…");
+    }
+  });
+};
 $("start-worker").onclick = () => {
   $("worker-models").replaceChildren(
     ...routes
@@ -984,8 +1181,11 @@ $("worker-form").onsubmit = (e) => {
     model,
     mode: $("worker-mode").value,
     task: $("worker-task").value,
-    write: $("worker-write").checked,
+    permission: $("worker-permission").value,
+    yolo_confirmed: false,
   };
+  // Choosing YOLO in the sheet is the confirmation, as for any YOLO change.
+  start.yolo_confirmed = start.permission === "yolo";
   detailLink?.act({ start_worker: start }, null, (ok, message) => {
     if (!ok) notice(message || "The host refused this worker.");
     else {

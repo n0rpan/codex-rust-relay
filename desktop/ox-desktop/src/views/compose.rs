@@ -23,12 +23,37 @@ impl Workbench {
             return;
         }
         let id = owner.map(str::to_owned);
+        if let Some(source) = owner
+            && let Some(start) =
+                ox_desk_core::handoff::HandoffStart::parse_command(source, store.draft(owner))
+        {
+            match start {
+                Ok(mut start) => {
+                    // Typing `--mode yolo` is the explicit YOLO confirmation on the desktop.
+                    start.yolo_confirmed = start.mode
+                        == ox_desk_core::modes::ModeRequest::Level(
+                            ox_desk_core::modes::Level::Yolo,
+                        );
+                    self.action(cx, DeskAction::StartHandoff(start));
+                    self.action(cx, DeskAction::DraftEdit(id, String::new()));
+                }
+                Err(message) => {
+                    self.launch_error = Some(message);
+                    cx.notify();
+                }
+            }
+            return;
+        }
         if let Some(parent) = owner
             && let Some(start) =
                 ox_desk_core::origin::WorkerStart::parse_command(parent, store.draft(owner))
         {
             match start {
-                Ok(start) => {
+                Ok(mut start) => {
+                    start.yolo_confirmed = start.permission
+                        == Some(ox_desk_core::modes::ModeRequest::Level(
+                            ox_desk_core::modes::Level::Yolo,
+                        ));
                     self.action(cx, DeskAction::StartWorker(start));
                     self.action(cx, DeskAction::DraftEdit(id, String::new()));
                 }
@@ -209,6 +234,10 @@ impl Workbench {
         let owner = selected.clone();
         let view = cx.weak_entity();
         let presets = Access::choices(self.route.runtime);
+        let granted = key
+            .and_then(|id| store.session_mark(id, "yolo_grant"))
+            .is_some_and(|v| v == true);
+        let grant_offer = key.is_some() && effective.is_some_and(Access::bypasses_permissions);
         let access = toolbar_button(
             p,
             "access-preset",
@@ -237,8 +266,27 @@ impl Workbench {
                         }),
                 );
             }
+            if grant_offer {
+                let id = owner.clone();
+                let view = view.clone();
+                menu = menu.separator().item(
+                    PopupMenuItem::new("Also YOLO for its workers and handoffs")
+                        .checked(granted)
+                        .on_click(move |_, _, cx| {
+                            let _ = view.update(cx, |s, cx| {
+                                if let Some(id) = &id {
+                                    s.action(cx, DeskAction::YoloGrant(id.clone(), !granted));
+                                }
+                            });
+                        }),
+                );
+            }
             menu
         });
+        let handoff_notice = key
+            .and_then(|id| ox_desk_core::handoff::HandoffStart::parse_command(id, draft))
+            .and_then(Result::ok)
+            .and_then(|start| ox_desk_core::handoff::provider_notice(&self.route, &start.route()));
         let suggestions = if is_command && !discovering {
             ox_desk_core::slash::completions(draft, &caps)
         } else {
@@ -276,6 +324,15 @@ impl Workbench {
                     );
                 }
                 panel.child(choices)
+            })
+            .when_some(handoff_notice, |panel, notice| {
+                panel.child(
+                    div()
+                        .id("handoff-provider-notice")
+                        .text_xs()
+                        .text_color(rgb(p.muted))
+                        .child(notice),
+                )
             })
             .child(super::mention_menu::composer_input(
                 editor.clone(),

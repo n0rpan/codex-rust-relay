@@ -18,6 +18,11 @@ enum Target {
         owner: Option<String>,
         text: String,
     },
+    /// Start a `/handoff` for the selected session in its composer.
+    Handoff {
+        pane: usize,
+        owner: String,
+    },
     More,
 }
 struct Item {
@@ -297,6 +302,20 @@ impl Host {
             );
         }
         if let Some(store) = &active.store
+            && let Some(owner) = store.selected()
+            && store.state() == &Connection::Ready
+            && !store.in_terminal(owner)
+        {
+            add(
+                "Continue in…".into(),
+                "Hand off this conversation to another runtime, billing route or model · /handoff <codex|claude>[:<alias>] [--mode <mode>] <request>".into(),
+                Target::Handoff {
+                    pane: self.active,
+                    owner: owner.to_owned(),
+                },
+            );
+        }
+        if let Some(store) = &active.store
             && store.state() == &Connection::Ready
             && !store.selected().is_some_and(|id| store.in_terminal(id))
         {
@@ -553,6 +572,15 @@ impl Host {
                         self.message = Some(format!("Project unavailable: {}", project.display()));
                         cx.notify();
                     }
+                }
+            }
+            Target::Handoff { pane, owner } => {
+                self.close_palette(window, cx);
+                if self.active == pane {
+                    self.switch(pane, window, cx);
+                    self.panes[pane].update(cx, |p, cx| {
+                        p.action(cx, DeskAction::DraftEdit(Some(owner), "/handoff ".into()))
+                    });
                 }
             }
             Target::Command { pane, owner, text } => {

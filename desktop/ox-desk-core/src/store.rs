@@ -69,6 +69,8 @@ enum Pending {
 
 pub struct Store {
     host_opened: Option<String>,
+    /// Codex items to inject before the next new thread's first turn.
+    handoff_items: Option<Vec<serde_json::Value>>,
     host_annotations: HashMap<String, (Option<String>, serde_json::Value)>,
     naming: Option<titles::Service>,
     authorized_models: HashMap<String, String>,
@@ -127,6 +129,10 @@ impl Store {
         }
     }
     pub fn opening_thread(&self) -> bool {
+        // A replica waits for the host to report the session it asked for.
+        if let Some(remote) = self.remote() {
+            return remote.await_new;
+        }
         self.pending.values().any(|(_, p)| {
             matches!(p, Pending::Compose(compose::Operation::New(_)))
                 || matches!(p,Pending::ThreadOp(op) if op.is_fork())
@@ -141,6 +147,7 @@ impl Store {
     fn with_link(profile: Profile, link: Link) -> Self {
         Self {
             host_opened: None,
+            handoff_items: None,
             host_annotations: Default::default(),
             naming: None,
             authorized_models: Default::default(),

@@ -28,7 +28,9 @@ pub struct Remote {
     pub(super) draft_access: Option<Access>,
     pending: HashMap<String, (Option<String>, Option<compose::Draft>)>,
     pub(super) origins: HashMap<String, crate::origin::Origin>,
-    await_new: bool,
+    /// Host marks on a session: handoffs from it and its YOLO grant.
+    pub(super) marks: HashMap<String, Value>,
+    pub(super) await_new: bool,
 }
 impl Remote {
     pub(super) fn can(&self, id: &str, cap: &str) -> bool {
@@ -73,12 +75,22 @@ impl Store {
             await_new: false,
             pending: HashMap::new(),
             origins: HashMap::new(),
+            marks: HashMap::new(),
         };
         Self::with_link(profile, Link::Host(Box::new(remote)))
     }
     /// The host's immutable lineage stamp for a worker session or its fork.
     pub fn origin(&self, id: &str) -> Option<&crate::origin::Origin> {
         self.remote()?.origins.get(id)
+    }
+    /// A host mark on a session: `handed_off_to`, `handoff_attempts`,
+    /// `yolo_grant` or `yolo_children`.
+    pub fn session_mark(&self, id: &str, key: &str) -> Option<&Value> {
+        self.remote()?
+            .marks
+            .get(id)
+            .and_then(|m| m.get(key))
+            .filter(|v| !v.is_null())
     }
     pub fn is_host_client(&self) -> bool {
         self.remote().is_some()
@@ -279,6 +291,10 @@ impl Store {
                 self.notice = None;
                 self.forward(action)?;
             }
+            Action::InjectHandoff(..) => {
+                self.forward(action)?;
+                self.remote_mut().await_new = true;
+            }
             action => self.forward(action)?,
         }
         Ok(Effect::Applied)
@@ -431,6 +447,7 @@ impl Store {
                 let r = self.remote_mut();
                 r.caps.clear();
                 r.origins.clear();
+                r.marks.clear();
                 r.routes.clear();
                 r.commands.clear();
                 r.options.clear();
@@ -567,6 +584,20 @@ impl Store {
             r.sending.insert(id.clone());
         } else {
             r.sending.remove(&id);
+        }
+        let marks: serde_json::Map<String, Value> = [
+            "handed_off_to",
+            "handoff_attempts",
+            "yolo_grant",
+            "yolo_children",
+        ]
+        .into_iter()
+        .filter_map(|k| Some((k.to_owned(), data.get(k)?.clone())))
+        .collect();
+        if marks.is_empty() {
+            r.marks.remove(&id);
+        } else {
+            r.marks.insert(id.clone(), Value::Object(marks));
         }
         match bits(&data["origin"]) {
             Some(origin) => {

@@ -814,6 +814,24 @@ impl App {
             .filter(|entry| entry["visibility"] == "list")
     }
 
+    /// The context window OX's catalog knows for each launchable alias.
+    fn model_contexts(&self) -> Vec<(String, u64)> {
+        let launchable: std::collections::BTreeSet<&str> = self
+            .launch_models()
+            .into_iter()
+            .map(|(alias, _)| alias)
+            .collect();
+        self.visible_models()
+            .filter_map(|entry| {
+                let alias = entry["slug"].as_str()?;
+                let window = entry["context_window"].as_u64()?;
+                launchable
+                    .contains(alias)
+                    .then(|| (alias.to_owned(), window))
+            })
+            .collect()
+    }
+
     fn launch_models(&self) -> Vec<(&str, &str)> {
         let Mode::Codeox {
             vendors, routes, ..
