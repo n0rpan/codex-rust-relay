@@ -191,7 +191,12 @@ impl Store {
             if !draft.is_empty() && unsent.last().is_none_or(|s| s != draft) {
                 unsent.push(draft.to_owned());
             }
-            self.edit(Some(owner), unsent.join("\n"));
+            let text = unsent.join("\n");
+            self.restore_seq += 1;
+            self.restored_drafts
+                .insert(owner.to_owned(), (self.restore_seq, text.clone()));
+            self.edit(Some(owner), text);
+            self.changed.mark(Changed::THREADS);
         }
     }
 
@@ -638,6 +643,13 @@ impl Store {
         let result = match r.payload {
             Ok(r) => r,
             Err(reason) => {
+                // A refused interrupt leaves the turn running: it must not later read as
+                // Stopped, which would also hide the error a failing turn reports.
+                if matches!(control, Control::Interrupt)
+                    && let Some(t) = self.transcripts.get_mut(owner)
+                {
+                    t.stop_requested = None;
+                }
                 self.notice = Some(reason);
                 self.changed.mark(Changed::NOTICE);
                 return Ok(());
@@ -859,6 +871,59 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap()
+    }
+    /// The replica clears its composer when the host acknowledges a resume send. When the
+    /// native startup then fails, the host restores the text; that restore must reach
+    /// the replica (by delta and by a later full snapshot) instead of leaving it empty.
+    #[test]
+    fn a_resume_that_fails_after_the_ack_puts_the_text_back_in_the_replica_composer() {
+        use crate::actions::Action;
+        use crate::host_protocol::{Cursor, Scope, Server};
+        let (mut host, a, _b) = fixture();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        host.claude_mut().deliver = Arc::new(move |event| {
+            let _ = tx.lock().unwrap().send(event);
+        });
+        host.state = Connection::Ready;
+        host.end_session(&a).unwrap();
+        let profile = host.profile.clone();
+        let scope = Scope {
+            project: profile.project.clone(),
+            route: profile.route.clone(),
+        };
+        let (actions, requests) = std::sync::mpsc::channel();
+        let mut replica = Store::remote_client(profile, move |action, _| {
+            actions.send(action).unwrap();
+            Ok("a1".into())
+        });
+        let snapshot = |host: &Store, seq| Server::Snapshot {
+            cursor: Cursor {
+                epoch: "e".into(),
+                seq,
+            },
+            scopes: vec![host.host_snapshot(&scope)],
+        };
+        replica.apply_host(snapshot(&host, 1)).unwrap();
+        replica.edit(Some(&a), "back again".into());
+        replica.submit(Some(&a)).unwrap();
+        let action = requests.recv().unwrap();
+        assert!(matches!(action, Action::SendText(..)));
+        host.dispatch(action).unwrap();
+        replica.apply_host(Server::Ack { id: "a1".into() }).unwrap();
+        assert_eq!(replica.draft(Some(&a)), "", "cleared on the ack");
+        let e = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        host.apply(e);
+        assert_eq!(host.draft(Some(&a)), "back again");
+        replica.apply_host(snapshot(&host, 2)).unwrap();
+        assert_eq!(replica.draft(Some(&a)), "back again");
+        // The same snapshot again (reconnect) does not duplicate it, and text typed in
+        // the meantime is kept after it.
+        replica.apply_host(snapshot(&host, 3)).unwrap();
+        assert_eq!(replica.draft(Some(&a)), "back again");
+        replica.edit(Some(&a), "back again\nmore".into());
+        replica.apply_host(snapshot(&host, 4)).unwrap();
+        assert_eq!(replica.draft(Some(&a)), "back again\nmore");
     }
     #[test]
     fn sending_to_an_ended_session_resumes_it_with_the_message_as_first_input() {

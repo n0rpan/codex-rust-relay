@@ -1704,9 +1704,12 @@ impl ResponseTranslator {
                     },
                     "input_json_delta",
                 ) => {
-                    *saw_json = true;
                     let partial =
                         required_string(delta, "partial_json", "content_block_delta.delta")?;
+                    // An empty fragment proves nothing about the arguments.
+                    if !partial.is_empty() {
+                        *saw_json = true;
+                    }
                     arguments.push_str(partial);
                     DeltaAction::Arguments {
                         item_id: item_id.clone(),
@@ -2021,7 +2024,15 @@ impl ResponseTranslator {
                 return Err(message);
             }
             if truncated {
-                for index in std::mem::take(&mut state.unproven) {
+                // Only the final block can have been cut before its arguments;
+                // a no-argument call that a later block follows was closed by
+                // the model and is complete.
+                let last_block = state.blocks.keys().next_back().copied();
+                let (cut, closed): (Vec<usize>, Vec<usize>) = std::mem::take(&mut state.unproven)
+                    .into_iter()
+                    .partition(|index| Some(*index) == last_block);
+                drop(closed);
+                for index in cut {
                     if let Some(item) = state.completed.remove(&index)
                         && let Some(call_id) = item.get("call_id").and_then(Value::as_str)
                     {

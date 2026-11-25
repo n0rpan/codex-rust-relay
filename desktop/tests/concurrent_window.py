@@ -196,18 +196,32 @@ def run(gui, stock, root):
                 click(*word("alpha", sidebar=True))
                 click(*word("/beta"))
                 beta_thread = wait_view(lambda s: s["selected_thread"] and not s["visible_turn"])["selected_thread"]
-                _, controls = word("speed")
+                def control_label(control_id):
+                    probe.sendto(b"snapshot", child["OX_DESK_STATS_SOCKET"])
+                    view = json.loads(probe.recv(1 << 20))
+                    return next((c["label"] for c in view.get("layout", [])
+                                 if c["window"] == "OX Desktop" and c["id"] == control_id), "")
 
-                def chip(label):
-                    return word(label, between_rows=(controls - 18, controls + 18))
+                def expect_label(control_id, wanted):
+                    # The chips show display names ("codeox · demo"), so read them from the layout probe.
+                    end = time.monotonic() + 12
+                    while time.monotonic() < end:
+                        if wanted in control_label(control_id).casefold():
+                            return
+                        time.sleep(.1)
+                    raise AssertionError(f"{control_id} never showed {wanted!r}; read {control_label(control_id)!r}")
 
-                click(*chip("fixture/demo"))
+                # Chip ids are model-setting-0 (model), -1 (effort), -2 (speed).
+                expect_label("model-setting-0", "demo")
+                press("model-setting-0")
                 click(*word("orchard"))
-                click(*chip("fixture/alternate"))
+                expect_label("model-setting-0", "alternate")
+                press("model-setting-0")
                 click(*word("meadow"))
-                click(*chip("effort"))
+                expect_label("model-setting-0", "demo")
+                press("model-setting-1")
                 click(*word("high"))
-                chip("high")
+                expect_label("model-setting-1", "high")
                 wait_view(lambda s: s["selected_thread"] == beta_thread)
                 enter("/speed default")
                 word("default")  # Codex acknowledged the requested speed.

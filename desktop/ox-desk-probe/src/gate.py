@@ -128,7 +128,7 @@ class Fixture:
         stage = self.root / str(self.sequence)
         stage.mkdir(mode=0o700)
         self.sock = str(stage / "stats")
-        self.control = str(stage / "control")
+        self.control_socket = str(stage / "control")
         self.trace = stage / "trace"
         self.env = {key: os.environ[key] for key in
                     ["PATH", "LD_LIBRARY_PATH", "DISPLAY", "XAUTHORITY", "VK_DRIVER_FILES"]
@@ -136,7 +136,7 @@ class Fixture:
         self.env.update(HOME=str(stage), CODEX_HOME=str(stage / ".codex"),
                         XDG_RUNTIME_DIR=str(stage), XDG_STATE_HOME=str(stage / "state"),
                         XDG_CONFIG_HOME=str(stage / "config"), XDG_SESSION_TYPE="x11",
-                        OX_DESK_STATS_SOCKET=self.sock, OX_DESK_SYNTH_CONTROL=self.control,
+                        OX_DESK_STATS_SOCKET=self.sock, OX_DESK_SYNTH_CONTROL=self.control_socket,
                         OX_DESK_SYNTH_TRACE=str(self.trace), OX_DESK_SYNTH_THREADS=str(threads),
                         OX_DESK_SYNTH_ITEMS=str(items))
         if sys.platform == "darwin":
@@ -192,7 +192,24 @@ class Fixture:
             self.window = self.x("search", "--sync", "--onlyvisible", "--pid", self.proc.pid,
                              "--name", "OX Desktop").splitlines()[-1]
             self.x("windowfocus", self.window)
-        wait(lambda: Path(self.sock).is_socket() and self.stats()["catalog_len"] > 0)
+        try:
+            wait(lambda: Path(self.sock).is_socket() and self.stats()["catalog_len"] > 0)
+        except Exception as error:
+            # Say why the app never listed its catalog: log, last stats, helper trace, host log.
+            self.log.flush()
+            print(f"::group::Startup failed: {type(error).__name__}", file=sys.stderr)
+            try:
+                print("stats:", json.dumps(self.stats())[:2000], file=sys.stderr)
+            except Exception as stats_error:
+                print(f"stats unavailable: {stats_error!r}", file=sys.stderr)
+            print("socket exists:", Path(self.sock).is_socket(), "app exited:", self.proc.poll(), file=sys.stderr)
+            for name, path in (("app.log", self.root / "app.log"), ("trace", self.trace)):
+                try:
+                    print(f"--- {name}\n{path.read_text()[-3000:]}", file=sys.stderr)
+                except OSError as read_error:
+                    print(f"--- {name}: {read_error}", file=sys.stderr)
+            print("::endgroup::", file=sys.stderr)
+            raise
         return None
 
     def remote_setup(self, stage):
@@ -439,7 +456,7 @@ if len(sys.argv) == 2 and "Tailscale" in sys.argv[1]:
                 if (d := json.loads(line))["event"] == name]
 
     def admin(self, instruction):
-        self.client.sendto(instruction.encode(), self.control)
+        self.client.sendto(instruction.encode(), self.control_socket)
 
 
 def idle_footprint(before, after, seconds):
@@ -638,7 +655,7 @@ def recovery(f):
     wait(lambda: "preserve" in f.words())
     def disconnect():
         pid = f.events("spawn")[-1]["pid"]
-        Path(f.control).unlink()
+        Path(f.control_socket).unlink()
         os.kill(pid, signal.SIGKILL)
     disconnect()
     wait(lambda: len(f.events("spawn")) == 2 and len(f.events("history-reply")) == 2)
@@ -907,7 +924,7 @@ def claude_gate(f):
         wait(lambda: any(e["id"] == ident for e in f.events("claude-user")))
     first = f.stats(reset=True)
     for ident in f.claude_ids.values():
-        f.client.sendto(b"stream", str(Path(f.control).with_name("c-" + ident)))
+        f.client.sendto(b"stream", str(Path(f.control_socket).with_name("c-" + ident)))
     wait(lambda: len(f.events("claude-stream-start")) == 4)
     f.x("key", "ctrl+l")
     f.x("type", "draft during streaming")

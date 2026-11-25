@@ -96,6 +96,13 @@ pub struct Store {
     /// session starts it in that mode; opening it from the list does not (see
     /// `claude_resume_send`).
     resume_access: HashMap<String, crate::runtime::Access>,
+    /// Text the host put back in a session's composer after a send it had acknowledged
+    /// failed (numbered, so a replica applies each restore once). Cleared by the next send.
+    restored_drafts: HashMap<String, (u64, String)>,
+    restore_seq: u64,
+    /// The launch contract of each hosted Claude worker session, kept with the session so
+    /// every relaunch (cold resume, resume after a host restart, fork) starts under it.
+    worker_contracts: HashMap<String, crate::claude_worker_contract::Contract>,
     child_threads: HashMap<String, (String, PathBuf)>,
     next_preset: Option<crate::codex::access::Access>,
     selection: u64,
@@ -122,6 +129,8 @@ pub struct Store {
     transcripts: HashMap<String, Transcript>,
     selected: Option<String>,
     reopen: Vec<String>,
+    /// A thread selected before the connection was ready; it opens as soon as it is.
+    queued_open: Option<String>,
 }
 
 impl Store {
@@ -184,6 +193,9 @@ impl Store {
             ended_threads: Default::default(),
             resume_sends: Default::default(),
             resume_access: Default::default(),
+            restored_drafts: Default::default(),
+            restore_seq: 0,
+            worker_contracts: Default::default(),
             child_threads: Default::default(),
             next_preset: None,
             selection: 0,
@@ -210,6 +222,7 @@ impl Store {
             transcripts: HashMap::new(),
             selected: None,
             reopen: vec![],
+            queued_open: None,
         }
     }
 
@@ -258,6 +271,7 @@ impl Store {
         self.terminal_threads = std::mem::take(&mut previous.terminal_threads);
         self.ended_threads = previous.ended_threads.clone();
         self.resume_access = std::mem::take(&mut previous.resume_access);
+        self.worker_contracts = std::mem::take(&mut previous.worker_contracts);
         self.authorized_models = std::mem::take(&mut previous.authorized_models);
         self.next_options = previous.next_options.take();
         self.selected = previous.selected.clone();
@@ -803,12 +817,23 @@ impl Store {
     fn connected(&mut self) -> io::Result<()> {
         self.state = Connection::Ready;
         self.list_more()?;
-        for id in std::mem::take(&mut self.reopen) {
-            if self.in_terminal(&id) {
+        let reopened = std::mem::take(&mut self.reopen);
+        for id in &reopened {
+            if self.in_terminal(id) {
                 continue;
             }
             self.request(Call::Read(id.clone()), Pending::Read(id.clone()))?;
-            self.mark_loading(&id);
+            self.mark_loading(id);
+        }
+        if let Some(id) = self.queued_open.take()
+            && self.selected.as_deref() == Some(id.as_str())
+            && !reopened.contains(&id)
+            && !self.in_terminal(&id)
+        {
+            if let Some(t) = self.transcripts.get_mut(&id) {
+                t.loading = false;
+            }
+            self.open_catalog_id(&id)?;
         }
         Ok(())
     }

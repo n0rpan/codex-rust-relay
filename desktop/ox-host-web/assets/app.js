@@ -5,6 +5,7 @@ import {
   showReview,
   imagesFor,
   clearImages,
+  moveImages,
   setComposerOwner,
   updateExtras,
   mentionInput,
@@ -108,6 +109,9 @@ const hash = new URLSearchParams(location.hash.slice(1));
 let code = hash.get("pair"),
   requested = hash.get("thread");
 if (location.hash) history.replaceState(null, "", location.pathname);
+// Whether the host has an OX API provider: then every catalog alias is a route for both
+// runtimes, even when the first Hello (before discovery finished) listed none.
+let apiProvider = false;
 let key,
   globalLink,
   detailLink,
@@ -125,6 +129,8 @@ let cold = new Map(),
   timelineRows = new Map(),
   askKeys = "",
   pendingNew = null,
+  // Message and images sent from a composer whose Ack has not come back, by owner.
+  unacked = new Map(),
   visibleRows = 200;
 const global = new Projection(true);
 const controls = new SessionControls();
@@ -253,6 +259,9 @@ class Link {
         this.discovery = crypto.randomUUID();
         this.discovering = new Map();
         this.send(wire.discover(this.discovery));
+        // Hello may predate model discovery; the settings catalog supplies the API routes
+        // (and, once discovery lands, the rest) without a refresh.
+        if (key) loadModelChoices();
       }
       // Replayed deltas may be empty. A subscription without a cursor requires its snapshot.
       if (this.model.cursor && !liveCatalog) this.connected();
@@ -279,7 +288,15 @@ class Link {
         scopeKey(this.scope) === scopeKey(msg.scope)
       ) {
         const old = keyOf(selected.scope, null);
+        // Opened can land before or after the Ack. What is in the provisional
+        // composer now is the user's own newer text unless it is still exactly the
+        // message just sent (its Ack has not arrived to clear it).
+        const typed = drafts.get(old),
+          sent = unacked.get(old);
         drafts.delete(old);
+        const fresh = keyOf(msg.scope, msg.thread);
+        if (typed?.trim() && typed !== sent?.content) drafts.set(fresh, typed);
+        moveImages(old, fresh, sent?.images);
         open(msg.scope, msg.thread);
       }
       return;
@@ -778,7 +795,7 @@ function catalog() {
       ),
     );
   $("list").replaceChildren(frag);
-  $("new").disabled = !globalLink?.ready || !routes.length;
+  $("new").disabled = !globalLink?.ready || !(routes.length || apiProvider);
 }
 function showAsks(asks) {
   const stamp = JSON.stringify(asks);
@@ -1659,13 +1676,29 @@ const optgroup = (label, options) => {
 async function loadModelChoices() {
   let starred = [],
     known = [];
+  const clean = (list) => [
+    ...new Set(list.filter((m) => typeof m === "string" && m)),
+  ];
+  const publish = () => {
+    modelChoices = {
+      starred,
+      all: clean([...starred, ...known, ...routes.map((r) => r.billing?.api)]),
+    };
+    addCatalogRoutes();
+    fillWorkerModels();
+    handoffRoutes();
+    repaint();
+  };
   try {
     const rows = await settingsRequest(key, { action: "read_rows" });
-    starred = rows.favorites ?? [];
+    starred = clean(rows.favorites ?? []);
     known = rows.models ?? [];
+    apiProvider = !!rows.api_provider;
   } catch {
     // The route list alone still works.
   }
+  // Settings are quick: show the configured aliases before discovery returns.
+  publish();
   try {
     // The full discovered catalog: stars only order, any model can be used.
     const found = await settingsRequest(key, { action: "models" });
@@ -1673,24 +1706,13 @@ async function loadModelChoices() {
   } catch {
     // Discovery needs the providers; the starred and configured models still work.
   }
-  const clean = (list) => [
-    ...new Set(list.filter((m) => typeof m === "string" && m)),
-  ];
-  const fromRoutes = routes.map((r) => r.billing?.api);
-  starred = clean(starred);
-  modelChoices = {
-    starred,
-    all: clean([...starred, ...known, ...fromRoutes]),
-  };
-  addCatalogRoutes();
-  fillWorkerModels();
-  handoffRoutes();
+  publish();
 }
 // Routes are only appended, so the indexes the forms hold stay valid.
 function addCatalogRoutes() {
   const have = new Set(routes.map((r) => `${r.runtime} ${r.billing?.api ?? ""}`));
   for (const runtime of ["codex", "claude"]) {
-    if (!routes.some((r) => r.runtime === runtime)) continue;
+    if (!apiProvider && !routes.some((r) => r.runtime === runtime)) continue;
     for (const m of modelChoices.all) {
       if (have.has(`${runtime} ${m}`)) continue;
       routes.push({ runtime, billing: { api: m } });
@@ -1877,8 +1899,11 @@ $("composer").onsubmit = (e) => {
       ? { send_images: [id, content, images.map((v) => v.image)] }
       : { send_text: [id, content] };
   pendingNew = { owner };
+  const sentNow = { content, images };
+  unacked.set(owner, sentNow);
   if (
     !link.act(action, null, (ok) => {
+      if (unacked.get(owner) === sentNow) unacked.delete(owner);
       pendingNew = null;
       if (ok) {
         clearImages(owner, images);
@@ -1892,8 +1917,10 @@ $("composer").onsubmit = (e) => {
       }
       repaint();
     })
-  )
+  ) {
     pendingNew = null;
+    unacked.delete(owner);
+  }
   repaint();
 };
 const closeCamera = setupCamera((secret) => {

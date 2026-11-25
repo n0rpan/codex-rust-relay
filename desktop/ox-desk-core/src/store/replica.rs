@@ -26,6 +26,8 @@ pub struct Remote {
     pub(super) schema: bool,
     pub(super) options: HashMap<String, routes_thread::Options>,
     pub(super) draft_access: Option<Access>,
+    /// The newest host draft restore applied per session.
+    restored_seen: HashMap<String, u64>,
     /// Input sent but not yet acknowledged by the host: the owner, the draft it came from
     /// and how many identical user messages the transcript held when it was sent.
     pending: HashMap<String, (Option<String>, Option<compose::Draft>, usize)>,
@@ -47,7 +49,7 @@ pub struct Remote {
 struct Unconfirmed {
     owner: Option<String>,
     text: String,
-    attachments: usize,
+    attachments: Vec<Option<String>>,
     seen: usize,
 }
 impl Remote {
@@ -89,6 +91,7 @@ impl Store {
             sending: HashSet::new(),
             schema: false,
             draft_access: None,
+            restored_seen: HashMap::new(),
             options: HashMap::new(),
             await_new: None,
             restore: None,
@@ -184,7 +187,7 @@ impl Store {
             .zip(owner.as_deref().and_then(|o| self.transcripts.get(o)))
             .map_or(0, |(d, t)| {
                 let (text, attachments) = d.signature();
-                t.user_messages(&text, attachments)
+                t.user_messages(&text, &attachments)
             });
         self.remote_mut()
             .pending
@@ -514,15 +517,19 @@ impl Store {
             let still_unsent = self
                 .drafts
                 .get(&u.owner)
-                .is_some_and(|d| d.signature() == (u.text.clone(), u.attachments));
+                .is_some_and(|d| d.signature() == (u.text.clone(), u.attachments.clone()));
             if !still_unsent {
                 continue;
             }
-            let delivered = u
-                .owner
-                .as_deref()
-                .and_then(|o| self.transcripts.get(o))
-                .is_some_and(|t| t.is_ready() && t.user_messages(&u.text, u.attachments) > u.seen);
+            // A pasted image cannot be told from another one of the same kind in the
+            // transcript: that is not proof this message arrived, so it stays.
+            let delivered = u.attachments.iter().all(Option::is_some)
+                && u.owner
+                    .as_deref()
+                    .and_then(|o| self.transcripts.get(o))
+                    .is_some_and(|t| {
+                        t.is_ready() && t.user_messages(&u.text, &u.attachments) > u.seen
+                    });
             if delivered {
                 self.drafts.remove(&u.owner);
                 self.notice = None;
@@ -745,6 +752,26 @@ impl Store {
             self.terminal_threads.insert(id.clone());
         } else {
             self.terminal_threads.remove(&id);
+        }
+        if let (Some(seq), Some(text)) = (
+            data["restored_draft"]["seq"].as_u64(),
+            data["restored_draft"]["text"].as_str(),
+        ) && self
+            .remote()
+            .is_some_and(|r| r.restored_seen.get(&id).is_none_or(|n| *n < seq))
+        {
+            self.remote_mut().restored_seen.insert(id.clone(), seq);
+            // The host took the send and then lost it: the text is back in its
+            // composer, so it comes back here too, before anything typed since.
+            let current = self.drafts.entry(Some(id.clone())).or_default();
+            if !current.text.contains(text) {
+                current.text = if current.text.is_empty() {
+                    text.to_owned()
+                } else {
+                    format!("{text}\n{}", current.text)
+                };
+            }
+            self.changed.mark(Changed::NOTICE);
         }
         let r = self.remote_mut();
         r.caps.insert(id.clone(), s.capabilities);
@@ -1313,5 +1340,56 @@ mod local_command_tests {
         fresh.apply_host(echo("do not lose me")).unwrap();
         assert_eq!(fresh.draft(Some("t00000")), "");
         assert!(fresh.draft_images(Some("t00000")).is_empty());
+    }
+    /// The same text arrives with a different image (a second device): that is not the
+    /// message this client lost, so its composer keeps text and image A.
+    #[test]
+    fn the_same_text_with_a_different_image_is_not_the_lost_message() {
+        let echo = |path: &str| {
+            let mut scope = scope_state(page(0, 150));
+            scope.sessions[0].capabilities = vec!["send".into()];
+            scope.transcripts.insert(
+                "t00000".into(),
+                crate::host_protocol::Timeline {
+                    items: vec![TimelineItem {
+                        turn: "turn-1".into(),
+                        id: "item-1".into(),
+                        role: "user".into(),
+                        text: "do not lose me".into(),
+                        revision: 1,
+                        detail: serde_json::to_value(Item::UserMessage {
+                            content: vec![
+                                crate::transcript::item::Content {
+                                    text: Some("do not lose me".into()),
+                                    path: None,
+                                },
+                                crate::transcript::item::Content {
+                                    text: None,
+                                    path: Some(path.into()),
+                                },
+                            ],
+                        })
+                        .unwrap(),
+                    }],
+                    detail: serde_json::json!({"ready": true}),
+                },
+            );
+            Server::Snapshot {
+                cursor: crate::host_protocol::Cursor {
+                    epoch: "e".into(),
+                    seq: 1,
+                },
+                scopes: vec![scope],
+            }
+        };
+        let mut old = store_whose_host_closed_the_socket();
+        let (mut fresh, _) = counting_replica();
+        fresh.recover_from(&mut old);
+        fresh.apply_host(echo("/tmp/other-device.png")).unwrap();
+        assert_eq!(fresh.draft(Some("t00000")), "do not lose me");
+        assert_eq!(fresh.draft_images(Some("t00000")).len(), 1);
+        // Its own echo (same path) still reconciles.
+        fresh.apply_host(echo("/tmp/shot.png")).unwrap();
+        assert_eq!(fresh.draft(Some("t00000")), "");
     }
 }

@@ -179,6 +179,17 @@ impl Engine {
                         error: status["error"].as_str().map(str::to_owned),
                     }))
                 }
+                // A stop the runtime confirmed, with the partial text it left. A route that
+                // merely closed is interrupted too, but says nothing about the run's end.
+                Some("interrupted")
+                    if timeline.is_some_and(|t| t.detail["interrupted"] == true) =>
+                {
+                    Some(Some(crate::workers::Last {
+                        status: "interrupted".to_owned(),
+                        result: status["result"].as_str().map(str::to_owned),
+                        error: None,
+                    }))
+                }
                 Some("running" | "waiting_for_operator") => Some(None),
                 _ => None,
             };

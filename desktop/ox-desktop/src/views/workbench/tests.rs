@@ -267,6 +267,7 @@ fn stock_reopen() {
                 break;
             }
         } else if let Some(row) = store.threads().first() {
+            // Selecting before the route is ready queues the open; no notice appears.
             store.select(&row.id.clone()).unwrap();
         }
     }
@@ -703,7 +704,14 @@ mod model_switch_fixture {
         while !condition(store) {
             let e = rx
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .unwrap_or_else(|_| panic!("Timed out at {caller}: {:?}", store.notice()));
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "Timed out at {caller}: {:?} {:?} {:?}",
+                        store.notice(),
+                        store.state(),
+                        store.threads()
+                    )
+                });
             store.apply(e);
             assert!(store.notice().is_none(), "{:?}", store.notice());
             if let Some(t) = store.selected().and_then(|id| store.transcript(id)) {
@@ -779,7 +787,10 @@ fn stock_model_cold_routes() {
     let id = std::fs::read_to_string("model-switch-thread").unwrap();
     for wrong in ["fixture/demo", "other/demo"] {
         let (mut other, events) = connect(wrong);
-        until(&mut other, &events, |s| s.catalog_row(&id).is_some());
+        // The host lists the remembered thread before the route is ready, without its model.
+        until(&mut other, &events, |s| {
+            s.state() == &Connection::Ready && s.catalog_row(&id).is_some_and(|r| r.model.is_some())
+        });
         assert_eq!(
             other.catalog_row(&id).unwrap().model.as_deref(),
             Some("fixture/alternate")

@@ -30,15 +30,69 @@ pub fn ids_in_processes() -> HashSet<String> {
     ids
 }
 
+/// Whether a registered pid is still running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Liveness {
+    Alive,
+    Dead,
+    /// The platform cannot tell; callers keep the journal-age fallback.
+    Unknown,
+}
+
+/// Portable liveness: `kill(pid, 0)` succeeds or fails with EPERM for a live process
+/// and fails with ESRCH for a dead one. No procfs needed (macOS, BSD).
+pub fn pid_liveness(pid: u32) -> Liveness {
+    #[cfg(unix)]
+    {
+        // A pid outside the kernel's range (or 0, a process group) names no process.
+        let Ok(raw) = libc::pid_t::try_from(pid) else {
+            return Liveness::Dead;
+        };
+        if raw <= 0 {
+            return Liveness::Dead;
+        }
+        // SAFETY: signal 0 only checks that the pid exists and may be signalled.
+        if unsafe { libc::kill(raw, 0) } == 0 {
+            return Liveness::Alive;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::ESRCH) => Liveness::Dead,
+            Some(libc::EPERM) => Liveness::Alive,
+            _ => Liveness::Unknown,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        Liveness::Unknown
+    }
+}
+
+/// What the sessions registry says. `authoritative` is false when any entry's liveness
+/// could not be determined, so the caller keeps the journal-age fallback.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Registry {
+    pub ids: HashSet<String>,
+    pub authoritative: bool,
+}
+
 /// Sessions a running stock client registered under `<profile>/sessions/<pid>.json`.
 /// A terminal client has no session id on its command line, so this is the signal that
 /// still holds while it thinks or runs a long tool without writing its journal. Only a
 /// live pid counts, and never OX's own headless entrypoint.
-pub fn ids_in_registry(profile: &std::path::Path) -> HashSet<String> {
-    let mut ids = HashSet::new();
-    let Ok(entries) = std::fs::read_dir(profile.join("sessions")) else {
-        return ids;
+pub fn ids_in_registry(profile: &std::path::Path) -> Registry {
+    registry_with(profile, pid_liveness)
+}
+
+pub fn registry_with(profile: &std::path::Path, probe: impl Fn(u32) -> Liveness) -> Registry {
+    let mut out = Registry {
+        ids: HashSet::new(),
+        authoritative: false,
     };
+    let Ok(entries) = std::fs::read_dir(profile.join("sessions")) else {
+        return out;
+    };
+    out.authoritative = true;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_none_or(|e| e != "json") {
@@ -47,22 +101,22 @@ pub fn ids_in_registry(profile: &std::path::Path) -> HashSet<String> {
         let Ok(raw) = std::fs::read(&path) else {
             continue;
         };
-        if let Some(id) = registered_id(&raw)
-            && std::path::Path::new("/proc")
-                .join(registered_pid(&raw))
-                .exists()
-        {
-            ids.insert(id);
+        let Some(id) = registered_id(&raw) else {
+            continue;
+        };
+        let pid = serde_json::from_slice::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|v| v["pid"].as_u64())
+            .and_then(|p| u32::try_from(p).ok());
+        match pid.map_or(Liveness::Unknown, &probe) {
+            Liveness::Alive => {
+                out.ids.insert(id);
+            }
+            Liveness::Dead => {}
+            Liveness::Unknown => out.authoritative = false,
         }
     }
-    ids
-}
-fn registered_pid(raw: &[u8]) -> String {
-    serde_json::from_slice::<serde_json::Value>(raw)
-        .ok()
-        .and_then(|v| v["pid"].as_u64())
-        .map(|p| p.to_string())
-        .unwrap_or_else(|| "0".into())
+    out
 }
 /// The session id of one registry file, unless it belongs to a headless client.
 pub fn registered_id(raw: &[u8]) -> Option<String> {
@@ -112,6 +166,59 @@ mod tests {
         assert_eq!(registered_id(row("cli").as_bytes()).as_deref(), Some(ID));
         assert_eq!(registered_id(row("sdk-cli").as_bytes()), None);
         assert_eq!(registered_id(b"{"), None);
+    }
+
+    #[test]
+    fn registry_liveness_alive_dead_and_indeterminate_keep_the_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let other = "11111111-abcd-4567-abcd-0123456789ab";
+        for (pid, id) in [(10, ID), (20, other)] {
+            std::fs::write(
+                sessions.join(format!("{pid}.json")),
+                format!(r#"{{"pid":{pid},"sessionId":"{id}","entrypoint":"cli"}}"#),
+            )
+            .unwrap();
+        }
+        // No procfs on this fixture platform: the injected probe is all there is.
+        let r = registry_with(dir.path(), |pid| {
+            if pid == 10 {
+                Liveness::Alive
+            } else {
+                Liveness::Dead
+            }
+        });
+        assert_eq!(r.ids, HashSet::from([ID.to_owned()]));
+        assert!(r.authoritative);
+        let r = registry_with(dir.path(), |_| Liveness::Dead);
+        assert!(r.ids.is_empty() && r.authoritative);
+        let r = registry_with(dir.path(), |pid| {
+            if pid == 10 {
+                Liveness::Alive
+            } else {
+                Liveness::Unknown
+            }
+        });
+        assert_eq!(r.ids, HashSet::from([ID.to_owned()]));
+        assert!(
+            !r.authoritative,
+            "indeterminate liveness keeps the journal fallback"
+        );
+        // No registry directory at all: not authoritative either.
+        assert!(!registry_with(&dir.path().join("none"), |_| Liveness::Alive).authoritative);
+    }
+
+    #[test]
+    fn real_probe_knows_this_process_and_a_dead_pid() {
+        assert_eq!(pid_liveness(std::process::id()), Liveness::Alive);
+        #[cfg(unix)]
+        {
+            let mut c = std::process::Command::new("true").spawn().unwrap();
+            let pid = c.id();
+            c.wait().unwrap();
+            assert_eq!(pid_liveness(pid), Liveness::Dead);
+        }
     }
 
     #[test]

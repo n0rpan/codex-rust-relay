@@ -700,6 +700,7 @@ fn prepare_native_body(
     version: &str,
 ) -> Value {
     payload["model"] = json!(upstream_model);
+    strip_ox_thinking(&mut payload);
     if payload.get("max_tokens").is_none_or(Value::is_null) {
         let tokens = vendor
             .max_output_tokens
@@ -712,6 +713,27 @@ fn prepare_native_body(
         upstream::strip_anthropic_sampling(object);
     }
     payload
+}
+
+/// Remove thinking blocks that carry the gateway's own Chat Completions
+/// reasoning marker. A session can move from a chat provider to a native
+/// Anthropic route (model switch, resume), and Anthropic rejects a signature
+/// it did not issue. Real Anthropic signatures never have the prefix.
+fn strip_ox_thinking(payload: &mut Value) {
+    use crate::adapters::chat_completions::CHAT_REASONING_PREFIX;
+    let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for message in messages {
+        if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+            blocks.retain(|block| {
+                !(block["type"] == "thinking"
+                    && block["signature"]
+                        .as_str()
+                        .is_some_and(|sig| sig.starts_with(CHAT_REASONING_PREFIX)))
+            });
+        }
+    }
 }
 
 /// Pass API capability headers through, while keeping authentication and
@@ -1256,6 +1278,25 @@ mod tests {
         );
         assert_eq!(body["messages"][0]["content"][0]["thinking"], "hmm");
         assert_eq!(body["tools"][0]["name"], "read");
+    }
+
+    #[test]
+    fn native_body_strips_ox_chat_reasoning_thinking_but_keeps_signed_thinking() {
+        let vendor = vendor(Wire::AnthropicMessages);
+        let marker = format!(
+            "{}t",
+            crate::adapters::chat_completions::CHAT_REASONING_PREFIX
+        );
+        let payload = json!({"messages": [
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "t", "signature": marker},
+                {"type": "thinking", "thinking": "real", "signature": "EqQBreal"},
+                {"type": "tool_use", "id": "c1", "name": "read", "input": {}}]}]});
+        let body = prepare_native_body(payload, &vendor, "m", &vendor.anthropic.version);
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["signature"], "EqQBreal");
+        assert_eq!(blocks[1]["type"], "tool_use");
     }
 
     #[test]

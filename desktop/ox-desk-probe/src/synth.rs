@@ -109,6 +109,12 @@ fn admin(pipe: Pipe, opened: Arc<Mutex<HashSet<String>>>) -> io::Result<()> {
 }
 
 pub fn run() -> io::Result<()> {
+    // The desktop's header asks the helper for weather at startup. Answer nothing: running
+    // as a synthetic server here would bind the control socket first and leave it behind,
+    // so the real synthetic server would fail to bind it and the catalog would never load.
+    if env::args().any(|s| s == "weather") {
+        return Ok(());
+    }
     if env::args().any(|s| s == "--ox-desktop-settings-v1") {
         let q: Value = serde_json::from_reader(io::stdin().lock())?;
         trace("helper", q["action"].as_str().unwrap_or_default());

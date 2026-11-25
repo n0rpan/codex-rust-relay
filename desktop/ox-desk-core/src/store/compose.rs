@@ -18,9 +18,18 @@ pub(super) struct Draft {
 }
 impl Draft {
     /// What a delivered copy of this draft looks like in a transcript: trimmed text and
-    /// the number of attachments.
-    pub(super) fn signature(&self) -> (String, usize) {
-        (self.text.trim().to_owned(), self.images.len())
+    /// its attachments. A pasted image has no identity the transcript echoes, so two
+    /// different pastes look alike (`None`).
+    pub(super) fn signature(&self) -> (String, Vec<Option<String>>) {
+        let images = self
+            .images
+            .iter()
+            .map(|i| match i {
+                crate::mentions::ImageInput::File(p) => Some(p.to_string_lossy().into_owned()),
+                crate::mentions::ImageInput::Clipboard(..) => None,
+            })
+            .collect();
+        (self.text.trim().to_owned(), images)
     }
     pub(super) fn restore_before(mut self, newer: &mut Draft) {
         if !self.text.is_empty() && !newer.text.is_empty() {
@@ -572,6 +581,15 @@ impl Store {
     /// The thread is ended (a send resumes it) even when discovery has not listed it:
     /// Codex gets a minimal row in this project and route, whose resume verifies identity
     /// with the server. `access` is the Claude mode the user had chosen.
+    /// Remember a worker session's launch contract (from the host's persisted origin)
+    /// unless the live store already knows the exact one it launched under.
+    pub fn restore_worker_contract(
+        &mut self,
+        id: &str,
+        contract: crate::claude_worker_contract::Contract,
+    ) {
+        self.worker_contracts.entry(id.into()).or_insert(contract);
+    }
     pub fn restore_ended(
         &mut self,
         id: &str,
@@ -657,7 +675,14 @@ impl Store {
                 }
                 s.owner
             }
-            Operation::Stop(id) => Some(id),
+            Operation::Stop(id) => {
+                // A refused Stop leaves the turn running: when it completes it did so on
+                // its own, and must not render as Stopped.
+                if let Some(t) = self.transcripts.get_mut(&id) {
+                    t.stop_requested = None;
+                }
+                Some(id)
+            }
         };
         if let Some(t) = owner.and_then(|id| self.transcripts.get_mut(&id)) {
             t.error = Some(reason);
@@ -1339,6 +1364,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_refused_stop_finishes_done() {
+        use crate::codex::activity::{Activity, Change};
+        let mut store = ready();
+        let id = "thread-stop".to_owned();
+        let t = store.transcripts.entry(id.clone()).or_default();
+        t.ready = true;
+        t.verified = true;
+        t.active_turn = Some("turn-1".into());
+        store.stop(&id).unwrap();
+        store.compose_failed(Operation::Stop(id.clone()), "stop refused".into());
+        let t = store.transcripts.get_mut(&id).unwrap();
+        t.apply_activity(Activity {
+            thread: id.clone(),
+            turn: "turn-1".into(),
+            change: Change::TurnCompleted {
+                error: None,
+                interrupted: false,
+            },
+        });
+        assert!(
+            !t.interrupted() && t.active_turn().is_none(),
+            "rejected stop must finish normally"
+        );
+        t.apply_activity(Activity {
+            thread: id.clone(),
+            turn: "turn-2".into(),
+            change: Change::TurnStarted,
+        });
+        assert!(!t.interrupted(), "a new turn clears the marker");
+        t.apply_activity(Activity {
+            thread: id,
+            turn: "turn-2".into(),
+            change: Change::TurnCompleted {
+                error: None,
+                interrupted: false,
+            },
+        });
+        assert!(!t.interrupted(), "a finished turn is done");
+    }
     #[test]
     fn a_stopped_turn_completes_as_interrupted_not_done() {
         use crate::codex::activity::{Activity, Change};

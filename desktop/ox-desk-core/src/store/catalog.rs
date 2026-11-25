@@ -152,6 +152,14 @@ impl Catalog {
 
 impl super::Store {
     pub(super) fn sync_title(&mut self, source: &ThreadRow) {
+        // A row restored for an ended thread has no model until discovery lists it.
+        if let Some(model) = &source.model
+            && let Some(row) = self.catalog.get_mut(&source.id)
+            && row.model.is_none()
+        {
+            row.model = Some(model.clone());
+            self.title_changed();
+        }
         if self.catalog.merge_title(source) {
             self.title_changed();
         }
@@ -356,6 +364,20 @@ mod keep_tests {
 
     fn row(id: &str, cwd: std::path::PathBuf, parent: Option<&str>) -> ThreadRow {
         serde_json::from_value(json!({"id":id,"cwd":cwd,"modelProvider":"openai","parentThreadId":parent,"preview":""})).unwrap()
+    }
+
+    #[test]
+    fn selecting_a_thread_while_connecting_queues_the_open() {
+        let mut s = store();
+        s.state = Connection::Connecting;
+        s.record_row(row("early", std::env::temp_dir(), None));
+        s.select("early").unwrap();
+        assert!(s.notice().is_none());
+        assert_eq!(s.selected(), Some("early"));
+        assert!(s.transcript("early").unwrap().is_loading());
+        s.connected().unwrap();
+        assert!(s.queued_open.is_none());
+        assert!(s.transcript("early").unwrap().is_loading());
     }
 
     #[test]

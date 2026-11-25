@@ -120,15 +120,12 @@ impl Access {
     }
     /// Whether a scope may be subscribed: listed in the hello, or discovered on this host.
     fn reachable(&self, app: &App, scope: &Scope) -> bool {
-        // Any catalog model may run, starred or not, so a host that lists API routes for a
-        // runtime accepts that runtime's other aliases: the host validates the alias at launch.
+        // Any catalog alias may run on either runtime, starred or not, and the Hello can
+        // predate model discovery (no routes at all), so a new scope for an API route needs
+        // no listed route: the host validates the provider and alias at launch. Subscription
+        // routes still have to be listed.
         (self.projects.contains(&scope.project)
-            && (self.routes.contains(&scope.route)
-                || (scope.route.is_api()
-                    && self
-                        .routes
-                        .iter()
-                        .any(|r| r.is_api() && r.runtime == scope.route.runtime))))
+            && (self.routes.contains(&scope.route) || scope.route.is_api()))
             || app.discovered.lock().unwrap().contains(scope)
     }
     /// A request that passed auth but was refused for its content: the request id, if it has
@@ -337,6 +334,7 @@ pub(crate) async fn session(app: App, id: String, mut ws: WebSocket) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ox_desk_core::runtime::Runtime;
     #[test]
     fn browser_actions_use_subscribed_route_and_native_permission_modes() {
         let dir = tempfile::tempdir().unwrap();
@@ -766,5 +764,62 @@ mod tests {
             )
         ));
         assert!(a.permit(&app, &list()));
+    }
+
+    fn cold_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let app = App {
+            state: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::state::State::load(dir.path()).unwrap(),
+            )),
+            host: Default::default(),
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            discovered: Default::default(),
+        };
+        (dir, app)
+    }
+
+    #[test]
+    fn a_cold_hello_without_routes_still_accepts_any_catalog_alias_for_a_new_scope() {
+        let (_dir, app) = cold_app();
+        let mut a = Access::default();
+        assert!(a.permit(&app, &Client::Hello { version: VERSION }));
+        let hello = Server::Hello {
+            version: VERSION,
+            projects: vec!["/approved".into()],
+            routes: vec![],
+            capabilities: vec![],
+            host: None,
+        };
+        a.host(&app, &serde_json::to_vec(&hello).unwrap()).unwrap();
+        let subscribe = |project: &str, route: Route| Client::Subscribe {
+            scope: Some(Scope {
+                project: project.into(),
+                route,
+            }),
+            after: None,
+            terminal: false,
+        };
+        // Discovery finished after the Hello: an unstarred alias opens on both runtimes.
+        for runtime in [Runtime::Codex, Runtime::Claude] {
+            assert!(a.permit(
+                &app,
+                &subscribe("/approved", runtime.route(Some("fixture/unstarred".into())))
+            ));
+        }
+        // A subscription route nobody listed, and a project nobody approved, stay refused.
+        assert!(!a.permit(&app, &subscribe("/approved", Route::CODEX_SUBSCRIPTION)));
+        assert!(!a.permit(
+            &app,
+            &subscribe(
+                "/other",
+                Runtime::Claude.route(Some("fixture/unstarred".into()))
+            )
+        ));
     }
 }

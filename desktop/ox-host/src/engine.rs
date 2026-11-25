@@ -1577,7 +1577,34 @@ impl Engine {
                     | Change::Retired { .. }
             )
         }) {
-            self.ledger.update(SavedScope::from_state(&live.state))?;
+            // Rows the host owned before a restart stay saved until the live runtime owns
+            // them again: a single-row update from a freshly opened route lists them as
+            // discovered, and must not drop their ownership or the access they resume with.
+            // Only the rows and asks are saved, so copy no transcripts.
+            let mut saved = ScopeState {
+                scope: live.state.scope.clone(),
+                connection: String::new(),
+                capabilities: vec![],
+                asks: live.state.asks.clone(),
+                transcripts: Default::default(),
+                detail: Value::Null,
+                sessions: live.state.sessions.clone(),
+            };
+            for old in &live.recovered {
+                match saved.sessions.iter_mut().find(|r| r.id == old.id) {
+                    Some(row) if row.detail["owned"] != true => {
+                        row.detail["owned"] = true.into();
+                        for key in ["resume_access", "worker_marks", "origin"] {
+                            if row.detail[key].is_null() && !old.detail[key].is_null() {
+                                row.detail[key] = old.detail[key].clone();
+                            }
+                        }
+                    }
+                    Some(_) => {}
+                    None => saved.sessions.push(old.clone()),
+                }
+            }
+            self.ledger.update(SavedScope::from_state(&saved))?;
         }
         self.broadcast(scope, changes)?;
         if let Some((id, frame)) = handoff {
@@ -2701,6 +2728,11 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
         e.1.insert("yolo_grant".into(), true.into());
         e.1.insert("yolo_grant_expires".into(), g.expires_at().into());
         e.1.insert("yolo_children".into(), children.into());
+    }
+    for (id, entry) in workers.in_scope(scope) {
+        if let Some(contract) = entry.origin.claude_contract(entry.origin.mode) {
+            store.restore_worker_contract(id, contract);
+        }
     }
     for (id, (parent, detail)) in out {
         store.annotate_session(&id, parent, Value::Object(detail));
@@ -5123,7 +5155,14 @@ mod tests {
 import json,sys
 mode=sys.argv[sys.argv.index("--permission-mode")+1] if "--permission-mode" in sys.argv else "default"
 sid=next((sys.argv[i+1] for i,a in enumerate(sys.argv) if a in ("--session-id","--resume")),"none")
-open("argv-"+sid,"w").write(json.dumps(sys.argv))
+open("argv-"+sid,"a").write(json.dumps(sys.argv)+"\n")
+if "--session-id" in sys.argv:
+ import os,re
+ d=os.path.join(os.getcwd(),"native","projects",re.sub("[^A-Za-z0-9]","-",os.path.realpath(os.getcwd())))
+ os.makedirs(d,exist_ok=True)
+ u="00000000-0000-4000-8000-0000000000"
+ rows=[{"type":k,"uuid":u+n,"cwd":os.path.realpath(os.getcwd()),"sessionId":sid,"entrypoint":"sdk-cli","message":{"role":k,"id":u+n,"content":"hi" if k=="user" else [{"type":"text","text":"ok"}]}} for k,n in (("user","01"),("assistant","02"))]
+ open(os.path.join(d,sid+".jsonl"),"w").write("".join(json.dumps(r)+"\n" for r in rows))
 for line in sys.stdin:
  r=json.loads(line)
  if r.get("type")=="control_request":
@@ -5134,6 +5173,9 @@ for line in sys.stdin:
   else:
    data={"claude_code_version":"2.2.0","current_permission_mode":mode,"commands":[],"models":[],"account":{"apiProvider":"firstParty","subscriptionType":"pro"}}
   print(json.dumps({"type":"control_response","response":{"request_id":r["request_id"],"subtype":"success","response":data}}),flush=True)
+ elif r.get("type")=="user":
+  print(json.dumps({"type":"user","message":r["message"],"uuid":r.get("uuid"),"session_id":sid,"isReplay":True}),flush=True)
+  print(json.dumps({"type":"result","subtype":"success","is_error":False,"session_id":sid,"stop_reason":"end_turn","result":"ok"}),flush=True)
 "#,
             )
             .unwrap();
@@ -5479,6 +5521,179 @@ for line in sys.stdin:
             assert!(!w.is_empty() && !o.is_empty(), "{w} / {o}");
             assert!(w.contains(&flag), "worker lost its contract: {w}");
             assert!(!o.contains(&flag), "the lead took the worker contract: {o}");
+        }
+
+        #[test]
+        fn a_worker_keeps_its_launch_contract_on_every_relaunch() {
+            use ox_desk_core::claude_worker_contract::Contract;
+            use ox_desk_core::store::claude::WorkerBlank;
+            let root = tempfile::tempdir().unwrap();
+            let (scope, _lead, mut engine, rx) = warm_claude(root.path());
+            let contract = Contract::with_support(true, false, true);
+            let pump = |engine: &mut Engine, until: &dyn Fn(&Store) -> bool| {
+                let end = Instant::now() + Duration::from_secs(10);
+                while !until(&engine.running[&scope].store) {
+                    assert!(Instant::now() < end, "runtime never became ready");
+                    if let Ok(e) = rx.recv_timeout(Duration::from_millis(50)) {
+                        engine.running.get_mut(&scope).unwrap().store.apply(e);
+                    }
+                }
+            };
+            let live = engine.running.get_mut(&scope).unwrap();
+            live.store.dispatch(Action::NewDraft).unwrap();
+            live.store.stage_claude_worker(contract).unwrap();
+            pump(&mut engine, &|s| {
+                s.can_send(None) && s.claude_worker_state() == WorkerBlank::Ready
+            });
+            let live = engine.running.get_mut(&scope).unwrap();
+            live.store
+                .send_on_worker_blank(Action::SendText(None, "worker task".into()))
+                .unwrap();
+            let worker = live.store.take_opened().unwrap();
+            let raw = worker.rsplit(':').next().unwrap().to_owned();
+            let argv = |id: &str| -> Vec<Vec<String>> {
+                std::fs::read_to_string(root.path().join(format!("argv-{id}")))
+                    .unwrap_or_default()
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect()
+            };
+            let policy = contract.args();
+            let has_policy =
+                |argv: &[String]| argv.windows(policy.len()).any(|w| w == policy.as_slice());
+            let at = |a: &[String], flag: &str| {
+                a.iter().position(|x| x == flag).map(|i| a[i + 1].clone())
+            };
+            pump(&mut engine, &|s| s.has_live_session(&worker));
+            let first = argv(&raw);
+            assert_eq!(first.len(), 1, "{first:?}");
+            assert!(has_policy(&first[0]), "initial launch: {:?}", first[0]);
+            // Let the journal and catalog row exist, then end the worker.
+            pump(&mut engine, &|s| s.catalog_row(&worker).is_some());
+            let live = engine.running.get_mut(&scope).unwrap();
+            live.store.end_session(&worker).unwrap();
+            // Cold resume after reap: a follow-up through SendText.
+            live.store
+                .dispatch(Action::DraftEdit(Some(worker.clone()), "follow-up".into()))
+                .unwrap();
+            live.store
+                .dispatch(Action::SendText(Some(worker.clone()), "follow-up".into()))
+                .unwrap();
+            let end = Instant::now() + Duration::from_secs(10);
+            while argv(&raw).len() < 2 {
+                assert!(Instant::now() < end, "no resumed launch");
+                if let Ok(e) = rx.recv_timeout(Duration::from_millis(50)) {
+                    engine.running.get_mut(&scope).unwrap().store.apply(e);
+                }
+            }
+            let resumed = argv(&raw);
+            assert!(has_policy(&resumed[1]), "resumed launch: {:?}", resumed[1]);
+            assert!(resumed[1].contains(&"--resume".to_owned()));
+            assert_eq!(
+                at(&resumed[1], "--permission-mode").as_deref(),
+                Some("acceptEdits")
+            );
+            assert_eq!(at(&resumed[1], "--tools"), at(&first[0], "--tools"));
+            assert_eq!(at(&resumed[1], "--settings"), at(&first[0], "--settings"));
+            // Both launches allow the same ordinary workspace command through Bash.
+            for a in [&first[0], &resumed[1]] {
+                let tools = at(a, "--tools").unwrap();
+                let allowed = at(a, "--allowedTools").unwrap();
+                assert!(tools.split(',').any(|t| t == "Bash"));
+                assert!(allowed.split(',').any(|t| t == "Bash"));
+                assert!(
+                    at(a, "--settings")
+                        .unwrap()
+                        .contains("autoAllowBashIfSandboxed")
+                );
+            }
+            // Fork shares the branch: it launches under the source's contract.
+            pump(&mut engine, &|s| s.can_manage_thread(&worker));
+            let live = engine.running.get_mut(&scope).unwrap();
+            live.store
+                .dispatch(Action::ForkThread(worker.clone()))
+                .unwrap();
+            let end = Instant::now() + Duration::from_secs(10);
+            while argv(&raw).len() < 3 {
+                assert!(Instant::now() < end, "no fork launch");
+                if let Ok(e) = rx.recv_timeout(Duration::from_millis(50)) {
+                    engine.running.get_mut(&scope).unwrap().store.apply(e);
+                }
+            }
+            let forked = argv(&raw);
+            assert!(
+                forked[2].contains(&"--fork-session".to_owned()),
+                "{:?}",
+                forked[2]
+            );
+            assert!(has_policy(&forked[2]), "fork launch: {:?}", forked[2]);
+            // A host restart: a fresh store knows the worker only from its persisted
+            // origin in the ledger, which the host applies when it opens the route.
+            let (parent, _) = scopes(root.path());
+            let mut stamp = origin(workers_parent(&parent, "p"), Ceiling::Write);
+            stamp.runtime = Runtime::Claude;
+            stamp.requested = Ceiling::Write;
+            engine.workers.stamp(&scope, &worker, stamp);
+            let (etx, rx2) = std::sync::mpsc::channel();
+            let mut fresh = Store::open_claude(
+                ox_desk_core::store::Profile {
+                    project: scope.project.clone(),
+                    route: scope.route.clone(),
+                    provider: ox_desk_core::store::claude::SUBSCRIPTION_PROVIDER.into(),
+                },
+                ox_desk_core::store::claude::Launcher {
+                    ox: root.path().join("private-fixture"),
+                    path: "/bin:/usr/bin".into(),
+                    profiles: ox_desk_core::claude::catalog::Profiles {
+                        api: root.path().join("api"),
+                        subscription: root.path().join("native"),
+                    },
+                    index: root.path().join("index.json"),
+                    aliases: vec![],
+                },
+                move |event| {
+                    let _ = etx.send(event);
+                },
+            )
+            .unwrap();
+            annotate(&engine.workers, &engine.ledger.data, &scope, &mut fresh);
+            fresh.restore_ended(&worker, "worker", 0, None);
+            let end = Instant::now() + Duration::from_secs(10);
+            while fresh.catalog_row(&worker).is_none() || !fresh.can_send(None) {
+                assert!(Instant::now() < end, "fresh store never listed the worker");
+                if let Ok(e) = rx2.recv_timeout(Duration::from_millis(50)) {
+                    fresh.apply(e);
+                }
+            }
+            fresh
+                .dispatch(Action::DraftEdit(
+                    Some(worker.clone()),
+                    "after restart".into(),
+                ))
+                .unwrap();
+            fresh
+                .dispatch(Action::SendText(
+                    Some(worker.clone()),
+                    "after restart".into(),
+                ))
+                .unwrap();
+            let end = Instant::now() + Duration::from_secs(10);
+            while argv(&raw).len() < 4 {
+                assert!(Instant::now() < end, "no launch after restart");
+                if let Ok(e) = rx2.recv_timeout(Duration::from_millis(50)) {
+                    fresh.apply(e);
+                }
+            }
+            let restarted = argv(&raw);
+            assert!(
+                has_policy(&restarted[3]),
+                "after restart: {:?}",
+                restarted[3]
+            );
+            assert_eq!(
+                at(&restarted[3], "--permission-mode").as_deref(),
+                Some("acceptEdits")
+            );
         }
 
         #[test]

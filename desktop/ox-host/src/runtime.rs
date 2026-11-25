@@ -459,4 +459,66 @@ for line in sys.stdin:
         assert_eq!(row.saved_runtime_route(&[STOCK.into()]), None);
         assert_eq!(row.saved_runtime_route(&full), Some(route(Runtime::Claude)));
     }
+
+    /// Discovery-only provider: no starred or static models, no accounts, empty cache.
+    fn discovery_only(dir: &std::path::Path) -> RuntimeConfig {
+        let snapshot = Snapshot {
+            version: VERSION,
+            models: vec![],
+            api_provider: Some("codeox".into()),
+            claude_account: false,
+            chatgpt_account: None,
+            ..Default::default()
+        };
+        script(
+            &dir.join("ox"),
+            &format!(
+                r#"import json, sys, time
+req = json.load(sys.stdin)
+a = req["action"]
+if a == "read_rows": print({snap:?})
+elif a == "models":
+    time.sleep(0.3)
+    print(json.dumps(["{UNSTARRED}"]))
+else: sys.exit("unsupported")
+"#,
+                snap = serde_json::to_string(&snapshot).unwrap(),
+            ),
+        );
+        RuntimeConfig {
+            ox: dir.join("ox"),
+            path: std::env::join_paths([dir, std::path::Path::new("/usr/bin"), "/bin".as_ref()])
+                .unwrap(),
+            desktop: dir.join("state"),
+        }
+    }
+
+    #[test]
+    fn cold_discovery_only_host_lists_no_routes_first_then_both_runtimes_without_stars() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = discovery_only(dir.path());
+        // The first Hello can only be empty: nothing starred, no subscription, empty cache.
+        let first = config.prepare().unwrap();
+        assert!(first.routes.is_empty(), "{:?}", first.routes);
+        // Discovery lands in the background; the same host then lists the alias for both
+        // runtimes with no pre-existing route.
+        let mut routes = vec![];
+        for _ in 0..100 {
+            routes = config.prepare().unwrap().routes;
+            if !routes.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let want = [Runtime::Codex, Runtime::Claude].map(|r| r.route(Some(UNSTARRED.into())));
+        assert_eq!(routes, want);
+        // Opening needs only the provider, not a listed route: a codex open of a route that
+        // was never in any Hello passes the preflight.
+        let scope = Scope {
+            project: dir.path().to_path_buf(),
+            route: want[0].clone(),
+        };
+        let store = config.open(&scope, None, |_| ());
+        assert!(store.is_ok(), "{:?}", store.err().map(|e| e.to_string()));
+    }
 }

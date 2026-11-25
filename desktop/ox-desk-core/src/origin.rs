@@ -93,7 +93,8 @@ impl Origin {
         mode: WorkerMode,
     ) -> Option<crate::claude_worker_contract::Contract> {
         (self.runtime == Runtime::Claude
-            && self.relation == Relation::Worker
+            && matches!(self.relation, Relation::Worker | Relation::Fork)
+            && self.handoff.is_none()
             && self.requested == Ceiling::Write)
             .then(|| {
                 crate::claude_worker_contract::Contract::detect(true, mode == WorkerMode::Workflow)

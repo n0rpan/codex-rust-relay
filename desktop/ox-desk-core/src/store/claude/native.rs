@@ -89,20 +89,18 @@ impl Store {
         };
         let mut processes = live::ids_in_processes();
         // A terminal client registers itself; that holds while it is quiet for minutes.
-        processes.extend(live::ids_in_registry(match origin {
+        let listed = live::ids_in_registry(match origin {
             Origin::Api => &p.launcher.profiles.api,
             _ => &p.launcher.profiles.subscription,
-        }));
+        });
+        processes.extend(listed.ids);
         // Current Claude Code keeps a registry of its live clients. When it exists it is
         // authoritative: a journal written moments ago (a fixture, a terminal client that
         // just closed) says nothing without a live registered pid. Only an older Claude
         // Code, with no registry, falls back to the journal's age.
-        let registry = match origin {
-            Origin::Api => &p.launcher.profiles.api,
-            _ => &p.launcher.profiles.subscription,
-        }
-        .join("sessions")
-        .is_dir();
+        // When a pid's liveness cannot be determined (no procfs, odd errno) the registry is
+        // not authoritative and the journal's age still counts.
+        let registry = listed.authoritative;
         let now = SystemTime::now();
         let mut found = HashSet::new();
         for key in p.catalog.keys().filter(|k| !k.contains('/')) {

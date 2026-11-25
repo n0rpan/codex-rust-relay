@@ -384,6 +384,7 @@ pub(crate) fn status(
     let o = &entry.origin;
     let row = view.map_or("interrupted", |v| v.status.as_str());
     let finished = timeline.is_some_and(|t| !t.detail["last_finished"].is_null());
+    let stopped = timeline.is_some_and(|t| t.detail["interrupted"] == true);
     let mut status = if entry.marks.cancelled {
         "cancelled"
     } else {
@@ -397,6 +398,8 @@ pub(crate) fn status(
             _ if !live => "interrupted",
             // A Workflow worker completes only if it called the Workflow tool.
             _ if finished && workflow_unrun(o.mode, timeline) => "failed",
+            // The operator's Stop (or the runtime) ended the turn: partial output, not an answer.
+            _ if finished && stopped => "interrupted",
             _ if finished || timeline.is_none() => "completed",
             _ => "running",
         }
@@ -408,18 +411,25 @@ pub(crate) fn status(
         .last
         .as_ref()
         .filter(|_| !entry.marks.cancelled && !matches!(row, "running" | "needs_input"));
-    if status == "interrupted"
+    // Only a worker with no transcript to read, or one the route's close left
+    // interrupted, answers from the record: a reopened route that lists the session
+    // without its history (an unrelated sibling opened it) must not turn a recorded
+    // failure into a success.
+    if (status == "interrupted" && !stopped || timeline.is_none() && status == "completed")
         && let Some(last) = recorded
     {
-        status = if last.status == "failed" {
-            "failed"
-        } else {
-            "completed"
+        status = match last.status.as_str() {
+            "failed" => "failed",
+            "interrupted" => "interrupted",
+            _ => "completed",
         };
     }
     let progress = match row {
         "needs_input" => "Waiting for the operator to answer a request",
         "running" => "Working",
+        _ if status == "interrupted" && stopped => {
+            "The worker was stopped before it finished. Its output is partial. Open the worker to continue it."
+        }
         _ if status == "interrupted" => {
             "The session host restarted or the runtime closed. Open the worker to continue it."
         }
@@ -501,6 +511,7 @@ pub(crate) fn status(
         "max_minutes": entry.marks.max_minutes,
         "warning": entry.marks.warning,
         "result": result,
+        "partial": status == "interrupted" && result.is_some(),
         "error": error,
         "operator": operator,
         "messages": [],
@@ -823,6 +834,111 @@ mod tests {
         );
         let used = run(vec![item("tool", "Workflow"), item("assistant", "done")]);
         assert_eq!(used["status"], "completed");
+    }
+
+    #[test]
+    fn a_stopped_worker_reports_interrupted_with_its_partial_output() {
+        let mut entry = Entry {
+            origin: worker(Level::Read, Runtime::Codex),
+            marks: Marks::default(),
+        };
+        let view = SessionView {
+            id: "w".into(),
+            title: String::new(),
+            parent: None,
+            status: "idle".into(),
+            updated_at: 0,
+            capabilities: vec![],
+            detail: Value::Null,
+        };
+        let partial = Timeline {
+            items: vec![ox_desk_core::host_protocol::TimelineItem {
+                turn: "t".into(),
+                id: "i".into(),
+                role: "assistant".into(),
+                text: "half an answ".into(),
+                revision: 1,
+                detail: Value::Null,
+            }],
+            detail: json!({"last_finished":"t","interrupted":true}),
+        };
+        let stopped = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view),
+            Some(&partial),
+            true,
+            Operators::default(),
+        );
+        assert_eq!(stopped["status"], "interrupted");
+        assert_eq!(stopped["partial"], true);
+        assert_eq!(stopped["result"], "half an answ");
+        // The same turn finishing normally is complete.
+        let mut done = partial.clone();
+        done.detail = json!({"last_finished":"t"});
+        let finished = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view),
+            Some(&done),
+            true,
+            Operators::default(),
+        );
+        assert_eq!(finished["status"], "completed");
+        assert_eq!(finished["partial"], false);
+        // A recorded stop survives the route closing: no transcript, still interrupted and partial.
+        entry.marks.last = Some(Last {
+            status: "interrupted".into(),
+            result: Some("half an answ".into()),
+            error: None,
+        });
+        let reopened = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view),
+            None,
+            true,
+            Operators::default(),
+        );
+        assert_eq!(reopened["status"], "interrupted");
+        assert_eq!(reopened["result"], "half an answ");
+        assert_eq!(reopened["partial"], true);
+    }
+
+    #[test]
+    fn a_failed_worker_stays_failed_when_a_sibling_reopens_its_route() {
+        let mut entry = Entry {
+            origin: worker(Level::Read, Runtime::Codex),
+            marks: Marks::default(),
+        };
+        entry.marks.last = Some(Last {
+            status: "failed".into(),
+            result: None,
+            error: Some("bad".into()),
+        });
+        let view = SessionView {
+            id: "w".into(),
+            title: String::new(),
+            parent: None,
+            status: "idle".into(),
+            updated_at: 0,
+            capabilities: vec![],
+            detail: Value::Null,
+        };
+        let s = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view),
+            None,
+            true,
+            Operators::default(),
+        );
+        assert_eq!(s["status"], "failed");
+        assert_eq!(s["error"], "bad");
     }
 
     #[test]

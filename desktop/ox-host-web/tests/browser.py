@@ -128,10 +128,15 @@ def build_report_items():
     ]
 
 
+WRITE = threading.Lock()
+
+
 class Host(socketserver.StreamRequestHandler):
     def handle(self):
         def send(value):
-            self.wfile.write(json.dumps(value).encode() + b"\n")
+            with WRITE:
+                self.wfile.write(json.dumps(value).encode() + b"\n")
+                self.wfile.flush()
 
         f = self.server
         sequence = 20
@@ -271,23 +276,40 @@ class Host(socketserver.StreamRequestHandler):
                     if changes:
                         sequence += 1
                         send({"type":"delta", "scope":f.scope, "cursor":{"epoch":"fixture","seq":sequence}, "changes":changes})
+                    late = None
                     if "send_text" in action and action["send_text"][0] is None:
+                        said = action["send_text"][1]
+                        # "Ack first" and "Opened first" hold the other reply until the
+                        # test releases it, so the phone can be edited in between.
+                        late = {"Ack first": "opened", "Opened first": "ack"}.get(said)
+                        ident = {"Ack first": "new-ack", "Opened first": "new-opened"}.get(said, "new")
                         f.sessions.append(
                             dict(
                                 f.sessions[0],
-                                id="new",
-                                title="Newly created phone session",
+                                id=ident,
+                                title=ident if late else "Newly created phone session",
                                 parent=None,
                             )
                         )
-                        send(
-                            {
-                                "type": "opened",
-                                "id": frame["id"],
-                                "scope": f.scope,
-                                "thread": "new",
-                            }
-                        )
+                        opened = {
+                            "type": "opened",
+                            "id": frame["id"],
+                            "scope": f.scope,
+                            "thread": ident,
+                        }
+                        if late == "opened":
+                            def later():
+                                f.release.wait(20)
+                                send(opened)
+                            threading.Thread(target=later, daemon=True).start()
+                        elif late == "ack":
+                            def later():
+                                f.release.wait(20)
+                                send(opened)
+                                send({"type": "ack", "id": frame["id"]})
+                            threading.Thread(target=later, daemon=True).start()
+                        else:
+                            send(opened)
                     if "answer_ask" in action:
                         q = {
                             "id": "q",
@@ -334,7 +356,8 @@ class Host(socketserver.StreamRequestHandler):
                             }
                         )
                     f.actions.append(frame["action"])
-                    send({"type": "ack", "id": frame["id"]})
+                    if late != "ack":
+                        send({"type": "ack", "id": frame["id"]})
         except (OSError, ValueError):
             pass
 
@@ -755,6 +778,7 @@ def run(harness, screenshot=None):
         host.sessions.append(dict(host.sessions[0], id="typed-block", title="Typed block", status="idle",
                                   updated_at=0, capabilities=["open", "send"], detail={"access": "default"}))
         host.actions = []
+        host.release = threading.Event()
         host.resumes = []
         host.connections = []
         host.answered = False
@@ -765,7 +789,7 @@ def run(harness, screenshot=None):
         (codex/"codeox.toml").write_text('[providers.garden]\nname="Garden"\nbase_url="https://garden.invalid/v1"\nenv_key="GARDEN_TOKEN"\nwire_api="chat_completions"\ndiscovery=false\n[[providers.garden.models]]\nid="orchard"\n')
         service = subprocess.Popen(
             [harness, "--exact", "fixture::browser_service", "--ignored"],
-            env=dict(os.environ, SHELL="/bin/sh", HOME=str(isolated), CODEX_HOME=str(codex), CLAUDE_CONFIG_DIR=str(isolated/".claude"), XDG_STATE_HOME=str(isolated/"state"), XDG_CONFIG_HOME=str(isolated/"config"), OX_TEST_REMOTE_DIR=str(d)),
+            env=dict(os.environ, SHELL="/bin/sh", GARDEN_TOKEN="fixture-env-token", HOME=str(isolated), CODEX_HOME=str(codex), CLAUDE_CONFIG_DIR=str(isolated/".claude"), XDG_STATE_HOME=str(isolated/"state"), XDG_CONFIG_HOME=str(isolated/"config"), OX_TEST_REMOTE_DIR=str(d)),
             stdout=subprocess.DEVNULL,
         )
         stack.callback(service.wait, 5)
@@ -969,6 +993,14 @@ def run(harness, screenshot=None):
         assert typed and not typed[0][0] and typed[0][1].startswith("<ox-handoff>"), typed
         assert js("return document.getElementById('handoff-marks').hidden")
         phone_report(js, port, base, keypress, capture, screenshot)
+        # Cold discovery through the real New action: the Hello listed one Claude subscription
+        # route and no API route, and the connected tab never refreshes. The unstarred provider
+        # alias must still be offered for BOTH runtimes once its catalog lands.
+        js("document.getElementById('home').click();document.getElementById('new').click()")
+        wait(lambda: js(
+            "const o=[...document.querySelectorAll('#route option')].map(x=>x.textContent);"
+            "return ['codex','claude'].every(r=>o.some(t=>t.toLowerCase().includes(r)&&t.includes('orchard')))"
+        ))
         js(
             "document.getElementById('home').click();document.getElementById('new').click();document.getElementById('new-form').requestSubmit()"
         )
@@ -991,6 +1023,31 @@ def run(harness, screenshot=None):
                 "return document.getElementById('title').innerText==='Newly created phone session'"
             )
         )
+        # The first message of a new thread is followed at once by more typing; the
+        # real thread's Opened must keep it, whichever of Ack and Opened comes first.
+        def type_draft(text):
+            js("const d=document.getElementById('draft');d.value=arguments[0];d.dispatchEvent(new Event('input'))", text)
+        def new_thread(first):
+            host.release.clear()
+            js("document.getElementById('home').click();document.getElementById('new').click();document.getElementById('new-form').requestSubmit()")
+            wait(lambda: js("return document.getElementById('network').innerText==='Connected' && document.getElementById('title').innerText==='New session'"))
+            type_draft(first)
+            js("document.getElementById('composer').requestSubmit()")
+            wait(lambda: {"send_text": [None, first]} in host.actions)
+        new_thread("Ack first")
+        wait(lambda: js("return document.getElementById('draft').value===''"))  # the Ack cleared it
+        type_draft("follow-up one")
+        host.release.set()  # Opened arrives after the Ack
+        wait(lambda: js("return document.getElementById('title').innerText==='new-ack'"))
+        assert js("return document.getElementById('draft').value")=="follow-up one"
+        type_draft("")
+        new_thread("Opened first")
+        type_draft("Opened first and the rest")  # before either reply
+        host.release.set()  # Opened, then the Ack
+        wait(lambda: js("return document.getElementById('title').innerText==='new-opened'"))
+        time.sleep(0.5)
+        assert js("return document.getElementById('draft').value")=="Opened first and the rest"
+        type_draft("")
         from phone_settings import exercise
         exercise(js, wait)
 

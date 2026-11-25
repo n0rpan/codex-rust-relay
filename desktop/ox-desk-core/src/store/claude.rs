@@ -559,14 +559,27 @@ impl Store {
             Session::Resume(_) => resume_mode,
             Session::Fork { .. } => None,
         };
+        // A worker keeps its launch contract on every relaunch: a resume reuses its own,
+        // a fork the contract of its source.
         let contract = match &session {
             Session::New(_) => self.claude_mut().worker.take(),
-            Session::Resume(_) | Session::Fork { .. } => None,
+            Session::Resume(_) => self.worker_contracts.get(&owner).copied(),
+            Session::Fork { source, .. } => self
+                .worker_contracts
+                .get(&session_key(&self.profile.route.billing, source))
+                .copied(),
         };
-        let mode = contract
-            .map(|c| c.permission_mode().to_owned())
-            .or_else(|| preset.and_then(Access::mode).map(str::to_owned))
-            .unwrap_or_else(|| "default".to_owned());
+        if let Some(c) = contract {
+            self.worker_contracts.insert(owner.clone(), c);
+        }
+        // A new worker starts in the contract's mode. A resumed one keeps the access the
+        // user chose since; without a recorded choice it starts in the contract's mode.
+        let mode = match (&session, contract) {
+            (Session::New(_), Some(c)) => Some(c.permission_mode().to_owned()),
+            _ => preset.and_then(Access::mode).map(str::to_owned),
+        }
+        .or_else(|| contract.map(|c| c.permission_mode().to_owned()))
+        .unwrap_or_else(|| "default".to_owned());
         let p = self.claude_mut();
         p.serial += 1;
         let generation = p.serial;
@@ -681,6 +694,7 @@ impl Store {
             return Err(io::Error::other(native::HINT));
         }
         let text = self.draft(Some(id)).to_owned();
+        self.restored_drafts.remove(id);
         let raw = stock_id(id)?.to_owned();
         // A send continues the conversation the user was having, so its first turn runs
         // in the access mode they had chosen, also after the host reaped the idle route
@@ -717,6 +731,9 @@ impl Store {
             return Err(io::Error::other(
                 "Remove the attachment before submitting to Claude Code",
             ));
+        }
+        if let Some(id) = id {
+            self.restored_drafts.remove(id);
         }
         let new_conversation = id.is_none() && command.is_none();
         let message = new_id()?;

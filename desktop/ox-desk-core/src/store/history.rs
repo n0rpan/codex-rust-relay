@@ -149,6 +149,12 @@ impl Store {
         if entry.ready || entry.loading || self.terminal_threads.contains(id) {
             return Ok(());
         }
+        if self.state == Connection::Connecting {
+            // Still connecting: keep the selection and open it once ready.
+            self.queued_open = Some(id.into());
+            self.mark_loading(id);
+            return Ok(());
+        }
         if self.state != Connection::Ready {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
