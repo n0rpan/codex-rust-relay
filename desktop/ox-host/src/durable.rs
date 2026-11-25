@@ -70,6 +70,25 @@ pub(crate) fn handoff_window(
 pub(crate) struct Grant {
     pub(crate) scope: Scope,
     pub(crate) session: String,
+    /// Unix seconds when the grant was given. Grants saved before this field existed read
+    /// as 0 and are therefore expired.
+    #[serde(default)]
+    pub(crate) granted_at: i64,
+}
+/// How long a session's YOLO grant lasts.
+pub(crate) const GRANT_SECS: i64 = 12 * 60 * 60;
+impl Grant {
+    pub(crate) fn expires_at(&self) -> i64 {
+        self.granted_at.saturating_add(GRANT_SECS)
+    }
+    pub(crate) fn live(&self, now: i64) -> bool {
+        now < self.expires_at()
+    }
+}
+pub(crate) fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct Outcome {

@@ -32,6 +32,8 @@ pub(super) struct TranscriptView {
     list: ListState,
     expanded: HashSet<ItemKey>,
     tool_limits: std::collections::HashMap<ItemKey, usize>,
+    /// Tool items whose long output is shown in full instead of head and tail.
+    show_all: HashSet<ItemKey>,
     all_expanded: bool,
     hide_thinking: bool,
     find: Option<tools::Find>,
@@ -132,6 +134,7 @@ impl Workbench {
                 list,
                 expanded: HashSet::new(),
                 tool_limits: Default::default(),
+                show_all: HashSet::new(),
                 all_expanded: false,
                 hide_thinking: false,
                 find: None,
@@ -423,6 +426,7 @@ impl Workbench {
                 let expanded = view.all_expanded ^ view.expanded.contains(&key);
                 let binding = key.clone();
                 let group_size = keys.len();
+                let shown_all = view.show_all.clone();
                 let visible = view.tool_limits.get(&key).copied().unwrap_or(cards::PAGE);
                 let mut group = col()
                     .id(("tool-card", index))
@@ -454,14 +458,28 @@ impl Workbench {
                                     super::terminal_review::Review::failed(entry, &self.project)
                                 })
                                 .flatten();
+                            let show_all = shown_all.contains(item_key);
                             let view = cx.weak_entity();
                             let (id, item) = (owner.clone(), item_key.clone());
+                            let toggle_all = {
+                                let (id, item) = (owner.clone(), item_key.clone());
+                                cx.listener(move |s, _, _, cx| {
+                                    if let Some(v) = s.transcript_views.get_mut(&id)
+                                        && !v.show_all.remove(&item)
+                                    {
+                                        v.show_all.insert(item.clone());
+                                    }
+                                    cx.notify();
+                                })
+                            };
                             group = group.child(cards::detail(
                                 entry,
                                 offset,
                                 group_size > 1,
                                 p,
                                 &mono,
+                                show_all,
+                                toggle_all,
                                 move |_, _, cx| {
                                     if let Some(view) = view.upgrade()
                                         && let Some(entry) = view

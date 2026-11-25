@@ -54,6 +54,19 @@ pub fn button(
     crate::platform::layout_probe::mark(button, &id, &label, enabled)
 }
 
+/// A destructive or high-risk action: error-coloured border and text.
+pub fn danger_button(
+    palette: Palette,
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    enabled: bool,
+    click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Button {
+    button(palette, id, label, false, enabled, click)
+        .border_color(rgb(palette.error))
+        .text_color(rgb(palette.error))
+}
+
 /// A quiet toolbar control retains Button's tab stop, accessible label, and activation behavior.
 pub fn toolbar_button(
     p: Palette,

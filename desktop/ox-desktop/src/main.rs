@@ -6,6 +6,7 @@ mod kit;
 mod platform;
 mod preferences;
 mod settings;
+mod sky;
 mod terminal;
 #[path = "../../../src/version.rs"]
 mod version;
@@ -52,6 +53,7 @@ fn main() {
         platform::set_application_icon();
         gpui_component::init(cx);
         appearance::init(cx);
+        sky::start(cx);
         workspace_state::finish_writes(cx);
         let layouts = views::host::layout::SavedLayouts::load();
         let bounds = Bounds::centered(None, layouts.for_project(&project).window_size(), cx);

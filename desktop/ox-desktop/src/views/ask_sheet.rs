@@ -15,6 +15,53 @@ use gpui_component::{
 use ox_desk_core::actions::Action as DeskAction;
 use ox_desk_core::{transcript::ItemKey, transcript::item::Item};
 
+/// The "Needs you" marker: blinks once a second for ten seconds, then holds steady. Motion is off
+/// with reduced motion or a hidden window; the dot is then simply lit. Only this entity repaints.
+struct NeedsBlink {
+    started: std::time::Instant,
+    lit: bool,
+    tick: Option<Task<()>>,
+}
+const BLINK_SECONDS: u64 = 10;
+impl NeedsBlink {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            lit: true,
+            tick: None,
+        }
+    }
+}
+impl Render for NeedsBlink {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = Palette::get(cx);
+        let blinking =
+            p.motion && window.is_visible() && self.started.elapsed().as_secs() < BLINK_SECONDS;
+        if blinking && self.tick.is_none() {
+            self.tick = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                let _ = this.update(cx, |s, cx| {
+                    s.lit = !s.lit;
+                    s.tick = None;
+                    cx.notify();
+                });
+            }));
+        }
+        let lit = !blinking || self.lit;
+        div()
+            .size(px(8.))
+            .flex_shrink_0()
+            .rounded_full()
+            .bg(rgb(if lit {
+                p.warning
+            } else {
+                crate::appearance::mix(p.bg, p.warning, 30)
+            }))
+    }
+}
+
 /// Header of the approval card, e.g. "NEEDS YOU · 2 OF 3".
 fn needs_you_label(index: usize, count: usize) -> String {
     if count <= 1 {
@@ -124,13 +171,20 @@ impl Workbench {
         }
 
         let mut body = col().gap_2().flex_1().min_w_0();
+        let blink = window.use_keyed_state(
+            SharedString::from(format!("needs-blink-{:?}", ask.id)),
+            cx,
+            |_, _| NeedsBlink::new(),
+        );
         body = body
             .child(
-                div()
-                    .text_size(p.text(Step::Label))
-                    .text_color(rgb(p.warning))
-                    .font_family("monospace")
-                    .child(card_kicker(ask.waits_for_yolo(), index, asks.len())),
+                row().gap_2().items_center().child(blink).child(
+                    div()
+                        .text_size(p.text(Step::Label))
+                        .text_color(rgb(p.warning))
+                        .font_family("monospace")
+                        .child(card_kicker(ask.waits_for_yolo(), index, asks.len())),
+                ),
             )
             .child(
                 div()

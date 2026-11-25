@@ -645,6 +645,7 @@ impl Store {
             "handed_off_to",
             "handoff_attempts",
             "yolo_grant",
+            "yolo_grant_expires",
             "yolo_children",
         ]
         .into_iter()

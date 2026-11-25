@@ -1021,6 +1021,9 @@ fn safe_message(message: &str, secrets: &[String]) -> String {
     truncate(&redact(message, secrets))
 }
 
+/// Same rule as `upstream::redact`: replace each configured secret in `text`. Secrets shorter than 4 bytes are left alone on
+/// purpose: a 1-3 byte "secret" would mangle ordinary text (every "a" or "42"), and real API
+/// keys and tokens are far longer (provider keys are 20+ bytes), so nothing real is skipped.
 fn redact<'a>(text: &'a str, secrets: &[String]) -> Cow<'a, str> {
     let mut output = Cow::Borrowed(text);
     for secret in secrets {

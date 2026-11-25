@@ -294,6 +294,10 @@ impl Store {
     pub fn threads(&self) -> &[ThreadRow] {
         &self.catalog.rows
     }
+    /// Show `text` as the scope's notice, for host flows that warn the operator.
+    pub fn post_notice(&mut self, text: impl Into<String>) {
+        self.notice = Some(text.into());
+    }
     pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
     }

@@ -429,7 +429,14 @@ fn rejects_unsupported_content_and_bad_arguments() {
         "max_output_tokens": 64,
         "stream": true
     });
-    assert!(translate_request(&image, "m").is_err());
+    assert!(translate_request(&image, "m").is_ok());
+    let file = json!({
+        "input": [{"type": "message", "role": "user",
+            "content": [{"type": "input_file", "file_id": "f"}]}],
+        "max_output_tokens": 64,
+        "stream": true
+    });
+    assert!(translate_request(&file, "m").is_err());
 
     let bad_name = json!({
         "input": "hi",
@@ -1584,4 +1591,35 @@ fn still_requires_a_call_id_for_real_tool_outputs() {
     });
     let error = translate_request(&request, "claude-upstream").unwrap_err();
     assert!(error.contains("call_id"), "{error}");
+}
+
+#[test]
+fn maps_images_in_messages_and_tool_results() {
+    let request = json!({
+        "input": [
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "look"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                {"type": "input_image", "image_url": "https://example.test/x.jpg"}
+            ]},
+            {"type": "function_call", "call_id": "c1", "name": "view_image", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": [
+                {"type": "input_image", "image_url": "data:image/jpeg;base64,BBBB"}
+            ]}
+        ],
+        "max_output_tokens": 64,
+        "stream": true
+    });
+    let out = translate_request(&request, "m").expect("translates");
+    let messages = out["messages"].as_array().unwrap();
+    let user = messages[0]["content"].as_array().unwrap();
+    assert_eq!(user[1]["type"], "image");
+    assert_eq!(user[1]["source"]["type"], "base64");
+    assert_eq!(user[1]["source"]["media_type"], "image/png");
+    assert_eq!(user[1]["source"]["data"], "AAAA");
+    assert_eq!(user[2]["source"]["type"], "url");
+    assert_eq!(user[2]["source"]["url"], "https://example.test/x.jpg");
+    let result = messages[2]["content"][0]["content"].as_array().unwrap();
+    assert_eq!(result[0]["type"], "image");
+    assert_eq!(result[0]["source"]["media_type"], "image/jpeg");
 }

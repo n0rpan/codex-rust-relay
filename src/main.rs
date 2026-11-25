@@ -32,6 +32,7 @@ mod ui;
 mod update;
 mod upstream;
 mod version;
+mod weather;
 mod workers;
 
 use std::collections::BTreeSet;
@@ -168,6 +169,9 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
     }
     if args.first().is_some_and(|arg| arg == "end") {
         return ps::run_end(&args[1..]);
+    }
+    if args.first().is_some_and(|arg| arg == "weather") {
+        return weather::run(&args[1..]).await;
     }
     if args.first().is_some_and(|arg| arg == "update") {
         return update::run(&args[1..]).await;
@@ -485,7 +489,7 @@ fn exempt_loopback_proxy(command: &mut Command) {
 const NO_PROVIDER: &str = "no ox API provider configured. Run `ox setup` to add one, or `ox help subscriptions` for native sign-in";
 
 const OX_COMMANDS: &[&str] = &[
-    "setup", "doctor", "provider", "serve", "update", "login", "help", "codex", "claude",
+    "setup", "doctor", "provider", "serve", "update", "weather", "login", "help", "codex", "claude",
 ];
 /// Stock Codex subcommands that `ox <word>` forwards unchanged.
 const CODEX_COMMANDS: &[&str] = &[

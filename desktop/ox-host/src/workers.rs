@@ -30,6 +30,32 @@ pub(crate) struct Marks {
     /// by the launch that started the worker. Never changed afterwards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session: Option<String>,
+    /// Unix seconds when the worker session was stamped. 0 for workers saved before limits.
+    #[serde(default)]
+    pub started_at: i64,
+    /// The wall-clock limit this worker runs under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_minutes: Option<u32>,
+    /// The host stopped the worker because it ran past `max_minutes`.
+    #[serde(default)]
+    pub expired: bool,
+    /// A caution recorded at launch, such as another write worker in the same project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// The default wall-clock limit of a worker, in minutes.
+pub(crate) const DEFAULT_MAX_MINUTES: u32 = 240;
+/// The default number of workers one parent may run at once.
+pub(crate) const DEFAULT_MAX_PER_PARENT: usize = 4;
+
+/// A positive number from an environment variable, or `default`.
+pub(crate) fn env_limit(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
 }
 
 #[derive(Clone, Debug)]
@@ -77,7 +103,10 @@ impl Registry {
             key,
             Entry {
                 origin,
-                marks: Marks::default(),
+                marks: Marks {
+                    started_at: crate::durable::unix_now(),
+                    ..Marks::default()
+                },
             },
         );
         true
@@ -356,9 +385,18 @@ pub(crate) fn status(
             .find(|i| i.role == "assistant")
             .map(|i| i.text[..i.text.floor_char_boundary(24 * 1024)].to_owned())
     });
-    let error = timeline
-        .and_then(|t| t.detail["error"].as_str())
-        .map(str::to_owned);
+    let error = if entry.marks.expired {
+        Some(format!(
+            "Worker stopped after {} minutes (time limit).",
+            entry.marks.max_minutes.unwrap_or(DEFAULT_MAX_MINUTES)
+        ))
+    } else {
+        timeline
+            .and_then(|t| t.detail["error"].as_str())
+            .map(str::to_owned)
+    };
+    let elapsed = (entry.marks.started_at > 0)
+        .then(|| (crate::durable::unix_now() - entry.marks.started_at).max(0));
     let operator = (entry.marks.steered > 0 || entry.marks.continued > 0 || entry.marks.access.is_some())
         .then(|| {
             json!({
@@ -407,6 +445,9 @@ pub(crate) fn status(
         "started_mode": o.started,
         "mode_decided": o.decided,
         "progress": progress,
+        "elapsed_seconds": elapsed,
+        "max_minutes": entry.marks.max_minutes,
+        "warning": entry.marks.warning,
         "result": result,
         "error": error,
         "operator": operator,

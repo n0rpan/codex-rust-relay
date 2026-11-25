@@ -491,7 +491,7 @@ impl Store {
                             None if confirm_missing_alias => (),
                             _ => {
                                 return Err(io::Error::other(
-                                    "Confirm the original OX API alias before resuming this session",
+                                    "This session was saved with a different model alias. Choose the saved alias in the sidebar to resume it.",
                                 ));
                             }
                         }

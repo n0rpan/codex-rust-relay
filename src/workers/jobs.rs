@@ -16,6 +16,17 @@ use tokio::{
 use crate::provider::RelayError;
 
 const MAX_RUNNING: usize = 4;
+/// Default wall-clock limit of one worker, in minutes.
+const DEFAULT_MAX_MINUTES: u64 = 240;
+
+/// A positive number from an environment variable, or `default`.
+fn env_limit(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
 const MAX_RETAINED: usize = 24;
 const MAX_TEXT: usize = 24 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -37,10 +48,13 @@ pub(super) struct Start {
     /// Legacy: false means read, true means write. Capped by the parent's mode.
     #[serde(default)]
     workspace_write: Option<bool>,
-    /// `inherit` (default) or a lower level: read, write, classifier, yolo, or a
-    /// native preset name. Never above the parent's own mode.
+    /// `inherit` (default) or a lower level: read, write, classifier or yolo.
+    /// Never above the parent's own mode.
     #[serde(default)]
     permission_mode: Option<String>,
+    /// Wall-clock limit in minutes. Default: OX_WORKER_MAX_MINUTES, else 240.
+    #[serde(default)]
+    max_minutes: Option<u32>,
 }
 
 /// The canonical level name of a permission mode, or None for inherit.
@@ -103,6 +117,7 @@ struct Job {
     sender: mpsc::Sender<Instruction>,
     state: Arc<Mutex<State>>,
     task: AbortHandle,
+    writes: bool,
 }
 
 struct State {
@@ -116,6 +131,9 @@ struct State {
     result: Option<String>,
     error: Option<String>,
     model: String,
+    started: std::time::Instant,
+    max_minutes: u64,
+    warning: Option<String>,
 }
 
 impl State {
@@ -140,6 +158,9 @@ impl State {
             "progress": self.progress,
             "result": self.result,
             "error": self.error,
+            "elapsed_seconds": self.started.elapsed().as_secs(),
+            "max_minutes": self.max_minutes,
+            "warning": self.warning,
         })
     }
     fn snapshot(&self, job_id: u64) -> Value {
@@ -195,10 +216,16 @@ impl Jobs {
             .values()
             .filter(|job| !job.task.is_finished())
             .count()
-            >= MAX_RUNNING
+            >= env_limit("OX_WORKER_MAX_PER_PARENT", MAX_RUNNING as u64) as usize
         {
-            return Err("All background worker slots are in use.".into());
+            return Err("All background worker slots are in use. Wait for one to finish or cancel one. The limit is OX_WORKER_MAX_PER_PARENT.".into());
         }
+        let writes = request.writes()?;
+        let warning = self.write_overlap(writes);
+        let max_minutes = request.max_minutes.map_or_else(
+            || env_limit("OX_WORKER_MAX_MINUTES", DEFAULT_MAX_MINUTES),
+            u64::from,
+        );
         if self.entries.len() >= MAX_RETAINED
             && let Some(id) = self
                 .entries
@@ -237,6 +264,9 @@ impl Jobs {
             },
             result: None,
             error: None,
+            started: std::time::Instant::now(),
+            max_minutes,
+            warning,
         }));
         state
             .lock()
@@ -246,14 +276,24 @@ impl Jobs {
         let handle = tokio::spawn({
             let state = Arc::clone(&state);
             async move {
-                let result = match request.runtime {
-                    Runtime::Codex => {
-                        run_codex(command, &request, &state, &secrets, instructions).await
-                    }
-                    Runtime::Claude => {
-                        run_claude(command, &request, &state, &secrets, instructions).await
+                let work = async {
+                    match request.runtime {
+                        Runtime::Codex => {
+                            run_codex(command, &request, &state, &secrets, instructions).await
+                        }
+                        Runtime::Claude => {
+                            run_claude(command, &request, &state, &secrets, instructions).await
+                        }
                     }
                 };
+                let result =
+                    match tokio::time::timeout(Duration::from_secs(max_minutes * 60), work).await {
+                        Ok(result) => result,
+                        Err(_) => Err(format!(
+                            "Worker stopped after {max_minutes} minutes (time limit)."
+                        )
+                        .into()),
+                    };
                 let mut state = state.lock().unwrap();
                 if state.status == "cancelled" {
                     return;
@@ -273,9 +313,23 @@ impl Jobs {
                 sender,
                 state,
                 task: handle.abort_handle(),
+                writes,
             },
         );
         Ok(initial)
+    }
+
+    /// A caution when this write worker starts beside another running write worker.
+    fn write_overlap(&self, writes: bool) -> Option<String> {
+        (writes
+            && self
+                .entries
+                .values()
+                .any(|job| job.writes && !job.task.is_finished()))
+        .then(|| {
+            "Another write worker is editing this project. Consider a separate git worktree."
+                .to_owned()
+        })
     }
 
     pub(super) fn has(&self, id: u64) -> bool {
@@ -321,6 +375,7 @@ impl Start {
             "mode": self.mode,
             "task": crate::upstream::redact(&self.task, secrets),
             "write": self.workspace_write,
+            "max_minutes": self.max_minutes,
             "permission": self.permission_mode.as_deref().map(|m| permission_level(m).ok().flatten().unwrap_or("inherit")),
         })
     }
@@ -341,6 +396,9 @@ impl Start {
         }
     }
     pub(super) fn validate(&self) -> Result<(), String> {
+        if self.max_minutes.is_some_and(|m| m == 0 || m > 7 * 24 * 60) {
+            return Err("max_minutes must be between 1 and 10080.".into());
+        }
         if let Some(mode) = &self.permission_mode {
             permission_level(mode)?;
         }
@@ -1047,6 +1105,9 @@ printf flushed > "$MARKER"
             result: None,
             error: None,
             model: "fixture".into(),
+            started: std::time::Instant::now(),
+            max_minutes: 240,
+            warning: None,
         });
         let (_instructions, receiver) = mpsc::channel::<Instruction>(1);
         let status = run_codex(command, &request, &state, &[], receiver)
@@ -1091,11 +1152,79 @@ printf '%s\n' '{"type":"result","is_error":true,"result":"overloaded right now"}
             result: None,
             error: None,
             model: "fixture".into(),
+            started: std::time::Instant::now(),
+            max_minutes: 240,
+            warning: None,
         });
         let (_instructions, receiver) = mpsc::channel::<Instruction>(1);
         let error = run_claude(command, &request, &state, &[], receiver)
             .await
             .expect_err("an errored last turn fails the session");
         assert!(error.to_string().contains("overloaded right now"));
+    }
+
+    fn pending_job(writes: bool) -> Job {
+        let (sender, _) = mpsc::channel(1);
+        let task = tokio::spawn(std::future::pending::<()>());
+        Job {
+            sender,
+            state: Arc::new(Mutex::new(State {
+                runtime: Runtime::Codex,
+                mode: Mode::Session,
+                can_steer: false,
+                messages: VecDeque::new(),
+                status: "running",
+                native_session: None,
+                progress: String::new(),
+                result: None,
+                error: None,
+                model: String::new(),
+                started: std::time::Instant::now(),
+                max_minutes: 240,
+                warning: None,
+            })),
+            task: task.abort_handle(),
+            writes,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_parent_cannot_run_more_workers_than_the_cap() {
+        let mut jobs = Jobs::default();
+        for id in 1..=4 {
+            jobs.entries.insert(id, pending_job(false));
+        }
+        let request = start(json!({
+            "runtime": "claude", "mode": "session", "task": "x", "model": "m"
+        }));
+        let error = jobs
+            .start(request, Path::new("/"), Path::new("/"), Arc::new(vec![]))
+            .unwrap_err();
+        assert!(error.contains("OX_WORKER_MAX_PER_PARENT"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_second_write_worker_gets_a_warning_and_a_read_worker_does_not() {
+        let mut jobs = Jobs::default();
+        assert!(jobs.write_overlap(true).is_none());
+        jobs.entries.insert(1, pending_job(true));
+        assert!(jobs.write_overlap(true).unwrap().contains("git worktree"));
+        assert!(jobs.write_overlap(false).is_none());
+    }
+
+    #[test]
+    fn max_minutes_is_bounded() {
+        let ok = |m: u32| {
+            start(json!({"runtime":"claude","mode":"session","task":"x","max_minutes":m}))
+                .validate()
+        };
+        assert!(ok(30).is_ok());
+        assert!(ok(0).is_err());
+        assert!(ok(100_000).is_err());
+        assert_eq!(
+            start(json!({"runtime":"claude","mode":"session","task":"x","max_minutes":5}))
+                .host_start(&[])["max_minutes"],
+            5
+        );
     }
 }

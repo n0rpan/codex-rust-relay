@@ -6,6 +6,7 @@ pub mod behavior;
 mod forms;
 mod key_field;
 mod remote;
+mod sessions;
 use crate::{
     appearance::Palette,
     platform,
@@ -31,6 +32,7 @@ enum Page {
     Favorites,
     Credentials,
     Legacy,
+    Sessions,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -354,7 +356,7 @@ impl Preferences {
             Page::Favorites => &self.settings.revisions.favorites,
             Page::Legacy => &self.settings.revisions.legacy,
             Page::Credentials => &self.settings.revisions.keys,
-            Page::Remote | Page::Accounts | Page::Behavior | Page::Advanced => {
+            Page::Remote | Page::Accounts | Page::Behavior | Page::Advanced | Page::Sessions => {
                 return String::new();
             }
         }
@@ -1114,13 +1116,14 @@ impl Preferences {
         for (page, title) in [
             (Page::Accounts, "Accounts"),
             (Page::Remote, "Remote access"),
-            (Page::Providers, "Providers"),
-            (Page::Credentials, "Credentials"),
-            (Page::Search, "Search"),
+            (Page::Providers, "Providers & models"),
+            (Page::Credentials, "API keys"),
+            (Page::Search, "Web search"),
             (Page::Favorites, "Starred models"),
             (Page::Behavior, "Appearance & input"),
-            (Page::Legacy, "Legacy"),
-            (Page::Advanced, "Advanced"),
+            (Page::Sessions, "Sessions"),
+            (Page::Legacy, "Legacy Codex provider"),
+            (Page::Advanced, "Advanced configuration"),
         ] {
             if page == Page::Legacy && self.legacy.is_none() {
                 continue;
@@ -1164,6 +1167,7 @@ impl Preferences {
                 Page::Accounts => self.account_view(p, cx),
                 Page::Advanced => self.advanced_page(p, cx),
                 Page::Behavior => self.behavior_page(p, cx),
+                Page::Sessions => self.sessions_page(p, cx),
                 Page::Providers => self.providers_view(p, cx),
                 Page::Credentials => self.credentials_view(p, cx),
                 Page::Favorites => self.favorites_view(p, cx),

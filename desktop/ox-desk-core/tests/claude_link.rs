@@ -103,7 +103,14 @@ fn stock_version_and_billing_are_checked_before_user_input() {
         (
             minimum(),
             Billing::Subscription,
+            // A key in the environment is not fixed by signing in: no sign-in prompt.
             json!({"apiProvider":"firstParty","apiKeySource":"ANTHROPIC_API_KEY"}),
+            false,
+        ),
+        (
+            minimum(),
+            Billing::Subscription,
+            json!({"apiProvider":"firstParty"}),
             true,
         ),
         (

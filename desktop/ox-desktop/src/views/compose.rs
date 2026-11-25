@@ -138,7 +138,20 @@ impl Workbench {
             {
                 "Send an instruction to this worker…".to_owned()
             } else {
-                format!("Ask {} about this project…", store.runtime_name())
+                match &store.profile().route.billing {
+                    ox_desk_core::runtime::Billing::Api(alias) => {
+                        let model = store.options(owner.as_deref()).model;
+                        let model = if model.is_empty() {
+                            alias.clone()
+                        } else {
+                            model
+                        };
+                        format!("Ask {model} ({}) about this project…", store.runtime_name())
+                    }
+                    ox_desk_core::runtime::Billing::Subscription => {
+                        format!("Ask {} about this project…", store.runtime_name())
+                    }
+                }
             };
             let editor = cx.new(|cx| {
                 TextareaState::new(window, cx)
@@ -230,7 +243,7 @@ impl Workbench {
             (Some(_), None) if granted => "YOLO allowed for workers".to_owned(),
             (None, Some(m)) => format!("Next thread · {}", m.label()),
             (_, Some(m)) => m.label().to_owned(),
-            _ => String::new(),
+            _ => "Default".to_owned(),
         };
         if effective.is_some_and(Access::bypasses_permissions)
             && p.motion

@@ -406,7 +406,8 @@ export class SessionControls {
       workers > 0 ||
       live(row ?? {}) ||
       !!state?.asks?.some((a) => a.thread === id);
-    const run = () => this.apply({ end_session: id }, "thread");
+    const run = (force) =>
+      this.apply({ [force ? "force_end_session" : "end_session"]: id }, "thread");
     if (!busy) return run();
     const who = workers
       ? ` and ${workers} worker${workers === 1 ? "" : "s"}`
@@ -414,7 +415,7 @@ export class SessionControls {
     this.ctx.confirm(
       `End session${who}? A running turn stops. History is kept.`,
       "End session",
-      run,
+      () => run(true),
     );
   }
 }

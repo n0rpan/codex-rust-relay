@@ -5,11 +5,11 @@ use crate::{
     kit::{button, col, small},
 };
 use gpui::*;
-use ox_desk_core::runtime::Billing;
+use ox_desk_core::runtime::{Billing, Runtime};
 use ox_desk_core::{
     slash::Capabilities,
     store::{
-        Route,
+        Route, Store,
         routes_thread::{Choice, Options},
     },
 };
@@ -36,8 +36,38 @@ pub(super) fn model_entries(caps: &Capabilities) -> Vec<model_picker::Entry> {
             } else {
                 format!("{} · {id}", m.label)
             },
+            note: String::new(),
+            new_session: false,
         })
         .collect()
+}
+/// Provider part of an alias, for the "API · provider" tag.
+fn api_provider(id: &str) -> &str {
+    id.split_once('/').map_or("OX", |(provider, _)| provider)
+}
+/// The composer's Model picker: API aliases plus the subscription routes, each tagged with its
+/// runtime and what bills, and flagged when choosing it must open a new session.
+pub(super) fn composer_entries(store: &Store, owner: Option<&str>) -> Vec<model_picker::Entry> {
+    let runtime = store.profile().route.runtime;
+    let mut entries = model_entries(&store.command_caps(owner));
+    for entry in &mut entries {
+        entry.note = format!("{} · API · {}", runtime.name(), api_provider(&entry.id));
+        entry.new_session = !store.same_model_route(&entry.id);
+    }
+    let mut plans = Vec::new();
+    for rt in [Runtime::Codex, Runtime::Claude] {
+        if store.profile().route == rt.route(None) {
+            continue;
+        }
+        plans.push(model_picker::Entry {
+            id: format!("{}{}", model_picker::PLAN_PREFIX, rt.executable()),
+            label: format!("{} plan", rt.account()),
+            note: format!("{} · subscription", rt.name()),
+            new_session: true,
+        });
+    }
+    plans.extend(entries);
+    plans
 }
 fn choices(caps: &Capabilities, settings: &Options, kind: Kind) -> Vec<(String, Choice)> {
     match kind {
@@ -73,11 +103,24 @@ impl Workbench {
     /// Pick a model for the owner's thread: a new session when the route changes, otherwise an
     /// option change on the current one.
     fn choose_model(&mut self, owner: Option<String>, id: String, cx: &mut Context<Self>) {
-        let new_route = self
+        let plan = id.strip_prefix(model_picker::PLAN_PREFIX).map(|name| {
+            if name == Runtime::Claude.executable() {
+                Runtime::Claude
+            } else {
+                Runtime::Codex
+            }
+            .route(None)
+        });
+        let runtime = self
             .store
             .as_ref()
-            .is_some_and(|store| !store.same_model_route(&id))
-            .then(|| self.route.runtime.route(Some(id.clone())));
+            .map_or(self.route.runtime, |s| s.profile().route.runtime);
+        let new_route = plan.or_else(|| {
+            self.store
+                .as_ref()
+                .is_some_and(|store| !store.same_model_route(&id))
+                .then(|| runtime.route(Some(id.clone())))
+        });
         if self.store.as_ref().and_then(|s| s.selected()) == owner.as_deref() {
             if let Some(route) = new_route {
                 cx.emit(NewModelRoute(route));
@@ -113,7 +156,7 @@ impl Workbench {
             _ => None,
         };
         let label = if new_route.is_some() {
-            format!("New session · {label}")
+            format!("Switch model (new session) · {label}")
         } else {
             label.to_owned()
         };
@@ -169,7 +212,7 @@ impl Workbench {
             let entries = self
                 .store
                 .as_ref()
-                .map(|store| model_entries(&store.command_caps(owner.as_deref())))
+                .map(|store| composer_entries(store, owner.as_deref()))
                 .unwrap_or_default();
             let picker = cx.new(|cx| ModelPicker::new(entries, window, cx));
             let chosen_owner = owner.clone();
@@ -205,12 +248,20 @@ impl Workbench {
         let settings = store.options(owner);
         let enabled = store.can_send(owner);
         let route = match &store.profile().route.billing {
-            Billing::Subscription if settings.model.is_empty() => self.route.label(),
-            Billing::Subscription => {
-                format!("{} · {}", self.route.runtime.account(), settings.model)
-            }
+            Billing::Subscription if settings.model.is_empty() => format!(
+                "{} · {} plan",
+                store.profile().route.runtime.name(),
+                store.profile().route.runtime.account()
+            ),
+            Billing::Subscription => format!(
+                "{} · {} plan · {}",
+                store.profile().route.runtime.name(),
+                store.profile().route.runtime.account(),
+                settings.model
+            ),
             Billing::Api(original) => format!(
-                "OX API · {}",
+                "{} · API · {}",
+                store.profile().route.runtime.name(),
                 if settings.model.is_empty() {
                     original
                 } else {
@@ -224,12 +275,12 @@ impl Workbench {
             (
                 Kind::Effort,
                 "Effort",
-                settings.effort.clone().unwrap_or_default(),
+                settings.effort.clone().unwrap_or_else(|| "Default".into()),
             ),
             (
                 Kind::Speed,
                 "Speed",
-                settings.tier.clone().unwrap_or_default(),
+                settings.tier.clone().unwrap_or_else(|| "Default".into()),
             ),
         ]
         .into_iter()

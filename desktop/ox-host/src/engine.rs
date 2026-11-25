@@ -283,6 +283,10 @@ pub(crate) struct Engine {
     receipts: Receipts,
     /// Last project default read from the settings snapshot, kept for a failed read.
     yolo_projects: Vec<PathBuf>,
+    /// Projects whose YOLO default was already announced since the host started.
+    yolo_announced: HashSet<PathBuf>,
+    /// Launch cautions by job number, recorded on the worker when it is stamped.
+    launch_warnings: HashMap<u64, String>,
     discovered: HashMap<(Scope, String), ox_desk_core::store::ThreadRow>,
     asking: BTreeMap<u64, Asking>,
     preparing: Vec<Preparing>,
@@ -333,6 +337,8 @@ impl Engine {
             workers,
             receipts: Receipts::default(),
             yolo_projects: Vec::new(),
+            yolo_announced: HashSet::new(),
+            launch_warnings: HashMap::new(),
             discovered: Default::default(),
             asking: Default::default(),
             preparing: Default::default(),
@@ -372,7 +378,7 @@ impl Engine {
                 )
                 .chain(self.reading.iter().map(|r| r.deadline))
                 .chain(self.draining)
-                .chain((!self.idle.is_zero()).then_some(self.next_reap))
+                .chain(Some(self.next_reap))
                 .min();
             let msg = if deadline.is_some_and(|at| at <= Instant::now()) {
                 None
@@ -762,7 +768,7 @@ impl Engine {
                     }
                     Ok(None) => (),
                 }
-                let ends = matches!(action, Action::EndSession(_));
+                let ends = matches!(action, Action::EndSession(_) | Action::ForceEndSession(_));
                 let result = match self.act(id, &key, &scope, action, approval) {
                     Ok(()) => Server::Ack { id: key.clone() },
                     Err(e) => fail(e.to_string()),
@@ -1024,7 +1030,8 @@ impl Engine {
             ));
         }
         match action {
-            Action::EndSession(thread) => return self.end_thread(scope, &thread),
+            Action::EndSession(thread) => return self.end_thread(scope, &thread, false),
+            Action::ForceEndSession(thread) => return self.end_thread(scope, &thread, true),
             Action::StartHandoff(start) => return self.start_handoff(id, key, scope, start),
             Action::YoloGrant(session, on) => return self.set_grant(scope, &session, on),
             Action::InjectHandoff(..) => {
@@ -1345,6 +1352,17 @@ impl Engine {
                     });
                 } else {
                     self.workers.stamp(scope, thread, l.origin.clone());
+                    if let Payload::Worker(w) = &l.payload
+                        && let Some(entry) = self.workers.get_mut(scope, thread)
+                    {
+                        entry.marks.max_minutes = Some(w.max_minutes.unwrap_or_else(|| {
+                            crate::workers::env_limit(
+                                "OX_WORKER_MAX_MINUTES",
+                                crate::workers::DEFAULT_MAX_MINUTES.into(),
+                            ) as u32
+                        }));
+                        entry.marks.warning = self.launch_warnings.remove(&l.origin.job_id);
+                    }
                     launched = Some(Finished::new(l, Ok(()), Some(thread.clone())));
                 }
             }
@@ -1664,6 +1682,8 @@ impl Engine {
         });
         let resolved =
             crate::workers::grant(source, external, start.mode_request(), start.runtime)?;
+        let this_parent = crate::workers::parent_ref(caller, parent.clone());
+        self.check_worker_cap(&this_parent)?;
         let scope = canonical_scope(Scope {
             project,
             route: start.route(),
@@ -1671,6 +1691,12 @@ impl Engine {
         .map_err(|e| e.to_string())?;
         let job_id = self.new_job_id()?;
         let mut origin = crate::workers::origin(caller, parent.clone(), &start, job_id, resolved);
+        if let Some(warning) = self.write_overlap(&scope, resolved.level) {
+            self.launch_warnings.insert(job_id, warning.clone());
+            if let Some(live) = caller_scope(caller).and_then(|s| self.running.get_mut(s)) {
+                live.store.post_notice(warning);
+            }
+        }
         if resolved.level.needs_person() {
             match caller {
                 Caller::Operator { device, .. } if start.yolo_confirmed => {
@@ -2091,7 +2117,20 @@ impl Engine {
     }
     /// End one thread's process and the host-owned workers it started. The thread
     /// stays in the catalog; selecting it again resumes it.
-    fn end_thread(&mut self, scope: &Scope, thread: &str) -> io::Result<()> {
+    ///
+    /// A busy thread is refused unless `force` is set, so a stale window or remote client
+    /// cannot kill a running turn and its workers by accident.
+    fn end_thread(&mut self, scope: &Scope, thread: &str, force: bool) -> io::Result<()> {
+        if !self.running.contains_key(scope) {
+            return Err(io::Error::other(
+                "This route is not open on the session host.",
+            ));
+        }
+        if !force && self.thread_busy(scope, thread) {
+            return Err(io::Error::other(
+                "This session is busy. Confirm ending it, which cancels its running work.",
+            ));
+        }
         let live = self
             .running
             .get(scope)
@@ -2105,6 +2144,7 @@ impl Engine {
         let busy = live.store.thread_busy(thread);
         live.store.end_session(thread)?;
         live.tracker.threads.remove(thread);
+        self.drop_grant(scope, thread)?;
         if busy && let Some(entry) = self.workers.get_mut(scope, thread) {
             entry.marks.cancelled = true;
         }
@@ -2139,7 +2179,7 @@ impl Engine {
             .map(|(s, id)| (s.clone(), id.to_owned()))
             .collect();
         for (child_scope, child) in children {
-            if self.end_thread(&child_scope, &child).is_ok()
+            if self.end_thread(&child_scope, &child, true).is_ok()
                 && self.running.contains_key(&child_scope)
             {
                 self.process(&child_scope, vec![], true)?;
@@ -2223,7 +2263,8 @@ impl Engine {
             }
         }
         for (scope, thread) in due {
-            if self.end_thread(&scope, &thread).is_ok() && self.running.contains_key(&scope) {
+            if self.end_thread(&scope, &thread, false).is_ok() && self.running.contains_key(&scope)
+            {
                 self.process(&scope, vec![], true)?;
             }
             self.reap_empty(&scope)?;
@@ -2231,7 +2272,7 @@ impl Engine {
         for scope in empty {
             self.reap_empty(&scope)?;
         }
-        Ok(())
+        self.expire_workers()
     }
     fn broadcast(&mut self, scope: &Scope, changes: Vec<Change>) -> io::Result<()> {
         self.replay.cursor.seq = self.ledger.next_sequence(self.replay.cursor.seq)?;
@@ -2459,7 +2500,12 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
             );
         }
     }
-    for g in data.grants.iter().filter(|g| &g.scope == scope) {
+    let now = crate::durable::unix_now();
+    for g in data
+        .grants
+        .iter()
+        .filter(|g| &g.scope == scope && g.live(now))
+    {
         let children: Vec<Value> = workers
             .all()
             .filter(|(_, _, e)| {
@@ -2469,10 +2515,17 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
             .collect();
         let e = out.entry(g.session.clone()).or_default();
         e.1.insert("yolo_grant".into(), true.into());
+        e.1.insert("yolo_grant_expires".into(), g.expires_at().into());
         e.1.insert("yolo_children".into(), children.into());
     }
     for (id, (parent, detail)) in out {
         store.annotate_session(&id, parent, Value::Object(detail));
+    }
+}
+fn caller_scope(caller: &Caller) -> Option<&Scope> {
+    match caller {
+        Caller::Hosted { scope, .. } | Caller::Operator { scope, .. } => Some(scope),
+        Caller::External(_) => None,
     }
 }
 fn key_ok(reply: &Replier) -> bool {
@@ -2978,6 +3031,7 @@ mod tests {
                 write: Some(write),
                 permission: None,
                 yolo_confirmed: false,
+                max_minutes: None,
             }
         }
 
@@ -3447,6 +3501,7 @@ mod tests {
                     write: Some(true),
                     permission: None,
                     yolo_confirmed: false,
+                    max_minutes: None,
                 },
                 41,
                 ox_desk_core::modes::Resolved {
@@ -3938,6 +3993,111 @@ mod tests {
                 l.origin.decided,
                 Some(ox_desk_core::modes::Decision::Capped)
             );
+        }
+
+        #[test]
+        fn a_grant_expires_after_twelve_hours_and_ends_with_its_session() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, _worker, _) = routes(root.path());
+            with_parent(&mut engine, &parent, "yolo");
+            engine
+                .act(1, "g1", &parent, Action::YoloGrant("a".into(), true), None)
+                .unwrap();
+            let grant = engine.ledger.data.grants[0].clone();
+            assert!(grant.granted_at > 0);
+            assert_eq!(grant.expires_at(), grant.granted_at + 12 * 3600);
+            assert!(engine.yolo_grant(&parent, "a").is_some());
+            // Past twelve hours the grant no longer covers anything and is pruned.
+            engine
+                .ledger
+                .change(|d| d.grants[0].granted_at -= 12 * 3600 + 1)
+                .unwrap();
+            assert!(engine.yolo_grant(&parent, "a").is_none());
+            assert!(engine.ledger.data.grants.is_empty());
+            // A fresh grant is removed when its session is ended.
+            engine
+                .act(1, "g2", &parent, Action::YoloGrant("a".into(), true), None)
+                .unwrap();
+            engine.drop_grant(&parent, "a").unwrap();
+            assert!(engine.yolo_grant(&parent, "a").is_none());
+        }
+
+        #[test]
+        fn a_project_yolo_default_is_announced_once() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, _worker, _) = routes(root.path());
+            with_parent(&mut engine, &parent, "yolo");
+            engine.yolo_projects = vec![parent.project.clone()];
+            assert!(engine.yolo_grant(&parent, "a").is_some());
+            let notice = engine.running[&parent].store.notice().map(str::to_owned);
+            assert!(
+                notice
+                    .unwrap()
+                    .contains("YOLO is on for this project by default")
+            );
+            engine
+                .running
+                .get_mut(&parent)
+                .unwrap()
+                .store
+                .dismiss_notice();
+            assert!(engine.yolo_grant(&parent, "a").is_some());
+            assert!(
+                engine.running[&parent].store.notice().is_none(),
+                "announced once"
+            );
+        }
+
+        #[test]
+        fn a_parent_runs_at_most_the_capped_number_of_workers_and_expired_ones_stop() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker, _) = routes(root.path());
+            with_parent(&mut engine, &parent, "workspace");
+            let ids = ["w1", "w2", "w3", "w4"];
+            engine.running.insert(
+                worker.clone(),
+                live(
+                    &worker,
+                    ids.iter()
+                        .map(|id| view(&worker, id, "running", "read_only"))
+                        .collect(),
+                    &ids,
+                    vec![],
+                )
+                .0,
+            );
+            let parent_ref = workers_parent(&parent, "a");
+            for (n, id) in ids.iter().enumerate() {
+                let mut o = origin(parent_ref.clone(), Ceiling::Write);
+                o.job_id = 100 + n as u64;
+                engine.workers.stamp(&worker, id, o);
+            }
+            let err = engine.check_worker_cap(&parent_ref).unwrap_err();
+            assert!(err.contains("OX_WORKER_MAX_PER_PARENT"), "{err}");
+            // A write worker beside running write workers is warned, a read one is not.
+            assert!(
+                engine
+                    .write_overlap(&worker, Ceiling::Write)
+                    .unwrap()
+                    .contains("git worktree")
+            );
+            assert!(engine.write_overlap(&worker, Ceiling::Read).is_none());
+            // Past its limit a running worker is stopped and reported as expired.
+            let entry = engine.workers.get_mut(&worker, "w1").unwrap();
+            entry.marks.max_minutes = Some(1);
+            entry.marks.started_at -= 120;
+            engine.expire_workers().unwrap();
+            let status = engine.job_status(100).unwrap();
+            assert_eq!(status["status"], "cancelled");
+            assert!(status["error"].as_str().unwrap().contains("1 minutes"));
+            assert!(status["elapsed_seconds"].as_i64().unwrap() >= 120);
+            assert_eq!(engine.job_status(101).unwrap()["status"], "running");
         }
 
         #[test]
@@ -4586,6 +4746,37 @@ mod tests {
         }
 
         #[test]
+        fn ending_a_busy_session_needs_force_and_an_idle_one_does_not() {
+            let root = tempfile::tempdir().unwrap();
+            let (scope, _) = scopes(root.path());
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (running, log) = live(
+                &scope,
+                vec![view(&scope, "a", "running", "workspace")],
+                &["a"],
+                vec![],
+            );
+            engine.running.insert(scope.clone(), running);
+            let refused = engine
+                .act(1, "e1", &scope, Action::EndSession("a".into()), None)
+                .unwrap_err();
+            assert!(refused.to_string().contains("busy"), "{refused}");
+            assert!(
+                !log.lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(a, _)| matches!(a, Action::EndSession(_))),
+                "a refused end reaches no runtime"
+            );
+            // Forced, it passes the guard and only then meets the missing live process.
+            let forced = engine
+                .act(1, "e2", &scope, Action::ForceEndSession("a".into()), None)
+                .unwrap_err();
+            assert!(forced.to_string().contains("no live process"), "{forced}");
+        }
+
+        #[test]
         fn a_parent_stays_running_while_a_worker_it_started_is_busy() {
             let root = tempfile::tempdir().unwrap();
             let (parent, worker) = scopes(root.path());
@@ -4653,7 +4844,7 @@ mod tests {
             engine.running.insert(scope.clone(), local_live(&scope));
             assert!(engine.processes().is_empty(), "no thread, no process row");
             // A thread that is not live cannot be ended.
-            assert!(engine.end_thread(&scope, "gone").is_err());
+            assert!(engine.end_thread(&scope, "gone", false).is_err());
             // A held handoff keeps the scope open until its subscriber takes it.
             engine.running.get_mut(&scope).unwrap().held_handoff = Some((
                 "k".into(),

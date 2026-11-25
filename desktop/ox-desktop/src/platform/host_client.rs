@@ -227,7 +227,7 @@ pub(crate) fn list_processes() -> io::Result<Vec<ProcessView>> {
 
 /// End the live process of each thread in `scope`. Acts need a subscription to the
 /// scope on the same socket, so this subscribes first, then waits for every reply.
-pub(crate) fn end_threads(scope: Scope, threads: Vec<String>) -> io::Result<()> {
+pub(crate) fn end_threads(scope: Scope, threads: Vec<String>, force: bool) -> io::Result<()> {
     if threads.is_empty() {
         return Ok(());
     }
@@ -248,7 +248,11 @@ pub(crate) fn end_threads(scope: Scope, threads: Vec<String>) -> io::Result<()> 
             &Client::Act {
                 id: id.clone(),
                 scope: scope.clone(),
-                action: Action::EndSession(thread),
+                action: if force {
+                    Action::ForceEndSession(thread)
+                } else {
+                    Action::EndSession(thread)
+                },
                 approval: None,
             },
         )?;

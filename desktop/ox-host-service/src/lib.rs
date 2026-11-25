@@ -101,19 +101,57 @@ impl Paths {
     }
 }
 
+/// The start of the error for an OX state folder that other accounts could read. The
+/// desktop recognises it to offer a one-click fix, so keep it stable.
+pub const UNSAFE_FOLDER: &str = "OX state folder has unsafe permissions";
+
 fn private_directory(path: &Path) -> io::Result<()> {
     DirBuilder::new().recursive(true).mode(0o700).create(path)?;
     let m = fs::symlink_metadata(path)?;
-    if !m.is_dir() || m.uid() != uid() || m.mode() & 0o077 != 0 {
+    if m.is_dir() && m.uid() == uid() && m.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!("{UNSAFE_FOLDER}: {}", path.display()),
+        ));
+    }
+    if !m.is_dir() || m.uid() != uid() {
         return Err(io::Error::new(
             ErrorKind::PermissionDenied,
             format!(
-                "{} must be a private directory owned by the current account",
+                "OX can't use {} because it is not a folder that only you own. Move or delete it, then reconnect.",
                 path.display()
             ),
         ));
     }
     Ok(())
+}
+
+/// The folder named by an [`UNSAFE_FOLDER`] error message, if `message` is one.
+pub fn unsafe_folder(message: &str) -> Option<PathBuf> {
+    let path = message.strip_prefix(UNSAFE_FOLDER)?.strip_prefix(": ")?;
+    let path = PathBuf::from(path.lines().next()?);
+    path.is_absolute().then_some(path)
+}
+
+/// The shell command that fixes an unsafe folder by hand.
+pub fn fix_command(path: &Path) -> String {
+    format!(
+        "chmod 700 '{}'",
+        path.display().to_string().replace('\'', "'\\''")
+    )
+}
+
+/// Make a folder OX created private again (mode 700). Only a real folder owned by the
+/// current account is changed; anything else is refused.
+pub fn fix_folder_permissions(path: &Path) -> io::Result<()> {
+    let m = fs::symlink_metadata(path)?;
+    if !m.is_dir() || m.uid() != uid() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!("{} is not a folder you own", path.display()),
+        ));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
 fn lock_file(path: &Path) -> io::Result<File> {

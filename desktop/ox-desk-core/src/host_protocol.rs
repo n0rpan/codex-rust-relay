@@ -158,7 +158,8 @@ pub enum Server {
 ///
 /// A Claude process serves one thread. A Codex app-server serves a scope and lists
 /// every thread subscribed on it. To end a process, send `Action::EndSession(thread)`
-/// for each id in `threads` (scoped to `scope`).
+/// for each id in `threads` (scoped to `scope`). The host refuses `EndSession` on a busy
+/// thread; `Action::ForceEndSession(thread)` ends it anyway, after the user confirmed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProcessView {

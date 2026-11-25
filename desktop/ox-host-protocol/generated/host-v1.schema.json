@@ -467,6 +467,18 @@
         {
           "additionalProperties": false,
           "properties": {
+            "force_end_session": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "force_end_session"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
             "answer_ask": {
               "maxItems": 2,
               "minItems": 2,
@@ -1499,7 +1511,7 @@
       ]
     },
     "ProcessView": {
-      "description": "One live process the host runs for a project and billing route.\n\nA Claude process serves one thread. A Codex app-server serves a scope and lists\nevery thread subscribed on it. To end a process, send `Action::EndSession(thread)`\nfor each id in `threads` (scoped to `scope`).",
+      "description": "One live process the host runs for a project and billing route.\n\nA Claude process serves one thread. A Codex app-server serves a scope and lists\nevery thread subscribed on it. To end a process, send `Action::EndSession(thread)`\nfor each id in `threads` (scoped to `scope`). The host refuses `EndSession` on a busy\nthread; `Action::ForceEndSession(thread)` ends it anyway, after the user confirmed.",
       "properties": {
         "kind": {
           "description": "`claude`, `codex` or `worker` (every thread of the process is a host-owned worker).",
@@ -2197,6 +2209,15 @@
       "additionalProperties": false,
       "description": "An operator's request to start a worker attached to a session in the subscribed scope.",
       "properties": {
+        "max_minutes": {
+          "description": "Wall-clock limit in minutes. Absent means the host default (`OX_WORKER_MAX_MINUTES`, 4 hours).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/WorkerMode"
         },

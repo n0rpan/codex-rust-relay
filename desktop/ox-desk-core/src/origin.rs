@@ -124,6 +124,9 @@ pub struct WorkerStart {
     /// An operator start whose client showed the YOLO confirmation.
     #[serde(default)]
     pub yolo_confirmed: bool,
+    /// Wall-clock limit in minutes. Absent means the host default (`OX_WORKER_MAX_MINUTES`, 4 hours).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_minutes: Option<u32>,
 }
 
 impl WorkerStart {
@@ -185,11 +188,15 @@ impl WorkerStart {
             write,
             permission,
             yolo_confirmed: false,
+            max_minutes: None,
         };
         Some(start.validate().map(|()| start))
     }
     /// The checks the standalone OX gateway applies, shared by every launcher.
     pub fn validate(&self) -> Result<(), String> {
+        if self.max_minutes.is_some_and(|m| m == 0 || m > 7 * 24 * 60) {
+            return Err("max_minutes must be between 1 and 10080.".into());
+        }
         if self.task.trim().is_empty() || self.task.len() > 32 * 1024 {
             return Err("Provide a task of up to 32 KiB.".into());
         }

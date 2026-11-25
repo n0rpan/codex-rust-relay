@@ -558,6 +558,9 @@ fn extract_error_message(value: &Value) -> Option<&str> {
     (!message.trim().is_empty()).then_some(message)
 }
 
+/// Replace each configured secret in `text`. Secrets shorter than 4 bytes are left alone on
+/// purpose: a 1-3 byte "secret" would mangle ordinary text (every "a" or "42"), and real API
+/// keys and tokens are far longer (provider keys are 20+ bytes), so nothing real is skipped.
 pub(crate) fn redact<'a>(text: &'a str, secrets: &[String]) -> Cow<'a, str> {
     let mut output = Cow::Borrowed(text);
     for secret in secrets {
@@ -684,6 +687,15 @@ fn forward_retry_after(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_keys_of_real_length_are_redacted_and_tiny_ones_do_not_mangle_text() {
+        let secrets = vec!["sk-12345678".to_owned(), "ab".to_owned()];
+        assert_eq!(
+            redact("key sk-12345678 and abc", &secrets),
+            "key [redacted] and abc"
+        );
+    }
 
     #[tokio::test]
     async fn oversized_translated_stream_fails_before_consuming_the_next_chunk() {

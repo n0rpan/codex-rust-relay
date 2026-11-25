@@ -6,7 +6,7 @@ use crate::{
     kit::{self, small},
     settings::{self, model, protocol::Request},
 };
-use gpui::*;
+use gpui::{prelude::FluentBuilder, *};
 use gpui_component::input::{Input, InputEvent, InputState};
 use std::{collections::HashSet, rc::Rc};
 
@@ -18,7 +18,14 @@ const VISIBLE_ROWS: usize = 10;
 pub(super) struct Entry {
     pub id: String,
     pub label: String,
+    /// Runtime and what bills, shown muted after the label ("Codex · API · openai").
+    pub note: String,
+    /// Choosing this row opens a new session instead of changing the current one.
+    pub new_session: bool,
 }
+
+/// Id prefix of a subscription-route row (`@plan:codex`, `@plan:claude`); not a catalog alias.
+pub(super) const PLAN_PREFIX: &str = "@plan:";
 
 impl Entry {
     /// A catalog alias with no separate display name.
@@ -26,7 +33,12 @@ impl Entry {
         Self {
             id: id.to_owned(),
             label: id.to_owned(),
+            note: String::new(),
+            new_session: false,
         }
+    }
+    fn is_plan(&self) -> bool {
+        self.id.starts_with(PLAN_PREFIX)
     }
 }
 
@@ -54,16 +66,28 @@ pub(super) fn arrange(entries: &[Entry], favorites: &[String], query: &str) -> V
         needle.is_empty()
             || entry.id.to_lowercase().contains(&needle)
             || entry.label.to_lowercase().contains(&needle)
+            || entry.note.to_lowercase().contains(&needle)
     };
     let mut seen = HashSet::new();
+    let mut rows = Vec::new();
+    let plans: Vec<usize> = (0..entries.len())
+        .filter(|&index| entries[index].is_plan() && matches(&entries[index]))
+        .collect();
+    if !plans.is_empty() {
+        rows.push(Row::Heading("SUBSCRIPTION PLANS".into()));
+        rows.extend(plans.into_iter().map(|entry| Row::Model {
+            entry,
+            starred: false,
+        }));
+    }
     let starred: Vec<usize> = favorites
         .iter()
         .filter_map(|id| {
             let index = entries.iter().position(|entry| &entry.id == id)?;
-            (matches(&entries[index]) && seen.insert(index)).then_some(index)
+            (!entries[index].is_plan() && matches(&entries[index]) && seen.insert(index))
+                .then_some(index)
         })
         .collect();
-    let mut rows = Vec::new();
     if !starred.is_empty() {
         rows.push(Row::Heading("STARRED".into()));
         rows.extend(starred.into_iter().map(|entry| Row::Model {
@@ -72,7 +96,7 @@ pub(super) fn arrange(entries: &[Entry], favorites: &[String], query: &str) -> V
         }));
     }
     let mut all: Vec<usize> = (0..entries.len())
-        .filter(|&index| matches(&entries[index]))
+        .filter(|&index| !entries[index].is_plan() && matches(&entries[index]))
         .collect();
     // Unknown providers go last; otherwise providers are compared case-insensitively.
     let group = |id: &str| {
@@ -222,6 +246,9 @@ impl ModelPicker {
     }
 
     fn toggle_star(&mut self, id: &str, cx: &mut Context<Self>) {
+        if id.starts_with(PLAN_PREFIX) {
+            return;
+        }
         let mut favorites = self.favorites.clone();
         match favorites.iter().position(|f| f == id) {
             Some(index) => {
@@ -268,6 +295,7 @@ impl ModelPicker {
             Row::Model { entry, starred } => {
                 let entry = &self.entries[*entry];
                 let id = entry.id.clone();
+                let plan = entry.is_plan();
                 let star = *starred;
                 let active = selected == Some(ix);
                 kit::row()
@@ -293,7 +321,11 @@ impl ModelPicker {
                             .id(("model-star", ix))
                             .flex_shrink_0()
                             .cursor_pointer()
-                            .child(kit::star_column(p, star))
+                            .child(if plan {
+                                div().w(px(14.)).into_any_element()
+                            } else {
+                                kit::star_column(p, star).into_any_element()
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.toggle_star(&id, cx);
@@ -307,6 +339,24 @@ impl ModelPicker {
                             .text_ellipsis()
                             .child(entry.label.clone()),
                     )
+                    .when(!entry.note.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(p.text(Step::Label))
+                                .text_color(rgb(p.muted))
+                                .child(entry.note.clone()),
+                        )
+                    })
+                    .when(entry.new_session, |row| {
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(p.text(Step::Label))
+                                .text_color(rgb(p.warning))
+                                .child("New session"),
+                        )
+                    })
                     .into_any_element()
             }
         }
@@ -360,6 +410,12 @@ impl Render for ModelPicker {
         }
         if let Some(notice) = &self.notice {
             view = view.child(small(p, notice.clone()));
+        }
+        if self.entries.iter().any(|e| e.new_session) {
+            view = view.child(small(
+                p,
+                "Rows marked New session switch model by opening a new session; others change this one in place.",
+            ));
         }
         if models.is_empty() {
             let text = if self.entries.is_empty() {
@@ -443,6 +499,8 @@ mod tests {
             Entry {
                 id: "openai/b".into(),
                 label: "Bravo".into(),
+                note: String::new(),
+                new_session: false,
             },
             entry("openai/a"),
             entry("anthropic/a"),

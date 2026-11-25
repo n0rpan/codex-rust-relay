@@ -79,8 +79,8 @@
 //!   representable in the subset shared by both destinations.
 //! * A tool result containing an image becomes a `function_call_output` whose
 //!   `output` is an array of `input_text`/`input_image` parts. Responses
-//!   accepts that shape, but the existing Chat Completions adapter rejects
-//!   image parts in tool output.
+//!   accepts that shape, and the Chat Completions adapter forwards the images
+//!   as a follow-up user message.
 //! * A `tool_result`'s `is_error` flag has no Responses field; its text
 //!   content is forwarded unchanged.
 //! * `top_k` has no Responses field and is ignored.

@@ -1,4 +1,11 @@
 //! Isolated, tool-free native inference, using the same authenticated OX route.
+//!
+//! Cost and visibility: a title is one short, tool-free turn (at most 1,800 characters in,
+//! a few words out, 30 s cap) run as a separate short-lived child on the SAME route and
+//! model as the thread it names. On a subscription route that is the subscription; on an
+//! API route it bills that thread's own API alias, never a different account. Such a child
+//! is not a session, so it is not listed in Running or `ox ps`; it ends by itself within
+//! seconds. Sessions that already have a name, workers and handoff children never run one.
 use super::{Launcher, concise};
 use crate::{
     ports::ox,

@@ -20,6 +20,8 @@ use std::{
 type Target = (Scope, Vec<String>);
 
 const POLL: Duration = Duration::from_secs(5);
+/// The slower cadence while nothing is running: each poll is a full host connection.
+const POLL_EMPTY: Duration = Duration::from_secs(20);
 
 /// A compact duration such as `40s`, `12m`, `3h` or `2d`. Negative spans read as zero.
 pub(crate) fn span(seconds: i64) -> String {
@@ -109,15 +111,30 @@ pub struct Running {
 }
 
 impl Running {
-    /// Live host processes that are mid-turn, for the sidebar footer.
-    pub fn running_count(&self) -> usize {
-        self.processes.iter().filter(|p| p.running).count()
+    /// The one count for "RUNNING · n": every live host process, busy or idle. The
+    /// panel header and the sidebar footer both read it, so they cannot disagree.
+    pub fn process_count(&self) -> usize {
+        self.processes.len()
+    }
+
+    /// The "RUNNING · n" label shared by the panel header and the sidebar footer.
+    pub fn summary(&self) -> String {
+        format!("RUNNING · {}", self.process_count())
     }
 
     pub fn new(cx: &mut Context<Self>) -> Self {
         let poll = cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(POLL).await;
+                let wait = this
+                    .update(cx, |s, _| {
+                        if s.processes.is_empty() {
+                            POLL_EMPTY
+                        } else {
+                            POLL
+                        }
+                    })
+                    .unwrap_or(POLL);
+                cx.background_executor().timer(wait).await;
                 let Ok(due) = this.update(cx, |s, _| s.shown) else {
                     break;
                 };
@@ -178,6 +195,7 @@ impl Running {
     fn end(
         &mut self,
         plan: impl FnOnce() -> Result<Vec<Target>, String> + Send + 'static,
+        force: bool,
         cx: &mut Context<Self>,
     ) {
         if self.ending {
@@ -192,7 +210,7 @@ impl Running {
             };
             let mut failure = None;
             for (scope, threads) in groups {
-                if let Err(e) = platform::end_threads(scope, threads) {
+                if let Err(e) = platform::end_threads(scope, threads, force) {
                     failure.get_or_insert(e.to_string());
                 }
             }
@@ -216,7 +234,7 @@ impl Running {
             self.confirm = Some(target);
             cx.notify();
         } else {
-            self.end(move || Ok(vec![target]), cx);
+            self.end(move || Ok(vec![target]), false, cx);
         }
     }
 
@@ -234,6 +252,7 @@ impl Running {
                 let fresh = platform::list_processes().map_err(|e| e.to_string())?;
                 Ok(still_idle(&seen, &fresh))
             },
+            false,
             cx,
         );
     }
@@ -245,7 +264,7 @@ impl Render for Running {
         let view = cx.weak_entity();
         let now = now_secs();
         let idle = idle_rows(&self.processes).len();
-        let count = self.processes.len();
+        let count = self.process_count();
 
         let rows = self.processes.iter().enumerate().map(|(i, process)| {
             let view = view.clone();
@@ -342,7 +361,7 @@ impl Render for Running {
                                 let target = confirm_target.clone();
                                 let _ = confirm_view.update(cx, |s, cx| {
                                     s.confirm = None;
-                                    s.end(move || Ok(vec![target]), cx);
+                                    s.end(move || Ok(vec![target]), true, cx);
                                 });
                             },
                         ))
@@ -375,7 +394,7 @@ impl Render for Running {
                 row()
                     .justify_between()
                     .min_w_0()
-                    .child(small(p, format!("RUNNING · {count}")))
+                    .child(small(p, self.summary()))
                     .child(button(
                         p,
                         "running-end-idle",

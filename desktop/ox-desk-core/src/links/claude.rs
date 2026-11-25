@@ -275,16 +275,50 @@ fn verify_initialization(reply: &ControlReply, billing: &Billing) -> io::Result<
     if !actual.is_some_and(|(n, pre)| n > required || n == required && !pre) {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            format!(
-                "OX Desktop requires Claude Code {} or later. Check claude --version.",
-                minimum()
-            ),
+            match caps.claude_code_version.as_deref() {
+                Some(found) => format!(
+                    "Claude Code {found} found; OX Desktop needs {} or later. Update Claude Code, then press Reconnect.",
+                    minimum()
+                ),
+                None => format!(
+                    "OX Desktop needs Claude Code {} or later. Update Claude Code, then press Reconnect.",
+                    minimum()
+                ),
+            },
         ));
     }
     if !matches_account(billing, &caps.account) {
+        let key = caps
+            .account
+            .api_key_source
+            .as_deref()
+            .filter(|s| *s != "none")
+            .or_else(|| {
+                caps.account
+                    .token_source
+                    .as_deref()
+                    .filter(|s| *s != "none")
+                    .filter(|_| *billing == Billing::Subscription)
+            });
+        // A key in the environment is not fixed by signing in, so it is not a sign-in error.
+        if let (Some(source), Billing::Subscription) = (key, billing) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Claude Code is using {source} from your environment instead of your Claude subscription. Unset it, or choose an API model route, then press Reconnect."
+                ),
+            ));
+        }
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "Claude Code reported a different billing route",
+            match billing {
+                Billing::Subscription => {
+                    "Claude Code is not signed in to a Claude subscription. Sign in, then press Reconnect."
+                }
+                Billing::Api(_) => {
+                    "Claude Code is not using the saved OX API key for this model route. Press Reconnect, or choose another model route."
+                }
+            },
         ));
     }
     Ok(())

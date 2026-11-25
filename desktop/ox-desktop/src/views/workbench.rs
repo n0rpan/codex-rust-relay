@@ -10,25 +10,43 @@ use ox_desk_core::{
 };
 use std::{collections::HashMap, path::PathBuf, time::Instant};
 
+pub(super) mod empty;
 mod review;
 mod thread_menu;
 mod usage;
 mod worker;
 
-fn current_activity(store: &Store) -> Option<activity::Scene> {
+/// Plain wording for the connection errors users meet most, each with its next step.
+/// Anything unrecognised is shown as is.
+fn plain_status(message: &str) -> String {
+    match message {
+        "Session host disconnected" | "Connection closed" => {
+            "The session host stopped. Reconnect to start it.".into()
+        }
+        "Incomplete or oversized host frame" => {
+            "The session host sent an unreadable reply. Reconnect, or restart OX Desktop if it keeps happening.".into()
+        }
+        "Claude Code closed its output" => {
+            "Claude Code stopped unexpectedly. Reconnect to start it again.".into()
+        }
+        _ => message.to_owned(),
+    }
+}
+
+fn current_activity(store: &Store) -> Option<(activity::Scene, u64)> {
     use activity::Scene;
-    use ox_desk_core::transcript::{Row, item::Item};
+    use ox_desk_core::transcript::Row;
     let id = store.selected()?;
     if store
         .asks()
         .iter()
         .any(|ask| ask.thread.as_deref() == Some(id))
     {
-        return Some(Scene::Waiting);
+        return Some((Scene::Waiting, 0));
     }
     let transcript = store.transcript(id)?;
     if transcript.is_loading() {
-        return Some(Scene::Loading);
+        return Some((Scene::Loading, 0));
     }
     let active = transcript.active_turn()?;
     let tail = transcript
@@ -43,21 +61,10 @@ fn current_activity(store: &Store) -> Option<activity::Scene> {
     let item = key
         .filter(|key| key.turn == active)
         .and_then(|key| transcript.entry(key));
-    Some(match item.map(|entry| &entry.item) {
-        Some(Item::AgentMessage { .. } | Item::Plan { .. }) => Scene::Typing,
-        Some(Item::AgentOperation { status, .. }) if active_tool(status) => Scene::Worker,
-        Some(
-            Item::CommandExecution { status, .. }
-            | Item::McpToolCall { status, .. }
-            | Item::FileChange { status, .. }
-            | Item::ToolCall { status, .. },
-        ) if active_tool(status) => Scene::Tool,
-        Some(Item::WebSearch { .. }) => Scene::Tool,
-        _ => Scene::Thinking,
-    })
-}
-fn active_tool(status: &str) -> bool {
-    matches!(status, "inProgress" | "in_progress" | "running" | "started")
+    Some((
+        Scene::for_item(item.map(|entry| &entry.item)),
+        activity::seed(id, active),
+    ))
 }
 
 pub struct Workbench {
@@ -101,6 +108,11 @@ pub struct Workbench {
         HashMap<ox_desk_core::runtime::RequestId, Vec<Entity<gpui_component::input::InputState>>>,
     pub(super) fire: Option<Entity<activity::Runner>>,
     pub(super) runner: Option<Entity<activity::Runner>>,
+    /// The selected thread's running turn at the last render, to notice it ending.
+    last_turn: Option<(String, String)>,
+    /// A just-ended turn's one-shot scene, kept until it has been seen once.
+    finale: Option<(String, activity::Scene)>,
+    finale_watch: Option<Subscription>,
     pub(super) transcript_views: HashMap<String, super::transcript::TranscriptView>,
     _pump: Task<()>,
 }
@@ -194,6 +206,9 @@ impl Workbench {
             wake,
             waiting_frame: None,
             runner: None,
+            last_turn: None,
+            finale: None,
+            finale_watch: None,
             fire: None,
             focused_ask: None,
             editors: HashMap::new(),
@@ -253,8 +268,13 @@ impl Workbench {
                             }
                         }
                         Err(error) => {
-                            s.launch_error = Some(error.to_string());
-                            s.retry_once(window, cx);
+                            let message = error.to_string();
+                            // Retrying cannot repair a folder's permissions.
+                            let fixable = ox_host_service::unsafe_folder(&message).is_some();
+                            s.launch_error = Some(message);
+                            if !fixable {
+                                s.retry_once(window, cx);
+                            }
                         }
                     }
                     if window.is_visible() {
@@ -428,6 +448,36 @@ impl Workbench {
             self.reconnect(window, cx);
         }
     }
+    /// The error this pane shows in its own header, if any.
+    pub(super) fn visible_error(&self) -> Option<&str> {
+        self.launch_error
+            .as_deref()
+            .or_else(|| match self.store.as_ref()?.state() {
+                Connection::Closed(message) => Some(message),
+                _ => None,
+            })
+    }
+    /// Make an unsafe OX state folder private again off the UI thread, then reconnect.
+    /// If that fails, name the exact command instead.
+    fn fix_permissions(&mut self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let target = folder.clone();
+        let task =
+            cx.background_spawn(async move { ox_host_service::fix_folder_permissions(&target) });
+        cx.spawn_in(window, async move |s, cx| {
+            let result = task.await;
+            let _ = s.update_in(cx, |s, window, cx| match result {
+                Ok(()) => s.reconnect(window, cx),
+                Err(e) => {
+                    s.launch_error = Some(format!(
+                        "Could not fix permissions ({e}). In a terminal, run: {}",
+                        ox_host_service::fix_command(&folder)
+                    ));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
 
     pub(super) fn select_catalog(
         &mut self,
@@ -553,6 +603,34 @@ impl Workbench {
         })
         .detach();
     }
+    /// What the activity slot shows: the live scene, or the finale of a turn that just ended.
+    fn activity_scene(&mut self) -> Option<(activity::Scene, u64)> {
+        use activity::Scene;
+        let store = self.store.as_ref()?;
+        let id = store.selected();
+        let transcript = id.and_then(|id| store.transcript(id));
+        let turn = id
+            .zip(transcript.and_then(|t| t.active_turn()))
+            .map(|(id, turn)| (id.to_owned(), turn.to_owned()));
+        if turn != self.last_turn {
+            self.finale = match (self.last_turn.take(), &turn) {
+                (Some((thread, _)), None) if id == Some(thread.as_str()) => {
+                    let failed = transcript.is_some_and(|t| t.error().is_some());
+                    Some((thread, if failed { Scene::GameOver } else { Scene::Done }))
+                }
+                _ => None,
+            };
+            self.last_turn = turn;
+        }
+        if self
+            .finale
+            .as_ref()
+            .is_some_and(|(thread, _)| id != Some(thread.as_str()))
+        {
+            self.finale = None;
+        }
+        current_activity(store).or(self.finale.as_ref().map(|(_, scene)| (*scene, 0)))
+    }
     pub(super) fn set_front(&mut self, front: bool, cx: &mut Context<Self>) {
         self.front = front;
         if let Some(store) = &mut self.store {
@@ -618,35 +696,57 @@ impl Workbench {
             })
             .and_then(|store| store.catalog_row(store.selected()?))
             .map(|row| row.title().to_owned());
-        let status = status.to_owned();
-        let scene = self.store.as_ref().and_then(current_activity);
-        let animate = p.motion && self.front && window.is_visible() && window.is_window_active();
-        if let Some(scene) = scene.filter(|scene| animate && *scene != activity::Scene::Waiting) {
-            if self
-                .runner
-                .as_ref()
-                .is_none_or(|r| r.read(cx).scene != scene)
-            {
-                self.runner = Some(cx.new(|_| activity::Runner::new(scene)));
+        let status = plain_status(status);
+        let unsafe_folder = ox_host_service::unsafe_folder(&status);
+        let live = self.activity_scene();
+        let seen = self.front && window.is_visible();
+        let animate = p.motion && seen && window.is_window_active();
+        // A finale plays once even with motion off: it is a still that leaves on one timer.
+        if let Some((scene, seed)) =
+            live.filter(|(scene, _)| animate || (seen && scene.one_shot().is_some()))
+        {
+            if self.runner.as_ref().is_none_or(|r| {
+                let r = r.read(cx);
+                (r.scene, r.seed) != (scene, seed)
+            }) {
+                let runner = cx.new(|_| activity::Runner::new(scene, seed));
+                self.finale_watch = scene.one_shot().map(|_| {
+                    cx.subscribe(&runner, |s, _, _: &activity::Finished, cx| {
+                        s.finale = None;
+                        s.runner = None;
+                        cx.notify();
+                    })
+                });
+                self.runner = Some(runner);
             }
         } else {
             self.runner = None;
         }
-        let activity_status = scene
-            .filter(|s| *s != activity::Scene::Loading)
-            .map(|scene| {
+        let activity_status = live
+            .filter(|(scene, _)| *scene != activity::Scene::Loading)
+            .map(|(scene, seed)| {
                 let icon = self
                     .runner
                     .as_ref()
                     .map(|r| r.clone().into_any_element())
-                    .unwrap_or_else(|| scene.sprite(p, 0));
+                    .unwrap_or_else(|| scene.still(p, seed));
                 row()
                     .gap_2()
                     .py_1()
                     .child(icon)
                     .child(crate::kit::small(p, scene.label()))
             });
-        let transcript = self.transcript_panel(cx);
+        let ready = self.launch_error.is_none()
+            && !self.connecting
+            && self
+                .store
+                .as_ref()
+                .is_some_and(|s| s.state() == &Connection::Ready && s.selected().is_none());
+        let transcript = if ready {
+            self.empty_state(p, cx)
+        } else {
+            self.transcript_panel(cx)
+        };
         let controls = self.thread_menu(cx);
         let review_toggle = self.review_toggle(cx);
         let inline_request = self.pane_width < px(825.);
@@ -768,14 +868,26 @@ impl Workbench {
                             },
                         )
                         .when(unavailable, |view| {
-                            view.child(crate::kit::button(
-                                p,
-                                "retry-connection",
-                                "Reconnect",
-                                false,
-                                true,
-                                cx.listener(|s, _, window, cx| s.reconnect(window, cx)),
-                            ))
+                            view.child(match unsafe_folder.clone() {
+                                Some(folder) => row().child(crate::kit::button(
+                                    p,
+                                    "fix-permissions",
+                                    "Fix permissions",
+                                    true,
+                                    true,
+                                    cx.listener(move |s, _, window, cx| {
+                                        s.fix_permissions(folder.clone(), window, cx)
+                                    }),
+                                )),
+                                None => row().child(crate::kit::button(
+                                    p,
+                                    "retry-connection",
+                                    "Reconnect",
+                                    false,
+                                    true,
+                                    cx.listener(|s, _, window, cx| s.reconnect(window, cx)),
+                                )),
+                            })
                         })
                         .when_some(
                             self.store.as_ref().and_then(Store::command_notice),

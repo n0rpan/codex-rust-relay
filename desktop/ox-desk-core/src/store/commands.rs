@@ -412,11 +412,13 @@ impl Store {
             .values()
             .any(|(_, p)| matches!(p,Pending::LeaveForTerminal(h) if h.thread.as_deref()==Some(id)))
         {
-            return Err(io::Error::other("Waiting for Codex to release the thread"));
+            return Err(io::Error::other(
+                "Codex is still closing its terminal for this thread. Wait a few seconds, then try again.",
+            ));
         }
         if self.handing_off_claude() {
             return Err(io::Error::other(
-                "Waiting for Claude Code to release the session",
+                "Claude Code is still finishing the previous turn for this session. Wait a few seconds, then try again.",
             ));
         }
         if !self.terminal_threads.remove(id) {

@@ -782,9 +782,9 @@ def run(harness, screenshot=None):
         icons=js("""return Object.fromEntries([...document.querySelectorAll('.session')].map(b=>[
             b.dataset.threadId,[b.dataset.source,b.querySelector('.status').textContent,getComputedStyle(b,'::before').boxShadow.replace(/rgba?[(][^)]*[)]/g,'')]
         ]));""")
-        assert icons["parent"][:2]==["claude","Needs input"] and icons["child"][0]=="worker", icons
+        assert icons["parent"][:2]==["claude","Needs you"] and icons["child"][0]=="worker", icons
         for ident,source in [("codex-source","codex"),("api-source","api"),("codex-api-source","api")]:
-            assert icons[ident][:2]==[source,"idle"] and icons[ident+"-running"][:2]==[source,"running"]
+            assert icons[ident][:2]==[source,""] and icons[ident+"-running"][:2]==[source,"Running"]
             assert icons[ident][2]==icons[ident+"-running"][2] and icons[ident][2]!="none"
         assert len({icons[k][2] for k in ("parent","child","codex-source","api-source")})==4
 
@@ -906,7 +906,7 @@ def run(harness, screenshot=None):
             js("document.getElementById('apply-permission').click()")
         js("document.getElementById('access-mode').click()")
         mode("plan")
-        wait(lambda: js("return document.getElementById('control-status').textContent.includes('Claude · Subscription · Mode disabled')"))
+        wait(lambda: js("return document.getElementById('control-status').textContent.includes('Claude subscription · Mode disabled')"))
         mode("bypass_permissions")
         wait(host.mode_requested.is_set)
         assert js("return document.getElementById('access-mode').dataset.bypass==='false' && document.getElementById('access-mode').textContent==='Default'")

@@ -109,5 +109,11 @@ impl About {
                     .text_color(rgb(p.muted))
                     .child("Made by Oscar"),
             )
+            .child(
+                div()
+                    .text_size(p.text(Step::Meta))
+                    .text_color(rgb(p.muted))
+                    .child("Weather data from MET Norway (CC BY 4.0)"),
+            )
     }
 }

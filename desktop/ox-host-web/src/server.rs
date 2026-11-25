@@ -44,6 +44,8 @@ mod operator;
 mod operator_handoff;
 #[path = "remote_settings.rs"]
 mod remote_settings;
+#[path = "weather.rs"]
+mod weather;
 type ErrCode = StatusCode;
 const DENY: StatusCode = StatusCode::FORBIDDEN;
 pub fn run(state_dir: PathBuf, host_socket: PathBuf) -> io::Result<()> {
@@ -313,6 +315,10 @@ fn start_listener(app: App, origin: String, listener: TcpListener) -> Listener {
             }),
         )
         .route(
+            "/activity.js",
+            get(|| async { asset("text/javascript", include_bytes!("../assets/activity.js")) }),
+        )
+        .route(
             "/app.js",
             get(|| async { asset("text/javascript", include_bytes!("../assets/app.js")) }),
         )
@@ -327,6 +333,10 @@ fn start_listener(app: App, origin: String, listener: TcpListener) -> Listener {
         .route(
             "/settings.css",
             get(|| async { asset("text/css", include_bytes!("../assets/settings.css")) }),
+        )
+        .route(
+            "/sky.js",
+            get(|| async { asset("text/javascript", include_bytes!("../assets/sky.js")) }),
         )
         .route(
             "/controls.js",
@@ -420,6 +430,7 @@ fn start_listener(app: App, origin: String, listener: TcpListener) -> Listener {
         .route("/api/pair", post(pair))
         .route("/api/challenge", post(challenge))
         .route("/api/push", post(subscribe))
+        .route("/api/weather", post(weather::weather))
         .route("/api/operator", get(operator::upgrade))
         .route(
             "/operator.js",

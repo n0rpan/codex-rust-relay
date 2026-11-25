@@ -157,6 +157,7 @@ pub(super) fn worker_start(
         write: None,
         permission: permission_field(permission),
         yolo_confirmed: yolo,
+        max_minutes: None,
     };
     start.validate()?;
     Ok(start)
@@ -187,8 +188,8 @@ fn permission_label(request: ModeRequest, runtime: Runtime) -> String {
 
 fn subscription_label(runtime: Runtime) -> &'static str {
     match runtime {
-        Runtime::Codex => "ChatGPT subscription",
-        Runtime::Claude => "Claude subscription",
+        Runtime::Codex => "ChatGPT plan",
+        Runtime::Claude => "Claude plan",
     }
 }
 
@@ -394,7 +395,7 @@ impl Workbench {
         // A Codex worker needs an OX API model; a handoff may use either subscription.
         let subscription_ok = kind == LaunchKind::Handoff || choice.runtime == Runtime::Claude;
         let model_label = match &choice.model {
-            Some(model) => format!("OX API · {model}"),
+            Some(model) => format!("{} · API · {model}", choice.runtime.name()),
             None => "Choose a model…".into(),
         };
         let chips = row()
@@ -416,7 +417,11 @@ impl Workbench {
                 true,
                 cx.listener(|s, _, window, cx| s.toggle_launch_picker(window, cx)),
             ));
-        field(p, "Model", chips)
+        let mut control = col().gap_1().child(chips);
+        if !subscription_ok {
+            control = control.child(small(p, "Codex workers need an OX API model."));
+        }
+        field(p, "Model", control)
     }
 
     fn permission_row(&self, p: Palette, choice: &Choice, cx: &mut Context<Self>) -> Div {

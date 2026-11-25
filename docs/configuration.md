@@ -760,7 +760,10 @@ The main agent can lower it with `start_ox_worker`'s `permission_mode`
 that would start in YOLO or bypass waits until you accept it in OX Desktop or
 on a paired phone, unless you granted YOLO for that session's workers and
 handoffs. Without a host, workers start with read access, and write access
-when you tell the main agent a worker may edit files. A write worker gets a
+when you tell the main agent a worker may edit files. Read workers without a
+host run Claude Code in `dontAsk` mode with only read tools, which is read-only
+but not the same mode name as the host's Claude Plan. Classifier and YOLO
+requests are refused without a host rather than falling back to read. A write worker gets a
 sandboxed shell and can write the workspace on both runtimes: Codex uses its
 Workspace sandbox, and Claude Code runs Bash under its own sandbox with
 `autoAllowBashIfSandboxed`, so commands inside the workspace need no prompt

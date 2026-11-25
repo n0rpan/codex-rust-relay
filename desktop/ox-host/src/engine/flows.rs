@@ -21,6 +21,11 @@ impl Engine {
     /// session or an ancestor (worker parents and handoff sources), or the
     /// project default from `[workers] yolo_grant_projects`.
     pub(super) fn yolo_grant(&mut self, scope: &Scope, session: &str) -> Option<YoloAllowance> {
+        let now = crate::durable::unix_now();
+        if self.ledger.data.grants.iter().any(|g| !g.live(now)) {
+            // Expired grants stop counting and are dropped from the ledger.
+            let _ = self.ledger.change(|d| d.grants.retain(|g| g.live(now)));
+        }
         let mut current = Some((scope.clone(), session.to_owned()));
         for _ in 0..64 {
             let Some((s, id)) = current.take() else { break };
@@ -29,7 +34,7 @@ impl Engine {
                 .data
                 .grants
                 .iter()
-                .any(|g| g.scope == s && g.session == id)
+                .any(|g| g.scope == s && g.session == id && g.live(now))
             {
                 return Some(YoloAllowance::Grant {
                     project: s.project.clone(),
@@ -43,13 +48,143 @@ impl Engine {
                 ))
             });
         }
-        self.yolo_projects()
+        let by_default = self
+            .yolo_projects()
             .iter()
-            .any(|p| p == &scope.project || p.canonicalize().ok().as_ref() == Some(&scope.project))
-            .then(|| YoloAllowance::Grant {
-                project: scope.project.clone(),
-                session: None,
+            .any(|p| p == &scope.project || p.canonicalize().ok().as_ref() == Some(&scope.project));
+        if by_default {
+            self.announce_yolo_default(scope);
+        }
+        by_default.then(|| YoloAllowance::Grant {
+            project: scope.project.clone(),
+            session: None,
+        })
+    }
+
+    /// Tell the operator, once per project and host run, that a session started under the
+    /// project's YOLO default, and log it.
+    fn announce_yolo_default(&mut self, scope: &Scope) {
+        if !self.yolo_announced.insert(scope.project.clone()) {
+            return;
+        }
+        ox_host_service::errlog::record(&format!(
+            "YOLO default applied for {}",
+            scope.project.display()
+        ));
+        if let Some(live) = self.running.get_mut(scope) {
+            live.store
+                .post_notice("YOLO is on for this project by default. Change it in Settings.");
+        }
+    }
+
+    /// Whether the worker of this job is running or waiting for the operator.
+    fn worker_active(&self, job_id: u64) -> bool {
+        self.job_status(job_id).is_ok_and(|s| {
+            matches!(
+                s["status"].as_str(),
+                Some("running" | "waiting_for_operator")
+            )
+        })
+    }
+
+    /// Refuse a worker start when this parent already runs the maximum number of workers.
+    pub(super) fn check_worker_cap(&self, parent: &ParentRef) -> Result<(), String> {
+        let cap = crate::workers::env_limit(
+            "OX_WORKER_MAX_PER_PARENT",
+            crate::workers::DEFAULT_MAX_PER_PARENT as u64,
+        ) as usize;
+        let started = self
+            .workers
+            .jobs()
+            .filter(|(_, _, e)| &e.origin.parent == parent)
+            .filter(|(_, _, e)| self.worker_active(e.origin.job_id))
+            .count();
+        let starting = self
+            .running
+            .values()
+            .filter_map(|l| l.launching.as_ref())
+            .filter(|l| l.origin.job_id != 0 && &l.origin.parent == parent)
+            .count()
+            + self
+                .asking
+                .values()
+                .filter(|a| &a.origin.parent == parent)
+                .count();
+        if started + starting >= cap {
+            return Err(format!(
+                "This session already runs {cap} workers. Wait for one to finish or cancel one. The limit is OX_WORKER_MAX_PER_PARENT."
+            ));
+        }
+        Ok(())
+    }
+
+    /// A caution when another running worker can write in the same project.
+    pub(super) fn write_overlap(
+        &self,
+        scope: &Scope,
+        level: ox_desk_core::origin::Ceiling,
+    ) -> Option<String> {
+        if level < ox_desk_core::origin::Ceiling::Write {
+            return None;
+        }
+        self.workers
+            .jobs()
+            .any(|(_, _, e)| {
+                e.origin.parent.project == scope.project
+                    && e.origin.ceiling >= ox_desk_core::origin::Ceiling::Write
+                    && self.worker_active(e.origin.job_id)
             })
+            .then(|| {
+                "Another write worker is editing this project. Consider a separate git worktree."
+                    .to_owned()
+            })
+    }
+
+    /// Stop workers that ran past their wall-clock limit.
+    pub(super) fn expire_workers(&mut self) -> io::Result<()> {
+        let now = crate::durable::unix_now();
+        let due: Vec<(Scope, String)> = self
+            .workers
+            .jobs()
+            .filter(|(_, _, e)| {
+                let m = &e.marks;
+                !m.expired
+                    && !m.cancelled
+                    && m.started_at > 0
+                    && m.max_minutes
+                        .is_some_and(|max| now - m.started_at >= i64::from(max) * 60)
+            })
+            .filter(|(_, _, e)| self.worker_active(e.origin.job_id))
+            .map(|(s, id, _)| (s.clone(), id.to_owned()))
+            .collect();
+        for (scope, id) in due {
+            if let Some(live) = self.running.get_mut(&scope) {
+                let _ = live.store.stop(&id);
+            }
+            if let Some(entry) = self.workers.get_mut(&scope, &id) {
+                entry.marks.expired = true;
+                entry.marks.cancelled = true;
+            }
+            self.persist_marks(&scope)?;
+        }
+        Ok(())
+    }
+
+    /// Drop the grants a session gave: they end with the session.
+    pub(super) fn drop_grant(&mut self, scope: &Scope, session: &str) -> io::Result<()> {
+        if self
+            .ledger
+            .data
+            .grants
+            .iter()
+            .any(|g| &g.scope == scope && g.session == session)
+        {
+            self.ledger.change(|d| {
+                d.grants
+                    .retain(|g| !(&g.scope == scope && g.session == session))
+            })?;
+        }
+        Ok(())
     }
 
     /// The project default from the settings snapshot. A failed read is retried once, and when
@@ -159,9 +294,15 @@ impl Engine {
         let grant = Grant {
             scope: scope.clone(),
             session: session.to_owned(),
+            granted_at: crate::durable::unix_now(),
         };
+        if on && let Some(live) = self.running.get_mut(scope) {
+            live.store
+                .post_notice("YOLO grant on for this session. It expires after 12 hours or when the session ends.");
+        }
         self.ledger.change(|d| {
-            d.grants.retain(|g| g != &grant);
+            d.grants
+                .retain(|g| !(g.scope == grant.scope && g.session == grant.session));
             if on {
                 d.grants.push(grant);
             }

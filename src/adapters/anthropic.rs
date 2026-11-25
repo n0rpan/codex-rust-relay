@@ -47,8 +47,9 @@
 //!
 //! # Known gaps in this slice
 //!
-//! Rejected explicitly: hosted/server tools, custom (freeform) tools, image and
-//! file inputs, structured outputs (`text.format`), non-streaming requests,
+//! Images (`input_image`, in user messages and tool results) map to Anthropic
+//! image blocks. Rejected explicitly: hosted/server tools, custom (freeform)
+//! tools, file inputs and assistant-side images, structured outputs (`text.format`), non-streaming requests,
 //! `item_reference`, unknown content blocks, and citations.
 //!
 //! Current Codex sends its base instructions as a leading `developer` input
@@ -600,13 +601,13 @@ fn translate_message_item(
             Ok(())
         }
         "user" => {
-            for block in content_blocks(content, path)? {
+            for block in content_blocks(content, path, true)? {
                 builder.push_block("user", block)?;
             }
             Ok(())
         }
         "assistant" => {
-            for block in content_blocks(content, path)? {
+            for block in content_blocks(content, path, false)? {
                 builder.push_block("assistant", block)?;
             }
             Ok(())
@@ -647,7 +648,7 @@ fn content_texts(content: &Value, path: &str) -> Result<Vec<String>, String> {
     }
 }
 
-fn content_blocks(content: &Value, path: &str) -> Result<Vec<Value>, String> {
+fn content_blocks(content: &Value, path: &str, allow_images: bool) -> Result<Vec<Value>, String> {
     match content {
         Value::String(text) => Ok(text_blocks(text)),
         Value::Array(parts) => {
@@ -661,6 +662,9 @@ fn content_blocks(content: &Value, path: &str) -> Result<Vec<Value>, String> {
                     }
                     "refusal" => {
                         blocks.extend(text_blocks(required_string(part, "refusal", &part_path)?));
+                    }
+                    "input_image" if allow_images => {
+                        blocks.push(image_block(part, &part_path)?);
                     }
                     "input_image" | "input_file" | "output_audio" | "audio" => {
                         return Err(format!(
@@ -681,6 +685,34 @@ fn content_blocks(content: &Value, path: &str) -> Result<Vec<Value>, String> {
         Value::Null => Err(format!("{path}.content must not be null")),
         _ => Err(format!("{path}.content must be a string or an array")),
     }
+}
+
+/// Map a Responses `input_image` part to an Anthropic image block: base64
+/// data URLs become inline sources, anything else is passed as a URL source.
+fn image_block(part: &Map<String, Value>, path: &str) -> Result<Value, String> {
+    let url = part
+        .get("image_url")
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| format!("{path} is an input_image without an image_url"))?;
+    if let Some(rest) = url.strip_prefix("data:") {
+        let (meta, data) = rest
+            .split_once(',')
+            .ok_or_else(|| format!("{path}.image_url is a malformed data URL"))?;
+        let media_type = meta.strip_suffix(";base64").ok_or_else(|| {
+            format!("{path}.image_url must be a base64 data URL for an Anthropic image")
+        })?;
+        if !media_type.starts_with("image/") {
+            return Err(format!(
+                "{path}.image_url media type \"{media_type}\" is not an image type"
+            ));
+        }
+        return Ok(json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": data}
+        }));
+    }
+    Ok(json!({"type": "image", "source": {"type": "url", "url": url}}))
 }
 
 fn text_blocks(text: &str) -> Vec<Value> {
@@ -740,11 +772,7 @@ fn tool_result_content(output: &Value, path: &str) -> Result<Value, String> {
                     "input_text" | "output_text" | "text" => {
                         blocks.extend(text_blocks(required_string(part, "text", &part_path)?));
                     }
-                    "input_image" => {
-                        return Err(format!(
-                            "{part_path} is an image, which this adapter slice does not support in tool results"
-                        ));
-                    }
+                    "input_image" => blocks.push(image_block(part, &part_path)?),
                     other => {
                         return Err(format!(
                             "unsupported tool result content type \"{other}\" at {part_path}"

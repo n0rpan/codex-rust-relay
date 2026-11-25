@@ -29,6 +29,25 @@ const fn field(key: Key, label: &'static str, kind: Kind, hint: &'static str) ->
         hint,
     }
 }
+/// One plain-language line for the choice fields whose values are raw config words.
+fn help(key: Key) -> Option<&'static str> {
+    Some(match key {
+        Key::ChatReasoningEffort => {
+            "Whether the reasoning-effort setting is passed on to this provider."
+        }
+        Key::MaxTokensField => {
+            "Which request field carries the output limit; newer models want the second."
+        }
+        Key::DeveloperRole => {
+            "Role used for instructions; pick Developer only if the provider supports it."
+        }
+        Key::AnthropicThinking => {
+            "Extended thinking: off, chosen by the model, or a fixed token budget."
+        }
+        Key::OutputConfigEffort => "Send the reasoning effort as an output option.",
+        _ => return None,
+    })
+}
 pub const CONNECTION: &[Spec] = &[
     field(Key::Name, "Display name", Text, "Provider name"),
     field(
@@ -305,6 +324,15 @@ impl Fields {
                         "anthropic_messages" => "Messages",
                         "true" => "On",
                         "false" => "Off",
+                        "drop" => "Do not send",
+                        "forward" => "Send to provider",
+                        "max_tokens" => "max_tokens (classic)",
+                        "max_completion_tokens" => "max_completion_tokens (newer)",
+                        "system" => "System message",
+                        "developer" => "Developer message",
+                        "off" => "Off",
+                        "adaptive" => "Adaptive",
+                        "manual" => "Fixed budget",
                         other => other,
                     };
                     choices = choices.child(crate::kit::button(
@@ -320,6 +348,15 @@ impl Fields {
                     ));
                 }
                 row = row.child(choices);
+                if let Some(help) = help(spec.key) {
+                    row = row.child(
+                        div()
+                            .min_w_0()
+                            .text_size(p.text(Step::Label))
+                            .text_color(rgb(p.muted))
+                            .child(help),
+                    );
+                }
             } else {
                 row = row.child(div().min_w_0().flex_1().child(crate::kit::input(editor)));
             }

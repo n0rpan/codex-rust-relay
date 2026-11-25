@@ -257,7 +257,7 @@ impl Store {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Codex opened the thread with a different billing route",
+                "Codex opened this thread on a different model route than the one you chose. Reconnect, or pick the thread's original route.",
             ));
         }
         Ok(())

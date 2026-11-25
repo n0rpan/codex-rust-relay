@@ -24,6 +24,8 @@ pub struct Behavior {
     pub theme: ThemeSource,
     pub font_size: u8,
     pub reduce_motion: bool,
+    /// Show the weather from MET Norway on the header horizon.
+    pub live_weather: bool,
 }
 impl Default for Behavior {
     fn default() -> Self {
@@ -32,6 +34,7 @@ impl Default for Behavior {
             theme: ThemeSource::System,
             font_size: 16,
             reduce_motion: false,
+            live_weather: true,
         }
     }
 }

@@ -48,6 +48,7 @@ struct Session {
     thread: String,
     scope: Value,
     label: String,
+    running: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -109,9 +110,19 @@ pub(crate) fn run_end(args: &[OsString]) -> Result<u8, RelayError> {
         println!("No sessions to end.");
         return Ok(0);
     }
-    if matches!(args.selector, Selector::All) && !args.yes {
+    let busy = targets.iter().filter(|s| s.running).count();
+    let all = matches!(args.selector, Selector::All);
+    if (all || busy > 0) && !args.yes {
         if !io::stdin().is_terminal() {
-            return Err("ox end --all needs --yes when there is no terminal to confirm in".into());
+            return Err(if all {
+                "ox end --all needs --yes when there is no terminal to confirm in"
+            } else {
+                "ox end of a running session needs --yes when there is no terminal to confirm in"
+            }
+            .into());
+        }
+        if busy > 0 {
+            print!("{busy} running session(s) will be stopped. ");
         }
         print!("End {} session(s)? [y/N] ", targets.len());
         io::stdout().flush()?;
@@ -125,7 +136,7 @@ pub(crate) fn run_end(args: &[OsString]) -> Result<u8, RelayError> {
     host.subscribe_all()?;
     for session in &targets {
         let shown = id_prefix(&session.thread, width);
-        host.end(&session.scope, &session.thread)
+        host.end(&session.scope, &session.thread, session.running)
             .map_err(|e| format!("could not end {shown}: {e}"))?;
         println!("ended {shown} ({})", session.label);
     }
@@ -185,6 +196,7 @@ fn sessions_of(rows: &[Row], home: Option<&Path>, keep: impl Fn(&Row) -> bool) -
                     thread: thread.clone(),
                     scope: row.scope.clone(),
                     label: format!("{} {}", row.kind, project_label(&row.project, home)),
+                    running: row.running,
                 });
             }
         }
@@ -433,13 +445,18 @@ impl Host {
         self.send(&json!({"type": "subscribe", "scope": null, "after": null}))
     }
 
-    fn end(&mut self, scope: &Value, thread: &str) -> Result<(), RelayError> {
+    fn end(&mut self, scope: &Value, thread: &str, force: bool) -> Result<(), RelayError> {
+        let action = if force {
+            json!({"force_end_session": thread})
+        } else {
+            json!({"end_session": thread})
+        };
         let id = self.next_id();
         self.send(&json!({
             "type": "act",
             "id": id,
             "scope": scope,
-            "action": {"end_session": thread},
+            "action": action,
             "approval": null,
         }))?;
         loop {

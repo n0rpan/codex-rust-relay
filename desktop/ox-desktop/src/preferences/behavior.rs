@@ -40,6 +40,7 @@ impl Preferences {
                                 Ok(()) => {
                                     cx.set_global(Active(next));
                                     crate::appearance::refresh(cx);
+                                    crate::sky::reload(cx);
                                     s.report(Ok(()), "Preference saved.", cx);
                                 }
                                 Err(e) => s.report(
@@ -76,14 +77,14 @@ impl Preferences {
                 "Send messages",
                 &[
                     (
-                        "Ctrl / Cmd + Enter",
+                        "Ctrl/Cmd+Enter sends · Enter for newline",
                         Behavior {
                             enter_sends: false,
                             ..b
                         },
                     ),
                     (
-                        "Enter",
+                        "Enter sends · Shift+Enter for newline (default)",
                         Behavior {
                             enter_sends: true,
                             ..b
@@ -98,7 +99,7 @@ impl Preferences {
                 "Theme",
                 &[
                     (
-                        "System (Omarchy)",
+                        "Follow system",
                         Behavior {
                             theme: ThemeSource::System,
                             ..b
@@ -157,6 +158,34 @@ impl Preferences {
                 p,
                 cx,
             ))
+            .child(self.preference_choices(
+                "Live weather (MET Norway)",
+                &[
+                    (
+                        "Weather on",
+                        Behavior {
+                            live_weather: true,
+                            ..b
+                        },
+                    ),
+                    (
+                        "Weather off",
+                        Behavior {
+                            live_weather: false,
+                            ..b
+                        },
+                    ),
+                ],
+                b,
+                p,
+                cx,
+            ))
+            .child(
+                div()
+                    .text_size(p.text(Step::Meta))
+                    .text_color(rgb(p.muted))
+                    .child("Only a city-level location derived from your timezone is sent to api.met.no. Time of day works without it."),
+            )
     }
 }
 

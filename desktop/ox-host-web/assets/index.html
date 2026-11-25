@@ -15,6 +15,7 @@
     <link rel="stylesheet" href="/style.css" />
     <link rel="stylesheet" href="/settings.css" />
     <script type="module" src="/app.js"></script>
+    <script type="module" src="/sky.js"></script>
   </head>
   <body>
     <header>
@@ -32,8 +33,8 @@
           <li id="step-paired"><span class="pix-num">3</span> Paired</li>
         </ol>
         <p id="pair-hint">
-          Open Remote access in OX Desktop and scan a pairing code for your
-          Tailscale account, or paste its pairing link below.
+          Open OX Desktop → Settings → Remote access and scan a pairing code for
+          your Tailscale account, or paste its pairing link below.
         </p>
         <button id="scan-pair" type="button" class="primary">Scan pairing QR</button>
         <div id="camera-panel" hidden>
@@ -105,8 +106,8 @@
         />
         <div id="filters" role="group" aria-label="Session filter">
           <button data-filter="all" aria-pressed="true">All</button
-          ><button data-filter="active" aria-pressed="false">Active</button
-          ><button data-filter="requests" aria-pressed="false">Requests</button
+          ><button data-filter="active" aria-pressed="false">Running</button
+          ><button data-filter="requests" aria-pressed="false">Needs you</button
           ><button data-filter="finished" aria-pressed="false">Finished</button>
         </div>
         <div id="list"></div>
@@ -253,15 +254,17 @@
           />
           <p class="field-label" id="worker-mode-label">Mode</p>
           <div id="worker-mode-group" class="segmented" role="radiogroup" aria-labelledby="worker-mode-label"></div>
+          <p id="worker-mode-note" class="note"></p>
           <input type="hidden" id="worker-mode" value="session" />
           <label for="worker-permission">Permission mode</label>
           <select id="worker-permission">
             <option value="inherit">Inherit this session's mode</option>
-            <option value="read">Read (Read only · Plan)</option>
-            <option value="write">Write (Workspace · Accept edits)</option>
-            <option value="classifier">Classifier (Auto-review · Auto)</option>
-            <option value="yolo">YOLO (YOLO · bypass)</option>
+            <option value="read">Read only</option>
+            <option value="write">Workspace</option>
+            <option value="classifier">Auto-review</option>
+            <option value="yolo">YOLO</option>
           </select>
+          <p id="worker-permission-note" class="note"></p>
           <p id="worker-warning" class="warning-line" hidden></p>
           <label for="worker-task">Task</label>
           <textarea id="worker-task" rows="3" required></textarea>
@@ -282,11 +285,12 @@
           <label for="handoff-mode">Permission mode</label>
           <select id="handoff-mode">
             <option value="inherit">Inherited from this session</option>
-            <option value="read">Read (Read only · Plan)</option>
-            <option value="write">Write (Workspace · Accept edits)</option>
-            <option value="classifier">Classifier (Auto-review · Auto)</option>
-            <option value="yolo">YOLO (YOLO · bypass)</option>
+            <option value="read">Read only</option>
+            <option value="write">Workspace</option>
+            <option value="classifier">Auto-review</option>
+            <option value="yolo">YOLO</option>
           </select>
+          <p id="handoff-permission-note" class="note"></p>
           <label id="handoff-grant-row" class="warning-line" hidden
             ><input type="checkbox" id="handoff-grant" /> Also YOLO for its workers and handoffs</label>
           <p id="handoff-provider" class="warning-line" hidden></p>
@@ -298,6 +302,10 @@
           </div>
         </form>
         <div id="timeline" aria-label="Transcript"></div>
+        <div id="activity" class="activity" hidden>
+          <canvas id="activity-sprite" width="20" height="11" aria-hidden="true"></canvas>
+          <span id="activity-label"></span>
+        </div>
         <div id="asks"></div>
         <form id="composer">
           <button type="button" id="needs-bar" class="needs-bar" hidden></button>

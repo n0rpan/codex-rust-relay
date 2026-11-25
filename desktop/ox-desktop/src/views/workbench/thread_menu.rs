@@ -34,7 +34,7 @@ impl Workbench {
                 Action::RenameThread(id.clone(), name.to_string())
             }
             Some(ThreadEdit::Archive(id)) => Action::ArchiveThread(id.clone()),
-            Some(ThreadEdit::End(id)) => Action::EndSession(id.clone()),
+            Some(ThreadEdit::End(id)) => Action::ForceEndSession(id.clone()),
             None => return,
         };
         self.thread_edit = None;

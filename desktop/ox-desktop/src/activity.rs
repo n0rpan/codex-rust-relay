@@ -1,60 +1,73 @@
 use crate::appearance::Palette;
 use gpui::*;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub enum Scene {
-    Loading,
-    Thinking,
-    Typing,
-    Tool,
-    Worker,
-    Waiting,
-    Fire,
+mod scene;
+use scene::Ink;
+pub use scene::Scene;
+
+/// Seconds the app has been up: the slow clock that rotates the thinking sprites.
+fn uptime() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs()
+}
+
+/// The seed that keeps one turn's thinking sprites stable across re-renders.
+pub fn seed(thread: &str, turn: &str) -> u64 {
+    scene::seed(thread, turn)
 }
 
 impl Scene {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Loading => "Loading history…",
-            Self::Thinking => "Thinking",
-            Self::Typing => "Writing",
-            Self::Tool => "Using a tool",
-            Self::Worker => "Worker active",
-            Self::Waiting => "Waiting for you",
-            Self::Fire => "YOLO",
-        }
+    pub fn sprite(self, p: Palette, frame: u8) -> AnyElement {
+        self.sprite_for(p, 0, frame)
     }
 
-    pub fn sprite(self, p: Palette, frame: u8) -> AnyElement {
+    /// The motionless key frame, for reduced motion and surfaces without a runner.
+    pub fn still(self, p: Palette, seed: u64) -> AnyElement {
+        self.sprite_for(p, seed, self.key_frame())
+    }
+
+    fn sprite_for(self, p: Palette, seed: u64, frame: u8) -> AnyElement {
         match self {
             Self::Fire => flame(p, frame).into_any_element(),
             Self::Loading => ox(p, frame, 2.).into_any_element(),
-            _ => cabinet(p, self, frame, false).into_any_element(),
+            _ => {
+                let variant = scene::thinking_variant(seed, uptime());
+                cabinet(p, self, variant, frame, false).into_any_element()
+            }
         }
     }
 }
+
+/// A one-shot scene has played through; its owner clears the slot.
+pub struct Finished;
 
 /// Schedule one tick after a rendered frame. A covered surface cannot spin its own timer.
 pub struct Runner {
     pub scene: Scene,
+    pub seed: u64,
     frame: u8,
+    left: Option<u8>,
     tick: Option<Task<()>>,
     bonus_frames: u8,
 }
 
+impl EventEmitter<Finished> for Runner {}
+
 impl Runner {
-    pub fn new(scene: Scene) -> Self {
+    pub fn new(scene: Scene, seed: u64) -> Self {
         Self {
             scene,
+            seed,
             frame: 0,
+            left: scene.one_shot(),
             tick: None,
             bonus_frames: 0,
         }
     }
 
     pub fn burning(_: &mut Context<Self>) -> Self {
-        Self::new(Scene::Fire)
+        Self::new(Scene::Fire, 0)
     }
 }
 
@@ -62,23 +75,39 @@ impl Render for Runner {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::app::guard(cx, |cx| {
             let p = Palette::get(cx);
-            if self.tick.is_none() && p.motion && window.is_visible() {
+            if self.left == Some(0) {
+                return div().into_any_element();
+            }
+            // With motion off only a one-shot still wakes, once, to leave the slot.
+            let frames = match self.left {
+                _ if p.motion => Some(1),
+                Some(left) => Some(u64::from(left)),
+                None => None,
+            };
+            if let Some(frames) = frames.filter(|_| self.tick.is_none() && window.is_visible()) {
+                let wait = Duration::from_millis(self.scene.tick_ms() * frames);
                 self.tick = Some(cx.spawn(async move |this, cx| {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(125))
-                        .await;
+                    cx.background_executor().timer(wait).await;
                     let _ = this.update(cx, |s, cx| {
                         s.frame = (s.frame + 1) % 8;
                         s.bonus_frames = s.bonus_frames.saturating_sub(1);
                         s.tick = None;
+                        if let Some(left) = &mut s.left {
+                            *left = left.saturating_sub(frames as u8);
+                            if *left == 0 {
+                                cx.emit(Finished);
+                            }
+                        }
                         cx.notify();
                     });
                 }));
             }
-            let sprite = if self.bonus_frames > 0 {
-                cabinet(p, self.scene, self.frame, true).into_any_element()
+            let sprite = if !p.motion {
+                self.scene.still(p, self.seed)
+            } else if self.bonus_frames > 0 {
+                cabinet(p, self.scene, 0, self.frame, true).into_any_element()
             } else {
-                self.scene.sprite(p, self.frame)
+                self.scene.sprite_for(p, self.seed, self.frame)
             };
             if self.scene == Scene::Fire {
                 return sprite;
@@ -97,7 +126,7 @@ impl Render for Runner {
 }
 
 // Low-resolution sprites share the terminal palette and one eight-frame clock.
-fn cabinet(p: Palette, scene: Scene, frame: u8, bonus: bool) -> impl IntoElement {
+fn cabinet(p: Palette, scene: Scene, variant: u8, frame: u8, bonus: bool) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
@@ -108,8 +137,9 @@ fn cabinet(p: Palette, scene: Scene, frame: u8, bonus: bool) -> impl IntoElement
                     rgb(color),
                 ));
             };
-            let beat = i32::from(frame);
             if bonus {
+                // The easter egg: a saucer hovers in and drops a shot.
+                let beat = i32::from(frame);
                 let lift = i32::from((2..6).contains(&frame));
                 rect(8, 1 + lift, 4, 1, p.fg);
                 rect(6, 2 + lift, 8, 2, p.accent);
@@ -129,62 +159,25 @@ fn cabinet(p: Palette, scene: Scene, frame: u8, bonus: bool) -> impl IntoElement
                     );
                 }
                 rect(7 + beat % 6, 8, 1, 2, p.warning);
-            } else {
-                match scene {
-                    Scene::Typing | Scene::Tool => {
-                        rect(2, 1, 15, 8, p.accent);
-                        rect(3, 2, 13, 6, p.panel);
-                        rect(4, 3, 1, 1, p.fg);
-                        rect(5, 4, 1, 1, p.fg);
-                        rect(4, 5, 1, 1, p.fg);
-                        if scene == Scene::Typing {
-                            rect(7, 5, 1 + beat, 1, p.accent);
-                        } else {
-                            rect(7 + beat / 2, 6, 3, 1, p.warning);
-                        }
-                        rect(6, 9, 7, 1, p.line);
-                    }
-                    Scene::Thinking => {
-                        rect(3, 2, 13, 5, p.accent);
-                        rect(2, 3, 1, 3, p.accent);
-                        rect(16, 3, 1, 3, p.accent);
-                        rect(5, 7, 3, 1, p.accent);
-                        rect(4, 8, 1, 1, p.accent);
-                        for i in 0..3 {
-                            rect(
-                                5 + i * 4,
-                                4,
-                                2,
-                                1,
-                                if beat / 2 % 3 == i { p.fg } else { p.on_accent },
-                            );
-                        }
-                    }
-                    Scene::Worker => {
-                        for i in 0..2 {
-                            let x = 1 + 10 * i;
-                            let y = 3 + (beat / 2 + i) % 2;
-                            rect(x, y, 7, 4, p.accent);
-                            rect(x + 1, y - 2, 1, 2, p.fg);
-                            rect(x + 5, y - 2, 1, 2, p.fg);
-                            rect(x + 1, y + 1, 1, 1, p.on_accent);
-                            rect(x + 5, y + 1, 1, 1, p.on_accent);
-                            rect(x + 1, y + 4, 1, 1, p.accent);
-                            rect(x + 5, y + 4, 1, 1, p.accent);
-                        }
-                    }
-                    Scene::Waiting => {
-                        rect(4, 1, 12, 8, p.warning);
-                        rect(6, 3, 2, 4, p.on_accent);
-                        rect(12, 3, 2, 4, p.on_accent);
-                    }
-                    _ => {}
-                }
+                return;
             }
+            scene::draw(scene, variant, frame, &mut |x, y, w, h, ink| {
+                let color = match ink {
+                    Ink::Fg => p.fg,
+                    Ink::Accent => p.accent,
+                    Ink::OnAccent => p.on_accent,
+                    Ink::Warning => p.warning,
+                    Ink::Success => p.success,
+                    Ink::Error => p.error,
+                    Ink::Line => p.line,
+                    Ink::Panel => p.panel,
+                };
+                rect(x, y, w, h, color);
+            });
         },
     )
-    .w(px(40.))
-    .h(px(22.))
+    .w(px(scene::GRID.0 as f32 * 2.))
+    .h(px(scene::GRID.1 as f32 * 2.))
     .flex_shrink_0()
 }
 
@@ -374,68 +367,7 @@ pub fn cartridge(p: Palette, kind: Cartridge, selected: bool) -> impl IntoElemen
     .flex_shrink_0()
 }
 
-/// An inset, stepped sunset for the cabinet header. Drawn once per normal paint,
-/// in the active theme's inks. There is no animation timer on the resting screen.
-pub fn horizon(p: Palette) -> impl IntoElement {
-    canvas(
-        |_, _, _| (),
-        move |b, _, window, _| {
-            let w = f32::from(b.size.width);
-            let h = f32::from(b.size.height);
-            let mix = crate::appearance::mix;
-            let mut rect = |x: f32, y: f32, width: f32, height: f32, color: u32| {
-                let left = x.max(0.);
-                let width = (x + width).min(w) - left;
-                if width > 0. && y < h {
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            b.origin + point(px(left), px(y)),
-                            size(px(width), px(height.min(h - y))),
-                        ),
-                        rgb(color),
-                    ));
-                }
-            };
-            // Two-pixel rows give the sun and distant ridge the same pitch as the OX lettering.
-            let sun = w - 55.;
-            for (i, half) in [
-                5., 10., 13., 15., 17., 17., 18., 18., 17., 16., 14., 11., 7.,
-            ]
-            .iter()
-            .enumerate()
-            {
-                let y = 6. + i as f32 * 2.;
-                if i != 8 && i != 10 && i != 12 {
-                    rect(
-                        sun - half,
-                        y,
-                        half * 2.,
-                        2.,
-                        mix(p.nav, p.warning, if p.light { 57 } else { 76 }),
-                    );
-                }
-            }
-            for (x, y) in [(24., 9.), (62., 4.), (104., 15.), (132., 7.)] {
-                rect(w - x, y, 2., 2., mix(p.nav, p.accent, 47));
-            }
-            let hills = [
-                0., 2., 4., 6., 8., 6., 4., 2., 4., 6., 8., 10., 12., 10., 8., 6., 4., 2., 4., 6.,
-                4., 2.,
-            ];
-            for (i, rise) in hills.iter().enumerate() {
-                let x = w - 132. + i as f32 * 6.;
-                rect(
-                    x,
-                    h - 10. - rise,
-                    6.,
-                    rise + 10.,
-                    mix(p.nav, p.accent, if p.light { 11 } else { 19 }),
-                );
-                rect(x, h - 10. - rise, 6., 2., mix(p.nav, p.accent, 40));
-            }
-            rect(0., h - 2., w, 2., mix(p.nav, p.accent, 43));
-        },
-    )
-    .absolute()
-    .inset_0()
+/// The cabinet header's living sky; see `sky.rs` for the drawing and the weather.
+pub fn horizon(p: Palette, sky: &crate::sky::Sky) -> impl IntoElement {
+    crate::sky::horizon(p, sky)
 }

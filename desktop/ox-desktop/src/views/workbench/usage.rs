@@ -49,6 +49,23 @@ impl Workbench {
             .selected()
             .and_then(|id| store.transcript(id))
             .and_then(|t| t.usage.as_ref());
+        // With no thread selected there is no usage to show: only a limit warning.
+        if store.selected().is_none() {
+            let limit = store.usage.closest_limit(Utc::now().timestamp())?;
+            return Some(
+                small(
+                    p,
+                    format!(
+                        "{} · {} limit {}% used",
+                        limit.0,
+                        duration(limit.1.window_duration_mins),
+                        limit.1.used_percent
+                    ),
+                )
+                .text_color(rgb(p.warning))
+                .into_any_element(),
+            );
+        }
         let mut label = tokens.map_or_else(
             || "Session usage".to_string(),
             |u| format!("{} tokens", compact(u.total.total_tokens)),

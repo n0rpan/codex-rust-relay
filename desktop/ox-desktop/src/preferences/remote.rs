@@ -20,6 +20,8 @@ pub(super) struct Remote {
     finished: u64,
     qr: Option<Arc<Image>>,
     expiry: Option<Task<()>>,
+    /// Device whose terminal grant awaits a second click.
+    confirm_grant: Option<String>,
 }
 impl Remote {
     pub fn new(project: PathBuf, cx: &mut Context<Self>) -> Self {
@@ -31,6 +33,7 @@ impl Remote {
             finished: 0,
             qr: None,
             expiry: None,
+            confirm_grant: None,
         };
         view.submit(Operation::Status, cx);
         view
@@ -309,27 +312,52 @@ impl Render for Remote {
                 let id = device.id.clone();
                 let grant = id.clone();
                 let enable = !device.terminal;
-                view = view.child(
+                let confirming =
+                    enable && self.confirm_grant.as_deref() == Some(device.id.as_str());
+                let ask = device.id.clone();
+                let label = if !enable {
+                    "Disable terminal access"
+                } else if confirming {
+                    "Yes, allow commands as me"
+                } else {
+                    "Allow terminal access"
+                };
+                let grant_button = if enable {
+                    crate::kit::danger_button(
+                        p,
+                        format!("terminal-grant-{}", device.id),
+                        label,
+                        !self.busy,
+                        cx.listener(move |s, _, _, cx| {
+                            if s.confirm_grant.as_deref() == Some(grant.as_str()) {
+                                s.confirm_grant = None;
+                                s.submit(Operation::TerminalGrant(grant.clone(), true), cx)
+                            } else {
+                                s.confirm_grant = Some(ask.clone());
+                                cx.notify();
+                            }
+                        }),
+                    )
+                } else {
+                    button(
+                        p,
+                        format!("terminal-grant-{}", device.id),
+                        label,
+                        false,
+                        !self.busy,
+                        cx.listener(move |s, _, _, cx| {
+                            s.submit(Operation::TerminalGrant(grant.clone(), false), cx)
+                        }),
+                    )
+                };
+                let mut line = div().flex().flex_col().gap_1().child(
                     div()
                         .flex()
                         .flex_wrap()
                         .gap_2()
                         .items_center()
                         .child(format!("{} · {}", device.label, device.login))
-                        .child(button(
-                            p,
-                            format!("terminal-grant-{}", device.id),
-                            if enable {
-                                "Allow terminal access"
-                            } else {
-                                "Disable terminal access"
-                            },
-                            false,
-                            !self.busy,
-                            cx.listener(move |s, _, _, cx| {
-                                s.submit(Operation::TerminalGrant(grant.clone(), enable), cx)
-                            }),
-                        ))
+                        .child(grant_button)
                         .child(button(
                             p,
                             format!("revoke-{}", device.id),
@@ -341,6 +369,19 @@ impl Render for Remote {
                             }),
                         )),
                 );
+                if enable {
+                    line = line.child(
+                        div()
+                            .text_size(p.text(Step::Label))
+                            .text_color(rgb(if confirming { p.error } else { p.muted }))
+                            .child(if confirming {
+                                "Click again to confirm. This device will run commands as you on this computer."
+                            } else {
+                                "Lets this device run commands as you on this computer."
+                            }),
+                    );
+                }
+                view = view.child(line);
             }
         }
         view.child(buttons)

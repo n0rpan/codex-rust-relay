@@ -11,6 +11,7 @@ import {
   forgetComposer,
 } from "./composer-tools.js";
 import { pairingCode, setupCamera } from "./pair-camera.js";
+import { ActivityLine } from "./activity.js";
 import * as wire from "./wire.js";
 import { SessionControls } from "./controls.js";
 import { setupSettings } from "./settings.js";
@@ -37,10 +38,25 @@ const button = (text, fn) => {
   b.onclick = fn;
   return b;
 };
+// Same wording as the desktop's Route::label (ox-desk-core runtime.rs).
 const routesLabel = (r) =>
-  r.runtime.replace(/^./, (x) => x.toUpperCase()) +
-  " · " +
-  (r.billing === "subscription" ? "Subscription" : r.billing.api);
+  r.billing === "subscription"
+    ? r.runtime === "codex"
+      ? "ChatGPT subscription"
+      : "Claude subscription"
+    : r.runtime.replace(/^./, (x) => x.toUpperCase()) + " · " + r.billing.api;
+// Desktop status words (views/host/discovery.rs route_status, views/host.rs).
+const statusText = (session, needsInput) =>
+  needsInput
+    ? "Needs you"
+    : session.capabilities.includes("ended")
+      ? "Ended"
+      : ({
+          running: "Running",
+          needs_input: "Needs you",
+          failed: "Error",
+          interrupted: "Interrupted",
+        })[session.status] ?? "";
 const leaf = (path) => path.split("/").filter(Boolean).pop() || path;
 const keyOf = (scope, id) => scopeKey(scope) + " " + id;
 function notice(s = "") {
@@ -106,6 +122,11 @@ let cold = new Map(),
   visibleRows = 200;
 const global = new Projection(true);
 const controls = new SessionControls();
+const activityLine = new ActivityLine(
+  $("activity"),
+  $("activity-sprite"),
+  $("activity-label"),
+);
 const phoneSettings = setupSettings({
   request: (operation) => settingsRequest(key, operation),
   open: () => page("settings"),
@@ -392,7 +413,7 @@ function confirmIn(slot, question, label, work) {
   cancel.focus();
 }
 // Ends every thread of one scope over a short-lived subscription. True when each end was acknowledged.
-function endThreads(scope, threads) {
+function endThreads(scope, threads, force) {
   return new Promise((resolve) => {
     const link = new Link(scope, new Projection());
     const started = Date.now();
@@ -415,18 +436,18 @@ function endThreads(scope, threads) {
         return;
       }
       for (const thread of threads)
-        if (!link.act({ end_session: thread }, null, (done) => settle(done)))
+        if (!link.act(force ? { force_end_session: thread } : { end_session: thread }, null, (done) => settle(done)))
           settle(false);
     };
     if (!threads.length) resolve(true);
     else begin();
   });
 }
-async function endProcesses(list) {
+async function endProcesses(list, force) {
   endBusy = true;
   drawRunning();
   const results = await Promise.all(
-    list.map((p) => endThreads(p.scope, p.threads)),
+    list.map((p) => endThreads(p.scope, p.threads, force)),
   );
   endBusy = false;
   if (results.includes(false))
@@ -467,7 +488,7 @@ function drawRunning() {
     name.append(el("span", "run-dot"), leaf(p.project));
     head.append(
       name,
-      el("span", "status", p.running ? "Turn running" : "Idle"),
+      el("span", "status", p.running ? "Running" : "Idle"),
     );
     const facts = [
       kindLabels[p.kind] ?? p.kind,
@@ -525,9 +546,9 @@ function endRow(p) {
         $("running-confirm"),
         `End ${leaf(fresh.project)}? Its running turn or pending approval stops. History is kept.`,
         "End session",
-        () => endProcesses([fresh]),
+        () => endProcesses([fresh], true),
       );
-    else endProcesses([fresh]);
+    else endProcesses([fresh], false);
   });
 }
 function openRunning() {
@@ -564,7 +585,7 @@ $("end-idle").onclick = () => {
       $("running-confirm"),
       `End ${idle.length} idle session${idle.length === 1 ? "" : "s"}? History is kept.`,
       "End idle",
-      () => endProcesses(idle),
+      () => endProcesses(idle, false),
     );
   });
 };
@@ -672,8 +693,9 @@ function catalog() {
       continue;
     if (
       (filter === "requests" && !needsInput) ||
+      // "Running" is the desktop chip: a live turn that is not waiting on you.
       (filter === "active" &&
-        !session.capabilities.some((c) => c === "stop" || c === "steer")) ||
+        (needsInput || session.status !== "running")) ||
       (filter === "finished" &&
         (needsInput || ["running", "needs_input"].includes(session.status)))
     )
@@ -721,15 +743,7 @@ function catalog() {
       const head = el("div", "session-top");
       head.append(
         el("span", "session-name", session.title || "Untitled session"),
-        el(
-          "span",
-          "status",
-          needsInput
-            ? "Needs input"
-            : session.capabilities.includes("ended")
-              ? "Ended"
-              : session.status,
-        ),
+        el("span", "status", statusText(session, needsInput)),
       );
       b.append(
         head,
@@ -748,9 +762,9 @@ function catalog() {
         "p",
         "empty",
         filter === "requests"
-          ? "No pending requests."
+          ? "Nothing needs you."
           : filter === "active"
-            ? "No active sessions."
+            ? "No running sessions."
             : filter === "finished"
               ? "No finished sessions."
             : "No sessions found.",
@@ -774,6 +788,11 @@ function showAsks(asks) {
     }
     card.append(el("h2", "", a.title));
     if (a.detail) card.append(el("p", "", a.detail));
+    // The command a shell approval would run, as the desktop card shows it.
+    if (a.command?.command) {
+      card.append(el("pre", "ask-command", a.command.command));
+      if (a.command.cwd) card.append(el("p", "ask-kicker", String(a.command.cwd)));
+    }
     const answer = (action) => {
       for (const b of card.querySelectorAll("button")) b.disabled = true;
       if (
@@ -859,14 +878,42 @@ function syncChildren(root, nodes) {
   }
 }
 
+// Mirrors the desktop shell_summary: a wrapped script loses both quotes.
+function shellSummary(command) {
+  const m = command?.match(/^(?:\S*\/)?(?:bash|zsh|sh)\s+-[a-z]*c\s+(['"]?)([\s\S]*)$/i);
+  let text = m ? m[2] : (command ?? "");
+  if (m && m[1] && text.endsWith(m[1])) text = text.slice(0, -1);
+  return text.slice(0, 120);
+}
+function fileChanges(data) {
+  return Array.isArray(data?.changes) ? data.changes : [];
+}
+// Added and removed lines of a unified diff, ignoring the ---/+++ headers.
+function diffStats(changes) {
+  let added = 0,
+    removed = 0;
+  for (const c of changes)
+    for (const line of String(c.diff ?? "").split("\n")) {
+      if (line.startsWith("+") && !line.startsWith("+++")) added++;
+      else if (line.startsWith("-") && !line.startsWith("---")) removed++;
+    }
+  return `+${added} −${removed}`;
+}
+function fileChangeTitle(data) {
+  const changes = fileChanges(data);
+  if (!changes.length) return "File changes";
+  const name =
+    changes.length === 1
+      ? String(changes[0].path ?? "File")
+      : `${changes.length} changed files`;
+  return `${name} · ${diffStats(changes)}`;
+}
+
 function toolInfo(item) {
   const [kind, data] = Object.entries(item.detail?.item ?? {})[0] ?? [];
   const labels = {
-    CommandExecution:
-      data?.command
-        ?.replace(/^(?:\S*\/)?(?:bash|zsh|sh)\s+-[a-z]*c\s+['"]?/i, "")
-        .slice(0, 120) || "Shell command",
-    FileChange: "File changes",
+    CommandExecution: shellSummary(data?.command) || "Shell command",
+    FileChange: fileChangeTitle(data),
     WebSearch: "Web search",
   };
   const title =
@@ -886,6 +933,11 @@ function toolText(item, info) {
     if (output) return [data.command, output].filter(Boolean).join("\n\n");
     return item.text;
   }
+  if (info.kind === "FileChange" && fileChanges(data).length)
+    // Same layout as the desktop write_detail: path, then the patch text.
+    return fileChanges(data)
+      .map((c) => `${c.path ?? ""}\n${c.diff ?? ""}`)
+      .join("\n\n");
   return [
     item.text,
     item.detail?.output,
@@ -1100,7 +1152,19 @@ function conversation() {
   $("older").onclick = () => detailLink.act({ load_older: id });
   $("start-worker").hidden = !id || !caps.includes("open");
   $("continue-in").hidden = !id || !caps.includes("open");
-  showAsks((s?.asks || []).filter((a) => a.thread === id));
+  const asks = (s?.asks || []).filter((a) => a.thread === id);
+  showAsks(asks);
+  // The activity line only trusts a live link: a reconnect must not look like a finished turn.
+  if (detailLink?.ready && s) {
+    const items = timeline?.items || [];
+    activityLine.update({
+      session: keyOf(scope, id),
+      items,
+      running: caps.includes("stop"),
+      waiting: asks.length > 0,
+      failed: items[items.length - 1]?.role === "error",
+    });
+  }
   if (selected.revealLatest && timeline?.items?.length) {
     selected.revealLatest = false;
     const answers = $("timeline").querySelectorAll(".assistant, .result");
@@ -1136,12 +1200,15 @@ function conversation() {
     (imagesFor(keyOf(scope, id)).length > 0 &&
       !inputCaps.includes("attach_image")) ||
     Boolean(pendingNew);
+  // A running turn that waits on an approval still gets the session terminal, so the
+  // person can review the command there (the desktop offers the same path).
+  const awaitingApproval =
+    caps.includes("stop") && (s?.asks || []).some((a) => a.thread === id);
   $("operator-session").hidden =
     !id ||
     !!row?.parent ||
     !!origin ||
-    !caps.includes("send") ||
-    caps.includes("stop");
+    !(caps.includes("send") || awaitingApproval);
   // Stop keeps its slot. It is enabled only while the host reports a running turn.
   $("stop").disabled = !detailLink?.ready || !caps.includes("stop");
   $("stop").onclick = () => detailLink?.act({ stop: id });
@@ -1427,11 +1494,26 @@ function handoffNotice() {
     line.hidden = false;
   } else line.hidden = true;
   $("handoff-grant-row").hidden = $("handoff-mode").value !== "yolo";
+  labelPermissions(
+    $("handoff-mode"),
+    $("handoff-runtime").value,
+    $("handoff-permission-note"),
+  );
 }
 $("continue-in").onclick = () => {
-  $("handoff-runtime").value =
-    selected?.scope?.route?.runtime === "codex" ? "claude" : "codex";
+  // Starts on the session's own runtime and route, as the desktop handoff sheet does.
+  const from = selected?.scope?.route;
+  if (from) $("handoff-runtime").value = from.runtime;
   handoffRoutes();
+  const same = routes.findIndex(
+    (r) =>
+      r.runtime === from?.runtime &&
+      (r.billing === "subscription"
+        ? from.billing === "subscription"
+        : r.billing?.api === from?.billing?.api),
+  );
+  if (same >= 0) $("handoff-route").value = String(same);
+  handoffNotice();
   loadModelChoices();
   $("handoff-form").hidden = false;
   $("handoff-request").focus();
@@ -1520,20 +1602,32 @@ async function loadModelChoices() {
   fillWorkerModels();
   handoffRoutes();
 }
+// The model the worker sheet should start from: the parent session's route, set when
+// the sheet opens (desktop worker_sheet.rs Choice::new). Cleared when the runtime changes.
+let workerSeed = null;
 function fillWorkerModels() {
   const select = $("worker-model"),
-    current = select.value,
+    runtime = $("worker-runtime").value,
+    current = workerSeed ? workerSeed.model : select.value,
     starred = modelChoices.starred,
     rest = modelChoices.all.filter((m) => !starred.includes(m));
   const option = (m) => new Option(m, m);
+  // A Codex worker needs an OX API model (desktop worker_sheet.rs subscription_ok).
+  const subscription = new Option(
+    runtime === "codex" ? "ChatGPT subscription" : "Claude subscription",
+    "",
+  );
+  subscription.disabled = runtime === "codex";
   select.replaceChildren(
-    new Option("Subscription (default)", ""),
+    subscription,
     ...(starred.length ? [optgroup("Starred", starred.map(option))] : []),
     ...(rest.length ? [optgroup("All models", rest.map(option))] : []),
   );
   select.value = [...select.options].some((o) => o.value === current)
     ? current
     : "";
+  if (runtime === "codex" && !select.value && select.options.length > 1)
+    select.value = select.options[1].value;
   // Free text is the fallback only when the phone has no model list at all.
   const free = !modelChoices.all.length;
   select.hidden = free;
@@ -1543,10 +1637,16 @@ const workerModelValue = () =>
   ($("worker-model-free").hidden
     ? $("worker-model").value
     : $("worker-model-free").value.trim()) || null;
+// Labels and one-line notes are the desktop's (worker_sheet.rs mode_label / mode_note).
 const workerModes = {
   session: "Session",
-  goal: "Codex goal",
-  workflow: "Claude workflow",
+  goal: "Goal",
+  workflow: "Workflow",
+};
+const workerModeNotes = {
+  session: "The task starts a new session under this one.",
+  goal: "Codex keeps working toward the task as an objective.",
+  workflow: "Claude Code runs the task with its Workflow tool.",
 };
 const modesFor = (runtime) =>
   runtime === "codex" ? ["session", "goal"] : ["session", "workflow"];
@@ -1554,6 +1654,7 @@ function renderWorkerMode() {
   const allowed = modesFor($("worker-runtime").value);
   if (!allowed.includes($("worker-mode").value)) $("worker-mode").value = "session";
   const current = $("worker-mode").value;
+  $("worker-mode-note").textContent = workerModeNotes[current] ?? "";
   $("worker-mode-group").replaceChildren(
     ...allowed.map((m) => {
       const b = button(workerModes[m], () => {
@@ -1567,15 +1668,52 @@ function renderWorkerMode() {
     }),
   );
 }
+// Each shared level names the native preset it starts in (ox-desk-core modes.rs preset),
+// so the labels and one-line descriptions are the desktop's for that runtime.
+const permissionPresets = {
+  codex: {
+    read: ["Read only", "Read files. Ask before writing or running outside the sandbox."],
+    write: ["Workspace", "Edit the workspace. Ask you before leaving the sandbox."],
+    classifier: ["Auto-review", "Edit the workspace. Let Codex review approval requests."],
+    yolo: ["YOLO", "Full filesystem and network access. Run commands without approval."],
+  },
+  claude: {
+    read: ["Plan mode", "Let Claude Code explore and plan before making changes."],
+    write: ["Accept edits", "Let Claude Code apply edits without asking about each edit."],
+    classifier: ["Auto", "Let Claude Code’s classifier review tool actions before they run."],
+    yolo: ["YOLO · bypass permissions", "Run Claude Code tools without permission prompts."],
+  },
+};
+function labelPermissions(select, runtime, note) {
+  const table = permissionPresets[runtime] ?? permissionPresets.codex;
+  for (const o of select.options) if (table[o.value]) o.textContent = table[o.value][0];
+  note.textContent =
+    select.value === "inherit"
+      ? "Uses this session's current permission mode."
+      : (table[select.value]?.[1] ?? "");
+}
 function renderWorkerPermission() {
   const yolo = $("worker-permission").value === "yolo";
+  labelPermissions($("worker-permission"), $("worker-runtime").value, $("worker-permission-note"));
   $("worker-warning").textContent =
-    "YOLO runs this worker without asking for each step. Choosing it here confirms that.";
+    "YOLO runs this worker's commands and edits without asking. Choosing it here confirms that.";
   $("worker-warning").hidden = !yolo;
 }
-$("worker-runtime").onchange = renderWorkerMode;
+$("worker-runtime").onchange = () => {
+  // A new runtime starts from its own subscription or first starred model, not the old one.
+  workerSeed = null;
+  fillWorkerModels();
+  renderWorkerMode();
+  renderWorkerPermission();
+};
 $("worker-permission").onchange = renderWorkerPermission;
 $("start-worker").onclick = () => {
+  // Start from the parent session's route, as the desktop sheet does.
+  const route = selected?.scope?.route;
+  if (route) {
+    $("worker-runtime").value = route.runtime;
+    workerSeed = { model: route.billing?.api ?? "" };
+  }
   fillWorkerModels();
   renderWorkerMode();
   renderWorkerPermission();

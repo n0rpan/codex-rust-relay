@@ -233,6 +233,7 @@ impl Access {
                     | Action::LoadOlder(_)
                     | Action::Stop(_)
                     | Action::EndSession(_)
+                    | Action::ForceEndSession(_)
                     | Action::SendText(..) => approval.is_none(),
                     Action::StartWorker(start) => approval.is_none() && start.validate().is_ok(),
                     Action::StartHandoff(start) => approval.is_none() && start.validate().is_ok(),
@@ -739,6 +740,14 @@ mod tests {
         assert!(a.permit(
             &app,
             &act(scope.clone(), Action::EndSession("thread".into()), None)
+        ));
+        assert!(a.permit(
+            &app,
+            &act(
+                scope.clone(),
+                Action::ForceEndSession("thread".into()),
+                None
+            )
         ));
         assert!(a.permit(&app, &list()));
     }

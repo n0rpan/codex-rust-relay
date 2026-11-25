@@ -121,7 +121,7 @@ header {
   isolation: isolate;
   height: 64px;
   border-bottom: 2px solid var(--line-strong);
-  background: var(--nav);
+  background: var(--sky-nav, var(--nav));
   display: flex;
   align-items: center;
   gap: 12px;
@@ -140,6 +140,19 @@ header:before {
   background: url("/horizon.png") bottom right/contain no-repeat;
   image-rendering: pixelated;
   pointer-events: none;
+}
+/* sky.js draws the live horizon in this canvas and hides the static picture. */
+header[data-sky]:before {
+  display: none;
+}
+#sky {
+  position: absolute;
+  z-index: -1;
+  bottom: 0;
+  right: max(94px, calc((100vw - 480px) / 2));
+  width: 166px;
+  height: 42px;
+  image-rendering: pixelated;
 }
 .wordmark {
   padding: 0;
@@ -392,6 +405,15 @@ h1 {
   height: 14px;
   background: url("/cartridges.png") -42px 0/56px 14px no-repeat;
   image-rendering: pixelated;
+}
+.ask .ask-command {
+  overflow: auto;
+  max-height: 10rem;
+  white-space: pre-wrap;
+  font: 0.83rem/1.45 var(--mono);
+  background: var(--panel);
+  padding: 0.5rem 0.6rem;
+  margin: 0 0 0.4rem;
 }
 .ask p {
   white-space: pre-wrap;
@@ -1235,6 +1257,27 @@ form > .primary {
 #notification-dismiss {
   flex: 0 0 auto;
   min-height: 44px;
+}
+
+/* The activity line is the one animated slot in a conversation (polish plan 2.7). */
+.activity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 30px;
+  margin: 6px 0;
+  color: var(--muted);
+  font: 600 12px/1.2 var(--mono);
+  letter-spacing: 0.04em;
+}
+.activity[hidden] {
+  display: none;
+}
+.activity canvas {
+  flex: 0 0 auto;
+  width: 40px;
+  height: 22px;
+  image-rendering: pixelated;
 }
 
 .needs-bar {

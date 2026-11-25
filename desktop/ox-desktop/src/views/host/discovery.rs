@@ -93,6 +93,8 @@ pub(super) struct Discovery {
     pub revision: usize,
     pub indexed: Option<(usize, String)>,
     pub pending: usize,
+    /// The last discovery failure, so a later success can clear the banner it raised.
+    pub error: Option<String>,
     removed: HashMap<Scope, HashMap<PathBuf, HashSet<String>>>,
     /// Parents whose child rows are folded away, by project and thread id.
     pub collapsed: HashSet<(PathBuf, String)>,
@@ -328,6 +330,14 @@ impl Host {
                 s.discovery.pending = 0;
                 match result {
                     Ok((rows, errors)) => {
+                        // A failure the user already saw is over once discovery works again.
+                        if s.discovery
+                            .error
+                            .take()
+                            .is_some_and(|e| s.message.as_ref() == Some(&e))
+                        {
+                            s.message = None;
+                        }
                         let mut groups = [vec![], vec![], vec![]];
                         for (scope, row) in rows {
                             let index = match (scope.route.runtime, scope.route.is_api()) {
@@ -365,7 +375,11 @@ impl Host {
                             eprintln!("Could not discover saved sessions: {message}");
                         }
                     }
-                    Err(e) => s.message = Some(e.to_string()),
+                    Err(e) => {
+                        let message = e.to_string();
+                        s.discovery.error = Some(message.clone());
+                        s.message = Some(message);
+                    }
                 }
                 cx.notify();
             });

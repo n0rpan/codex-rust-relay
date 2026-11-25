@@ -324,7 +324,7 @@ fn two_turns_can_finish_out_of_order_while_a_failed_steer_returns_to_its_draft()
     apply(&mut store, 1);
     assert_eq!(store.draft(None), "wrong billing");
     assert!(store.transcript("x").is_none());
-    assert!(store.notice().unwrap().contains("different billing"));
+    assert!(store.notice().unwrap().contains("different model route"));
 }
 
 #[test]

@@ -64,6 +64,25 @@ fn age(now: i64, timestamp: i64) -> String {
     }
 }
 
+/// Whether a new session can start on `route` now, or the one next step to show instead.
+/// An API route needs its model alias to be configured. The ChatGPT plan needs a signed-in
+/// account. The Claude plan is checked by the session itself, which asks to sign in.
+fn new_route_gate(
+    route: &Route,
+    models: &[String],
+    chatgpt_account: bool,
+) -> Result<(), &'static str> {
+    use ox_desk_core::runtime::Runtime;
+    match &route.billing {
+        Billing::Api(alias) if models.contains(alias) => Ok(()),
+        Billing::Api(_) => Err("Add this model in Settings → Models first."),
+        Billing::Subscription if route.runtime == Runtime::Codex && !chatgpt_account => {
+            Err("Sign in to ChatGPT in Settings → Accounts first.")
+        }
+        Billing::Subscription => Ok(()),
+    }
+}
+
 pub struct Host {
     palette: Option<palette::State>,
     _palette_keys: Subscription,
@@ -526,6 +545,14 @@ impl Host {
         cx.subscribe_in(
             &pane,
             window,
+            |s, _, _: &super::workbench::empty::OpenProject, window, cx| {
+                s.pick_project(window, cx);
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &pane,
+            window,
             |s, owner, _: &super::onboarding::ConfigureProvider, window, cx| {
                 let project = owner.read(cx).project.clone();
                 owner.update(cx, |p, cx| p.set_front(false, cx));
@@ -541,14 +568,16 @@ impl Host {
             window,
             |s, owner, event: &super::route_chip::NewModelRoute, window, cx| {
                 let project = owner.read(cx).project.clone();
-                if let Billing::Api(alias) = &event.0.billing
-                    && s.models.contains(alias)
-                {
-                    s.open(project, event.0.clone(), window, cx);
-                    s.panes[s.active].update(cx, |pane, cx| pane.action(cx, DeskAction::NewDraft));
-                } else {
-                    s.message = Some("Configure this billing route in Settings first.".into());
-                    cx.notify();
+                match new_route_gate(&event.0, &s.models, s.native_account) {
+                    Ok(()) => {
+                        s.open(project, event.0.clone(), window, cx);
+                        s.panes[s.active]
+                            .update(cx, |pane, cx| pane.action(cx, DeskAction::NewDraft));
+                    }
+                    Err(message) => {
+                        s.message = Some(message.into());
+                        cx.notify();
+                    }
                 }
             },
         )
@@ -622,21 +651,50 @@ impl Host {
         cx.spawn_in(window, async move |s, cx| {
             let result = choice.await;
             let _ = s.update_in(cx, |s, window, cx| match result {
-                Ok(Ok(Some(paths))) if !paths.is_empty() => match paths[0].canonicalize() {
-                    Ok(project) => {
+                Ok(Ok(Some(paths))) if !paths.is_empty() => {
+                    let path = paths[0].clone();
+                    s.with_project_dir(path, true, window, cx, |s, project, window, cx| {
                         let route = s.recent.route(&project);
                         s.open(project, route, window, cx);
-                    }
-                    Err(err) => {
-                        s.message = Some(err.to_string());
-                        cx.notify();
-                    }
-                },
+                    });
+                }
                 Ok(Err(err)) => {
                     s.message = Some(err.to_string());
                     cx.notify();
                 }
                 _ => (),
+            });
+        })
+        .detach();
+    }
+    /// Check, off the UI thread, that `path` (canonicalised when asked) is a directory,
+    /// then continue with it. A stalled network mount cannot freeze the window this way.
+    /// An unavailable project sets the sidebar message instead.
+    fn with_project_dir(
+        &mut self,
+        path: PathBuf,
+        canonical: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, PathBuf, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        let probe = path.clone();
+        let task = cx.background_spawn(async move {
+            let resolved = if canonical {
+                probe.canonicalize().ok()
+            } else {
+                Some(probe)
+            };
+            resolved.filter(|p| p.is_dir())
+        });
+        cx.spawn_in(window, async move |s, cx| {
+            let resolved = task.await;
+            let _ = s.update_in(cx, |s, window, cx| match resolved {
+                Some(project) => then(s, project, window, cx),
+                None => {
+                    s.message = Some(format!("Project unavailable: {}", path.display()));
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -649,22 +707,22 @@ impl Host {
             ("filter-finished", "is:finished", "Finished"),
         ];
         let current = self.filter.read(cx).value().to_string();
-        let mut chips = crate::kit::row().gap_1().px_2().flex_wrap();
+        // One compact row of equal segments that always fits the sidebar.
+        let mut chips = crate::kit::row().gap_1().px_2().flex_nowrap().min_w_0();
         for (id, token, label) in CHIPS {
             let filter = self.filter.clone();
             let active = current.split_whitespace().any(|word| word == token);
-            chips = chips.child(crate::kit::button(
-                p,
-                id,
-                label,
-                active,
-                true,
-                move |_, window, cx| {
-                    let value = filter.read(cx).value().to_string();
-                    let next = toggle_status_filter(&value, token);
-                    filter.update(cx, |field, cx| field.set_value(next, window, cx));
-                },
-            ));
+            chips = chips.child(
+                div().flex_1().min_w_0().child(
+                    crate::kit::button(p, id, label, active, true, move |_, window, cx| {
+                        let value = filter.read(cx).value().to_string();
+                        let next = toggle_status_filter(&value, token);
+                        filter.update(cx, |field, cx| field.set_value(next, window, cx));
+                    })
+                    .w_full()
+                    .px_1(),
+                ),
+            );
         }
         chips
     }
@@ -755,29 +813,26 @@ impl Host {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !project.is_dir() {
-            self.message = Some(format!("Project unavailable: {}", project.display()));
-            cx.notify();
-            return;
-        }
-        let (route, _) = self.project_row_state(&project, &row, scope, cx);
-        if let Some(route) = route {
-            self.open_catalog(project, row, route, window, cx);
-        } else if (row.needs_claude_alias()
-            || (scope.api && self.api_provider.as_deref() == Some(&row.model_provider)))
-            && !self.models.is_empty()
-        {
-            self.choose_route = Some((project, row));
-            self.reveal_sidebar(window, cx);
-            cx.notify();
-        } else {
-            self.reveal_sidebar(window, cx);
-            self.message = Some(format!(
-                "Configure the saved provider {} in Settings to open this thread.",
-                row.model_provider
-            ));
-            cx.notify();
-        }
+        self.with_project_dir(project, false, window, cx, move |s, project, window, cx| {
+            let (route, _) = s.project_row_state(&project, &row, scope, cx);
+            if let Some(route) = route {
+                s.open_catalog(project, row, route, window, cx);
+            } else if (row.needs_claude_alias()
+                || (scope.api && s.api_provider.as_deref() == Some(&row.model_provider)))
+                && !s.models.is_empty()
+            {
+                s.choose_route = Some((project, row));
+                s.reveal_sidebar(window, cx);
+                cx.notify();
+            } else {
+                s.reveal_sidebar(window, cx);
+                s.message = Some(format!(
+                    "Set up {} in Settings to open this thread.",
+                    row.model_provider
+                ));
+                cx.notify();
+            }
+        });
     }
 
     fn navigate(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1079,7 +1134,7 @@ impl Host {
             .as_ref()
             .is_some_and(|s| s.state() == &Connection::Ready);
         let count = self.catalog.len();
-        let running = self.running.read(cx).running_count();
+        let running = self.running.read(cx).summary();
         // The route menu lists the two subscriptions and starred aliases; everything else is
         // one row away in the searchable picker.
         let starred_routes: Vec<Route> = self
@@ -1199,17 +1254,17 @@ impl Host {
                 menu = menu.item(
                     PopupMenuItem::new(directory.display().to_string()).on_click(
                         move |_, window, cx| {
-                            let _ = host.update(cx, |s, cx| match directory.canonicalize() {
-                                Ok(project) if project.is_dir() => {
-                                    s.open(project, route.clone(), window, cx)
-                                }
-                                _ => {
-                                    s.message = Some(format!(
-                                        "Project unavailable: {}",
-                                        directory.display()
-                                    ));
-                                    cx.notify();
-                                }
+                            let _ = host.update(cx, |s, cx| {
+                                let route = route.clone();
+                                s.with_project_dir(
+                                    directory.clone(),
+                                    true,
+                                    window,
+                                    cx,
+                                    move |s, project, window, cx| {
+                                        s.open(project, route, window, cx)
+                                    },
+                                );
                             });
                         },
                     ),
@@ -1273,7 +1328,7 @@ impl Host {
                     .p_3()
                     .gap_2()
                     .justify_between()
-                    .child(activity::horizon(p))
+                    .child(activity::horizon(p, &crate::sky::now(cx)))
                     .child(row().gap_2().child(activity::marquee(p, hot, false)))
                     .child(self.palette_button(cx))
                     .when(compact, |bar| {
@@ -1404,6 +1459,7 @@ impl Host {
                 // Footer: settings on the left, running count and host status on the right.
                 row()
                     .flex_shrink_0()
+                    .flex_wrap()
                     .justify_between()
                     .gap(px(SPACE_S))
                     .px(px(SPACE_S))
@@ -1425,7 +1481,8 @@ impl Host {
                     .child(
                         row()
                             .gap(px(SPACE_S))
-                            .child(small(p, format!("RUNNING · {running}")))
+                            .min_w_0()
+                            .child(small(p, running))
                             .child(
                                 gpui::div()
                                     .w(px(8.))
@@ -1435,18 +1492,24 @@ impl Host {
                             ),
                     ),
             )
-            .when_some(self.message.clone(), |d, m| {
-                d.child(crate::kit::banner(
-                    p,
-                    "host-error",
-                    "host-error-dismiss",
-                    m,
-                    cx.listener(|s, _, _, cx| {
-                        s.message = None;
-                        cx.notify();
-                    }),
-                ))
-            });
+            .when_some(
+                // The pane header already shows its own connection error: say it once.
+                self.message.clone().filter(|m| {
+                    self.panes[self.active].read(cx).visible_error() != Some(m.as_str())
+                }),
+                |d, m| {
+                    d.child(crate::kit::banner(
+                        p,
+                        "host-error",
+                        "host-error-dismiss",
+                        m,
+                        cx.listener(|s, _, _, cx| {
+                            s.message = None;
+                            cx.notify();
+                        }),
+                    ))
+                },
+            );
         let (side, drawer) = if inline {
             (Some(sidebar), None)
         } else if self.drawer_open {
@@ -1517,7 +1580,7 @@ impl Host {
                                 .py_1()
                                 .gap_2()
                                 .bg(rgb(p.nav))
-                                .child(activity::horizon(p))
+                                .child(activity::horizon(p, &crate::sky::now(cx)))
                                 .child(activity::marquee(p, hot, true))
                                 .child(button(
                                     p,
@@ -1594,5 +1657,31 @@ mod tests {
             "fix is:waiting"
         );
         assert_eq!(toggle_status_filter("is:running fix", "is:running"), "fix");
+    }
+}
+
+#[cfg(test)]
+mod route_gate_tests {
+    use super::new_route_gate;
+    use ox_desk_core::runtime::Runtime;
+
+    #[test]
+    fn subscription_routes_need_only_their_account() {
+        let claude = Runtime::Claude.route(None);
+        let codex = Runtime::Codex.route(None);
+        assert!(new_route_gate(&claude, &[], false).is_ok());
+        assert!(new_route_gate(&codex, &[], true).is_ok());
+        assert!(
+            new_route_gate(&codex, &[], false)
+                .unwrap_err()
+                .contains("ChatGPT")
+        );
+    }
+
+    #[test]
+    fn api_routes_need_a_configured_alias() {
+        let api = Runtime::Codex.route(Some("fixture/demo".into()));
+        assert!(new_route_gate(&api, &["fixture/demo".into()], false).is_ok());
+        assert!(new_route_gate(&api, &[], false).is_err());
     }
 }
