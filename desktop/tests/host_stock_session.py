@@ -100,8 +100,17 @@ def worker_cases(root, stack, binary, env, log):
                 client.act(scope,uuid.uuid4().hex,{"answer_ask":[pending["id"],0]},pending["token"])
             return (n:=change(frame,"notification")) and n["event"]=="finished"
         client.until(launched)
-        assert any('"job_id"' in json.dumps(request["messages"]) for request in native.requests), [
-            request["messages"][-1] for request in native.requests]
+        def launch_results():
+            for request in native.requests:
+                for message in request["messages"]:
+                    for block in message["content"] if isinstance(message["content"], list) else []:
+                        if block.get("type")=="tool_result" and isinstance(block.get("content"),str):
+                            try:
+                                yield json.loads(block["content"])
+                            except ValueError:
+                                pass
+        assert any(r.get("owner")=="host" and r.get("job_id") and r.get("access_ceiling")=="read"
+                   for r in launch_results()), [request["messages"][-1] for request in native.requests]
         # A host-owned worker is an ordinary session on its own route, stamped with
         # its origin and nested under the parent across scopes in the catalog.
         catalog=Client(env["OX_HOST_SOCKET"])
