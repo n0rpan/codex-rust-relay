@@ -310,12 +310,23 @@ fn native_sign_in_and_launch_use_stock_clients() {
             "-c\nmodel_provider=\"openai\"\nresume\n",
         ),
         (&["claude", "--native", "--continue"], "--continue\n"),
-        (&["claude", "--subscription"], "\n"),
+        // A new Claude session gets a session ID OX knows before the first turn.
+        (&["claude", "--subscription"], "--session-id\n{uuid}\n"),
     ];
     for &(args, forwarded) in cases {
         let output = run(args, "Logged in using ChatGPT");
         assert!(output.status.success(), "{:?}", output.stderr);
-        assert_eq!(read(&capture.0.join("run-args")), forwarded);
+        let received = read(&capture.0.join("run-args"));
+        match forwarded.split_once("{uuid}") {
+            Some((before, after)) => {
+                let id = received
+                    .strip_prefix(before)
+                    .and_then(|rest| rest.strip_suffix(after))
+                    .unwrap_or_else(|| panic!("{received:?}"));
+                assert!(is_uuid_v4(id), "{id}");
+            }
+            None => assert_eq!(received, forwarded),
+        }
         let env = read(&capture.0.join("run-env"));
         if args == ["login", "claude"] || args == ["claude", "--subscription"] {
             assert!(!env.contains("ANTHROPIC_BASE_URL="));
@@ -632,7 +643,19 @@ fn streamed_claude_subscription_checks_stock_and_owns_routing_settings() {
     assert_eq!(overlay["apiKeyHelper"], "");
     assert_eq!(overlay["env"]["ANTHROPIC_API_KEY"], "");
     assert_eq!(overlay["env"]["ANTHROPIC_BASE_URL"], "");
+    assert_eq!(parts.next(), Some("--session-id"));
+    assert!(is_uuid_v4(parts.next().unwrap()));
     assert_eq!(parts.collect::<Vec<_>>(), &stream[2..]);
     let env = read(&capture.0.join("run-env"));
     assert!(!env.contains("unrelated-key") && !env.contains("another-profile"));
+}
+
+fn is_uuid_v4(id: &str) -> bool {
+    let parts: Vec<&str> = id.split('-').collect();
+    parts.iter().map(|p| p.len()).eq([8, 4, 4, 4, 12])
+        && id
+            .chars()
+            .all(|c| c == '-' || c.is_ascii_digit() || ('a'..='f').contains(&c))
+        && parts[2].starts_with('4')
+        && parts[3].starts_with(['8', '9', 'a', 'b'])
 }

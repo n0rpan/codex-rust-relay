@@ -487,13 +487,18 @@ impl Service {
             .start(request, &self.home, &self.cwd, Arc::clone(&app.secrets))
     }
 
-    /// The most exact session this launch knows for a call: the calling thread,
-    /// then the session in its own resume arguments, then the first one observed.
+    /// The session this launch names for a call. Codex reports the exact calling
+    /// thread, which can be a subagent. A Claude launch has one session, fixed by
+    /// its `--session-id` or `--resume` argument before the first turn. A later
+    /// ID for the same Claude launch, such as after `/clear`, never replaces it;
+    /// the launch token still covers that work while the launch lives.
     fn caller(&self, thread: Option<&str>) -> Value {
-        let session = thread
-            .map(str::to_owned)
-            .or_else(|| self.session.clone())
-            .or_else(|| self.observed.lock().unwrap().clone());
+        let thread = thread.map(str::to_owned);
+        let session = match self.client {
+            ClientKind::Codex => thread.or_else(|| self.session.clone()),
+            ClientKind::Claude => self.session.clone().or(thread),
+        }
+        .or_else(|| self.observed.lock().unwrap().clone());
         json!({
             "project": self.cwd,
             "runtime": match self.client {
@@ -852,6 +857,24 @@ mod tests {
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
     }
+    #[test]
+    fn a_new_claude_launch_names_its_session_before_the_first_turn() {
+        // The ID OX adds is the one the worker gateway records for the launch.
+        let (rewritten, id) = crate::clients::claude_session_args(args(&["-p", "fix it"])).unwrap();
+        let id = id.unwrap();
+        assert_eq!(
+            session_hint(&rewritten, ClientKind::Claude).as_deref(),
+            Some(id.as_str())
+        );
+        // A later resume of that session names the same ID, so it reclaims the workers.
+        let resumed = crate::clients::claude_session_args(args(&["--resume", &id])).unwrap();
+        assert_eq!(resumed.1, None);
+        assert_eq!(
+            session_hint(&resumed.0, ClientKind::Claude).as_deref(),
+            Some(id.as_str())
+        );
+    }
+
     #[test]
     fn only_plausible_native_session_ids_are_observed() {
         assert!(valid_session("019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b"));

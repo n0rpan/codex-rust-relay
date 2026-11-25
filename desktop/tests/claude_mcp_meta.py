@@ -1,9 +1,16 @@
 """What stock Claude Code tells an MCP server about the calling session.
 
-The OX worker gateway learns a new `ox claude` launch's session only from
-`--session-id`, which OX adds when the user passed no session flag. Claude Code
-2.1.332 sends no session identity on MCP requests: `tools/call` carries only
-`_meta.claudecode/toolUseId` and `progressToken`, and no session header.
+Claude Code 2.1.331 and 2.1.332 send no session identity on MCP requests:
+`tools/call` carries only `_meta.claudecode/toolUseId` and `progressToken`, and
+there is no session header. OX therefore fixes the session itself. When
+`ox claude` starts a new session on either billing route and the user passed no
+session flag (`--resume`/`-r`, `--continue`/`-c`, `--session-id`,
+`--fork-session`, `--from-pr`), it adds `--session-id <uuid>` with a fresh
+UUIDv4 (`claude_session_args` in src/clients.rs). The OX worker gateway reads
+that ID from the launch arguments and stamps it as the parent session of every
+host-owned worker the launch starts. After the terminal exits,
+`ox claude --resume <uuid>` reclaims those workers. This fixture checks the
+two stock behaviours that design relies on.
 
 Usage: python3 desktop/tests/claude_mcp_meta.py /path/to/claude
 
@@ -11,7 +18,7 @@ One HTTP server plays both the Messages API and a streamable-HTTP MCP server.
 The provider asks the model to call mcp__capture__probe once. The fixture
 fails when `--session-id` is not honoured or the tool call never arrives. It
 passes either way on the session identity and prints a NOTE when Claude Code
-starts naming the session, so OX can use it instead of `--session-id`.
+starts naming the session on MCP requests.
 """
 import json, os, subprocess, sys, tempfile, threading, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

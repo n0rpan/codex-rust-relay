@@ -2228,6 +2228,130 @@ mod tests {
         }
 
         #[test]
+        fn a_resumed_claude_session_reclaims_the_workers_its_new_launch_started() {
+            let root = tempfile::tempdir().unwrap();
+            let (_, worker) = scopes(root.path());
+            // `ox claude` added `--session-id` before the first turn, so the
+            // launch names its session when it calls start_ox_worker.
+            let session = "6f1c2d3e-4b5a-4c6d-8e7f-90a1b2c3d4e5";
+            let terminal = |session: Option<&str>, launch: &str| {
+                Caller::External(ExternalCaller {
+                    project: worker.project.clone(),
+                    runtime: Runtime::Claude,
+                    session: session.map(Into::into),
+                    launch: launch.into(),
+                })
+            };
+            let launch = terminal(Some(session), "first-launch-token");
+            let started = crate::workers::origin(
+                &launch,
+                None,
+                &WorkerStart {
+                    parent: String::new(),
+                    runtime: Runtime::Codex,
+                    model: Some("fixture".into()),
+                    mode: WorkerMode::Session,
+                    task: "fix".into(),
+                    write: true,
+                },
+                41,
+                Ceiling::Write,
+            );
+            assert_eq!(
+                started.parent.session.as_deref(),
+                Some(session),
+                "recorded at launch"
+            );
+            {
+                let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+                let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+                let (l, _) = live(
+                    &worker,
+                    vec![view(&worker, "w", "running", "workspace")],
+                    &["w"],
+                    vec![],
+                );
+                engine.running.insert(worker.clone(), l);
+                engine.workers.stamp(&worker, "w", started.clone());
+                engine.process(&worker, vec![], true).unwrap();
+                assert_eq!(
+                    engine
+                        .parent_call(&launch, ParentCall::Status { job_id: 41 })
+                        .unwrap()["job_id"],
+                    41
+                );
+                // A later binding from the same launch, e.g. after /clear, changes nothing.
+                engine
+                    .parent_call(
+                        &launch,
+                        ParentCall::Bind {
+                            session: "after-clear".into(),
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    engine
+                        .workers
+                        .get(&worker, "w")
+                        .unwrap()
+                        .marks
+                        .parent_session,
+                    None
+                );
+                assert_eq!(
+                    engine
+                        .workers
+                        .get(&worker, "w")
+                        .unwrap()
+                        .origin
+                        .parent
+                        .session
+                        .as_deref(),
+                    Some(session)
+                );
+            }
+            // The terminal exits and the host restarts.
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            // Another new `ox claude` in the same project has its own session ID.
+            let other = terminal(
+                Some("0a1b2c3d-4e5f-4a6b-9c7d-8e9f0a1b2c3d"),
+                "second-launch-token",
+            );
+            assert_eq!(
+                engine.parent_call(&other, ParentCall::List).unwrap()["jobs"],
+                json!([])
+            );
+            for call in [
+                ParentCall::Status { job_id: 41 },
+                ParentCall::Steer {
+                    job_id: 41,
+                    text: "x".into(),
+                },
+                ParentCall::Cancel { job_id: 41 },
+            ] {
+                assert!(engine.parent_call(&other, call).is_err());
+            }
+            assert!(!engine.workers.get(&worker, "w").unwrap().marks.cancelled);
+            // `ox claude --resume <that uuid>` is a new launch naming the same session.
+            let resumed = terminal(Some(session), "resume-launch-token");
+            assert_eq!(
+                engine.parent_call(&resumed, ParentCall::List).unwrap()["jobs"][0]["job_id"],
+                41
+            );
+            assert_eq!(
+                engine
+                    .parent_call(&resumed, ParentCall::Status { job_id: 41 })
+                    .unwrap()["job_id"],
+                41
+            );
+            let cancelled = engine
+                .parent_call(&resumed, ParentCall::Cancel { job_id: 41 })
+                .unwrap();
+            assert_eq!(cancelled["job_id"], 41);
+        }
+
+        #[test]
         fn a_host_restart_mid_worker_keeps_its_stamp_and_never_relaunches_it() {
             let root = tempfile::tempdir().unwrap();
             let (parent, worker) = scopes(root.path());
