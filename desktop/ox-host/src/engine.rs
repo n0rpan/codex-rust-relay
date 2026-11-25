@@ -282,6 +282,7 @@ const REAP_EVERY: Duration = Duration::from_secs(60);
 
 pub(crate) struct Engine {
     config: RuntimeConfig,
+    schema_reader: std::sync::Arc<ox_desk_core::codex::installed::SchemaReader>,
     ledger: Ledger,
     replay: Replay,
     tx: SyncSender<Message>,
@@ -308,6 +309,13 @@ pub(crate) struct Engine {
     next_reap: Instant,
 }
 mod flows;
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.schema_reader.shutdown();
+    }
+}
+
 fn nonce() -> io::Result<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(io::Error::other)?;
@@ -358,6 +366,7 @@ impl Engine {
             state_dir: dir.to_owned(),
             idle: idle_timeout(std::env::var("OX_HOST_IDLE_MINUTES").ok().as_deref()),
             next_reap: Instant::now() + REAP_EVERY,
+            schema_reader: Default::default(),
         })
     }
     pub(crate) fn serve(&mut self, rx: Receiver<Message>) -> io::Result<()> {
@@ -1354,8 +1363,9 @@ impl Engine {
             let path = self.config.path.clone();
             let scope = scope.clone();
             let gen_id = live.generation;
+            let reader = self.schema_reader.clone();
             thread::spawn(move || {
-                if let Ok(caps) = ox_desk_core::codex::installed::installed(&path) {
+                if let Ok(caps) = reader.read(&path) {
                     let _ = tx.send(Message::Schema(scope, gen_id, Box::new(caps)));
                 }
             });
