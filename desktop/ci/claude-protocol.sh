@@ -19,6 +19,7 @@ for version in "${versions[@]}"; do
     actual=$(env HOME="$stage/home" CLAUDE_CONFIG_DIR="$stage/profile" "$binary" --version)
     test "$actual" = "$version (Claude Code)"
     echo "Verifying $actual"
+    python3 desktop/tests/claude_mcp_meta.py "$binary"
     python3 desktop/tests/claude_stock_session.py "$ox" "$binary"
     python3 desktop/tests/host_stock_session.py "$(dirname "$ox")/ox-host" "$ox" "$binary"
 done
