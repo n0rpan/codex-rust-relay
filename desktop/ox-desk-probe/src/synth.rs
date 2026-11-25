@@ -125,6 +125,9 @@ pub fn run() -> io::Result<()> {
                 let home = std::path::PathBuf::from(env::var_os("HOME").unwrap_or_default());
                 json!({"subscription":home.join("absent-native"),"api":home.join("absent-api")})
             }
+            Some("models") if env::var_os("OX_DESK_SYNTH_ROUTES").is_some() => {
+                json!(["fixture-model", "fixture-discovered"])
+            }
             Some("read" | "read_rows") => {
                 let models: Vec<&str> = if env::var_os("OX_DESK_SYNTH_ROUTES").is_some() {
                     vec!["fixture-model"]

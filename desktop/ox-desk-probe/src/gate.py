@@ -378,13 +378,13 @@ if len(sys.argv) == 2 and "Tailscale" in sys.argv[1]:
         if "error" in reply:
             raise RuntimeError(f"press {label!r}: {reply['error']}")
 
-    def agent(self, query):
-        """Switch the active window's route with the sidebar AGENT picker: open it and press the
+    def agent(self, query, control="billing-route"):
+        """Switch the active window's route with the requested model picker: open it and press the
         model row whose probe label (display name · id) names `query`. Picker ids are namespaced:
         an API alias is "@api:<alias>" and a subscription plan "@plan:<name>", and a runtime's own
         model can share a bare id with an API alias, so an API query prefers the "@api:" row and
         a plan query the "@plan:" row; a runtime-model row matches only when neither exists."""
-        self.press("billing-route")
+        self.press(control)
         needle = query.casefold()
         preferred = (f"@api:{needle}", f"@plan:{needle}")
 
@@ -392,7 +392,7 @@ if len(sys.argv) == 2 and "Tailscale" in sys.argv[1]:
             rows = [
                 (c["id"], c["label"].casefold())
                 for c in self.stats().get("layout", [])
-                if c["id"].startswith("model-row")
+                if c["id"].startswith("model-row") and c["enabled"]
             ]
             for want in preferred:
                 for ident, label in rows:
@@ -763,13 +763,22 @@ def reuse(f):
         if i == 0:
             wait(lambda: len(f.events("spawn")) == 2)
             first_route_spawns = len(f.events("spawn")) + len(f.events("helper")) - before_route
-    total = len(f.events("spawn")) + len(f.events("helper"))
+    servers = f.events("spawn")
+    total = len(servers) + len(f.events("helper"))
+    # Both pickers must also offer a model reported only by provider discovery.
+    # This third route opens after the process-reuse measurement.
+    f.agent("fixture-discovered")
+    wait(lambda: f.stats()["pane"] == 2 and f.stats()["connected"])
+    f.agent("codex")
+    wait(lambda: f.stats()["pane"] == 0)
+    f.agent("fixture-discovered", "model-setting-0")
+    wait(lambda: f.stats()["pane"] == 2)
     record("G9", created == 20 and base == before_route and cold_route_spawns == 2 and first_route_spawns == 0 and
-           total == before_route + first_route_spawns and len(f.events("spawn")) == 2,
+           total == before_route + first_route_spawns and len(servers) == 2,
            new_threads=created, thread_selections=20, route_changes=20, cold_route_spawns=cold_route_spawns,
            new_and_switch_spawns=before_route-base, first_api_route_spawns=first_route_spawns,
            subsequent_route_spawns=total-before_route-first_route_spawns,
-           app_servers=[e["id"] for e in f.events("spawn")])
+           app_servers=[e["id"] for e in servers], discovery_only_route="fixture-discovered")
 
 
 def saved_layout(f):
