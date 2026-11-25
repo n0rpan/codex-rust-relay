@@ -19,13 +19,9 @@ for version in "${versions[@]}"; do
     actual=$(env HOME="$stage/home" CLAUDE_CONFIG_DIR="$stage/profile" "$binary" --version)
     test "$actual" = "$version (Claude Code)"
     echo "Verifying $actual"
-    env HOME="$stage/home" CLAUDE_CONFIG_DIR="$stage/profile" "$binary" --help \
-        | python3 desktop/tests/claude_subcommands.py src/clients.rs
-    python3 desktop/tests/claude_mcp_meta.py "$binary"
+    # claude_subcommands, claude_mcp_meta and the host session fixtures run
+    # in the fast lane (fast.yml); this job keeps what needs the packaged build.
     python3 desktop/tests/claude_stock_session.py "$ox" "$binary"
-    python3 desktop/tests/host_stock_session.py "$(dirname "$ox")/ox-host" "$ox" "$binary"
-    python3 desktop/tests/host_handoff_session.py "$(dirname "$ox")/ox-host" "$ox" "$binary"
-    python3 desktop/tests/host_upgrade_session.py "$(dirname "$ox")/ox-host" "$ox" "$binary"
 done
 
 title_test=$(cargo test --no-run --locked --release --manifest-path desktop/Cargo.toml \

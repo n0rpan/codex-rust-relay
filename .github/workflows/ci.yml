@@ -101,6 +101,9 @@ jobs:
     name: Stock clients (${{ matrix.client_track }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # latest blocks only in the nightly run; elsewhere an upstream release
+    # must not block an unrelated change or a release of the tested baseline.
+    continue-on-error: ${{ matrix.client_track == 'latest' && github.event_name != 'schedule' }}
     strategy:
       fail-fast: false
       matrix:

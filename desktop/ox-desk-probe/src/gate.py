@@ -55,6 +55,20 @@ if args.ox:
     report["companion_sha256"] = sha256(args.ox)
 
 
+# Wall-clock thresholds (frame times, latencies, CPU) measure the machine as
+# much as the app. On shared CI runners they are recorded and reported, and
+# only counts and structure decide a scenario. Set OX_GATE_TIMING=block on
+# dedicated hardware to make them decide it too.
+TIMING_BLOCKS = os.environ.get("OX_GATE_TIMING") == "block"
+
+
+def timed(structure_ok, timing_ok, name):
+    if not timing_ok:
+        print(f"::warning title=Gate timing::{name} is over a timing threshold "
+              f"({'blocking' if TIMING_BLOCKS else 'reported, not blocking'})", flush=True)
+    return structure_ok and (timing_ok or not TIMING_BLOCKS)
+
+
 def record(key, passed, **values):
     report["scenarios"][key] = {"passed": passed, **values}
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -527,7 +541,8 @@ def streaming(f):
     if "G8" in selected:
         ms = (after["tail_ns"] - f.events("history-reply")[-1]["ns"]) / 1e6
         budget = after["uniform_row_budget"] or 0
-        record("G8", 0 <= ms <= limits["history_tail_ms"] and 0 < after["measured_items"] <= budget, reply_to_tail_paint_ms=ms,
+        record("G8", timed(0 <= ms and 0 < after["measured_items"] <= budget, ms <= limits["history_tail_ms"], "G8"),
+               timing_ok=ms <= limits["history_tail_ms"], reply_to_tail_paint_ms=ms,
                distinct_history_rows=after["measured_items"], viewport_with_overscan=budget,
                rows_built=after["rows"]-before["rows"], history_items=2000)
     if "G7" in selected:
@@ -546,8 +561,10 @@ def streaming(f):
         rendered = f.words()
         typed = "draft" in rendered and "streaming" in rendered
         cohort = int(f.events("stream-start")[-1]["id"])
-        record("G7", cohort == 4 and typed and end["frames_drawn"] > 0
-               and end["drains"] - start["drains"] <= end["frames_drawn"] and end["draw_p95_ns"] <= limits["stream_frame_p95_ms"]*1e6,
+        record("G7", timed(cohort == 4 and typed and end["frames_drawn"] > 0
+                           and end["drains"] - start["drains"] <= end["frames_drawn"],
+                           end["draw_p95_ns"] <= limits["stream_frame_p95_ms"]*1e6, "G7"),
+               timing_ok=end["draw_p95_ns"] <= limits["stream_frame_p95_ms"]*1e6,
                simultaneous_threads=cohort, message_bytes=200000, deltas_per_second_per_thread=200,
                draw_p95_ms=end["draw_p95_ns"]/1e6, dirty_to_present_p95_ms=end["dirty_to_present_p95_ns"]/1e6,
                present_interval_p95_ms=end["present_interval_p95_ns"]/1e6,
@@ -563,7 +580,11 @@ def streaming(f):
         f.click(stop)
         end = wait(lambda: f.events("stop-read"))
         elapsed = (end[-1]["ns"] - f.stats()["stop_ns"])/1e6
-        record("G10", 0 <= elapsed <= limits["stop_latency_frames"]*1000/60, control_to_pipe_ms=elapsed, frame_budget_ms=1000/60)
+        # Stop must reach the runtime promptly; 250 ms catches a hang, the frame
+        # budget is the timing target.
+        on_time = elapsed <= limits["stop_latency_frames"]*1000/60
+        record("G10", timed(0 <= elapsed <= 250, on_time, "G10"), timing_ok=on_time,
+               control_to_pipe_ms=elapsed, frame_budget_ms=1000/60)
 
 
 def navigate(f):
@@ -892,20 +913,26 @@ def claude_gate(f):
         surface.extend(p for p in directory.rglob("*") if p.is_file())
     leaks += sum(f.canary.encode() in path.read_bytes() for path in surface)
     budget = limits["stop_latency_frames"] * 1000 / 60
-    passed = (
+    timing_ok = (
         p90 <= limits["cold_start_p90_ms"]
         and cpu <= limits["idle_cpu_percent"]
-        and typed
+        and end["draw_p95_ns"] <= limits["stream_frame_p95_ms"] * 1e6
+        and elapsed <= budget
+    )
+    passed = timed(
+        typed
         and overlap
         and 0 < end["drains"] - first["drains"] <= end["frames_drawn"]
-        and end["draw_p95_ns"] <= limits["stream_frame_p95_ms"] * 1e6
-        and 0 <= elapsed <= budget
+        and 0 <= elapsed <= 250
         and leaks == 0
-        and len({e["id"] for e in f.events("claude-clean-env")}) >= 4
+        and len({e["id"] for e in f.events("claude-clean-env")}) >= 4,
+        timing_ok,
+        "claude",
     )
     record(
         "claude",
         passed,
+        timing_ok=timing_ok,
         launch_ms=times,
         cold_start_p90_ms=p90,
         idle_cpu_percent=cpu,

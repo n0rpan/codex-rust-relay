@@ -468,20 +468,29 @@ mod tests {
     }
 
     #[test]
-    fn errors_are_listed_newest_last() {
+    fn errors_are_listed_oldest_first_and_cut_to_the_last_n() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths {
             socket: dir.path().join("s"),
             state_dir: dir.path().to_owned(),
         };
-        errlog::init(dir.path());
+        let lines = |report: &Report| -> Vec<String> {
+            report.lines.iter().map(|(_, t)| t.clone()).collect()
+        };
         let mut report = Report::default();
         recent_errors(&paths, &mut report, 5);
-        assert!(
-            report
-                .lines
-                .iter()
-                .any(|(_, t)| t == "host errors: none recorded")
-        );
+        assert_eq!(lines(&report), ["host errors: none recorded"]);
+        std::fs::write(
+            dir.path().join(errlog::FILE),
+            "100 first failure\n200 second failure\n300 third failure\n",
+        )
+        .unwrap();
+        let mut report = Report::default();
+        recent_errors(&paths, &mut report, 2);
+        let shown = lines(&report);
+        assert_eq!(shown[0], "host errors: last 2");
+        assert!(shown[1].ends_with(": second failure"), "{shown:?}");
+        assert!(shown[2].ends_with(": third failure"), "{shown:?}");
+        assert_eq!(shown.len(), 3);
     }
 }

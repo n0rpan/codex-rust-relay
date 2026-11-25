@@ -10,7 +10,9 @@ Messages API, the fixture:
 - releases the reply and checks the turn finishes on the old host;
 - checks the restart command starts a new host (new boot epoch), the phone
   reconnects to it, the session is idle rather than interrupted, and a new
-  turn in the same session runs on the new host.
+  turn in the same session runs on the new host;
+- holds a second turn past `--timeout 2` and checks that restart reports one
+  interrupted turn and the new host shows the session as interrupted.
 
 Usage: python3 desktop/tests/host_upgrade_session.py /path/to/ox-host /path/to/ox /path/to/claude
 """
@@ -69,12 +71,18 @@ def run(root, host, ox, claude):
             except OSError:
                 shutil.copy2(source, target)
         started, release = threading.Event(), threading.Event()
+        stuck, held = threading.Event(), threading.Event()
 
         def script(body, prompt):
             if prompt.startswith("LONG-TURN"):
                 started.set()
                 release.wait(120)
                 return [{"type": "text", "text": "LONG-TURN finished on the old host"}]
+            if prompt.startswith("STUCK-TURN"):
+                # Its own event: `release` is already set by the first phase.
+                stuck.set()
+                held.wait(120)
+                return [{"type": "text", "text": "never shown"}]
             if prompt.startswith("AFTER-UPGRADE"):
                 return [{"type": "text", "text": "AFTER-UPGRADE answered by the new host"}]
             return [{"type": "text", "text": "ok"}]
@@ -145,11 +153,26 @@ def run(root, host, ox, claude):
                     time.sleep(0.5)
                 finish(phone, scope)
                 print("PASS: the same session takes a new turn on the new host")
+
+                # A turn that outlasts the drain bound is cut and reported, never replayed.
+                phone.act(scope, "stuck", {"send_text": [thread, "STUCK-TURN hold forever"]})
+                assert stuck.wait(90), "the held turn never reached the provider"
+                bounded = subprocess.run([root / "bin" / "ox-host", "restart", "--timeout", "2"], env=env,
+                                         capture_output=True, text=True, timeout=60)
+                assert bounded.returncode == 0, bounded.stdout + bounded.stderr
+                assert "1 turn(s) were still running at the bound" in bounded.stdout, bounded.stdout
+                phone.close()
+                phone, _ = hello(socket_path)
+                state = ready(phone, scope)
+                row = next(r for r in state["sessions"] if r["id"] == thread)
+                assert row["status"] == "interrupted", row
+                print("PASS: a turn past the drain bound is reported interrupted, by restart and by the new host")
                 phone.close()
                 subprocess.run([root / "bin" / "ox-host", "stop"], env=env, check=True,
                                stdout=subprocess.DEVNULL)
         finally:
             release.set()
+            held.set()
             subprocess.run([root / "bin" / "ox-host", "stop"], env=env, check=False,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if restart and restart.poll() is None:
