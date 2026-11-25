@@ -1,273 +1,96 @@
-# ox
+# OX
 
-**Run Codex and Claude Code on any model API, with one setup and one command.**
+**Run stock Codex and Claude Code side by side, on your subscriptions or any model API, from your desk or your phone.**
 
-ox is a single small binary that sits between the stock Codex and Claude Code
-CLIs and the model provider you choose. It is for people who use both clients,
-or who want one of them on a model its vendor does not sell. You add each
-provider key once, and both clients get the same models, the same picker and
-the same web search. There is no second config to keep in sync, no key copied
-between tools, and plain `codex` and `claude` keep working exactly as before.
+OX does not replace either client. It starts the official `codex` and `claude` CLIs, points them at the billing route you pick, and keeps their sessions running in a small per-user host so you can close the window, follow a turn from your phone, and pick it up again. Plain `codex` and `claude` keep working exactly as before.
 
-**OX Desktop** bundles the same `ox` gateway with a native Linux or macOS workbench and a session host. The standalone terminal install needs only the gateway. Choose a subscription or an OX API model for each session. The local session host keeps turns and workers running when you close the window. Pair a phone over Tailscale to follow a turn or answer its next approval. [Desktop guide](desktop/README.md)
+## What OX is
 
-## Install OX Desktop from the dev release
+- **The relay (`ox`).** One small binary between the stock clients and your model provider. Add a provider key once and both clients get the same models, picker and web search. Any model in either client: a Claude model in Codex, a GPT model in Claude Code, OpenRouter or a self-hosted model in both. [Relay and CLI](docs/relay.md)
+- **OX Desktop (`ox-desktop`).** A native Linux and macOS workbench for Codex and Claude Code sessions across projects and billing routes: ChatGPT or Claude subscription, or an OX API alias. [Desktop guide](desktop/README.md)
+- **The session host (`ox-host`).** A per-user background process that owns every session, its approvals and its workers. Closing the desktop does not stop a turn. It starts on demand, or at login with `ox host install`. [Host design](docs/design/desktop/host-notes.md)
+- **The phone.** A web app served by the host over your private Tailscale network. Pair it with a QR code, then follow turns, answer approvals and questions, start sessions and get notifications. Nothing is exposed to the internet: OX refuses Tailscale Funnel.
+- **Workers.** A session can start a Codex goal or Claude Code workflow as a separate session, often on a cheaper API model. Workers appear under their parent on both screens.
+- **Handoffs.** Continue a conversation in another runtime, billing route or model (`/handoff claude:<alias> …` or **Continue in…**). The new session receives the real recent messages, not a summary, and can read the rest of the source.
+- **One mode model.** Every permission preset maps to one of four levels: read (Codex Read only, Claude Plan), write (Workspace, Accept edits), classifier (Auto-review, Auto) and YOLO (YOLO, bypass permissions). Workers and handoffs start at their source's level or lower. Agents can lower a child's mode but never raise it. A YOLO child waits for you to accept it on a paired device, unless you stored a grant. [Mode model](docs/design/desktop/host-notes.md#permission-modes-for-workers-and-handoffs)
 
-Once the merged commit passes CI on `main` and the rolling **dev** release lists the desktop archives, run this in your project directory:
+## Install and first run
+
+You need macOS 11 or later, or Linux with glibc 2.39 or later (x86-64 or ARM64), and the stock client you want to use: [Codex](https://developers.openai.com/codex/cli/) 0.171.0 or later and/or [Claude Code](https://code.claude.com/docs/en/quickstart) 2.1.331 or later.
+
+### macOS
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh -s -- --dev --desktop
-ox desktop .
+curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh -s -- --desktop
+cd ~/Work/my-project && ox desktop .
 ```
 
-Rerun the installer command to update the desktop app, session host and CLI together. Install the stock Codex or Claude Code CLI you want to use. Existing native sign-ins and saved sessions are available in the app. You can also open **OX Desktop** from the Linux application launcher or from **~/Applications** on macOS. To test a commit before it reaches the dev release, use its branch workflow packages. [Dev release assets](https://github.com/n0rpan/ox/releases/tag/dev) · [Branch package instructions](desktop/README.md#run-a-packaged-build)
+The installer verifies the download's SHA-256 checksum, installs `ox`, `ox-desktop` and `ox-host` in `~/.local/bin`, and puts **OX Desktop** in `~/Applications`. If your shell cannot find `ox`, add the line the installer prints to your shell profile. If Gatekeeper asks, allow the app in **System Settings → Privacy & Security**.
 
-Pair a phone in **Settings → Remote access** to see and control the same live sessions. On iPhone, install OX on the Home Screen, open it there, and tap **Scan pairing QR**. Open **Session notifications** to enable alerts for approvals and questions. [Phone setup and desktop controls](desktop/README.md#keep-sessions-running-and-pair-a-phone)
+### Linux
 
-## CLI quick start
-
-You need macOS 11+ or Linux with glibc 2.39+ (x86-64 or ARM64), and Codex or
-Claude Code installed.
-[Install Codex](https://developers.openai.com/codex/cli/) ·
-[Install Claude Code](https://code.claude.com/docs/en/quickstart)
-
-Dev release
 ```sh
-curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh -s -- --dev
-ox setup
-ox codex      # or: ox claude
+curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh -s -- --desktop
+cd ~/Work/my-project && ox desktop .
 ```
 
-Stable release (not released yet)
+The same installer adds **OX Desktop** to your application launcher. It runs on Wayland or X11 with a Vulkan driver.
+
+### First session
+
+1. **Pick a route.** In the header, choose the runtime (Codex or Claude Code) and billing route. Subscription routes use your existing `codex` or `claude` sign-in. To use an API model, open **Settings → Accounts → Configure provider**, or run `ox setup` in a terminal.
+2. **Send a prompt.** Choose **New session**, type, press Enter. Existing Codex and Claude Code sessions from your terminal appear in the sidebar.
+3. **Keep it running.** Run `ox host install` so the session host starts at login. Close the window during a turn; reopen it and the turn is still there.
+4. **Check the setup.** `ox host doctor` checks the host, Tailscale Serve, paired devices and the stock client versions, and names the fix for anything that blocks.
+
+### Pair a phone
+
+1. Install Tailscale on the computer and the phone and sign in to the same tailnet with MagicDNS and HTTPS enabled.
+2. On the computer, open **Settings → Remote access → Enable Tailscale Serve**, then **Pair a device**.
+3. On the phone, open the HTTPS address shown, add it to the Home Screen (iPhone: Safari → Share → Add to Home Screen), open it from the icon, tap **Scan pairing QR** and scan the computer's screen.
+4. Turn on **Session notifications** for approvals, questions and finished turns.
+
+[Phone setup in detail](desktop/README.md#keep-sessions-running-and-pair-a-phone)
+
+### Terminal only
+
+If you only want the relay in your terminal, leave out `--desktop`:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh
 ox setup
 ox codex      # or: ox claude
 ```
 
-1. **Install.** The script picks the build for your machine, verifies its
-   SHA-256 checksum, installs it as `~/.local/bin/ox`, and prints the line to
-   add if that directory is not on your `PATH`. No stable release has been
-   tagged yet, so today this command tells you so and installs the development
-   build. To ask for the development build explicitly, end the command with
-   `sh -s -- --dev`.
-2. **Set up.** `ox setup` opens a five-line menu. Choose **Add an API key**,
-   pick the service (OpenCode Go, OpenRouter, Anthropic, OpenAI, Alibaba Cloud,
-   or paste any compatible endpoint URL), and paste the key at a hidden prompt.
-   That is three decisions and no file to edit.
-3. **Launch.** Run `ox codex` or `ox claude` from your project. With one model
-   you go straight in. With several you get a searchable picker.
+[CLI guide](docs/relay.md)
 
-Shortcut: on a terminal with nothing set up yet, plain `ox`, `ox codex` or
-`ox claude` runs the same guided setup and then opens the client in the same
-command.
+## Upgrade
 
-Already paying for ChatGPT or Claude? Choose **Sign in with ChatGPT** or
-**Sign in with Claude** in the same menu. See `ox help subscriptions`.
+Rerun the install command you used. For OX Desktop it updates the app, host and CLI together. If the session host is running, the installer restarts it on the new version without cutting work short: running turns finish first (up to 10 minutes), new turns wait a moment for the new host, and the desktop and paired phones reconnect on their own. Sessions, pairings and settings are kept. `ox host restart` does the same by hand; `ox host doctor` shows which version is running.
 
-## Why ox
+The terminal-only CLI updates itself with `ox update`. Add `--dev` to the install command (`sh -s -- --dev --desktop`) for the rolling development build of `main`.
 
-- **Any model in either client.** Use a Claude model in Codex, a GPT model in
-  Claude Code, or an OpenRouter, OpenCode Go, Alibaba Cloud or self-hosted
-  model in both. The alias is the same everywhere: `provider/model-id`.
-- **One setup for both clients.** Providers, keys, starred models and Brave web
-  search are configured once and shared by `ox codex` and `ox claude`.
-- **Subscription and API side by side.** When you are signed in, the picker
-  lists your ChatGPT or Claude plan next to your API models. API sessions use
-  a separate ox profile, so your usual settings and history stay untouched.
-- **Background workers.** Keep the main conversation on your subscription and
-  ask it to start a Codex goal or a Claude Code workflow on an API model. ox
-  runs it in the background and gives you a job ID.
-- **One gateway for every device.** `ox serve` shares the same providers with
-  Codex Desktop, Claude Desktop, T3 Code and other machines on your tailnet.
-  The provider keys stay on the host.
-- **It tells you the fix.** `ox doctor` ends with the one command to run next,
-  `ox doctor --fix` repairs what ox can repair itself, and every ox error
-  carries a `fix:` line you can copy.
-- **You do not feel it.** ox adds well under a millisecond to the first token
-  and about a tenth of a millisecond per token after that. It uses no CPU when
-  idle and about 6 MiB of memory. The numbers and their conditions are in
-  [Speed](#speed).
+To remove the login service, run `ox host uninstall`. It keeps your sessions and pairings. `ox host uninstall --purge` also deletes OX's host state. Neither touches Codex or Claude Code sessions or sign-ins.
 
-## How it works
-
-```text
-  codex / claude          ox                          your provider
-  (stock CLI, tools  -->  127.0.0.1, one process, --> OpenAI Responses,
-   run locally)           one thread                  Chat Completions or
-        HTTP on loopback                HTTPS         Anthropic Messages
-```
-
-- **ox starts the stock client for you.** It points that one launch at a
-  loopback address and gives it a random token that is valid only for that
-  launch. The client is unmodified and runs its tools on your machine as usual.
-- **Same format in and out is passed through.** Codex to a Responses API and
-  Claude Code to a Messages API have their streams forwarded as they arrive.
-- **Different formats are translated.** ox rewrites the request and reframes
-  the streamed reply one event at a time, including tool calls. It never
-  buffers a whole reply. [Where translation ends](docs/compatibility.md#where-api-translation-ends)
-- **What stays on your machine.** ox listens only on `127.0.0.1`. A provider
-  key is sent only to the provider URL it was saved for and is kept out of the
-  client's environment. Pasted keys live in a private file (mode 0600). ox has
-  no telemetry and keeps no log of prompts or replies.
-- **What does leave.** Your prompts and tool results go to the provider you
-  selected, and that provider bills you. With Brave enabled, search queries go
-  to Brave.
-
-## Speed
-
-Measured on 2026-11-23 with a release build, on a 4-vCPU Intel Xeon 2.1 GHz
-virtual machine running Linux 6.18. Client, ox and a mock provider all ran on
-loopback, so these numbers are the overhead ox adds. Model and network time are
-excluded.
-
-| What | Measured |
-| --- | --- |
-| Time added before the first token | p95 under 0.6 ms on all six client and API combinations |
-| Delay added to each streamed token | about 0.1 ms at the median, at most 0.15 ms at p95, at 200 tokens per second |
-| Tokens per second | unchanged: total stream time +0.0% |
-| CPU while idle | 0% in a 10-second sample |
-| Memory | about 6 MiB resident when idle |
-| Size | one executable of about 5.6 MB, one thread, no background process |
-
-A few things keep it there. Each token costs three system calls (wait, read,
-write) on one thread, with no batching between provider and client. Client
-sockets use `TCP_NODELAY`, so a client that is busy rendering does not stall
-the tokens behind it. Provider connections are opened while the client
-starts, shared over HTTP/2 and kept alive through pauses, so requests do not
-pay a new TCP and TLS handshake. Where a provider caches prompts only on
-request, ox makes the request, so a long conversation is not processed from
-scratch on each turn.
-[How to reproduce these numbers](docs/verification.md#how-ox-stays-fast)
-
-## Release channels
-
-The table covers the standalone CLI. For desktop updates, rerun the installer with `--dev --desktop` to get a matching set of binaries.
-
-| Channel | What it is | Version looks like | Install | Stay current |
-| --- | --- | --- | --- | --- |
-| **stable** | Tagged releases, `vX.Y.Z` | `0.1.0` | `curl … \| sh` | `ox update` |
-| **dev** | One pre-release, rebuilt from every commit on `main` | `0.0.1-dev.42` | `curl … \| sh -s -- --dev` | `ox update` |
-
-- **No stable release has been tagged yet.** Today the dev pre-release is the
-  only download. The plain install command notices that and installs it.
-- **Dev versions** are the latest stable version plus one patch, followed by
-  `-dev.` and the CI run number. With no stable release that is `0.0.1-dev.N`.
-  Every dev version sorts below the stable release it leads up to.
-- **A build follows its own channel.** `ox update --check` looks for a newer
-  release and `ox update` installs it over the running executable after
-  verifying its SHA-256 digest. `ox update --dev` and `ox update --stable`
-  switch channels.
-- **Manual download.** Every release has `ox-<target>.tar.gz` and a matching
-  `.sha256` for four platforms on the
-  [Releases page](https://github.com/n0rpan/ox/releases).
-  [Manual steps, platform names and source builds](docs/configuration.md#install-options)
-
-## Use it
-
-**Pick a model.** `ox codex` and `ox claude` open the same picker. Type to
-search, **↑/↓** to move, **Tab** to star, **Enter** to launch. Stars stay at
-the top in both clients. **Alt+↑/↓** reorders them, **Ctrl+F** shows only
-stars, **Esc** closes the picker. To skip it:
-
-```sh
-ox codex --model openrouter/openai/gpt-5.4-mini
-ox claude --model openrouter/openai/gpt-5.4-mini
-```
-
-**Check it end to end.** Ask **“Read this project’s README and tell me how to
-run its tests. Leave the files as they are.”** A reply grounded in the file
-confirms both the model connection and a local file read.
-
-**Add a provider from a script.** Load the key into `OPENROUTER_API_KEY` from
-your secret manager first:
-
-```sh
-ox setup openrouter \
-  --base-url https://openrouter.ai/api/v1 \
-  --wire responses \
-  --env-key OPENROUTER_API_KEY \
-  --no-discovery --model openai/gpt-5.4-mini
-
-ox doctor
-```
-
-**Use both in one session.** Pick your subscription in `ox codex` or
-`ox claude`, then ask **“List my API models and subscription routes.”** Pick an
-alias and ask **“Start a Codex goal worker on that model to fix the failing
-tests. Let it edit this project and tell me the job ID.”** The main
-conversation stays on your subscription, and ox runs the worker in the
-background on the API provider you chose.
-[Delegate to an API worker](docs/configuration.md#subscription-main-session-with-api-workers)
-
-**Resume.** API sessions live in their own ox profile. Use `ox codex resume`
-or `ox claude --resume <session-id>`.
-[Profiles and session recovery](docs/configuration.md#sessions-and-sign-in)
-
-## Common tasks
-
-| I want to… | Where to go |
-| --- | --- |
-| Connect Anthropic, OpenAI, a Chat Completions vendor, or a local server | [Provider setup](docs/configuration.md#add-a-provider) |
-| Pin a model, rename an alias, or understand the picker and `/model` | [Model names and discovery](docs/configuration.md#model-names-and-discovery) |
-| Add Brave citations or configure Claude Code Auto mode | [Search and Claude settings](docs/configuration.md#web-search-with-brave) |
-| Resume a session, switch models, or keep my usual ChatGPT sign-in | [Sessions and sign-in](docs/configuration.md#sessions-and-sign-in) |
-| Keep my subscription and delegate to an API model | [API workers](docs/configuration.md#subscription-main-session-with-api-workers) |
-| Share one ox gateway on a tailnet, or connect desktop clients and T3 Code | [Home-server setup](docs/shared-gateway.md) |
-| Install by hand, switch channels, or build from source | [Install options](docs/configuration.md#install-options) |
-| See supported clients, API versions, and feature boundaries | [Compatibility](docs/compatibility.md) |
-| Reproduce the checks or measure the relay | [Verification and performance](docs/verification.md) |
-
-## Troubleshooting
-
-Start with the doctor. It works offline, never prints a key, and its last line
-is the command to run next:
-
-```text
-$ ox doctor
-…
-provider openrouter
-  · wire: responses
-  ✗ credential reference OPENROUTER_API_KEY is not set; add the key in ox setup or export it before launching
-  ✓ validation: ok
-
-summary: 1 provider(s), 1 error(s), 0 warning(s)
-next: ox setup   (choose the same service again to paste its key)
-```
-
-- `ox doctor` only reads. It never changes a file.
-- `ox doctor --fix` repairs what ox can repair itself, then runs the check. An
-  unreadable `codeox.toml`, saved-key file or starred-models file is moved to
-  `<name>.broken-<time>` next to the original. Nothing you wrote is deleted,
-  and running it twice is safe.
-- `ox doctor --live --provider NAME` sends one small real request to check the
-  key, the model and streaming. It can be billed.
-
-[Everything the doctor checks and repairs](docs/configuration.md#check-and-repair-a-setup)
-
-Errors from ox name the problem and the command that fixes it:
-
-```text
-ox: unknown command "docter"
-  fix: ox doctor   (to send "docter" to Codex instead: ox codex docter)
-```
+## When something is wrong
 
 | What you see | What to do |
 | --- | --- |
-| `ox: command not found` after installing | Add `~/.local/bin` to your `PATH`. The installer prints the exact line for your shell. |
-| The installer reports glibc older than 2.39, or musl | [Build from source](docs/configuration.md#build-from-source). |
-| `no stable ox release has been published yet` from `ox update` | Run `ox update --dev`. This is expected until the first stable tag. |
-| ``could not find `codex` on PATH`` (or `claude`) | Run the install command on the error's `fix:` line. ox starts the stock client and does not bundle it. |
-| `could not parse codeox.toml` | Run `ox doctor --fix`, then `ox setup`. Saved keys are kept. |
-| `provider … is unavailable`, or a provider has no key | Run `ox doctor`. Its `next:` line says what to do: usually `ox setup`, choosing the same service again to paste its key. You can also export the variable it names. |
-| `unknown provider … in --model` | Use the alias on the `fix:` line. `ox doctor` lists your providers and static aliases. |
-| `unknown command` for a one-word prompt | Send it with `ox codex <word>`, or quote a longer prompt. |
-| `unknown model`, or an empty picker | Pass the full alias. Check the vendor model ID, or pin it with a [static model entry](docs/configuration.md#model-names-and-discovery). |
-| Authentication error after a clean `doctor` | Run `ox doctor --live --provider <name>`. |
-| Provider returns `404` or rejects the request format | Check that the [base URL and wire format](docs/configuration.md#add-a-provider) match the endpoint. Leave the request path, such as `/chat/completions`, off the base URL. |
-| Provider returns `429` | Check that provider’s quota and rate limits, or choose another configured model. |
-| `port … is already in use` from `ox serve` | Stop the other program, or use the port on the `fix:` line and update your client settings to match. |
-| Codex’s bundled model catalog fails to load | Run `codex --version` and `codex debug models --bundled` from the same terminal. If it began after a client update, check the [latest-client CI job](docs/verification.md#client-updates). |
-| Plain `codex` or `claude` opens on an ox alias saved by an older build | Use `/model` in the plain client to choose a subscription model, then start a fresh session. [Profiles and session recovery](docs/configuration.md#sessions-and-sign-in) |
-| A direct OpenAI key returns `codex_byok_restricted_by_api_credit_promo` | That account’s API-credit plan rejected the Codex request in live testing. Use an eligible provider credential, or launch plain `codex` for your usual ChatGPT session. |
-| Brave configured but search unavailable | Run `ox doctor` to check that the key variable is set and see any Codex policy conflict. For one live Codex launch, use `ox codex -c 'web_search="live"' --model <alias>`. [Search setup](docs/configuration.md#web-search-with-brave) |
+| Anything in the desktop or phone | `ox host doctor`. Each FAIL line ends with the fix. |
+| Provider, key or model errors | `ox doctor`, then the [relay troubleshooting table](docs/relay.md#troubleshooting). |
+| "The running OX session host speaks protocol …" | `ox host restart`. The desktop and host versions differ. |
+| The phone says the host is restarting for an update | Wait a few seconds and send again. |
+| `codex` or `claude` is below OX's floor | Update the stock client; `ox host doctor` prints the command. |
+| Remote access fails after a Tailscale change | Turn Remote access off and on in Desktop settings. If doctor reports Funnel, run `tailscale funnel 8443 off`. |
+
+## Documentation
+
+| Topic | Page |
+| --- | --- |
+| Relay, CLI, speed, release channels | [docs/relay.md](docs/relay.md) |
+| Providers, models, search, API workers, install options | [docs/configuration.md](docs/configuration.md) |
+| Desktop features, keyboard, building from source | [desktop/README.md](desktop/README.md) |
+| Session host, workers, handoffs, modes, remote access | [docs/design/desktop/host-notes.md](docs/design/desktop/host-notes.md) |
+| Home-server gateway for other machines | [docs/shared-gateway.md](docs/shared-gateway.md) |
+| Supported clients and API boundaries | [docs/compatibility.md](docs/compatibility.md) |
+| How releases are checked | [docs/verification.md](docs/verification.md), [release checklist](docs/design/desktop/release-checklist.md), [real-tailnet check](docs/design/desktop/tailnet-check.md) |

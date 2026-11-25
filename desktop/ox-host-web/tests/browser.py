@@ -552,7 +552,17 @@ def paired_browser(d, state_dir, stack, camera=False):
         "sessionId"
     ]
     base = "/session/" + ident
-    stack.callback(browser, port, "DELETE", base)
+
+    def end_session():
+        # Teardown only: every check has already run. ChromeDriver can drop the
+        # connection while Chromium exits (http.client.BadStatusLine on ARM),
+        # which says nothing about OX.
+        try:
+            browser(port, "DELETE", base)
+        except (OSError, http.client.HTTPException) as e:
+            print(f"ChromeDriver session teardown: {e!r} (ignored)")
+
+    stack.callback(end_session)
 
     def js(script, *args):
         return browser(port, "POST", base + "/execute/sync", {"script": script, "args": args})

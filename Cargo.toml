@@ -34,3 +34,9 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+
+# The relay returns ready-made hyper responses as errors and keeps a few
+# fixture tuples inline; boxing them would only add allocations.
+[lints.clippy]
+result_large_err = "allow"
+type_complexity = "allow"

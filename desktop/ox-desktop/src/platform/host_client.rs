@@ -60,6 +60,11 @@ fn handshake() -> io::Result<(BufReader<UnixStream>, UnixStream, Vec<String>)> {
             capabilities,
             ..
         } => capabilities,
+        Server::Hello { version, .. } => {
+            return Err(io::Error::other(
+                ox_desk_core::host_protocol::version_mismatch(version, VERSION),
+            ));
+        }
         Server::Error { message, .. } => return Err(io::Error::other(message)),
         _ => {
             return Err(io::Error::other(

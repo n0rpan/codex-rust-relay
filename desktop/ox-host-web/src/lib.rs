@@ -4,6 +4,7 @@ pub mod admin;
 mod bridge;
 #[cfg(feature = "server")]
 mod push;
+pub mod serve;
 #[cfg(feature = "server")]
 mod server;
 #[cfg(feature = "server")]

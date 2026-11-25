@@ -1,11 +1,40 @@
 name: OX Desktop
+
+# Full lane: packaged desktop builds, window tests and stock sessions in the
+# packaged app. The fast lane (fmt, clippy, unit tests, the Linux workbench
+# check and stock-client protocol fixtures) is fast.yml and runs on every push.
+#
+# When this workflow runs, once per change:
+#   - pull request labelled `full-ci`: ubuntu-24.04 only. Adding the label
+#     starts it; each later push to the labelled PR runs it again.
+#   - push to main and v* tags: called by ci.yml (job desktop-release) with the
+#     release version, all four legs. That call is the only main/tag run, so the
+#     packages are built once and published from the same run.
+#   - nightly schedule and manual runs: ubuntu-24.04, ubuntu-24.04-arm and
+#     macos-26. macos-26-intel runs for tags and release builds only (or a
+#     manual run with `intel`).
+# Pushes to feature branches do not run this workflow; their pull request does.
+#
+# Flake rule: a window test that fails intermittently is quarantined, not
+# retried and not deleted. Add it to desktop/ci/quarantine.toml with the
+# issue that tracks it (optionally only for the runners where it flakes).
+# Window test steps run through desktop/ci/quarantine.py, which skips a
+# quarantined test on pull requests and main and runs it, blocking, in the
+# nightly schedule, manual runs and tags. Fix the flake, then delete the entry
+# and close the issue. Entries expire after at most 30 days, and the fast lane
+# rejects an entry without an issue or past its date.
 on:
-  push:
-    branches-ignore: [main]
-    paths: ['desktop/**', 'src/**', 'Cargo.*', 'install.sh', '.github/workflows/desktop.yml']
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
     paths: ['desktop/**', 'src/**', 'Cargo.*', 'install.sh', '.github/workflows/desktop.yml']
+  schedule:
+    - cron: '41 2 * * *'
   workflow_dispatch:
+    inputs:
+      intel:
+        description: Also build and test on macos-26-intel
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       build_version:
@@ -15,7 +44,8 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: desktop-${{ github.ref }}
+  # Adding an unrelated label must not cancel a running full lane.
+  group: desktop-${{ github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 env:
   OX_BUILD_SHA: ${{ github.sha }}
@@ -25,43 +55,21 @@ env:
   CARGO_TARGET_DIR: desktop/target
   CARGO_PROFILE_RELEASE_STRIP: symbols
 jobs:
-  check:
-    name: Fast Linux workbench check
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 35
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: desktop/target/debug
-          key: ox-desktop-check-arm64-rust1.100-${{ hashFiles('desktop/Cargo.lock', 'Cargo.lock') }}
-          restore-keys: ox-desktop-check-arm64-rust1.100-
-      - name: Install toolchain and runtime
-        run: |
-          rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
-          rustup default 1.100.0
-          desktop/ci/linux-deps.sh sway dbus-daemon
-          curl --fail --silent --show-error --location --retry 3 --output "$RUNNER_TEMP/nextest.tar.gz" \
-            https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.152/cargo-nextest-0.9.152-aarch64-unknown-linux-gnu.tar.gz
-          echo "ca1f81a5b86533eb45ab97e0064aa88e925e53aab9a698ca6331a7cad1f85f07  $RUNNER_TEMP/nextest.tar.gz" | sha256sum --check
-          tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$HOME/.cargo/bin" cargo-nextest
-      - run: cargo fmt --manifest-path desktop/Cargo.toml --all -- --check
-      - run: python3 desktop/ci/contract.py --final
-      - run: cargo clippy --manifest-path desktop/Cargo.toml --locked --workspace --all-targets -- -D warnings
-      - run: cargo nextest run --manifest-path desktop/Cargo.toml --locked --workspace
-      - run: cargo run --locked --manifest-path desktop/Cargo.toml -p ox-host-protocol -- --check
-      - run: cargo build --locked --bin ox && cargo build --locked --manifest-path desktop/Cargo.toml -p ox-desktop -p ox-host
-      - run: dbus-run-session -- desktop/ci/wayland-smoke.sh desktop/target/debug/ox-desktop
   package:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (contains(github.event.pull_request.labels.*.name, 'full-ci') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'full-ci'))
     strategy:
       fail-fast: false
       matrix:
-        # On the sprint branch, include macOS on a push marked [desktop-full].
-        # Manual runs and other refs keep the full platform matrix.
-        runner: ${{ fromJSON(github.event_name == 'push' && github.ref == 'refs/heads/desktop/gpui' && !contains(github.event.head_commit.message, '[desktop-full]') && '["ubuntu-24.04","ubuntu-24.04-arm"]' || '["ubuntu-24.04","ubuntu-24.04-arm","macos-26","macos-26-intel"]') }}
+        runner: >-
+          ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' ||
+          (inputs.build_version || inputs.intel) && '["ubuntu-24.04","ubuntu-24.04-arm","macos-26","macos-26-intel"]' ||
+          '["ubuntu-24.04","ubuntu-24.04-arm","macos-26"]') }}
     runs-on: ${{ matrix.runner }}
+    env:
+      OX_RUNNER: ${{ matrix.runner }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -84,7 +92,7 @@ jobs:
             ox-desktop-v1-${{ matrix.runner }}-rust1.100-
       - name: Install Rust
         run: |
-          rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
+          rustup toolchain install 1.100.0 --profile minimal
           rustup default 1.100.0
       - name: Install Linux development libraries
         if: runner.os == 'Linux'
@@ -95,9 +103,8 @@ jobs:
           if ! xcrun -sdk macosx metal --version; then
             xcodebuild -downloadComponent MetalToolchain
           fi
-      - run: cargo fmt --manifest-path desktop/Cargo.toml --all -- --check
-      - run: python3 desktop/ci/contract.py --final
-      - run: cargo clippy --workspace --all-targets --locked --release --manifest-path desktop/Cargo.toml -- -D warnings
+      # fmt, the contract check and clippy run in the fast lane, which gates
+      # every push and every release. Tests run again here in release mode.
       - run: cargo test --workspace --locked --release --manifest-path desktop/Cargo.toml
       - run: desktop/package.sh
       - name: Exercise gateway service lifecycle with the packaged host
@@ -133,7 +140,7 @@ jobs:
         run: desktop/ci/claude-protocol.sh desktop/target/release/ox
       - name: Open the packaged Linux app on X11
         if: runner.os == 'Linux'
-        run: xvfb-run -a desktop/tests/packaged-window.sh desktop/dist/*.tar.gz
+        run: python3 desktop/ci/quarantine.py packaged-window -- xvfb-run -a desktop/tests/packaged-window.sh desktop/dist/*.tar.gz
       - name: Prepare isolated Linux window tests
         id: window-tests
         if: runner.os == 'Linux' && !cancelled() && steps.probe.outcome == 'success'
@@ -148,8 +155,8 @@ jobs:
         env:
           FIXTURE: ${{ steps.window-tests.outputs.dir }}
         run: |
-          xvfb-run -a -s '-screen 0 1280x900x24' python3 desktop/tests/local_terminal_window.py "$FIXTURE/ox-desktop/ox-desktop"
-          xvfb-run -a -s '-screen 0 1280x900x24' python3 desktop/tests/remote_permission_window.py "$FIXTURE/ox-desktop/ox-desktop"
+          python3 desktop/ci/quarantine.py local_terminal_window -- xvfb-run -a -s '-screen 0 1280x900x24' python3 desktop/tests/local_terminal_window.py "$FIXTURE/ox-desktop/ox-desktop"
+          python3 desktop/ci/quarantine.py remote_permission_window -- xvfb-run -a -s '-screen 0 1280x900x24' python3 desktop/tests/remote_permission_window.py "$FIXTURE/ox-desktop/ox-desktop"
       - name: Prepare matched headless Chromium and ChromeDriver
         if: runner.os == 'Linux' && !cancelled() && steps.window-tests.outcome == 'success'
         id: browser
@@ -161,31 +168,31 @@ jobs:
           OX_TEST_CARGO_PROFILE: release
         run: |
           desktop/ox-host-web/tests/check.sh
-          xvfb-run -a -s '-screen 0 1280x900x24' python3 desktop/tests/host_continuity_window.py \
+          python3 desktop/ci/quarantine.py host_continuity_window -- xvfb-run -a -s '-screen 0 1280x900x24' python3 desktop/tests/host_continuity_window.py \
             "$FIXTURE/ox-desktop/ox-desktop" "$FIXTURE/node_modules/.bin/claude"
       - name: Exercise concurrent stock sessions in the packaged Linux window
         if: runner.os == 'Linux' && !cancelled() && steps.window-tests.outcome == 'success'
         env:
           FIXTURE: ${{ steps.window-tests.outputs.dir }}
         run: |
-          xvfb-run -a -s '-screen 0 1280x900x24' python3 desktop/tests/concurrent_window.py \
+          python3 desktop/ci/quarantine.py concurrent_window -- xvfb-run -a -s '-screen 0 1280x900x24' python3 desktop/tests/concurrent_window.py \
             "$FIXTURE/ox-desktop/ox-desktop" "$FIXTURE/node_modules/.bin/codex"
       - name: Exercise Codex and Claude together in the packaged Linux workbench
         if: runner.os == 'Linux' && !cancelled() && steps.window-tests.outcome == 'success'
         env:
           FIXTURE: ${{ steps.window-tests.outputs.dir }}
         run: |
-          xvfb-run -a -s '-screen 0 1280x900x24' python3 desktop/tests/mixed_runtime_window.py \
+          python3 desktop/ci/quarantine.py mixed_runtime_window -- xvfb-run -a -s '-screen 0 1280x900x24' python3 desktop/tests/mixed_runtime_window.py \
             "$FIXTURE/ox-desktop/ox-desktop" "$FIXTURE/node_modules/.bin/codex" "$FIXTURE/node_modules/.bin/claude" \
             --failure-image "$RUNNER_TEMP/mixed-runtime-window.png"
-          xvfb-run -a -s '-screen 0 1280x900x24' python3 desktop/tests/native_catalog_window.py \
+          python3 desktop/ci/quarantine.py native_catalog_window -- xvfb-run -a -s '-screen 0 1280x900x24' python3 desktop/tests/native_catalog_window.py \
             "$FIXTURE/ox-desktop/ox-desktop" "$FIXTURE/node_modules/.bin/codex" "$FIXTURE/node_modules/.bin/claude" \
             --failure-image "$RUNNER_TEMP/native-catalog-window.png"
       - name: Exercise keyboard and IME in the packaged Wayland window
         if: runner.os == 'Linux' && !cancelled() && steps.window-tests.outcome == 'success'
         env:
           FIXTURE: ${{ steps.window-tests.outputs.dir }}
-        run: python3 desktop/tests/keyboard_window.py "$FIXTURE/ox-desktop/ox-desktop" "$FIXTURE/node_modules/.bin/codex"
+        run: python3 desktop/ci/quarantine.py keyboard_window -- python3 desktop/tests/keyboard_window.py "$FIXTURE/ox-desktop/ox-desktop" "$FIXTURE/node_modules/.bin/codex"
       - name: Measure packaged rendering, interaction and secure entry
         if: runner.os == 'Linux' && !cancelled() && steps.window-tests.outcome == 'success'
         env:
@@ -193,7 +200,7 @@ jobs:
         run: |
           # The simulated disconnect must reach the normal recovery screen for an installed CLI.
           export PATH="$FIXTURE/node_modules/.bin:$PATH"
-          xvfb-run -a -s '-screen 0 1280x900x24' desktop/target/release/ox-desk-probe gate \
+          python3 desktop/ci/quarantine.py gate-x11 -- xvfb-run -a -s '-screen 0 1280x900x24' desktop/target/release/ox-desk-probe gate \
             --app "$FIXTURE/ox-desktop/ox-desktop" --ox "$FIXTURE/ox-desktop/ox" \
             --scenarios G4,G6,G7,G8,G9,G10,G11,G12,reconnect,navigation,layout,remote-access --out "$RUNNER_TEMP/desktop-gate.json"
       - name: Measure packaged Claude sessions on native Linux Wayland
@@ -201,7 +208,7 @@ jobs:
         env:
           FIXTURE: ${{ steps.window-tests.outputs.dir }}
         run: |
-          dbus-run-session -- desktop/ci/wayland-smoke.sh --run \
+          python3 desktop/ci/quarantine.py gate-wayland-claude -- dbus-run-session -- desktop/ci/wayland-smoke.sh --run \
             desktop/target/release/ox-desk-probe gate --wayland --scenarios claude \
             --app "$FIXTURE/ox-desktop/ox-desktop" --ox "$FIXTURE/ox-desktop/ox" \
             --out "$RUNNER_TEMP/claude-gate.json"
@@ -254,8 +261,11 @@ jobs:
             ${{ runner.temp }}/mac-window.log
             ${{ runner.temp }}/mac-window-unavailable.json
       # Keep compiled dependencies even when the application itself fails to build.
+      # Only main, tags and nightly runs write the cache: pull request entries
+      # would fill the repository's cache quota and evict main's, and every run
+      # restores from main.
       - name: Cache native dependency build
-        if: "!cancelled() && steps.deps.outputs.cache-hit != 'true' && steps.deps.outputs.cache-primary-key != ''"
+        if: "!cancelled() && github.event_name != 'pull_request' && steps.deps.outputs.cache-hit != 'true' && steps.deps.outputs.cache-primary-key != ''"
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -267,3 +277,27 @@ jobs:
             !desktop/target/release/ox-desktop
             !desktop/target/release/ox-host
           key: ${{ steps.deps.outputs.cache-primary-key }}
+
+  clean-account:
+    needs: package
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' ||
+       (contains(github.event.pull_request.labels.*.name, 'full-ci') &&
+        (github.event.action != 'labeled' || github.event.label.name == 'full-ci')))
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["ubuntu-24.04","macos-26"]') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ox-desktop-${{ matrix.runner }}
+          path: ${{ runner.temp }}/dist
+      - name: Install, restart, crash, upgrade and uninstall as a new account
+        run: sh desktop/tests/host_clean_account.sh "$RUNNER_TEMP/dist"

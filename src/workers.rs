@@ -988,6 +988,82 @@ mod tests {
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
     }
+    /// Stock Codex's MCP client (rmcp) logs every 4xx other than 405 from a
+    /// streamable-HTTP server as a fatal worker error. The gateway issues no
+    /// `Mcp-Session-Id` and offers no SSE stream, so a GET or DELETE on its
+    /// endpoint must be 405 with `Allow: POST`, never 404.
+    #[tokio::test]
+    async fn the_gateway_answers_stock_mcp_transport_requests_rmcp_accepts() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let token = "gateway-status-fixture".to_owned();
+        let service = Arc::new(Service {
+            app: OnceCell::new(),
+            local_auth: crate::provider::bearer(&token).unwrap(),
+            token: token.clone(),
+            origin: origin.clone(),
+            home: PathBuf::from("."),
+            cwd: PathBuf::from("."),
+            session: None,
+            observed: Mutex::new(None),
+            unbound: std::sync::atomic::AtomicBool::new(false),
+            host_policy: Default::default(),
+            launch: "launch".to_owned(),
+            client: ClientKind::Codex,
+            slots: Semaphore::new(1),
+            jobs: Mutex::new(jobs::Jobs::default()),
+            tools: Tools::All,
+        });
+        let server = tokio::spawn(crate::serve_requests(listener, move |request| {
+            let service = Arc::clone(&service);
+            async move { service.handle(request).await }
+        }));
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = format!("{origin}/mcp");
+        let send = |method: reqwest::Method| {
+            client
+                .request(method, &url)
+                .bearer_auth(&token)
+                .header("mcp-protocol-version", "2025-06-18")
+        };
+
+        let initialize = send(reqwest::Method::POST)
+            .json(&json!({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                          "params": {"protocolVersion": "2025-06-18"}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(initialize.status(), StatusCode::OK);
+        assert!(initialize.headers().get("mcp-session-id").is_none());
+
+        let initialized = send(reqwest::Method::POST)
+            .json(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(initialized.status(), StatusCode::ACCEPTED);
+
+        for (method, session) in [
+            (reqwest::Method::GET, None),
+            (reqwest::Method::DELETE, None),
+            (reqwest::Method::GET, Some("unknown-session")),
+            (reqwest::Method::DELETE, Some("unknown-session")),
+        ] {
+            let mut request = send(method.clone()).header("accept", "text/event-stream");
+            if let Some(session) = session {
+                request = request.header("mcp-session-id", session);
+            }
+            let reply = request.send().await.unwrap();
+            assert_eq!(
+                reply.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {session:?}"
+            );
+            assert_eq!(reply.headers()["allow"], "POST");
+        }
+        server.abort();
+    }
+
     #[test]
     fn a_new_claude_launch_names_its_session_before_the_first_turn() {
         // The ID OX adds is the one the worker gateway records for the launch.

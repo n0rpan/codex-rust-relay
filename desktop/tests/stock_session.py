@@ -23,6 +23,41 @@ def jwt(payload):
     return f"{encode({'alg': 'none'})}.{encode(payload)}.sig"
 
 
+APPS_MCP = "/backend-api/ps/mcp"
+
+
+def apps_mcp_reply(body):
+    """Answer stock Codex's built-in ChatGPT apps MCP server (`codex_apps`).
+
+    On the subscription route Codex connects it at `chatgpt_base_url` + /ps/mcp.
+    A 404 there makes rmcp log `UnexpectedServerResponse("HTTP 404")`, so the
+    fixture serves an empty streamable-HTTP server instead.
+    Returns (status, payload).
+    """
+    request = json.loads(body or b"{}")
+    if "id" not in request:
+        return 202, b""
+    method = request.get("method")
+    results = {
+        "initialize": {
+            "protocolVersion": request.get("params", {}).get("protocolVersion", "2025-06-18"),
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "fixture_apps", "version": "1"},
+        },
+        "tools/list": {"tools": []},
+        "resources/list": {"resources": []},
+        "resources/templates/list": {"resourceTemplates": []},
+        "prompts/list": {"prompts": []},
+        "ping": {},
+    }
+    reply = {"jsonrpc": "2.0", "id": request["id"]}
+    if method in results:
+        reply["result"] = results[method]
+    else:
+        reply["error"] = {"code": -32601, "message": f"fixture has no {method}"}
+    return 200, json.dumps(reply).encode()
+
+
 class Fixture(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -39,7 +74,10 @@ class Fixture(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
-        if self.path == "/backend-api/wham/accounts/check":
+        if self.path == APPS_MCP:
+            # No server-initiated SSE stream, as the MCP spec allows.
+            self.reply(405, "application/json", b"")
+        elif self.path == "/backend-api/wham/accounts/check":
             info = {
                 "id": ACCOUNT,
                 "workspace_backend_origin": self.server.tls_origin,
@@ -63,8 +101,15 @@ class Fixture(BaseHTTPRequestHandler):
         else:
             self.reply(404, "application/json", b"{}")
 
+    def do_DELETE(self):
+        self.reply(405 if self.path == APPS_MCP else 404, "application/json", b"")
+
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
+        if self.path == APPS_MCP:
+            status, payload = apps_mcp_reply(body)
+            self.reply(status, "application/json", payload)
+            return
         if self.path in ("/backend-api/codex/responses", "/v1/responses"):
             if self.path.startswith("/backend-api"):
                 assert self.headers["Authorization"] == f"Bearer {self.server.access}"

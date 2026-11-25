@@ -78,6 +78,7 @@ account = sys.argv[4]
 requests_path = state / "requests.jsonl"
 lock = threading.Lock()
 tls = {"port": 0}
+APPS_MCP = "/backend-api/ps/mcp"
 
 
 def record(server, handler):
@@ -113,7 +114,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         record(self.server_tag, self)
-        if self.server_tag == "discovery" and self.path == "/backend-api/wham/accounts/check":
+        if self.path == APPS_MCP:
+            # No server-initiated SSE stream, as the MCP spec allows.
+            self.reply(405)
+        elif self.server_tag == "discovery" and self.path == "/backend-api/wham/accounts/check":
             payload = {
                 "accounts": [{
                     "id": account,
@@ -125,9 +129,15 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.reply(404, b'{"error":"fixture"}')
 
+    def do_DELETE(self):
+        record(self.server_tag, self)
+        self.reply(405 if self.path == APPS_MCP else 404)
+
     def do_POST(self):
         body = record(self.server_tag, self)
-        if self.server_tag == "inference_tls" and self.path == "/backend-api/codex/responses":
+        if self.path == APPS_MCP:
+            self.apps_mcp_reply(json.loads(body or b"{}"))
+        elif self.server_tag == "inference_tls" and self.path == "/backend-api/codex/responses":
             if b"native worker fixture" not in body:
                 self.inference_reply("gpt-5.1-codex", "native fixture reply")
             elif b"vendor fixture reply" in body:
@@ -170,6 +180,32 @@ class Handler(BaseHTTPRequestHandler):
             self.claude_reply(json.loads(body))
         else:
             self.reply(404, b'{"error":"fixture"}')
+
+    def apps_mcp_reply(self, request):
+        # Stock Codex's built-in ChatGPT apps server (`codex_apps`) lives at
+        # chatgpt_base_url + /ps/mcp on the subscription route. Answering 404
+        # there makes rmcp log `UnexpectedServerResponse("HTTP 404")`.
+        if "id" not in request:
+            return self.reply(202)
+        method = request.get("method")
+        results = {
+            "initialize": {
+                "protocolVersion": request.get("params", {}).get("protocolVersion", "2025-06-18"),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "fixture_apps", "version": "1"},
+            },
+            "tools/list": {"tools": []},
+            "resources/list": {"resources": []},
+            "resources/templates/list": {"resourceTemplates": []},
+            "prompts/list": {"prompts": []},
+            "ping": {},
+        }
+        reply = {"jsonrpc": "2.0", "id": request["id"]}
+        if method in results:
+            reply["result"] = results[method]
+        else:
+            reply["error"] = {"code": -32601, "message": "fixture has no " + str(method)}
+        self.reply(200, json.dumps(reply).encode())
 
     def inference_reply(self, model, text, item=None):
         item = item or {
@@ -541,7 +577,7 @@ fn stock_codex_uses_native_credentials_and_an_isolated_relay_profile() {
     assert_header(inference, "chatgpt-account-id", ACCOUNT_ID);
     assert_header(inference, "originator", "codex_exec");
     assert!(
-        inference.headers.get("x-api-key").is_none(),
+        !inference.headers.contains_key("x-api-key"),
         "native ChatGPT auth must not be downgraded to an API key"
     );
 
@@ -628,7 +664,7 @@ fn stock_codex_uses_native_credentials_and_an_isolated_relay_profile() {
         .unwrap_or_else(|| panic!("missing vendor request; captured {requests:#?}"));
     assert_header(vendor, "authorization", &format!("Bearer {VENDOR_KEY}"));
     assert!(
-        vendor.headers.get("chatgpt-account-id").is_none(),
+        !vendor.headers.contains_key("chatgpt-account-id"),
         "the vendor must not receive the ChatGPT account id"
     );
     for (name, value) in &vendor.headers {
@@ -701,7 +737,7 @@ fn stock_codex_uses_native_credentials_and_an_isolated_relay_profile() {
     assert!(worker_call.body_text.contains("delegated-only marker"));
     assert!(!worker_call.body_text.contains("native worker fixture"));
     assert!(!worker_call.body_text.contains(&access_token));
-    assert!(worker_call.headers.get("chatgpt-account-id").is_none());
+    assert!(!worker_call.headers.contains_key("chatgpt-account-id"));
     let returned = phase3
         .iter()
         .find(|request| {
@@ -1129,6 +1165,18 @@ fn wait_for_turn(child: &mut Child, log: &Path, expected: &str) {
             }),
         "expected a completed Codex turn with {expected:?}:\n{}",
         tail(log)
+    );
+    // Every streamable-HTTP MCP server Codex reaches here (the ox_workers
+    // gateway and the fixture's ChatGPT apps endpoint) must answer with a
+    // status rmcp accepts. rmcp logs any other 4xx as a fatal worker error.
+    let rejected: Vec<&str> = raw
+        .lines()
+        .filter(|line| line.contains("rmcp") && line.contains("HTTP 4"))
+        .collect();
+    assert!(
+        rejected.is_empty(),
+        "an MCP server rejected a stock Codex request:\n{}",
+        rejected.join("\n")
     );
 }
 

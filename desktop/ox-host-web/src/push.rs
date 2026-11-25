@@ -250,58 +250,72 @@ async fn notifications(
     .await?;
     loop {
         let bytes = bridge::line(&mut r, &mut buf).await?;
-        let frame: NoticeFrame = serde_json::from_slice(&bytes)?;
-        let Some(c) = frame.cursor else {
-            if frame.kind == "error" {
-                return Err(io::Error::other("Host subscription closed"));
+        match notices(&bytes, cursor.as_ref())? {
+            Notices::Skip => {}
+            Notices::Snapshot(c) => *cursor = Some(c),
+            Notices::Delta(c, payloads) => {
+                for data in payloads {
+                    if tx.send(data).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                *cursor = Some(c);
             }
+        }
+    }
+}
+enum Notices {
+    Skip,
+    Snapshot(Cursor),
+    Delta(Cursor, Vec<Vec<u8>>),
+}
+/// Turn one host frame into Web Push payloads. Each payload holds only the scoped
+/// thread identifier, the session title and the event kind.
+fn notices(bytes: &[u8], cursor: Option<&Cursor>) -> io::Result<Notices> {
+    let frame: NoticeFrame = serde_json::from_slice(bytes)?;
+    let Some(c) = frame.cursor else {
+        if frame.kind == "error" {
+            return Err(io::Error::other("Host subscription closed"));
+        }
+        return Ok(Notices::Skip);
+    };
+    if frame.kind == "snapshot" {
+        return Ok(Notices::Snapshot(c));
+    }
+    if frame.kind != "delta" || cursor.is_some_and(|old| old.epoch == c.epoch && old.seq >= c.seq) {
+        return Ok(Notices::Skip);
+    }
+    let Some(scope) = frame.scope else {
+        return Ok(Notices::Skip);
+    };
+    let mut payloads = Vec::new();
+    for change in frame.changes {
+        if change.kind != "notification" {
+            continue;
+        }
+        let (Some(thread), Some(title), Some(kind)) = (change.thread, change.title, change.event)
+        else {
             continue;
         };
-        if frame.kind == "snapshot" {
-            *cursor = Some(c);
-            continue;
-        }
-        if frame.kind != "delta"
-            || cursor
-                .as_ref()
-                .is_some_and(|old| old.epoch == c.epoch && old.seq >= c.seq)
-        {
-            continue;
-        }
-        let Some(scope) = frame.scope else { continue };
-        for change in frame.changes {
-            if change.kind != "notification" {
-                continue;
-            }
-            let (Some(thread), Some(title), Some(kind)) =
-                (change.thread, change.title, change.event)
-            else {
-                continue;
-            };
-            let title = title
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(80)
-                .collect::<String>();
-            let alias = match &scope.route.billing {
-                ox_desk_core::runtime::Billing::Subscription => None,
-                ox_desk_core::runtime::Billing::Api(a) => Some(a.as_str()),
-            };
-            let identity =
-                serde_json::to_vec(&(&scope.project, scope.route.runtime, alias, &thread))?;
-            let hash = ring::digest::digest(&ring::digest::SHA256, &identity);
-            let thread = format!("{thread}~{}", B64.encode(hash.as_ref()));
-            let data = serde_json::to_vec(&Payload {
-                thread: &thread,
-                title: &title,
-                kind,
-            })?;
-            if tx.send(data).await.is_err() {
-                return Ok(());
-            }
-        }
-        *cursor = Some(c);
+        let title = title
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(80)
+            .collect::<String>();
+        let alias = match &scope.route.billing {
+            ox_desk_core::runtime::Billing::Subscription => None,
+            ox_desk_core::runtime::Billing::Api(a) => Some(a.as_str()),
+        };
+        let identity = serde_json::to_vec(&(&scope.project, scope.route.runtime, alias, &thread))?;
+        let hash = ring::digest::digest(&ring::digest::SHA256, &identity);
+        let thread = format!("{thread}~{}", B64.encode(hash.as_ref()));
+        payloads.push(serde_json::to_vec(&Payload {
+            thread: &thread,
+            title: &title,
+            kind,
+        })?);
     }
+    Ok(Notices::Delta(c, payloads))
 }
 
 // Push never materializes transcript bodies or tool output from a global subscription.
@@ -327,6 +341,7 @@ mod tests {
     use super::*;
     use p256::ecdsa::{VerifyingKey, signature::Verifier};
     use p256::elliptic_curve::rand_core::OsRng;
+    use serde_json::json;
     fn fixture() -> (Subscription, SecretKey) {
         let phone = SecretKey::random(&mut OsRng);
         (
@@ -409,6 +424,142 @@ mod tests {
             web_push_native::decrypt(ciphertext, &phone, &Auth::from([7; 16])).unwrap(),
             b"fixture"
         );
+    }
+    #[test]
+    fn push_payloads_carry_only_scoped_thread_title_and_kind() {
+        use ox_desk_core::{
+            asks::{CommandApproval, Question},
+            host_protocol::{AskView, Change, SessionView, Timeline, TimelineItem},
+            runtime::{Billing, RequestId, Route, Runtime},
+        };
+        const SECRET: &str = "SECRET-7f3a";
+        let leak = |what: &str| format!("{SECRET}-{what}");
+        // Every kind must be listed here; adding one fails this match until it is covered.
+        let all = [
+            NotificationKind::Finished,
+            NotificationKind::Failed,
+            NotificationKind::Approval,
+            NotificationKind::Question,
+        ];
+        for kind in all {
+            match kind {
+                NotificationKind::Finished
+                | NotificationKind::Failed
+                | NotificationKind::Approval
+                | NotificationKind::Question => {}
+            }
+        }
+        for (n, kind) in all.into_iter().enumerate() {
+            let scope = Scope {
+                project: format!("/home/me/{}", leak("project")).into(),
+                route: Route {
+                    runtime: Runtime::Claude,
+                    billing: Billing::Api(leak("alias")),
+                },
+            };
+            let question = Question {
+                id: "q".into(),
+                question: leak("question"),
+                header: leak("header"),
+                is_other: false,
+                is_secret: true,
+                multi_select: false,
+                options: None,
+            };
+            let ask = AskView {
+                command: Some(CommandApproval {
+                    command: format!("curl -H 'Authorization: {}' https://x", leak("command")),
+                    cwd: Some(format!("/srv/{}", leak("cwd")).into()),
+                    decline: 1,
+                }),
+                id: RequestId::Text(leak("request")),
+                token: leak("token"),
+                thread: Some("thread-1".into()),
+                turn: Some("turn".into()),
+                item: Some("item".into()),
+                choice_details: vec![Some(leak("choice-detail"))],
+                title: format!("Run {}?", leak("ask-title")),
+                detail: format!("--- a/x\n+++ b/x\n+{}", leak("diff")),
+                choices: vec![leak("choice")],
+                questions: if kind == NotificationKind::Question {
+                    vec![question]
+                } else {
+                    vec![]
+                },
+            };
+            let item = TimelineItem {
+                turn: "turn".into(),
+                id: "item".into(),
+                role: "tool".into(),
+                text: leak("message-body"),
+                revision: 1,
+                detail: json!({"arguments": {"path": leak("tool-argument")}, "diff": leak("diff")}),
+            };
+            let frame = Server::Delta {
+                cursor: Cursor {
+                    epoch: "e".into(),
+                    seq: 1 + n as u64,
+                },
+                scope: scope.clone(),
+                changes: vec![
+                    Change::Asks { asks: vec![ask] },
+                    Change::Session {
+                        session: SessionView {
+                            id: "thread-1".into(),
+                            title: "Fix login".into(),
+                            parent: None,
+                            status: "running".into(),
+                            updated_at: 0,
+                            capabilities: vec![],
+                            detail: json!({"last_error": leak("error")}),
+                        },
+                    },
+                    Change::Transcript {
+                        thread: "thread-1".into(),
+                        timeline: Timeline {
+                            items: vec![item.clone()],
+                            detail: json!({"pending": leak("timeline")}),
+                        },
+                    },
+                    Change::Items {
+                        thread: "thread-1".into(),
+                        items: vec![item],
+                    },
+                    Change::Append {
+                        thread: "thread-1".into(),
+                        turn: "turn".into(),
+                        id: "item".into(),
+                        text: leak("append"),
+                        revision: 2,
+                    },
+                    Change::TimelineState {
+                        thread: "thread-1".into(),
+                        detail: json!({"command": leak("state")}),
+                    },
+                    Change::Notification {
+                        thread: "thread-1".into(),
+                        title: "Fix login\u{7}".into(),
+                        event: kind,
+                    },
+                ],
+            };
+            let bytes = serde_json::to_vec(&frame).unwrap();
+            assert!(String::from_utf8_lossy(&bytes).contains(SECRET));
+            let Notices::Delta(_, payloads) = notices(&bytes, None).unwrap() else {
+                panic!("delta frame was not processed");
+            };
+            assert_eq!(payloads.len(), 1, "{kind:?}");
+            let text = String::from_utf8(payloads[0].clone()).unwrap();
+            assert!(!text.contains(SECRET), "{kind:?} payload leaked: {text}");
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            assert_eq!(keys, ["kind", "thread", "title"]);
+            assert_eq!(v["kind"], serde_json::to_value(kind).unwrap());
+            assert_eq!(v["title"], "Fix login");
+            let thread = v["thread"].as_str().unwrap();
+            assert!(thread.starts_with("thread-1~") && thread.len() == "thread-1~".len() + 43);
+        }
     }
     #[test]
     fn push_endpoint_and_destination_are_constrained() {

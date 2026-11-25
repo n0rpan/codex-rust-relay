@@ -1,0 +1,246 @@
+name: Fast lane
+
+# The fast lane answers "is this push sane?" in under five minutes on a warm
+# cache. It runs on every push to a branch; a pull request's checks come from
+# the push run on its head commit. (No pull_request trigger: a second run per
+# push only added a row of skipped checks.)
+# On main, tags and manual release runs, ci.yml calls this workflow instead,
+# so the same checks gate the dev and tagged releases.
+#
+# Jobs run in parallel; none waits on another:
+#   - root:      fmt, clippy and unit tests of the `ox` crate, installer lint
+#   - workbench: fmt, clippy and nextest of the desktop workspace (ox-desk-core,
+#                ox-host, ...), the protocol schema check and a Wayland smoke run
+#   - protocol:  stock-client protocol fixtures on the baseline and latest
+#                Codex and Claude Code releases (latest reports, never blocks)
+#   - host-sessions: the real host, helper and stock Claude Code (floor)
+#
+# Caches are written only from main, so every branch restores main's warm
+# dependency build and none evicts it. The full lane (packages, window tests,
+# stock sessions in the packaged app) lives in desktop.yml.
+on:
+  push:
+    branches: ['**', '!main']
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+concurrency:
+  group: fast-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: '1'
+  SAVE_CACHE: ${{ github.ref == 'refs/heads/main' }}
+
+jobs:
+  root:
+    name: ox crate (fmt, clippy, tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            target/debug
+            !target/debug/incremental
+          key: ox-fast-root-x64-rust1.100-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ox-fast-root-x64-rust1.100-
+      - name: Install pinned Rust 1.100.0
+        run: |
+          rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy --no-self-update
+          rustup default 1.100.0
+      - run: cargo fmt --all -- --check
+      - name: Lint the installer script
+        run: sh -n install.sh && bash -n install.sh && shellcheck install.sh
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            target/debug
+            !target/debug/incremental
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  workbench:
+    name: Fast Linux workbench check
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: '3'
+      CARGO_TARGET_DIR: desktop/target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: desktop/target/debug
+          key: ox-desktop-check-arm64-rust1.100-${{ hashFiles('desktop/Cargo.lock', 'Cargo.lock') }}
+          restore-keys: ox-desktop-check-arm64-rust1.100-
+      - name: Install toolchain and runtime
+        run: |
+          rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy --no-self-update
+          rustup default 1.100.0
+          desktop/ci/linux-deps.sh sway dbus-daemon
+          curl --fail --silent --show-error --location --retry 3 --output "$RUNNER_TEMP/nextest.tar.gz" \
+            https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.152/cargo-nextest-0.9.152-aarch64-unknown-linux-gnu.tar.gz
+          echo "ca1f81a5b86533eb45ab97e0064aa88e925e53aab9a698ca6331a7cad1f85f07  $RUNNER_TEMP/nextest.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$HOME/.cargo/bin" cargo-nextest
+      - run: cargo fmt --manifest-path desktop/Cargo.toml --all -- --check
+      - run: python3 desktop/ci/contract.py --final
+      - run: python3 desktop/ci/quarantine.py --self-test && python3 desktop/ci/quarantine.py --check
+      - run: cargo clippy --manifest-path desktop/Cargo.toml --locked --workspace --all-targets -- -D warnings
+      - run: cargo nextest run --manifest-path desktop/Cargo.toml --locked --workspace
+      - run: cargo run --locked --manifest-path desktop/Cargo.toml -p ox-host-protocol -- --check
+      - run: cargo build --locked --bin ox && cargo build --locked --manifest-path desktop/Cargo.toml -p ox-desktop -p ox-host
+      - run: dbus-run-session -- desktop/ci/wayland-smoke.sh desktop/target/debug/ox-desktop
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: desktop/target/debug
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  protocol:
+    name: Stock-client protocol (${{ matrix.track }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # baseline (the floors in gate.toml) blocks. latest reports: an upstream
+    # release must not turn an unrelated push red. The nightly CI run blocks
+    # on latest so a break is seen within a day.
+    continue-on-error: ${{ matrix.track == 'latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        track: [baseline, latest]
+    env:
+      CARGO_TARGET_DIR: desktop/target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            desktop/target/debug
+            !desktop/target/debug/incremental
+          key: ox-fast-protocol-x64-rust1.100-${{ hashFiles('desktop/Cargo.lock') }}
+          restore-keys: ox-fast-protocol-x64-rust1.100-
+      - name: Install pinned Rust 1.100.0
+        run: |
+          rustup toolchain install 1.100.0 --profile minimal --no-self-update
+          rustup default 1.100.0
+      - name: Build the contract test while the stock clients install
+        run: |
+          nohup sh -c 'cargo test --no-run --locked --manifest-path desktop/Cargo.toml -p ox-desk-core \
+            --test contract_protocol > "$RUNNER_TEMP/build.log" 2>&1; echo $? > "$RUNNER_TEMP/build.status"' &
+      - name: Install stock Codex and Claude Code (${{ matrix.track }})
+        run: desktop/ci/stock-clients.sh "${{ matrix.track }}" "$RUNNER_TEMP/stock"
+      - name: Allow Codex's bubblewrap sandbox
+        run: |
+          if ! bwrap --ro-bind / / --dev /dev --proc /proc true 2>/dev/null &&
+              [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Codex tells MCP servers the calling thread
+        run: python3 desktop/tests/codex_thread_meta.py "$RUNNER_TEMP/stock/node_modules/.bin/codex"
+      - name: Codex accepts injected handoff items
+        run: python3 desktop/tests/codex_inject_items.py "$RUNNER_TEMP/stock/node_modules/.bin/codex"
+      - name: Claude Code MCP metadata
+        run: python3 desktop/tests/claude_mcp_meta.py "$RUNNER_TEMP/stock/node_modules/.bin/claude"
+      - name: Claude Code subcommands are all known to ox
+        run: |
+          stage=$(mktemp -d)
+          env HOME="$stage" CLAUDE_CONFIG_DIR="$stage/profile" "$RUNNER_TEMP/stock/node_modules/.bin/claude" --help \
+            | python3 desktop/tests/claude_subcommands.py src/clients.rs
+      - name: App-server protocol contract
+        env:
+          CODEOX_TEST_CODEX_BIN: ${{ runner.temp }}/stock/node_modules/.bin/codex
+        run: |
+          until [ -s "$RUNNER_TEMP/build.status" ]; do sleep 1; done
+          [ "$(cat "$RUNNER_TEMP/build.status")" = 0 ] || { cat "$RUNNER_TEMP/build.log"; exit 1; }
+          cargo test --locked --manifest-path desktop/Cargo.toml -p ox-desk-core --test contract_protocol \
+            -- --ignored --exact installed_protocol
+      - name: Report a latest-client break without blocking
+        if: failure() && matrix.track == 'latest'
+        run: echo "::warning title=Latest stock client::A protocol fixture fails against the latest Codex or Claude Code release. It does not block this push; the nightly CI run does."
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.SAVE_CACHE == 'true' && matrix.track == 'baseline' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            desktop/target/debug
+            !desktop/target/debug/incremental
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  host-sessions:
+    # The real session host, OX helper and stock Claude Code against a local
+    # Messages API: two clients, approvals, SIGKILL recovery, workers, handoffs
+    # and a mid-turn upgrade. No window and no package, so it belongs here.
+    # It tests the host, so it runs once, on the Claude Code floor.
+    name: Host sessions (stock Claude floor)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_TARGET_DIR: desktop/target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            desktop/target/debug
+            !desktop/target/debug/incremental
+          key: ox-fast-host-x64-rust1.100-${{ hashFiles('desktop/Cargo.lock', 'Cargo.lock') }}
+          restore-keys: ox-fast-host-x64-rust1.100-
+      - name: Install pinned Rust 1.100.0
+        run: |
+          rustup toolchain install 1.100.0 --profile minimal --no-self-update
+          rustup default 1.100.0
+      - name: Build the host and helper while Claude Code installs
+        run: |
+          nohup sh -c '{ cargo build --locked --bin ox && cargo build --locked --manifest-path desktop/Cargo.toml -p ox-host; } \
+            > "$RUNNER_TEMP/build.log" 2>&1; echo $? > "$RUNNER_TEMP/build.status"' > /dev/null 2>&1 &
+      - name: Install stock Claude Code (floor)
+        run: |
+          floor=$(python3 -c 'import tomllib; print(tomllib.load(open("desktop/gate.toml", "rb"))["claude"]["minimum_version"])')
+          npm install --prefix "$RUNNER_TEMP/stock" --no-audit --no-fund --loglevel=error "@anthropic-ai/claude-code@$floor"
+      - name: Wait for the build
+        run: |
+          until [ -s "$RUNNER_TEMP/build.status" ]; do sleep 1; done
+          [ "$(cat "$RUNNER_TEMP/build.status")" = 0 ] || { cat "$RUNNER_TEMP/build.log"; exit 1; }
+      - name: Two clients, approvals and SIGKILL recovery
+        run: python3 desktop/tests/host_stock_session.py desktop/target/debug/ox-host desktop/target/debug/ox "$RUNNER_TEMP/stock/node_modules/.bin/claude"
+      - name: Handoff into stock Claude Code
+        run: python3 desktop/tests/host_handoff_session.py desktop/target/debug/ox-host desktop/target/debug/ox "$RUNNER_TEMP/stock/node_modules/.bin/claude"
+      - name: Upgrade the host in the middle of a turn
+        run: python3 desktop/tests/host_upgrade_session.py desktop/target/debug/ox-host desktop/target/debug/ox "$RUNNER_TEMP/stock/node_modules/.bin/claude"
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.SAVE_CACHE == 'true' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            desktop/target/debug
+            !desktop/target/debug/incremental
+          key: ${{ steps.cache.outputs.cache-primary-key }}

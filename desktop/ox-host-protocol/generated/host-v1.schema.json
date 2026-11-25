@@ -1218,6 +1218,21 @@
       ],
       "type": "object"
     },
+    "HostInfo": {
+      "properties": {
+        "epoch": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "epoch"
+      ],
+      "type": "object"
+    },
     "ImageInput": {
       "oneOf": [
         {
@@ -1619,6 +1634,17 @@
                 "type": "string"
               },
               "type": "array"
+            },
+            "host": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/HostInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The host's build version and boot epoch. Older hosts omit it."
             },
             "projects": {
               "items": {

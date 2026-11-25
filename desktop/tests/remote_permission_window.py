@@ -11,7 +11,7 @@ import tempfile
 import time
 
 from host_fixture import session_host
-from mixed_runtime_window import Window
+from mixed_runtime_window import Window, ocr_passes
 
 ENABLE = ["tailscale", "serve", "--bg", "--https=8443", "http://127.0.0.1:48162"]
 DISABLE = ["tailscale", "serve", "--https=8443", "off"]
@@ -122,13 +122,46 @@ def run(gui, home):
         def status():
             return admin({"type": "status"})["Ok"]
 
+        def settled():
+            # While Remote access re-checks Tailscale it shows "Checking remote
+            # access…" and disables Refresh, Enable and Disable. OCR still reads
+            # the greyed labels, so a click then lands on a disabled button.
+            deadline = time.monotonic() + 20
+            shot = home / "settled.png"
+            while time.monotonic() < deadline:
+                win.command("import", "-window", win.id, str(shot))
+                # The whole-window pass is enough for this plain status line.
+                words = {text.strip(" .…").casefold()
+                         for text, *_ in next(ocr_passes(win.command, home, shot))}
+                if words and "checking" not in words:
+                    return
+                time.sleep(0.1)
+            raise AssertionError("Remote access kept checking for 20 seconds")
+
         def click(word):
+            if word in ("Refresh", "Enable", "Disable"):
+                settled()
             win.word(word, click=True, bottom=True)
+
+        def terminal_window():
+            # `xdotool search --name` can also return the main window, so its
+            # --sync may return before the terminal exists. Wait for a window
+            # other than the main one whose title is exactly "OX Terminal".
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                found = subprocess.run(["xdotool", "search", "--onlyvisible", "--pid", str(proc.pid),
+                                        "--name", "OX Terminal"], capture_output=True, text=True).stdout.split()
+                for candidate in found:
+                    name = subprocess.run(["xdotool", "getwindowname", candidate],
+                                          capture_output=True, text=True).stdout.strip()
+                    if candidate != main and name == "OX Terminal":
+                        return candidate
+                time.sleep(0.1)
+            raise AssertionError("The OX Terminal window did not open")
 
         def review():
             click("Run")
-            win.id = win.command("xdotool", "search", "--sync", "--onlyvisible", "--pid", str(proc.pid),
-                                 "--name", "^OX Terminal$").splitlines()[-1]
+            win.id = terminal_window()
             win.command("xdotool", "windowfocus", win.id)
             win.word("Cancel")
 

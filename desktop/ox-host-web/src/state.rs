@@ -24,9 +24,20 @@ use std::{
 use tokio::sync::watch;
 use url::Url;
 
+/// A paired device that is not used for this long is forgotten.
 pub(crate) const INACTIVE: i64 = 30 * 24 * 3600;
-const PAIR_TTL: i64 = 300;
+/// Lifetime of a single-use pairing invitation.
+pub(crate) const PAIR_TTL: i64 = 300;
+#[cfg(test)]
+thread_local! {
+    /// Tests pin the clock so expiry boundaries are checked exactly.
+    pub(crate) static CLOCK: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
 pub(crate) fn now() -> i64 {
+    #[cfg(test)]
+    if let Some(t) = CLOCK.with(std::cell::Cell::get) {
+        return t;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -675,6 +686,72 @@ mod tests {
         assert!(state.identity("me", &cookie).is_none());
         let reopened = State::load(dir.path()).unwrap();
         assert!(reopened.disk.devices.is_empty());
+    }
+    #[test]
+    fn pairing_invitations_and_unused_pairings_expire_on_a_pinned_clock() {
+        struct Unpin;
+        impl Drop for Unpin {
+            fn drop(&mut self) {
+                CLOCK.with(|c| c.set(None));
+            }
+        }
+        let _unpin = Unpin;
+        let at = |t: i64| CLOCK.with(|c| c.set(Some(t)));
+        const { assert!(PAIR_TTL <= 300, "invitations must stay short-lived") };
+        assert_eq!(INACTIVE, 30 * 24 * 3600, "docs promise a 30-day expiry");
+        let start = 1_900_000_000;
+        at(start);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let mut s = State::load(dir.path()).unwrap();
+        s.set_origin(Some("https://machine.test.ts.net".into()), 9000)
+            .unwrap();
+        let key = SigningKey::random(&mut OsRng);
+        let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
+        let pair = |s: &mut State, code: &str, label: &str| {
+            s.pair("me", code, &public, &sign(&key, code), label)
+        };
+
+        // An invitation expires exactly PAIR_TTL seconds after it is issued.
+        let stale = s.invite("me".into()).unwrap();
+        assert_eq!(stale.expires_at, start + PAIR_TTL);
+        let stale = stale.url.split_once("#pair=").unwrap().1.to_owned();
+        at(start + PAIR_TTL);
+        assert!(pair(&mut s, &stale, "Late").is_none());
+
+        // A fresh invitation works once, one second before its deadline, then never again.
+        let issued = start + PAIR_TTL;
+        let fresh = s.invite("me".into()).unwrap();
+        let fresh = fresh.url.split_once("#pair=").unwrap().1.to_owned();
+        at(issued + PAIR_TTL - 1);
+        let cookie = pair(&mut s, &fresh, "Phone").unwrap();
+        assert!(pair(&mut s, &fresh, "Replay").is_none());
+        let paired = issued + PAIR_TTL - 1;
+        let id = s.identity("me", &cookie).unwrap();
+
+        // A pairing that is not used for 30 days expires, in memory and on reload.
+        at(paired + INACTIVE - 1);
+        assert_eq!(s.identity("me", &cookie).as_deref(), Some(id.as_str()));
+        at(paired + INACTIVE);
+        assert!(s.identity("me", &cookie).is_none());
+        assert!(!s.alive(&id));
+        assert!(s.reply(None).devices.is_empty());
+        assert!(State::load(dir.path()).unwrap().disk.devices.is_empty());
+
+        // Use renews the window: a device used on day 29 survives past day 30.
+        let fresh = s.invite("me".into()).unwrap();
+        let fresh = fresh.url.split_once("#pair=").unwrap().1.to_owned();
+        let cookie = pair(&mut s, &fresh, "Phone").unwrap();
+        let id = s.identity("me", &cookie).unwrap();
+        let paired = paired + INACTIVE;
+        at(paired + 29 * 24 * 3600);
+        assert!(s.active_device(&id));
+        at(paired + 31 * 24 * 3600);
+        assert_eq!(s.identity("me", &cookie).as_deref(), Some(id.as_str()));
     }
     #[test]
     fn only_canonical_https_serve_origins_are_valid() {

@@ -178,6 +178,9 @@ impl SavedScope {
     }
 }
 
+/// The session ledger file in the host state directory.
+pub(crate) const LEDGER: &str = "ownership-v1.json";
+
 pub(crate) struct Ledger {
     failed: bool,
     path: PathBuf,
@@ -185,7 +188,7 @@ pub(crate) struct Ledger {
 }
 impl Ledger {
     pub(crate) fn open(dir: &Path) -> io::Result<Self> {
-        let path = dir.join("ownership-v1.json");
+        let path = dir.join(LEDGER);
         let data = match File::open(&path) {
             Ok(f) => serde_json::from_reader(BufReader::new(f))?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => Owned::default(),
@@ -261,21 +264,22 @@ impl Ledger {
     }
     /// A new epoch never replays a launch: pending YOLO requests become declined
     /// and handoffs that had not started their first turn become failed.
-    pub(crate) fn retire(&mut self) -> io::Result<()> {
+    /// `cause` completes "The OX session host …", e.g. "restarted for an update".
+    pub(crate) fn retire(&mut self, cause: &str) -> io::Result<()> {
         self.change(|data| {
             for origin in std::mem::take(&mut data.asking) {
                 data.outcomes.push(Outcome {
                     origin,
                     status: "declined".into(),
-                    message: "The OX session host restarted before the operator answered, so the YOLO request was declined. Start the worker again if it is still needed.".into(),
+                    message: format!("The OX session host {cause} before the operator answered, so the YOLO request was declined. Start the worker again if it is still needed."),
                 });
             }
             for h in &mut data.handoffs {
                 if h.status == "starting" {
                     h.status = "failed".into();
-                    h.message = Some(
-                        "The OX session host restarted before the new session's first turn. Nothing was retried. Start the handoff again.".into(),
-                    );
+                    h.message = Some(format!(
+                        "The OX session host {cause} before the new session's first turn. Nothing was retried. Start the handoff again."
+                    ));
                 }
             }
         })

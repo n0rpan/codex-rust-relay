@@ -7,7 +7,11 @@ name: CI
 # A separate native matrix then builds the locked release binary on Linux
 # x86_64/ARM64 and macOS Intel/Apple silicon, runs it, and uploads one `ox`
 # archive, native updater binary, and checksums per platform. The matrix uses
-# the read-only token. Only the two publication jobs can write Releases:
+# the read-only token. On a pull request it builds Linux x86_64 only; the
+# other three platforms build for main, tags and manual runs, which are the
+# release builds. fmt, clippy, unit tests and the installer lint
+# run in the fast lane (fast.yml). Only the two publication jobs can write
+# Releases:
 #   - every push to main replaces the rolling pre-release tagged `dev`, whose
 #     version is the latest stable release plus one patch, `-dev.<run number>`;
 #   - a pushed tag vMAJOR.MINOR.PATCH publishes that stable release.
@@ -41,6 +45,7 @@ jobs:
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       channel: ${{ steps.resolve.outputs.channel }}
+      platforms: ${{ steps.platforms.outputs.platforms }}
     env:
       GH_TOKEN: ${{ github.token }}
       REF: ${{ github.ref }}
@@ -81,10 +86,30 @@ jobs:
           echo "Building ox ${version} (${channel})"
           echo "- ox ${version} (${channel})" >> "${GITHUB_STEP_SUMMARY}"
 
+      - name: Choose the release platforms
+        id: platforms
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          # Pull requests build Linux x86_64 only. GitHub's macOS arm64 pool
+          # is capacity-limited: twice in one day a PR job was never given a
+          # runner and was cancelled after 15 minutes ("not acquired by Runner
+          # of type hosted"), which turned the PR red for nothing. macOS builds
+          # run for main, tags and manual runs, and the nightly OX Desktop run
+          # builds the same ox binary on macos-26 inside its package.
+          if [ "${EVENT}" = pull_request ]; then
+            echo 'platforms=[{"platform":"linux-x86_64","runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","file_type":"x86-64","macos_deployment_target":""}]' >> "${GITHUB_OUTPUT}"
+          else
+            echo 'platforms=[{"platform":"linux-x86_64","runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","file_type":"x86-64","macos_deployment_target":""},{"platform":"linux-aarch64","runner":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","file_type":"aarch64","macos_deployment_target":""},{"platform":"macos-x86_64","runner":"macos-26-intel","target":"x86_64-apple-darwin","file_type":"x86_64","macos_deployment_target":"11.0"},{"platform":"macos-aarch64","runner":"macos-26","target":"aarch64-apple-darwin","file_type":"arm64","macos_deployment_target":"11.0"}]' >> "${GITHUB_OUTPUT}"
+          fi
+
   verify:
     name: Stock clients (${{ matrix.client_track }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # latest blocks only in the nightly run; elsewhere an upstream release
+    # must not block an unrelated change or a release of the tested baseline.
+    continue-on-error: ${{ matrix.client_track == 'latest' && github.event_name != 'schedule' }}
     strategy:
       fail-fast: false
       matrix:
@@ -97,39 +122,32 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install pinned Rust 1.100.0 with rustfmt
+      # The fast lane on main writes this cache; reuse its dependency build.
+      - name: Restore the dependency build
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            target/debug
+            !target/debug/incremental
+          key: ox-fast-root-x64-rust1.100-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ox-fast-root-x64-rust1.100-
+
+      - name: Install pinned Rust 1.100.0
         timeout-minutes: 10
         run: |
           set -euo pipefail
-          rustup toolchain install 1.100.0 --profile minimal --component rustfmt --no-self-update
+          rustup toolchain install 1.100.0 --profile minimal --no-self-update
           rustup default 1.100.0
           rustc --version
           cargo --version
-          cargo fmt --version
-
-      - name: Check formatting
-        run: |
-          set -euo pipefail
-          cargo fmt --all -- --check
-
-      - name: Lint the installer script
-        run: |
-          set -euo pipefail
-          sh -n install.sh
-          bash -n install.sh
-          shellcheck install.sh
 
       - name: Fetch locked dependencies
         timeout-minutes: 15
         run: |
           set -euo pipefail
           cargo fetch --locked
-
-      - name: Run all non-ignored tests offline against the lockfile
-        timeout-minutes: 20
-        run: |
-          set -euo pipefail
-          cargo test --locked --offline
 
       # The debug binary built for the tests above is enough here. The
       # release binary is built, run and put through this same fixture on
@@ -364,28 +382,9 @@ jobs:
       matrix:
         # Linux artifacts link the Ubuntu 24.04 glibc (2.39) used by the verify
         # job. macOS artifacts are native Intel and Apple silicon builds, not
-        # cross-compiled, so each job can run what it packages.
-        include:
-          - platform: linux-x86_64
-            runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            file_type: x86-64
-            macos_deployment_target: ""
-          - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            file_type: aarch64
-            macos_deployment_target: ""
-          - platform: macos-x86_64
-            runner: macos-26-intel
-            target: x86_64-apple-darwin
-            file_type: x86_64
-            macos_deployment_target: "11.0"
-          - platform: macos-aarch64
-            runner: macos-26
-            target: aarch64-apple-darwin
-            file_type: arm64
-            macos_deployment_target: "11.0"
+        # cross-compiled, so each job can run what it packages. The version job
+        # lists the platforms and their runners.
+        include: ${{ fromJSON(needs.version.outputs.platforms) }}
     env:
       # rustc defaults x86_64-apple-darwin to 10.12 and aarch64-apple-darwin to
       # 11.0. Pin both macOS artifacts to the 11.0 arm64 floor so the Intel
@@ -561,6 +560,12 @@ jobs:
           # The archives are already gzip-compressed.
           compression-level: 0
 
+  fast:
+    name: Fast lane
+    # Pushes to branches run fast.yml directly. A release must pass it too.
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/fast.yml
+
   desktop-release:
     name: Build matching desktop packages
     needs: version
@@ -577,7 +582,7 @@ jobs:
     if: >-
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [version, verify, release, desktop-release]
+    needs: [version, fast, verify, release, desktop-release]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -732,7 +737,7 @@ jobs:
   publish:
     name: Publish a tagged release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [version, verify, release, desktop-release]
+    needs: [version, fast, verify, release, desktop-release]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -775,4 +780,8 @@ jobs:
                     "$directory/$executable.tar.gz" "$directory/$executable.tar.gz.sha256"
                     "$directory/$alias" "$directory/$alias.sha256")
           done
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --latest "${files[@]}"
+          # Hand-written notes in docs/releases/<tag>.md go first; GitHub appends the change list.
+          notes=()
+          if [ -f "docs/releases/${TAG}.md" ]; then notes=(--notes-file "docs/releases/${TAG}.md"); fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "OX ${TAG#v}" \
+            "${notes[@]}" --generate-notes --latest "${files[@]}"

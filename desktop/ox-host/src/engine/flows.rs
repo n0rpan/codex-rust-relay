@@ -698,7 +698,7 @@ enum Step {
 }
 
 fn tracing_error(e: &io::Error) {
-    eprintln!("ox-host: {e}");
+    ox_host_service::errlog::record(&e.to_string());
 }
 
 /// One page of a handoff source for read_ox_thread.

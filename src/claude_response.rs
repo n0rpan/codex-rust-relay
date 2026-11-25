@@ -1339,7 +1339,7 @@ fn content_index_from(
         })
 }
 
-fn text_part_text<'a>(part: &'a Map<String, Value>) -> Option<&'a str> {
+fn text_part_text(part: &Map<String, Value>) -> Option<&str> {
     match part.get("type").and_then(Value::as_str)? {
         "output_text" => Some(part.get("text").and_then(Value::as_str).unwrap_or("")),
         "refusal" => Some(part.get("refusal").and_then(Value::as_str).unwrap_or("")),
