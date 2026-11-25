@@ -54,32 +54,26 @@ def run_reviewed_fixture(window, marker, expected):
         window.command("xdotool", "windowfocus", window.id)
 
 
-def open_transcript_find(window, attempts=3):
-    """Open transcript find and wait for its field before typing a query.
+def capture(window, name):
+    """Save the app's view and a screenshot for the Linux gate artifact."""
+    print(f"desktop state at {name}:", json.dumps(window.snapshot()), flush=True)
+    if temp := os.environ.get("RUNNER_TEMP"):
+        window.command("import", "-window", window.id, str(Path(temp) / f"continuity-{name}.png"))
 
-    The desktop matches shortcut modifiers exactly. On ubuntu-24.04-arm the
-    ctrl+f sent right after the ctrl+alt+1 answer shortcut sometimes never
-    opened the field, and the query was typed into the composer. Release any
-    modifier xdotool left down, then retry the shortcut, reporting the attempt.
+
+def open_transcript_find(window):
+    """Open transcript find and wait for its bar before typing a query.
+
+    Wait for the bar's Previous button: OCR on ubuntu-24.04-arm does not read
+    the grey "Find in transcript" placeholder even while the field is open
+    and focused, which a screenshot from that runner showed.
     """
-    for attempt in range(1, attempts + 1):
-        window.command("xdotool", "keyup", "ctrl", "alt", "shift", "super")
-        window.key("ctrl+f")
-        try:
-            window.word("Find", same_row="transcript")
-        except AssertionError:
-            if attempt == attempts:
-                # Keep what the next investigation needs: the app's own view of the
-                # selection and a screenshot, uploaded with the Linux gate artifacts.
-                print("desktop state when transcript find failed:", json.dumps(window.snapshot()), flush=True)
-                if temp := os.environ.get("RUNNER_TEMP"):
-                    window.command("import", "-window", window.id, str(Path(temp) / "continuity-find.png"))
-                raise
-            print(f"transcript find did not open on attempt {attempt}; retrying", flush=True)
-            continue
-        if attempt > 1:
-            print(f"transcript find opened on attempt {attempt}", flush=True)
-        return
+    window.key("ctrl+f")
+    try:
+        window.word("Previous")
+    except AssertionError:
+        capture(window, "find")
+        raise
 
 
 def local_tool_terminal(window, provider, root, project):
@@ -109,7 +103,11 @@ def local_tool_terminal(window, provider, root, project):
     # Earlier approvals can have another identically titled Terminal header on screen.
     open_transcript_find(window)
     window.text("fixture-failed")
-    window.word("Run", same_row="terminal", click=True)
+    try:
+        window.word("Run", same_row="terminal", click=True)
+    except AssertionError:
+        capture(window, "run")
+        raise
     run_reviewed_fixture(window, marker, [str(project.resolve()), "--", "fixture-failed", "two words"])
     assert "PrivateTerminalOutput" not in json.dumps(provider.requests)
     print("PASS real approval and failed tool handoffs, tty, argv, cwd, exactly one manual execution, private output.", flush=True)

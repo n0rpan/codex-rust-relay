@@ -217,6 +217,7 @@ jobs:
             ${{ runner.temp }}/claude-gate.json
             ${{ runner.temp }}/claude-gate.png
             ${{ runner.temp }}/continuity-find.png
+            ${{ runner.temp }}/continuity-run.png
           if-no-files-found: warn
       - name: Launch the packaged macOS app
         id: mac-window
