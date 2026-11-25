@@ -7,9 +7,9 @@ name: CI
 # A separate native matrix then builds the locked release binary on Linux
 # x86_64/ARM64 and macOS Intel/Apple silicon, runs it, and uploads one `ox`
 # archive, native updater binary, and checksums per platform. The matrix uses
-# the read-only token. On a pull request it builds Linux x86_64 and macOS
-# Apple silicon only; macOS Intel builds run for main, tags and manual runs,
-# which are the release builds. fmt, clippy, unit tests and the installer lint
+# the read-only token. On a pull request it builds Linux x86_64 only; the
+# other three platforms build for main, tags and manual runs, which are the
+# release builds. fmt, clippy, unit tests and the installer lint
 # run in the fast lane (fast.yml). Only the two publication jobs can write
 # Releases:
 #   - every push to main replaces the rolling pre-release tagged `dev`, whose
@@ -91,8 +91,14 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
         run: |
+          # Pull requests build Linux x86_64 only. GitHub's macOS arm64 pool
+          # is capacity-limited: twice in one day a PR job was never given a
+          # runner and was cancelled after 15 minutes ("not acquired by Runner
+          # of type hosted"), which turned the PR red for nothing. macOS builds
+          # run for main, tags and manual runs, and the nightly OX Desktop run
+          # builds the same ox binary on macos-26 inside its package.
           if [ "${EVENT}" = pull_request ]; then
-            echo 'platforms=[{"platform":"linux-x86_64","runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","file_type":"x86-64","macos_deployment_target":""},{"platform":"macos-aarch64","runner":"macos-26","target":"aarch64-apple-darwin","file_type":"arm64","macos_deployment_target":"11.0"}]' >> "${GITHUB_OUTPUT}"
+            echo 'platforms=[{"platform":"linux-x86_64","runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","file_type":"x86-64","macos_deployment_target":""}]' >> "${GITHUB_OUTPUT}"
           else
             echo 'platforms=[{"platform":"linux-x86_64","runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","file_type":"x86-64","macos_deployment_target":""},{"platform":"linux-aarch64","runner":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","file_type":"aarch64","macos_deployment_target":""},{"platform":"macos-x86_64","runner":"macos-26-intel","target":"x86_64-apple-darwin","file_type":"x86_64","macos_deployment_target":"11.0"},{"platform":"macos-aarch64","runner":"macos-26","target":"aarch64-apple-darwin","file_type":"arm64","macos_deployment_target":"11.0"}]' >> "${GITHUB_OUTPUT}"
           fi
