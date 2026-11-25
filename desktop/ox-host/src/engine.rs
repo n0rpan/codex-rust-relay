@@ -492,6 +492,9 @@ impl Engine {
                 call,
             } => {
                 let reply = Replier::Client(id, key);
+                if matches!(call, ParentCall::ReadThread { .. }) {
+                    return self.read_thread(&Caller::External(caller), call, reply);
+                }
                 let result = caller
                     .project
                     .canonicalize()
