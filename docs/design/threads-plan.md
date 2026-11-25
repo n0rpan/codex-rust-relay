@@ -106,3 +106,22 @@ SIGKILLed right after `turn/completed` with no flush (`jobs.rs:725`).
 
 Hardware/human check after wave 1 and wave 2. Rerun the original dogfood: Claude thread in OX → Gemini
 worker → `cd` → screenshots → End session; check that no process survives.
+
+## Progress log (hand-off point — keep current)
+
+How to continue (any agent or a human):
+- Worktree `~/Work/ox-wt-dogfood`, branch `fix/ox-thread-dogfood`, one PR for all waves. Rebase on
+  `origin/main` before starting a wave; never work in `~/Work/ox` (live agents use it).
+- Build/test with shared caches: root `CARGO_TARGET_DIR=~/Work/ox/target cargo test -q`;
+  desktop `cd desktop && CARGO_TARGET_DIR=~/Work/ox/desktop/target cargo test -q -p ox-desk-core -p ox-host`
+  (add `-p ox-desktop -p ox-host-web` when those change), plus `cargo clippy --all-targets` and `cargo fmt --all` in both.
+- Per wave: implement → self-review the diff (correctness against the finding's scenario, a regression
+  test per bug) → fix review findings → tests green → one commit per wave → update this log.
+- Bug details and scenarios: `bug-hunt-findings.json` (match on file + title). UI items: `polish-plan.md` §4 numbers.
+
+| Date | Wave | State | Commit | Notes |
+|---|---|---|---|---|
+| 2026-11-25 | 0 dogfood fixes | done | 767c454 | rebased on c8ff6a1 (#8 CI hardening) |
+| 2026-11-25 | 1 bugs 1–5, 7, 12 + polish wave 1 | in progress | — | |
+| | 2 session control + bugs 6, 8–11 + polish wave 2 | todo | — | |
+| | 3 polish waves 3–4 + lows | todo | — | |
