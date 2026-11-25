@@ -14,7 +14,7 @@ use std::{
     env,
     ffi::OsString,
     io,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::PermissionsExt,
     path::PathBuf,
     sync::{
         Arc,
@@ -22,58 +22,24 @@ use std::{
     },
 };
 
-type FileIdentity = (u64, u64, u64, i64, i64, i64, i64);
 pub(crate) struct Prepared {
     alias: Vec<String>,
     provider: Option<String>,
     pub routes: Vec<Route>,
     pub yolo_grant_projects: Vec<PathBuf>,
-    inputs: Option<[Option<FileIdentity>; 4]>,
+    inputs: Option<ox::RouteInputs>,
     when: std::time::Instant,
-}
-fn route_inputs() -> Option<[Option<FileIdentity>; 4]> {
-    let home = env::var_os("CODEX_HOME")
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|p| PathBuf::from(p).join(".codex")))?;
-    let mut ids = [None; 4];
-    for (i, name) in [
-        "codeox.toml",
-        "config.toml",
-        "ox-api-keys.json",
-        "ox-favorites.json",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        match std::fs::metadata(home.join(name)) {
-            Ok(m) => {
-                ids[i] = Some((
-                    m.dev(),
-                    m.ino(),
-                    m.len(),
-                    m.mtime(),
-                    m.mtime_nsec(),
-                    m.ctime(),
-                    m.ctime_nsec(),
-                ))
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-            Err(_) => return None,
-        }
-    }
-    Some(ids)
 }
 impl Prepared {
     fn current(&self) -> bool {
         self.when.elapsed() < std::time::Duration::from_secs(5)
             && self.inputs.is_some()
-            && self.inputs == route_inputs()
+            && self.inputs == ox::route_inputs()
     }
 }
 #[derive(Default)]
 struct CatalogCache {
-    key: Option<(PathBuf, Option<[Option<FileIdentity>; 4]>)>,
+    key: Option<(PathBuf, Option<ox::RouteInputs>)>,
     at: Option<std::time::Instant>,
     models: Vec<String>,
     loading: bool,
@@ -163,9 +129,9 @@ impl RuntimeConfig {
             .collect()
     }
     pub(crate) fn prepare(&self) -> io::Result<Prepared> {
-        let before = route_inputs();
+        let before = ox::route_inputs();
         let s = ox::snapshot(&self.ox, &self.path).map_err(io::Error::other)?;
-        let after = route_inputs();
+        let after = ox::route_inputs();
         // Stars only order: the snapshot's static and starred aliases first, then every other
         // catalog alias. Discovery asks the providers, so it runs off the caller's thread and
         // the list fills in once it lands.
@@ -190,7 +156,7 @@ impl RuntimeConfig {
     }
     /// `base` followed by the cached discovered catalog; stale or missing entries start a
     /// background refresh (one at a time) and never block the caller.
-    fn catalog(&self, base: &[String], inputs: Option<[Option<FileIdentity>; 4]>) -> Vec<String> {
+    fn catalog(&self, base: &[String], inputs: Option<ox::RouteInputs>) -> Vec<String> {
         const FRESH: std::time::Duration = std::time::Duration::from_secs(120);
         let mut cache = CATALOG.lock().unwrap_or_else(|e| e.into_inner());
         let key = (self.ox.clone(), inputs);

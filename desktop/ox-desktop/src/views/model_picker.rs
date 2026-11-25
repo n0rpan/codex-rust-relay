@@ -393,17 +393,15 @@ impl ModelPicker {
             },
         )];
         search.read(cx).focus_handle(cx).focus(window, cx);
-        let task = cx.background_spawn(async {
-            settings::load().map(|s| (s.favorites, s.models, s.api_provider.is_some()))
-        });
+        let task = cx.background_spawn(async { settings::picker_settings() });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok((favorites, aliases, providers)) => {
-                        this.favorites = favorites;
-                        this.providers = providers;
-                        this.add_aliases(aliases);
+                    Ok(settings) => {
+                        this.favorites = settings.favorites;
+                        this.providers = settings.providers;
+                        this.add_aliases(settings.aliases);
                     }
                     Err(error) => this.notice = Some(error),
                 }
