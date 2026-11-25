@@ -100,7 +100,13 @@ pub fn chip(
     click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Button {
     let value: SharedString = value.into();
-    Button::new(id)
+    let id: ElementId = id.into();
+    let probe: SharedString = if value.is_empty() {
+        label.into()
+    } else {
+        format!("{label} {value}").into()
+    };
+    let button = Button::new(id.clone())
         .ghost()
         .h(px(CHIP_HEIGHT))
         .px(px(SPACE_S))
@@ -132,7 +138,8 @@ pub fn chip(
                             .child(value),
                     )
                 }),
-        )
+        );
+    crate::platform::layout_probe::mark(button, &id, &probe, enabled)
 }
 
 /// A text input on the control grid: 32 px tall with the control radius.
