@@ -10,6 +10,9 @@ use std::{
 
 pub struct Sample {
     pub reset: bool,
+    /// Redraw every window after replying, so the client can wait for a frame
+    /// that reflects the state it just observed (`frame` in each window's entry).
+    pub refresh: bool,
     pub reply: mpsc::Sender<String>,
 }
 pub struct Socket {
@@ -30,13 +33,21 @@ impl Socket {
                 let Some(client) = address.as_pathname() else {
                     break;
                 };
-                let reset = match &command[..n] {
-                    b"snapshot" => false,
-                    b"reset" => true,
+                let (reset, refresh) = match &command[..n] {
+                    b"snapshot" => (false, false),
+                    b"reset" => (true, false),
+                    b"frame" => (false, true),
                     _ => continue,
                 };
                 let (reply, result) = mpsc::channel();
-                if send.send(Sample { reset, reply }).is_err() {
+                if send
+                    .send(Sample {
+                        reset,
+                        refresh,
+                        reply,
+                    })
+                    .is_err()
+                {
                     break;
                 }
                 if let Ok(payload) = result.recv() {

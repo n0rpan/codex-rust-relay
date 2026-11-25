@@ -212,6 +212,15 @@ impl Host {
                         if sample.reset {
                             s.measure_from = Some(window.frame_duration_snapshot());
                         }
+                        if sample.refresh {
+                            window.refresh();
+                            let main = window.window_handle().window_id();
+                            for other in cx.windows() {
+                                if other.window_id() != main {
+                                    let _ = other.update(cx, |_, window, _| window.refresh());
+                                }
+                            }
+                        }
                     })
                     .is_err()
                 {
@@ -265,7 +274,13 @@ impl Host {
             unknown += pane.store.as_ref().map_or(0, |s| s.unknown_frames());
         }
         let active = self.panes[self.active].read(cx).store.as_ref();
+        let (windows, layout) = crate::kit::layout_probe::snapshot();
+        let settings = self
+            .preferences
+            .as_ref()
+            .map(|p| p.read(cx).probe_state(cx));
         serde_json::json!({
+            "windows": windows, "layout": layout, "settings": settings,
             "saved_sessions":self.discovery.rows.len(),"discovery_pending":self.discovery.pending,
             "connected":active.is_some_and(|s|s.state()==&Connection::Ready),
             "pane": self.active, "selected_thread": active.and_then(|s|s.selected()), "catalog_len": active.map_or(0, |s|s.threads().len()),
