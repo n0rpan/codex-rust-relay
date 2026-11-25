@@ -12,11 +12,13 @@ use ox_desk_core::actions::Action;
 pub(super) enum ThreadEdit {
     Name(String, Entity<InputState>),
     Archive(String),
+    /// End a busy thread (a running turn, approval or worker), after confirmation.
+    End(String),
 }
 impl ThreadEdit {
     fn owner(&self) -> &str {
         match self {
-            Self::Name(id, _) | Self::Archive(id) => id,
+            Self::Name(id, _) | Self::Archive(id) | Self::End(id) => id,
         }
     }
 }
@@ -32,10 +34,26 @@ impl Workbench {
                 Action::RenameThread(id.clone(), name.to_string())
             }
             Some(ThreadEdit::Archive(id)) => Action::ArchiveThread(id.clone()),
+            Some(ThreadEdit::End(id)) => Action::EndSession(id.clone()),
             None => return,
         };
         self.thread_edit = None;
         self.action(cx, action);
+    }
+    /// End a thread's live process. A busy thread (running turn, pending approval or
+    /// running worker) asks first, inline, because ending it cancels that work.
+    pub(crate) fn request_end(&mut self, id: String, cx: &mut Context<Self>) {
+        let busy = self
+            .store
+            .as_ref()
+            .is_some_and(|store| store.thread_busy(&id))
+            || self.running_workers(&id, cx) > 0;
+        if busy {
+            self.thread_edit = Some(ThreadEdit::End(id));
+            cx.notify();
+        } else {
+            self.action(cx, Action::EndSession(id));
+        }
     }
     pub(super) fn thread_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let id = self.store.as_ref()?.selected()?.to_owned();
@@ -60,6 +78,7 @@ impl Workbench {
             let (input, label) = match edit {
                 ThreadEdit::Name(_, state) => (Some(Input::new(state)), "Save name"),
                 ThreadEdit::Archive(_) => (None, "Archive this thread"),
+                ThreadEdit::End(_) => (None, "End running session"),
             };
             return Some(
                 row()
@@ -184,7 +203,7 @@ impl Workbench {
                 ))
                 .when(can_end, |menu| menu.item(
                     PopupMenuItem::new("End session").on_click(move |_, _, cx| {
-                        let _ = end.update(cx, |s, cx| s.action(cx, Action::EndSession(ended.clone())));
+                        let _ = end.update(cx, |s, cx| s.request_end(ended.clone(), cx));
                     }),
                 ))
             })

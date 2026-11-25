@@ -219,10 +219,15 @@ impl Workbench {
         let granted = key
             .and_then(|id| store.session_mark(id, "yolo_grant"))
             .is_some_and(|v| v == true);
+        // A live grant shows on the chip whatever the session's current mode is.
         let value = match (key, mode) {
             (Some(_), Some(m)) if granted && m.bypasses_permissions() => {
                 "YOLO + workers".to_owned()
             }
+            (Some(_), Some(m)) if granted => {
+                format!("{} · YOLO allowed for workers", m.label())
+            }
+            (Some(_), None) if granted => "YOLO allowed for workers".to_owned(),
             (None, Some(m)) => format!("Next thread · {}", m.label()),
             (_, Some(m)) => m.label().to_owned(),
             _ => String::new(),
@@ -241,7 +246,10 @@ impl Workbench {
         let owner = selected.clone();
         let view = cx.weak_entity();
         let presets = Access::choices(self.route.runtime);
-        let grant_offer = key.is_some() && effective.is_some_and(Access::bypasses_permissions);
+        // The grant menu (and its Revoke) follows the grant, not the current mode, so a
+        // grant stays visible and revocable after the session drops back to Default.
+        let grant_offer =
+            key.is_some() && (granted || effective.is_some_and(Access::bypasses_permissions));
         let access = crate::kit::chip(
             p,
             "access-preset",

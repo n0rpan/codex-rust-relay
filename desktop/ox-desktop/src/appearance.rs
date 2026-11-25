@@ -373,6 +373,18 @@ fn migrate(mut behavior: Behavior) -> Behavior {
     behavior
 }
 
+/// The saved preference as the UI uses it. A legacy value is rewritten once, against the
+/// revision read from disk, so the migrated value is what the file holds. Later saves
+/// compare with the migrated value and no longer report "changed on another device".
+fn settled(snapshot: ox_desk_core::desktop_behavior::Snapshot) -> Behavior {
+    let migrated = migrate(snapshot.behavior);
+    if migrated != snapshot.behavior {
+        // A concurrent change wins the race; the watcher then loads that value.
+        let _ = ox_desk_core::desktop_behavior::write(&snapshot.revision, migrated);
+    }
+    migrated
+}
+
 pub fn observe_window(window: &mut gpui::Window) {
     window
         .observe_window_appearance(|_, cx| {
@@ -389,11 +401,11 @@ pub fn refresh(cx: &mut App) {
     cx.refresh_windows();
 }
 pub fn init(cx: &mut App) {
-    cx.set_global(Active(migrate(
+    cx.set_global(Active(
         ox_desk_core::desktop_behavior::read()
-            .map(|s| s.behavior)
+            .map(settled)
             .unwrap_or_default(),
-    )));
+    ));
     watch_behavior(cx);
     refresh(cx);
     #[cfg(target_os = "linux")]
@@ -480,7 +492,7 @@ fn watch_behavior(cx: &mut App) {
                 .await;
             if let Ok(next) = next {
                 cx.update(|cx| {
-                    let next = migrate(next.behavior);
+                    let next = settled(next);
                     if cx.global::<Active>().0 != next {
                         cx.set_global(Active(next));
                         refresh(cx);
@@ -495,6 +507,34 @@ fn watch_behavior(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_font_size_is_saved_once_so_the_next_save_is_not_a_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: this is the only test in this crate that reads the state directory.
+        unsafe { std::env::set_var("XDG_STATE_HOME", dir.path()) };
+        let path = ox_desk_core::desktop_behavior::path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"font_size":19}"#).unwrap();
+
+        let active = settled(ox_desk_core::desktop_behavior::read().unwrap());
+        assert_eq!(active.font_size, 18);
+        // The file now holds the migrated size, so the page's next save (which compares
+        // with the value it shows) is applied rather than reported as a conflict.
+        let saved = ox_desk_core::desktop_behavior::read().unwrap();
+        assert_eq!(saved.behavior.font_size, 18);
+        let outcome = ox_desk_core::desktop_behavior::write(
+            &ox_desk_core::desktop_behavior::revision(active),
+            Behavior {
+                font_size: 20,
+                ..active
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            ox_desk_core::desktop_behavior::Outcome::Applied
+        ));
+    }
     #[test]
     fn maps_both_generations_and_derives_readable_colors() {
         let modern = Palette::parse(

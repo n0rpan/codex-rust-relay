@@ -6,7 +6,7 @@ use ox_desk_core::{
     links::LinkEvent,
     store::{Profile, Route, Store, ThreadRow, replica},
 };
-use ox_host_service::{Paths, ensure_running};
+use ox_host_service::{Paths, ensure_running, is_running};
 use std::{
     collections::HashSet,
     io::{self, BufRead, BufReader, BufWriter, Read, Write},
@@ -48,9 +48,27 @@ fn read_frame(input: &mut BufReader<UnixStream>) -> io::Result<Server> {
 fn connect() -> io::Result<(BufReader<UnixStream>, UnixStream)> {
     handshake().map(|(input, socket, _)| (input, socket))
 }
+/// Shown when the host is not up. Polls treat it as a quiet state, not an error.
+pub(crate) const HOST_NOT_RUNNING: &str = "Session host not running";
+
 fn handshake() -> io::Result<(BufReader<UnixStream>, UnixStream, Vec<String>)> {
     let paths = Paths::discover()?;
     ensure_running(&paths)?;
+    open_handshake(&paths)
+}
+/// Connects to a host that is already up and never starts one, so a background poll
+/// cannot revive a host the user stopped.
+fn connect_existing() -> io::Result<(BufReader<UnixStream>, UnixStream)> {
+    let paths = Paths::discover()?;
+    if !is_running(&paths)? {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            HOST_NOT_RUNNING,
+        ));
+    }
+    open_handshake(&paths).map(|(input, socket, _)| (input, socket))
+}
+fn open_handshake(paths: &Paths) -> io::Result<(BufReader<UnixStream>, UnixStream, Vec<String>)> {
     let mut socket = UnixStream::connect(&paths.socket)?;
     socket.set_read_timeout(Some(Duration::from_secs(15)))?;
     write_frame(&mut socket, &Client::Hello { version: VERSION })?;
@@ -189,7 +207,7 @@ pub(crate) fn discover() -> io::Result<CatalogResult> {
 
 /// The live processes the host runs, newest first. A one-shot request on its own socket.
 pub(crate) fn list_processes() -> io::Result<Vec<ProcessView>> {
-    let (mut input, mut socket) = connect()?;
+    let (mut input, mut socket) = connect_existing()?;
     write_frame(
         &mut socket,
         &Client::ListProcesses {

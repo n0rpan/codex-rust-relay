@@ -1141,22 +1141,50 @@ impl ResponseTranslator {
         events.push(self.event(kind.delta_event(), delta));
     }
 
-    /// Track one `tool_calls[]` delta.
-    /// A `call_id` for a tool call that announces without one. It is derived
-    /// from the output index, which is unique within the response, and skips
-    /// any ID another item already holds.
+    /// The `call_id` for a tool call that must be announced before the upstream
+    /// sent one. It is scoped to this response, so calls in different responses
+    /// never share it, and it skips any ID another item already holds.
     fn fallback_call_id(&self, output_index: usize) -> String {
-        let mut candidate = format!("call_{output_index}");
+        let base = format!("call_{}_{output_index}", self.response_id);
+        let mut candidate = base.clone();
         let mut suffix = 1;
         while self
             .items
             .iter()
             .any(|item| matches!(item, StreamItem::Tool(tool) if tool.call_id == candidate))
         {
-            candidate = format!("call_{output_index}_{suffix}");
+            candidate = format!("{base}_{suffix}");
             suffix += 1;
         }
         candidate
+    }
+
+    /// Announce a named tool call and return its `response.output_item.added`
+    /// event. A call that still has no upstream ID gets a generated one here, and
+    /// that ID is fixed from now on: the announce, deltas and done item all use it.
+    fn announce_tool(&mut self, index: usize) -> Value {
+        let (output_index, fallback) = match &self.items[index] {
+            StreamItem::Tool(tool) if tool.call_id.is_empty() => (
+                tool.output_index,
+                Some(self.fallback_call_id(tool.output_index)),
+            ),
+            StreamItem::Tool(tool) => (tool.output_index, None),
+            StreamItem::Message(_) => unreachable!("announce_tool is only called for tool items"),
+        };
+        let tool = match &mut self.items[index] {
+            StreamItem::Tool(tool) => tool,
+            StreamItem::Message(_) => unreachable!("announce_tool is only called for tool items"),
+        };
+        if let Some(fallback) = fallback {
+            tool.call_id = fallback;
+        }
+        tool.item_id = format!("fc_{}", tool.call_id);
+        tool.announced = true;
+        let item = tool.value("in_progress", "");
+        let mut added = Map::new();
+        added.insert("output_index".into(), json!(output_index));
+        added.insert("item".into(), item);
+        self.event("response.output_item.added", added)
     }
 
     fn push_tool_call(&mut self, call: &Value, events: &mut Vec<Value>) -> Result<(), String> {
@@ -1197,11 +1225,6 @@ impl ResponseTranslator {
             }
         };
 
-        let output_index = match &self.items[position] {
-            StreamItem::Tool(tool) => tool.output_index,
-            StreamItem::Message(_) => unreachable!("position matched a tool item"),
-        };
-        let fallback_call_id = self.fallback_call_id(output_index);
         let mut announce = None;
         {
             let tool = match &mut self.items[position] {
@@ -1227,24 +1250,18 @@ impl ResponseTranslator {
             if !arguments.is_empty() {
                 tool.arguments.push_str(arguments);
             }
-            if !tool.announced && !tool.name.is_empty() {
-                // Without an upstream ID at announce time, the call gets a
-                // generated one. It is fixed from here on: a real ID that
-                // arrives in a later delta is ignored, so the announce, delta
-                // and done items all agree.
-                if tool.call_id.is_empty() {
-                    tool.call_id = fallback_call_id;
-                }
-                tool.item_id = format!("fc_{}", tool.call_id);
-                tool.announced = true;
-                announce = Some((tool.output_index, tool.value("in_progress", "")));
+            // Announce once the call has a name and either its upstream ID or some
+            // arguments. A name that arrives before its ID waits for that ID, so the
+            // real one is kept; only arguments that start first force a fallback ID.
+            if !tool.announced
+                && !tool.name.is_empty()
+                && (!tool.call_id.is_empty() || !tool.arguments.is_empty())
+            {
+                announce = Some(position);
             }
         }
-        if let Some((output_index, item)) = announce {
-            let mut added = Map::new();
-            added.insert("output_index".into(), json!(output_index));
-            added.insert("item".into(), item);
-            events.push(self.event("response.output_item.added", added));
+        if let Some(index) = announce {
+            events.push(self.announce_tool(index));
         }
 
         let mut pending = None;
@@ -1283,7 +1300,7 @@ impl ResponseTranslator {
                 .retain(|item| matches!(item, StreamItem::Message(_)));
         }
         if let Some(tool) = self.items.iter().find_map(|item| match item {
-            StreamItem::Tool(tool) if !tool.announced => Some(tool),
+            StreamItem::Tool(tool) if !tool.announced && tool.name.is_empty() => Some(tool),
             _ => None,
         }) {
             return Err(format!(
@@ -1291,8 +1308,21 @@ impl ResponseTranslator {
                 tool.chunk_index
             ));
         }
-        let items = std::mem::take(&mut self.items);
+        // A named call that never reached an ID or arguments is announced now.
         let mut events = Vec::new();
+        let unannounced: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| match item {
+                StreamItem::Tool(tool) if !tool.announced => Some(index),
+                _ => None,
+            })
+            .collect();
+        for index in unannounced {
+            events.push(self.announce_tool(index));
+        }
+        let items = std::mem::take(&mut self.items);
         for item in items {
             match item {
                 StreamItem::Message(message) => {
@@ -1437,5 +1467,83 @@ fn error_message(data: &str) -> String {
         }
         Ok(Value::String(message)) => message,
         _ => data.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tool_call_id_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn chunk(tool_calls: Value) -> String {
+        json!({"choices": [{"index": 0, "delta": {"tool_calls": tool_calls}}]}).to_string()
+    }
+
+    fn finish_chunk() -> String {
+        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}).to_string()
+    }
+
+    /// Every event whose `type` is `kind`, in order.
+    fn of_type<'a>(events: &'a [Value], kind: &str) -> Vec<&'a Value> {
+        events.iter().filter(|e| e["type"] == kind).collect()
+    }
+
+    #[test]
+    fn a_name_that_arrives_before_its_id_keeps_the_real_id() {
+        let mut translator = ResponseTranslator::new("resp_a", "m", 0);
+        let mut events = translator
+            .push_event(
+                "",
+                &chunk(json!([{"index": 0, "function": {"name": "shell"}}])),
+            )
+            .unwrap();
+        // Nothing is announced yet: the call has no ID and no arguments.
+        assert!(of_type(&events, "response.output_item.added").is_empty());
+        events = translator
+            .push_event(
+                "",
+                &chunk(json!([{"index": 0, "id": "call_real", "function": {"arguments": "{}"}}])),
+            )
+            .unwrap();
+        let added = of_type(&events, "response.output_item.added");
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0]["item"]["call_id"], "call_real");
+        events.extend(translator.push_event("", &finish_chunk()).unwrap());
+        let done = of_type(&events, "response.output_item.done");
+        assert_eq!(done[0]["item"]["call_id"], "call_real");
+        assert_eq!(done[0]["item"]["name"], "shell");
+    }
+
+    #[test]
+    fn fallback_ids_are_unique_across_responses() {
+        let call = chunk(json!([{"index": 0, "function": {"name": "shell", "arguments": "{}"}}]));
+        let mut first = ResponseTranslator::new("resp_one", "m", 0);
+        let mut second = ResponseTranslator::new("resp_two", "m", 0);
+        let mut ids = Vec::new();
+        for translator in [&mut first, &mut second] {
+            let mut events = translator.push_event("", &call).unwrap();
+            events.extend(translator.push_event("", &finish_chunk()).unwrap());
+            let done = of_type(&events, "response.output_item.done");
+            ids.push(done[0]["item"]["call_id"].as_str().unwrap().to_owned());
+        }
+        assert!(ids[0].starts_with("call_"), "{ids:?}");
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn a_call_without_any_id_still_completes_with_a_fallback() {
+        let mut translator = ResponseTranslator::new("resp_c", "m", 0);
+        let mut events = translator
+            .push_event(
+                "",
+                &chunk(json!([{"index": 0, "function": {"name": "shell", "arguments": "{}"}}])),
+            )
+            .unwrap();
+        events.extend(translator.push_event("", &finish_chunk()).unwrap());
+        let added = of_type(&events, "response.output_item.added");
+        let done = of_type(&events, "response.output_item.done");
+        let call_id = added[0]["item"]["call_id"].as_str().unwrap();
+        assert!(call_id.starts_with("call_resp_c_"), "{call_id}");
+        assert_eq!(done[0]["item"]["call_id"], call_id);
     }
 }

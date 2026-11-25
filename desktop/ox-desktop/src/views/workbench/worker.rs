@@ -49,6 +49,12 @@ impl Workbench {
     }
 
     /// "2 workers running" under the parent's activity line, linking to the first one.
+    /// Workers running under a thread, at any depth.
+    pub(super) fn running_workers(&self, id: &str, cx: &App) -> usize {
+        cx.try_global::<TreeIndex>()
+            .and_then(|index| index.0.get(&(self.project.clone(), id.to_owned())))
+            .map_or(0, |tree| tree.running)
+    }
     pub(super) fn workers_line(&self, p: Palette, cx: &mut Context<Self>) -> Option<AnyElement> {
         let store = self.store.as_ref()?;
         let id = store.selected()?;

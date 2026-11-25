@@ -96,6 +96,8 @@ pub(super) struct Discovery {
     removed: HashMap<Scope, HashMap<PathBuf, HashSet<String>>>,
     /// Parents whose child rows are folded away, by project and thread id.
     pub collapsed: HashSet<(PathBuf, String)>,
+    /// Each indexed child's parent, by project and thread id, from the last index.
+    pub parents: HashMap<(PathBuf, String), (PathBuf, String)>,
 }
 
 /// What a parent session has under it, counted over all descendants.
@@ -114,6 +116,25 @@ pub(crate) struct Tree {
 #[derive(Default)]
 pub(crate) struct TreeIndex(pub HashMap<(PathBuf, String), Tree>);
 impl gpui::Global for TreeIndex {}
+
+/// Unfolds every collapsed ancestor of `start`. Returns whether any fold was removed.
+/// Bounded by the parent map's size, so a malformed parent cycle cannot spin.
+fn unfold_ancestors(
+    parents: &HashMap<(PathBuf, String), (PathBuf, String)>,
+    collapsed: &mut HashSet<(PathBuf, String)>,
+    start: (PathBuf, String),
+) -> bool {
+    let mut unfolded = false;
+    let mut at = start;
+    for _ in 0..parents.len() {
+        let Some(parent) = parents.get(&at).cloned() else {
+            break;
+        };
+        unfolded |= collapsed.remove(&parent);
+        at = parent;
+    }
+    unfolded
+}
 
 /// A child's parent link survives a merge with a richer row that has none.
 fn keep_parent(known: Option<String>, incoming: Option<String>) -> Option<String> {
@@ -458,13 +479,19 @@ impl Host {
                     .map(str::to_owned),
             )
         };
-        // The target may be a worker folded under the session being viewed.
-        if let Some(selected) = selected
-            && self
-                .discovery
+        // The target may be a worker folded under the session being viewed, or under
+        // any other folded ancestor. Unfold the whole chain so its row shows.
+        let mut unfolded = selected.is_some_and(|selected| {
+            self.discovery
                 .collapsed
                 .remove(&(project.clone(), selected))
-        {
+        });
+        unfolded |= unfold_ancestors(
+            &self.discovery.parents,
+            &mut self.discovery.collapsed,
+            (project.clone(), id.clone()),
+        );
+        if unfolded {
             self.discovery.revision += 1;
             self.index_catalog(cx);
         }
@@ -580,6 +607,7 @@ impl Host {
         });
         let mut roots = Vec::new();
         let mut children = HashMap::new();
+        let mut parents: HashMap<(PathBuf, String), (PathBuf, String)> = HashMap::new();
         // A host-owned worker runs on its own route. Its origin names a parent
         // session on another route of the same project.
         let by_id: HashMap<_, _> = entries
@@ -593,11 +621,19 @@ impl Host {
                 && let Some((key, _)) =
                     entries.get_key_value(&(key.0.clone(), key.1, parent.clone(), key.3.clone()))
             {
+                parents.insert(
+                    (node.0.0.clone(), node.0.2.clone()),
+                    (key.0.clone(), key.2.clone()),
+                );
                 children.entry(key).or_insert_with(Vec::new).push(node);
             } else if let Some(parent) = parent
                 && let Some(owner) = by_id.get(&(key.0.as_path(), parent.as_str()))
                 && *owner != key
             {
+                parents.insert(
+                    (node.0.0.clone(), node.0.2.clone()),
+                    (owner.0.clone(), owner.2.clone()),
+                );
                 children.entry(*owner).or_insert_with(Vec::new).push(node);
             } else {
                 roots.push(node);
@@ -610,6 +646,7 @@ impl Host {
             self.walk_tree(key, &children, cx, &mut tree);
         }
         cx.set_global(TreeIndex(tree));
+        self.discovery.parents = parents;
         let mut catalog = Vec::new();
         let mut previous = None;
         let mut ordinal = 0;
@@ -645,6 +682,42 @@ impl Host {
             }
         }
         self.catalog = catalog;
+    }
+}
+
+#[cfg(test)]
+mod unfold_tests {
+    use super::unfold_ancestors;
+    use std::collections::{HashMap, HashSet};
+    use std::path::PathBuf;
+
+    fn key(id: &str) -> (PathBuf, String) {
+        (PathBuf::from("/work/app"), id.to_owned())
+    }
+
+    #[test]
+    fn unfolds_every_collapsed_ancestor_of_a_folded_worker() {
+        // grandchild G sits under child C, which sits under parent P.
+        let parents = HashMap::from([(key("G"), key("C")), (key("C"), key("P"))]);
+        let mut collapsed = HashSet::from([key("C"), key("P")]);
+        assert!(unfold_ancestors(&parents, &mut collapsed, key("G")));
+        assert!(collapsed.is_empty());
+    }
+
+    #[test]
+    fn reports_nothing_to_do_without_folded_ancestors() {
+        let parents = HashMap::from([(key("G"), key("C"))]);
+        let mut collapsed = HashSet::from([key("X")]);
+        assert!(!unfold_ancestors(&parents, &mut collapsed, key("G")));
+        assert_eq!(collapsed, HashSet::from([key("X")]));
+    }
+
+    #[test]
+    fn a_parent_cycle_terminates() {
+        let parents = HashMap::from([(key("A"), key("B")), (key("B"), key("A"))]);
+        let mut collapsed = HashSet::from([key("B")]);
+        assert!(unfold_ancestors(&parents, &mut collapsed, key("A")));
+        assert!(collapsed.is_empty());
     }
 }
 

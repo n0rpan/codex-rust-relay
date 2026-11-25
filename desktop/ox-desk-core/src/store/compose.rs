@@ -498,6 +498,7 @@ impl Store {
         t.ready = false;
         t.verified = false;
         t.loading = false;
+        t.active_turn = None;
         t.error = None;
         self.ended_threads.insert(id.into());
         self.changed.transcript(id);
@@ -787,10 +788,12 @@ mod tests {
         let t = store.transcripts.entry(id.clone()).or_default();
         t.ready = true;
         t.verified = true;
+        t.active_turn = Some("turn-1".into());
         assert!(store.can_end_session(&id));
         store.end_session(&id).unwrap();
         let t = store.transcripts.get(&id).unwrap();
         assert!(!t.ready && !t.verified && !t.loading);
+        assert!(t.active_turn().is_none(), "an ended turn is not running");
         assert!(
             store
                 .pending

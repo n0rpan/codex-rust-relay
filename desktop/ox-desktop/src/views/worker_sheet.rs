@@ -217,7 +217,9 @@ impl Workbench {
         if store.state() != &Connection::Ready || store.in_terminal(&owner) {
             return;
         }
-        let choice = Choice::new(owner, &store.profile().route);
+        // The sheet starts from the route this session is on, not the window's route.
+        let route = store.thread_route(Some(&owner));
+        let choice = Choice::new(owner, &route);
         let launch = match kind {
             LaunchKind::Worker => {
                 let task = cx.new(|cx| {

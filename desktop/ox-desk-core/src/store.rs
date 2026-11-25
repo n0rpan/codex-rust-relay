@@ -249,6 +249,7 @@ impl Store {
         }
         self.child_threads = std::mem::take(&mut previous.child_threads);
         self.terminal_threads = std::mem::take(&mut previous.terminal_threads);
+        self.ended_threads = previous.ended_threads.clone();
         self.authorized_models = std::mem::take(&mut previous.authorized_models);
         self.next_options = previous.next_options.take();
         self.selected = previous.selected.clone();
@@ -257,7 +258,10 @@ impl Store {
             .transcripts
             .iter()
             .filter(|(id, t)| {
-                self.selected.as_ref() == Some(*id) || t.active_turn().is_some() || t.is_loading()
+                !previous.ended_threads.contains(*id)
+                    && (self.selected.as_ref() == Some(*id)
+                        || t.active_turn().is_some()
+                        || t.is_loading())
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -567,9 +571,10 @@ impl Store {
                     row.status = None;
                 }
                 for (id, thread) in &mut self.transcripts {
-                    if thread.active_turn.take().is_some()
+                    if (thread.active_turn.take().is_some()
                         || thread.is_loading()
-                        || self.selected.as_ref() == Some(id)
+                        || self.selected.as_ref() == Some(id))
+                        && !self.ended_threads.contains(id)
                     {
                         self.reopen.push(id.clone());
                     }
@@ -659,7 +664,16 @@ impl Store {
                         self.listing = false;
                         self.catalog_revision += 1;
                         if cursor.is_none() {
-                            self.catalog.keep(&self.created_while_listing);
+                            // Rows the listing returned stay, and so do the workers of those
+                            // parents (they live in subdirectories the page loop skips).
+                            let mut retained = self.created_while_listing.clone();
+                            retained.extend(
+                                page.data
+                                    .iter()
+                                    .filter(|row| row.cwd == self.profile.project)
+                                    .map(|row| row.id.clone()),
+                            );
+                            self.catalog.keep(&retained);
                         }
                         self.created_while_listing.clear();
                         for row in page.data {

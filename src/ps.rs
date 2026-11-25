@@ -96,6 +96,7 @@ pub(crate) fn run_end(args: &[OsString]) -> Result<u8, RelayError> {
     let rows = parse_rows(&host.processes()?)?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let sessions = sessions(&rows, home.as_deref());
+    let width = id_width(sessions.iter().map(|s| s.thread.as_str()));
     let targets: Vec<Session> = match &args.selector {
         Selector::Prefix(prefix) => {
             let index = resolve_prefix(&sessions, prefix)?;
@@ -123,9 +124,10 @@ pub(crate) fn run_end(args: &[OsString]) -> Result<u8, RelayError> {
     }
     host.subscribe_all()?;
     for session in &targets {
+        let shown = id_prefix(&session.thread, width);
         host.end(&session.scope, &session.thread)
-            .map_err(|e| format!("could not end {}: {e}", short_id(&session.thread)))?;
-        println!("ended {} ({})", short_id(&session.thread), session.label);
+            .map_err(|e| format!("could not end {shown}: {e}"))?;
+        println!("ended {shown} ({})", session.label);
     }
     Ok(0)
 }
@@ -214,17 +216,33 @@ fn resolve_prefix(sessions: &[Session], prefix: &str) -> Result<usize, String> {
                 "{prefix:?} matches {} sessions, so it is ambiguous. Use a longer prefix:",
                 many.len()
             );
+            let width = id_width(sessions.iter().map(|s| s.thread.as_str()));
             for &index in many {
                 let s = &sessions[index];
-                message.push_str(&format!("\n  {}  {}", short_id(&s.thread), s.label));
+                message.push_str(&format!("\n  {}  {}", id_prefix(&s.thread, width), s.label));
             }
             Err(message)
         }
     }
 }
 
-fn short_id(thread: &str) -> String {
-    thread.chars().take(SHORT_ID).collect()
+/// The shortest id prefix, at least `SHORT_ID` long, that tells every given thread
+/// apart from the others. Distinct ids always differ somewhere, so this never
+/// exceeds the full id.
+fn id_width<'a>(threads: impl IntoIterator<Item = &'a str>) -> usize {
+    let threads: Vec<&str> = threads.into_iter().collect();
+    let mut width = SHORT_ID;
+    for (i, a) in threads.iter().enumerate() {
+        for b in &threads[i + 1..] {
+            let shared = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+            width = width.max(shared + 1);
+        }
+    }
+    width
+}
+
+fn id_prefix(thread: &str, width: usize) -> String {
+    thread.chars().take(width).collect()
 }
 
 /// Seconds as `45s`, `12m`, `2h05m` or `3d04h`. Negative spans (clock skew) show as zero.
@@ -252,7 +270,7 @@ fn project_label(project: &Path, home: Option<&Path>) -> String {
     project.display().to_string()
 }
 
-fn cells(row: &Row, now: i64, home: Option<&Path>) -> [String; 7] {
+fn cells(row: &Row, now: i64, home: Option<&Path>, width: usize) -> [String; 7] {
     [
         row.kind.clone(),
         row.model.clone().unwrap_or_else(|| "-".to_owned()),
@@ -262,7 +280,7 @@ fn cells(row: &Row, now: i64, home: Option<&Path>) -> [String; 7] {
         (if row.running { "running" } else { "idle" }).to_owned(),
         row.threads
             .iter()
-            .map(|t| short_id(t))
+            .map(|t| id_prefix(t, width))
             .collect::<Vec<_>>()
             .join(","),
     ]
@@ -274,8 +292,12 @@ fn render_table(rows: &[Row], now: i64, home: Option<&Path>) -> String {
     if rows.is_empty() {
         return "No live sessions.\n".to_owned();
     }
+    let width = id_width(
+        rows.iter()
+            .flat_map(|row| row.threads.iter().map(String::as_str)),
+    );
     let mut table: Vec<[String; 7]> = vec![HEADERS.map(str::to_owned)];
-    table.extend(rows.iter().map(|row| cells(row, now, home)));
+    table.extend(rows.iter().map(|row| cells(row, now, home, width)));
     let mut widths = [0usize; 7];
     for line in &table {
         for (i, cell) in line.iter().enumerate() {
@@ -571,6 +593,27 @@ mod tests {
         assert!(error.contains("abc123"), "{error}");
         assert!(error.contains("abd456"), "{error}");
         assert!(resolve_prefix(&all, "abc").is_ok());
+    }
+
+    #[test]
+    fn ids_sharing_eight_characters_are_shown_long_enough_to_pick() {
+        let rows = [row(
+            "codex",
+            None,
+            false,
+            &[
+                "0196abcd-1111-7000-8000-000000000001",
+                "0196abcd-2222-7000-8000-000000000002",
+            ],
+        )];
+        let all = sessions(&rows, None);
+        let error = resolve_prefix(&all, "0196abcd").unwrap_err();
+        assert!(error.contains("0196abcd-1  codex"), "{error}");
+        assert!(error.contains("0196abcd-2  codex"), "{error}");
+        let table = render_table(&rows, 0, None);
+        assert!(table.contains("0196abcd-1,0196abcd-2"), "{table}");
+        assert_eq!(resolve_prefix(&all, "0196abcd-1").unwrap(), 0);
+        assert_eq!(resolve_prefix(&all, "0196abcd-2").unwrap(), 1);
     }
 
     #[test]

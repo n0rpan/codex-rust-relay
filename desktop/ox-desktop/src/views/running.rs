@@ -6,13 +6,18 @@ use crate::{
     appearance::Palette,
     kit::{button, col, row, small, toolbar_button},
     platform,
+    platform::HOST_NOT_RUNNING,
 };
 use gpui::{prelude::FluentBuilder, *};
 use ox_desk_core::host_protocol::{ProcessView, Scope};
 use std::{
+    io,
     path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+/// A process to end: its scope and every thread id it runs.
+type Target = (Scope, Vec<String>);
 
 const POLL: Duration = Duration::from_secs(5);
 
@@ -41,6 +46,20 @@ pub(crate) fn idle_rows(processes: &[ProcessView]) -> Vec<&ProcessView> {
     processes.iter().filter(|p| !p.running).collect()
 }
 
+/// The idle rows of a fresh snapshot that were also idle in the snapshot the user saw.
+/// A process that started a turn since then, or changed its threads, is left alone.
+pub(crate) fn still_idle(seen: &[Target], fresh: &[ProcessView]) -> Vec<Target> {
+    fresh
+        .iter()
+        .filter(|p| !p.running)
+        .filter(|p| {
+            seen.iter()
+                .any(|(scope, threads)| *scope == p.scope && *threads == p.threads)
+        })
+        .map(|p| (p.scope.clone(), p.threads.clone()))
+        .collect()
+}
+
 /// The last path component of a project, or the whole path when it has none.
 pub(crate) fn project_name(project: &Path) -> String {
     project
@@ -58,6 +77,13 @@ fn kind_label(kind: &str) -> &'static str {
     }
 }
 
+fn error_line(p: Palette, message: String) -> Div {
+    div()
+        .text_size(p.text(Step::Meta))
+        .text_color(rgb(p.error))
+        .child(message)
+}
+
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -71,7 +97,12 @@ pub struct Running {
     /// A refresh was requested while one was in flight; run it when that one lands.
     again: bool,
     ending: bool,
+    /// A failed refresh or poll. Cleared by the next successful refresh.
     error: Option<String>,
+    /// The last End that failed. Kept until dismissed or until the next End.
+    end_error: Option<String>,
+    /// A busy row whose End is waiting for the user to confirm.
+    confirm: Option<Target>,
     /// Set by the sidebar each time it draws. Polling stops while the panel is hidden.
     pub(super) shown: bool,
     _poll: Task<()>,
@@ -102,6 +133,8 @@ impl Running {
             again: false,
             ending: false,
             error: None,
+            end_error: None,
+            confirm: None,
             shown: false,
             _poll: poll,
         }
@@ -124,6 +157,11 @@ impl Running {
                         s.loaded = true;
                         s.error = None;
                     }
+                    Err(e) if e.kind() == io::ErrorKind::NotConnected => {
+                        // The host was stopped: nothing is running under it any more.
+                        s.processes.clear();
+                        s.error = Some(HOST_NOT_RUNNING.to_owned());
+                    }
                     Err(e) => s.error = Some(e.to_string()),
                 }
                 if std::mem::take(&mut s.again) {
@@ -135,14 +173,23 @@ impl Running {
         .detach();
     }
 
-    /// End the live process behind each group of threads, then refresh the list.
-    fn end(&mut self, groups: Vec<(Scope, Vec<String>)>, cx: &mut Context<Self>) {
-        if self.ending || groups.is_empty() {
+    /// End the processes `plan` picks, in the background, then refresh the list. `plan`
+    /// runs off the UI thread, so it may read the host first.
+    fn end(
+        &mut self,
+        plan: impl FnOnce() -> Result<Vec<Target>, String> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ending {
             return;
         }
         self.ending = true;
-        self.error = None;
+        self.end_error = None;
         let task = cx.background_spawn(async move {
+            let groups = match plan() {
+                Ok(groups) => groups,
+                Err(message) => return Some(message),
+            };
             let mut failure = None;
             for (scope, threads) in groups {
                 if let Err(e) = platform::end_threads(scope, threads) {
@@ -155,7 +202,7 @@ impl Running {
             let failure = task.await;
             let _ = this.update(cx, |s, cx| {
                 s.ending = false;
-                s.error = failure;
+                s.end_error = failure;
                 s.refresh(cx);
                 cx.notify();
             });
@@ -163,12 +210,32 @@ impl Running {
         .detach();
     }
 
+    /// End one row. A busy row is only ended after its inline confirmation.
+    fn end_row(&mut self, target: Target, busy: bool, cx: &mut Context<Self>) {
+        if busy {
+            self.confirm = Some(target);
+            cx.notify();
+        } else {
+            self.end(move || Ok(vec![target]), cx);
+        }
+    }
+
+    /// End every idle row, judged against a fresh host snapshot taken just before ending.
     fn end_all_idle(&mut self, cx: &mut Context<Self>) {
-        let groups = idle_rows(&self.processes)
+        let seen: Vec<Target> = idle_rows(&self.processes)
             .into_iter()
             .map(|p| (p.scope.clone(), p.threads.clone()))
             .collect();
-        self.end(groups, cx);
+        if seen.is_empty() {
+            return;
+        }
+        self.end(
+            move || {
+                let fresh = platform::list_processes().map_err(|e| e.to_string())?;
+                Ok(still_idle(&seen, &fresh))
+            },
+            cx,
+        );
     }
 }
 
@@ -182,14 +249,18 @@ impl Render for Running {
 
         let rows = self.processes.iter().enumerate().map(|(i, process)| {
             let view = view.clone();
-            let scope = process.scope.clone();
-            let threads = process.threads.clone();
             let model = process
                 .model
                 .clone()
                 .unwrap_or_else(|| process.route.clone());
             let end_enabled = !self.ending;
-            row()
+            let target: Target = (process.scope.clone(), process.threads.clone());
+            let busy = process.running;
+            let confirming = self.confirm.as_ref() == Some(&target);
+            let confirm_target = target.clone();
+            let end_target = target;
+            let row_view = view.clone();
+            let line = row()
                 .gap_2()
                 .items_start()
                 .min_w_0()
@@ -244,16 +315,55 @@ impl Render for Running {
                     p,
                     ElementId::from(format!("running-end-{i}")),
                     "End",
-                    end_enabled,
+                    end_enabled && !confirming,
                     move |_, _, cx| {
-                        let scope = scope.clone();
-                        let threads = threads.clone();
-                        let _ = view.update(cx, |s, cx| s.end(vec![(scope, threads)], cx));
+                        let target = end_target.clone();
+                        let _ = row_view.update(cx, |s, cx| s.end_row(target, busy, cx));
                     },
-                ))
+                ));
+            let confirm_view = view.clone();
+            let keep_view = view.clone();
+            col().gap_1().child(line).when(confirming, |c| {
+                c.child(
+                    row()
+                        .gap_2()
+                        .flex_wrap()
+                        .child(small(
+                            p,
+                            "This session is busy. Ending it stops its turn and workers.",
+                        ))
+                        .child(button(
+                            p,
+                            ElementId::from(format!("running-confirm-{i}")),
+                            "End session",
+                            true,
+                            end_enabled,
+                            move |_, _, cx| {
+                                let target = confirm_target.clone();
+                                let _ = confirm_view.update(cx, |s, cx| {
+                                    s.confirm = None;
+                                    s.end(move || Ok(vec![target]), cx);
+                                });
+                            },
+                        ))
+                        .child(toolbar_button(
+                            p,
+                            ElementId::from(format!("running-keep-{i}")),
+                            "Keep running",
+                            true,
+                            move |_, _, cx| {
+                                let _ = keep_view.update(cx, |s, cx| {
+                                    s.confirm = None;
+                                    cx.notify();
+                                });
+                            },
+                        )),
+                )
+            })
         });
 
         let header_view = view.clone();
+        let dismiss_view = view.clone();
         col()
             .flex_shrink_0()
             .px_2()
@@ -277,20 +387,40 @@ impl Render for Running {
                         },
                     )),
             )
-            // Without a reachable host (local-only desktop) there is nothing to list:
+            // Without a running host (local-only desktop) there is nothing to list:
             // say so quietly instead of repeating a red error every poll.
-            .when(!self.loaded && self.error.is_some(), |c| {
-                c.child(small(p, "Session host not running"))
+            .when(self.error.as_deref() == Some(HOST_NOT_RUNNING), |c| {
+                c.child(small(p, HOST_NOT_RUNNING))
             })
-            .when_some(self.error.clone().filter(|_| self.loaded), |c, message| {
+            .when_some(
+                self.error
+                    .clone()
+                    .filter(|e| e != HOST_NOT_RUNNING)
+                    .filter(|_| self.loaded),
+                |c, message| c.child(error_line(p, message)),
+            )
+            .when_some(self.end_error.clone(), |c, message| {
                 c.child(
-                    div()
-                        .text_size(p.text(Step::Meta))
-                        .text_color(rgb(p.error))
-                        .child(message),
+                    row()
+                        .gap_2()
+                        .min_w_0()
+                        .child(div().flex_1().min_w_0().child(error_line(p, message)))
+                        .child(button(
+                            p,
+                            "running-end-dismiss",
+                            "Dismiss",
+                            false,
+                            true,
+                            move |_, _, cx| {
+                                let _ = dismiss_view.update(cx, |s, cx| {
+                                    s.end_error = None;
+                                    cx.notify();
+                                });
+                            },
+                        )),
                 )
             })
-            .when(count == 0 && (self.loaded || self.error.is_none()), |c| {
+            .when(count == 0 && self.error.is_none(), |c| {
                 c.child(small(
                     p,
                     if self.loaded {
@@ -315,7 +445,7 @@ impl Render for Running {
 
 #[cfg(test)]
 mod tests {
-    use super::{idle_label, idle_rows, project_name, span};
+    use super::{idle_label, idle_rows, project_name, span, still_idle};
     use ox_desk_core::host_protocol::{ProcessView, Scope};
     use std::path::Path;
 
@@ -376,6 +506,28 @@ mod tests {
             vec![vec!["a".to_owned()], vec!["d".to_owned(), "e".to_owned()]]
         );
         assert!(idle_rows(&rows[1..2]).is_empty());
+    }
+
+    #[test]
+    fn end_all_idle_skips_rows_that_started_a_turn_since_the_snapshot() {
+        let seen = vec![process(&["a"], false, 0), process(&["d", "e"], false, 0)];
+        let seen: Vec<_> = idle_rows(&seen)
+            .into_iter()
+            .map(|p| (p.scope.clone(), p.threads.clone()))
+            .collect();
+        // "a" went busy after the snapshot, "d e" is still idle, and "f" is new and idle.
+        let fresh = vec![
+            process(&["a"], true, 0),
+            process(&["d", "e"], false, 0),
+            process(&["f"], false, 0),
+        ];
+        assert_eq!(
+            still_idle(&seen, &fresh),
+            vec![(fresh[1].scope.clone(), vec!["d".to_owned(), "e".to_owned()])]
+        );
+        // A process whose thread set changed is not the one the user saw.
+        let regrouped = vec![process(&["d"], false, 0)];
+        assert!(still_idle(&seen, &regrouped).is_empty());
     }
 
     #[test]

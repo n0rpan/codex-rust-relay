@@ -321,9 +321,13 @@ mod title_tests;
 #[cfg(test)]
 mod keep_tests {
     use super::super::{Connection, Profile, Route, Store, ThreadRow};
-    use crate::links::codex::{Launch, Link};
+    use crate::codex::{
+        frame::{Frame, RequestId},
+        history::ThreadPage,
+        reply::Reply,
+    };
+    use crate::links::codex::{Launch, Link, LinkEvent};
     use serde_json::json;
-    use std::collections::HashSet;
 
     fn store() -> Store {
         let project = std::env::temp_dir();
@@ -366,9 +370,17 @@ mod keep_tests {
         s.record_lineage(&row("unrelated", sub.clone(), Some("gone")));
         s.record_row(row("unrelated", sub, Some("gone")));
 
-        // The first page relists only the project-root parent.
-        let listed: HashSet<String> = ["parent".to_string()].into();
-        s.catalog.keep(&listed);
+        // A real refresh: the first page relists only the project-root parent.
+        s.list_more().unwrap();
+        let list = s.seq;
+        s.created_while_listing.clear();
+        s.apply(LinkEvent::Frame(Frame::Reply {
+            id: RequestId::Number(list),
+            result: Ok(Reply::Threads(ThreadPage {
+                data: vec![row("parent", project, None)],
+                next_cursor: None,
+            })),
+        }));
 
         assert!(s.catalog_row("parent").is_some());
         assert!(s.catalog_row("worker").is_some());

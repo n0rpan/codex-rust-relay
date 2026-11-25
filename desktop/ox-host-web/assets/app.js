@@ -96,7 +96,8 @@ let key,
   scheduled = false;
 let runningTimer = null,
   processes = null,
-  endBusy = false;
+  endBusy = false,
+  endChecking = false;
 let cold = new Map(),
   drafts = new Map(),
   timelineRows = new Map(),
@@ -484,16 +485,45 @@ function drawRunning() {
   }
   list.replaceChildren(...rows);
 }
+// Asks the host for a fresh process list and draws it. Calls done with the list, or null when none came back.
+function freshProcesses(done) {
+  const sent = globalLink?.listProcesses((ok, value) => {
+    if (!ok) {
+      if (value) notice(value);
+      done(null);
+      return;
+    }
+    processes = value;
+    drawRunning();
+    done(value);
+  });
+  if (!sent) {
+    notice("Reconnect to see running sessions.");
+    done(null);
+  }
+}
+// Ends are decided on a fresh snapshot, never the cached one, which may be seconds old.
 function endRow(p) {
-  const run = () => endProcesses([p]);
-  if (p.running)
-    confirmIn(
-      $("running-confirm"),
-      `End ${leaf(p.project)}? Its running turn or pending approval stops. History is kept.`,
-      "End session",
-      run,
-    );
-  else run();
+  if (endChecking) return;
+  endChecking = true;
+  freshProcesses((list) => {
+    endChecking = false;
+    if (!list) return;
+    const key = JSON.stringify(p.scope);
+    const fresh = list.find((q) => JSON.stringify(q.scope) === key);
+    if (!fresh) {
+      notice("That session has already ended.");
+      return;
+    }
+    if (fresh.running)
+      confirmIn(
+        $("running-confirm"),
+        `End ${leaf(fresh.project)}? Its running turn or pending approval stops. History is kept.`,
+        "End session",
+        () => endProcesses([fresh]),
+      );
+    else endProcesses([fresh]);
+  });
 }
 function openRunning() {
   if (!globalLink?.ready) {
@@ -515,14 +545,23 @@ function stopRunning() {
 }
 $("open-running").onclick = openRunning;
 $("end-idle").onclick = () => {
-  const idle = (processes ?? []).filter((p) => !p.running);
-  if (!idle.length) return;
-  confirmIn(
-    $("running-confirm"),
-    `End ${idle.length} idle session${idle.length === 1 ? "" : "s"}? History is kept.`,
-    "End idle",
-    () => endProcesses(idle),
-  );
+  if (endChecking) return;
+  endChecking = true;
+  freshProcesses((list) => {
+    endChecking = false;
+    if (!list) return;
+    const idle = list.filter((p) => !p.running);
+    if (!idle.length) {
+      notice("No idle sessions to end.");
+      return;
+    }
+    confirmIn(
+      $("running-confirm"),
+      `End ${idle.length} idle session${idle.length === 1 ? "" : "s"}? History is kept.`,
+      "End idle",
+      () => endProcesses(idle),
+    );
+  });
 };
 function home() {
   detailLink?.close();

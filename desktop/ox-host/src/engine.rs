@@ -197,9 +197,13 @@ struct Live {
     /// When each live process started and was last used, for the process list and the idle reaper.
     tracker: Tracker,
     /// A terminal handoff whose requesting client was gone when it was ready. The
-    /// next subscriber to this scope (or a replayed request) receives it.
-    held_handoff: Option<(String, Server)>,
+    /// next scoped subscriber (or a replayed request) receives it until the
+    /// deadline, after which it is dropped so the runtime can be reaped.
+    held_handoff: Option<(String, Server, Instant)>,
 }
+
+/// How long a terminal handoff waits for a client to take it before it is dropped.
+const HELD_HANDOFF_TTL: Duration = Duration::from_secs(600);
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -745,8 +749,11 @@ impl Engine {
                             {
                                 *client = id;
                             }
-                            if live.held_handoff.as_ref().is_some_and(|(k, _)| k == &key)
-                                && let Some((_, frame)) = live.held_handoff.take()
+                            if live
+                                .held_handoff
+                                .as_ref()
+                                .is_some_and(|(k, _, _)| k == &key)
+                                && let Some((_, frame, _)) = live.held_handoff.take()
                             {
                                 self.reply(id, frame)?;
                             }
@@ -875,7 +882,8 @@ impl Engine {
             .running
             .get_mut(scope)
             .and_then(|l| l.held_handoff.take())
-            .map(|(_, frame)| frame)
+            .filter(|(_, _, deadline)| *deadline > Instant::now())
+            .map(|(_, frame, _)| frame)
         {
             self.reply(id, frame)?;
         }
@@ -1293,7 +1301,7 @@ impl Engine {
                     Server::Handoff { id, .. } => id.clone(),
                     _ => String::new(),
                 };
-                live.held_handoff = Some((key, frame));
+                live.held_handoff = Some((key, frame, Instant::now() + HELD_HANDOFF_TTL));
                 None
             }
             other => other,
@@ -2050,7 +2058,8 @@ impl Engine {
         if !live.store.has_live_session(thread) {
             return Err(io::Error::other("This session has no live process to end."));
         }
-        self.end_children(scope, thread)?;
+        // End the parent first: if the store refuses (not ready, sign-in needed),
+        // its workers must not already be cancelled.
         let live = self.running.get_mut(scope).expect("checked above");
         let busy = live.store.thread_busy(thread);
         live.store.end_session(thread)?;
@@ -2058,6 +2067,7 @@ impl Engine {
         if busy && let Some(entry) = self.workers.get_mut(scope, thread) {
             entry.marks.cancelled = true;
         }
+        self.end_children(scope, thread)?;
         Ok(())
     }
     /// Ending a parent ends its host-owned workers: launches still opening are
@@ -2139,6 +2149,16 @@ impl Engine {
     fn reap_idle(&mut self, now: Instant) -> io::Result<()> {
         let mut due: Vec<(Scope, String)> = Vec::new();
         let mut empty: Vec<Scope> = Vec::new();
+        for (scope, live) in &mut self.running {
+            if live
+                .held_handoff
+                .as_ref()
+                .is_some_and(|(_, _, deadline)| *deadline <= now)
+            {
+                live.held_handoff = None;
+                empty.push(scope.clone());
+            }
+        }
         for (scope, live) in &self.running {
             let threads = live.store.live_threads();
             if threads.is_empty() {
@@ -2213,6 +2233,14 @@ impl Engine {
                     capabilities: vec![],
                 });
             }
+            // Web push subscribes without a scope and needs notifications, which
+            // carry no transcript content.
+            catalog.extend(
+                changes
+                    .iter()
+                    .filter(|c| matches!(c, Change::Notification { .. }))
+                    .cloned(),
+            );
             if !catalog.is_empty() {
                 let packet = encode(&Server::Delta {
                     cursor: self.replay.cursor.clone(),
@@ -2662,6 +2690,11 @@ mod tests {
                         sessions: vec![session],
                     },
                     transcript,
+                    Change::Notification {
+                        thread: "t".into(),
+                        title: "Title".into(),
+                        event: ox_desk_core::host_protocol::NotificationKind::Finished,
+                    },
                 ],
             )
             .unwrap();
@@ -2683,7 +2716,10 @@ mod tests {
                     .all(|c| !matches!(c, Change::Transcript { .. })),
                 "{frames:?}"
             );
-            assert!(matches!(frames[0].as_slice(), [Change::Sessions { .. }]));
+            assert!(matches!(
+                frames[0].as_slice(),
+                [Change::Sessions { .. }, Change::Notification { .. }]
+            ));
         }
         let scoped = decode(scoped);
         assert_eq!(scoped.len(), 1);
@@ -4537,6 +4573,7 @@ mod tests {
                     thread: None,
                     command: String::new(),
                 },
+                Instant::now() + Duration::from_secs(600),
             ));
             engine.reap_empty(&scope).unwrap();
             assert!(engine.running.contains_key(&scope));
@@ -4579,6 +4616,7 @@ mod tests {
                     thread: Some("t".into()),
                     command: String::new(),
                 },
+                Instant::now() + Duration::from_secs(600),
             ));
             engine.running.insert(scope.clone(), live);
             let (peer, frames) = crate::transport::test_peer();
@@ -4599,6 +4637,53 @@ mod tests {
                 .collect();
             assert!(sent.iter().any(|f| f.contains("\"handoff\"")), "{sent:?}");
             assert!(engine.running[&scope].held_handoff.is_none());
+        }
+
+        #[test]
+        fn an_expired_held_handoff_is_dropped_and_its_scope_reaped() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (scope, _) = scopes(root.path());
+            let mut live = local_live(&scope);
+            live.held_handoff = Some((
+                "k".into(),
+                Server::Handoff {
+                    argv: vec![],
+                    id: "k".into(),
+                    scope: scope.clone(),
+                    thread: None,
+                    command: String::new(),
+                },
+                Instant::now() + HELD_HANDOFF_TTL,
+            ));
+            engine.running.insert(scope.clone(), live);
+            // A scope-less subscriber never receives it.
+            let (peer, frames) = crate::transport::test_peer();
+            engine.clients.insert(
+                9,
+                ClientState {
+                    peer,
+                    hello: true,
+                    prepared: None,
+                    subscription: None,
+                    catalog: false,
+                },
+            );
+            engine.subscribe(9, None, None).unwrap();
+            assert!(
+                !frames
+                    .try_iter()
+                    .any(|p| String::from_utf8_lossy(&p).contains("\"handoff\""))
+            );
+            assert!(engine.running[&scope].held_handoff.is_some());
+            engine.idle = Duration::from_secs(3600);
+            engine.reap_idle(Instant::now()).unwrap();
+            assert!(engine.running.contains_key(&scope), "still held");
+            engine
+                .reap_idle(Instant::now() + HELD_HANDOFF_TTL + Duration::from_secs(1))
+                .unwrap();
+            assert!(!engine.running.contains_key(&scope), "expired and reaped");
         }
 
         #[test]

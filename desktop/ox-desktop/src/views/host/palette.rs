@@ -635,7 +635,7 @@ impl Host {
             }
             Target::EndSession { pane, owner } => {
                 self.close_palette(window, cx);
-                self.panes[pane].update(cx, |p, cx| p.action(cx, DeskAction::EndSession(owner)));
+                self.panes[pane].update(cx, |p, cx| p.request_end(owner, cx));
             }
             Target::Command { pane, owner, text } => {
                 if text == "/rename" {

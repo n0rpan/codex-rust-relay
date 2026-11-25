@@ -160,6 +160,28 @@ impl Access {
         let message = match action {
             Action::StartWorker(start) => start.validate().err()?,
             Action::StartHandoff(start) => start.validate().err()?,
+            Action::YoloGrant(grant, _) if grant.is_empty() || grant.len() > 512 => {
+                "This approval target is not valid. Reopen the session and try again.".into()
+            }
+            Action::Mention(_, Some(query)) if query.len() > 512 => {
+                "That mention search is too long. Shorten it and try again.".into()
+            }
+            Action::SendImages(_, text, images) => {
+                if text.len() > 128 * 1024 {
+                    "This message is too long to send with images. Shorten it and try again.".into()
+                } else if images.is_empty() || images.len() > 4 || !images.iter().all(valid_upload)
+                {
+                    "Attach up to 4 images pasted from this device, then send again.".into()
+                } else {
+                    return None;
+                }
+            }
+            Action::SetNextAccess(mode) | Action::SetAccess(_, mode)
+                if !ox_desk_core::runtime::Access::choices(scope.route.runtime).contains(mode) =>
+            {
+                "That access mode is not available for this route. Choose another and try again."
+                    .into()
+            }
             _ => return None,
         };
         Some((Some(id.clone()), message))
@@ -391,6 +413,118 @@ mod tests {
                 None
             )
         ));
+    }
+
+    #[test]
+    fn refused_content_answers_its_request_and_keeps_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let app = App {
+            state: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::state::State::load(dir.path()).unwrap(),
+            )),
+            host: Default::default(),
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            discovered: Default::default(),
+        };
+        let route = Route::CODEX_SUBSCRIPTION;
+        let scope = Scope {
+            project: "/approved".into(),
+            route: route.clone(),
+        };
+        let mut a = Access::default();
+        assert!(a.permit(&app, &Client::Hello { version: VERSION }));
+        let hello = Server::Hello {
+            version: VERSION,
+            projects: vec![scope.project.clone()],
+            routes: vec![route.clone()],
+            capabilities: vec![],
+            host: None,
+        };
+        a.host(&app, &serde_json::to_vec(&hello).unwrap()).unwrap();
+        assert!(a.permit(
+            &app,
+            &Client::Subscribe {
+                scope: Some(scope.clone()),
+                after: None
+            }
+        ));
+        let act = |action, approval: Option<String>| Client::Act {
+            id: "request".into(),
+            scope: scope.clone(),
+            action,
+            approval,
+        };
+        let image = || {
+            ox_desk_core::mentions::ImageInput::Clipboard(
+                "image/png".into(),
+                "data:image/png;base64,AAAA".into(),
+            )
+        };
+        let refused = [
+            act(
+                Action::SendImages(None, "x".repeat(128 * 1024 + 1), vec![image()]),
+                None,
+            ),
+            act(Action::SendImages(None, "hi".into(), vec![]), None),
+            act(
+                Action::SendImages(
+                    None,
+                    "hi".into(),
+                    vec![ox_desk_core::mentions::ImageInput::File(
+                        "/etc/passwd".into(),
+                    )],
+                ),
+                None,
+            ),
+            act(Action::Mention(None, Some("q".repeat(513))), None),
+            act(Action::YoloGrant(String::new(), true), None),
+            act(
+                Action::SetAccess(
+                    "thread".into(),
+                    ox_desk_core::runtime::Access::BypassPermissions,
+                ),
+                None,
+            ),
+            act(
+                Action::SetNextAccess(ox_desk_core::runtime::Access::BypassPermissions),
+                None,
+            ),
+        ];
+        for req in &refused {
+            assert!(!a.permit(&app, req));
+            let (id, message) = a.invalid(&app, req).expect("content refusal is answered");
+            assert_eq!(id.as_deref(), Some("request"));
+            assert!(!message.is_empty());
+            let frame = serde_json::to_value(Server::Error { id, message }).unwrap();
+            assert_eq!(frame["type"], "error");
+            assert_eq!(frame["id"], "request");
+        }
+
+        // Content that passes is not answered as a refusal.
+        assert!(a.permit(
+            &app,
+            &act(Action::SendImages(None, "hi".into(), vec![image()]), None)
+        ));
+        assert!(
+            a.invalid(
+                &app,
+                &act(Action::SendImages(None, "hi".into(), vec![image()]), None)
+            )
+            .is_none()
+        );
+
+        // Protocol violations still close: an approval on a content refusal is not answered.
+        let approved = act(
+            Action::SendImages(None, "hi".into(), vec![]),
+            Some("yes".into()),
+        );
+        assert!(!a.permit(&app, &approved));
+        assert!(a.invalid(&app, &approved).is_none());
     }
 
     #[test]

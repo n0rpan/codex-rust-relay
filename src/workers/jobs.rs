@@ -611,13 +611,10 @@ async fn run_claude(
         state.can_steer = pending > 0;
     }
     drop(input);
-    // A one-shot job fails with its last turn's error. A session keeps today's end
-    // at the last turn, with the error still visible in its status.
-    if let Some(error) = turn_failure
-        .as_ref()
-        .filter(|_| request.mode != Mode::Session)
-    {
-        return Err(error.clone().into());
+    // The job ends with its last turn's error, whatever its mode. A session stays
+    // steerable while turns are pending; once the last turn errors, nothing is left to steer.
+    if let Some(error) = turn_failure {
+        return Err(error.into());
     }
     if request.mode == Mode::Workflow && !used_workflow {
         return Err("Claude Code did not run the Workflow tool. Check the selected model, Claude Code version, and workflow permissions.".into());
@@ -1062,5 +1059,43 @@ printf flushed > "$MARKER"
             Some("flushed")
         );
         let _ = std::fs::remove_file(&marker);
+    }
+
+    /// A session whose last turn errors ends failed with that error, not "completed".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_whose_last_turn_errors_ends_failed() {
+        const SCRIPT: &str = r#"
+read -r _line
+printf '%s\n' '{"type":"result","is_error":true,"result":"overloaded right now"}'
+"#;
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", SCRIPT])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0);
+        let request = start(json!({
+            "runtime": "claude", "mode": "session", "task": "say hi", "model": "fixture"
+        }));
+        let state = Mutex::new(State {
+            runtime: Runtime::Claude,
+            mode: Mode::Session,
+            can_steer: false,
+            messages: VecDeque::new(),
+            status: "running",
+            native_session: None,
+            progress: String::new(),
+            result: None,
+            error: None,
+            model: "fixture".into(),
+        });
+        let (_instructions, receiver) = mpsc::channel::<Instruction>(1);
+        let error = run_claude(command, &request, &state, &[], receiver)
+            .await
+            .expect_err("an errored last turn fails the session");
+        assert!(error.to_string().contains("overloaded right now"));
     }
 }
