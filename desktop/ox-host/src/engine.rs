@@ -3231,7 +3231,7 @@ mod tests {
                 engine.advance_flows().unwrap();
             }
         }
-                fn claude_source(root: &Path) -> Scope {
+        fn claude_source(root: &Path) -> Scope {
             Scope {
                 project: root.canonicalize().unwrap(),
                 route: Runtime::Claude.route(None),
