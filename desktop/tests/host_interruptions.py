@@ -1031,6 +1031,15 @@ def case_2(ctx):
     pre_worker = worker_view(ctx.fixture.of("worker")[-1]) + [("assistant", "", [(f"call_Bash_{ctx.fixture.calls}", "Bash", json.dumps({"command": f"echo ran >> {ctx.root}/Alpha/cd.log && sleep 12 && cd {ctx.root}/Alpha", "description": "Enter the project"}))])]
     before, ledger = restart(run)
     prefix_kept(ctx, before, ledger)
+    # A catalog refresh after a restart can emit a single row before any user
+    # resumes it. The next restart must still remember the interrupted turn.
+    first_recovery = json.loads(ctx.ledger())
+    saved = next(row for scope in first_recovery["scopes"] for row in scope["sessions"]
+                 if row["id"] == run.thread)
+    assert saved["active"] and saved["access"] == "accept_edits", saved
+    restart(run)
+    recovered = row_of(run.desk.frames, run.thread)
+    assert recovered and recovered["detail"]["owned"] and recovered["status"] == "interrupted", recovered
     status = resume_checks(run, ctx, pre, "interrupted")
     assert status["result"] is None and status["partial"] is False, status
     continue_worker(run, ctx, status, pre_worker[:1])
@@ -1126,7 +1135,7 @@ def case_6(ctx):
     run.watcher = Pipe(ctx, None)
     run.watcher.wait(lambda f: f["type"] == "snapshot", "catalog snapshot")
     run.attach()
-    assert ledger_path.read_bytes().startswith(good[:0]) and json.loads(ledger_path.read_bytes())["scopes"], "ledger unreadable after a torn temp file"
+    assert json.loads(ledger_path.read_bytes())["scopes"], "ledger unreadable after a torn temp file"
     prefix_kept(ctx, before, good)
     resume_checks(run, ctx, pre, "completed")
 

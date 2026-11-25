@@ -231,6 +231,18 @@ jobs:
           [ "$(cat "$RUNNER_TEMP/build.status")" = 0 ] || { cat "$RUNNER_TEMP/build.log"; exit 1; }
       - name: Two clients, approvals and SIGKILL recovery
         run: python3 desktop/tests/host_stock_session.py desktop/target/debug/ox-host desktop/target/debug/ox "$RUNNER_TEMP/stock/node_modules/.bin/claude"
+      - name: Worker turns across dropped connections, Stop and host restarts
+        run: |
+          if ! command -v bwrap || ! command -v socat; then
+            sudo apt-get update -o Acquire::Retries=3
+            sudo apt-get install -y -o Acquire::Retries=3 bubblewrap socat
+          fi
+          if ! bwrap --ro-bind / / --dev /dev --proc /proc true &&
+              [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --ro-bind / / --dev /dev --proc /proc true
+          python3 desktop/tests/host_interruptions.py desktop/target/debug/ox-host desktop/target/debug/ox "$RUNNER_TEMP/stock/node_modules/.bin/claude"
       - name: Handoff into stock Claude Code
         run: python3 desktop/tests/host_handoff_session.py desktop/target/debug/ox-host desktop/target/debug/ox "$RUNNER_TEMP/stock/node_modules/.bin/claude"
       - name: Upgrade the host in the middle of a turn
