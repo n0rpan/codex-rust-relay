@@ -142,6 +142,8 @@ class Fixture(BaseHTTPRequestHandler):
             if naming:
                 assert not json.loads(body).get("tools")
                 item["content"][0]["text"] = "Fixture conversation"
+            elif self.server.mode == "host-cut":
+                self.server.on_turn(json.loads(body))
             elif self.server.mode in ("ox-workers", "worker-cwd"):
                 payload = json.loads(body)
                 result = next(
