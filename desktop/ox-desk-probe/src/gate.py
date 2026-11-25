@@ -558,8 +558,9 @@ def streaming(f):
         # The final stream event has crossed the UI pump when the turn controls return to idle.
         wait(lambda: not f.stats()["visible_turn"])
         end = f.stats()
-        rendered = f.words()
-        typed = "draft" in rendered and "streaming" in rendered
+        # Typing reached the composer while the streams rendered. Read from the
+        # app's state: OCR glued the text cursor to the last word ("streaming|").
+        typed = end.get("draft") == "draft during streaming"
         cohort = int(f.events("stream-start")[-1]["id"])
         record("G7", timed(cohort == 4 and typed and end["frames_drawn"] > 0
                            and end["drains"] - start["drains"] <= end["frames_drawn"],
@@ -888,7 +889,9 @@ def claude_gate(f):
     wait(lambda: len(f.events("claude-stream-end")) == 4, 18)
     wait(lambda: not f.stats()["visible_turn"])
     end = f.stats()
-    typed = wait(lambda: "streaming" in f.words())
+    # Typing reached the composer while the streams rendered. Read from the
+    # app's state: OCR glued the text cursor to the last word ("streaming|").
+    typed = bool(wait(lambda: f.stats().get("draft") == "draft during streaming"))
     f.x("key", "ctrl+Return")
     wait(lambda: len(f.events("claude-user")) == 5)
     wait(lambda: f.stats()["visible_turn"])

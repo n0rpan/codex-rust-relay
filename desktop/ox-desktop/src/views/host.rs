@@ -287,6 +287,7 @@ impl Host {
             "selected_requests":active.map_or(0, |s|s.asks().iter().filter(|a|a.thread.as_deref()==s.selected()).count()),
             "selected_parent":active.and_then(|s|s.catalog_row(s.selected()?)).and_then(|r|r.parent_thread_id.as_deref()),
             "visible_turn":active.and_then(|s|s.selected().and_then(|id|s.transcript(id))).is_some_and(|t|t.active_turn().is_some()),
+            "draft":active.map(|s|s.draft(s.selected())),
             "voluntary_switches":ox_desk_core::perf::voluntary_switches(),
             "frames_drawn":frames.draw_duration_histogram.len(),"draw_p95_ns":frames.draw_duration_histogram.value_at_quantile(0.95),
             "dirty_to_present_p95_ns":frames.dirty_to_present_histogram.value_at_quantile(0.95),"present_interval_p95_ns":frames.present_interval_histogram.value_at_quantile(0.95),
