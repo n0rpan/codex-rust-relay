@@ -5698,7 +5698,14 @@ for line in sys.stdin:
                     fresh.apply(e);
                 }
             };
-            assert!(has_policy(&restarted), "after restart: {restarted:?}");
+            // After a restart the contract is re-derived from the saved origin on
+            // this machine: sandboxed shell where bwrap and socat exist, otherwise
+            // the edits-only fallback (CI runners may lack them).
+            let here = Contract::detect(true, false).args();
+            assert!(
+                restarted.windows(here.len()).any(|w| w == here.as_slice()),
+                "after restart: {restarted:?}"
+            );
             assert_eq!(
                 at(&restarted, "--permission-mode").as_deref(),
                 Some("acceptEdits")
