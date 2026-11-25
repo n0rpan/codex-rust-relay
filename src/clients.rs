@@ -1390,6 +1390,8 @@ mod tests {
             &["--help"],
             &["-h"],
             &["mcp", "--help"],
+            // A background-session command with its argument.
+            &["logs", "abc"],
         ];
         for list in unchanged {
             let (args, id) = session_args(list);

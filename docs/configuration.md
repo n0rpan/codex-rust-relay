@@ -719,10 +719,14 @@ Work already written to the project stays there if you cancel.
 
 `ox claude` gives each new session an ID before the first turn by passing
 `--session-id` to Claude Code, unless you chose a session yourself with
-`--resume`, `--continue`, `--session-id`, `--fork-session` or `--from-pr`, or
-ran a subcommand such as `mcp` or `update`. After you close the terminal,
-`ox claude --resume <that id>` lets the main agent read and steer the workers
-it started. The ID is the one Claude Code shows for the session.
+`--resume`, `--continue`, `--session-id`, `--fork-session` or `--from-pr`,
+turned off saving with `--no-session-persistence`, or ran a subcommand such
+as `mcp` or `update`. After you close the terminal, `ox claude --resume <that
+id>` lets the main agent read and steer the workers it started. The ID is the
+one Claude Code shows for the session. `ox codex resume <id>` does the same
+for Codex. Only the launch that started a worker, or a later resume of its
+session, controls it; another `ox` in the same project does not. Otherwise
+use OX Desktop or a paired phone.
 
 A host-owned worker's approvals and questions wait for a person in OX Desktop
 or on a paired phone, never for the main agent. `ox_worker_status` then
