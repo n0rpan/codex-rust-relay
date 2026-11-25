@@ -61,6 +61,12 @@ impl Node {
     }
 }
 
+/// Enabling stops here, with the reason, when Serve status shows the OX port is
+/// published through Funnel or taken by another application.
+fn admit(node: &Node) -> Result<(), String> {
+    node.reason().map_or(Ok(()), |reason| Err(reason.into()))
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum ServeChange {
     Enable,
@@ -362,9 +368,7 @@ pub fn run(op: Operation) -> Result<Report, String> {
         }
         Operation::Enable => {
             let node = network.as_ref().map_err(Clone::clone)?;
-            if let Some(err) = node.reason() {
-                return Err(err.into());
-            }
+            admit(node)?;
             if node.ready() {
                 request(Request::Enable {
                     origin: node.origin.clone(),
@@ -465,8 +469,32 @@ pub fn guidance(project: &Path, runtime: ox_desk_core::runtime::Runtime) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, PROXY, configuration};
-    use serde_json::json;
+    use super::{Config, Node, PROXY, admit, configuration};
+    use serde_json::{Value, json};
+    #[test]
+    fn funnel_in_serve_status_fixture_refuses_remote_access() {
+        let cases: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/serve-status.json")).unwrap();
+        let authority = "work.tail1234.ts.net:8443";
+        let node = |case: &str| Node {
+            origin: format!("https://{authority}"),
+            login: "me@example.test".into(),
+            state: configuration(&cases[case], authority),
+        };
+        let private = node("private");
+        assert!(private.ready());
+        assert_eq!(admit(&private), Ok(()));
+        for case in ["funnel", "foreground_funnel"] {
+            let public = node(case);
+            assert!(!public.ready() && !public.available(), "{case}");
+            let refused = admit(&public).unwrap_err();
+            assert!(refused.contains("Funnel"), "{case}: {refused}");
+        }
+        // Funnel on an unrelated port does not block the private OX port.
+        let elsewhere = node("funnel_elsewhere");
+        assert_eq!(admit(&elsewhere), Ok(()));
+        assert!(elsewhere.available());
+    }
     #[test]
     fn sharing_never_overwrites_a_port_or_publishes_to_funnel() {
         let key = "work.tail.ts.net:8443";

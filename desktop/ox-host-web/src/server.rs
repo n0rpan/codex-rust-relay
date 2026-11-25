@@ -198,7 +198,7 @@ async fn administer(
                 }
                 None
             } else {
-                Some(TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?)
+                Some(bind(port).await?)
             };
             let ticket = state::random();
             reservation = Some(ticket.clone());
@@ -278,8 +278,17 @@ async fn administer(
     reply.reservation = reservation;
     Ok(reply)
 }
-async fn listen(app: App, origin: String, port: u16) -> io::Result<(u16, Listener)> {
+/// The only way the remote listener opens a TCP socket. Tailscale Serve is the sole
+/// path in, so the address is loopback whatever origin or port is configured.
+async fn bind(port: u16) -> io::Result<TcpListener> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
+    if !listener.local_addr()?.ip().is_loopback() {
+        return Err(io::Error::other("Remote listener must bind to loopback"));
+    }
+    Ok(listener)
+}
+async fn listen(app: App, origin: String, port: u16) -> io::Result<(u16, Listener)> {
+    let listener = bind(port).await?;
     let actual = listener.local_addr()?.port();
     Ok((actual, start_listener(app, origin, listener)))
 }
@@ -446,8 +455,15 @@ fn login(headers: &HeaderMap) -> Option<&str> {
         !s.is_empty() && s.len() <= 254 && !s.bytes().any(|b| b.is_ascii_control() || b == b' ')
     })
 }
+/// Tailscale marks requests that arrive from the public internet through Funnel.
+const FUNNEL: &str = "tailscale-funnel-request";
+const FUNNEL_REFUSED: &str =
+    "OX remote access is private to your tailnet. Turn off Tailscale Funnel for this port.";
+/// Identity headers count only on requests Tailscale Serve forwarded over loopback to
+/// the configured origin. Funnel traffic comes from the public internet and is refused.
 fn permitted(origin: &str, peer: SocketAddr, path: &str, headers: &HeaderMap) -> bool {
     peer.ip().is_loopback()
+        && !headers.contains_key(FUNNEL)
         && login(headers).is_some()
         && one(headers, "host") == origin.strip_prefix("https://")
         && (!path.starts_with("/api/") || one(headers, "origin") == Some(origin))
@@ -459,6 +475,9 @@ async fn guard(
     next: Next,
 ) -> Response {
     if !permitted(&origin, peer, req.uri().path(), req.headers()) {
+        if req.headers().contains_key(FUNNEL) {
+            return (DENY, FUNNEL_REFUSED).into_response();
+        }
         return DENY.into_response();
     }
     let mut response = next.run(req).await;
@@ -660,7 +679,301 @@ mod tests {
         assert!(!permitted(origin, local, "/api/socket", &h));
         h.remove("origin");
         assert!(!permitted(origin, local, "/api/pair", &h));
+        h.insert("origin", origin.parse().unwrap());
+        assert!(permitted(origin, local, "/api/pair", &h));
+        // Reaching the loopback port directly, not through the Serve hostname.
+        let mut direct = h.clone();
+        direct.insert("host", "127.0.0.1:48162".parse().unwrap());
+        assert!(!permitted(origin, local, "/", &direct));
+        // Public Funnel traffic is refused even with an identity header attached.
+        let mut funnel = h.clone();
+        funnel.insert("tailscale-funnel-request", "?1".parse().unwrap());
+        assert!(!permitted(origin, local, "/", &funnel));
         h.remove("tailscale-user-login");
         assert!(!permitted(origin, local, "/", &h));
+    }
+
+    #[tokio::test]
+    async fn listener_binds_loopback_whatever_the_configured_port() {
+        for port in [0, 8443, 48162] {
+            let Ok(listener) = bind(port).await else {
+                continue; // port busy on this machine; port 0 always succeeds below
+            };
+            assert!(listener.local_addr().unwrap().ip().is_loopback());
+        }
+        let listener = bind(0).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert_eq!(addr.ip(), std::net::IpAddr::from(Ipv4Addr::LOCALHOST));
+        // The same port on a non-loopback address of this machine is not listening.
+        if let Ok(probe) = std::net::UdpSocket::bind("0.0.0.0:0")
+            && probe.connect("192.0.2.1:9").is_ok()
+            && let Ok(local) = probe.local_addr()
+            && !local.ip().is_loopback()
+            && !local.ip().is_unspecified()
+        {
+            let outside = SocketAddr::new(local.ip(), addr.port());
+            let attempt = tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::net::TcpStream::connect(outside),
+            )
+            .await;
+            assert!(!matches!(attempt, Ok(Ok(_))));
+        }
+    }
+
+    mod live {
+        use super::super::*;
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
+        use p256::{
+            ecdsa::{Signature, SigningKey, signature::Signer},
+            elliptic_curve::rand_core::OsRng,
+        };
+        use tokio::net::TcpStream;
+
+        pub(super) const ORIGIN: &str = "https://machine.test.ts.net:8443";
+        pub(super) const HOST: &str = "machine.test.ts.net:8443";
+        pub(super) const LOGIN: &str = "me@example.test";
+
+        pub(super) struct Live {
+            _dir: tempfile::TempDir,
+            pub app: App,
+            pub addr: SocketAddr,
+            pub key: SigningKey,
+            pub cookie: String,
+            pub id: String,
+            pub host_connected: tokio::sync::mpsc::UnboundedReceiver<()>,
+            _listener: Listener,
+        }
+        fn sign(key: &SigningKey, message: &str) -> String {
+            let sig: Signature = key.sign(message.as_bytes());
+            B64.encode(sig.to_bytes())
+        }
+        /// A real remote listener in front of a silent stand-in session host, with one paired device.
+        pub(super) async fn start() -> Live {
+            let dir = tempfile::tempdir().unwrap();
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let mut state = State::load(dir.path()).unwrap();
+            state.set_origin(Some(ORIGIN.into()), 0).unwrap();
+            let key = SigningKey::random(&mut OsRng);
+            let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
+            let invite = state.invite(LOGIN.into()).unwrap();
+            let code = invite.url.split_once("#pair=").unwrap().1;
+            let cookie = state
+                .pair(LOGIN, code, &public, &sign(&key, code), "Phone")
+                .unwrap();
+            let id = state.identity(LOGIN, &cookie).unwrap();
+            let socket = dir.path().join("host.sock");
+            let host = UnixListener::bind(&socket).unwrap();
+            let (tx, host_connected) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((stream, _)) = host.accept().await {
+                    held.push(stream);
+                    let _ = tx.send(());
+                }
+            });
+            let app = App {
+                state: Arc::new(Mutex::new(state)),
+                host: Arc::new(socket),
+                slots: Arc::new(Semaphore::new(4)),
+                discovered: Default::default(),
+            };
+            let tcp = bind(0).await.unwrap();
+            let addr = tcp.local_addr().unwrap();
+            let listener = start_listener(app.clone(), ORIGIN.into(), tcp);
+            Live {
+                _dir: dir,
+                app,
+                addr,
+                key,
+                cookie,
+                id,
+                host_connected,
+                _listener: listener,
+            }
+        }
+        pub(super) struct Req<'a> {
+            pub method: &'a str,
+            pub path: &'a str,
+            pub host: &'a str,
+            pub login: Option<&'a str>,
+            pub cookie: Option<&'a str>,
+            pub extra: &'a [(&'a str, &'a str)],
+            pub body: &'a str,
+        }
+        impl Default for Req<'_> {
+            fn default() -> Self {
+                Req {
+                    method: "GET",
+                    path: "/",
+                    host: HOST,
+                    login: Some(LOGIN),
+                    cookie: None,
+                    extra: &[],
+                    body: "",
+                }
+            }
+        }
+        /// Send a raw HTTP/1.1 request the way the Serve proxy would and return the status.
+        pub(super) async fn send(addr: SocketAddr, r: Req<'_>, close: bool) -> (u16, TcpStream) {
+            let mut text = format!(
+                "{} {} HTTP/1.1\r\nhost: {}\r\norigin: {ORIGIN}\r\n",
+                r.method, r.path, r.host
+            );
+            if let Some(login) = r.login {
+                text += &format!("tailscale-user-login: {login}\r\n");
+            }
+            if let Some(cookie) = r.cookie {
+                text += &format!("cookie: __Host-ox-device={cookie}\r\n");
+            }
+            for (k, v) in r.extra {
+                text += &format!("{k}: {v}\r\n");
+            }
+            if !r.body.is_empty() {
+                text += &format!(
+                    "content-type: application/json\r\ncontent-length: {}\r\n",
+                    r.body.len()
+                );
+            }
+            if close {
+                text += "connection: close\r\n";
+            }
+            text += "\r\n";
+            text += r.body;
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(text.as_bytes()).await.unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8];
+                if stream.read(&mut byte).await.unwrap() == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&head);
+            let status = head
+                .split(' ')
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            (status, stream)
+        }
+        pub(super) fn proof(live: &Live) -> String {
+            let nonce = live
+                .app
+                .state
+                .lock()
+                .unwrap()
+                .challenge(&live.id, Purpose::Connect)
+                .unwrap();
+            json!({"nonce": nonce, "signature": sign(&live.key, &nonce)}).to_string()
+        }
+        /// One masked client text frame.
+        pub(super) fn text_frame(payload: &str) -> Vec<u8> {
+            let mask = [0x1b, 0x2c, 0x3d, 0x4e];
+            let mut out = vec![0x81];
+            let len = payload.len();
+            if len < 126 {
+                out.push(0x80 | len as u8);
+            } else {
+                out.push(0x80 | 126);
+                out.extend_from_slice(&(len as u16).to_be_bytes());
+            }
+            out.extend_from_slice(&mask);
+            out.extend(payload.bytes().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+            out
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_headers_count_only_on_the_serve_path_and_never_alone() {
+        use live::{LOGIN, Req, send, start};
+        let live = start().await;
+        assert_eq!(send(live.addr, Req::default(), true).await.0, 200);
+        // Direct loopback access with a forged identity header: wrong Host.
+        let direct = format!("127.0.0.1:{}", live.addr.port());
+        let forged = Req {
+            host: &direct,
+            ..Req::default()
+        };
+        assert_eq!(send(live.addr, forged, true).await.0, 403);
+        let funnel = Req {
+            extra: &[("tailscale-funnel-request", "?1")],
+            ..Req::default()
+        };
+        let (status, mut refused) = send(live.addr, funnel, true).await;
+        assert_eq!(status, 403);
+        let mut body = String::new();
+        refused.read_to_string(&mut body).await.unwrap();
+        assert!(body.contains("Funnel"), "{body}");
+        let duplicated = Req {
+            extra: &[("tailscale-user-login", "other@example.test")],
+            ..Req::default()
+        };
+        assert_eq!(send(live.addr, duplicated, true).await.0, 403);
+        let challenge = |login, cookie| Req {
+            method: "POST",
+            path: "/api/challenge",
+            login,
+            cookie,
+            body: r#"{"purpose":"connect"}"#,
+            ..Req::default()
+        };
+        // The login header alone grants nothing.
+        assert_eq!(
+            send(live.addr, challenge(Some(LOGIN), None), true).await.0,
+            403
+        );
+        // A paired device's cookie under another Tailscale identity grants nothing.
+        let other = challenge(Some("other@example.test"), Some(&live.cookie));
+        assert_eq!(send(live.addr, other, true).await.0, 403);
+        // The cookie without a Serve identity grants nothing.
+        let anonymous = challenge(None, Some(&live.cookie));
+        assert_eq!(send(live.addr, anonymous, true).await.0, 403);
+        // Positive control: the paired device on the Serve path.
+        let paired = challenge(Some(LOGIN), Some(&live.cookie));
+        assert_eq!(send(live.addr, paired, true).await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn revoking_a_device_closes_its_live_socket_immediately() {
+        use live::{Req, send, start, text_frame};
+        let mut live = start().await;
+        let cookie = live.cookie.clone();
+        let upgrade = Req {
+            path: "/api/socket",
+            cookie: Some(&cookie),
+            extra: &[
+                ("connection", "Upgrade"),
+                ("upgrade", "websocket"),
+                ("sec-websocket-version", "13"),
+                ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ],
+            ..Req::default()
+        };
+        let (status, mut ws) = send(live.addr, upgrade, false).await;
+        assert_eq!(status, 101);
+        ws.write_all(&text_frame(&live::proof(&live)))
+            .await
+            .unwrap();
+        // The bridge opens its session-host connection only after the proof verifies.
+        tokio::time::timeout(Duration::from_secs(5), live.host_connected.recv())
+            .await
+            .expect("device authenticated")
+            .unwrap();
+        let mut first = [0u8; 2];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), ws.read(&mut first))
+                .await
+                .is_err(),
+            "socket stays open while the device is paired"
+        );
+        live.app.state.lock().unwrap().revoke(&live.id).unwrap();
+        // No further client traffic: the host closes the socket on its own.
+        let n = tokio::time::timeout(Duration::from_secs(2), ws.read(&mut first))
+            .await
+            .expect("revocation did not close the live socket")
+            .unwrap();
+        assert!(n == 0 || first[0] & 0x0f == 0x8, "expected a close frame");
     }
 }
