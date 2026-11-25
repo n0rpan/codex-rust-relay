@@ -149,6 +149,11 @@ class Fixture:
                 self.env[key] = previous[key]
         if routes:
             self.env["OX_DESK_SYNTH_ROUTES"] = "1"
+            # The synthetic settings report a saved subscription. Give the
+            # desktop's first-launch probe the matching local sign-in state.
+            profile = Path(self.env["CODEX_HOME"])
+            profile.mkdir(parents=True, exist_ok=True)
+            (profile / "auth.json").write_text('{"auth_mode":"chatgpt"}')
         if args.wayland:
             self.env.pop("DISPLAY", None)
             self.env.update(WAYLAND_DISPLAY=os.path.join(os.environ["XDG_RUNTIME_DIR"], os.environ["WAYLAND_DISPLAY"]),
@@ -853,14 +858,13 @@ def secure_key(f):
     import secrets
     since = int(time.time())
     f.press("settings")
-    f.click(wait(lambda: f.words().get("credentials")))
+    f.press("API keys")
     words = wait(lambda: w if "enter" in (w := f.words()) else None)
     f.click(words["enter"])
     canary = ("ox-probe-" + secrets.token_hex(16)).encode()
     command = ["wtype", "-s", "120", "-"] if args.wayland else ["xdotool", "type", "--file", "-"]
     subprocess.run(command, input=canary, check=True)
-    width = int(next(s[6:] for s in f.x("getwindowgeometry", "--shell", f.window).splitlines() if s.startswith("WIDTH=")))
-    f.click(words.get("save", (width - 75, words["enter"][1])))
+    f.press("key-save-0")
     keyfile = Path(f.env["CODEX_HOME"]) / "ox-api-keys.json"
     wait(lambda: keyfile.exists() and canary in keyfile.read_bytes())
     f.stop()  # Snapshot files after the desktop stops replacing its state atomically.
