@@ -717,6 +717,11 @@ the worker keeps running after you close the terminal, its approvals reach
 your desktop and paired phone, and a resumed parent can still read its status.
 The status includes the stock client's session ID when available.
 Work already written to the project stays there if you cancel.
+To keep a finished worker's status and final answer available after its
+process has been reaped or the host restarts, the session host keeps a small
+copy of that final answer (at most 24 KiB, never the transcript) in its
+ledger under the host state directory. The full history stays in the stock
+client's own session files.
 
 `ox claude` gives each new session an ID before the first turn by passing
 `--session-id` to Claude Code, unless you chose a session yourself with

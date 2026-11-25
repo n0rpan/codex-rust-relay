@@ -105,7 +105,8 @@ printf '%s\\n' "$(basename "$0")" "$@" > "$FIXTURE_TRACE"
 if [ "$(basename "$0")" = claude ]; then
     printf '%s' "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-}" > "$FIXTURE_CONTEXT"
     printf '%s\\n' "${CLAUDE_CODE_AUTO_MODE_SERVER:-}" "${CLAUDE_CODE_AUTO_MODE_MODEL:-}" > "$FIXTURE_CLASSIFIER"
-    if [ "$1" = --settings ]; then
+    # API routes pass a settings file; subscription launches pass inline JSON.
+    if [ "$1" = --settings ] && [ -f "$2" ]; then
         "$FIXTURE_PYTHON" -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("modelPicker")))' "$2" > "$FIXTURE_LINEUP"
     fi
 fi
@@ -457,6 +458,15 @@ for args, sign_in, expected in (
     session = drop_session(argv)
     # A new Claude session gets an ID ox knows before the first turn.
     assert (session is not None) == (expected[0] == "claude"), argv
+    if expected[0] == "claude":
+        # Subscription launches carry ox's inline billing overlay, so a user or
+        # project settings file cannot redirect the session to another API origin.
+        i = argv.index("--settings")
+        overlay = json.loads(argv[i + 1])
+        assert overlay["apiKeyHelper"] == "", overlay
+        for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+            assert overlay["env"][key] == "", (key, overlay)
+        del argv[i:i + 2]
     assert argv == expected and registry is None, (text, argv)
     assert "What would you like to use?" not in text
 print("plain commands: launch signed-in stock clients without reopening setup")

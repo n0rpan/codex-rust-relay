@@ -49,7 +49,18 @@ pub(crate) async fn launch_subscription(
         ClientKind::Codex => launch_chatgpt(&[], home, relay).await,
         // The same checked settings overlay as every other subscription launch, so
         // a user or project settings file cannot point the session at another origin.
-        ClientKind::Claude => launch_claude_subscription_with(&[], home, relay).await,
+        // No `auth status` probe here: choosing the subscription in the launcher starts
+        // Claude Code directly, which shows its own sign-in when it needs one.
+        ClientKind::Claude => {
+            launch_session(
+                checked_claude_command(home, false)?,
+                &[],
+                home,
+                client,
+                relay,
+            )
+            .await
+        }
     }
 }
 
