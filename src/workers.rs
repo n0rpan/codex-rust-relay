@@ -1012,6 +1012,7 @@ mod tests {
             client: ClientKind::Codex,
             slots: Semaphore::new(1),
             jobs: Mutex::new(jobs::Jobs::default()),
+            tools: Tools::All,
         });
         let server = tokio::spawn(crate::serve_requests(listener, move |request| {
             let service = Arc::clone(&service);
