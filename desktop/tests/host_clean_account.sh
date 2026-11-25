@@ -33,6 +33,9 @@ cp "$repo/install.sh" "$dist"/ox-desktop-* "$stage/"
 chmod 644 "$stage"/*
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
+# Set once this run has checked that no OX agent was loaded before it, so the
+# cleanup unloads only an agent this run created.
+owns_agent=0
 cleanup() {
     if [ "$os" = Linux ]; then
         sudo loginctl disable-linger "$user" 2>/dev/null || true
@@ -40,7 +43,9 @@ cleanup() {
         sudo userdel -r "$user" 2>/dev/null || true
     else
         # Never touch the runner account itself: only the agent and the home made here.
-        launchctl bootout "gui/$(id -u)/dev.ox.session-host" 2>/dev/null || true
+        if [ "$owns_agent" = 1 ]; then
+            launchctl bootout "gui/$(id -u)/dev.ox.session-host" 2>/dev/null || true
+        fi
         if [ -n "${home:-}" ]; then rm -rf "$home"; fi
     fi
     rm -rf "$stage"
@@ -76,6 +81,7 @@ else
     if launchctl print "gui/$(id -u)/dev.ox.session-host" >/dev/null 2>&1; then
         fail "an OX host agent is already loaded for $user; refusing to replace it"
     fi
+    owns_agent=1
     home=$(mktemp -d /tmp/ox-home.XXXXXX)
     chmod 700 "$home"
     uid=$(id -u)
