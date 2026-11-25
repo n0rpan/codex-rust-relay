@@ -185,13 +185,12 @@ impl RuntimeConfig {
         } else {
             None
         };
-        if scope.route.is_api()
-            && !settings
-                .as_ref()
-                .is_some_and(|s| s.routes.contains(&scope.route))
-        {
+        // Any catalog model may open, starred or not: stars only order the lists.
+        // `ox --model` validates the alias against the configured providers at
+        // launch and names the closest match, so only a missing provider stops here.
+        if scope.route.is_api() && settings.as_ref().is_none_or(|s| s.provider.is_none()) {
             return Err(io::Error::other(
-                "The selected API billing route is no longer configured.",
+                "Configure an OX API provider in Settings first.",
             ));
         }
         let receive = Arc::new(receive);

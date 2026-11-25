@@ -132,6 +132,7 @@ impl Link {
         let receive = Arc::new(receive);
         let output = receive.clone();
         let mut decoder = Decoder::default();
+        let mut project_checked = false;
         let process = process::Process::spawn(
             launch.command(),
             move |line| {
@@ -152,13 +153,19 @@ impl Link {
                     if !initialized.load(Ordering::Acquire) {
                         continue;
                     }
-                    if let Frame::Init(init) = &frame
-                        && (init.session_id != session_id
-                            || std::path::Path::new(&init.cwd).canonicalize()? != project)
-                    {
-                        return Err(io::Error::other(
-                            "Claude Code opened a different project or session",
-                        ));
+                    if let Frame::Init(init) = &frame {
+                        // Claude Code repeats init on every turn and reports the Bash
+                        // tool's current directory, which follows `cd`. Only the
+                        // first init must match the project; later ones only the session.
+                        let first = !project_checked;
+                        project_checked = true;
+                        if init.session_id != session_id
+                            || first && std::path::Path::new(&init.cwd).canonicalize()? != project
+                        {
+                            return Err(io::Error::other(
+                                "Claude Code opened a different project or session",
+                            ));
+                        }
                     }
                     output(Event::Frame(frame));
                 }

@@ -365,10 +365,36 @@ fn maps_image_parts_only_for_user_messages() {
             .contains("cannot carry image")
     );
 
+    // Codex view_image returns an image as tool output. Tool messages are text-only,
+    // so the image follows the last tool result of the turn as a user message.
+    let input = json!({"input": [
+        {"type": "function_call", "call_id": "call_a", "name": "view_image", "arguments": "{}"},
+        {"type": "function_call", "call_id": "call_b", "name": "shell", "arguments": "{}"},
+        {
+            "type": "function_call_output",
+            "call_id": "call_a",
+            "output": [{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]
+        },
+        {"type": "function_call_output", "call_id": "call_b", "output": "ok"},
+        {"type": "message", "role": "user", "content": "next"}
+    ]});
+    let body = translate_request(&input, "m").unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    let roles: Vec<_> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["assistant", "tool", "tool", "user", "user"]);
+    assert_eq!(messages[1]["content"], "[image attached below]");
+    assert_eq!(
+        messages[3]["content"][1],
+        json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}})
+    );
+
     let input = json!({"input": [{
         "type": "function_call_output",
         "call_id": "call_a",
-        "output": [{"type": "input_image", "image_url": "https://example.com/x.png"}]
+        "output": [{"type": "input_audio", "data": "x"}]
     }]});
     assert!(
         translate_request(&input, "m")

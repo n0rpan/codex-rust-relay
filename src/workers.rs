@@ -696,12 +696,24 @@ impl Service {
         let query = filters.query.trim().to_lowercase();
         let mut total = 0;
         let mut models = Vec::new();
-        for (alias, provider) in self.app().await?.launch_models() {
+        // Every listed model can run. The user's starred models come first, in
+        // star order, so agents see the preferred choices on the first page.
+        let favorites = crate::picker::read_favorites(&self.home).unwrap_or_default();
+        let rank = |alias: &str| favorites.iter().position(|f| f == alias);
+        let app = self.app().await?;
+        let mut catalog = app.launch_models();
+        catalog.sort_by_key(|(alias, _)| rank(alias).unwrap_or(usize::MAX));
+        for (alias, provider) in catalog {
             if !alias.to_lowercase().contains(&query) && !provider.to_lowercase().contains(&query) {
                 continue;
             }
             if total >= filters.offset && models.len() < PAGE_SIZE {
-                models.push(json!({"model": alias, "provider": provider, "auth": "api_key"}));
+                models.push(json!({
+                    "model": alias,
+                    "provider": provider,
+                    "auth": "api_key",
+                    "starred": rank(alias).is_some(),
+                }));
             }
             total += 1;
         }
@@ -820,7 +832,7 @@ fn tools() -> Value {
         "tools": [
             {
                 "name": "list_ox_models",
-                "description": "List available ox API models and detected native subscription routes, labelled by provider. Filter by model or provider. Use an API alias when delegating to an API model.",
+                "description": "List available ox API models and detected native subscription routes, labelled by provider. The user's starred models come first (starred: true): prefer them unless the task needs another model. Any listed model can be used. Filter by model or provider. Use an API alias when delegating to an API model.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

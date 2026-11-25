@@ -316,6 +316,7 @@ fn push_input_items(
     options: &AdapterOptions,
     messages: &mut Vec<Value>,
 ) -> Result<(), String> {
+    let mut pending_images = Vec::new();
     for (position, item) in items.iter().enumerate() {
         let item = item
             .as_object()
@@ -358,11 +359,31 @@ fn push_input_items(
                 let output = item
                     .get("output")
                     .ok_or_else(|| format!("input item {position} needs output"))?;
+                let (text, images) = tool_output(output, position)?;
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": call_id,
-                    "content": tool_output(output, position)?,
+                    "content": text,
                 }));
+                // Chat Completions tool messages are text-only. Images a tool returned
+                // (Codex view_image, screenshots) follow as one user message after the
+                // last tool result of the turn, so every tool_call still answers first.
+                pending_images.extend(images);
+                let next_is_output = items
+                    .get(position + 1)
+                    .and_then(Value::as_object)
+                    .is_some_and(|next| {
+                        next.get("type").and_then(Value::as_str) == Some("function_call_output")
+                            && !is_injected_context(next)
+                    });
+                if !next_is_output && !pending_images.is_empty() {
+                    let mut content = vec![json!({
+                        "type": "text",
+                        "text": "Images returned by the tool calls above:"
+                    })];
+                    content.append(&mut pending_images);
+                    messages.push(json!({"role": "user", "content": content}));
+                }
             }
             // Reasoning is replayable only against the store that produced it, so
             // it is dropped rather than forwarded as a bogus assistant message.
@@ -403,7 +424,8 @@ fn push_injected_context(
     let output = item
         .get("output")
         .ok_or_else(|| format!("input item {position} needs output"))?;
-    let text = tool_output(output, position)?;
+    // Injected context is text; images only ever come from real tool calls.
+    let (text, _) = tool_output(output, position)?;
     if text.trim().is_empty() {
         return Ok(());
     }
@@ -518,11 +540,13 @@ fn message_content(
     }
 }
 
-fn tool_output(output: &Value, position: usize) -> Result<String, String> {
+/// Text of a tool result plus any images it carried, as Chat Completions image parts.
+fn tool_output(output: &Value, position: usize) -> Result<(String, Vec<Value>), String> {
     match output {
-        Value::String(text) => Ok(text.clone()),
+        Value::String(text) => Ok((text.clone(), Vec::new())),
         Value::Array(parts) => {
             let mut text = String::new();
+            let mut images = Vec::new();
             for part in parts {
                 let part = part.as_object().ok_or_else(|| {
                     format!("the function_call_output in input item {position} has a part that is not an object")
@@ -537,6 +561,22 @@ fn tool_output(output: &Value, position: usize) -> Result<String, String> {
                             },
                         )?);
                     }
+                    Some("input_image") => {
+                        let url = part.get("image_url").and_then(Value::as_str).ok_or_else(
+                            || format!("a tool output image part in input item {position} needs image_url"),
+                        )?;
+                        let mut image = Map::new();
+                        image.insert("url".into(), json!(url));
+                        if let Some(detail) = part.get("detail").filter(|detail| !detail.is_null())
+                        {
+                            image.insert("detail".into(), detail.clone());
+                        }
+                        images
+                            .push(json!({"type": "image_url", "image_url": Value::Object(image)}));
+                        if text.is_empty() {
+                            text.push_str("[image attached below]");
+                        }
+                    }
                     Some(other) => {
                         return Err(format!(
                             "the {other} tool output part is not supported by the chat completions adapter"
@@ -549,7 +589,7 @@ fn tool_output(output: &Value, position: usize) -> Result<String, String> {
                     }
                 }
             }
-            Ok(text)
+            Ok((text, images))
         }
         _ => Err(format!(
             "the function_call_output in input item {position} must be a string or an array of content parts"
