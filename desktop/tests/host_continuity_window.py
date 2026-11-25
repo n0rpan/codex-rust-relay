@@ -80,6 +80,9 @@ def local_tool_terminal(window, provider, root, project):
     # Native transcript search expands the exact matching tool and scrolls it into view.
     # Earlier approvals can have another identically titled Terminal header on screen.
     window.key("ctrl+f")
+    # Type only once the find field exists and has focus. Typing straight after
+    # the shortcut can race it and send the query to the composer instead.
+    window.word("Find", same_row="transcript")
     window.text("fixture-failed")
     window.word("Run", same_row="terminal", click=True)
     run_reviewed_fixture(window, marker, [str(project.resolve()), "--", "fixture-failed", "two words"])
