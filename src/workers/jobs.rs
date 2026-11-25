@@ -47,7 +47,7 @@ pub(super) struct Start {
     /// Never above the parent's own mode.
     #[serde(default)]
     permission_mode: Option<String>,
-    /// Wall-clock limit in minutes. Default: OX_WORKER_MAX_MINUTES, else 240.
+    /// Wall-clock limit in minutes. Falls back to OX_WORKER_MAX_MINUTES when set.
     #[serde(default)]
     max_minutes: Option<u32>,
 }
