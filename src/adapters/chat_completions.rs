@@ -69,6 +69,18 @@
 
 use serde_json::{Map, Value, json};
 
+/// Build the `item_id` reported for a generated assistant message.
+///
+/// Codex keys transcript rows by `(turn, item_id)` and appends a row only the
+/// first time it sees a key, so an id that repeats within a turn makes every
+/// later reply rewrite the first row in place. A name built only from a
+/// per-stream `output_index` repeats on every response, because the index
+/// restarts at 0. Prefixing the response id keeps ids unique across a thread
+/// while staying reproducible.
+fn message_item_id(response_id: &str, index: usize) -> String {
+    format!("msg_{response_id}_{index}")
+}
+
 /// Which Chat Completions field carries the Responses `max_output_tokens` limit.
 ///
 /// `MaxTokens` is deprecated upstream but is what essentially every compatible
@@ -331,6 +343,14 @@ fn push_input_items(
                 push_function_call(messages, call_id, name, arguments);
             }
             "function_call_output" => {
+                // Codex injects goal context as a namespaced pseudo-tool result
+                // carrying `name` + `namespace` and no `call_id`. It is not a
+                // real call result, so there is no `tool_call_id` to answer;
+                // forwarding it as context keeps the objective on later turns.
+                if is_injected_context(item) {
+                    push_injected_context(messages, item, position)?;
+                    continue;
+                }
                 let call_id = item
                     .get("call_id")
                     .and_then(Value::as_str)
@@ -354,6 +374,51 @@ fn push_input_items(
             }
         }
     }
+    Ok(())
+}
+
+/// A `function_call_output` that stands in for tool output Codex holds itself
+/// rather than a real call the model made. Codex marks these with a `namespace`
+/// and no `call_id`.
+fn is_injected_context(item: &Map<String, Value>) -> bool {
+    let namespaced = item.get("namespace").is_some_and(|value| !value.is_null());
+    let has_call_id = item
+        .get("call_id")
+        .and_then(Value::as_str)
+        .is_some_and(|call_id| !call_id.is_empty());
+    namespaced && !has_call_id
+}
+
+/// Fold an injected context item into a plain `user` turn.
+///
+/// It cannot become a `tool` message: there is no `tool_call_id` to answer, and
+/// a `tool` message with an invented id would be rejected upstream or, worse,
+/// silently answered as if the model had asked. A user message keeps the text in
+/// the conversation for later turns without pretending a call happened.
+fn push_injected_context(
+    messages: &mut Vec<Value>,
+    item: &Map<String, Value>,
+    position: usize,
+) -> Result<(), String> {
+    let output = item
+        .get("output")
+        .ok_or_else(|| format!("input item {position} needs output"))?;
+    let text = tool_output(output, position)?;
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let label = match (
+        item.get("namespace").and_then(Value::as_str),
+        item.get("name").and_then(Value::as_str),
+    ) {
+        (Some(namespace), Some(name)) => format!("{namespace}.{name}"),
+        (None, Some(name)) => name.to_owned(),
+        _ => "context".to_owned(),
+    };
+    messages.push(json!({
+        "role": "user",
+        "content": format!("[{label}]\n{text}"),
+    }));
     Ok(())
 }
 
@@ -960,7 +1025,7 @@ impl ResponseTranslator {
             let output_index = self.next_output_index;
             self.next_output_index += 1;
             let message = MessageState {
-                item_id: format!("msg_{output_index}"),
+                item_id: message_item_id(&self.response_id, output_index),
                 output_index,
                 parts: Vec::new(),
             };

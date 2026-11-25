@@ -615,7 +615,7 @@ fn streams_text_as_responses_events() {
     assert_eq!(added["output_index"], 0);
     assert_eq!(
         added["item"],
-        json!({"id": "msg_0", "type": "message", "status": "in_progress", "role": "assistant", "content": []})
+        json!({"id": "msg_resp_test_0", "type": "message", "status": "in_progress", "role": "assistant", "content": []})
     );
     let part_added = one(&events, "response.content_part.added");
     assert_eq!(part_added["content_index"], 0);
@@ -626,7 +626,7 @@ fn streams_text_as_responses_events() {
 
     let text_done = one(&events, "response.output_text.done");
     assert_eq!(text_done["text"], "Hello, world");
-    assert_eq!(text_done["item_id"], "msg_0");
+    assert_eq!(text_done["item_id"], "msg_resp_test_0");
 
     let completed = one(&events, "response.completed");
     assert_eq!(completed["response"]["id"], "resp_test");
@@ -637,7 +637,7 @@ fn streams_text_as_responses_events() {
     assert_eq!(
         completed["response"]["output"],
         json!([{
-            "id": "msg_0",
+            "id": "msg_resp_test_0",
             "type": "message",
             "status": "completed",
             "role": "assistant",
@@ -1191,4 +1191,104 @@ fn fixture_framing_tolerates_a_truncated_stream() {
     assert!(error.contains("finish_reason"), "{error}");
     assert_eq!(text(&events), "Fixture reply.");
     events.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Regression: assistant item ids must be unique across a thread
+// ---------------------------------------------------------------------------
+
+/// Codex keys transcript rows by `(turn, item_id)` and appends a row only the
+/// first time it sees a key. Ids built from a per-stream `output_index` repeat
+/// on every response, so a second reply rewrote the first row in place instead
+/// of adding a new one. Two separate responses must never share an item id.
+#[test]
+fn assistant_item_ids_are_unique_across_responses() {
+    let mut first = ResponseTranslator::new("resp_a", "upstream-model", 1_700_000_000);
+    push(&mut first, &role_chunk());
+    push(&mut first, &chunk(json!({"content": "first"})));
+    push(&mut first, &finish_chunk("stop"));
+    let mut first_events = push(&mut first, &usage_chunk());
+    first_events.extend(first.push_event("message", "[DONE]").expect("done"));
+    let first_id = one(&first_events, "response.completed")["response"]["output"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut second = ResponseTranslator::new("resp_b", "upstream-model", 1_700_000_001);
+    push(&mut second, &role_chunk());
+    push(&mut second, &chunk(json!({"content": "second"})));
+    push(&mut second, &finish_chunk("stop"));
+    let mut second_events = push(&mut second, &usage_chunk());
+    second_events.extend(second.push_event("message", "[DONE]").expect("done"));
+    let second_id = one(&second_events, "response.completed")["response"]["output"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    assert_ne!(
+        first_id, second_id,
+        "two responses produced the same assistant item id {first_id:?}; \
+         Codex collapses them onto one transcript row"
+    );
+    // Both are still distinct message ids, and neither is the bare position.
+    assert!(first_id.starts_with("msg_"), "{first_id}");
+    assert!(second_id.starts_with("msg_"), "{second_id}");
+}
+
+// ---------------------------------------------------------------------------
+// Regression: namespaced injected context (Codex goal objectives)
+// ---------------------------------------------------------------------------
+
+/// When a thread has a goal, Codex injects the objective as a
+/// `function_call_output` carrying `name` + `namespace` and no `call_id`. It is
+/// context, not the answer to a call, so demanding a `call_id` aborted the whole
+/// turn with "input item N needs a call_id". It must reach the model instead.
+#[test]
+fn forwards_namespaced_injected_context_without_a_call_id() {
+    let input = json!({"input": [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        {
+            "type": "function_call_output",
+            "name": "goal_objective",
+            "namespace": "agent",
+            "output": "Inspect the repo and describe the UI/UX."
+        }
+    ]});
+    let body = translate_request(&input, "m").expect("injected context must not abort the turn");
+    let messages = body["messages"].as_array().unwrap();
+    let context = messages
+        .iter()
+        .find(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Inspect the repo"))
+        })
+        .expect("the objective reached the model");
+
+    // It is context, not an answer to a tool call: no invented `tool` role.
+    assert_eq!(context["role"], "user");
+    assert!(context.get("tool_call_id").is_none());
+    assert!(
+        messages.iter().all(|message| message["role"] != "tool"),
+        "injected context must not fabricate a tool result: {messages:?}"
+    );
+    // The label keeps the provenance discoverable.
+    assert!(
+        context["content"]
+            .as_str()
+            .unwrap()
+            .contains("agent.goal_objective")
+    );
+}
+
+/// A real tool result still requires its `call_id`; the injected-context
+/// exemption must not swallow genuine protocol errors.
+#[test]
+fn still_requires_a_call_id_for_real_tool_outputs() {
+    let input = json!({"input": [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        {"type": "function_call_output", "output": "orphan output"}
+    ]});
+    let error = translate_request(&input, "m").unwrap_err();
+    assert!(error.contains("needs a call_id"), "{error}");
 }
