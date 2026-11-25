@@ -259,4 +259,19 @@ fn a_codex_handoff_sends_carried_messages_in_order_before_the_request() {
     );
     let opened = store.take_opened();
     assert!(opened.is_some(), "the store reports the new native session");
+    // Codex reports the model's context window in thread/tokenUsage/updated.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut windows = Vec::new();
+    while windows.is_empty() && Instant::now() < deadline {
+        if let Ok(e) = rx.recv_timeout(Duration::from_millis(200)) {
+            store.apply(e);
+        }
+        let _ = store.drain(vec![], Instant::now());
+        windows.extend(store.take_context_windows());
+    }
+    println!("reported context windows: {windows:?}");
+    assert!(
+        windows.iter().any(|(_, w)| *w > 0),
+        "Codex reported a context window"
+    );
 }

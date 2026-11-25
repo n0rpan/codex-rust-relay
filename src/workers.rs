@@ -71,21 +71,46 @@ impl Relay {
         home: &Path,
         client: ClientKind,
     ) -> Result<u8, RelayError> {
+        let (mcp, gateway) = self.attach(args, home, client, Tools::All)?;
+        command.env(TOKEN_ENV, &gateway.token);
+        command.args(mcp);
+        command.args(args);
+        crate::exempt_loopback_proxy(&mut command);
+        eprintln!(
+            "ox: API workers enabled. Ask for the ox model list or name an API model to delegate to."
+        );
+        tokio::select! {
+            result = crate::native::launch(command) => result,
+            result = gateway.serve() => Err(result),
+        }
+    }
+
+    /// Prepare this gateway for a client launch: the stock client's MCP
+    /// arguments, and the gateway to serve while the client runs. The client
+    /// also needs `TOKEN_ENV` set to [`Gateway::token`].
+    pub(crate) fn attach(
+        self,
+        args: &[OsString],
+        home: &Path,
+        client: ClientKind,
+        tools: Tools,
+    ) -> Result<(Vec<OsString>, Gateway), RelayError> {
         let origin = format!("http://{}", self.listener.local_addr()?);
         let url = format!("{origin}/mcp");
-        command.env(TOKEN_ENV, &self.token);
-        match client {
-            ClientKind::Codex => {
-                for (field, value) in [
-                    ("url", json!(url)),
-                    ("bearer_token_env_var", json!(TOKEN_ENV)),
-                    ("tool_timeout_sec", json!(120)),
-                ] {
-                    command
-                        .arg("-c")
-                        .arg(format!("mcp_servers.{SERVER}.{field}={value}"));
-                }
-            }
+        let mcp = match client {
+            ClientKind::Codex => [
+                ("url", json!(url)),
+                ("bearer_token_env_var", json!(TOKEN_ENV)),
+                ("tool_timeout_sec", json!(120)),
+            ]
+            .into_iter()
+            .flat_map(|(field, value)| {
+                [
+                    OsString::from("-c"),
+                    OsString::from(format!("mcp_servers.{SERVER}.{field}={value}")),
+                ]
+            })
+            .collect(),
             ClientKind::Claude => {
                 let config = json!({
                     "mcpServers": {
@@ -96,11 +121,10 @@ impl Relay {
                         }
                     }
                 });
-                command.arg(format!("--mcp-config={config}"));
+                vec![OsString::from(format!("--mcp-config={config}"))]
             }
-        }
-        command.args(args);
-        crate::exempt_loopback_proxy(&mut command);
+        };
+        let token = self.token.clone();
         let service = Arc::new(Service {
             app: OnceCell::new_with(self.app.map(|app| Ok(prepare_app(app, home, &self.token)))),
             local_auth: crate::provider::bearer(&self.token)?,
@@ -119,17 +143,47 @@ impl Relay {
             client,
             slots: Semaphore::new(4),
             jobs: Mutex::new(jobs::Jobs::default()),
+            tools,
         });
-        eprintln!(
-            "ox: API workers enabled. Ask for the ox model list or name an API model to delegate to."
-        );
-        tokio::select! {
-            result = crate::native::launch(command) => result,
-            result = crate::serve_requests(self.listener, move |request| {
-                let service = Arc::clone(&service);
-                async move { service.handle(request).await }
-            }) => Err(result.unwrap_err().into()),
-        }
+        Ok((
+            mcp,
+            Gateway {
+                listener: self.listener,
+                service,
+                token,
+            },
+        ))
+    }
+}
+
+/// Which tools a gateway offers. An API session the session host runs gets only
+/// read_ox_thread, so a handoff target on an API alias can read its source.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tools {
+    All,
+    HandoffRead,
+}
+
+pub(crate) struct Gateway {
+    listener: TcpListener,
+    service: Arc<Service>,
+    pub(crate) token: String,
+}
+
+impl Gateway {
+    /// The environment variable and value the client needs for this gateway.
+    pub(crate) fn env(&self) -> (&'static str, &str) {
+        (TOKEN_ENV, &self.token)
+    }
+    pub(crate) async fn serve(self) -> RelayError {
+        let service = self.service;
+        crate::serve_requests(self.listener, move |request| {
+            let service = Arc::clone(&service);
+            async move { service.handle(request).await }
+        })
+        .await
+        .unwrap_err()
+        .into()
     }
 }
 
@@ -215,6 +269,7 @@ struct Service {
     client: ClientKind,
     slots: Semaphore,
     jobs: Mutex<jobs::Jobs>,
+    tools: Tools,
 }
 
 #[derive(Deserialize)]
@@ -357,7 +412,20 @@ impl Service {
         let result = match method {
             "initialize" => initialize(params),
             "ping" => json!({}),
+            "tools/list" if self.tools == Tools::HandoffRead => {
+                let mut all = tools();
+                if let Some(list) = all["tools"].as_array_mut() {
+                    list.retain(|t| t["name"] == "read_ox_thread");
+                }
+                all
+            }
             "tools/list" => tools(),
+            "tools/call"
+                if self.tools == Tools::HandoffRead
+                    && params["name"].as_str() != Some("read_ox_thread") =>
+            {
+                return rpc_error(id.clone(), -32602, "Unknown worker tool");
+            }
             "tools/call" => match params["name"].as_str() {
                 Some("list_ox_models") => match serde_json::from_value(
                     params
