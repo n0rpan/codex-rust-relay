@@ -27,7 +27,7 @@ pub struct Remote {
     pub(super) options: HashMap<String, routes_thread::Options>,
     pub(super) draft_access: Option<Access>,
     /// The newest host draft restore applied per session.
-    restored_seen: HashMap<String, u64>,
+    restored_seen: HashMap<String, String>,
     /// Input sent but not yet acknowledged by the host: the owner, the draft it came from
     /// and how many identical user messages the transcript held when it was sent.
     pending: HashMap<String, (Option<String>, Option<compose::Draft>, usize)>,
@@ -483,6 +483,7 @@ impl Store {
         let Link::Host(old) = &mut previous.link else {
             return;
         };
+        self.remote_mut().restored_seen = std::mem::take(&mut old.restored_seen);
         let mut unsent: Vec<_> = std::mem::take(&mut old.pending).into_values().collect();
         // Input the old replica was already holding back for the same reason.
         let waiting = std::mem::take(&mut old.unconfirmed);
@@ -753,18 +754,20 @@ impl Store {
         } else {
             self.terminal_threads.remove(&id);
         }
-        if let (Some(seq), Some(text)) = (
-            data["restored_draft"]["seq"].as_u64(),
+        if let (Some(message), Some(text)) = (
+            data["restored_draft"]["message"].as_str(),
             data["restored_draft"]["text"].as_str(),
         ) && self
             .remote()
-            .is_some_and(|r| r.restored_seen.get(&id).is_none_or(|n| *n < seq))
+            .is_some_and(|r| r.restored_seen.get(&id).is_none_or(|seen| seen != message))
         {
-            self.remote_mut().restored_seen.insert(id.clone(), seq);
+            self.remote_mut()
+                .restored_seen
+                .insert(id.clone(), message.to_owned());
             // The host took the send and then lost it: the text is back in its
             // composer, so it comes back here too, before anything typed since.
             let current = self.drafts.entry(Some(id.clone())).or_default();
-            if !current.text.contains(text) {
+            if current.text != text {
                 current.text = if current.text.is_empty() {
                     text.to_owned()
                 } else {

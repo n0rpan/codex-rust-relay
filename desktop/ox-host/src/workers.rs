@@ -396,10 +396,9 @@ pub(crate) fn status(
             "failed" => "failed",
             "interrupted" | "Last seen running" => "interrupted",
             _ if !live => "interrupted",
-            // A Workflow worker completes only if it called the Workflow tool.
-            _ if finished && workflow_unrun(o.mode, timeline) => "failed",
-            // The operator's Stop (or the runtime) ended the turn: partial output, not an answer.
+            // A stopped Workflow can exit before calling its tool.
             _ if finished && stopped => "interrupted",
+            _ if finished && workflow_unrun(o.mode, timeline) => "failed",
             _ if finished || timeline.is_none() => "completed",
             _ => "running",
         }
@@ -435,15 +434,22 @@ pub(crate) fn status(
         }
         _ => "",
     };
+    let stopped_turn = timeline
+        .filter(|_| stopped && status == "interrupted")
+        .and_then(|t| t.detail["last_finished"].as_str());
     let result = timeline
         .and_then(|t| {
             t.items
                 .iter()
                 .rev()
-                .find(|i| i.role == "assistant")
+                .find(|i| i.role == "assistant" && stopped_turn.is_none_or(|turn| i.turn == turn))
                 .map(|i| i.text[..i.text.floor_char_boundary(24 * 1024)].to_owned())
         })
-        .or_else(|| recorded.and_then(|l| l.result.clone()));
+        .or_else(|| {
+            recorded
+                .filter(|_| stopped_turn.is_none())
+                .and_then(|last| last.result.clone())
+        });
     let error = if entry.marks.expired {
         Some(format!(
             "Worker stopped after {} minutes (time limit).",
@@ -906,6 +912,49 @@ mod tests {
         assert_eq!(reopened["status"], "interrupted");
         assert_eq!(reopened["result"], "half an answ");
         assert_eq!(reopened["partial"], true);
+    }
+
+    #[test]
+    fn interrupted_second_turn_does_not_publish_the_previous_turn_as_partial() {
+        let entry = Entry {
+            origin: worker(Level::Read, Runtime::Codex),
+            marks: Marks::default(),
+        };
+        let view = SessionView {
+            id: "w".into(),
+            title: String::new(),
+            parent: None,
+            status: "idle".into(),
+            updated_at: 0,
+            capabilities: vec![],
+            detail: Value::Null,
+        };
+        let timeline = Timeline {
+            items: vec![ox_desk_core::host_protocol::TimelineItem {
+                turn: "earlier".into(),
+                id: "i".into(),
+                role: "assistant".into(),
+                text: "original answer".into(),
+                revision: 1,
+                detail: Value::Null,
+            }],
+            detail: json!({"last_finished":"second","interrupted":true}),
+        };
+        let state = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view),
+            Some(&timeline),
+            true,
+            Operators::default(),
+        );
+        assert_eq!(state["status"], "interrupted");
+        assert!(
+            state["result"].is_null(),
+            "second turn had no output: {state}"
+        );
+        assert_eq!(state["partial"], false);
     }
 
     #[test]

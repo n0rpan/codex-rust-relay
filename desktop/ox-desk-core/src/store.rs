@@ -97,9 +97,8 @@ pub struct Store {
     /// `claude_resume_send`).
     resume_access: HashMap<String, crate::runtime::Access>,
     /// Text the host put back in a session's composer after a send it had acknowledged
-    /// failed (numbered, so a replica applies each restore once). Cleared by the next send.
-    restored_drafts: HashMap<String, (u64, String)>,
-    restore_seq: u64,
+    /// failed (identified by the last unsent message). Cleared by the next send.
+    restored_drafts: HashMap<String, (String, String)>,
     /// The launch contract of each hosted Claude worker session, kept with the session so
     /// every relaunch (cold resume, resume after a host restart, fork) starts under it.
     worker_contracts: HashMap<String, crate::claude_worker_contract::Contract>,
@@ -194,7 +193,6 @@ impl Store {
             resume_sends: Default::default(),
             resume_access: Default::default(),
             restored_drafts: Default::default(),
-            restore_seq: 0,
             worker_contracts: Default::default(),
             child_threads: Default::default(),
             next_preset: None,

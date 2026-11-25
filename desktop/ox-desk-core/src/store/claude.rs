@@ -871,15 +871,8 @@ impl Store {
         if let Some(mode) = p.mode.filter(|_| p.link.is_some()) {
             self.resume_access.insert(id.into(), mode);
         }
-        let mut unsent: Vec<_> = p
-            .events
-            .take_awaiting_echo()
-            .into_iter()
-            .map(|(_, text)| text)
-            .collect();
-        if let Some((_, text)) = p.first.take() {
-            unsent.push(text);
-        }
+        let mut unsent = p.events.take_awaiting_echo();
+        unsent.extend(p.first.take());
         drop(p);
         self.restore_claude_drafts(id, unsent);
         let removed: std::collections::HashSet<_> = self

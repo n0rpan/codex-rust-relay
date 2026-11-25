@@ -136,15 +136,8 @@ impl Store {
         let Some(mut p) = self.claude_mut().sessions.remove(owner) else {
             return;
         };
-        let mut unsent: Vec<_> = p
-            .events
-            .awaiting_echo
-            .into_iter()
-            .map(|(_, text)| text)
-            .collect();
-        if let Some((_, text)) = p.first.take() {
-            unsent.push(text);
-        }
+        let mut unsent = p.events.awaiting_echo;
+        unsent.extend(p.first.take());
         self.restore_claude_drafts(owner, unsent);
         if self.claude().blank.as_deref() == Some(owner) {
             self.claude_mut().blank = None;
@@ -185,16 +178,17 @@ impl Store {
             .mark(Changed::CONNECTION | Changed::NOTICE | Changed::ASK | Changed::THREADS);
     }
 
-    pub(super) fn restore_claude_drafts(&mut self, owner: &str, mut unsent: Vec<String>) {
-        if !unsent.is_empty() {
+    pub(super) fn restore_claude_drafts(&mut self, owner: &str, messages: Vec<(String, String)>) {
+        if let Some((id, _)) = messages.last() {
+            let id = id.clone();
+            let mut unsent: Vec<_> = messages.into_iter().map(|(_, text)| text).collect();
             let draft = self.draft(Some(owner));
             if !draft.is_empty() && unsent.last().is_none_or(|s| s != draft) {
                 unsent.push(draft.to_owned());
             }
             let text = unsent.join("\n");
-            self.restore_seq += 1;
             self.restored_drafts
-                .insert(owner.to_owned(), (self.restore_seq, text.clone()));
+                .insert(owner.to_owned(), (id, text.clone()));
             self.edit(Some(owner), text);
             self.changed.mark(Changed::THREADS);
         }
@@ -700,10 +694,7 @@ impl Store {
                         .into_iter()
                         .partition(|(id, _)| cancelled.contains(id.as_str()));
                     *pending = survivors;
-                    self.restore_claude_drafts(
-                        owner,
-                        cancelled.into_iter().map(|(_, t)| t).collect(),
-                    );
+                    self.restore_claude_drafts(owner, cancelled);
                 }
                 if let Some(count) = result["still_queued"]
                     .as_array()
@@ -915,8 +906,13 @@ mod tests {
         let e = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         host.apply(e);
         assert_eq!(host.draft(Some(&a)), "back again");
+        replica.edit(Some(&a), "please come back again tomorrow".into());
         replica.apply_host(snapshot(&host, 2)).unwrap();
-        assert_eq!(replica.draft(Some(&a)), "back again");
+        assert_eq!(
+            replica.draft(Some(&a)),
+            "back again\nplease come back again tomorrow"
+        );
+        replica.edit(Some(&a), "back again".into());
         // The same snapshot again (reconnect) does not duplicate it, and text typed in
         // the meantime is kept after it.
         replica.apply_host(snapshot(&host, 3)).unwrap();
