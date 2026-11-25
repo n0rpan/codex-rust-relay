@@ -520,7 +520,8 @@ def idle(f):
 
 def memory(f):
     positions = wait(lambda: words if "0000" in (words := f.words()) else None)
-    search, first = positions["search"], positions["0000"]
+    first = positions["0000"]
+    search = f.wait_for("the thread search field", f.search_pos)
     for i in range(30):
         f.click(search)
         f.x("key", "ctrl+a")
@@ -627,7 +628,7 @@ def streaming(f):
         start = f.stats(reset=True)
         f.admin("stream")
         wait(lambda: f.events("stream-start"))
-        f.click((475, 645))
+        f.press("composer")
         f.x("type", "draft during streaming")
         wait(lambda: f.events("stream-end"), 18)
         # The final stream event has crossed the UI pump when the turn controls return to idle.
@@ -649,7 +650,7 @@ def streaming(f):
         # With text in the composer the submit slot is Send; it turns into Stop only for an
         # empty draft. G7 leaves its typed draft behind, so clear it first.
         if f.stats().get("draft"):
-            f.click((475, 645))
+            f.press("composer")
             f.x("key", "ctrl+a")
             f.x("key", "BackSpace")
             f.wait_for("an empty composer draft", lambda: not f.stats().get("draft"))
@@ -685,7 +686,7 @@ def recovery(f):
     pos = wait(lambda: f.words().get("0000"))
     f.click(pos)
     wait(lambda: f.events("history-reply") and f.stats()["tail_ns"] > 0)
-    f.click((475, 645))
+    f.press("composer")
     f.x("type", "preserve this draft")
     wait(lambda: "preserve" in f.words())
     def disconnect():
@@ -712,8 +713,6 @@ def recovery(f):
 def reuse(f):
     words = wait(lambda: w if "0000" in (w := f.words()) else None)
     first = words["0000"]
-    search = words["search"]
-    new_button = (search[0], search[1] - 40)
     wait(lambda: f.stats()["discovery_pending"] == 0 and len(f.events("spawn")) == 1)
     before_open = len(f.events("spawn")) + len(f.events("helper"))
     f.agent("fixture-model")
@@ -724,8 +723,9 @@ def reuse(f):
     base = len(f.events("spawn")) + len(f.events("helper"))
     for i in range(20):
         f.click(first)
-        f.click(new_button)
-        f.click((475, 645))
+        f.press("new-session")
+        f.wait_for("composer", lambda: f.control("composer"))
+        f.press("composer")
         f.x("type", f"Create thread {i}")
         f.x("key", "ctrl+Return")
         wait(lambda: len(f.events("send")) == i + 1)
@@ -752,7 +752,7 @@ def saved_layout(f):
     f.start(30, 1, routes=True)
     # A new window creates only its selected route. Use the same billing picker
     # as the route-reuse gate to create both panes before saving their layout.
-    wait(lambda: f.words().get("search"))
+    f.wait_for("the thread search field", f.search_pos)
     for target in (1, 0):
         f.agent("fixture-model" if target else "codex")
         wait(lambda: f.stats()["pane"] == target and f.stats()["connected"])

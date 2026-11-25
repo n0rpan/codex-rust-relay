@@ -113,6 +113,9 @@ def run(gui, stock, root):
                     icon buttons carry no visible word for OCR."""
                     end = time.monotonic() + 12
                     while time.monotonic() < end:
+                        if not Path(sock).exists():
+                            time.sleep(.06)
+                            continue
                         probe.sendto(b"snapshot", sock)
                         view = json.loads(probe.recv(1 << 20))
                         for control in view.get("layout", []):
@@ -289,7 +292,7 @@ def run(gui, stock, root):
         fresh_env = {**child, "HOME": str(fresh), "CODEX_HOME": str(fresh / ".codex"),
                      "XDG_STATE_HOME": str(fresh / "state"),
                      "OX_DESK_STATS_SOCKET": str(fresh / "stats")}
-        with session_host(gui.with_name("ox-host"),root,fresh_env), subprocess.Popen([gui, alpha], env=fresh_env) as app, \
+        with session_host(gui.with_name("ox-host"),root,fresh_env), subprocess.Popen([gui, "--desk-stats", alpha], env=fresh_env) as app, \
                 socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as probe:
             probe.bind(str(fresh / "probe"))
             probe.settimeout(2)

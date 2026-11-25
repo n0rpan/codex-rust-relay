@@ -442,13 +442,19 @@ impl Workbench {
                         .child(notice),
                 )
             })
-            .child(super::mention_menu::composer_input(
-                editor.clone(),
-                selected.clone(),
-                store,
-                self.image_work.contains_key(&selected),
-                self.mention_index,
-                cx,
+            // Marked for the test probe so window tests focus the composer by id.
+            .child(crate::platform::layout_probe::mark_element(
+                div().w_full().child(super::mention_menu::composer_input(
+                    editor.clone(),
+                    selected.clone(),
+                    store,
+                    self.image_work.contains_key(&selected),
+                    self.mention_index,
+                    cx,
+                )),
+                &gpui::ElementId::from("composer"),
+                &gpui::SharedString::from("Composer"),
+                true,
             ))
             .child(
                 row()
