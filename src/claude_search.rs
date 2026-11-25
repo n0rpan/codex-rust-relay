@@ -696,7 +696,7 @@ fn display_title(result: &SearchResult) -> String {
 }
 
 fn token_estimate(text: &str) -> u64 {
-    ((text.len() as u64) + 3) / 4
+    (text.len() as u64).div_ceil(4)
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -744,9 +744,7 @@ fn dedicated_query(messages: Option<&Value>) -> Option<Result<String, BridgeErro
         }
         _ => return None,
     };
-    let Some(query) = text.strip_prefix(QUERY_PREFIX) else {
-        return None;
-    };
+    let query = text.strip_prefix(QUERY_PREFIX)?;
     let query = query.trim();
     if query.is_empty() {
         return Some(Err(BridgeError::InvalidRequest(

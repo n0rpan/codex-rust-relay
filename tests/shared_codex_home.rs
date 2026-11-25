@@ -541,7 +541,7 @@ fn stock_codex_uses_native_credentials_and_an_isolated_relay_profile() {
     assert_header(inference, "chatgpt-account-id", ACCOUNT_ID);
     assert_header(inference, "originator", "codex_exec");
     assert!(
-        inference.headers.get("x-api-key").is_none(),
+        !inference.headers.contains_key("x-api-key"),
         "native ChatGPT auth must not be downgraded to an API key"
     );
 
@@ -628,7 +628,7 @@ fn stock_codex_uses_native_credentials_and_an_isolated_relay_profile() {
         .unwrap_or_else(|| panic!("missing vendor request; captured {requests:#?}"));
     assert_header(vendor, "authorization", &format!("Bearer {VENDOR_KEY}"));
     assert!(
-        vendor.headers.get("chatgpt-account-id").is_none(),
+        !vendor.headers.contains_key("chatgpt-account-id"),
         "the vendor must not receive the ChatGPT account id"
     );
     for (name, value) in &vendor.headers {
@@ -701,7 +701,7 @@ fn stock_codex_uses_native_credentials_and_an_isolated_relay_profile() {
     assert!(worker_call.body_text.contains("delegated-only marker"));
     assert!(!worker_call.body_text.contains("native worker fixture"));
     assert!(!worker_call.body_text.contains(&access_token));
-    assert!(worker_call.headers.get("chatgpt-account-id").is_none());
+    assert!(!worker_call.headers.contains_key("chatgpt-account-id"));
     let returned = phase3
         .iter()
         .find(|request| {

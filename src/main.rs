@@ -2429,9 +2429,7 @@ env_key = "ALPHA_KEY"
         let hidden = catalog["models"]
             .as_array()
             .unwrap()
-            .iter()
-            .filter(|model| model["slug"] == "bundled-default")
-            .next()
+            .iter().find(|model| model["slug"] == "bundled-default")
             .expect("bundled models are shadowed");
         assert_eq!(hidden["visibility"], "hide");
         assert_eq!(hidden["supported_in_api"], false);
@@ -3541,7 +3539,7 @@ context_window = 200000
         assert_eq!(hit.path, "/v1/messages");
         assert_eq!(hit.headers.get("x-api-key").unwrap(), "alpha-secret-key");
         assert_eq!(hit.headers.get("anthropic-version").unwrap(), "2023-06-01");
-        assert!(hit.headers.get("authorization").is_none());
+        assert!(!hit.headers.contains_key("authorization"));
         let body = hit.body.unwrap();
         assert_eq!(body["model"], "upstream-model");
         assert_eq!(body["max_tokens"], 64);

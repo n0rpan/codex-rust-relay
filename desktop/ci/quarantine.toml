@@ -1,0 +1,12 @@
+# Quarantined window tests. See desktop/ci/quarantine.py and the flake rule
+# at the top of .github/workflows/desktop.yml.
+#
+# A quarantined test still runs in the nightly schedule and in manual runs,
+# where it blocks. On pull requests, main and tags it is skipped with a notice.
+# Every entry names the tracking issue; remove the entry when the issue closes.
+#
+# [[test]]
+# name = "host_continuity_window"      # desktop/tests/<name>.py or a gate scenario set
+# runners = ["ubuntu-24.04-arm"]       # optional; default: every runner
+# issue = 123                          # required: github.com/n0rpan/ox/issues/123
+# reason = "transcript find not opened by xdotool ctrl+f on ARM"

@@ -266,7 +266,7 @@ impl Protocol {
         }
     }
 
-    fn direct_body<'a>(self, fixtures: &'a Fixtures) -> &'a [u8] {
+    fn direct_body(self, fixtures: &Fixtures) -> &[u8] {
         match self {
             Protocol::Responses => &fixtures.responses_direct,
             Protocol::ChatCompletions => &fixtures.chat_upstream,
@@ -274,7 +274,7 @@ impl Protocol {
         }
     }
 
-    fn events<'a>(self, fixtures: &'a Fixtures) -> &'a [Vec<u8>] {
+    fn events(self, fixtures: &Fixtures) -> &[Vec<u8>] {
         match self {
             Protocol::Responses => &fixtures.responses_events,
             Protocol::ChatCompletions => &fixtures.chat_events,
@@ -1945,11 +1945,10 @@ fn sha256(path: &Path) -> Option<String> {
         let Ok(text) = String::from_utf8(output.stdout) else {
             continue;
         };
-        if let Some(first) = text.split_whitespace().next() {
-            if first.len() == 64 && first.chars().all(|c| c.is_ascii_hexdigit()) {
+        if let Some(first) = text.split_whitespace().next()
+            && first.len() == 64 && first.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Some(first.to_ascii_lowercase());
             }
-        }
     }
     None
 }
