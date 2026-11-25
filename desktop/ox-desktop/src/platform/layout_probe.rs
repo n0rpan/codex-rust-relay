@@ -8,6 +8,7 @@ use gpui::{
     App, Bounds, ElementId, ParentElement, Pixels, SharedString, Styled, Window, WindowId, canvas,
 };
 use gpui_component::button::Button;
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::sync::{LazyLock, Mutex};
 
@@ -39,12 +40,12 @@ pub fn active() -> bool {
 /// Called from a window's root render, before any control prepaints: drops the
 /// controls of the previous frame and records the window's test-facing state.
 /// Views are not cached in OX, so every drawn frame renders the root again.
-pub fn begin_frame(window: &Window, title: &'static str, state: impl FnOnce() -> Value) {
+pub fn begin_frame<S: Serialize>(window: &Window, title: &'static str, state: impl FnOnce() -> S) {
     if !active() {
         return;
     }
     let id = window.window_handle().window_id();
-    let state = state();
+    let state = serde_json::to_value(state()).unwrap_or(Value::Null);
     let mut windows = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(frame) = windows.iter_mut().find(|f| f.window == id) {
         frame.controls.clear();
@@ -144,4 +145,23 @@ fn x11(window: &Window) -> Option<u64> {
         RawWindowHandle::Xcb(h) => Some(u64::from(h.window.get())),
         _ => None,
     }
+}
+
+/// What Settings shows, for the stats snapshot.
+#[derive(Serialize)]
+pub struct SettingsProbe {
+    pub page: String,
+    pub remote: Option<RemoteProbe>,
+}
+
+/// What Settings → Remote access shows, for the stats snapshot. `finished`
+/// counts completed status operations, so a test waits for the one it started.
+#[derive(Serialize)]
+pub struct RemoteProbe {
+    pub checking: bool,
+    pub finished: u64,
+    pub notice: Option<String>,
+    pub permission: Option<String>,
+    pub enabled: bool,
+    pub origin: Option<String>,
 }

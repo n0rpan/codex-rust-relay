@@ -89,7 +89,7 @@ fn main() {
         })
         .detach_and_log_err(cx);
         cx.on_window_closed(|cx, window| {
-            kit::layout_probe::forget(window);
+            platform::layout_probe::forget(window);
             if cx.windows().is_empty() {
                 cx.quit()
             }

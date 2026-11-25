@@ -140,7 +140,7 @@ impl Panel {
             dimensions(window, cx),
         ) {
             Ok((terminal, screen, updates)) => {
-                if crate::kit::layout_probe::active() {
+                if crate::platform::layout_probe::active() {
                     // Lets a window test type a password only once echo is off.
                     terminal.observe_echo();
                 }
@@ -282,7 +282,7 @@ fn key_bytes(k: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
 
 impl Render for Panel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        crate::kit::layout_probe::begin_frame(window, "OX Terminal", || {
+        crate::platform::layout_probe::begin_frame(window, "OX Terminal", || {
             serde_json::json!({
                 "reviewing": self.screen.is_none(),
                 "running": self.terminal.is_some(),

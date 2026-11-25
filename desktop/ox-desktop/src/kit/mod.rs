@@ -1,5 +1,4 @@
 //! Shared keyboard-accessible controls for the workspace and preferences.
-pub mod layout_probe;
 use crate::appearance::Palette;
 use gpui::{
     App, AppContext, ClickEvent, ElementId, InteractiveElement, ParentElement, SharedString,
@@ -37,7 +36,7 @@ pub fn button(
         .disabled(!enabled)
         .tab_stop(enabled)
         .on_click(click);
-    layout_probe::mark(button, &id, &label, enabled)
+    crate::platform::layout_probe::mark(button, &id, &label, enabled)
 }
 
 /// A quiet toolbar control retains Button's tab stop, accessible label, and activation behavior.
@@ -58,7 +57,7 @@ pub fn toolbar_button(
         .disabled(!enabled)
         .tab_stop(enabled)
         .on_click(click);
-    layout_probe::mark(button, &id, &label, enabled)
+    crate::platform::layout_probe::mark(button, &id, &label, enabled)
 }
 
 pub use gpui_component::menu::{DropdownMenu, PopupMenuItem};

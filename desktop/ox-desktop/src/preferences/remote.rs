@@ -126,17 +126,17 @@ impl Remote {
         cx.notify();
     }
     /// What Settings → Remote access shows, for the desk stats probe.
-    pub fn probe_state(&self) -> serde_json::Value {
+    pub fn probe_state(&self) -> crate::platform::layout_probe::RemoteProbe {
         let report = self.report.as_ref();
         let permission = report.and_then(|r| r.denied.as_ref());
-        serde_json::json!({
-            "checking": self.busy,
-            "finished": self.finished,
-            "notice": self.message.as_deref().or(permission.map(|p| p.error.as_str())),
-            "permission": permission.map(|p| p.suggested()),
-            "enabled": report.is_some_and(|r| r.host.enabled),
-            "origin": report.and_then(|r| r.host.origin.as_deref()),
-        })
+        crate::platform::layout_probe::RemoteProbe {
+            checking: self.busy,
+            finished: self.finished,
+            notice: self.message.clone().or(permission.map(|p| p.error.clone())),
+            permission: permission.map(|p| p.suggested()),
+            enabled: report.is_some_and(|r| r.host.enabled),
+            origin: report.and_then(|r| r.host.origin.clone()),
+        }
     }
     fn action(
         &self,

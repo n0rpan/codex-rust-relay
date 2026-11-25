@@ -74,7 +74,7 @@ impl Workspace {
 }
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        kit::layout_probe::begin_frame(window, "OX Desktop", || serde_json::Value::Null);
+        crate::platform::layout_probe::begin_frame(window, "OX Desktop", || ());
         if let Some(host) = &self.host {
             return host.clone().into_any_element();
         }

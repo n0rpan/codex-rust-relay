@@ -1038,11 +1038,11 @@ fn button(
 
 impl Preferences {
     /// Test-facing state of the open settings page for the desk stats probe.
-    pub fn probe_state(&self, cx: &App) -> serde_json::Value {
-        serde_json::json!({
-            "page": format!("{:?}", self.page),
-            "remote": self.remote.as_ref().map(|r| r.read(cx).probe_state()),
-        })
+    pub fn probe_state(&self, cx: &App) -> crate::platform::layout_probe::SettingsProbe {
+        crate::platform::layout_probe::SettingsProbe {
+            page: format!("{:?}", self.page),
+            remote: self.remote.as_ref().map(|r| r.read(cx).probe_state()),
+        }
     }
 }
 

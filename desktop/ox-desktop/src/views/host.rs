@@ -274,7 +274,7 @@ impl Host {
             unknown += pane.store.as_ref().map_or(0, |s| s.unknown_frames());
         }
         let active = self.panes[self.active].read(cx).store.as_ref();
-        let (windows, layout) = crate::kit::layout_probe::snapshot();
+        let (windows, layout) = crate::platform::layout_probe::snapshot();
         let settings = self
             .preferences
             .as_ref()
