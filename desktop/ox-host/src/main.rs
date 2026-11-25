@@ -7,6 +7,7 @@ mod replay;
 mod runtime;
 mod transport;
 mod workers;
+mod yolo;
 
 use engine::{Engine, Message};
 use ox_host_service::{Paths, SocketGuard};

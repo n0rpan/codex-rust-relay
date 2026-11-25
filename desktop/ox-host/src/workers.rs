@@ -5,7 +5,8 @@
 //! go to the human clients through the normal ask path.
 use ox_desk_core::{
     host_protocol::{Scope, SessionView, Timeline},
-    origin::{Ceiling, ExternalCaller, Origin, ParentCall, ParentRef, Relation, WorkerStart},
+    modes::{self, Level, ModeRequest},
+    origin::{ExternalCaller, Origin, ParentCall, ParentRef, Relation, WorkerStart},
     runtime::{Access, Runtime},
 };
 use serde::{Deserialize, Serialize};
@@ -95,6 +96,9 @@ impl Registry {
             .filter(move |((s, _), _)| s == scope)
             .map(|((_, id), e)| (id.as_str(), e))
     }
+    pub fn all(&self) -> impl Iterator<Item = (&Scope, &str, &Entry)> {
+        self.sessions.iter().map(|((s, id), e)| (s, id.as_str(), e))
+    }
     pub fn entries_mut(&mut self) -> impl Iterator<Item = (&Scope, &mut Entry)> {
         self.sessions.iter_mut().map(|((s, _), e)| (s, e))
     }
@@ -124,64 +128,63 @@ impl Registry {
         self.sessions
             .iter()
             .filter(move |(_, e)| {
-                e.origin.parent.scope.as_ref() == Some(scope)
+                e.origin.relation != Relation::Handoff
+                    && e.origin.parent.scope.as_ref() == Some(scope)
                     && e.origin.parent.session.as_deref() == Some(id)
             })
             .map(|((s, id), _)| (s, id.as_str()))
     }
 }
 
-/// The parent permission check that existed for gateway-run workers, unchanged.
-pub(crate) fn permits(access: Option<Access>, write: bool, claude: bool) -> bool {
-    match access {
-        Some(Access::Yolo | Access::BypassPermissions) => true,
-        Some(Access::Workspace | Access::AutoReview) => !write || !claude,
-        Some(Access::AcceptEdits) => !write || claude,
-        Some(Access::ReadOnly | Access::Plan | Access::Default | Access::Auto) => !write,
-        _ => false,
-    }
+/// The level a hosted source grants its children: its confirmed live mode,
+/// further bounded by its own stamp when it is a worker or a fork of one. An
+/// unverified mode grants nothing.
+pub(crate) fn source_level(
+    runtime: Runtime,
+    access: Option<Access>,
+    origin: Option<&Origin>,
+) -> Option<Level> {
+    let live = Level::of(runtime, access?)?;
+    Some(match origin.and_then(Origin::limits_children) {
+        Some(stamp) => live.min(stamp),
+        None => live,
+    })
 }
 
-/// Decide the recorded ceiling before any process starts.
-/// A hosted parent's confirmed mode bounds it. A worker parent's own ceiling
-/// bounds its children. A terminal parent is bounded by what it asked for.
+/// A terminal launch's own mode cannot be verified. It may ask for read or
+/// write, as before; inheriting gives read, and nothing above write is granted.
+pub(crate) const TERMINAL_CEILING: Level = Level::Write;
+
+/// Decide a worker's starting mode before any process starts. Agents and the
+/// operator's `/worker` both inherit the source's level by default and may only
+/// lower it. Returns the resolved level, preset and how it was decided.
 pub(crate) fn grant(
-    parent_access: Option<Access>,
-    parent_origin: Option<&Origin>,
+    source: Option<Level>,
     external: bool,
+    request: ModeRequest,
     runtime: Runtime,
-    requested: Ceiling,
-) -> Result<Ceiling, String> {
-    let claude = runtime == Runtime::Claude;
-    let mut ceiling = if external {
-        requested
-    } else if permits(parent_access, true, claude) {
-        Ceiling::Write
-    } else if permits(parent_access, false, claude) {
-        Ceiling::Read
-    } else {
-        return Err("The parent session’s permission mode is not verified.".into());
-    };
-    if let Some(origin) = parent_origin {
-        ceiling = origin.child_ceiling(runtime, ceiling);
+) -> Result<modes::Resolved, String> {
+    if external {
+        let request = match request {
+            ModeRequest::Inherit => ModeRequest::Level(Level::Read),
+            other => other,
+        };
+        return modes::resolve(Some(TERMINAL_CEILING), request, runtime).map_err(|_| {
+            "A terminal launch can start read or write workers. Its own mode cannot be verified, so nothing above write is granted.".into()
+        });
     }
-    if requested > ceiling {
-        return Err("Worker access exceeds its active parent’s permission ceiling.".into());
-    }
-    Ok(ceiling)
+    modes::resolve(source, request, runtime)
 }
 
 /// The operator may change a worker's mode only within its recorded ceiling.
+/// Handoff targets belong to the operator and have no such bound.
 pub(crate) fn operator_access(origin: &Origin, access: Access) -> Result<(), String> {
-    if origin.ceiling.allows(origin.runtime, access) {
+    if !origin.bounds_operator() || origin.ceiling.allows(origin.runtime, access) {
         Ok(())
     } else {
         Err(format!(
             "This worker’s recorded ceiling is {}. Start a new worker for broader access.",
-            match origin.ceiling {
-                Ceiling::Read => "read-only",
-                Ceiling::Write => "workspace write",
-            }
+            origin.ceiling.label(origin.runtime)
         ))
     }
 }
@@ -275,7 +278,7 @@ pub(crate) fn origin(
     parent: Option<String>,
     start: &WorkerStart,
     job_id: u64,
-    ceiling: Ceiling,
+    resolved: modes::Resolved,
 ) -> Origin {
     Origin {
         relation: Relation::Worker,
@@ -286,9 +289,13 @@ pub(crate) fn origin(
         route: start.route(),
         mode: start.mode,
         job_id,
-        requested: Ceiling::of(start.write),
-        ceiling,
+        requested: resolved.level,
+        ceiling: resolved.level,
         source: None,
+        started: Some(resolved.access),
+        decided: Some(resolved.decision),
+        yolo: None,
+        handoff: None,
     }
 }
 
@@ -397,6 +404,8 @@ pub(crate) fn status(
         "session": id,
         "owner": "host",
         "access_ceiling": o.ceiling,
+        "started_mode": o.started,
+        "mode_decided": o.decided,
         "progress": progress,
         "result": result,
         "error": error,
@@ -416,7 +425,7 @@ mod tests {
             route,
         }
     }
-    fn worker(ceiling: Ceiling, runtime: Runtime) -> Origin {
+    fn worker(ceiling: Level, runtime: Runtime) -> Origin {
         Origin {
             relation: Relation::Worker,
             parent: ParentRef {
@@ -431,116 +440,127 @@ mod tests {
             route: runtime.route(Some("fixture".into())),
             mode: WorkerMode::Session,
             job_id: 7,
-            requested: Ceiling::Read,
+            requested: Level::Read,
             ceiling,
             source: None,
+            started: None,
+            decided: None,
+            yolo: None,
+            handoff: None,
         }
     }
 
-    #[test]
-    fn worker_cannot_inherit_unverified_or_broader_permissions() {
-        for mode in [
-            Access::ReadOnly,
-            Access::Plan,
-            Access::Default,
-            Access::Auto,
-        ] {
-            assert!(!permits(Some(mode), true, false));
-            assert!(!permits(Some(mode), true, true));
-        }
-        assert!(!permits(None, false, false));
-        assert!(!permits(Some(Access::Configured), true, false));
-        assert!(permits(Some(Access::Workspace), true, false));
-        assert!(!permits(Some(Access::Workspace), true, true));
-        assert!(!permits(Some(Access::AcceptEdits), true, false));
+    fn level(r: Result<modes::Resolved, String>) -> Result<(Level, Access), String> {
+        r.map(|r| (r.level, r.access))
     }
 
     #[test]
-    fn the_ceiling_is_the_parent_grant_and_requests_cannot_exceed_it() {
-        let c = Runtime::Codex;
+    fn workers_inherit_the_mapped_source_mode_and_unverified_modes_grant_nothing() {
+        use ModeRequest::Inherit;
+        let codex = |a| source_level(Runtime::Codex, Some(a), None);
+        let claude = |a| source_level(Runtime::Claude, Some(a), None);
+        // Workspace and Accept edits inherit across runtimes as each other.
         assert_eq!(
-            grant(Some(Access::Workspace), None, false, c, Ceiling::Read),
-            Ok(Ceiling::Write)
-        );
-        assert_eq!(
-            grant(Some(Access::ReadOnly), None, false, c, Ceiling::Read),
-            Ok(Ceiling::Read)
-        );
-        assert!(grant(Some(Access::ReadOnly), None, false, c, Ceiling::Write).is_err());
-        assert!(grant(None, None, false, c, Ceiling::Read).is_err());
-        assert!(grant(Some(Access::Configured), None, false, c, Ceiling::Read).is_err());
-        assert!(
-            grant(
-                Some(Access::Workspace),
-                None,
+            level(grant(
+                codex(Access::Workspace),
                 false,
-                Runtime::Claude,
-                Ceiling::Write
-            )
-            .is_err()
+                Inherit,
+                Runtime::Claude
+            )),
+            Ok((Level::Write, Access::AcceptEdits))
         );
-        // A terminal gateway is bounded by its own request.
-        assert_eq!(grant(None, None, true, c, Ceiling::Read), Ok(Ceiling::Read));
         assert_eq!(
-            grant(None, None, true, c, Ceiling::Write),
-            Ok(Ceiling::Write)
+            level(grant(
+                claude(Access::AcceptEdits),
+                false,
+                Inherit,
+                Runtime::Codex
+            )),
+            Ok((Level::Write, Access::Workspace))
         );
+        // Classifier modes inherit freely.
+        assert_eq!(
+            level(grant(claude(Access::Auto), false, Inherit, Runtime::Codex)),
+            Ok((Level::Classifier, Access::AutoReview))
+        );
+        assert_eq!(
+            level(grant(codex(Access::Yolo), false, Inherit, Runtime::Claude)),
+            Ok((Level::Yolo, Access::BypassPermissions))
+        );
+        // Unverified or foreign presets grant nothing.
+        assert_eq!(source_level(Runtime::Codex, None, None), None);
+        assert_eq!(codex(Access::Configured), None);
+        assert_eq!(codex(Access::AcceptEdits), None);
+        assert!(grant(None, false, Inherit, Runtime::Codex).is_err());
+        assert!(grant(None, false, ModeRequest::Level(Level::Read), Runtime::Codex).is_err());
+    }
+
+    #[test]
+    fn requests_above_the_source_are_refused_and_lower_ones_start_there() {
+        let c = Runtime::Codex;
+        let src = source_level(c, Some(Access::Workspace), None);
+        assert_eq!(
+            level(grant(src, false, ModeRequest::Level(Level::Read), c)),
+            Ok((Level::Read, Access::ReadOnly))
+        );
+        assert_eq!(
+            grant(src, false, ModeRequest::Level(Level::Read), c)
+                .unwrap()
+                .decision,
+            modes::Decision::Lowered
+        );
+        for above in [Level::Classifier, Level::Yolo] {
+            assert!(grant(src, false, ModeRequest::Level(above), c).is_err());
+        }
+        // Legacy workspace_write: false is read, true is write, never above the source.
+        let read = source_level(c, Some(Access::ReadOnly), None);
+        assert!(grant(read, false, ModeRequest::legacy(Some(true)), c).is_err());
+        assert_eq!(
+            level(grant(read, false, ModeRequest::legacy(Some(false)), c)),
+            Ok((Level::Read, Access::ReadOnly))
+        );
+        assert_eq!(
+            level(grant(src, false, ModeRequest::legacy(Some(true)), c)),
+            Ok((Level::Write, Access::Workspace))
+        );
+        // A terminal gateway: read by default, write on request, never more.
+        assert_eq!(
+            level(grant(None, true, ModeRequest::Inherit, c)),
+            Ok((Level::Read, Access::ReadOnly))
+        );
+        assert_eq!(
+            level(grant(None, true, ModeRequest::legacy(Some(true)), c)),
+            Ok((Level::Write, Access::Workspace))
+        );
+        assert!(grant(None, true, ModeRequest::Level(Level::Yolo), c).is_err());
+        assert!(grant(None, true, ModeRequest::Level(Level::Classifier), c).is_err());
     }
 
     #[test]
     fn ceilings_are_inherited_through_children_forks_and_continuation() {
-        let read = worker(Ceiling::Read, Runtime::Codex);
-        // A read worker in YOLO would still give its children only read.
+        let read = worker(Level::Read, Runtime::Codex);
+        // A read worker switched to YOLO by its operator still gives its children only read.
+        let src = source_level(Runtime::Codex, Some(Access::Yolo), Some(&read));
+        assert_eq!(src, Some(Level::Read));
+        assert!(grant(src, false, ModeRequest::Level(Level::Write), Runtime::Codex).is_err());
+        let write = worker(Level::Write, Runtime::Codex);
+        let src = source_level(Runtime::Codex, Some(Access::Workspace), Some(&write));
         assert_eq!(
-            grant(
-                Some(Access::Yolo),
-                Some(&read),
-                false,
-                Runtime::Codex,
-                Ceiling::Read
-            ),
-            Ok(Ceiling::Read)
+            level(grant(src, false, ModeRequest::Inherit, Runtime::Claude)),
+            Ok((Level::Write, Access::AcceptEdits))
         );
-        assert!(
-            grant(
-                Some(Access::Yolo),
-                Some(&read),
-                false,
-                Runtime::Codex,
-                Ceiling::Write
-            )
-            .is_err()
-        );
-        let write = worker(Ceiling::Write, Runtime::Codex);
-        assert_eq!(
-            grant(
-                Some(Access::Workspace),
-                Some(&write),
-                false,
-                Runtime::Codex,
-                Ceiling::Write
-            ),
-            Ok(Ceiling::Write)
-        );
-        // A nested write needs the same runtime's sandbox.
-        assert!(
-            grant(
-                Some(Access::Yolo),
-                Some(&write),
-                false,
-                Runtime::Claude,
-                Ceiling::Write
-            )
-            .is_err()
-        );
+        // A write worker lowered to read by its operator passes on read.
+        let src = source_level(Runtime::Codex, Some(Access::ReadOnly), Some(&write));
+        assert_eq!(src, Some(Level::Read));
         // Forks and forks of forks keep the original stamp's ceiling and job.
         let fork = read.fork("w1");
         let again = fork.fork("w2");
         for f in [&fork, &again] {
-            assert_eq!(f.ceiling, Ceiling::Read);
+            assert_eq!(f.ceiling, Level::Read);
             assert_eq!(f.job_id, read.job_id);
             assert_eq!(f.parent, read.parent);
             assert_eq!(f.relation, Relation::Fork);
+            assert_eq!(f.limits_children(), Some(Level::Read));
         }
         assert_eq!(again.source.as_deref(), Some("w2"));
         // Continuation keeps the session and its stamp, so the operator check is unchanged.
@@ -552,28 +572,33 @@ mod tests {
             !registry.stamp(&s, "w1", write.clone()),
             "a stamp is immutable"
         );
-        assert_eq!(
-            registry.get(&s, "w1").unwrap().origin.ceiling,
-            Ceiling::Read
-        );
+        assert_eq!(registry.get(&s, "w1").unwrap().origin.ceiling, Level::Read);
         assert!(registry.stamp(&s, "w2", fork));
         assert_eq!(registry.job(7).map(|(_, id, _)| id), Some("w1"));
     }
 
     #[test]
     fn the_operator_cannot_raise_access_above_the_recorded_ceiling() {
-        let read = worker(Ceiling::Read, Runtime::Codex);
+        let read = worker(Level::Read, Runtime::Codex);
         assert!(operator_access(&read, Access::ReadOnly).is_ok());
         assert!(operator_access(&read, Access::Workspace).is_err());
         assert!(operator_access(&read, Access::Yolo).is_err());
-        let write = worker(Ceiling::Write, Runtime::Codex);
+        let write = worker(Level::Write, Runtime::Codex);
         assert!(operator_access(&write, Access::Workspace).is_ok());
         assert!(operator_access(&write, Access::AutoReview).is_err());
         assert!(operator_access(&write, Access::Yolo).is_err());
-        let claude = worker(Ceiling::Write, Runtime::Claude);
+        let claude = worker(Level::Write, Runtime::Claude);
         assert!(operator_access(&claude, Access::AcceptEdits).is_ok());
         assert!(operator_access(&claude, Access::BypassPermissions).is_err());
         assert!(operator_access(&claude, Access::Auto).is_err());
+        let classifier = worker(Level::Classifier, Runtime::Claude);
+        assert!(operator_access(&classifier, Access::Auto).is_ok());
+        assert!(operator_access(&classifier, Access::BypassPermissions).is_err());
+        // A handoff target is the operator's own session.
+        let mut handoff = worker(Level::Read, Runtime::Claude);
+        handoff.relation = Relation::Handoff;
+        assert!(operator_access(&handoff, Access::BypassPermissions).is_ok());
+        assert_eq!(handoff.limits_children(), None);
     }
 
     #[test]
@@ -598,7 +623,7 @@ mod tests {
             origin: o,
             marks: Marks::default(),
         };
-        let hosted = entry(worker(Ceiling::Read, Runtime::Codex));
+        let hosted = entry(worker(Level::Read, Runtime::Codex));
         let me = |session: &str| Resolved::Hosted {
             scope: scope(Route::CODEX_SUBSCRIPTION),
             session: session.into(),
@@ -622,7 +647,7 @@ mod tests {
         );
 
         // Started by launch l1 without a known session.
-        let mut o = worker(Ceiling::Read, Runtime::Codex);
+        let mut o = worker(Level::Read, Runtime::Codex);
         o.parent.scope = None;
         o.parent.session = None;
         o.launch = launch_digest("terminal", "l1");
@@ -644,7 +669,7 @@ mod tests {
         assert!(!owns(&terminal(Some("s2"), "l3"), &started));
 
         // Recorded at launch: the session's resume owns it; others do not.
-        let mut t = worker(Ceiling::Read, Runtime::Codex);
+        let mut t = worker(Level::Read, Runtime::Codex);
         t.parent.scope = None;
         t.parent.session = Some("s1".into());
         t.launch = launch_digest("terminal", "l1");
@@ -657,7 +682,7 @@ mod tests {
     #[test]
     fn status_reports_operator_continuation_and_restart() {
         let mut entry = Entry {
-            origin: worker(Ceiling::Read, Runtime::Codex),
+            origin: worker(Level::Read, Runtime::Codex),
             marks: Marks::default(),
         };
         let view = |status: &str| SessionView {

@@ -27,6 +27,7 @@ pub(crate) struct Prepared {
     alias: Vec<String>,
     provider: Option<String>,
     pub routes: Vec<Route>,
+    pub yolo_grant_projects: Vec<PathBuf>,
     inputs: Option<[Option<FileIdentity>; 4]>,
     when: std::time::Instant,
 }
@@ -165,6 +166,7 @@ impl RuntimeConfig {
             alias: s.models,
             provider: s.api_provider,
             routes,
+            yolo_grant_projects: s.yolo_grant_projects,
             inputs: if before == after { after } else { None },
             when: std::time::Instant::now(),
         })

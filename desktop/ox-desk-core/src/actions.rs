@@ -45,6 +45,9 @@ macro_rules! actions {
         pub const ACTION_TARGETS:&[(&str, Target)]=&[$((stringify!($name),$target)),+];
     }
 }
+// `YoloGrant` stores or revokes a session's grant for its workers and handoffs.
+// `InjectHandoff` is host-internal: it opens a session with carried handoff
+// context. Clients cannot send it; the host builds it from a validated handoff.
 actions! {
     OpenCatalogRow(Box<crate::store::ThreadRow>)=>Target::Runtime(Operation::OpenCatalogRow),
     ConfirmAliasAndResume(Box<crate::store::ThreadRow>)=>Target::Runtime(Operation::OpenCatalogRow),
@@ -65,6 +68,9 @@ actions! {
     NativeCommand(Option<String>,String)=>Target::Runtime(Operation::PaletteCommand),
     PaletteCommand(Option<String>,String)=>Target::Runtime(Operation::PaletteCommand),
     StartWorker(crate::origin::WorkerStart)=>Target::Host,
+    StartHandoff(crate::handoff::HandoffStart)=>Target::Host,
+    YoloGrant(String,bool)=>Target::Host,
+    InjectHandoff(String,Vec<serde_json::Value>)=>Target::Runtime(Operation::Submit),
     DismissNotice=>Target::Local,
     TerminalText(Option<String>,String)=>Target::Terminal,
     SendImages(Option<String>,String,Vec<crate::mentions::ImageInput>)=>Target::Runtime(Operation::Submit),
@@ -134,11 +140,12 @@ impl Store {
             Action::PaletteCommand(id, text) => {
                 return self.run_command(id.as_deref(), Some(&text));
             }
-            Action::StartWorker(_) => {
+            Action::StartWorker(_) | Action::StartHandoff(_) | Action::YoloGrant(..) => {
                 return Err(io::Error::other(
-                    "Workers start through the OX session host.",
+                    "Workers and handoffs start through the OX session host.",
                 ));
             }
+            Action::InjectHandoff(text, items) => self.start_handoff(text, items)?,
             Action::DismissNotice => self.dismiss_notice(),
             Action::TerminalText(id, text) => self.handoff_text(id, text)?,
             Action::SendImages(owner, text, images) => {

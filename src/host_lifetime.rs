@@ -128,7 +128,14 @@ impl HostLink {
         call: Option<Value>,
     ) -> Result<Value, String> {
         let hint = env::var("OX_HOST_WORKER_PARENT").ok().or(thread);
-        let wait = Duration::from_secs(if start.is_some() { 80 } else { 15 });
+        let reading = call.as_ref().is_some_and(|c| c["op"] == "read_thread");
+        let wait = Duration::from_secs(if start.is_some() {
+            80
+        } else if reading {
+            50
+        } else {
+            15
+        });
         tokio::task::spawn_blocking(move || match self {
             Self::Hosted { addr, scope } => {
                 let body = match (start, call) {

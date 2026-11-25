@@ -69,6 +69,12 @@ enum Pending {
 
 pub struct Store {
     host_opened: Option<String>,
+    /// Codex items to inject before the next new thread's first turn.
+    handoff_items: Option<Vec<serde_json::Value>>,
+    /// Context windows the stock client reported, by model, not yet taken by the host.
+    context_windows: Vec<(Option<String>, u64)>,
+    /// The next new Claude session's first turn is a handoff block plus request.
+    claude_handoff: bool,
     host_annotations: HashMap<String, (Option<String>, serde_json::Value)>,
     naming: Option<titles::Service>,
     authorized_models: HashMap<String, String>,
@@ -126,7 +132,17 @@ impl Store {
             self.changed.mark(Changed::THREADS);
         }
     }
+    /// The context windows the stock client reported since the last call, as
+    /// (model, tokens): Claude Code's `result.modelUsage[].contextWindow` and
+    /// Codex's `thread/tokenUsage/updated` `modelContextWindow`.
+    pub fn take_context_windows(&mut self) -> Vec<(Option<String>, u64)> {
+        std::mem::take(&mut self.context_windows)
+    }
     pub fn opening_thread(&self) -> bool {
+        // A replica waits for the host to report the session it asked for.
+        if let Some(remote) = self.remote() {
+            return remote.await_new;
+        }
         self.pending.values().any(|(_, p)| {
             matches!(p, Pending::Compose(compose::Operation::New(_)))
                 || matches!(p,Pending::ThreadOp(op) if op.is_fork())
@@ -141,6 +157,9 @@ impl Store {
     fn with_link(profile: Profile, link: Link) -> Self {
         Self {
             host_opened: None,
+            handoff_items: None,
+            context_windows: Vec::new(),
+            claude_handoff: false,
             host_annotations: Default::default(),
             naming: None,
             authorized_models: Default::default(),

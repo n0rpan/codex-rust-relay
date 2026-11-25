@@ -70,6 +70,14 @@ pub struct TurnResult {
     #[serde(default)]
     pub errors: Vec<String>,
     pub stop_reason: Option<String>,
+    /// Per-model usage, including the context window Claude Code used.
+    #[serde(default, rename = "modelUsage")]
+    pub model_usage: std::collections::BTreeMap<String, ModelUsage>,
+}
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ModelUsage {
+    #[serde(default, rename = "contextWindow")]
+    pub context_window: Option<u64>,
 }
 #[derive(Clone, Debug)]
 pub struct ControlReply {
@@ -248,5 +256,25 @@ impl Permission {
                 vec![Decision::new("Deny", self.deny("Denied by user"))]
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    #[test]
+    fn a_turn_result_reports_the_context_window_per_model() {
+        let r: TurnResult = serde_json::from_value(serde_json::json!({
+            "type":"result","subtype":"success","is_error":false,"session_id":"s","stop_reason":"end_turn",
+            "modelUsage":{"claude-sonnet":{"inputTokens":3,"contextWindow":200000},"haiku":{"inputTokens":1}}
+        }))
+        .unwrap();
+        assert_eq!(r.model_usage["claude-sonnet"].context_window, Some(200_000));
+        assert_eq!(r.model_usage["haiku"].context_window, None);
+        let old: TurnResult = serde_json::from_value(serde_json::json!({
+            "subtype":"success","is_error":false,"session_id":"s","stop_reason":null
+        }))
+        .unwrap();
+        assert!(old.model_usage.is_empty());
     }
 }

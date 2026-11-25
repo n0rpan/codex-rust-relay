@@ -90,7 +90,9 @@ def worker_cases(root, stack, binary, env, log):
             first_frames.extend(c for c in frame.get("changes",[]) if c["kind"]=="sessions")
             return (n:=change(frame,"notification")) and n["event"]=="finished"
         client.until(approve)
-        assert any("permission ceiling" in json.dumps(request["messages"]) for request in native.requests), [
+        # The parent runs in Claude Default, which is the read level: a write worker is above it.
+        assert any("Requested mode write is above the source's mode read" in json.dumps(request["messages"])
+                   for request in native.requests), [
             request["messages"][-1] for request in native.requests]
         assert all(not any(row["parent"]==thread for row in d["sessions"]) for d in first_frames)
         client.act(scope,"worker-ok",{"send_text":[thread,"HOST-WORKER read"]})
@@ -125,6 +127,8 @@ def worker_cases(root, stack, binary, env, log):
         origin=worker["detail"]["origin"]
         assert origin["relation"]=="worker" and origin["runtime"]=="claude", origin
         assert origin["ceiling"]=="read" and origin["requested"]=="read", origin
+        # Read on Claude Code is Plan; asking for read from a read parent is inheriting it.
+        assert origin.get("started")=="plan" and origin.get("decided")=="inherited", origin
         assert origin["parent"]["session"]==thread and origin["parent"]["scope"]==scope, origin
         assert worker_scope["route"]=={"runtime":"claude","billing":{"api":"fixture/demo"}}, worker_scope
         operator=Client(env["OX_HOST_SOCKET"])
@@ -148,7 +152,7 @@ def worker_cases(root, stack, binary, env, log):
         operator.until(finished)
         operator.close()
         client.close()
-    print("Stock Claude worker: escalating MCP launch refused, host-owned read worker stamped with its parent, operator escalation above the ceiling refused.")
+    print("Stock Claude worker: launch above the parent's mode refused, host-owned read worker started in Plan and stamped with its parent, operator escalation above the ceiling refused.")
 
 
 def live_descendants(pid):

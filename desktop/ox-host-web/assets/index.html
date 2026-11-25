@@ -139,11 +139,13 @@
               <button type="button" id="operator-project">Project terminal</button>
               <button type="button" id="operator-session" hidden>Open session in terminal</button>
               <button type="button" id="start-worker" hidden>Start worker</button>
+              <button type="button" id="continue-in" hidden>Continue in…</button>
             </div>
           </details>
         </nav>
         <div id="context"></div>
         <h1 id="title"></h1>
+        <div id="handoff-marks" class="handoff-marks" hidden></div>
         <button id="older" class="quiet" hidden>Load earlier messages</button
         >
         <div id="session-controls" hidden>
@@ -167,7 +169,11 @@
               <label for="permission">Permission mode</label>
               <select id="permission"></select
               ><button id="apply-permission" type="submit">Apply mode</button>
+              <label id="yolo-grant-row" hidden
+                ><input type="checkbox" id="yolo-grant" /> Also YOLO for its workers and handoffs</label
+              >
             </form>
+            <div id="yolo-grant-status" hidden></div>
             <div id="model-fields"></div>
             <form id="native-command-form" hidden>
               <label for="native-command">Native command</label>
@@ -204,12 +210,46 @@
             <option value="goal">Codex goal</option>
             <option value="workflow">Claude workflow</option>
           </select>
-          <label><input type="checkbox" id="worker-write" /> Allow workspace edits</label>
+          <label for="worker-permission">Permission mode</label>
+          <select id="worker-permission">
+            <option value="inherit">Inherit this session's mode</option>
+            <option value="read">Read (Read only · Plan)</option>
+            <option value="write">Write (Workspace · Accept edits)</option>
+            <option value="classifier">Classifier (Auto-review · Auto)</option>
+            <option value="yolo">YOLO (YOLO · bypass)</option>
+          </select>
           <label for="worker-task">Task</label>
           <textarea id="worker-task" rows="3" required></textarea>
           <div class="actions">
             <button type="button" id="worker-cancel" class="quiet">Cancel</button
             ><button class="primary" id="worker-submit">Start worker</button>
+          </div>
+        </form>
+        <form id="handoff-form" hidden aria-label="Continue in another runtime">
+          <label for="handoff-runtime">Runtime</label>
+          <select id="handoff-runtime">
+            <option value="codex">Codex</option>
+            <option value="claude">Claude Code</option>
+          </select>
+          <label for="handoff-route">Route and model</label>
+          <select id="handoff-route"></select>
+          <label for="handoff-mode">Permission mode</label>
+          <select id="handoff-mode">
+            <option value="inherit">Inherited from this session</option>
+            <option value="read">Read (Read only · Plan)</option>
+            <option value="write">Write (Workspace · Accept edits)</option>
+            <option value="classifier">Classifier (Auto-review · Auto)</option>
+            <option value="yolo">YOLO (YOLO · bypass)</option>
+          </select>
+          <label id="handoff-grant-row" hidden
+            ><input type="checkbox" id="handoff-grant" /> Also YOLO for its workers and handoffs</label
+          >
+          <p id="handoff-provider" class="note" hidden></p>
+          <label for="handoff-request">Request</label>
+          <textarea id="handoff-request" rows="3" required></textarea>
+          <div class="actions">
+            <button type="button" id="handoff-cancel" class="quiet">Cancel</button
+            ><button class="primary" id="handoff-submit">Continue</button>
           </div>
         </form>
         <div id="timeline" aria-label="Transcript"></div>

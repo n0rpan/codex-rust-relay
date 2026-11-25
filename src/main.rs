@@ -370,6 +370,19 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         catalog::prioritize_favorites(catalog, &favorites);
     }
     app.client_kind = client_kind;
+    // A session the OX session host runs on an API alias gets read_ox_thread,
+    // so a handoff target can read its source. Workers stay subscription-only.
+    let gateway = if host_lifetime::hosted() {
+        match workers::Relay::load(&codex_home).await? {
+            Some(relay) => {
+                Some(relay.attach(&args, &codex_home, client_kind, workers::Tools::HandoffRead)?)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let (mcp, gateway) = gateway.map_or((vec![], None), |(mcp, g)| (mcp, Some(g)));
     let (mut command, _claude_settings) = match codex_profile {
         Some(home) => {
             let mut command = codex_relay_command(&home)?;
@@ -380,6 +393,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
             for entry in &overrides {
                 command.arg("-c").arg(entry);
             }
+            command.args(&mcp);
             command.args(args);
             (command, None)
         }
@@ -414,9 +428,15 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
                 },
                 |model| app.claude_model_info(model),
             )?;
+            let mut command = command;
+            command.args(&mcp);
             (command, Some(settings))
         }
     };
+    if let Some(gateway) = &gateway {
+        let (name, value) = gateway.env();
+        command.env(name, value);
+    }
     command.kill_on_drop(true);
     exempt_loopback_proxy(&mut command);
 
@@ -425,9 +445,16 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         let client = command.as_std().get_program().to_string_lossy();
         client_launch_error(&client, error)
     })?;
+    let gateway = async move {
+        match gateway {
+            Some(gateway) => gateway.serve().await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::select! {
         status = child.wait() => Ok(status?.code().unwrap_or(1) as u8),
         result = serve(listener, Arc::new(app)) => Err(result.unwrap_err().into()),
+        error = gateway => Err(error),
     }
 }
 
@@ -812,6 +839,24 @@ impl App {
             .unwrap_or_default()
             .iter()
             .filter(|entry| entry["visibility"] == "list")
+    }
+
+    /// The context window OX's catalog knows for each launchable alias.
+    fn model_contexts(&self) -> Vec<(String, u64)> {
+        let launchable: std::collections::BTreeSet<&str> = self
+            .launch_models()
+            .into_iter()
+            .map(|(alias, _)| alias)
+            .collect();
+        self.visible_models()
+            .filter_map(|entry| {
+                let alias = entry["slug"].as_str()?;
+                let window = entry["context_window"].as_u64()?;
+                launchable
+                    .contains(alias)
+                    .then(|| (alias.to_owned(), window))
+            })
+            .collect()
     }
 
     fn launch_models(&self) -> Vec<(&str, &str)> {

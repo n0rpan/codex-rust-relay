@@ -167,6 +167,10 @@ impl Access {
                     | Action::Stop(_)
                     | Action::SendText(..) => approval.is_none(),
                     Action::StartWorker(start) => approval.is_none() && start.validate().is_ok(),
+                    Action::StartHandoff(start) => approval.is_none() && start.validate().is_ok(),
+                    Action::YoloGrant(id, _) => {
+                        approval.is_none() && !id.is_empty() && id.len() <= 512
+                    }
                     Action::Mention(_, query) => {
                         approval.is_none() && query.as_ref().is_none_or(|q| q.len() <= 512)
                     }

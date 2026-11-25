@@ -78,6 +78,8 @@ pub enum Request {
         value: Option<String>,
     },
     Models,
+    /// Context windows of launchable API aliases, from OX's model catalog.
+    ModelContexts,
 }
 
 /// Directories in which stock Claude Code persists sessions for each OX launch.

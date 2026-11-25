@@ -32,6 +32,7 @@ wire_names!(Method {
     Compact => "thread/compact/start", GetGoal => "thread/goal/get", SetGoal => "thread/goal/set",
     ClearGoal => "thread/goal/clear", TurnStart => "turn/start", Steer => "turn/steer",
     Interrupt => "turn/interrupt", CallTool => "mcpServer/tool/call",
+    InjectItems => "thread/inject_items",
 });
 wire_names!(Notice {
     ThreadStarted => "thread/started", ThreadStatus => "thread/status/changed",

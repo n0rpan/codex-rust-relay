@@ -33,8 +33,36 @@ pub(super) struct Start {
     #[serde(default)]
     pub model: Option<String>,
     task: String,
+    /// Legacy: false means read, true means write. Capped by the parent's mode.
     #[serde(default)]
-    workspace_write: bool,
+    workspace_write: Option<bool>,
+    /// `inherit` (default) or a lower level: read, write, classifier, yolo, or a
+    /// native preset name. Never above the parent's own mode.
+    #[serde(default)]
+    permission_mode: Option<String>,
+}
+
+/// The canonical level name of a permission mode, or None for inherit.
+pub(super) fn permission_level(text: &str) -> Result<Option<&'static str>, String> {
+    Ok(Some(
+        match text
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_")
+            .as_str()
+        {
+            "inherit" | "" => return Ok(None),
+            "read" | "read_only" | "readonly" | "plan" | "default" => "read",
+            "write" | "workspace" | "workspace_write" | "accept_edits" => "write",
+            "classifier" | "auto_review" | "auto" => "classifier",
+            "yolo" | "bypass" | "bypass_permissions" => "yolo",
+            _ => {
+                return Err(
+                    "permission_mode must be inherit, read, write, classifier or yolo.".into(),
+                );
+            }
+        },
+    ))
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -160,6 +188,7 @@ impl Jobs {
         secrets: Arc<Vec<String>>,
     ) -> Result<Value, String> {
         request.validate()?;
+        request.writes()?;
         if self
             .entries
             .values()
@@ -287,9 +316,29 @@ impl Start {
             "mode": self.mode,
             "task": crate::upstream::redact(&self.task, secrets),
             "write": self.workspace_write,
+            "permission": self.permission_mode.as_deref().map(|m| permission_level(m).ok().flatten().unwrap_or("inherit")),
         })
     }
+    /// Without a session host the gateway cannot verify the parent's mode: it
+    /// starts read workers by default and write workers on request, as before.
+    pub(super) fn writes(&self) -> Result<bool, String> {
+        match self
+            .permission_mode
+            .as_deref()
+            .map(permission_level)
+            .transpose()?
+            .flatten()
+        {
+            None => Ok(self.workspace_write.unwrap_or(false)),
+            Some("read") => Ok(false),
+            Some("write") => Ok(true),
+            Some(_) => Err("Classifier and YOLO workers need the OX session host, which asks the operator. Start OX Desktop or run `ox host install`.".into()),
+        }
+    }
     pub(super) fn validate(&self) -> Result<(), String> {
+        if let Some(mode) = &self.permission_mode {
+            permission_level(mode)?;
+        }
         if self.task.trim().is_empty() || self.task.len() > 32 * 1024 {
             return Err("Provide a task of up to 32 KiB.".into());
         }
@@ -360,12 +409,13 @@ impl Start {
                     .stdin(Stdio::piped());
             }
             (Runtime::Claude, mode) => {
-                let tools = if self.workspace_write {
+                let writes = self.writes()?;
+                let tools = if writes {
                     "Read,Glob,Grep,Edit,Write,Bash,Workflow"
                 } else {
                     "Read,Glob,Grep,Workflow"
                 };
-                if !self.workspace_write {
+                if !writes {
                     command.args([
                         "--disallowedTools",
                         "Bash,Edit,Write,MultiEdit,NotebookEdit",
@@ -380,11 +430,7 @@ impl Start {
                         "stream-json",
                         "--verbose",
                         "--permission-mode",
-                        if self.workspace_write {
-                            "acceptEdits"
-                        } else {
-                            "dontAsk"
-                        },
+                        if writes { "acceptEdits" } else { "dontAsk" },
                         "--tools",
                         tools,
                         "--allowedTools",
@@ -401,7 +447,7 @@ impl Start {
     }
 
     fn sandbox(&self) -> &'static str {
-        if self.workspace_write {
+        if self.writes().unwrap_or(false) {
             "workspace-write"
         } else {
             "read-only"

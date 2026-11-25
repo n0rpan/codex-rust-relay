@@ -46,18 +46,21 @@ pub(super) struct Submit {
     expected_turn: Option<String>,
     selection: u64,
     command: Option<ThreadCommand>,
+    /// Handoff items injected after thread/start and before the first turn.
+    inject: Vec<serde_json::Value>,
 }
 #[derive(Debug)]
 pub(super) enum Operation {
     New(Submit),
     Account(Submit),
     Send(Submit),
+    Inject(Submit),
     Stop(String),
 }
 impl Operation {
     pub(super) fn thread(&self) -> Option<&str> {
         match self {
-            Self::New(s) | Self::Account(s) | Self::Send(s) => s.owner.as_deref(),
+            Self::New(s) | Self::Account(s) | Self::Send(s) | Self::Inject(s) => s.owner.as_deref(),
             Self::Stop(id) => Some(id),
         }
     }
@@ -169,6 +172,20 @@ impl Store {
             }
         }
     }
+    /// Open a new session that continues another one. Codex receives `items`
+    /// through thread/inject_items before the first turn; a Claude `text`
+    /// already carries its context block, so `items` must be empty there.
+    pub fn start_handoff(&mut self, text: String, items: Vec<serde_json::Value>) -> io::Result<()> {
+        if self.is_session_scoped() && !items.is_empty() {
+            return Err(io::Error::other("This runtime has no history injection"));
+        }
+        self.handoff_items = (!items.is_empty()).then_some(items);
+        self.claude_handoff = self.is_session_scoped();
+        let result = self.send_client_message(None, text, vec![]);
+        self.handoff_items = None;
+        self.claude_handoff = false;
+        result
+    }
     pub fn submit(&mut self, id: Option<&str>) -> io::Result<()> {
         if self.remote().is_some() {
             return self
@@ -227,6 +244,11 @@ impl Store {
             expected_turn: id.and_then(|id| self.transcripts[id].active_turn.clone()),
             selection: self.selection,
             command,
+            inject: if id.is_none() {
+                self.handoff_items.take().unwrap_or_default()
+            } else {
+                vec![]
+            },
         };
         if id.is_none() {
             let model = submit
@@ -258,7 +280,7 @@ impl Store {
             self.transmit(submit)
         }
     }
-    fn transmit(&mut self, submit: Submit) -> io::Result<()> {
+    fn transmit(&mut self, mut submit: Submit) -> io::Result<()> {
         let id = submit.owner.as_deref().expect("opened thread");
         let t = &self.transcripts[id];
         if !t.ready
@@ -273,6 +295,16 @@ impl Store {
             let message = "The active turn or billing route changed before sending";
             self.compose_failed(Operation::Send(submit), message.into());
             return Err(io::Error::other(message));
+        }
+        if submit.command.is_none() && submit.expected_turn.is_none() && !submit.inject.is_empty() {
+            let items = std::mem::take(&mut submit.inject);
+            return self.request(
+                Call::Inject {
+                    thread: id.into(),
+                    items,
+                },
+                Pending::Compose(Operation::Inject(submit)),
+            );
         }
         if let Some(command) = &submit.command {
             return self.request(
@@ -332,7 +364,10 @@ impl Store {
 
     pub(super) fn compose_failed(&mut self, op: Operation, reason: String) {
         let owner = match op {
-            Operation::New(s) | Operation::Account(s) | Operation::Send(s) => {
+            Operation::New(s)
+            | Operation::Account(s)
+            | Operation::Send(s)
+            | Operation::Inject(s) => {
                 if let Some(d) = self.drafts.get_mut(&s.owner)
                     && let Some(SentInput::Draft(mut sent, mut images)) = d.sent.take()
                 {
@@ -360,6 +395,7 @@ impl Store {
     pub(super) fn compose_reply(&mut self, op: Operation, reply: Reply) -> io::Result<()> {
         match (op, reply) {
             (Operation::New(s), Reply::Opened(reply)) => self.first_send(s, *reply),
+            (Operation::Inject(s), Reply::Acknowledged) => self.transmit(s),
             (Operation::Account(s), Reply::Account(account)) if account.chatgpt() => {
                 self.transmit(s)
             }

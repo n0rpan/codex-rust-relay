@@ -12,5 +12,7 @@ for version in 0.171.0 latest; do
     CODEOX_TEST_CODEX_BIN="$binary" cargo test --manifest-path desktop/Cargo.toml \
         --locked --release -p ox-desk-core --test contract_protocol -- --ignored --exact installed_protocol
     CODEOX_TEST_CODEX_BIN="$binary" cargo test --manifest-path desktop/Cargo.toml \
+        --locked --release -p ox-desk-core --test handoff_codex -- --ignored --nocapture
+    CODEOX_TEST_CODEX_BIN="$binary" cargo test --manifest-path desktop/Cargo.toml \
         --locked --release -p ox-desktop views::workbench::tests::stock_session -- --ignored --exact --nocapture
 done

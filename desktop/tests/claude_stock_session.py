@@ -62,7 +62,8 @@ class Provider(BaseHTTPRequestHandler):
         if (
             not supplied
             or any(value != self.server.expected_auth for value in supplied)
-            or (not hasattr(self.server, "native_tls") and body["model"] != "demo")
+            or (not hasattr(self.server, "native_tls")
+                and body["model"] not in getattr(self.server, "models", {"demo"}))
         ):
             self.send_error(403)
             self.server.errors.append("Wrong credential or model")
@@ -130,6 +131,9 @@ class Provider(BaseHTTPRequestHandler):
                     },
                 }
             ]
+        script = getattr(self.server, "script", None)
+        if script is not None and "Name a conversation" not in str(body.get("system")):
+            output = script(body, prompt) or output
         msg = {
             "id": "msg_" + uuid.uuid4().hex[:16],
             "model": body["model"],

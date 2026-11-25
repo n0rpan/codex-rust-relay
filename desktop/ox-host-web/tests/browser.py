@@ -185,7 +185,9 @@ class Host(socketserver.StreamRequestHandler):
                         "sessions": f.sessions,
                         "asks": [] if f.answered else [ask],
                         "transcripts": {"parent": {"items": [item], "detail": {}},
-                                        "disk-report": {"items": f.report_items, "detail": {}}},
+                                        "disk-report": {"items": f.report_items, "detail": {}},
+                                        "handoff-target": {"items": f.handoff_items, "detail": {}},
+                                        "typed-block": {"items": f.handoff_items[2:], "detail": {}}},
                         "detail": f.detail,
                     }
                     scopes=[state]
@@ -721,6 +723,27 @@ def run(harness, screenshot=None):
         host.sessions.append(dict(host.sessions[0], id="disk-report", title="Rust build disk usage",
                                   status="idle", updated_at=0, capabilities=["open", "send"], detail={"access": "default"}))
         host.report_items = build_report_items()
+        # A handoff target's first user message carries the block; the same text typed later
+        # in that session, or in an ordinary session, renders as typed.
+        block = "<ox-handoff>\nCARRIED earlier context\n</ox-handoff>\n\n"
+        host.handoff_items = [
+            {"role": "user", "text": block + "Carry on here", "turn": "h1", "id": "hu1", "revision": 1, "detail": {}},
+            {"role": "assistant", "text": "On it", "turn": "h1", "id": "ha1", "revision": 1, "detail": {}},
+            {"role": "user", "text": block + "Typed later", "turn": "h2", "id": "hu2", "revision": 1, "detail": {}},
+        ]
+        route = {"runtime": "claude", "billing": "subscription"}
+        handoff_origin = {"relation": "handoff", "job_id": 0, "ceiling": "write", "requested": "write",
+            "runtime": "claude", "mode": "session", "by_operator": True, "launch": "operator:fixture",
+            "source": None, "route": route, "started": "accept_edits", "decided": "inherited",
+            "parent": {"project": "/fixture", "scope": None, "session": "parent", "runtime": "claude"},
+            "handoff": {"scope": host.scope, "session": "parent", "native": None, "title": "Database connection timeouts",
+                "runtime": "claude", "route": route, "source_access": "accept_edits", "source_level": "write",
+                "decision": "inherited", "selection": {"total": 4, "carried": 3, "omitted": 1, "items": [], "cut": [],
+                "ranges": [], "window": 64000, "window_known": False}}}
+        host.sessions.append(dict(host.sessions[0], id="handoff-target", title="Continued pool work", status="idle",
+                                  updated_at=0, capabilities=["open", "send"], detail={"access": "accept_edits", "origin": handoff_origin}))
+        host.sessions.append(dict(host.sessions[0], id="typed-block", title="Typed block", status="idle",
+                                  updated_at=0, capabilities=["open", "send"], detail={"access": "default"}))
         host.actions = []
         host.resumes = []
         host.connections = []
@@ -900,6 +923,29 @@ def run(harness, screenshot=None):
         js("document.getElementById('worker-runtime').value='claude';document.getElementById('worker-task').value='Check the pool limits';document.getElementById('worker-form').requestSubmit()")
         wait(lambda: any(isinstance(a, dict) and a.get("start_worker", {}).get("parent") == "child"
                          and a["start_worker"]["task"] == "Check the pool limits" for a in host.actions))
+        assert any(a["start_worker"].get("permission") == "inherit" for a in host.actions
+                   if isinstance(a, dict) and "start_worker" in a), "workers inherit by default"
+        # The operator continues the open session in another route with the inherited mode.
+        js("document.getElementById('continue-in').click()")
+        js("const r=document.getElementById('handoff-runtime');for(const v of ['codex','claude']){r.value=v;r.dispatchEvent(new Event('change'));if(document.getElementById('handoff-route').options.length)break}"
+           "document.getElementById('handoff-request').value='Carry on elsewhere';document.getElementById('handoff-form').requestSubmit()")
+        wait(lambda: any(isinstance(a, dict) and a.get("start_handoff", {}).get("source") == "child"
+                         and a["start_handoff"]["mode"] == "inherit" and not a["start_handoff"]["yolo_confirmed"]
+                         and a["start_handoff"]["request"] == "Carry on elsewhere" for a in host.actions))
+        # The handoff marker and the folded block appear only on a handoff target's first user message.
+        def bubbles(thread, title):
+            js("document.getElementById('home').click()")
+            wait(lambda: js(f"return !!document.querySelector('[data-thread-id={thread}]')"))
+            js(f"document.querySelector('[data-thread-id={thread}]').click()")
+            wait(lambda: js(f"return document.getElementById('title').textContent==={title!r} && document.querySelectorAll('#timeline .bubble.user').length>0"))
+            return js("return [...document.querySelectorAll('#timeline .bubble.user')].map(b=>[!!b.querySelector('details.handoff-context'),b.querySelector('.body').textContent])")
+        target = bubbles("handoff-target", "Continued pool work")
+        assert target[0][0] and target[0][1].endswith("Carry on here"), target
+        assert not target[1][0] and target[1][1].startswith("<ox-handoff>"), target
+        assert js("return !document.getElementById('handoff-marks').hidden && document.getElementById('handoff-marks').textContent.includes('Continued from')")
+        typed = bubbles("typed-block", "Typed block")
+        assert typed and not typed[0][0] and typed[0][1].startswith("<ox-handoff>"), typed
+        assert js("return document.getElementById('handoff-marks').hidden")
         phone_report(js, port, base, keypress, capture, screenshot)
         js(
             "document.getElementById('home').click();document.getElementById('new').click();document.getElementById('new-form').requestSubmit()"

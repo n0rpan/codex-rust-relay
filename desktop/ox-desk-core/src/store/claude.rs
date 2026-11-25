@@ -562,14 +562,22 @@ impl Store {
                 None => self.spawn_claude(Session::New(new_id()?), None, false)?,
             },
         };
+        // A handoff's first turn titles the session from its request, not its block.
+        let visible = if new_conversation && self.claude_handoff {
+            crate::handoff::split_claude_turn(&text).map_or(text.as_str(), |(_, r)| r)
+        } else {
+            text.as_str()
+        }
+        .to_owned();
         if new_conversation {
-            self.first_title_prompt(&owner, &text);
+            self.first_title_prompt(&owner, &visible);
         }
         if !self.claude().catalog.contains_key(&owner) {
             let new = row(
                 &self.profile,
                 owner.clone(),
-                text.trim()
+                visible
+                    .trim()
                     .lines()
                     .next()
                     .unwrap_or("")

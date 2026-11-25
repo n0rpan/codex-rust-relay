@@ -77,6 +77,11 @@ pub enum Call {
         thread: String,
         turn: String,
     },
+    /// Raw Responses message items placed before the thread's first turn.
+    Inject {
+        thread: String,
+        items: Vec<Value>,
+    },
 }
 #[derive(Clone, Debug)]
 pub enum ThreadCommand {
@@ -140,6 +145,7 @@ impl Call {
             Self::Start { .. } => Method::TurnStart,
             Self::Steer { .. } => Method::Steer,
             Self::Stop { .. } => Method::Interrupt,
+            Self::Inject { .. } => Method::InjectItems,
         }
     }
     fn params(self) -> Value {
@@ -254,6 +260,7 @@ impl Call {
                 json!({"threadId":thread,"expectedTurnId":turn,"input":crate::mentions::turn_input(text,images)})
             }
             Self::Stop { thread, turn } => json!({"threadId":thread,"turnId":turn}),
+            Self::Inject { thread, items } => json!({"threadId":thread,"items":items}),
         }
     }
 }

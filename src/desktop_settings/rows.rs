@@ -115,6 +115,9 @@ pub(super) fn read(home: &Path) -> Result<Snapshot, RelayError> {
         match doc.id.as_str() {
             REGISTRY => {
                 out.revisions.registry = doc.revision;
+                if let Ok(config) = crate::provider::CodeoxConfig::load_from_str(&doc.text) {
+                    out.yolo_grant_projects = config.yolo_grant_projects;
+                }
                 match registry(&doc.text) {
                     Ok(r) => out.registry = Some(r),
                     Err(_) => out.issues.push(

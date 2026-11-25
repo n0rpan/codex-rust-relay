@@ -167,9 +167,11 @@ impl Workbench {
         }
         let list_state = view.list.clone();
         let find_bar = tools::find_bar(view, &id, p, cx);
+        let banner = handoff_banner(store, &id, p, cx);
         col()
             .flex_1()
             .min_h_0()
+            .children(banner)
             .children(find_bar)
             .when(!view.following, |d| {
                 let state = view.list.clone();
@@ -311,11 +313,41 @@ impl Workbench {
                         )
                     }
                     Item::UserMessage { content } => {
-                        let text = content
+                        let mut text = content
                             .iter()
                             .filter_map(|c| c.text.as_deref().or(c.path.as_deref()))
                             .collect::<Vec<_>>()
                             .join("\n");
+                        // A Claude handoff target's first turn carries the earlier
+                        // conversation. Fold it under the handoff marker.
+                        let mut carried = None;
+                        let folded = handoff_fold(store, id, key, &text);
+                        if let Some((block, request)) = folded {
+                            let expanded = view.all_expanded ^ view.expanded.contains(key);
+                            let shown = if expanded {
+                                format!("{block}{request}")
+                            } else {
+                                request.to_owned()
+                            };
+                            let toggle_key = key.clone();
+                            let toggle_owner = owner.clone();
+                            carried = Some(
+                                div()
+                                    .id(SharedString::from(format!("handoff-context-{index}")))
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(rgb(p.muted))
+                                    .child(if expanded {
+                                        "Hide carried handoff context"
+                                    } else {
+                                        "Carried handoff context is folded · show"
+                                    })
+                                    .on_click(cx.listener(move |s, _, _, cx| {
+                                        s.toggle_row(&toggle_owner, index, &toggle_key, cx)
+                                    })),
+                            );
+                            text = shown;
+                        }
                         frame.items_end().py_2().child(
                             col()
                                 .min_w_0()
@@ -332,6 +364,7 @@ impl Workbench {
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(rgb(p.fg)),
                                 )
+                                .children(carried)
                                 .child(markdown(id, key, text)),
                         )
                     }
@@ -491,6 +524,125 @@ impl Workbench {
     }
 }
 
+/// The carried block and request to show folded, for the first user message
+/// of a handoff target only.
+fn handoff_fold(
+    store: &ox_desk_core::store::Store,
+    id: &str,
+    key: &ItemKey,
+    text: &str,
+) -> Option<(String, String)> {
+    let t = store.transcript(id)?;
+    ox_desk_core::handoff::fold(store.origin(id), t, key, text)
+        .map(|(block, request)| (block.to_owned(), request.to_owned()))
+}
+
+/// The handoff marker at the top of a target, the marks on a source, and a
+/// session's YOLO grant with the running children it allowed.
+fn handoff_banner(
+    store: &ox_desk_core::store::Store,
+    id: &str,
+    p: Palette,
+    cx: &mut Context<Workbench>,
+) -> Option<Div> {
+    let mut lines: Vec<AnyElement> = Vec::new();
+    let route = &store.profile().route;
+    if let Some(origin) = store.origin(id)
+        && let Some(text) = ox_desk_core::handoff::marker(origin)
+        && let Some(h) = &origin.handoff
+    {
+        let mut line = crate::row().gap_2().flex_wrap().child(small(p, text));
+        if &h.route == route {
+            let source = h.session.clone();
+            line = line.child(button(
+                p,
+                "handoff-source",
+                "Open source",
+                false,
+                true,
+                cx.listener(move |s, _, _, cx| {
+                    s.action(cx, DeskAction::SelectThread(source.clone()))
+                }),
+            ));
+        } else {
+            line = line.child(small(
+                p,
+                format!("Source {} on {}", h.session, h.route.label()),
+            ));
+        }
+        lines.push(line.into_any_element());
+    }
+    let list = |key: &str| {
+        store
+            .session_mark(id, key)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    for (i, to) in list("handed_off_to").into_iter().enumerate() {
+        let label = to["label"].as_str().unwrap_or("another route").to_owned();
+        let session = to["session"].as_str().unwrap_or_default().to_owned();
+        let same = serde_json::from_value::<ox_desk_core::runtime::Route>(to["route"].clone())
+            .is_ok_and(|r| &r == route);
+        let mut line = crate::row()
+            .gap_2()
+            .flex_wrap()
+            .child(small(p, format!("Handed off to {label} · {session}")));
+        if same {
+            line = line.child(button(
+                p,
+                ("handoff-target", i),
+                "Open",
+                false,
+                true,
+                cx.listener(move |s, _, _, cx| {
+                    s.action(cx, DeskAction::SelectThread(session.clone()))
+                }),
+            ));
+        }
+        lines.push(line.into_any_element());
+    }
+    for attempt in list("handoff_attempts") {
+        let label = attempt["label"].as_str().unwrap_or("another route");
+        let text = match attempt["status"].as_str() {
+            Some("failed") => format!(
+                "Handoff to {label} failed: {}",
+                attempt["message"].as_str().unwrap_or("unknown error")
+            ),
+            _ => format!("Handing off to {label}…"),
+        };
+        lines.push(small(p, text).into_any_element());
+    }
+    if store
+        .session_mark(id, "yolo_grant")
+        .is_some_and(|v| v == true)
+    {
+        let running = list("yolo_children").len();
+        let session = id.to_owned();
+        lines.push(
+            crate::row()
+                .gap_2()
+                .flex_wrap()
+                .child(small(
+                    p,
+                    format!("YOLO also allowed for this session's workers and handoffs · {running} started under it"),
+                ))
+                .child(button(
+                    p,
+                    "revoke-yolo-grant",
+                    "Revoke",
+                    false,
+                    true,
+                    cx.listener(move |s, _, _, cx| {
+                        s.action(cx, DeskAction::YoloGrant(session.clone(), false))
+                    }),
+                ))
+                .into_any_element(),
+        );
+    }
+    (!lines.is_empty()).then(|| col().gap_1().px_3().py_2().children(lines))
+}
+
 fn markdown(owner: &str, key: &ItemKey, text: String) -> impl IntoElement {
     cards::markdown(
         TextView::markdown(
@@ -499,4 +651,102 @@ fn markdown(owner: &str, key: &ItemKey, text: String) -> impl IntoElement {
         ),
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handoff_fold;
+    use ox_desk_core::transcript::ItemKey;
+    use ox_desk_core::{
+        host_protocol::{Cursor, ScopeState, Server, SessionView, Timeline, TimelineItem},
+        links::LinkEvent,
+        runtime::Runtime,
+        store::{Profile, Store},
+    };
+    use serde_json::json;
+
+    #[test]
+    fn only_a_handoff_targets_first_user_message_is_folded() {
+        let route = Runtime::Claude.route(None);
+        let mut store = Store::remote_client(
+            Profile {
+                project: "/p".into(),
+                route: route.clone(),
+                provider: "anthropic".into(),
+            },
+            |_, _| Ok("sent".into()),
+        );
+        let block = "<ox-handoff>\ncarried\n</ox-handoff>\n\nrequest";
+        let user = |turn: &str, id: &str| TimelineItem {
+            turn: turn.into(),
+            id: id.into(),
+            role: "user".into(),
+            text: block.into(),
+            revision: 1,
+            detail: json!({"UserMessage": {"content": [{"text": block}]}}),
+        };
+        let timeline = Timeline {
+            items: vec![user("t1", "u1"), user("t2", "u2")],
+            detail: json!({"ready": true}),
+        };
+        let origin: serde_json::Value = serde_json::from_str(
+            &r#"{"relation":"handoff","parent":{"project":"/p","scope":null,"session":"s","runtime":"claude"},
+            "launch":"operator:x","by_operator":true,"runtime":"claude","route":ROUTE,
+            "mode":"session","job_id":0,"requested":"read","ceiling":"read","source":null,
+            "handoff":{"scope":{"project":"/p","route":ROUTE},"session":"s","native":null,"title":"t",
+                "runtime":"claude","route":ROUTE,"source_access":null,"source_level":null,
+                "decision":"inherited","selection":{"total":0,"carried":0,"omitted":0,"items":[],"cut":[],
+                "ranges":[],"window":64000,"window_known":false}}}"#
+                .replace("ROUTE", &serde_json::to_string(&route).unwrap()),
+        )
+        .unwrap();
+        let session = |id: &str, detail| SessionView {
+            id: id.into(),
+            title: id.into(),
+            parent: None,
+            status: "idle".into(),
+            updated_at: 1,
+            capabilities: vec!["open".into()],
+            detail,
+        };
+        store.apply(LinkEvent::Host(Box::new(Server::Snapshot {
+            cursor: Cursor {
+                epoch: "e".into(),
+                seq: 1,
+            },
+            scopes: vec![ScopeState {
+                scope: ox_desk_core::host_protocol::Scope {
+                    project: "/p".into(),
+                    route,
+                },
+                connection: "ready".into(),
+                capabilities: vec![],
+                sessions: vec![
+                    session("target", json!({"origin": origin})),
+                    session("plain", json!({})),
+                ],
+                asks: vec![],
+                transcripts: [
+                    ("target".to_owned(), timeline.clone()),
+                    ("plain".to_owned(), timeline),
+                ]
+                .into(),
+                detail: json!({}),
+            }],
+        })));
+        let key = |turn: &str, id: &str| ItemKey {
+            turn: turn.into(),
+            item: id.into(),
+        };
+        assert!(store.origin("target").is_some());
+        assert_eq!(
+            handoff_fold(&store, "target", &key("t1", "u1"), block).map(|(_, r)| r),
+            Some("request".to_owned())
+        );
+        assert_eq!(
+            handoff_fold(&store, "target", &key("t2", "u2"), block),
+            None
+        );
+        assert_eq!(handoff_fold(&store, "plain", &key("t1", "u1"), block), None);
+    }
 }

@@ -28,7 +28,9 @@ pub struct Remote {
     pub(super) draft_access: Option<Access>,
     pending: HashMap<String, (Option<String>, Option<compose::Draft>)>,
     pub(super) origins: HashMap<String, crate::origin::Origin>,
-    await_new: bool,
+    /// Host marks on a session: handoffs from it and its YOLO grant.
+    pub(super) marks: HashMap<String, Value>,
+    pub(super) await_new: bool,
 }
 impl Remote {
     pub(super) fn can(&self, id: &str, cap: &str) -> bool {
@@ -73,12 +75,22 @@ impl Store {
             await_new: false,
             pending: HashMap::new(),
             origins: HashMap::new(),
+            marks: HashMap::new(),
         };
         Self::with_link(profile, Link::Host(Box::new(remote)))
     }
     /// The host's immutable lineage stamp for a worker session or its fork.
     pub fn origin(&self, id: &str) -> Option<&crate::origin::Origin> {
         self.remote()?.origins.get(id)
+    }
+    /// A host mark on a session: `handed_off_to`, `handoff_attempts`,
+    /// `yolo_grant` or `yolo_children`.
+    pub fn session_mark(&self, id: &str, key: &str) -> Option<&Value> {
+        self.remote()?
+            .marks
+            .get(id)
+            .and_then(|m| m.get(key))
+            .filter(|v| !v.is_null())
     }
     pub fn is_host_client(&self) -> bool {
         self.remote().is_some()
@@ -279,6 +291,10 @@ impl Store {
                 self.notice = None;
                 self.forward(action)?;
             }
+            Action::InjectHandoff(..) => {
+                self.forward(action)?;
+                self.remote_mut().await_new = true;
+            }
             action => self.forward(action)?,
         }
         Ok(Effect::Applied)
@@ -313,8 +329,33 @@ impl Store {
                 self.remote_mut().sending.remove("");
             }
             Server::WorkerReply { result, error, .. } => {
+                let handoff = result
+                    .as_ref()
+                    .filter(|r| r["relation"] == "handoff" && error.is_none())
+                    .cloned();
+                if let Some(r) = handoff {
+                    let scope: Option<crate::host_protocol::Scope> =
+                        serde_json::from_value(r["scope"].clone()).ok();
+                    let session = r["session"].as_str().unwrap_or_default().to_owned();
+                    let label = scope
+                        .as_ref()
+                        .map_or("another route".into(), |s| s.route.label());
+                    self.notice = Some(format!("Continued in {label}."));
+                    if scope.is_some_and(|s| {
+                        s.project == self.profile.project && s.route == self.profile.route
+                    }) && self.catalog_row(&session).is_some()
+                    {
+                        self.select_replica(&session);
+                    }
+                    self.changed.mark(Changed::NOTICE | Changed::THREADS);
+                    return Ok(());
+                }
                 self.notice = Some(match (result, error) {
                     (_, Some(error)) => error,
+                    (Some(status), None) if status["status"] == "waiting_for_operator" => format!(
+                        "OX worker {} waits for you to accept YOLO on its parent session.",
+                        status["job_id"]
+                    ),
                     (Some(status), None) => format!(
                         "Started OX worker {} on {}.",
                         status["job_id"],
@@ -431,6 +472,7 @@ impl Store {
                 let r = self.remote_mut();
                 r.caps.clear();
                 r.origins.clear();
+                r.marks.clear();
                 r.routes.clear();
                 r.commands.clear();
                 r.options.clear();
@@ -568,6 +610,20 @@ impl Store {
         } else {
             r.sending.remove(&id);
         }
+        let marks: serde_json::Map<String, Value> = [
+            "handed_off_to",
+            "handoff_attempts",
+            "yolo_grant",
+            "yolo_children",
+        ]
+        .into_iter()
+        .filter_map(|k| Some((k.to_owned(), data.get(k)?.clone())))
+        .collect();
+        if marks.is_empty() {
+            r.marks.remove(&id);
+        } else {
+            r.marks.insert(id.clone(), Value::Object(marks));
+        }
         match bits(&data["origin"]) {
             Some(origin) => {
                 r.origins.insert(id, origin);
@@ -621,6 +677,44 @@ mod local_command_tests {
         asks::CommandApproval,
         host_protocol::{AskView, Change},
     };
+    #[test]
+    fn worker_replies_name_handoffs_and_yolo_waits() {
+        let route = crate::runtime::Runtime::Claude.route(None);
+        let mut store = Store::remote_client(
+            Profile {
+                project: "/p".into(),
+                route: route.clone(),
+                provider: "anthropic".into(),
+            },
+            |_, _| Ok("sent".into()),
+        );
+        let reply = |result: Value, error: Option<&str>| {
+            LinkEvent::Host(Box::new(Server::WorkerReply {
+                id: "k".into(),
+                result: Some(result),
+                error: error.map(Into::into),
+            }))
+        };
+        let target = crate::runtime::Runtime::Codex.route(Some("fixture/demo".into()));
+        store.apply(reply(
+            serde_json::json!({"relation":"handoff","session":"t","scope":{"project":"/p","route":target}}),
+            None,
+        ));
+        assert_eq!(store.notice(), Some("Continued in OX API · fixture/demo."));
+        store.apply(reply(
+            serde_json::json!({"status":"waiting_for_operator","job_id":9}),
+            None,
+        ));
+        assert!(store.notice().unwrap().contains("accept YOLO"));
+        store.apply(reply(
+            serde_json::json!({}),
+            Some("This session cannot be handed off yet"),
+        ));
+        assert_eq!(
+            store.notice(),
+            Some("This session cannot be handed off yet")
+        );
+    }
     #[test]
     fn terminal_handoff_sends_only_the_verified_stock_decline() {
         let project = PathBuf::from("/project");

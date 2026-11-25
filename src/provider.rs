@@ -718,6 +718,9 @@ pub struct CodeoxConfig {
     pub search: Option<SearchSettings>,
     /// `[workers] host`: whether a terminal launch hands workers to a running session host.
     pub workers_host: WorkersHost,
+    /// `[workers] yolo_grant_projects`: absolute project directories whose
+    /// sessions grant YOLO to their workers and handoffs by default.
+    pub yolo_grant_projects: Vec<std::path::PathBuf>,
 }
 
 /// Where workers started from a terminal `ox` launch run.
@@ -776,14 +779,15 @@ impl CodeoxConfig {
             Some(item) => parse_search(item)?,
             None => None,
         };
-        let workers_host = match document.get("workers") {
+        let (workers_host, yolo_grant_projects) = match document.get("workers") {
             Some(item) => parse_workers(item)?,
-            None => WorkersHost::Auto,
+            None => (WorkersHost::Auto, Vec::new()),
         };
         Ok(Self {
             vendors,
             search,
             workers_host,
+            yolo_grant_projects,
         })
     }
 
@@ -801,20 +805,38 @@ impl CodeoxConfig {
     }
 }
 
-fn parse_workers(item: &Item) -> Result<WorkersHost, RelayError> {
+fn parse_workers(item: &Item) -> Result<(WorkersHost, Vec<std::path::PathBuf>), RelayError> {
     let table = item
         .as_table()
         .ok_or("`workers` must be a table of worker settings")?;
     for key in table.iter().map(|(key, _)| key) {
-        if key != "host" {
+        if key != "host" && key != "yolo_grant_projects" {
             return Err(format!("workers.{key} is not a recognized setting").into());
         }
     }
-    match opt_str(table, "host")?.as_deref() {
-        None | Some("auto") => Ok(WorkersHost::Auto),
-        Some("never") => Ok(WorkersHost::Never),
-        Some(_) => Err("workers.host must be \"auto\" or \"never\"".into()),
-    }
+    let host = match opt_str(table, "host")?.as_deref() {
+        None | Some("auto") => WorkersHost::Auto,
+        Some("never") => WorkersHost::Never,
+        Some(_) => return Err("workers.host must be \"auto\" or \"never\"".into()),
+    };
+    let projects = match table.get("yolo_grant_projects") {
+        None => Vec::new(),
+        Some(item) => item
+            .as_array()
+            .ok_or("workers.yolo_grant_projects must be a list of absolute project directories")?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(std::path::PathBuf::from)
+                    .filter(|p| p.is_absolute())
+                    .ok_or_else(|| {
+                        "workers.yolo_grant_projects must be a list of absolute project directories"
+                            .into()
+                    })
+            })
+            .collect::<Result<_, RelayError>>()?,
+    };
+    Ok((host, projects))
 }
 
 fn parse_search(item: &Item) -> Result<Option<SearchSettings>, RelayError> {
@@ -1510,6 +1532,14 @@ mod tests {
             WorkersHost::Never
         );
         assert!(load("[workers]\nhost = \"always\"\n").is_err());
+        assert_eq!(
+            load("[workers]\nyolo_grant_projects = [\"/srv/app\"]\n")
+                .unwrap()
+                .yolo_grant_projects,
+            vec![std::path::PathBuf::from("/srv/app")]
+        );
+        assert!(load("[workers]\nyolo_grant_projects = [\"relative\"]\n").is_err());
+        assert!(load("[workers]\nyolo_grant_projects = true\n").is_err());
         assert!(load("[workers]\nhosted = \"never\"\n").is_err());
         assert!(CodeoxConfig::load_from_str(&format!("workers = \"never\"\n{base}")).is_err());
     }

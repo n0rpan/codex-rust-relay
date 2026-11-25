@@ -11,7 +11,86 @@ use std::{
 pub(crate) struct Owned {
     pub(crate) scopes: Vec<SavedScope>,
     pub(crate) reserved: u64,
+    /// Sessions whose YOLO grant covers their workers' and handoffs' YOLO starts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) grants: Vec<Grant>,
+    /// Children waiting for the operator to accept YOLO. Only their stamps: the
+    /// task stays in memory, so a new epoch retires them as declined.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) asking: Vec<ox_desk_core::origin::Origin>,
+    /// Jobs that never became sessions, so their parent can still read why.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) outcomes: Vec<Outcome>,
+    /// Handoffs started but not yet confirmed, and recent failures.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) handoffs: Vec<HandoffRecord>,
+    /// Context windows stock clients reported, by route and model, newest last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) windows: Vec<Window>,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct Window {
+    pub(crate) route: ox_desk_core::runtime::Route,
+    pub(crate) model: Option<String>,
+    pub(crate) tokens: u64,
+}
+/// At most this many reported windows are kept.
+pub(crate) const WINDOWS: usize = 64;
+
+/// Record a reported window, replacing the same route and model and keeping it newest.
+pub(crate) fn record_window(windows: &mut Vec<Window>, window: Window) {
+    if windows.last() == Some(&window) {
+        return;
+    }
+    windows.retain(|w| !(w.route == window.route && w.model == window.model));
+    windows.push(window);
+    let excess = windows.len().saturating_sub(WINDOWS);
+    windows.drain(..excess);
+}
+
+/// The window a later handoff to `route` uses: the newest one reported on that
+/// route, bounded by OX's catalog when both are known. Without either, the
+/// selection's conservative default applies.
+pub(crate) fn handoff_window(
+    windows: &[Window],
+    route: &ox_desk_core::runtime::Route,
+    catalog: Option<u64>,
+) -> Option<u64> {
+    let seen = windows
+        .iter()
+        .rev()
+        .find(|w| &w.route == route)
+        .map(|w| w.tokens);
+    match (seen, catalog) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct Grant {
+    pub(crate) scope: Scope,
+    pub(crate) session: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub(crate) struct Outcome {
+    pub(crate) origin: ox_desk_core::origin::Origin,
+    /// `declined` or `failed`.
+    pub(crate) status: String,
+    pub(crate) message: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub(crate) struct HandoffRecord {
+    pub(crate) id: String,
+    pub(crate) target: Scope,
+    /// The stamp the target receives. References only, no message text.
+    pub(crate) origin: ox_desk_core::origin::Origin,
+    /// `starting` until the target's first turn is sent, then removed, or `failed`.
+    pub(crate) status: String,
+    #[serde(default)]
+    pub(crate) message: Option<String>,
+}
+/// At most this many outcomes and failed handoffs are kept.
+pub(crate) const KEPT: usize = 256;
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct SavedScope {
     pub(crate) scope: Scope,
@@ -148,6 +227,59 @@ impl Ledger {
         }
         Ok(())
     }
+    /// Change the host-level records atomically, restoring them if the write fails.
+    pub(crate) fn change(&mut self, f: impl FnOnce(&mut Owned)) -> io::Result<()> {
+        let before = self.data.clone();
+        f(&mut self.data);
+        if self.data == before {
+            return Ok(());
+        }
+        let trim = |n: usize| n.saturating_sub(KEPT);
+        let drop = trim(self.data.outcomes.len());
+        self.data.outcomes.drain(..drop);
+        let failed = self
+            .data
+            .handoffs
+            .iter()
+            .filter(|h| h.status != "starting")
+            .count();
+        let mut excess = trim(failed);
+        self.data.handoffs.retain(|h| {
+            if excess > 0 && h.status != "starting" {
+                excess -= 1;
+                false
+            } else {
+                true
+            }
+        });
+        if let Err(e) = self.save() {
+            self.data = before;
+            self.failed = true;
+            return Err(e);
+        }
+        Ok(())
+    }
+    /// A new epoch never replays a launch: pending YOLO requests become declined
+    /// and handoffs that had not started their first turn become failed.
+    pub(crate) fn retire(&mut self) -> io::Result<()> {
+        self.change(|data| {
+            for origin in std::mem::take(&mut data.asking) {
+                data.outcomes.push(Outcome {
+                    origin,
+                    status: "declined".into(),
+                    message: "The OX session host restarted before the operator answered, so the YOLO request was declined. Start the worker again if it is still needed.".into(),
+                });
+            }
+            for h in &mut data.handoffs {
+                if h.status == "starting" {
+                    h.status = "failed".into();
+                    h.message = Some(
+                        "The OX session host restarted before the new session's first turn. Nothing was retried. Start the handoff again.".into(),
+                    );
+                }
+            }
+        })
+    }
     pub(crate) fn update(&mut self, state: SavedScope) -> io::Result<()> {
         let index = self.data.scopes.iter().position(|e| e.scope == state.scope);
         let previous = match index {
@@ -194,6 +326,76 @@ impl Ledger {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn handoffs_use_reported_windows_and_fall_back_only_until_one_is_seen() {
+        use ox_desk_core::runtime::Runtime;
+        let sub = Runtime::Claude.route(None);
+        let api = Runtime::Codex.route(Some("fixture".into()));
+        let mut windows = Vec::new();
+        // Nothing seen and no catalog entry: the selection's 64k default applies.
+        assert_eq!(handoff_window(&windows, &sub, None), None);
+        assert_eq!(
+            ox_desk_core::handoff::Budget::new(handoff_window(&windows, &sub, None), "").window,
+            ox_desk_core::handoff::DEFAULT_CONTEXT
+        );
+        // The catalog alone is used for an API alias.
+        assert_eq!(handoff_window(&windows, &api, Some(128_000)), Some(128_000));
+        record_window(
+            &mut windows,
+            Window {
+                route: sub.clone(),
+                model: Some("opus".into()),
+                tokens: 200_000,
+            },
+        );
+        assert_eq!(handoff_window(&windows, &sub, None), Some(200_000));
+        assert_eq!(
+            handoff_window(&windows, &api, None),
+            None,
+            "windows are per route"
+        );
+        // A newer report replaces the same model and wins over older ones.
+        record_window(
+            &mut windows,
+            Window {
+                route: sub.clone(),
+                model: Some("sonnet".into()),
+                tokens: 1_000_000,
+            },
+        );
+        record_window(
+            &mut windows,
+            Window {
+                route: sub.clone(),
+                model: Some("opus".into()),
+                tokens: 180_000,
+            },
+        );
+        assert_eq!(windows.len(), 2);
+        assert_eq!(handoff_window(&windows, &sub, None), Some(180_000));
+        // Reported and catalog windows together: the tighter one.
+        record_window(
+            &mut windows,
+            Window {
+                route: api.clone(),
+                model: Some("fixture".into()),
+                tokens: 272_000,
+            },
+        );
+        assert_eq!(handoff_window(&windows, &api, Some(128_000)), Some(128_000));
+        for n in 0..100 {
+            record_window(
+                &mut windows,
+                Window {
+                    route: sub.clone(),
+                    model: Some(format!("m{n}")),
+                    tokens: 1,
+                },
+            );
+        }
+        assert_eq!(windows.len(), WINDOWS);
+    }
+
     use super::*;
     use ox_desk_core::{
         host_protocol::{AskView, Timeline, TimelineItem},

@@ -122,6 +122,28 @@ async fn handle(home: &Path, request: Request) -> Result<Value, RelayError> {
             prioritize(&mut models, home);
             Ok(json!(models))
         }
+        Request::ModelContexts => {
+            if !home.join(REGISTRY).try_exists()? {
+                return Ok(json!({}));
+            }
+            let config = CodeoxConfig::load(&home.join(REGISTRY))?;
+            let keys = SavedKeys::for_config(home, &config)?;
+            let app = App::codeox(
+                config,
+                BundledModels::default(),
+                &crate::random_token()?,
+                upstream_client()?,
+                MAX_REQUEST_BYTES,
+                &|name| keys.get(name),
+                None,
+            )
+            .await?;
+            Ok(json!(
+                app.model_contexts()
+                    .into_iter()
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            ))
+        }
         Request::Save { id, revision, text } => {
             let _lock = setup::lock_config(home)?;
             if id == legacy::ID {

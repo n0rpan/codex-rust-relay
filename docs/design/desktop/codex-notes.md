@@ -10,6 +10,10 @@ Key long-lived connections by canonical project directory and billing route. An 
 
 To reproduce the filesystem check, run the stock session test from the desktop README with `OX_DESKTOP_TEST_CASE=worker-cwd`. Both directories, accounts, credentials and inference endpoints are temporary fixtures.
 
+## Handoff history
+
+A handoff into Codex starts a thread, calls `thread/inject_items` with raw Responses message items (role user or assistant), then starts the turn with the new request. On 0.171.0 and 0.172.0 the model sees the items in order after Codex's own context and before the request; they persist across `thread/resume`, need no experimental capability, and are not listed by `thread/read`. `desktop/tests/codex_inject_items.py` checks the stock behaviour and `desktop/ox-desk-core/tests/handoff_codex.rs` checks that the desktop store sends a real selection in order before the request. Both run in the protocol job for each release.
+
 ## Catalog and subscription observations
 
 Two independent stock app-servers opened the same synthetic profile. A substring of the assigned title matched via `thread/list` with `sortKey=updated_at` and requested limits of 1 and 5,000 (the fixture contained one matching thread). The state-database-only and ordinary searches respectively took 4.34 / 6.71 ms on 0.171.0 and 1.62 / 4.50 ms on 0.172.0. These small-catalog measurements establish the request contract. Large-list scrolling is a separate gate.

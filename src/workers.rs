@@ -71,21 +71,46 @@ impl Relay {
         home: &Path,
         client: ClientKind,
     ) -> Result<u8, RelayError> {
+        let (mcp, gateway) = self.attach(args, home, client, Tools::All)?;
+        command.env(TOKEN_ENV, &gateway.token);
+        command.args(mcp);
+        command.args(args);
+        crate::exempt_loopback_proxy(&mut command);
+        eprintln!(
+            "ox: API workers enabled. Ask for the ox model list or name an API model to delegate to."
+        );
+        tokio::select! {
+            result = crate::native::launch(command) => result,
+            result = gateway.serve() => Err(result),
+        }
+    }
+
+    /// Prepare this gateway for a client launch: the stock client's MCP
+    /// arguments, and the gateway to serve while the client runs. The client
+    /// also needs `TOKEN_ENV` set to [`Gateway::token`].
+    pub(crate) fn attach(
+        self,
+        args: &[OsString],
+        home: &Path,
+        client: ClientKind,
+        tools: Tools,
+    ) -> Result<(Vec<OsString>, Gateway), RelayError> {
         let origin = format!("http://{}", self.listener.local_addr()?);
         let url = format!("{origin}/mcp");
-        command.env(TOKEN_ENV, &self.token);
-        match client {
-            ClientKind::Codex => {
-                for (field, value) in [
-                    ("url", json!(url)),
-                    ("bearer_token_env_var", json!(TOKEN_ENV)),
-                    ("tool_timeout_sec", json!(120)),
-                ] {
-                    command
-                        .arg("-c")
-                        .arg(format!("mcp_servers.{SERVER}.{field}={value}"));
-                }
-            }
+        let mcp = match client {
+            ClientKind::Codex => [
+                ("url", json!(url)),
+                ("bearer_token_env_var", json!(TOKEN_ENV)),
+                ("tool_timeout_sec", json!(120)),
+            ]
+            .into_iter()
+            .flat_map(|(field, value)| {
+                [
+                    OsString::from("-c"),
+                    OsString::from(format!("mcp_servers.{SERVER}.{field}={value}")),
+                ]
+            })
+            .collect(),
             ClientKind::Claude => {
                 let config = json!({
                     "mcpServers": {
@@ -96,11 +121,10 @@ impl Relay {
                         }
                     }
                 });
-                command.arg(format!("--mcp-config={config}"));
+                vec![OsString::from(format!("--mcp-config={config}"))]
             }
-        }
-        command.args(args);
-        crate::exempt_loopback_proxy(&mut command);
+        };
+        let token = self.token.clone();
         let service = Arc::new(Service {
             app: OnceCell::new_with(self.app.map(|app| Ok(prepare_app(app, home, &self.token)))),
             local_auth: crate::provider::bearer(&self.token)?,
@@ -119,17 +143,47 @@ impl Relay {
             client,
             slots: Semaphore::new(4),
             jobs: Mutex::new(jobs::Jobs::default()),
+            tools,
         });
-        eprintln!(
-            "ox: API workers enabled. Ask for the ox model list or name an API model to delegate to."
-        );
-        tokio::select! {
-            result = crate::native::launch(command) => result,
-            result = crate::serve_requests(self.listener, move |request| {
-                let service = Arc::clone(&service);
-                async move { service.handle(request).await }
-            }) => Err(result.unwrap_err().into()),
-        }
+        Ok((
+            mcp,
+            Gateway {
+                listener: self.listener,
+                service,
+                token,
+            },
+        ))
+    }
+}
+
+/// Which tools a gateway offers. An API session the session host runs gets only
+/// read_ox_thread, so a handoff target on an API alias can read its source.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tools {
+    All,
+    HandoffRead,
+}
+
+pub(crate) struct Gateway {
+    listener: TcpListener,
+    service: Arc<Service>,
+    pub(crate) token: String,
+}
+
+impl Gateway {
+    /// The environment variable and value the client needs for this gateway.
+    pub(crate) fn env(&self) -> (&'static str, &str) {
+        (TOKEN_ENV, &self.token)
+    }
+    pub(crate) async fn serve(self) -> RelayError {
+        let service = self.service;
+        crate::serve_requests(self.listener, move |request| {
+            let service = Arc::clone(&service);
+            async move { service.handle(request).await }
+        })
+        .await
+        .unwrap_err()
+        .into()
     }
 }
 
@@ -215,6 +269,7 @@ struct Service {
     client: ClientKind,
     slots: Semaphore,
     jobs: Mutex<jobs::Jobs>,
+    tools: Tools,
 }
 
 #[derive(Deserialize)]
@@ -224,6 +279,19 @@ struct ListModels {
     query: String,
     #[serde(default)]
     offset: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadThread {
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    item: Option<String>,
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -344,7 +412,20 @@ impl Service {
         let result = match method {
             "initialize" => initialize(params),
             "ping" => json!({}),
+            "tools/list" if self.tools == Tools::HandoffRead => {
+                let mut all = tools();
+                if let Some(list) = all["tools"].as_array_mut() {
+                    list.retain(|t| t["name"] == "read_ox_thread");
+                }
+                all
+            }
             "tools/list" => tools(),
+            "tools/call"
+                if self.tools == Tools::HandoffRead
+                    && params["name"].as_str() != Some("read_ox_thread") =>
+            {
+                return rpc_error(id.clone(), -32602, "Unknown worker tool");
+            }
             "tools/call" => match params["name"].as_str() {
                 Some("list_ox_models") => match serde_json::from_value(
                     params
@@ -380,6 +461,23 @@ impl Service {
                     }
                 }
                 Some("list_ox_workers") => tool_result(self.list_jobs(thread).await),
+                Some("read_ox_thread") => {
+                    match serde_json::from_value::<ReadThread>(
+                        params
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or_else(|| json!({})),
+                    ) {
+                        Ok(read) => tool_result(self.read_thread(read, thread).await),
+                        Err(_) => {
+                            return rpc_error(
+                                id.clone(),
+                                -32602,
+                                "Use session, item, after and limit to read a handoff source",
+                            );
+                        }
+                    }
+                }
                 Some("steer_ox_worker") => {
                     let result = async {
                         let request: jobs::Steer =
@@ -560,6 +658,27 @@ impl Service {
         Ok(redact_value(reply, &app.secrets))
     }
 
+    /// Read this session's handoff sources through the session host, which
+    /// resolves the caller exactly as for every parent operation.
+    async fn read_thread(&self, read: ReadThread, thread: Option<&str>) -> Result<Value, String> {
+        if crate::host_lifetime::HostLink::find(&self.cwd, self.host_policy)?.is_none() {
+            return Err("read_ox_thread needs the OX session host, which ran the handoff.".into());
+        }
+        if read.limit.is_some_and(|l| l == 0 || l > 100)
+            || [&read.session, &read.item, &read.after]
+                .into_iter()
+                .flatten()
+                .any(|s| s.is_empty() || s.len() > 256)
+        {
+            return Err("Use a limit of 1 to 100 and IDs of up to 256 bytes.".into());
+        }
+        self.host_call(
+            json!({"op":"read_thread","session":read.session,"item":read.item,"after":read.after,"limit":read.limit}),
+            thread,
+        )
+        .await
+    }
+
     async fn list_jobs(&self, thread: Option<&str>) -> Result<Value, String> {
         let mut local = self.jobs.lock().unwrap().list();
         if crate::host_lifetime::HostLink::find(&self.cwd, self.host_policy)?.is_some() {
@@ -692,7 +811,7 @@ fn initialize(params: &Value) -> Value {
         "protocolVersion": version,
         "serverInfo": {"name": SERVER, "version": crate::VERSION},
         "capabilities": {"tools": {}},
-        "instructions": "Use start_ox_worker for long coding tasks, Codex goals or Claude workflows, then check ox_worker_status. Use delegate_to_ox_model for one short text answer. Start jobs only at the user's request and only enable workspace writes when requested. The named provider bills the delegated work.",
+        "instructions": "Use start_ox_worker for long coding tasks, Codex goals or Claude workflows, then check ox_worker_status. Workers inherit your permission mode; lower it with permission_mode when a task only reads or needs less. Use delegate_to_ox_model for one short text answer. Start jobs only at the user's request. The named provider bills the delegated work. If this session continues another one (an OX handoff), read_ox_thread returns the source's omitted or cut messages by item ID.",
     })
 }
 
@@ -728,7 +847,7 @@ fn tools() -> Value {
             },
             {
                 "name": "start_ox_worker",
-                "description": "Start a background stock-client coding session in this project. Use mode goal for Codex Goal mode or workflow for a Claude Code workflow. Returns a job ID immediately. The worker can read project files. Request workspace_write only when the user asked the worker to edit this project.",
+                "description": "Start a background stock-client coding session in this project. Use mode goal for Codex Goal mode or workflow for a Claude Code workflow. Returns a job ID immediately. Workers inherit your permission mode, mapped to the worker's runtime; lower it with permission_mode for tasks that only read or need less. You cannot raise it. A YOLO worker waits until a person accepts it (status waiting_for_operator) unless the operator granted YOLO for this session's workers.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -736,12 +855,24 @@ fn tools() -> Value {
                         "mode": {"enum": ["session", "goal", "workflow"]},
                         "model": {"type": "string", "description": "Exact ox API model alias. Leave out only for a Claude subscription worker."},
                         "task": {"type": "string", "description": "The job objective, desired validation, and stopping condition."},
-                        "workspace_write": {"type": "boolean", "default": false},
+                        "permission_mode": {"enum": ["inherit", "read", "write", "classifier", "yolo"], "default": "inherit", "description": "inherit (default) or a lower level. read: Codex Read only / Claude Plan. write: Codex Workspace / Claude Accept edits. classifier: Codex Auto-review / Claude Auto. yolo: Codex YOLO / Claude bypass. Above your own mode is refused."},
+                        "workspace_write": {"type": "boolean", "description": "Deprecated: false means read, true means write. Use permission_mode."},
                     },
                     "required": ["runtime", "mode", "task"],
                     "additionalProperties": false,
                 },
                 "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+            },
+            {
+                "name":"read_ox_thread",
+                "description":"Read the session this one was handed off from (and earlier sources in its chain), read-only and within this project. The handoff carried a budgeted selection of real messages; use this to read omitted or cut items in full. Pages by item ID: item returns one item, after continues after an item. Omit session for the nearest source.",
+                "inputSchema":{"type":"object","properties":{
+                    "session":{"type":"string","description":"A source session ID from the handoff note. Omit for the nearest source."},
+                    "item":{"type":"string","description":"Return this item in full."},
+                    "after":{"type":"string","description":"Start after this item ID. Use next_after from the previous page."},
+                    "limit":{"type":"integer","minimum":1,"maximum":100,"default":20}
+                },"additionalProperties":false},
+                "annotations":{"readOnlyHint":true,"openWorldHint":false}
             },
             {
                 "name":"list_ox_workers",
@@ -873,6 +1004,66 @@ mod tests {
             session_hint(&resumed.0, ClientKind::Claude).as_deref(),
             Some(id.as_str())
         );
+    }
+
+    #[test]
+    fn worker_permission_modes_keep_workspace_write_compatible() {
+        let start = |v: Value| serde_json::from_value::<jobs::Start>(v).unwrap();
+        let base = json!({"runtime":"codex","mode":"session","model":"m","task":"t"});
+        let with = |extra: Value| {
+            let mut v = base.clone();
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            start(v)
+        };
+        // Inherit by default; the host resolves it against the parent's mode.
+        let inherit = with(json!({}));
+        assert_eq!(inherit.host_start(&[])["permission"], Value::Null);
+        assert_eq!(inherit.host_start(&[])["write"], Value::Null);
+        // Old callers keep working: false is read, true is write.
+        let old = with(json!({"workspace_write": true}));
+        assert_eq!(old.host_start(&[])["write"], true);
+        assert_eq!(old.writes(), Ok(true));
+        assert_eq!(with(json!({"workspace_write": false})).writes(), Ok(false));
+        assert_eq!(
+            inherit.writes(),
+            Ok(false),
+            "standalone inherit starts read"
+        );
+        // A lower named level, by level or native name.
+        let lower = with(json!({"permission_mode": "read-only"}));
+        assert_eq!(lower.host_start(&[])["permission"], "read");
+        assert!(lower.validate().is_ok());
+        assert_eq!(
+            with(json!({"permission_mode": "accept_edits"})).writes(),
+            Ok(true)
+        );
+        assert!(with(json!({"permission_mode": "root"})).validate().is_err());
+        // Without a host nothing can ask the operator, so YOLO and classifiers are refused.
+        assert!(with(json!({"permission_mode": "yolo"})).writes().is_err());
+        assert!(with(json!({"permission_mode": "auto"})).writes().is_err());
+        let tools = tools();
+        let names: Vec<_> = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"read_ox_thread"));
+        let start_tool = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "start_ox_worker")
+            .unwrap();
+        assert!(
+            start_tool["description"]
+                .as_str()
+                .unwrap()
+                .contains("inherit your permission mode")
+        );
+        assert!(start_tool["inputSchema"]["properties"]["workspace_write"].is_object());
     }
 
     #[test]
