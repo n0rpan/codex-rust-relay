@@ -44,8 +44,9 @@ on:
 permissions:
   contents: read
 concurrency:
-  # Adding an unrelated label must not cancel a running full lane.
-  group: desktop-${{ github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
+  # Adding an unrelated label must not cancel a running full lane, and the
+  # nightly run must not cancel the release build ci.yml calls on main.
+  group: desktop-${{ github.ref }}-${{ github.event_name == 'schedule' && 'nightly' || 'change' }}${{ github.event.action == 'labeled' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 env:
   OX_BUILD_SHA: ${{ github.sha }}
