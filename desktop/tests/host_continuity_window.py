@@ -69,6 +69,11 @@ def open_transcript_find(window, attempts=3):
             window.word("Find", same_row="transcript")
         except AssertionError:
             if attempt == attempts:
+                # Keep what the next investigation needs: the app's own view of the
+                # selection and a screenshot, uploaded with the Linux gate artifacts.
+                print("desktop state when transcript find failed:", json.dumps(window.snapshot()), flush=True)
+                if temp := os.environ.get("RUNNER_TEMP"):
+                    window.command("import", "-window", window.id, str(Path(temp) / "continuity-find.png"))
                 raise
             print(f"transcript find did not open on attempt {attempt}; retrying", flush=True)
             continue
