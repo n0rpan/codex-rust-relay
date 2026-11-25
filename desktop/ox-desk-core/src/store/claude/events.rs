@@ -352,6 +352,11 @@ impl Store {
                 self.claude_activity(&display);
             }
             Event::Result(r) => {
+                for (model, usage) in &r.model_usage {
+                    if let Some(window) = usage.context_window.filter(|w| *w > 0) {
+                        self.context_windows.push((Some(model.clone()), window));
+                    }
+                }
                 if !r.is_error {
                     self.title_after_turn(owner);
                 }

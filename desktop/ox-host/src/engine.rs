@@ -991,6 +991,22 @@ impl Engine {
                     .retain(|id, _| live.store.asks().iter().any(|a| &a.id == id));
             }
         }
+        let reported = live.store.take_context_windows();
+        if !reported.is_empty() {
+            let route = scope.route.clone();
+            self.ledger.change(|d| {
+                for (model, tokens) in reported {
+                    crate::durable::record_window(
+                        &mut d.windows,
+                        crate::durable::Window {
+                            route: route.clone(),
+                            model,
+                            tokens,
+                        },
+                    );
+                }
+            })?;
+        }
         let launch_failure = advance_launch(live);
         let mut dirty = live.store.drain(vec![], Instant::now());
         if from_action {
@@ -3334,6 +3350,20 @@ mod tests {
                 );
                 let (l, log) = live(&target, vec![], &[], vec![]);
                 engine.running.insert(target.clone(), l);
+                // A window a stock client reported earlier on the target route sets the budget.
+                engine
+                    .ledger
+                    .change(|d| {
+                        crate::durable::record_window(
+                            &mut d.windows,
+                            crate::durable::Window {
+                                route: target.route.clone(),
+                                model: Some("fixture".into()),
+                                tokens: 300_000,
+                            },
+                        )
+                    })
+                    .unwrap();
                 engine
                     .act(
                         1,
@@ -3367,6 +3397,10 @@ mod tests {
                 assert_eq!((h.session.as_str(), h.runtime), ("s", Runtime::Claude));
                 assert_eq!(h.selection.items, ["u1", "c1", "a1", "u2", "a2"]);
                 assert_eq!(h.selection.omitted, 0);
+                assert_eq!(
+                    (h.selection.window, h.selection.window_known),
+                    (300_000, true)
+                );
                 assert!(matches!(
                     log.lock().unwrap()[0].0,
                     Action::SetNextAccess(Access::Workspace)

@@ -721,7 +721,12 @@ function splitHandoff(text) {
   return end < 0 ? null : [text.slice(0, end + close.length), text.slice(end + close.length)];
 }
 
-function transcript(items) {
+// Only the first user message of a handoff target carries the folded block,
+// and only once the first page of history is loaded.
+function transcript(items, handoffTarget = false) {
+  const foldId = handoffTarget
+    ? items.find((i) => i.role === "user")?.id
+    : undefined;
   const nodes = [],
     nextRows = new Map(),
     visible = items.slice(-visibleRows);
@@ -766,11 +771,13 @@ function transcript(items) {
         row.text = el("div", "body");
         row.node.append(row.label, row.text);
       }
-      if (row.item !== i || row.revision !== i.revision) {
+      const fold = foldId !== undefined && i.id === foldId;
+      if (row.item !== i || row.revision !== i.revision || row.fold !== fold) {
         row.item = i;
         row.revision = i.revision;
+        row.fold = fold;
         const carried =
-          i.role === "user" ? splitHandoff(i.text) : null;
+          i.role === "user" && fold ? splitHandoff(i.text) : null;
         if (["assistant", "result", "plan"].includes(i.role))
           messageText(row.text, i.text);
         else if (carried) {
@@ -845,7 +852,10 @@ function conversation() {
   const inputCaps = id ? caps : (s?.capabilities ?? []);
   updateExtras(s, inputCaps, detailLink, id);
   showReview(timeline?.detail?.reviews);
-  transcript(timeline?.items || []);
+  transcript(
+    timeline?.items || [],
+    !!origin?.handoff && !timeline?.detail?.older,
+  );
   $("older").hidden = !timeline?.detail?.older;
   $("older").onclick = () => detailLink.act({ load_older: id });
   $("start-worker").hidden = !id || !caps.includes("open");

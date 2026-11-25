@@ -24,6 +24,47 @@ pub(crate) struct Owned {
     /// Handoffs started but not yet confirmed, and recent failures.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) handoffs: Vec<HandoffRecord>,
+    /// Context windows stock clients reported, by route and model, newest last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) windows: Vec<Window>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct Window {
+    pub(crate) route: ox_desk_core::runtime::Route,
+    pub(crate) model: Option<String>,
+    pub(crate) tokens: u64,
+}
+/// At most this many reported windows are kept.
+pub(crate) const WINDOWS: usize = 64;
+
+/// Record a reported window, replacing the same route and model and keeping it newest.
+pub(crate) fn record_window(windows: &mut Vec<Window>, window: Window) {
+    if windows.last() == Some(&window) {
+        return;
+    }
+    windows.retain(|w| !(w.route == window.route && w.model == window.model));
+    windows.push(window);
+    let excess = windows.len().saturating_sub(WINDOWS);
+    windows.drain(..excess);
+}
+
+/// The window a later handoff to `route` uses: the newest one reported on that
+/// route, bounded by OX's catalog when both are known. Without either, the
+/// selection's conservative default applies.
+pub(crate) fn handoff_window(
+    windows: &[Window],
+    route: &ox_desk_core::runtime::Route,
+    catalog: Option<u64>,
+) -> Option<u64> {
+    let seen = windows
+        .iter()
+        .rev()
+        .find(|w| &w.route == route)
+        .map(|w| w.tokens);
+    match (seen, catalog) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Grant {
@@ -285,6 +326,76 @@ impl Ledger {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn handoffs_use_reported_windows_and_fall_back_only_until_one_is_seen() {
+        use ox_desk_core::runtime::Runtime;
+        let sub = Runtime::Claude.route(None);
+        let api = Runtime::Codex.route(Some("fixture".into()));
+        let mut windows = Vec::new();
+        // Nothing seen and no catalog entry: the selection's 64k default applies.
+        assert_eq!(handoff_window(&windows, &sub, None), None);
+        assert_eq!(
+            ox_desk_core::handoff::Budget::new(handoff_window(&windows, &sub, None), "").window,
+            ox_desk_core::handoff::DEFAULT_CONTEXT
+        );
+        // The catalog alone is used for an API alias.
+        assert_eq!(handoff_window(&windows, &api, Some(128_000)), Some(128_000));
+        record_window(
+            &mut windows,
+            Window {
+                route: sub.clone(),
+                model: Some("opus".into()),
+                tokens: 200_000,
+            },
+        );
+        assert_eq!(handoff_window(&windows, &sub, None), Some(200_000));
+        assert_eq!(
+            handoff_window(&windows, &api, None),
+            None,
+            "windows are per route"
+        );
+        // A newer report replaces the same model and wins over older ones.
+        record_window(
+            &mut windows,
+            Window {
+                route: sub.clone(),
+                model: Some("sonnet".into()),
+                tokens: 1_000_000,
+            },
+        );
+        record_window(
+            &mut windows,
+            Window {
+                route: sub.clone(),
+                model: Some("opus".into()),
+                tokens: 180_000,
+            },
+        );
+        assert_eq!(windows.len(), 2);
+        assert_eq!(handoff_window(&windows, &sub, None), Some(180_000));
+        // Reported and catalog windows together: the tighter one.
+        record_window(
+            &mut windows,
+            Window {
+                route: api.clone(),
+                model: Some("fixture".into()),
+                tokens: 272_000,
+            },
+        );
+        assert_eq!(handoff_window(&windows, &api, Some(128_000)), Some(128_000));
+        for n in 0..100 {
+            record_window(
+                &mut windows,
+                Window {
+                    route: sub.clone(),
+                    model: Some(format!("m{n}")),
+                    tokens: 1,
+                },
+            );
+        }
+        assert_eq!(windows.len(), WINDOWS);
+    }
+
     use super::*;
     use ox_desk_core::{
         host_protocol::{AskView, Timeline, TimelineItem},

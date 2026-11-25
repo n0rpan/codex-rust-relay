@@ -217,6 +217,55 @@ pub struct SelectionRefs {
     pub ranges: Vec<Omitted>,
     pub window: u64,
     pub window_known: bool,
+    /// When the source itself was a handoff target: its own sources, nearest
+    /// first. read_ox_thread reads them; their messages are not carried again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub earlier: Vec<Earlier>,
+    /// The source's first user item, whose carried context block was stripped
+    /// to its request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stripped: Option<String>,
+}
+
+/// An earlier session in a handoff chain, readable through read_ox_thread.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Earlier {
+    pub session: String,
+    pub title: String,
+    pub runtime: Runtime,
+    pub route: Route,
+}
+
+/// A Claude handoff target's first user message is the carried `<ox-handoff>`
+/// block plus its request. When that session is handed off again, keep only
+/// the request, so carried context never nests. Codex sources need nothing:
+/// injected items are not listed by thread/read. Returns the stripped item.
+pub fn strip_carried_context(items: &mut [SourceItem]) -> Option<String> {
+    let first = items.iter_mut().find(|i| i.kind == Kind::User)?;
+    let (_, request) = split_claude_turn(&first.text)?;
+    first.text = request.to_owned();
+    Some(first.id.clone())
+}
+
+/// [`select`] for a source that may itself be a handoff target. `earlier` is
+/// the source's own handoff chain, nearest first; when it is not empty the
+/// source is stamped as a handoff and its carried block is stripped.
+pub fn select_chained(
+    mut items: Vec<SourceItem>,
+    request: &str,
+    window: Option<u64>,
+    earlier: Vec<Earlier>,
+) -> Result<Selection, String> {
+    let stripped = if earlier.is_empty() {
+        None
+    } else {
+        strip_carried_context(&mut items)
+    };
+    let mut selection = select(&items, request, window)?;
+    selection.refs.earlier = earlier;
+    selection.refs.stripped = stripped;
+    Ok(selection)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -360,6 +409,8 @@ pub fn select(
         ranges,
         window: budget.window,
         window_known: budget.known,
+        earlier: vec![],
+        stripped: None,
     };
     Ok(Selection {
         carried: selected,
@@ -401,9 +452,27 @@ impl HandoffSource {
                     .join(", ")
             )
         };
+        let chain = if r.earlier.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " That session itself continued {}; the context carried into it is not repeated here. read_ox_thread with that session ID reads it.",
+                r.earlier
+                    .iter()
+                    .map(|e| format!(
+                        "\"{}\" (session {}, {})",
+                        e.title.replace('"', "'"),
+                        e.session,
+                        e.route.label()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", which continued ")
+            )
+        };
         format!(
-            "OX handoff: this session continues \"{}\" ({}, {}). The messages that follow are real earlier messages from it, in order, not a summary: {} of {} carried. {omitted} Use the read_ox_thread tool to read the source session's omitted or cut items by ID. Answer the request after them.",
+            "OX handoff: this session continues \"{}\" (session {}, {}, {}). The messages that follow are real earlier messages from it, in order, not a summary: {} of {} carried. {omitted}{chain} Use the read_ox_thread tool to read the source session's omitted or cut items by ID. Answer the request after them.",
             self.title.replace('"', "'"),
+            self.session,
             self.runtime.name(),
             self.route.label(),
             r.carried,
@@ -518,6 +587,39 @@ pub fn marker(origin: &crate::origin::Origin) -> Option<String> {
         h.selection.carried,
         h.selection.omitted
     ))
+}
+
+/// The carried block a client folds: only in the first user item of a handoff
+/// target (relation `handoff`, or a fork of one, which copies that message),
+/// and only once the transcript's first page is loaded. Any other message that
+/// starts with `<ox-handoff>` renders as typed.
+pub fn fold<'a>(
+    origin: Option<&crate::origin::Origin>,
+    transcript: &crate::transcript::Transcript,
+    key: &crate::transcript::ItemKey,
+    text: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    use crate::transcript::{Row, item::Item};
+    origin.filter(|o| o.handoff.is_some())?;
+    if transcript.has_older() {
+        return None;
+    }
+    let first = (0..transcript.len())
+        .filter_map(|i| match transcript.row(i)? {
+            Row::Message(k) => Some(k),
+            Row::Tools(_) => None,
+        })
+        .find(|k| {
+            matches!(
+                transcript.entry(k).map(|e| &e.item),
+                Some(Item::UserMessage { .. })
+            )
+        })?;
+    if first == key {
+        split_claude_turn(text)
+    } else {
+        None
+    }
 }
 
 /// An operator's request to continue a session elsewhere.
@@ -840,6 +942,204 @@ mod tests {
         assert!(block.contains("<message role=\"outcome\" id=\"i1\">"));
         assert!(!block[..block.len() - 16].contains("</ox-handoff>\n\n"));
         assert!(split_claude_turn("plain text").is_none());
+    }
+
+    /// One hop. Returns the target's own transcript afterwards as items (a
+    /// Claude target's first user message is the block plus the request; a
+    /// Codex target lists only the request), its chain entry, and what was sent.
+    fn hop(
+        from: (&str, Runtime, Route),
+        to: Runtime,
+        items: Vec<SourceItem>,
+        earlier: Vec<Earlier>,
+        request: &str,
+    ) -> (Vec<SourceItem>, Earlier, String) {
+        let selection = select_chained(items, request, Some(200_000), earlier).unwrap();
+        let source = HandoffSource {
+            scope: Scope {
+                project: "/p".into(),
+                route: from.2.clone(),
+            },
+            session: from.0.into(),
+            native: None,
+            title: format!("title {}", from.0),
+            runtime: from.1,
+            route: from.2.clone(),
+            source_access: None,
+            source_level: None,
+            decision: Decision::Inherited,
+            selection: selection.refs.clone(),
+        };
+        let (sent, first) = match to {
+            Runtime::Claude => {
+                let turn = claude_turn(&source, &selection, request);
+                (turn.clone(), turn)
+            }
+            Runtime::Codex => (
+                serde_json::to_string(&codex_items(&source, &selection)).unwrap(),
+                request.to_owned(),
+            ),
+        };
+        let item = |id: String, kind, text| SourceItem {
+            id,
+            turn: "t".into(),
+            kind,
+            text,
+        };
+        let target = vec![
+            item(format!("{}-u", from.0), Kind::User, first),
+            item(
+                format!("{}-a", from.0),
+                Kind::Assistant,
+                format!("reply after {}", from.0),
+            ),
+        ];
+        let me = Earlier {
+            session: from.0.into(),
+            title: format!("title {}", from.0),
+            runtime: from.1,
+            route: from.2,
+        };
+        (target, me, sent)
+    }
+
+    #[test]
+    fn chained_handoffs_never_nest_carried_context() {
+        let original = vec![
+            SourceItem {
+                id: "o1".into(),
+                turn: "t".into(),
+                kind: Kind::User,
+                text: "ORIGINAL request".into(),
+            },
+            SourceItem {
+                id: "o2".into(),
+                turn: "t".into(),
+                kind: Kind::Assistant,
+                text: "ORIGINAL answer".into(),
+            },
+        ];
+        let sub = Runtime::Claude.route(None);
+        let api = Runtime::Claude.route(Some("anthropic/sonnet".into()));
+        let codex = Runtime::Codex.route(Some("openai/gpt".into()));
+
+        // Claude subscription -> Claude API -> Codex.
+        let (api_items, first, _) = hop(
+            ("s1", Runtime::Claude, sub.clone()),
+            Runtime::Claude,
+            original.clone(),
+            vec![],
+            "SECOND request",
+        );
+        let (_, _, to_codex) = hop(
+            ("s2", Runtime::Claude, api),
+            Runtime::Codex,
+            api_items.clone(),
+            vec![first.clone()],
+            "THIRD request",
+        );
+        let items: Vec<Value> = serde_json::from_str(&to_codex).unwrap();
+        let texts: Vec<&str> = items
+            .iter()
+            .map(|i| i["content"][0]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            texts.iter().filter(|t| t.contains("<ox-handoff>")).count(),
+            1,
+            "{texts:#?}"
+        );
+        assert!(
+            texts[0].contains("session s1") && texts[0].contains("read_ox_thread"),
+            "{}",
+            texts[0]
+        );
+        assert_eq!(
+            texts[1], "SECOND request",
+            "the block was stripped to its request"
+        );
+        assert!(
+            !to_codex.contains("ORIGINAL"),
+            "the first hop's messages are not carried again"
+        );
+        let refs = select_chained(api_items.clone(), "x", Some(200_000), vec![first.clone()])
+            .unwrap()
+            .refs;
+        assert_eq!(refs.stripped.as_deref(), Some("s1-u"));
+        assert_eq!(refs.earlier, vec![first]);
+        // A source that is not a handoff target keeps a typed block as is.
+        let plain = select_chained(api_items, "x", Some(200_000), vec![]).unwrap();
+        assert!(plain.carried[0].text.starts_with("<ox-handoff>") && plain.refs.stripped.is_none());
+
+        // Codex -> Claude -> Claude.
+        let (claude_items, codex_src, _) = hop(
+            ("c1", Runtime::Codex, codex),
+            Runtime::Claude,
+            original,
+            vec![],
+            "SECOND request",
+        );
+        assert!(claude_items[0].text.starts_with("<ox-handoff>\n"));
+        let (_, _, to_claude) = hop(
+            ("c2", Runtime::Claude, sub),
+            Runtime::Claude,
+            claude_items,
+            vec![codex_src],
+            "THIRD request",
+        );
+        assert_eq!(to_claude.matches("<ox-handoff>").count(), 1, "{to_claude}");
+        assert_eq!(to_claude.matches("</ox-handoff>").count(), 1);
+        let (block, request) = split_claude_turn(&to_claude).unwrap();
+        assert_eq!(request, "THIRD request");
+        assert!(block.contains(">\nSECOND request\n</message>") && block.contains("session c1"));
+        assert!(!block.contains("ORIGINAL"));
+    }
+
+    #[test]
+    fn only_a_handoff_targets_first_user_message_folds() {
+        use crate::transcript::{ItemKey, Transcript, item::Item};
+        let block = "<ox-handoff>\ncarried\n</ox-handoff>\n\nrequest";
+        let mut t = Transcript::default();
+        let user = |text: &str| Item::UserMessage {
+            content: vec![crate::transcript::item::Content {
+                text: Some(text.into()),
+                path: None,
+            }],
+        };
+        for (turn, id, item) in [
+            ("t1", "u1", user(block)),
+            (
+                "t1",
+                "a1",
+                Item::AgentMessage {
+                    text: "ok".into(),
+                    is_update: false,
+                },
+            ),
+            ("t2", "u2", user(block)),
+        ] {
+            t.observe_item(turn.into(), id.into(), item, true, None);
+        }
+        let key = |turn: &str, id: &str| ItemKey {
+            turn: turn.into(),
+            item: id.into(),
+        };
+        let mut origin: crate::origin::Origin = serde_json::from_value(json!({
+            "relation":"handoff","parent":{"project":"/p","scope":null,"session":"s","runtime":"claude"},
+            "launch":"operator:x","by_operator":true,"runtime":"claude","route":{"runtime":"claude","billing":"subscription"},
+            "mode":"session","job_id":0,"requested":"read","ceiling":"read","source":null
+        }))
+        .unwrap();
+        // Without the handoff record nothing folds.
+        assert_eq!(fold(Some(&origin), &t, &key("t1", "u1"), block), None);
+        origin.handoff = Some(Box::new(source(SelectionRefs::default())));
+        assert_eq!(
+            fold(Some(&origin), &t, &key("t1", "u1"), block).map(|(_, r)| r),
+            Some("request")
+        );
+        // A later message that starts with the tag renders as typed.
+        assert_eq!(fold(Some(&origin), &t, &key("t2", "u2"), block), None);
+        // An ordinary session never folds.
+        assert_eq!(fold(None, &t, &key("t1", "u1"), block), None);
     }
 
     #[test]

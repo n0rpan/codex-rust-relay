@@ -226,9 +226,12 @@ impl Engine {
         // The helper may run provider model discovery, so the catalog lookup
         // never blocks the engine. A slow or failed lookup uses the default budget.
         let window = std::sync::Arc::new(std::sync::Mutex::new(None));
-        match &start.route().billing {
+        let route = start.route();
+        let windows = self.ledger.data.windows.clone();
+        match &route.billing {
             ox_desk_core::runtime::Billing::Api(alias) => {
                 let (slot, alias, config) = (window.clone(), alias.clone(), self.config.clone());
+                let route = route.clone();
                 let (tx, source) = (self.tx.clone(), scope.clone());
                 let generation = self.running.get(scope).map(|l| l.generation);
                 thread::spawn(move || {
@@ -239,13 +242,17 @@ impl Engine {
                     )
                     .ok()
                     .and_then(|w| w.get(&alias).copied());
-                    *slot.lock().unwrap() = Some(found);
+                    *slot.lock().unwrap() =
+                        Some(crate::durable::handoff_window(&windows, &route, found));
                     if let Some(generation) = generation {
                         let _ = tx.send(Message::Runtime(source, generation));
                     }
                 });
             }
-            ox_desk_core::runtime::Billing::Subscription => *window.lock().unwrap() = Some(None),
+            ox_desk_core::runtime::Billing::Subscription => {
+                *window.lock().unwrap() =
+                    Some(crate::durable::handoff_window(&windows, &route, None))
+            }
         }
         self.preparing.push(Preparing {
             source: scope.clone(),
@@ -325,7 +332,19 @@ impl Engine {
             Ok(t) => t,
             Err(e) => fail!(e.to_string()),
         };
-        let selection = match handoff::select(&items, &start.request, window) {
+        // A source that was itself handed off carries only its own messages;
+        // the earlier chain stays readable through read_ox_thread.
+        let earlier = self
+            .handoff_chain(&src, &start.source)
+            .into_iter()
+            .map(|h| handoff::Earlier {
+                session: h.session,
+                title: h.title,
+                runtime: h.runtime,
+                route: h.route,
+            })
+            .collect();
+        let selection = match handoff::select_chained(items, &start.request, window, earlier) {
             Ok(s) => s,
             Err(e) => fail!(e),
         };

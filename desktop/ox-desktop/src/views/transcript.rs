@@ -321,9 +321,8 @@ impl Workbench {
                         // A Claude handoff target's first turn carries the earlier
                         // conversation. Fold it under the handoff marker.
                         let mut carried = None;
-                        if let Some((block, request)) =
-                            ox_desk_core::handoff::split_claude_turn(&text)
-                        {
+                        let folded = handoff_fold(store, id, key, &text);
+                        if let Some((block, request)) = folded {
                             let expanded = view.all_expanded ^ view.expanded.contains(key);
                             let shown = if expanded {
                                 format!("{block}{request}")
@@ -525,6 +524,19 @@ impl Workbench {
     }
 }
 
+/// The carried block and request to show folded, for the first user message
+/// of a handoff target only.
+fn handoff_fold(
+    store: &ox_desk_core::store::Store,
+    id: &str,
+    key: &ItemKey,
+    text: &str,
+) -> Option<(String, String)> {
+    let t = store.transcript(id)?;
+    ox_desk_core::handoff::fold(store.origin(id), t, key, text)
+        .map(|(block, request)| (block.to_owned(), request.to_owned()))
+}
+
 /// The handoff marker at the top of a target, the marks on a source, and a
 /// session's YOLO grant with the running children it allowed.
 fn handoff_banner(
@@ -639,4 +651,102 @@ fn markdown(owner: &str, key: &ItemKey, text: String) -> impl IntoElement {
         ),
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handoff_fold;
+    use ox_desk_core::transcript::ItemKey;
+    use ox_desk_core::{
+        host_protocol::{Cursor, ScopeState, Server, SessionView, Timeline, TimelineItem},
+        links::LinkEvent,
+        runtime::Runtime,
+        store::{Profile, Store},
+    };
+    use serde_json::json;
+
+    #[test]
+    fn only_a_handoff_targets_first_user_message_is_folded() {
+        let route = Runtime::Claude.route(None);
+        let mut store = Store::remote_client(
+            Profile {
+                project: "/p".into(),
+                route: route.clone(),
+                provider: "anthropic".into(),
+            },
+            |_, _| Ok("sent".into()),
+        );
+        let block = "<ox-handoff>\ncarried\n</ox-handoff>\n\nrequest";
+        let user = |turn: &str, id: &str| TimelineItem {
+            turn: turn.into(),
+            id: id.into(),
+            role: "user".into(),
+            text: block.into(),
+            revision: 1,
+            detail: json!({"UserMessage": {"content": [{"text": block}]}}),
+        };
+        let timeline = Timeline {
+            items: vec![user("t1", "u1"), user("t2", "u2")],
+            detail: json!({"ready": true}),
+        };
+        let origin: serde_json::Value = serde_json::from_str(
+            &r#"{"relation":"handoff","parent":{"project":"/p","scope":null,"session":"s","runtime":"claude"},
+            "launch":"operator:x","by_operator":true,"runtime":"claude","route":ROUTE,
+            "mode":"session","job_id":0,"requested":"read","ceiling":"read","source":null,
+            "handoff":{"scope":{"project":"/p","route":ROUTE},"session":"s","native":null,"title":"t",
+                "runtime":"claude","route":ROUTE,"source_access":null,"source_level":null,
+                "decision":"inherited","selection":{"total":0,"carried":0,"omitted":0,"items":[],"cut":[],
+                "ranges":[],"window":64000,"window_known":false}}}"#
+                .replace("ROUTE", &serde_json::to_string(&route).unwrap()),
+        )
+        .unwrap();
+        let session = |id: &str, detail| SessionView {
+            id: id.into(),
+            title: id.into(),
+            parent: None,
+            status: "idle".into(),
+            updated_at: 1,
+            capabilities: vec!["open".into()],
+            detail,
+        };
+        store.apply(LinkEvent::Host(Box::new(Server::Snapshot {
+            cursor: Cursor {
+                epoch: "e".into(),
+                seq: 1,
+            },
+            scopes: vec![ScopeState {
+                scope: ox_desk_core::host_protocol::Scope {
+                    project: "/p".into(),
+                    route,
+                },
+                connection: "ready".into(),
+                capabilities: vec![],
+                sessions: vec![
+                    session("target", json!({"origin": origin})),
+                    session("plain", json!({})),
+                ],
+                asks: vec![],
+                transcripts: [
+                    ("target".to_owned(), timeline.clone()),
+                    ("plain".to_owned(), timeline),
+                ]
+                .into(),
+                detail: json!({}),
+            }],
+        })));
+        let key = |turn: &str, id: &str| ItemKey {
+            turn: turn.into(),
+            item: id.into(),
+        };
+        assert!(store.origin("target").is_some());
+        assert_eq!(
+            handoff_fold(&store, "target", &key("t1", "u1"), block).map(|(_, r)| r),
+            Some("request".to_owned())
+        );
+        assert_eq!(
+            handoff_fold(&store, "target", &key("t2", "u2"), block),
+            None
+        );
+        assert_eq!(handoff_fold(&store, "plain", &key("t1", "u1"), block), None);
+    }
 }

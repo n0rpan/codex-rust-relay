@@ -180,10 +180,10 @@ impl Store {
             return Err(io::Error::other("This runtime has no history injection"));
         }
         self.handoff_items = (!items.is_empty()).then_some(items);
+        self.claude_handoff = self.is_session_scoped();
         let result = self.send_client_message(None, text, vec![]);
-        if result.is_err() {
-            self.handoff_items = None;
-        }
+        self.handoff_items = None;
+        self.claude_handoff = false;
         result
     }
     pub fn submit(&mut self, id: Option<&str>) -> io::Result<()> {

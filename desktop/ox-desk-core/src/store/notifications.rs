@@ -100,6 +100,10 @@ impl Store {
                 }
             }
             Notification::Tokens { thread, usage, .. } => {
+                if let Some(window) = usage.model_context_window.filter(|w| *w > 0) {
+                    let model = self.transcripts.get(&thread).and_then(|t| t.model.clone());
+                    self.context_windows.push((model, window as u64));
+                }
                 if let Some(t) = self.transcripts.get_mut(&thread) {
                     t.usage = Some(usage);
                     self.changed.transcript(&thread);
