@@ -132,6 +132,25 @@ def run(root, host, ox, claude):
             client.act(scope, "mode", {"set_access": [thread, "accept_edits"]})
             client.until(lambda f: f["type"] == "ack" and f["id"] == "mode")
             time.sleep(1)
+            # Subscribe to the target route before the handoff, so no approval the
+            # target asks for can be pending before the operator sees it.
+            operator = Client(env["OX_HOST_SOCKET"])
+            operator.open(target_scope)
+            answered = set()
+            seen_asks = []
+
+            def answer_all(frame):
+                asks = [a for s in frame.get("scopes", []) for a in s.get("asks", [])]
+                asks += [a for c in frame.get("changes", []) if c["kind"] == "asks" for a in c["asks"]]
+                for pending in asks:
+                    key = json.dumps(pending["id"])
+                    if key not in answered and pending.get("token"):
+                        answered.add(key)
+                        seen_asks.append(pending.get("title"))
+                        operator.act(target_scope, uuid.uuid4().hex,
+                                     {"answer_ask": [pending["id"], 0]}, pending["token"])
+
+            answer_all(operator.until(lambda f: f["type"] == "snapshot"))
             client.act(scope, "handoff", {"start_handoff": {
                 "source": thread, "runtime": "claude", "model": "fixture/other", "mode": "inherit",
                 "request": REQUEST, "yolo_confirmed": False}})
@@ -139,24 +158,26 @@ def run(root, host, ox, claude):
             assert reply["type"] == "worker_reply" and not reply.get("error"), reply
             target = reply["result"]["session"]
             assert reply["result"]["scope"] == target_scope, reply
-            operator = Client(env["OX_HOST_SOCKET"])
-            operator.open(target_scope)
-            operator.until(lambda f: f["type"] == "snapshot")
             # Answer the target's tool approvals until both reads have come back.
             operator.conn.settimeout(2)
             deadline = time.monotonic() + 300
             while len(reads) < 2:
-                assert time.monotonic() < deadline, "the target never finished its reads"
+                if time.monotonic() >= deadline:
+                    other = [r for r in vendor.requests if r.get("model") == "other"]
+                    raise AssertionError({
+                        "target_requests": len(other),
+                        "first_target_seen": bool(first_target),
+                        "reads": reads,
+                        "asks_answered": seen_asks,
+                        "last_target_message": json.dumps(other[-1]["messages"][-1])[:1500] if other else None,
+                    })
                 try:
                     line = operator.input.readline()
                 except (TimeoutError, OSError):
                     continue
                 if not line:
                     raise RuntimeError("Host closed the operator socket")
-                frame = json.loads(line)
-                if pending := ask(frame):
-                    operator.act(target_scope, uuid.uuid4().hex,
-                                 {"answer_ask": [pending["id"], 0]}, pending["token"])
+                answer_all(json.loads(line))
             operator.close()
             client.close()
 
