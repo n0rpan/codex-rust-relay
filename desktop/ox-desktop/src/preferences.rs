@@ -19,7 +19,7 @@ use gpui::{prelude::*, *};
 use gpui_component::input::{Input, InputState};
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {
     Remote,
     Accounts,
@@ -1034,6 +1034,16 @@ fn button(
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     crate::kit::button(p, id, label, active, true, on_click)
+}
+
+impl Preferences {
+    /// Test-facing state of the open settings page for the desk stats probe.
+    pub fn probe_state(&self, cx: &App) -> crate::platform::layout_probe::SettingsProbe {
+        crate::platform::layout_probe::SettingsProbe {
+            page: format!("{:?}", self.page),
+            remote: self.remote.as_ref().map(|r| r.read(cx).probe_state()),
+        }
+    }
 }
 
 impl Render for Preferences {

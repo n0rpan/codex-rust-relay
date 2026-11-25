@@ -28,7 +28,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # The nightly run has its own group. Sharing main's group, a late-running
+  # schedule cancelled main's release run, its macOS clean-account test and
+  # the dev release publish. A new push still replaces an older one.
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'schedule' && 'nightly' || 'change' }}
   cancel-in-progress: true
 
 env:

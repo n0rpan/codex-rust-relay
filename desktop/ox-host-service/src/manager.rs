@@ -215,7 +215,10 @@ pub(super) fn start() -> io::Result<()> {
                 Err(e) => last = Some(e),
             }
         }
-        Err(last.unwrap_or_else(|| io::Error::other("launchctl bootstrap failed")))
+        let detail = last.map_or_else(|| "launchctl bootstrap failed".into(), |e| e.to_string());
+        Err(io::Error::other(format!(
+            "launchd would not start the OX host agent ({detail}). A login agent needs this account's desktop session: run `ox host install` from Terminal in a logged-in desktop session, or start the host with `ox desktop .`."
+        )))
     }
 }
 fn owned_contents(file: &Path) -> io::Result<Option<String>> {

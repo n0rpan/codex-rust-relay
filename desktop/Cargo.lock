@@ -4743,6 +4743,7 @@ dependencies = [
  "ox-host-service",
  "ox-host-web",
  "ox-pty",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "shlex",

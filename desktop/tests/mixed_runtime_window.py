@@ -34,14 +34,17 @@ class Window:
 
     @staticmethod
     def command(*args):
-        return subprocess.check_output(args, text=True, stderr=subprocess.DEVNULL, timeout=20)
+        # Tesseract's OpenMP threads spin against each other on a loaded runner;
+        # one thread reads a window screenshot quickly and predictably.
+        env = dict(os.environ, OMP_THREAD_LIMIT="1") if args[0] == "tesseract" else None
+        return subprocess.check_output(args, text=True, stderr=subprocess.DEVNULL, timeout=20, env=env)
 
-    def snapshot(self):
-        self.probe.sendto(b"snapshot", self.stats)
-        return json.loads(self.probe.recv(65536))
+    def snapshot(self, request=b"snapshot"):
+        self.probe.sendto(request, self.stats)
+        return json.loads(self.probe.recv(1 << 20))
 
-    def wait(self, predicate, description):
-        deadline = time.monotonic() + 25
+    def wait(self, predicate, description, timeout=25):
+        deadline = time.monotonic() + timeout
         state = {}
         while time.monotonic() < deadline:
             if self.app.poll() is not None:
@@ -54,6 +57,49 @@ class Window:
                 return state
             time.sleep(0.08)
         raise AssertionError(f"Timed out waiting for {description}. Window state {state}")
+
+    def window(self, title="OX Desktop"):
+        """The X11 id of an open OX window, as the app reports it."""
+        state = self.wait(lambda s: any(w["title"] == title and w["x11"] for w in s.get("windows", [])),
+                          f"the {title} window", timeout=20)
+        return str([w["x11"] for w in state["windows"] if w["title"] == title][-1])
+
+    def control(self, label, window="OX Desktop", *, enabled=True, timeout=20):
+        """A button as the app laid it out: label, id, enabled and bounds in window pixels.
+
+        Matches the exact label or element id. Only a frame drawn after this
+        call counts, so the bounds reflect any state the caller already
+        waited for, never an earlier layout.
+        """
+        start = {w["title"]: w["frame"] for w in self.snapshot(b"frame").get("windows", [])}
+        deadline = time.monotonic() + timeout
+        state = {}
+        while time.monotonic() < deadline:
+            if self.app.poll() is not None:
+                raise AssertionError(f"OX Desktop exited while looking for {label!r}")
+            try:
+                state = self.snapshot()
+            except socket.timeout:
+                continue
+            if any(w["title"] == window and w["frame"] > start.get(window, 0) for w in state.get("windows", [])):
+                for control in state["layout"]:
+                    if (control["window"] == window and label in (control["label"], control["id"])
+                            and (control["enabled"] or not enabled)):
+                        return control
+            time.sleep(0.05)
+        shown = [c["label"] + ("" if c["enabled"] else " (disabled)")
+                 for c in state.get("layout", []) if c["window"] == window]
+        raise AssertionError(f"No {'enabled ' if enabled else ''}{label!r} in {window} within {timeout}s. "
+                             f"Controls: {shown}")
+
+    def press(self, label, window="OX Desktop", **options):
+        """Click the centre of an enabled control in the window that lays it out."""
+        control = self.control(label, window, **options)
+        target = self.window(window)
+        self.command("xdotool", "windowfocus", target)
+        self.command("xdotool", "mousemove", "--window", target, str(control["x"] + control["w"] // 2),
+                     str(control["y"] + control["h"] // 2), "click", "1")
+        return control
 
     def key(self, chord):
         self.command("xdotool", "key", "--clearmodifiers", chord)

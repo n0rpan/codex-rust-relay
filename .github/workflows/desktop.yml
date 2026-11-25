@@ -44,8 +44,9 @@ on:
 permissions:
   contents: read
 concurrency:
-  # Adding an unrelated label must not cancel a running full lane.
-  group: desktop-${{ github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
+  # Adding an unrelated label must not cancel a running full lane, and the
+  # nightly run must not cancel the release build ci.yml calls on main.
+  group: desktop-${{ github.ref }}-${{ github.event_name == 'schedule' && 'nightly' || 'change' }}${{ github.event.action == 'labeled' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: true
 env:
   OX_BUILD_SHA: ${{ github.sha }}
@@ -295,9 +296,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      # This leg's package job may have failed or never got a runner; that job
+      # already reports it. Say so here instead of failing on the download.
+      - id: package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
         with:
           name: ox-desktop-${{ matrix.runner }}
           path: ${{ runner.temp }}/dist
+      - name: No package for this platform
+        if: steps.package.outcome != 'success'
+        run: echo "::notice title=Clean-account install skipped::package (${{ matrix.runner }}) produced no package; see that job."
       - name: Install, restart, crash, upgrade and uninstall as a new account
+        if: steps.package.outcome == 'success'
         run: sh desktop/tests/host_clean_account.sh "$RUNNER_TEMP/dist"

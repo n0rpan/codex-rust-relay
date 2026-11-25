@@ -140,6 +140,10 @@ impl Panel {
             dimensions(window, cx),
         ) {
             Ok((terminal, screen, updates)) => {
+                if crate::platform::layout_probe::active() {
+                    // Lets a window test type a password only once echo is off.
+                    terminal.observe_echo();
+                }
                 self.terminal = Some(terminal);
                 self.screen = Some(screen.clone());
                 self.focus.focus(window, cx);
@@ -278,6 +282,16 @@ fn key_bytes(k: &Keystroke, app_cursor: bool) -> Option<Vec<u8>> {
 
 impl Render for Panel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::platform::layout_probe::begin_frame(window, "OX Terminal", || {
+            serde_json::json!({
+                "reviewing": self.screen.is_none(),
+                "running": self.terminal.is_some(),
+                // The command ran and ended (or failed to start) and Close is shown.
+                "exited": self.screen.is_some() && self.terminal.is_none(),
+                "status": self.status,
+                "echo": self.screen.as_ref().and_then(|s| s.lock().unwrap().echo),
+            })
+        });
         let p = Palette::get(cx);
         let mut body = col()
             .id("terminal-panel")

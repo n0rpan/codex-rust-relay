@@ -22,9 +22,10 @@ pub fn button(
     } else {
         ButtonVariant::Secondary
     };
-    Button::new(id)
+    let (id, label) = (id.into(), label.into());
+    let button = Button::new(id.clone())
         .with_variant(variant)
-        .label(label)
+        .label(label.clone())
         .h(px(32.))
         .border_1()
         .border_color(rgb(if primary {
@@ -34,7 +35,8 @@ pub fn button(
         }))
         .disabled(!enabled)
         .tab_stop(enabled)
-        .on_click(click)
+        .on_click(click);
+    crate::platform::layout_probe::mark(button, &id, &label, enabled)
 }
 
 /// A quiet toolbar control retains Button's tab stop, accessible label, and activation behavior.
@@ -45,15 +47,17 @@ pub fn toolbar_button(
     enabled: bool,
     click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Button {
-    Button::new(id)
+    let (id, label) = (id.into(), label.into());
+    let button = Button::new(id.clone())
         .ghost()
-        .label(label)
+        .label(label.clone())
         .h(px(30.))
         .rounded(px(3.))
         .text_color(rgb(p.muted))
         .disabled(!enabled)
         .tab_stop(enabled)
-        .on_click(click)
+        .on_click(click);
+    crate::platform::layout_probe::mark(button, &id, &label, enabled)
 }
 
 pub use gpui_component::menu::{DropdownMenu, PopupMenuItem};

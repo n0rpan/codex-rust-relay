@@ -15,6 +15,8 @@ pub(super) struct Remote {
     report: Option<Report>,
     message: Option<String>,
     busy: bool,
+    /// Completed status operations; lets a window test wait for the one it started.
+    finished: u64,
     qr: Option<Arc<Image>>,
     expiry: Option<Task<()>>,
 }
@@ -25,6 +27,7 @@ impl Remote {
             report: None,
             message: None,
             busy: false,
+            finished: 0,
             qr: None,
             expiry: None,
         };
@@ -54,6 +57,7 @@ impl Remote {
             let result = result.await;
             let _ = this.update(cx, |s, cx| {
                 s.busy = false;
+                s.finished += 1;
                 match result {
                     Ok(mut r) => {
                         s.message = r.notice.take();
@@ -120,6 +124,19 @@ impl Remote {
             self.message = Some(e);
         }
         cx.notify();
+    }
+    /// What Settings → Remote access shows, for the desk stats probe.
+    pub fn probe_state(&self) -> crate::platform::layout_probe::RemoteProbe {
+        let report = self.report.as_ref();
+        let permission = report.and_then(|r| r.denied.as_ref());
+        crate::platform::layout_probe::RemoteProbe {
+            checking: self.busy,
+            finished: self.finished,
+            notice: self.message.clone().or(permission.map(|p| p.error.clone())),
+            permission: permission.map(|p| p.suggested()),
+            enabled: report.is_some_and(|r| r.host.enabled),
+            origin: report.and_then(|r| r.host.origin.clone()),
+        }
     }
     fn action(
         &self,
