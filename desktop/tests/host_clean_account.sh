@@ -1,7 +1,13 @@
 #!/bin/sh
-# Install, run, upgrade and remove the OX session host as a brand-new account,
-# with the real service manager: a systemd user service on Linux, a launchd
-# agent on macOS. Needs passwordless sudo (CI runners have it).
+# Install, run, upgrade and remove the OX session host from nothing, with the
+# real service manager: a systemd user service on Linux, a launchd agent on
+# macOS. Needs passwordless sudo (CI runners have it).
+#
+# On Linux it creates a brand-new account. On macOS a login agent needs the
+# account's GUI login session, which a CI runner cannot create for a new
+# account (launchd refuses with "Bootstrap failed: 5"), so it runs as the
+# runner's own logged-in user with a brand-new, empty home directory. That is
+# how a real Mac user installs OX: from a logged-in desktop session.
 #
 # Usage: desktop/tests/host_clean_account.sh DIST_DIR
 #   DIST_DIR holds the packaged ox-desktop-* archive and its .sha256.
@@ -19,8 +25,8 @@
 set -eu
 dist=$(cd "${1:?pass the dist directory}" && pwd)
 repo=$(cd "$(dirname "$0")/../.." && pwd)
-user="oxclean$(date +%s | tail -c 5)"
 os=$(uname -s)
+if [ "$os" = Linux ]; then user="oxclean$(date +%s | tail -c 5)"; else user=$(id -un); fi
 stage=$(mktemp -d /tmp/ox-clean.XXXXXX)
 chmod 755 "$stage"
 cp "$repo/install.sh" "$dist"/ox-desktop-* "$stage/"
@@ -33,8 +39,9 @@ cleanup() {
         sudo pkill -KILL -u "$user" 2>/dev/null || true
         sudo userdel -r "$user" 2>/dev/null || true
     else
-        sudo pkill -KILL -u "$user" 2>/dev/null || true
-        sudo sysadminctl -deleteUser "$user" >/dev/null 2>&1 || true
+        # Never touch the runner account itself: only the agent and the home made here.
+        launchctl bootout "gui/$(id -u)/dev.ox.session-host" 2>/dev/null || true
+        if [ -n "${home:-}" ]; then rm -rf "$home"; fi
     fi
     rm -rf "$stage"
 }
@@ -66,18 +73,18 @@ if [ "$os" = Linux ]; then
     unit="$home/.config/systemd/user/ox-host.service"
     state="$home/.local/state/ox/host"
 else
-    password=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
-    sudo sysadminctl -addUser "$user" -password "$password" -home "/Users/$user" >/dev/null 2>&1
-    sudo createhomedir -c -u "$user" >/dev/null
-    home="/Users/$user"
-    uid=$(id -u "$user")
+    if launchctl print "gui/$(id -u)/dev.ox.session-host" >/dev/null 2>&1; then
+        fail "an OX host agent is already loaded for $user; refusing to replace it"
+    fi
+    home=$(mktemp -d /tmp/ox-home.XXXXXX)
+    chmod 700 "$home"
+    uid=$(id -u)
     as_user() {
-        sudo launchctl asuser "$uid" sudo -u "$user" env -i HOME="$home" USER="$user" LOGNAME="$user" \
+        env -i HOME="$home" USER="$user" LOGNAME="$user" \
             PATH="$home/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" TMPDIR=/tmp "$@"
     }
     service_active() {
-        as_user launchctl print "user/$uid/dev.ox.session-host" 2>/dev/null | grep -q 'state = running' ||
-            as_user launchctl print "gui/$uid/dev.ox.session-host" 2>/dev/null | grep -q 'state = running'
+        launchctl print "gui/$uid/dev.ox.session-host" 2>/dev/null | grep -q 'state = running'
     }
     unit="$home/Library/LaunchAgents/dev.ox.session-host.plist"
     state="$home/Library/Application Support/ox/host"
@@ -120,7 +127,7 @@ if [ "$os" = Linux ]; then
     rm -rf "$unpacked"
 fi
 
-echo "== install as a new account ($user)"
+echo "== install for $user with an empty home ($home)"
 as_user sh -c "cd /tmp && OX_INSTALL_BASE_URL=file://$stage sh $stage/install.sh --desktop"
 as_user "$ox" --version
 
