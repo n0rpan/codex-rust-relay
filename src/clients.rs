@@ -681,7 +681,9 @@ fn inject_settings(
 
 /// Root `claude` subcommands of the compatibility floor, Claude Code 2.1.331,
 /// read from the command table that builds its `claude --help` (hidden ones
-/// included). None of them starts a conversation.
+/// included). None of them starts a conversation. This is the only copy:
+/// `desktop/tests/claude_subcommands.py` reads it and fails the Claude protocol
+/// job when a stock release lists a root command or alias missing here.
 const CLAUDE_SUBCOMMANDS: &[&str] = &[
     "agents",
     "auth",
@@ -715,9 +717,10 @@ const CLAUDE_SUBCOMMANDS: &[&str] = &[
     "worktree-hook",
 ];
 
-/// Options that choose an existing or remote session, or ask for no session.
-/// The first five are the session flags; the rest attach to, rewind or
-/// teleport another session, where a new ID would conflict.
+/// Options that choose an existing or remote session, or ask for no saved
+/// session. The first five are the session flags. The next six attach to,
+/// rewind or teleport another session, where a new ID would conflict. A session
+/// that is never saved cannot be resumed, so it gets no ID either.
 const CLAUDE_SESSION_OPTIONS: &[&str] = &[
     "--resume",
     "--continue",
@@ -730,6 +733,7 @@ const CLAUDE_SESSION_OPTIONS: &[&str] = &[
     "--attach-serve",
     "--resume-session-at",
     "--rewind-files",
+    "--no-session-persistence",
     "--version",
     "--help",
 ];
@@ -1370,6 +1374,9 @@ mod tests {
             &["--attach-serve", "abc"],
             &["--resume-session-at", "m1"],
             &["--rewind-files", "m1"],
+            // A session that is never saved cannot be resumed.
+            &["--no-session-persistence"],
+            &["-p", "hi", "--no-session-persistence"],
             // Version and help.
             &["--version"],
             &["-v"],
@@ -1402,6 +1409,35 @@ mod tests {
         ] {
             assert!(CLAUDE_SUBCOMMANDS.contains(&listed), "{listed}");
         }
+    }
+
+    #[test]
+    fn an_unsaved_session_gets_no_session_id() {
+        // Subscription launches call the rewrite directly.
+        for list in [
+            &["-p", "hi", "--no-session-persistence"][..],
+            &["--no-session-persistence", "-p", "hi"],
+        ] {
+            let (args, id) = session_args(list);
+            assert_eq!(id, None, "{list:?}");
+            assert_eq!(args, list);
+        }
+        // API launches keep their overlay and add no ID either.
+        let (command, settings) = launch(
+            strings(&["-p", "hi", "--no-session-persistence"]),
+            "http://127.0.0.1:4321/v1",
+            "fresh-token-123",
+            &aliases(&["alpha/claude"]),
+            &refs(&[]),
+        );
+        assert_eq!(settings.session, None);
+        assert!(!argv(&command).iter().any(|a| a == "--session-id"));
+        // After `--` the flag is only prompt text and does not stop the ID.
+        assert!(
+            session_args(&["-p", "--", "--no-session-persistence"])
+                .1
+                .is_some()
+        );
     }
 
     #[test]
