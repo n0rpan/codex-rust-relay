@@ -25,6 +25,7 @@ for version in "${versions[@]}"; do
     python3 desktop/tests/claude_stock_session.py "$ox" "$binary"
     python3 desktop/tests/host_stock_session.py "$(dirname "$ox")/ox-host" "$ox" "$binary"
     python3 desktop/tests/host_handoff_session.py "$(dirname "$ox")/ox-host" "$ox" "$binary"
+    python3 desktop/tests/host_upgrade_session.py "$(dirname "$ox")/ox-host" "$ox" "$binary"
 done
 
 title_test=$(cargo test --no-run --locked --release --manifest-path desktop/Cargo.toml \
