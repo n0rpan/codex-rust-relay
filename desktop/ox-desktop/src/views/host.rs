@@ -115,6 +115,8 @@ pub struct Host {
     panes: Vec<Entity<Workbench>>,
     active: usize,
     models: Vec<String>,
+    // Replacing this task cancels delivery of older settings and provider results.
+    route_refresh: Task<()>,
     api_provider: Option<String>,
     native_account: bool,
     favorite_models: Vec<String>,
@@ -163,7 +165,7 @@ impl Host {
             .err()
             .map(|e| e.to_string());
         let pane = Self::pane(project, route, first_frame, stats, window, cx);
-        Self::refresh_routes(window, cx);
+        let route_refresh = Self::refresh_routes(window, cx);
         cx.observe_window_visibility(window, |_, _, w, cx| {
             if w.is_visible() {
                 cx.notify()
@@ -213,6 +215,7 @@ impl Host {
             panes: vec![pane],
             active: 0,
             models: vec![],
+            route_refresh,
             api_provider: None,
             native_account: false,
             favorite_models: vec![],
@@ -608,8 +611,8 @@ impl Host {
                 ),
         )
     }
-    fn refresh_routes(window: &mut Window, cx: &mut Context<Self>) {
-        let task = cx.background_spawn(async {
+    fn refresh_routes(window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
+        let snapshot = cx.background_spawn(async {
             settings::load().map(|s| {
                 (
                     s.models,
@@ -619,8 +622,11 @@ impl Host {
                 )
             })
         });
+        // Start both reads immediately, but publish the local settings first: a slow
+        // snapshot must never overwrite the discovered aliases from this refresh.
+        let discovered = cx.background_spawn(async { settings::discover_models() });
         cx.spawn_in(window, async move |this, cx| {
-            let result = task.await;
+            let result = snapshot.await;
             let _ = this.update_in(cx, |s, window, cx| {
                 match result {
                     Ok((models, provider, native_account, favorites)) => {
@@ -657,13 +663,7 @@ impl Host {
                     cx.notify();
                 }
             });
-        })
-        .detach();
-        // Any catalog model can be used, starred or not: the discovered aliases follow the
-        // settings' own so saved history on an unstarred alias reopens and routes list it.
-        let task = cx.background_spawn(async { settings::discover_models() });
-        cx.spawn(async move |this, cx| {
-            if let Ok(found) = task.await {
+            if let Ok(found) = discovered.await {
                 let _ = this.update(cx, |s, cx| {
                     let merged = ox_desk_core::ports::ox::merge_catalog(&s.models, found);
                     if merged != s.models {
@@ -673,7 +673,6 @@ impl Host {
                 });
             }
         })
-        .detach();
     }
     fn compact(&self, window: &Window) -> bool {
         needs_drawer(window.viewport_size().width, self.sidebar_width)
@@ -722,7 +721,7 @@ impl Host {
             if let Some(previous) = self.before_settings.take() {
                 window.focus(&previous, cx);
             }
-            Self::refresh_routes(window, cx);
+            self.route_refresh = Self::refresh_routes(window, cx);
         } else {
             let project = self.panes[self.active].read(cx).project.clone();
             self.before_settings = window.focused(cx);
