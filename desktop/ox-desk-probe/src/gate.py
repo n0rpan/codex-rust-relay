@@ -374,12 +374,19 @@ if len(sys.argv) == 2 and "Tailscale" in sys.argv[1]:
             raise RuntimeError(f"press {label!r}: {reply['error']}")
 
     def agent(self, query):
-        """Switch the active window's route with the sidebar AGENT picker: open it, filter, Enter."""
+        """Switch the active window's route with the sidebar AGENT picker: open it and press the
+        model row whose probe label (display name · id, e.g. "@plan:codex") contains `query`.
+        Rows are ordered by the picker, so pressing by label is stable where Enter is not."""
         self.press("billing-route")
-        time.sleep(.3)
-        self.x("type", query)
-        time.sleep(.2)
-        self.x("key", "Return")
+        needle = query.casefold()
+
+        def row():
+            for c in self.stats().get("layout", []):
+                if c["id"].startswith("model-row") and needle in c["label"].casefold():
+                    return c["id"]
+            return None
+
+        self.press(self.wait_for(f"a model picker row matching {query!r}", row))
 
     def sample(self):
         desktop = json.loads(subprocess.check_output([probe, str(self.proc.pid)]))
