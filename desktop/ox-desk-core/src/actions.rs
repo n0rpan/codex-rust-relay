@@ -18,7 +18,6 @@ pub enum Operation {
     MoreThreads,
     ExecuteCommand,
     PaletteCommand,
-    WorkerControl,
     Submit,
     Stop,
     ModelOptions,
@@ -30,6 +29,8 @@ pub enum Operation {
 #[derive(Clone, Copy, Debug)]
 pub enum Target {
     Local,
+    /// The session host performs it across scopes.
+    Host,
     Runtime(Operation),
     ServerReply,
     NativeCli,
@@ -63,7 +64,7 @@ actions! {
     ExecuteCommand(Option<String>)=>Target::Runtime(Operation::ExecuteCommand),
     NativeCommand(Option<String>,String)=>Target::Runtime(Operation::PaletteCommand),
     PaletteCommand(Option<String>,String)=>Target::Runtime(Operation::PaletteCommand),
-    WorkerControl(String,crate::worker::WorkerAction)=>Target::Runtime(Operation::WorkerControl),
+    StartWorker(crate::origin::WorkerStart)=>Target::Host,
     DismissNotice=>Target::Local,
     TerminalText(Option<String>,String)=>Target::Terminal,
     SendImages(Option<String>,String,Vec<crate::mentions::ImageInput>)=>Target::Runtime(Operation::Submit),
@@ -133,7 +134,11 @@ impl Store {
             Action::PaletteCommand(id, text) => {
                 return self.run_command(id.as_deref(), Some(&text));
             }
-            Action::WorkerControl(id, op) => self.job_request(&id, op)?,
+            Action::StartWorker(_) => {
+                return Err(io::Error::other(
+                    "Workers start through the OX session host.",
+                ));
+            }
             Action::DismissNotice => self.dismiss_notice(),
             Action::TerminalText(id, text) => self.handoff_text(id, text)?,
             Action::SendImages(owner, text, images) => {

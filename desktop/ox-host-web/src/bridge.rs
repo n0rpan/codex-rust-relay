@@ -165,8 +165,8 @@ impl Access {
                     | Action::ModelOptions(..)
                     | Action::LoadOlder(_)
                     | Action::Stop(_)
-                    | Action::SendText(..)
-                    | Action::WorkerControl(..) => approval.is_none(),
+                    | Action::SendText(..) => approval.is_none(),
+                    Action::StartWorker(start) => approval.is_none() && start.validate().is_ok(),
                     Action::Mention(_, query) => {
                         approval.is_none() && query.as_ref().is_none_or(|q| q.len() <= 512)
                     }

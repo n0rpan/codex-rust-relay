@@ -313,6 +313,13 @@ async fn launch_session(
     client: ClientKind,
     relay: Option<crate::workers::Relay>,
 ) -> Result<u8, RelayError> {
+    // A new Claude Code session gets an ID OX knows before the first turn, so
+    // the worker gateway can record it. This applies with or without a host.
+    let args = match client {
+        ClientKind::Claude => crate::clients::claude_session_args(args.to_vec())?.0,
+        ClientKind::Codex => args.to_vec(),
+    };
+    let args = args.as_slice();
     let relay = match relay {
         Some(relay) => Some(relay),
         None => crate::workers::Relay::load(home).await?,

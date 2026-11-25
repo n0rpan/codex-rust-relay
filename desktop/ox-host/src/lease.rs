@@ -1,6 +1,10 @@
 //! A private per-boot lease. A kernel close on host death also reaches children
 //! supervised by an OX helper, including workers in their own process groups.
-use crate::{engine::Message, transport::same_user};
+use crate::{
+    engine::{Gateway, Message, Replier},
+    transport::same_user,
+    workers::Caller,
+};
 use serde::Deserialize;
 use std::{
     fs,
@@ -22,11 +26,19 @@ enum Request {
         id: String,
         parent: Option<String>,
     },
-    Worker {
+    /// A hosted gateway asks the host to own a worker. `start.parent` carries
+    /// only the helper's own session hint and is never trusted as the parent.
+    Launch {
         scope: ox_desk_core::host_protocol::Scope,
+        launch: String,
+        start: ox_desk_core::origin::WorkerStart,
+    },
+    /// One of the parent agent's worker tools.
+    Call {
+        scope: ox_desk_core::host_protocol::Scope,
+        launch: String,
         parent: Option<String>,
-        write: bool,
-        claude: bool,
+        call: serde_json::Value,
     },
 }
 
@@ -119,6 +131,33 @@ impl Groups {
         }
     }
 }
+fn reply(socket: &mut UnixStream, result: Result<serde_json::Value, String>) -> io::Result<()> {
+    let body = serde_json::to_vec(&match result {
+        Ok(value) => serde_json::json!({"result": value}),
+        Err(error) => serde_json::json!({"error": error}),
+    })?;
+    socket.write_all(&(body.len() as u32).to_be_bytes())?;
+    socket.write_all(&body)
+}
+fn answer(
+    socket: &mut UnixStream,
+    tx: &SyncSender<Message>,
+    caller: Caller,
+    request: Gateway,
+    seconds: u64,
+) -> io::Result<()> {
+    let (done, result) = mpsc::sync_channel(1);
+    tx.send(Message::Gateway {
+        caller,
+        request,
+        reply: Replier::Channel(done),
+    })
+    .map_err(io::Error::other)?;
+    let result = result
+        .recv_timeout(Duration::from_secs(seconds))
+        .unwrap_or_else(|_| Err("The session host did not answer in time.".into()));
+    reply(socket, result)
+}
 fn serve(
     mut socket: UnixStream,
     tx: SyncSender<Message>,
@@ -145,49 +184,35 @@ fn serve(
             groups.lock().unwrap().retire(&id);
             result?;
         }
-        Request::Worker {
+        Request::Launch {
             scope,
-            parent,
-            write,
-            claude,
+            launch,
+            mut start,
         } => {
-            let (reply, result) = mpsc::sync_channel(1);
-            tx.send(Message::Worker {
+            let hint = Some(std::mem::take(&mut start.parent)).filter(|p| !p.is_empty());
+            let caller = Caller::Hosted {
                 scope,
-                parent,
-                write,
-                claude,
-                reply,
-            })
-            .map_err(io::Error::other)?;
-            let Some((permit, parent)) = result.recv_timeout(Duration::from_secs(4)).ok().flatten()
-            else {
-                socket.write_all(&[0])?;
-                return Ok(());
+                hint,
+                launch,
             };
-            let registered = (|| -> io::Result<bool> {
-                socket.write_all(&[1])?;
-                socket.write_all(&(parent.len() as u32).to_be_bytes())?;
-                socket.write_all(parent.as_bytes())?;
-                socket.read_exact(&mut size_buf)?;
-                let n = u32::from_be_bytes(size_buf) as usize;
-                if n > 64 * 1024 {
-                    return Err(io::Error::other("Worker registration too large"));
-                }
-                let mut bytes = vec![0; n];
-                socket.read_exact(&mut bytes)?;
-                let registration = serde_json::from_slice(&bytes)?;
-                let (reply, result) = mpsc::sync_channel(1);
-                tx.send(Message::RegisterJob {
-                    permit,
-                    registration,
-                    reply,
-                })
-                .map_err(io::Error::other)?;
-                Ok(result.recv_timeout(Duration::from_secs(4)).unwrap_or(false))
-            })();
-            let _ = tx.send(Message::Release(permit));
-            socket.write_all(&[u8::from(registered.unwrap_or(false))])?;
+            answer(&mut socket, &tx, caller, Gateway::Launch(start), 75)?;
+        }
+        Request::Call {
+            scope,
+            launch,
+            parent,
+            call,
+        } => {
+            let caller = Caller::Hosted {
+                scope,
+                hint: parent,
+                launch,
+            };
+            let request = crate::workers::parent_call(call).map(Gateway::Call);
+            match request {
+                Ok(request) => answer(&mut socket, &tx, caller, request, 10)?,
+                Err(error) => reply(&mut socket, Err(error))?,
+            }
         }
     }
     Ok(())

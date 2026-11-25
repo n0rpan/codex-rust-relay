@@ -21,6 +21,20 @@ import urllib.request
 binary = pathlib.Path(os.environ.get("OX_TEST_BINARY", "target/release/ox")).resolve()
 
 
+UUID_V4 = __import__("re").compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+
+
+def drop_session(argv):
+    """Remove the `--session-id <uuidv4>` ox gives a new Claude session; return the ID."""
+    if "--session-id" not in argv:
+        return None
+    i = argv.index("--session-id")
+    session = argv[i + 1]
+    assert UUID_V4.fullmatch(session), argv
+    del argv[i:i + 2]
+    return session
+
+
 def run(
     args, choices=None, signed_in=False, claude_signed_in=False,
     config=None, prompt="Choose 1–5".encode(), saved=None, model=None,
@@ -440,6 +454,9 @@ for args, sign_in, expected in (
     ([], {"claude_signed_in": True}, ["claude"]),
 ):
     text, argv, registry = run(args, **sign_in)
+    session = drop_session(argv)
+    # A new Claude session gets an ID ox knows before the first turn.
+    assert (session is not None) == (expected[0] == "claude"), argv
     assert argv == expected and registry is None, (text, argv)
     assert "What would you like to use?" not in text
 print("plain commands: launch signed-in stock clients without reopening setup")
@@ -493,6 +510,7 @@ for main_model, options, config, expected in (
         ["claude", "--model", main_model, *options], config=config,
         expected_classifier=expected,
     )
+    assert drop_session(argv) is not None, argv
     assert argv[0] == "claude" and argv[3:] == ["--model", main_model], argv
 print("Claude launch: native review default, translated review fallback, and configured Sonnet classifier")
 

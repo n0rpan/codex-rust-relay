@@ -380,6 +380,8 @@ impl Host {
             .collect();
         let query = self.filter.read(cx).value().trim().to_lowercase();
         let state = (self.discovery.revision, query.clone());
+        // `is:running`, `is:waiting` and `is:finished` filter by live status.
+        let (status_filter, query) = split_status_filter(&query);
         if versions == self.catalog_versions && self.discovery.indexed.as_ref() == Some(&state) {
             return;
         }
@@ -407,6 +409,19 @@ impl Host {
             };
             if self.archived(project, scope, &r.id, cx) {
                 continue;
+            }
+            if let Some(wanted) = status_filter {
+                let (_, status) = self.project_row_state(project, r, scope, cx);
+                let matches = match (wanted, status) {
+                    (StatusFilter::Running, Some("Running")) => true,
+                    (StatusFilter::Waiting, Some("Needs you")) => true,
+                    (StatusFilter::Finished, Some("Running" | "Needs you")) => false,
+                    (StatusFilter::Finished, _) => true,
+                    _ => false,
+                };
+                if !matches {
+                    continue;
+                }
             }
             if !query.is_empty()
                 && !r.title().to_lowercase().contains(&query)
@@ -459,6 +474,12 @@ impl Host {
         });
         let mut roots = Vec::new();
         let mut children = HashMap::new();
+        // A host-owned worker runs on its own route. Its origin names a parent
+        // session on another route of the same project.
+        let by_id: HashMap<_, _> = entries
+            .keys()
+            .map(|k| ((k.0.as_path(), k.2.as_str()), k))
+            .collect();
         for key in ordered {
             let ((time, _), loc, parent, _) = &entries[key];
             let node = (key, *time, *loc);
@@ -467,6 +488,11 @@ impl Host {
                     entries.get_key_value(&(key.0.clone(), key.1, parent.clone(), key.3.clone()))
             {
                 children.entry(key).or_insert_with(Vec::new).push(node);
+            } else if let Some(parent) = parent
+                && let Some(owner) = by_id.get(&(key.0.as_path(), parent.as_str()))
+                && *owner != key
+            {
+                children.entry(*owner).or_insert_with(Vec::new).push(node);
             } else {
                 roots.push(node);
             }
@@ -604,5 +630,52 @@ mod tests {
         library.replace(Some(false), vec![row()]);
         assert!(!library.removed(project, native, "duplicate"));
         assert_eq!(library.rows.len(), 2);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum StatusFilter {
+    Running,
+    Waiting,
+    Finished,
+}
+
+/// Split a leading or trailing `is:` token from the catalog search text.
+pub(super) fn split_status_filter(query: &str) -> (Option<StatusFilter>, String) {
+    let mut filter = None;
+    let rest: Vec<&str> = query
+        .split_whitespace()
+        .filter(|word| {
+            let found = match *word {
+                "is:running" => Some(StatusFilter::Running),
+                "is:waiting" | "is:approval" => Some(StatusFilter::Waiting),
+                "is:finished" | "is:done" => Some(StatusFilter::Finished),
+                _ => None,
+            };
+            filter = filter.or(found);
+            found.is_none()
+        })
+        .collect();
+    (filter, rest.join(" "))
+}
+
+#[cfg(test)]
+mod status_filter_tests {
+    use super::{StatusFilter, split_status_filter};
+    #[test]
+    fn status_tokens_leave_the_text_query() {
+        assert_eq!(
+            split_status_filter("is:running fix"),
+            (Some(StatusFilter::Running), "fix".into())
+        );
+        assert_eq!(
+            split_status_filter("tests is:waiting"),
+            (Some(StatusFilter::Waiting), "tests".into())
+        );
+        assert_eq!(
+            split_status_filter("is:finished"),
+            (Some(StatusFilter::Finished), String::new())
+        );
+        assert_eq!(split_status_filter("plain"), (None, "plain".into()));
     }
 }

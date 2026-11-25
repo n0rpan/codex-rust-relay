@@ -75,30 +75,19 @@ class Window:
         """Locate a rendered label, allowing for scale and font differences."""
         deadline = time.monotonic() + 10
         shot = self.root / "window.png"
-        visible = ""
+        visible = []
         while time.monotonic() < deadline:
             self.command("import", "-window", self.id, str(shot))
-            for scale in (1, 2):
-                page = shot
-                if scale == 2:
-                    page = self.root / "large.png"
-                    self.command(shutil.which("magick") or "convert", str(shot), "-resize", "200%", "-colorspace", "gray", "-negate", str(page))
-                data = self.command("tesseract", str(page), "stdout", "--psm", "11", "tsv")
+            for cells in ocr_passes(self.command, self.root, shot):
+                visible = [text for text, *_ in cells]
                 matches = []
                 neighbors = []
-                visible = []
-                for row in data.splitlines()[1:]:
-                    cell = row.split("\t")
-                    if len(cell) < 12 or not cell[11].strip():
-                        continue
-                    visible.append(cell[11])
-                    label = cell[11].strip(" .,:·↓↑▾‘’'\"“”()[]").casefold()
-                    x = (int(cell[6]) + int(cell[8]) // 2) // scale
-                    y = (int(cell[7]) + int(cell[9]) // 2) // scale
+                for text, x, y, height in cells:
+                    label = text.strip(" .,:·↓↑▾‘’'\"“”()[]|").casefold()
                     if label == word.casefold() and x >= after_x:
                         matches.append((x, y))
                     if same_row and label == same_row.casefold():
-                        neighbors.append((x, y, int(cell[9]) / scale))
+                        neighbors.append((x, y, height))
                 if same_row:
                     matches = [(x, y) for x, y in matches if any(
                         nx > x and abs(y - ny) <= height / 2 for nx, ny, height in neighbors
@@ -110,6 +99,41 @@ class Window:
                     return
             time.sleep(.1)
         raise AssertionError(f"Missing visible {word!r}. Read {visible}")
+
+
+def ocr_cells(command, page, scale=1, top=0):
+    """Words in a page as (text, x, y, height) in window coordinates."""
+    data = command("tesseract", str(page), "stdout", "--psm", "11", "tsv")
+    cells = []
+    for row in data.splitlines()[1:]:
+        cell = row.split("\t")
+        if len(cell) < 12 or not cell[11].strip():
+            continue
+        x = (int(cell[6]) + int(cell[8]) // 2) // scale
+        y = (int(cell[7]) + int(cell[9]) // 2) // scale + top
+        cells.append((cell[11], x, y, int(cell[9]) / scale))
+    return cells
+
+
+def ocr_passes(command, root, shot, band=40, step=20):
+    """Yield OCR results for the window, then a 2x negated copy, then bands.
+
+    Tesseract's page layout can drop a whole row inside a focus frame or a
+    bordered card. On ubuntu-24.04-arm it skipped the open transcript find bar
+    ("Find in transcript | Previous | Next | Close"), drawn over the top of the
+    transcript, in the full window and in 120px bands, while a 40px band read
+    it exactly. Overlapping 40px bands are the last, slowest pass.
+    """
+    yield ocr_cells(command, shot)
+    large = root / "large.png"
+    command(shutil.which("magick") or "convert", str(shot), "-resize", "200%", "-colorspace", "gray", "-negate", str(large))
+    yield ocr_cells(command, large, scale=2)
+    width, height = map(int, command(shutil.which("magick") or "identify", *(["identify"] if shutil.which("magick") else []),
+                                     "-format", "%w %h", str(shot)).split())
+    strip = root / "band.png"
+    for top in range(0, max(height - band, 0) + step, step):
+        command(shutil.which("magick") or "convert", str(shot), "-crop", f"{width}x{band}+0+{top}", "+repage", str(strip))
+        yield ocr_cells(command, strip, top=top)
 
 
 def run(gui, codex, claude, root, failure_image=None):

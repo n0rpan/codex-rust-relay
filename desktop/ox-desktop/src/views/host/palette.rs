@@ -298,9 +298,7 @@ impl Host {
         }
         if let Some(store) = &active.store
             && store.state() == &Connection::Ready
-            && !store
-                .selected()
-                .is_some_and(|id| store.job(id).is_some() || store.in_terminal(id))
+            && !store.selected().is_some_and(|id| store.in_terminal(id))
         {
             for (cmd, hint) in store.command_caps(store.selected()).choices() {
                 let text = if query.split_whitespace().next() == Some(cmd.as_str()) {

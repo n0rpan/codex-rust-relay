@@ -23,17 +23,20 @@ impl Workbench {
             return;
         }
         let id = owner.map(str::to_owned);
-        if let Some(id) = owner
-            && store.job(id).is_some()
+        if let Some(parent) = owner
+            && let Some(start) =
+                ox_desk_core::origin::WorkerStart::parse_command(parent, store.draft(owner))
         {
-            let text = store.draft(owner).to_owned();
-            self.action(
-                cx,
-                DeskAction::WorkerControl(
-                    id.to_owned(),
-                    ox_desk_core::worker::WorkerAction::Steer(text),
-                ),
-            );
+            match start {
+                Ok(start) => {
+                    self.action(cx, DeskAction::StartWorker(start));
+                    self.action(cx, DeskAction::DraftEdit(id, String::new()));
+                }
+                Err(message) => {
+                    self.launch_error = Some(message);
+                    cx.notify();
+                }
+            }
             return;
         }
         let action = if store.draft(owner).trim_start().starts_with('/') {
@@ -80,7 +83,6 @@ impl Workbench {
         let selected = store.selected().map(str::to_owned);
         let key = selected.as_deref();
         let draft = store.draft(key);
-        let job = key.and_then(|id| store.job(id)).map(|j| j.view());
         let busy = store.sending(key);
         let running = key
             .and_then(|id| store.transcript(id))
@@ -104,7 +106,10 @@ impl Workbench {
         }
         let editor = self.editors.entry(selected.clone()).or_insert_with(|| {
             let owner = selected.clone();
-            let placeholder = if job.is_some() {
+            let placeholder = if owner
+                .as_deref()
+                .is_some_and(|id| store.origin(id).is_some())
+            {
                 "Send an instruction to this worker…".to_owned()
             } else {
                 format!("Ask {} about this project…", store.runtime_name())
@@ -156,10 +161,6 @@ impl Workbench {
                     e.set_value(draft.to_owned(), window, cx);
                 }
             });
-        }
-        if let Some(job) = job {
-            let id = selected.as_deref().unwrap();
-            return super::workers::controls(job, id, editor.clone(), draft, p, cx);
         }
         let is_command = draft.trim_start().starts_with('/');
         let caps = store.command_caps(key);

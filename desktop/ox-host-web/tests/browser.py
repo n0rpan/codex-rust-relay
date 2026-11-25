@@ -711,7 +711,11 @@ def run(harness, screenshot=None):
                 "status": "running",
                 "updated_at": 1,
                 "capabilities": ["open", "steer", "stop"],
-                "detail": {"job": {"parent": "parent"}},
+                "detail": {"worker": True, "origin": {"relation": "worker", "job_id": 7, "ceiling": "read",
+                    "requested": "read", "runtime": "claude", "mode": "session", "by_operator": False,
+                    "launch": "helper:fixture", "source": None,
+                    "route": {"runtime": "claude", "billing": "subscription"},
+                    "parent": {"project": "/fixture", "scope": None, "session": "parent", "runtime": "claude"}}},
             },
         ]
         host.sessions.append(dict(host.sessions[0], id="disk-report", title="Rust build disk usage",
@@ -888,8 +892,14 @@ def run(harness, screenshot=None):
                 "return document.getElementById('title').textContent==='Investigate connection pool' && !document.getElementById('stop').disabled && document.getElementById('network').innerText==='Connected'"
             )
         )
+        assert js("return document.getElementById('context').textContent.includes('worker 7 · read-only ceiling')")
         js("document.getElementById('stop').click()")
-        wait(lambda: {"worker_control": ["child", "stop"]} in host.actions)
+        wait(lambda: {"stop": "child"} in host.actions)
+        # The operator starts a worker attached to the open session.
+        js("document.getElementById('start-worker').click()")
+        js("document.getElementById('worker-runtime').value='claude';document.getElementById('worker-task').value='Check the pool limits';document.getElementById('worker-form').requestSubmit()")
+        wait(lambda: any(isinstance(a, dict) and a.get("start_worker", {}).get("parent") == "child"
+                         and a["start_worker"]["task"] == "Check the pool limits" for a in host.actions))
         phone_report(js, port, base, keypress, capture, screenshot)
         js(
             "document.getElementById('home').click();document.getElementById('new').click();document.getElementById('new-form').requestSubmit()"

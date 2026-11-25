@@ -27,6 +27,7 @@ pub struct Remote {
     pub(super) options: HashMap<String, routes_thread::Options>,
     pub(super) draft_access: Option<Access>,
     pending: HashMap<String, (Option<String>, Option<compose::Draft>)>,
+    pub(super) origins: HashMap<String, crate::origin::Origin>,
     await_new: bool,
 }
 impl Remote {
@@ -71,8 +72,13 @@ impl Store {
             options: HashMap::new(),
             await_new: false,
             pending: HashMap::new(),
+            origins: HashMap::new(),
         };
         Self::with_link(profile, Link::Host(Box::new(remote)))
+    }
+    /// The host's immutable lineage stamp for a worker session or its fork.
+    pub fn origin(&self, id: &str) -> Option<&crate::origin::Origin> {
+        self.remote()?.origins.get(id)
     }
     pub fn is_host_client(&self) -> bool {
         self.remote().is_some()
@@ -183,7 +189,7 @@ impl Store {
     }
     fn select_replica(&mut self, id: &str) {
         self.selected = Some(id.to_owned());
-        if !self.jobs.contains_key(id) {
+        {
             let t = self.transcripts.entry(id.to_owned()).or_default();
             if !t.is_ready() {
                 t.loading = true;
@@ -306,6 +312,18 @@ impl Store {
                 }
                 self.remote_mut().sending.remove("");
             }
+            Server::WorkerReply { result, error, .. } => {
+                self.notice = Some(match (result, error) {
+                    (_, Some(error)) => error,
+                    (Some(status), None) => format!(
+                        "Started OX worker {} on {}.",
+                        status["job_id"],
+                        status["model"].as_str().unwrap_or("its route")
+                    ),
+                    (None, None) => "The worker request finished.".into(),
+                });
+                self.changed.mark(Changed::NOTICE);
+            }
             Server::Snapshot { scopes, .. } => {
                 for scope in scopes {
                     self.apply_scope(scope)?;
@@ -409,10 +427,10 @@ impl Store {
             }
             Change::Sessions { sessions } => {
                 self.catalog.clear();
-                self.jobs.clear();
                 self.terminal_threads.clear();
                 let r = self.remote_mut();
                 r.caps.clear();
+                r.origins.clear();
                 r.routes.clear();
                 r.commands.clear();
                 r.options.clear();
@@ -550,21 +568,13 @@ impl Store {
         } else {
             r.sending.remove(&id);
         }
-        let j = &data["job"];
-        if let Some(snapshot) = bits(&j["snapshot"]) {
-            self.jobs.insert(
-                id,
-                jobs::Job {
-                    parent: bits(&j["parent"]).unwrap_or_default(),
-                    title: s.title,
-                    snapshot,
-                    live: j["live"] == true,
-                    pending: j["pending"] == true,
-                    launched_here: false,
-                    error: bits(&j["error"]),
-                    poll: None,
-                },
-            );
+        match bits(&data["origin"]) {
+            Some(origin) => {
+                r.origins.insert(id, origin);
+            }
+            None => {
+                r.origins.remove(&id);
+            }
         }
     }
 }

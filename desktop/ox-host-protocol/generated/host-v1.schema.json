@@ -278,22 +278,12 @@
         {
           "additionalProperties": false,
           "properties": {
-            "worker_control": {
-              "maxItems": 2,
-              "minItems": 2,
-              "prefixItems": [
-                {
-                  "type": "string"
-                },
-                {
-                  "$ref": "#/$defs/WorkerAction"
-                }
-              ],
-              "type": "array"
+            "start_worker": {
+              "$ref": "#/$defs/WorkerStart"
             }
           },
           "required": [
-            "worker_control"
+            "start_worker"
           ],
           "type": "object"
         },
@@ -1011,6 +1001,58 @@
             "action"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A same-user OX gateway that the host does not run asks it to own a worker.",
+          "properties": {
+            "caller": {
+              "$ref": "#/$defs/ExternalCaller"
+            },
+            "id": {
+              "type": "string"
+            },
+            "start": {
+              "$ref": "#/$defs/WorkerStart"
+            },
+            "type": {
+              "const": "worker_launch",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "caller",
+            "start"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The parent-agent tools of such a gateway.",
+          "properties": {
+            "call": {
+              "$ref": "#/$defs/ParentCall"
+            },
+            "caller": {
+              "$ref": "#/$defs/ExternalCaller"
+            },
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "worker_call",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "caller",
+            "call"
+          ],
+          "type": "object"
         }
       ],
       "title": "Client"
@@ -1052,6 +1094,33 @@
       "required": [
         "epoch",
         "seq"
+      ],
+      "type": "object"
+    },
+    "ExternalCaller": {
+      "additionalProperties": false,
+      "description": "A worker gateway the host does not run, such as `ox claude` in a terminal.\nThe host can verify only the OS user. `launch` is a random token private to\nthat gateway; the host keeps only its digest. `session` is the native session\nthe gateway has observed, from its resume arguments or the stock client's own\nMCP request metadata.",
+      "properties": {
+        "launch": {
+          "type": "string"
+        },
+        "project": {
+          "type": "string"
+        },
+        "runtime": {
+          "$ref": "#/$defs/Runtime"
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "project",
+        "runtime",
+        "launch"
       ],
       "type": "object"
     },
@@ -1144,6 +1213,103 @@
         "question"
       ],
       "type": "string"
+    },
+    "ParentCall": {
+      "description": "The only operations a parent agent has on its workers. Approvals, questions and\npermission changes belong to the human operator and have no variant here.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "list",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "job_id": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "op": {
+              "const": "status",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "job_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "job_id": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "op": {
+              "const": "steer",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "job_id",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "job_id": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "op": {
+              "const": "cancel",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "job_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Sent by a terminal gateway, never by the agent: the gateway observed its\nown native session. The host records it once on the launch's workers so\na later resume of that session can reach them.",
+          "properties": {
+            "op": {
+              "const": "bind",
+              "type": "string"
+            },
+            "session": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "session"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "Question": {
       "properties": {
@@ -1529,6 +1695,29 @@
         },
         {
           "properties": {
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "result": true,
+            "type": {
+              "const": "worker_reply",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
             "id": {
               "type": [
                 "string",
@@ -1718,28 +1907,48 @@
       ],
       "type": "object"
     },
-    "WorkerAction": {
-      "oneOf": [
-        {
-          "enum": [
-            "refresh",
-            "stop"
-          ],
+    "WorkerMode": {
+      "enum": [
+        "session",
+        "goal",
+        "workflow"
+      ],
+      "type": "string"
+    },
+    "WorkerStart": {
+      "additionalProperties": false,
+      "description": "An operator's request to start a worker attached to a session in the subscribed scope.",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/WorkerMode"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent": {
           "type": "string"
         },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "steer": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "steer"
-          ],
-          "type": "object"
+        "runtime": {
+          "$ref": "#/$defs/Runtime"
+        },
+        "task": {
+          "type": "string"
+        },
+        "write": {
+          "type": "boolean"
         }
-      ]
+      },
+      "required": [
+        "parent",
+        "runtime",
+        "mode",
+        "task",
+        "write"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",

@@ -247,6 +247,9 @@ pub(crate) fn select(mut args: Vec<OsString>) -> (ClientKind, Vec<OsString>) {
 #[derive(Debug)]
 pub(crate) struct ClaudeLaunchSettings {
     path: PathBuf,
+    /// The session ID OX chose for a new interactive or `-p` session.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) session: Option<String>,
 }
 
 impl ClaudeLaunchSettings {
@@ -666,12 +669,136 @@ fn inject_settings(
     // relay authenticates with the bearer, so keep the launch credential one
     // source only. An empty helper is ignored (verified on 2.1.330).
     document.insert("apiKeyHelper".to_owned(), Value::String(String::new()));
-    let settings = write_settings(&document)?;
+    let mut settings = write_settings(&document)?;
+    let (mut args, session) = claude_session_args(std::mem::take(&mut args))?;
+    settings.session = session;
     let mut rewritten = Vec::with_capacity(args.len() + 2);
     rewritten.push(OsString::from("--settings"));
     rewritten.push(settings.path.clone().into_os_string());
     rewritten.append(&mut args);
     Ok((rewritten, settings))
+}
+
+/// Root `claude` subcommands of the compatibility floor, Claude Code 2.1.331,
+/// read from the command table that builds its `claude --help` (hidden ones
+/// included). None of them starts a conversation. This is the only copy:
+/// `desktop/tests/claude_subcommands.py` reads it and fails the Claude protocol
+/// job when a stock release lists a root command or alias missing here.
+const CLAUDE_SUBCOMMANDS: &[&str] = &[
+    "agents",
+    "attach",
+    "auth",
+    "auto-mode",
+    "design-login",
+    "doctor",
+    "edit-chrome-settings",
+    "edit-hook",
+    "edit-memory-settings",
+    "edit-permission-rules",
+    "edit-sandbox-settings",
+    "edit-skill-overrides",
+    "gateway",
+    "help",
+    "import",
+    "import-conversations",
+    "install",
+    "kill",
+    "logs",
+    "mcp",
+    "plugin",
+    "plugins",
+    "project",
+    "purge",
+    "rc",
+    "remote-control",
+    "respawn",
+    "rm",
+    "sandbox",
+    "setup-token",
+    "stop",
+    "ultrareview",
+    "update",
+    "upgrade",
+    "workspace-trust",
+    "worktree-hook",
+];
+
+/// Options that choose an existing or remote session, or ask for no saved
+/// session. The first five are the session flags. The next six attach to,
+/// rewind or teleport another session, where a new ID would conflict. A session
+/// that is never saved cannot be resumed, so it gets no ID either.
+const CLAUDE_SESSION_OPTIONS: &[&str] = &[
+    "--resume",
+    "--continue",
+    "--session-id",
+    "--fork-session",
+    "--from-pr",
+    "--teleport",
+    "--remote",
+    "--cloud",
+    "--attach-serve",
+    "--resume-session-at",
+    "--rewind-files",
+    "--no-session-persistence",
+    "--version",
+    "--help",
+];
+
+/// `-r`, `-c`, `-v`, `-V` and `-h`, alone or in a cluster of short flags.
+const CLAUDE_SESSION_SHORT: &[char] = &['r', 'c', 'v', 'V', 'h'];
+
+/// Gives a new Claude Code session an ID that OX knows before the first turn,
+/// so its OX workers can be reclaimed later with `--resume <id>`. Stock Claude
+/// Code sends no session identity to MCP servers, so this is the only way the
+/// launch learns it. Leaves the arguments unchanged when the user already
+/// chose a session, asked for version or help, or ran a subcommand. Arguments
+/// after `--` are positional and never inspected.
+pub(crate) fn claude_session_args(
+    args: Vec<OsString>,
+) -> Result<(Vec<OsString>, Option<String>), RelayError> {
+    for arg in args.iter().take_while(|arg| *arg != "--") {
+        let Some(text) = arg.to_str() else {
+            continue;
+        };
+        let name = text.split('=').next().unwrap_or(text);
+        let chooses = if let Some(long) = name.strip_prefix("--") {
+            !long.is_empty() && CLAUDE_SESSION_OPTIONS.contains(&name)
+        } else if let Some(short) = name.strip_prefix('-') {
+            !short.is_empty()
+                && short.chars().all(|c| c.is_ascii_alphabetic())
+                && short.chars().any(|c| CLAUDE_SESSION_SHORT.contains(&c))
+        } else {
+            // A value or prompt that happens to equal a subcommand only skips
+            // the ID; it never adds one to a subcommand.
+            CLAUDE_SUBCOMMANDS.contains(&text)
+        };
+        if chooses {
+            return Ok((args, None));
+        }
+    }
+    let id = new_session_id()?;
+    let mut rewritten = Vec::with_capacity(args.len() + 2);
+    rewritten.push(OsString::from("--session-id"));
+    rewritten.push(OsString::from(&id));
+    rewritten.extend(args);
+    Ok((rewritten, Some(id)))
+}
+
+/// A random RFC 9562 version 4 UUID in lowercase hyphenated form.
+fn new_session_id() -> Result<String, RelayError> {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).map_err(|error| error.to_string())?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex: String = b.iter().map(|v| format!("{v:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    ))
 }
 
 /// Removes every `--settings` option before `--` and loads the last one, which
@@ -830,7 +957,10 @@ fn write_settings(document: &SettingsMap) -> Result<ClaudeLaunchSettings, RelayE
         let _ = std::fs::remove_file(&path);
         return Err(format!("could not write a temporary Claude settings file: {error}").into());
     }
-    Ok(ClaudeLaunchSettings { path })
+    Ok(ClaudeLaunchSettings {
+        path,
+        session: None,
+    })
 }
 
 /// Refuses a launch whose backend is controlled above the settings overlay.
@@ -1166,10 +1296,211 @@ mod tests {
     }
 
     /// The forwarded user argv, after the two overlay tokens.
+    /// The user's own arguments after the overlay and any session ID OX added.
     fn forwarded(command: &Command) -> Vec<String> {
         let args = argv(command);
         assert_eq!(args.first().map(String::as_str), Some("--settings"));
-        args.into_iter().skip(2).collect()
+        let mut rest: Vec<String> = args.into_iter().skip(2).collect();
+        if rest.first().map(String::as_str) == Some("--session-id") {
+            assert!(is_uuid_v4(&rest[1]), "{rest:?}");
+            rest.drain(..2);
+        }
+        rest
+    }
+
+    fn is_uuid_v4(id: &str) -> bool {
+        let parts: Vec<&str> = id.split('-').collect();
+        parts.iter().map(|p| p.len()).eq([8, 4, 4, 4, 12])
+            && id
+                .chars()
+                .all(|c| c == '-' || c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            && parts[2].starts_with('4')
+            && parts[3].starts_with(['8', '9', 'a', 'b'])
+    }
+
+    fn session_args(list: &[&str]) -> (Vec<String>, Option<String>) {
+        let (args, id) = claude_session_args(strings(list)).unwrap();
+        (
+            args.iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect(),
+            id,
+        )
+    }
+
+    #[test]
+    fn a_new_claude_session_gets_a_uuid_v4_session_id() {
+        for plain in [
+            &[][..],
+            &["-p", "list files"],
+            &["--print", "hi", "--model", "sonnet"],
+            &["fix the failing test"],
+            &["--permission-mode", "plan"],
+            &["--remote-control"],
+            // A prompt that merely mentions a subcommand is still a session.
+            &["run the doctor checks"],
+        ] {
+            let (args, id) = session_args(plain);
+            let id = id.unwrap_or_else(|| panic!("{plain:?} starts a session"));
+            assert!(is_uuid_v4(&id), "{id}");
+            assert_eq!(&args[..2], ["--session-id", id.as_str()]);
+            assert_eq!(&args[2..], plain);
+        }
+        assert_ne!(
+            session_args(&[]).1,
+            session_args(&[]).1,
+            "each launch gets its own ID"
+        );
+    }
+
+    #[test]
+    fn the_users_session_choice_subcommands_and_info_flags_are_left_alone() {
+        let unchanged: &[&[&str]] = &[
+            // Session flags, in every accepted spelling.
+            &["--resume"],
+            &["--resume", "0b8d6f2e-3c41-4f0a-9e57-1d2c3b4a5f60"],
+            &["--resume=0b8d6f2e-3c41-4f0a-9e57-1d2c3b4a5f60"],
+            &["-r"],
+            &["-r", "name"],
+            &["--continue"],
+            &["-c"],
+            &["-p", "-c", "go on"],
+            &["-pc", "go on"],
+            &["--session-id", "0b8d6f2e-3c41-4f0a-9e57-1d2c3b4a5f60"],
+            &["--session-id=0b8d6f2e-3c41-4f0a-9e57-1d2c3b4a5f60"],
+            &["--resume", "x", "--fork-session"],
+            &["--fork-session"],
+            &["--from-pr"],
+            &["--from-pr", "123"],
+            &["--from-pr=123"],
+            // Options that attach to or rewind another session.
+            &["--teleport"],
+            &["--remote", "task"],
+            &["--cloud"],
+            &["--attach-serve", "abc"],
+            &["--resume-session-at", "m1"],
+            &["--rewind-files", "m1"],
+            // A session that is never saved cannot be resumed.
+            &["--no-session-persistence"],
+            &["-p", "hi", "--no-session-persistence"],
+            // Version and help.
+            &["--version"],
+            &["-v"],
+            &["-V"],
+            &["--help"],
+            &["-h"],
+            &["mcp", "--help"],
+            // A background-session command with its argument.
+            &["logs", "abc"],
+        ];
+        for list in unchanged {
+            let (args, id) = session_args(list);
+            assert_eq!(id, None, "{list:?}");
+            assert_eq!(args, *list, "{list:?}");
+        }
+        for command in CLAUDE_SUBCOMMANDS {
+            let (args, id) = session_args(&[command]);
+            assert_eq!(id, None, "{command}");
+            assert_eq!(args, [*command]);
+            let (_, id) = session_args(&["--debug", command, "list"]);
+            assert_eq!(id, None, "{command} after an option");
+        }
+        for listed in [
+            "mcp",
+            "plugin",
+            "update",
+            "doctor",
+            "install",
+            "setup-token",
+            "auth",
+            "agents",
+        ] {
+            assert!(CLAUDE_SUBCOMMANDS.contains(&listed), "{listed}");
+        }
+    }
+
+    #[test]
+    fn an_unsaved_session_gets_no_session_id() {
+        // Subscription launches call the rewrite directly.
+        for list in [
+            &["-p", "hi", "--no-session-persistence"][..],
+            &["--no-session-persistence", "-p", "hi"],
+        ] {
+            let (args, id) = session_args(list);
+            assert_eq!(id, None, "{list:?}");
+            assert_eq!(args, list);
+        }
+        // API launches keep their overlay and add no ID either.
+        let (command, settings) = launch(
+            strings(&["-p", "hi", "--no-session-persistence"]),
+            "http://127.0.0.1:4321/v1",
+            "fresh-token-123",
+            &aliases(&["alpha/claude"]),
+            &refs(&[]),
+        );
+        assert_eq!(settings.session, None);
+        assert!(!argv(&command).iter().any(|a| a == "--session-id"));
+        // After `--` the flag is only prompt text and does not stop the ID.
+        assert!(
+            session_args(&["-p", "--", "--no-session-persistence"])
+                .1
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn arguments_after_double_dash_never_decide_the_session() {
+        // After `--` everything is positional: a flag-like prompt starts a session.
+        let (args, id) = session_args(&["-p", "--", "--resume", "-c", "mcp"]);
+        let id = id.unwrap();
+        assert_eq!(
+            args,
+            [
+                "--session-id",
+                id.as_str(),
+                "-p",
+                "--",
+                "--resume",
+                "-c",
+                "mcp"
+            ]
+        );
+        // The ID is added before `--`, where stock Claude Code reads options.
+        let (args, id) = session_args(&["--", "doctor"]);
+        assert_eq!(args[..3], ["--session-id", id.as_deref().unwrap(), "--"]);
+        // A session flag before `--` still wins.
+        assert_eq!(session_args(&["--continue", "--", "x"]).1, None);
+    }
+
+    #[test]
+    fn an_api_launch_keeps_its_settings_overlay_and_adds_the_session_id() {
+        let (command, settings) = launch(
+            strings(&["-p", "hi"]),
+            "http://127.0.0.1:4321/v1",
+            "fresh-token-123",
+            &aliases(&["alpha/claude"]),
+            &refs(&[]),
+        );
+        let args = argv(&command);
+        let id = settings
+            .session
+            .clone()
+            .expect("a new API session gets an ID");
+        assert_eq!(args[0], "--settings");
+        assert_eq!(args[2..4], ["--session-id".to_owned(), id]);
+        assert_eq!(args[4..], ["-p".to_owned(), "hi".to_owned()]);
+        assert_eq!(args.iter().filter(|a| *a == "--settings").count(), 1);
+        // A resumed API session keeps the overlay and gets no new ID.
+        let (command, settings) = launch(
+            strings(&["--resume", "0b8d6f2e-3c41-4f0a-9e57-1d2c3b4a5f60"]),
+            "http://127.0.0.1:4321/v1",
+            "fresh-token-123",
+            &aliases(&["alpha/claude"]),
+            &refs(&[]),
+        );
+        assert_eq!(settings.session, None);
+        assert_eq!(argv(&command)[0], "--settings");
+        assert!(!argv(&command).iter().any(|a| a == "--session-id"));
     }
 
     /// The overlay file path from argv, asserting exactly one tokens pair.

@@ -91,7 +91,8 @@
         <div id="filters" role="group" aria-label="Session filter">
           <button data-filter="all" aria-pressed="true">All</button
           ><button data-filter="active" aria-pressed="false">Active</button
-          ><button data-filter="requests" aria-pressed="false">Requests</button>
+          ><button data-filter="requests" aria-pressed="false">Requests</button
+          ><button data-filter="finished" aria-pressed="false">Finished</button>
         </div>
         <div id="list"></div>
       </section>
@@ -137,15 +138,14 @@
             <div>
               <button type="button" id="operator-project">Project terminal</button>
               <button type="button" id="operator-session" hidden>Open session in terminal</button>
+              <button type="button" id="start-worker" hidden>Start worker</button>
             </div>
           </details>
         </nav>
         <div id="context"></div>
         <h1 id="title"></h1>
         <button id="older" class="quiet" hidden>Load earlier messages</button
-        ><button id="refresh-worker" class="quiet" hidden>
-          Refresh worker
-        </button>
+        >
         <div id="session-controls" hidden>
           <div class="session-toolbar">
             <button
@@ -188,6 +188,30 @@
           <summary>Changes &amp; plan</summary>
           <div id="review-content"></div>
         </details>
+        <form id="worker-form" hidden aria-label="Start worker">
+          <label for="worker-runtime">Runtime</label>
+          <select id="worker-runtime">
+            <option value="codex">Codex</option>
+            <option value="claude">Claude Code</option>
+          </select>
+          <label for="worker-model">API model</label>
+          <input id="worker-model" list="worker-models" autocomplete="off"
+            placeholder="Leave empty for a Claude subscription worker" />
+          <datalist id="worker-models"></datalist>
+          <label for="worker-mode">Mode</label>
+          <select id="worker-mode">
+            <option value="session">Session</option>
+            <option value="goal">Codex goal</option>
+            <option value="workflow">Claude workflow</option>
+          </select>
+          <label><input type="checkbox" id="worker-write" /> Allow workspace edits</label>
+          <label for="worker-task">Task</label>
+          <textarea id="worker-task" rows="3" required></textarea>
+          <div class="actions">
+            <button type="button" id="worker-cancel" class="quiet">Cancel</button
+            ><button class="primary" id="worker-submit">Start worker</button>
+          </div>
+        </form>
         <div id="timeline" aria-label="Transcript"></div>
         <div id="asks"></div>
         <form id="composer">

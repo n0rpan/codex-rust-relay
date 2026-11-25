@@ -709,9 +709,34 @@ Approve the tool call when your client prompts.
 
 `start_ox_worker` returns a job ID. Ask for status or the result with
 `ox_worker_status`, or ask to stop it with `cancel_ox_worker`. Jobs run between
-tool calls and have no ox wall-clock limit. They stop when the parent ox launch
-exits. The status includes the stock client's session ID when available.
+tool calls and have no ox wall-clock limit. Without a running OX session host
+they stop when the parent ox launch exits. When the session host is running
+(OX Desktop or `ox host install`), it owns the worker as an ordinary session:
+the worker keeps running after you close the terminal, its approvals reach
+your desktop and paired phone, and a resumed parent can still read its status.
+The status includes the stock client's session ID when available.
 Work already written to the project stays there if you cancel.
+
+`ox claude` gives each new session an ID before the first turn by passing
+`--session-id` to Claude Code, unless you chose a session yourself with
+`--resume`, `--continue`, `--session-id`, `--fork-session` or `--from-pr`,
+turned off saving with `--no-session-persistence`, or ran a subcommand such
+as `mcp` or `update`. After you close the terminal, `ox claude --resume <that
+id>` lets the main agent read and steer the workers it started. The ID is the
+one Claude Code shows for the session. `ox codex resume <id>` does the same
+for Codex. Only the launch that started a worker, or a later resume of its
+session, controls it; another `ox` in the same project does not. Otherwise
+use OX Desktop or a paired phone.
+
+A host-owned worker's approvals and questions wait for a person in OX Desktop
+or on a paired phone, never for the main agent. `ox_worker_status` then
+reports `waiting_for_operator` with where to answer. To keep terminal workers
+inside the launch, with approvals denied as before, add this to `codeox.toml`:
+
+```toml
+[workers]
+host = "never"   # default "auto": use the session host when one is running
+```
 
 Workers start with read access in the current project. Tell the main agent
 explicitly when a worker may edit files. Client permissions still apply,

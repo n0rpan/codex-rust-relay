@@ -1,12 +1,12 @@
 mod durable;
 mod engine;
-mod jobs;
 mod lease;
 mod policy;
 mod receipts;
 mod replay;
 mod runtime;
 mod transport;
+mod workers;
 
 use engine::{Engine, Message};
 use ox_host_service::{Paths, SocketGuard};

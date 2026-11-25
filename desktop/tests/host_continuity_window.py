@@ -54,6 +54,28 @@ def run_reviewed_fixture(window, marker, expected):
         window.command("xdotool", "windowfocus", window.id)
 
 
+def capture(window, name):
+    """Save the app's view and a screenshot for the Linux gate artifact."""
+    print(f"desktop state at {name}:", json.dumps(window.snapshot()), flush=True)
+    if temp := os.environ.get("RUNNER_TEMP"):
+        window.command("import", "-window", window.id, str(Path(temp) / f"continuity-{name}.png"))
+
+
+def open_transcript_find(window):
+    """Open transcript find and wait for its bar before typing a query.
+
+    Wait for the bar's Previous button: OCR on ubuntu-24.04-arm does not read
+    the grey "Find in transcript" placeholder even while the field is open
+    and focused, which a screenshot from that runner showed.
+    """
+    window.key("ctrl+f")
+    try:
+        window.word("Previous")
+    except AssertionError:
+        capture(window, "find")
+        raise
+
+
 def local_tool_terminal(window, provider, root, project):
     import shlex
     program = root / "bin/sudo"
@@ -79,9 +101,13 @@ def local_tool_terminal(window, provider, root, project):
     assert not marker.exists()
     # Native transcript search expands the exact matching tool and scrolls it into view.
     # Earlier approvals can have another identically titled Terminal header on screen.
-    window.key("ctrl+f")
+    open_transcript_find(window)
     window.text("fixture-failed")
-    window.word("Run", same_row="terminal", click=True)
+    try:
+        window.word("Run", same_row="terminal", click=True)
+    except AssertionError:
+        capture(window, "run")
+        raise
     run_reviewed_fixture(window, marker, [str(project.resolve()), "--", "fixture-failed", "two words"])
     assert "PrivateTerminalOutput" not in json.dumps(provider.requests)
     print("PASS real approval and failed tool handoffs, tty, argv, cwd, exactly one manual execution, private output.", flush=True)

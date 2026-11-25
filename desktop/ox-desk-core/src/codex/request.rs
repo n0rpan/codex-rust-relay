@@ -8,11 +8,6 @@ pub enum Call {
         project: std::path::PathBuf,
         query: String,
     },
-    Job {
-        parent: String,
-        number: u64,
-        operation: crate::worker::WorkerAction,
-    },
     Features(Option<String>),
     Models {
         provider: String,
@@ -125,7 +120,6 @@ impl ThreadCommand {
 impl Call {
     pub fn method(&self) -> Method {
         match self {
-            Self::Job { .. } => Method::CallTool,
             Self::Features(_) => Method::Features,
             Self::Models { .. } => Method::Models,
             Self::Config(_) => Method::Config,
@@ -151,22 +145,6 @@ impl Call {
     fn params(self) -> Value {
         const TURNS: usize = 12;
         match self {
-            Self::Job {
-                parent,
-                number,
-                operation,
-            } => {
-                let mut args = json!({"job_id":number});
-                let tool = match &operation {
-                    crate::worker::WorkerAction::Refresh => "ox_worker_status",
-                    crate::worker::WorkerAction::Steer(_) => "steer_ox_worker",
-                    crate::worker::WorkerAction::Stop => "cancel_ox_worker",
-                };
-                if let crate::worker::WorkerAction::Steer(text) = operation {
-                    args["text"] = text.into();
-                }
-                json!({"threadId":parent,"server":"ox_workers","tool":tool,"arguments":args})
-            }
             Self::Features(cursor) => json!({"limit":100,"cursor":cursor}),
             Self::Models { provider, cursor } => {
                 json!({"modelProvider":provider,"limit":100,"cursor":cursor})

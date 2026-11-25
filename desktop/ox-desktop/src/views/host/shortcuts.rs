@@ -63,22 +63,13 @@ impl Host {
                     }
                     Command::Changes => pane.toggle_review(cx),
                     Command::Stop => {
-                        if let Some(id) = owner {
-                            if store.job(&id).is_some_and(|j| j.can_stop()) {
-                                pane.action(
-                                    cx,
-                                    DeskAction::WorkerControl(
-                                        id,
-                                        ox_desk_core::worker::WorkerAction::Stop,
-                                    ),
-                                );
-                            } else if store
+                        if let Some(id) = owner
+                            && store
                                 .transcript(&id)
                                 .and_then(|t| t.active_turn())
                                 .is_some()
-                            {
-                                pane.action(cx, DeskAction::Stop(id));
-                            }
+                        {
+                            pane.action(cx, DeskAction::Stop(id));
                         }
                     }
                     Command::Answer(choice) => {

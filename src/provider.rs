@@ -716,6 +716,18 @@ pub struct CodeoxConfig {
     pub vendors: Vec<Vendor>,
     /// Present only when `codeox.toml` opts in with a `[search]` table.
     pub search: Option<SearchSettings>,
+    /// `[workers] host`: whether a terminal launch hands workers to a running session host.
+    pub workers_host: WorkersHost,
+}
+
+/// Where workers started from a terminal `ox` launch run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WorkersHost {
+    /// Use the OX session host when one is running, otherwise run in this launch.
+    #[default]
+    Auto,
+    /// Always run workers inside the launching gateway, as without a host.
+    Never,
 }
 
 impl CodeoxConfig {
@@ -764,7 +776,15 @@ impl CodeoxConfig {
             Some(item) => parse_search(item)?,
             None => None,
         };
-        Ok(Self { vendors, search })
+        let workers_host = match document.get("workers") {
+            Some(item) => parse_workers(item)?,
+            None => WorkersHost::Auto,
+        };
+        Ok(Self {
+            vendors,
+            search,
+            workers_host,
+        })
     }
 
     /// Environment variable names that must never reach the Codex child.
@@ -778,6 +798,22 @@ impl CodeoxConfig {
             refs.insert(search.env_key.clone());
         }
         refs
+    }
+}
+
+fn parse_workers(item: &Item) -> Result<WorkersHost, RelayError> {
+    let table = item
+        .as_table()
+        .ok_or("`workers` must be a table of worker settings")?;
+    for key in table.iter().map(|(key, _)| key) {
+        if key != "host" {
+            return Err(format!("workers.{key} is not a recognized setting").into());
+        }
+    }
+    match opt_str(table, "host")?.as_deref() {
+        None | Some("auto") => Ok(WorkersHost::Auto),
+        Some("never") => Ok(WorkersHost::Never),
+        Some(_) => Err("workers.host must be \"auto\" or \"never\"".into()),
     }
 }
 
@@ -1458,6 +1494,24 @@ mod tests {
             input_modalities: vec!["text".to_owned()],
             reasoning_efforts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn workers_host_defaults_to_auto_and_accepts_only_known_values() {
+        let base = "[providers.alpha]\nname = \"Alpha\"\nbase_url = \"https://alpha.example/v1\"\nenv_key = \"ALPHA_KEY\"\n";
+        let load = |extra: &str| CodeoxConfig::load_from_str(&format!("{base}{extra}"));
+        assert_eq!(load("").unwrap().workers_host, WorkersHost::Auto);
+        assert_eq!(
+            load("[workers]\nhost = \"auto\"\n").unwrap().workers_host,
+            WorkersHost::Auto
+        );
+        assert_eq!(
+            load("[workers]\nhost = \"never\"\n").unwrap().workers_host,
+            WorkersHost::Never
+        );
+        assert!(load("[workers]\nhost = \"always\"\n").is_err());
+        assert!(load("[workers]\nhosted = \"never\"\n").is_err());
+        assert!(CodeoxConfig::load_from_str(&format!("workers = \"never\"\n{base}")).is_err());
     }
 
     fn two_vendors(extra_alpha: &str, extra_beta: &str) -> CodeoxConfig {

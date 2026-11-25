@@ -63,7 +63,6 @@ fn decode_item(input: &Value) -> Option<Item> {
 
 #[derive(Clone, Debug)]
 pub struct ThreadItem {
-    pub job: Option<Box<super::jobs::Observation>>,
     pub id: String,
     pub item: Item,
 }
@@ -84,11 +83,7 @@ impl ThreadItem {
                 .unwrap_or_default()
                 .into(),
         });
-        Some(Self {
-            id,
-            item,
-            job: super::jobs::Observation::decode(input),
-        })
+        Some(Self { id, item })
     }
 }
 
