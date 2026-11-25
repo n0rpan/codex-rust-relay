@@ -11,13 +11,14 @@ import tempfile
 import time
 
 from host_fixture import session_host
-from mixed_runtime_window import Window, ocr_passes
+from mixed_runtime_window import Window
 
 ENABLE = ["tailscale", "serve", "--bg", "--https=8443", "http://127.0.0.1:48162"]
 DISABLE = ["tailscale", "serve", "--https=8443", "off"]
 ERROR = "Access denied: serve config denied. Fixture advisory text."
 NODE = "workstation.fixture.ts.net"
 CANARY = "nimbuspasscanary"
+TERMINAL = "OX Terminal"
 SUDO = """#!/usr/bin/env python3
 import json, os, sys, termios
 from pathlib import Path
@@ -110,7 +111,7 @@ def run(gui, home):
         probe.bind(str(home / "probe"))
         probe.settimeout(2)
         win = Window(home, proc, env["OX_DESK_STATS_SOCKET"], probe)
-        main = win.id
+
         def admin(operation):
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
                 s.settimeout(2)
@@ -122,127 +123,119 @@ def run(gui, home):
         def status():
             return admin({"type": "status"})["Ok"]
 
-        def settled():
-            # While Remote access re-checks Tailscale it shows "Checking remote
-            # access…" and disables Refresh, Enable and Disable. OCR still reads
-            # the greyed labels, so a click then lands on a disabled button.
-            deadline = time.monotonic() + 20
-            shot = home / "settled.png"
-            while time.monotonic() < deadline:
-                win.command("import", "-window", win.id, str(shot))
-                # The whole-window pass is enough for this plain status line.
-                words = {text.strip(" .…").casefold()
-                         for text, *_ in next(ocr_passes(win.command, home, shot))}
-                if words and "checking" not in words:
-                    return
-                time.sleep(0.1)
-            raise AssertionError("Remote access kept checking for 20 seconds")
+        # Navigation and waits use the app's own state and layout from the stats
+        # socket. OCR remains only where rendering itself is the point.
+        def remote(state):
+            return (state.get("settings") or {}).get("remote")
 
-        def click(word):
-            if word in ("Refresh", "Enable", "Disable"):
-                settled()
-            win.word(word, click=True, bottom=True)
+        def terminal(state):
+            return next((w["state"] for w in state.get("windows", []) if w["title"] == TERMINAL), None)
 
-        def terminal_window():
-            # `xdotool search --name` can also return the main window, so its
-            # --sync may return before the terminal exists. Wait for a window
-            # other than the main one whose title is exactly "OX Terminal".
-            deadline = time.monotonic() + 20
-            while time.monotonic() < deadline:
-                found = subprocess.run(["xdotool", "search", "--onlyvisible", "--pid", str(proc.pid),
-                                        "--name", "OX Terminal"], capture_output=True, text=True).stdout.split()
-                for candidate in found:
-                    name = subprocess.run(["xdotool", "getwindowname", candidate],
-                                          capture_output=True, text=True).stdout.strip()
-                    if candidate != main and name == "OX Terminal":
-                        return candidate
+        def until_remote(predicate, description):
+            return remote(win.wait(lambda s: remote(s) is not None and predicate(remote(s)), description))
+
+        def idle():
+            return until_remote(lambda r: not r["checking"], "Remote access to finish checking")
+
+        def act(label):
+            # Wait for the operation this press starts, not a result already shown.
+            before = idle()["finished"]
+            win.press(label)
+            return until_remote(lambda r: not r["checking"] and r["finished"] > before, f"Remote access after {label}")
+
+        def until_clipboard(expected):
+            deadline = time.monotonic() + 10
+            while (copied := clipboard()) != expected and time.monotonic() < deadline:
                 time.sleep(0.1)
-            raise AssertionError("The OX Terminal window did not open")
+            assert copied == expected, repr(copied)
 
         def review():
-            click("Run")
-            win.id = terminal_window()
-            win.command("xdotool", "windowfocus", win.id)
-            win.word("Cancel")
+            before = idle()["finished"]
+            win.press("Run in OX terminal")
+            win.wait(lambda s: (t := terminal(s)) is not None and t["reviewing"], "the OX Terminal command review")
+            return before
 
-        def confirm():
-            # Some fonts render the short primary label "Run" poorly in OCR.
-            # Locate the neighboring Cancel label and click the first button on that row.
-            shot = home / "review.png"
-            win.command("import", "-window", win.id, str(shot))
-            rows = win.command("tesseract", str(shot), "stdout", "--psm", "11", "tsv")
-            cancel = next(row.split("\t") for row in rows.splitlines() if row.endswith("\tCancel"))
-            y = int(cancel[7]) + int(cancel[9]) // 2
-            win.command("xdotool", "mousemove", "--window", win.id, "36", str(y), "click", "1")
+        def close(label, before):
+            win.press(label, TERMINAL)
+            win.wait(lambda s: terminal(s) is None, "the OX Terminal window to close")
+            return until_remote(lambda r: not r["checking"] and r["finished"] > before, "Remote access after the terminal")
 
-        def close(word):
-            click(word)
-            win.id = main
-            win.command("xdotool", "windowfocus", main)
+        def ended(word):
+            state = win.wait(lambda s: (t := terminal(s)) is not None and t["exited"], "the terminal command to end")
+            assert word in terminal(state)["status"], terminal(state)
 
-        def submit(removing=False):
-            confirm()
-            win.word("password")
+        def submit(before, removing=False):
+            win.press("Run", TERMINAL)
+            # The fixture turns echo off before it prints its prompt; typing earlier would echo.
+            win.wait(lambda s: (t := terminal(s)) is not None and t["running"] and t["echo"] is False,
+                     "the password prompt with echo off")
             if removing:
                 assert "Err" in admin({"type": "enable", "origin": "https://" + NODE + ":8443", "port": 48162})
                 assert status()["enabled"]
             win.text(CANARY)
-            time.sleep(.15)
+            # OCR proves what the PTY really drew: the prompt, never the typed password.
             pic = home / "typed.png"
-            win.command("import", "-window", win.id, str(pic))
-            screen = win.command("tesseract", str(pic), "stdout", "--psm", "11").lower()
-            assert "password" in screen and "nimbus" not in screen, screen
+            deadline = time.monotonic() + 30
+            while True:
+                time.sleep(.15)
+                win.command("import", "-window", win.window(TERMINAL), str(pic))
+                screen = win.command("tesseract", str(pic), "stdout", "--psm", "11").lower()
+                assert "nimbus" not in screen, screen
+                if "password" in screen:
+                    break
+                assert time.monotonic() < deadline, f"No password prompt drawn. Read {screen!r}"
             win.key("Return")
-            win.word("Exited")
-            close("Close")
+            ended("Exited")
+            return close("Close", before)
 
-        click("Settings")
-        click("Remote")
-        click("Enable")
-        win.word("Copy", same_row="error", click=True)
-        copied = clipboard()
-        assert copied == ERROR, repr(copied)
-        click("command")
-        assert clipboard() == "sudo " + " ".join(ENABLE)
-        review()
-        close("Cancel")
-        win.word("cancelled")
+        win.press("Settings")
+        win.press("Remote access")
+        failed = act("Enable Tailscale Serve")
+        assert failed["notice"] == ERROR and failed["permission"] == "sudo " + " ".join(ENABLE), failed
+        win.press("Copy error")
+        until_clipboard(ERROR)
+        win.press("Copy command")
+        until_clipboard("sudo " + " ".join(ENABLE))
+        cancelled = close("Cancel", review())
+        assert "cancelled" in cancelled["notice"], cancelled
+        win.word("cancelled")  # The notice is really drawn, not only held in state.
         assert not (home / "calls").exists() and not status()["enabled"]
-        click("Enable")
-        review()
+        act("Enable Tailscale Serve")
+        before = review()
         mapping = home / "mapping"
         mapping.write_text(json.dumps({"TCP": {"8443": {"TCPForward": "127.0.0.1:1111"}}}))
-        confirm()
-        win.word("another")
-        close("Close")
+        win.press("Run", TERMINAL)
+        ended("another")
+        conflict = close("Close", before)
+        assert not conflict["enabled"], conflict
         assert not (home / "calls").exists() and not status()["enabled"]
         mapping.unlink()
-        click("Refresh")
-        click("Enable")
-        review()
+        act("Refresh")
+        act("Enable Tailscale Serve")
+        before = review()
         unconfirmed = home / "unconfirmed"
         unconfirmed.touch()
-        submit()
-        win.word("changed")
+        changed = submit(before)
+        assert "changed" in changed["notice"], changed
         assert not mapping.exists() and not status()["enabled"]
         unconfirmed.unlink()
-        click("Enable")
-        review()
-        submit()
-        win.word("Pair")
+        act("Enable Tailscale Serve")
+        enabled = submit(review())
+        assert enabled["enabled"] and not enabled["permission"], enabled
+        win.control("Pair a device")
         assert mapping.exists() and status()["enabled"] and status()["origin"] == "https://" + NODE + ":8443"
-        click("Disable")
-        click("command")
-        assert clipboard() == "sudo " + " ".join(DISABLE)
+        pending = act("Disable remote access")
+        assert pending["permission"] == "sudo " + " ".join(DISABLE), pending
+        win.press("Copy command")
+        until_clipboard("sudo " + " ".join(DISABLE))
         assert status()["enabled"] and mapping.exists()
-        review()
-        close("Cancel")
-        win.word("cancelled")
+        cancelled = close("Cancel", review())
+        assert "cancelled" in cancelled["notice"], cancelled
         assert status()["enabled"] and mapping.exists()
-        click("Disable")
-        review()
-        submit(removing=True)
-        win.word("Enable")
+        act("Disable remote access")
+        disabled = submit(review(), removing=True)
+        assert not disabled["enabled"], disabled
+        win.control("Enable Tailscale Serve")
         assert not mapping.exists() and not status()["enabled"]
         assert [json.loads(line) for line in (home / "calls").read_text().splitlines()] == [ENABLE, ENABLE, DISABLE]
         print("Tailscale permission recovery passed for clipboard, cancel, conflict, PTY non-echo, exact commands and verified host origin.")
