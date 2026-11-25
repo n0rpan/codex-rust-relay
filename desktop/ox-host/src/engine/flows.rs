@@ -11,6 +11,8 @@ use ox_desk_core::{
 
 /// Longest wait for a handoff source's older history or a read's transcript.
 const LOAD_WAIT: Duration = Duration::from_secs(40);
+/// Longest wait for the target model's context window before the default is used.
+const WINDOW_WAIT: Duration = Duration::from_secs(12);
 /// Bytes of item text one read_ox_thread page returns at most.
 const PAGE_BYTES: usize = 256 * 1024;
 
@@ -221,28 +223,40 @@ impl Engine {
         if let Some(reason) = self.handoff_blocker(scope, &start.source) {
             return Err(io::Error::other(reason));
         }
+        // The helper may run provider model discovery, so the catalog lookup
+        // never blocks the engine. A slow or failed lookup uses the default budget.
+        let window = std::sync::Arc::new(std::sync::Mutex::new(None));
+        match &start.route().billing {
+            ox_desk_core::runtime::Billing::Api(alias) => {
+                let (slot, alias, config) = (window.clone(), alias.clone(), self.config.clone());
+                let (tx, source) = (self.tx.clone(), scope.clone());
+                let generation = self.running.get(scope).map(|l| l.generation);
+                thread::spawn(move || {
+                    let found = ox_desk_core::ports::ox::request::<BTreeMap<String, u64>>(
+                        &config.ox,
+                        &config.path,
+                        ox_desk_core::settings_protocol::Request::ModelContexts,
+                    )
+                    .ok()
+                    .and_then(|w| w.get(&alias).copied());
+                    *slot.lock().unwrap() = Some(found);
+                    if let Some(generation) = generation {
+                        let _ = tx.send(Message::Runtime(source, generation));
+                    }
+                });
+            }
+            ox_desk_core::runtime::Billing::Subscription => *window.lock().unwrap() = Some(None),
+        }
         self.preparing.push(Preparing {
             source: scope.clone(),
             start,
             reply: Replier::Client(client, key.to_owned()),
             device: format!("client-{client}"),
             deadline: Instant::now() + LOAD_WAIT,
+            window,
+            window_deadline: Instant::now() + WINDOW_WAIT,
         });
         Ok(())
-    }
-
-    /// The context window OX's catalog records for the target's API alias.
-    fn context_window(&self, route: &ox_desk_core::runtime::Route) -> Option<u64> {
-        let ox_desk_core::runtime::Billing::Api(alias) = &route.billing else {
-            return None;
-        };
-        let windows: BTreeMap<String, u64> = ox_desk_core::ports::ox::request(
-            &self.config.ox,
-            &self.config.path,
-            ox_desk_core::settings_protocol::Request::ModelContexts,
-        )
-        .ok()?;
-        windows.get(alias).copied()
     }
 
     /// Resolve, select and open the target. Nothing starts on an error.
@@ -252,8 +266,10 @@ impl Engine {
             start,
             reply,
             device,
+            window,
             ..
         } = prep;
+        let window = window.lock().unwrap().flatten();
         macro_rules! fail {
             ($e:expr) => {
                 return Err((reply, $e))
@@ -309,7 +325,6 @@ impl Engine {
             Ok(t) => t,
             Err(e) => fail!(e.to_string()),
         };
-        let window = self.context_window(&target.route);
         let selection = match handoff::select(&items, &start.request, window) {
             Ok(s) => s,
             Err(e) => fail!(e),
@@ -418,7 +433,9 @@ impl Engine {
                 )?;
                 continue;
             };
-            if t.has_older() || t.is_loading() {
+            let waiting_window =
+                prep.window.lock().unwrap().is_none() && prep.window_deadline > now;
+            if t.has_older() || t.is_loading() || waiting_window {
                 if prep.deadline <= now {
                     self.answer(
                         prep.reply,
@@ -428,7 +445,7 @@ impl Engine {
                     )?;
                     continue;
                 }
-                if !t.is_loading() {
+                if t.has_older() && !t.is_loading() {
                     let _ = live
                         .store
                         .dispatch(Action::LoadOlder(prep.start.source.clone()));

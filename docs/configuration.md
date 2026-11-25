@@ -738,9 +738,30 @@ inside the launch, with approvals denied as before, add this to `codeox.toml`:
 host = "never"   # default "auto": use the session host when one is running
 ```
 
-Workers start with read access in the current project. Tell the main agent
-explicitly when a worker may edit files. Client permissions still apply,
-including to shell commands. Give concurrent writers separate working
+When you switch a session to YOLO in OX Desktop or on the phone, you can
+also allow YOLO for its workers and handoffs. That grant covers the session's
+descendants until you revoke it; running children keep their mode. To turn
+the grant on by default for every session of a project, list the project:
+
+```toml
+[workers]
+yolo_grant_projects = ["/home/me/src/app"]   # absolute project directories
+```
+
+There is no global switch. Only list projects whose agents you would let run
+without permission prompts. Their YOLO workers and handoffs then start without
+asking, and the session ledger records the project grant as what allowed them.
+
+With the session host running, workers start in the main session's own
+permission mode, mapped to the worker's runtime (Codex Read only ↔ Claude Plan,
+Workspace ↔ Accept edits, Auto-review ↔ Auto, YOLO ↔ bypass permissions).
+The main agent can lower it with `start_ox_worker`'s `permission_mode`
+(`read`, `write`, `classifier` or `yolo`) and can never raise it. A worker
+that would start in YOLO or bypass waits until you accept it in OX Desktop or
+on a paired phone, unless you granted YOLO for that session's workers and
+handoffs. Without a host, workers start with read access, and write access
+when you tell the main agent a worker may edit files. Client permissions still
+apply, including to shell commands. Give concurrent writers separate working
 directories by starting their parent sessions there. The main session and
 its built-in subagents use your subscription. The worker bills the API provider
 you picked or the Claude subscription you requested.
@@ -760,6 +781,19 @@ model. If a mode fails, check the job status. You can also run it directly in
 `ox codex --model <alias>` or `ox claude --model <alias>`.
 [Codex Goal mode](https://learn.chatgpt.com/docs/long-running-work) ·
 [Claude Code workflows](https://code.claude.com/docs/en/workflows)
+
+### Continue a session in another runtime, route or model
+
+In OX Desktop, type `/handoff codex:<alias> <request>` or `/handoff claude[:<alias>]
+<request>` in a session, or choose **Continue in…** in the command palette. On
+the phone, use **Continue in…** in the session menu. The new native session
+starts with a budgeted selection of the real earlier messages, not a summary,
+then your request. It links back to the source, and its agent can read the
+rest of the source with `read_ox_thread`. It starts in the source's permission
+mode unless you choose another with `--mode` or in the sheet. A Claude session
+cannot move between billing routes, so switching from the Claude subscription
+to an API alias is also a handoff. The source must be idle with no pending
+requests. Before a conversation goes to a different provider, OX says which one.
 
 ### Upgrade from the original single-provider relay
 

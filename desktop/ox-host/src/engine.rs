@@ -123,6 +123,10 @@ struct Preparing {
     reply: Replier,
     device: String,
     deadline: Instant,
+    /// The target's context window, looked up off the engine thread. The outer
+    /// None means the lookup is still running.
+    window: std::sync::Arc<std::sync::Mutex<Option<Option<u64>>>>,
+    window_deadline: Instant,
 }
 /// A read_ox_thread call waiting for its source transcript to load.
 struct Reading {
@@ -235,6 +239,12 @@ impl Engine {
                         .chain(r.launching.as_ref().map(|l| l.deadline))
                 })
                 .chain(self.preparing.iter().map(|p| p.deadline))
+                .chain(
+                    self.preparing
+                        .iter()
+                        .map(|p| p.window_deadline)
+                        .filter(|at| *at > Instant::now()),
+                )
                 .chain(self.reading.iter().map(|r| r.deadline))
                 .min();
             let msg = if deadline.is_some_and(|at| at <= Instant::now()) {
@@ -3213,7 +3223,15 @@ mod tests {
             );
         }
 
-        fn claude_source(root: &Path) -> Scope {
+        /// Wait for the off-thread context window lookup, then advance the handoff.
+        fn settle(engine: &mut Engine, target: &Scope) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while engine.running[target].launching.is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+                engine.advance_flows().unwrap();
+            }
+        }
+                fn claude_source(root: &Path) -> Scope {
             Scope {
                 project: root.canonicalize().unwrap(),
                 route: Runtime::Claude.route(None),
@@ -3330,6 +3348,7 @@ mod tests {
                     )
                     .unwrap();
                 engine.process(&source, vec![], true).unwrap();
+                settle(&mut engine, &target);
                 let l = engine.running[&target]
                     .launching
                     .as_ref()
@@ -3418,6 +3437,82 @@ mod tests {
                     .as_deref()
                     .unwrap()
                     .contains("Nothing was retried")
+            );
+        }
+
+        #[test]
+        fn a_same_runtime_route_change_is_a_handoff_with_a_claude_context_block() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let source = claude_source(root.path());
+            let target = Scope {
+                route: Runtime::Claude.route(Some("fixture".into())),
+                ..source.clone()
+            };
+            let items = [("u1", "user", "first request"), ("a1", "assistant", "done")];
+            engine.running.insert(
+                source.clone(),
+                live_with(
+                    &source,
+                    vec![view(&source, "s", "idle", "auto")],
+                    vec![("s", timeline(&items, false))],
+                    vec![],
+                )
+                .0,
+            );
+            let (l, log) = live(&target, vec![], &[], vec![]);
+            engine.running.insert(target.clone(), l);
+            engine
+                .act(
+                    1,
+                    "h1",
+                    &source,
+                    Action::StartHandoff(HandoffStart {
+                        source: "s".into(),
+                        runtime: Runtime::Claude,
+                        model: Some("fixture".into()),
+                        mode: Default::default(),
+                        request: "continue on the API".into(),
+                        yolo_confirmed: false,
+                    }),
+                    None,
+                )
+                .unwrap();
+            engine.process(&source, vec![], true).unwrap();
+            settle(&mut engine, &target);
+            let o = &engine.running[&target].launching.as_ref().unwrap().origin;
+            // Claude Auto is a classifier mode and is inherited without asking.
+            assert_eq!(o.started, Some(Access::Auto));
+            assert!(o.yolo.is_none());
+            let confirm = LinkEvent::Host(Box::new(Server::Delta {
+                cursor: Cursor {
+                    epoch: "e".into(),
+                    seq: 3,
+                },
+                scope: target.clone(),
+                changes: vec![Change::State {
+                    connection: "ready".into(),
+                    capabilities: vec!["start".into()],
+                    detail: json!({"next_access": "auto"}),
+                }],
+            }));
+            engine.process(&target, vec![confirm], false).unwrap();
+            let (text, carried) = log
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|(a, _)| match a {
+                    Action::InjectHandoff(t, i) => Some((t.clone(), i.clone())),
+                    _ => None,
+                })
+                .expect("first turn");
+            assert!(carried.is_empty(), "Claude Code has no history injection");
+            let (block, request) = ox_desk_core::handoff::split_claude_turn(&text).unwrap();
+            assert_eq!(request, "continue on the API");
+            assert!(
+                block.contains("first request")
+                    && block.contains("<message role=\"assistant\" id=\"a1\">")
             );
         }
 

@@ -900,6 +900,15 @@ def run(harness, screenshot=None):
         js("document.getElementById('worker-runtime').value='claude';document.getElementById('worker-task').value='Check the pool limits';document.getElementById('worker-form').requestSubmit()")
         wait(lambda: any(isinstance(a, dict) and a.get("start_worker", {}).get("parent") == "child"
                          and a["start_worker"]["task"] == "Check the pool limits" for a in host.actions))
+        assert any(a["start_worker"].get("permission") == "inherit" for a in host.actions
+                   if isinstance(a, dict) and "start_worker" in a), "workers inherit by default"
+        # The operator continues the open session in another route with the inherited mode.
+        js("document.getElementById('continue-in').click()")
+        js("const r=document.getElementById('handoff-runtime');for(const v of ['codex','claude']){r.value=v;r.dispatchEvent(new Event('change'));if(document.getElementById('handoff-route').options.length)break}"
+           "document.getElementById('handoff-request').value='Carry on elsewhere';document.getElementById('handoff-form').requestSubmit()")
+        wait(lambda: any(isinstance(a, dict) and a.get("start_handoff", {}).get("source") == "child"
+                         and a["start_handoff"]["mode"] == "inherit" and not a["start_handoff"]["yolo_confirmed"]
+                         and a["start_handoff"]["request"] == "Carry on elsewhere" for a in host.actions))
         phone_report(js, port, base, keypress, capture, screenshot)
         js(
             "document.getElementById('home').click();document.getElementById('new').click();document.getElementById('new-form').requestSubmit()"
