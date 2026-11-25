@@ -328,7 +328,9 @@ impl Engine {
                     break;
                 }
                 Some(Message::Drain(bound)) => {
-                    let at = Instant::now() + bound;
+                    let at = Instant::now()
+                        .checked_add(bound)
+                        .unwrap_or_else(|| Instant::now() + crate::control::MAX_BOUND);
                     self.draining = Some(self.draining.map_or(at, |d| d.min(at)));
                     eprintln!(
                         "OX host: draining for an update, {} running turn(s), at most {}s",
@@ -1373,28 +1375,25 @@ impl Engine {
         });
         self.answer(f.reply, result)
     }
-    /// Check policy, then hand the launch to the worker's own runtime. Nothing
-    /// starts unless every check passes. The reply waits for the native session,
-    /// or, for a YOLO child that needs the operator, returns at once with
-    /// `waiting_for_operator`.
-    /// Turns still running in hosted sessions, plus worker launches in flight.
+    /// Work a drain waits for: turns in progress in any loaded thread, worker
+    /// launches and handoff targets not yet confirmed, and handoffs still
+    /// preparing or reading their source.
     fn running_turns(&self) -> usize {
         self.running
             .values()
             .map(|live| {
-                live.store
-                    .threads()
-                    .iter()
-                    .filter(|r| {
-                        live.store
-                            .transcript(&r.id)
-                            .is_some_and(|t| t.active_turn().is_some())
-                    })
-                    .count()
+                live.store.active_turns()
                     + usize::from(live.launching.is_some())
+                    + usize::from(live.confirming.is_some())
             })
-            .sum()
+            .sum::<usize>()
+            + self.preparing.len()
+            + self.reading.len()
     }
+    /// Check policy, then hand the launch to the worker's own runtime. Nothing
+    /// starts unless every check passes. The reply waits for the native session,
+    /// or, for a YOLO child that needs the operator, returns at once with
+    /// `waiting_for_operator`.
     fn launch(&mut self, caller: Caller, start: WorkerStart, reply: Replier) -> io::Result<()> {
         match self.accept_launch(&caller, start) {
             Ok(Accepted::Launch(scope, launching)) => {

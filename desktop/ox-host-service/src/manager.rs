@@ -269,6 +269,13 @@ fn install(paths: &Paths, file: &Path) -> io::Result<()> {
         service(&["daemon-reload"])?;
         service(&["enable", UNIT])?;
     }
+    // Clear any earlier `launchctl disable`, even when a host started on demand
+    // is already running, so the agent loads at the next login.
+    #[cfg(target_os = "macos")]
+    for domain in domains() {
+        let name = format!("{domain}/{LABEL}");
+        let _ = run("launchctl", &["enable".as_ref(), name.as_ref()]);
+    }
     if !is_running(paths)? {
         start()?;
     }

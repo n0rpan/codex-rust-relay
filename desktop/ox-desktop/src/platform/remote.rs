@@ -34,13 +34,7 @@ pub struct Node {
     pub login: String,
     state: Config,
 }
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Config {
-    Free,
-    Owned,
-    Conflict,
-    Public,
-}
+use ox_host_web::serve::Config;
 impl Node {
     pub fn ready(&self) -> bool {
         self.state == Config::Owned
@@ -260,40 +254,7 @@ fn output(args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(stdout)
 }
 fn configuration(v: &Value, authority: &str) -> Config {
-    let port_match = |name: &str| name.rsplit_once(':').is_some_and(|(_, p)| p == HTTPS);
-    if v["AllowFunnel"]
-        .as_object()
-        .is_some_and(|m| m.iter().any(|(k, b)| port_match(k) && b == true))
-    {
-        return Config::Public;
-    }
-    if let Some(fg) = v["Foreground"].as_object() {
-        for f in fg.values() {
-            match configuration(f, authority) {
-                Config::Public => return Config::Public,
-                Config::Free => (),
-                _ => return Config::Conflict,
-            }
-        }
-    }
-    let tcp = &v["TCP"][HTTPS];
-    let mut webs = v["Web"]
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter(|(k, _)| port_match(k));
-    match (webs.next(), webs.next()) {
-        (None, None) if tcp.is_null() => Config::Free,
-        (Some((key, web)), None)
-            if key == authority
-                && tcp["HTTPS"] == true
-                && web["Handlers"].as_object().is_some_and(|m| m.len() == 1)
-                && web["Handlers"]["/"]["Proxy"] == PROXY =>
-        {
-            Config::Owned
-        }
-        _ => Config::Conflict,
-    }
+    ox_host_web::serve::configuration(v, authority, HTTPS, PROXY)
 }
 fn inspect() -> Result<Node, String> {
     let v: Value = serde_json::from_slice(&output(&["status", "--json", "--peers=false"])?)

@@ -110,7 +110,7 @@ fn run(paths: Paths) -> io::Result<()> {
     }
     result
 }
-const USAGE: &str = "Usage: ox-host [--socket PATH --state-dir PATH] COMMAND
+const USAGE: &str = "Usage: ox-host COMMAND [--socket PATH] [--state-dir PATH] [ARGS]
   run                       serve sessions (what the login service runs)
   install                   start the host at login (launchd or systemd user service)
   status                    show whether the host and its login service run

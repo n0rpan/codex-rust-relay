@@ -1,9 +1,11 @@
 name: Fast lane
 
 # The fast lane answers "is this push sane?" in under five minutes on a warm
-# cache. It runs on every push to any branch and on every pull request update.
+# cache. It runs on every push to a branch and on every pull request update.
 # Pull requests from this repository are already covered by the push run on
 # their head commit, so the pull_request trigger only runs jobs for forks.
+# On main, tags and manual release runs, ci.yml calls this workflow instead,
+# so the same checks gate the dev and tagged releases.
 #
 # Jobs run in parallel; none waits on another:
 #   - root:      fmt, clippy and unit tests of the `ox` crate, installer lint
@@ -17,9 +19,10 @@ name: Fast lane
 # stock sessions in the packaged app) lives in desktop.yml.
 on:
   push:
-    branches: ['**']
+    branches: ['**', '!main']
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read

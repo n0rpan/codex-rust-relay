@@ -178,6 +178,9 @@ impl SavedScope {
     }
 }
 
+/// The session ledger file in the host state directory.
+pub(crate) const LEDGER: &str = "ownership-v1.json";
+
 pub(crate) struct Ledger {
     failed: bool,
     path: PathBuf,
@@ -185,7 +188,7 @@ pub(crate) struct Ledger {
 }
 impl Ledger {
     pub(crate) fn open(dir: &Path) -> io::Result<Self> {
-        let path = dir.join("ownership-v1.json");
+        let path = dir.join(LEDGER);
         let data = match File::open(&path) {
             Ok(f) => serde_json::from_reader(BufReader::new(f))?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => Owned::default(),

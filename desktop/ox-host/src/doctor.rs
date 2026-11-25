@@ -6,6 +6,7 @@
 //! Funnel exposes it, or a stock client is below OX's floor.
 use crate::{control, durable::Ledger, handover, runtime::RuntimeConfig};
 use ox_host_service::{Paths, errlog};
+use ox_host_web::serve::Config;
 use serde_json::Value;
 use std::{
     io,
@@ -115,6 +116,17 @@ fn host(paths: &Paths, report: &mut Report) -> bool {
             );
             false
         }
+        Ok(Some(probe)) if probe.refused.is_some() => {
+            report.add(
+                Level::Fail,
+                format!(
+                    "host: running (pid {}) but refused this version: {}",
+                    probe.pid,
+                    probe.refused.as_deref().unwrap_or_default()
+                ),
+            );
+            true
+        }
         Ok(Some(probe)) => {
             match &probe.host {
                 Some(info) => {
@@ -187,39 +199,15 @@ impl Tailscale {
     }
 }
 
-/// What Tailscale Serve does with OX's HTTPS port.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Serve {
-    Off,
-    /// Serves the expected origin and proxies to the host's loopback port.
-    Routed,
-    Funnel,
-    Other,
-}
-
-pub(crate) fn serve_state(v: &Value, authority: &str, port: u16) -> Serve {
-    let on_port = |name: &str| name.rsplit_once(':').is_some_and(|(_, p)| p == SERVE_PORT);
-    if v["AllowFunnel"]
-        .as_object()
-        .is_some_and(|m| m.iter().any(|(k, b)| on_port(k) && b == true))
-    {
-        return Serve::Funnel;
-    }
-    let web = v["Web"]
-        .as_object()
-        .into_iter()
-        .flatten()
-        .find(|(k, _)| on_port(k));
-    match web {
-        None if v["TCP"][SERVE_PORT].is_null() => Serve::Off,
-        Some((key, web))
-            if key == authority
-                && web["Handlers"]["/"]["Proxy"] == format!("http://127.0.0.1:{port}") =>
-        {
-            Serve::Routed
-        }
-        _ => Serve::Other,
-    }
+/// What Tailscale Serve does with OX's HTTPS port, judged by the same rules
+/// as the desktop's Remote access setup.
+pub(crate) fn serve_state(v: &Value, authority: &str, port: u16) -> Config {
+    ox_host_web::serve::configuration(
+        v,
+        authority,
+        SERVE_PORT,
+        &format!("http://127.0.0.1:{port}"),
+    )
 }
 
 fn remote(paths: &Paths, report: &mut Report, tailscale: &Tailscale) {
@@ -261,23 +249,23 @@ fn remote(paths: &Paths, report: &mut Report, tailscale: &Tailscale) {
             format!("remote access: on for {origin}, but Tailscale Serve could not be read: {e}"),
         ),
         Ok(v) => match serve_state(&v, &authority, status.port) {
-            Serve::Routed => report.info(format!(
+            Config::Owned => report.info(format!(
                 "remote access: {origin} → 127.0.0.1:{} (tailnet only)",
                 status.port
             )),
-            Serve::Funnel => report.add(
+            Config::Public => report.add(
                 Level::Fail,
                 format!(
                     "remote access: Funnel exposes port {SERVE_PORT} to the internet. OX refuses public access; run `tailscale funnel {SERVE_PORT} off`."
                 ),
             ),
-            Serve::Off => report.add(
+            Config::Free => report.add(
                 Level::Fail,
                 format!(
                     "remote access: on for {origin}, but Tailscale Serve is off. Turn Remote access off and on in Desktop settings."
                 ),
             ),
-            Serve::Other => report.add(
+            Config::Conflict => report.add(
                 Level::Fail,
                 format!(
                     "remote access: Tailscale Serve port {SERVE_PORT} does not route {origin} to the host. Turn Remote access off and on in Desktop settings."
@@ -432,12 +420,14 @@ mod tests {
     fn serve_status_is_routed_off_other_or_funnel() {
         let authority = "box.tail.ts.net:8443";
         let routed = json!({"TCP":{"8443":{"HTTPS":true}},"Web":{authority:{"Handlers":{"/":{"Proxy":"http://127.0.0.1:48162"}}}}});
-        assert_eq!(serve_state(&routed, authority, 48162), Serve::Routed);
-        assert_eq!(serve_state(&json!({}), authority, 48162), Serve::Off);
-        assert_eq!(serve_state(&routed, authority, 1234), Serve::Other);
+        assert_eq!(serve_state(&routed, authority, 48162), Config::Owned);
+        assert_eq!(serve_state(&json!({}), authority, 48162), Config::Free);
+        assert_eq!(serve_state(&routed, authority, 1234), Config::Conflict);
         let mut funnel = routed.clone();
         funnel["AllowFunnel"] = json!({authority: true});
-        assert_eq!(serve_state(&funnel, authority, 48162), Serve::Funnel);
+        assert_eq!(serve_state(&funnel, authority, 48162), Config::Public);
+        let foreground = json!({"Foreground": {"session": funnel}});
+        assert_eq!(serve_state(&foreground, authority, 48162), Config::Public);
     }
 
     #[test]

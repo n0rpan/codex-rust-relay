@@ -17,6 +17,15 @@ impl Store {
         self.transcripts.get(id)
     }
 
+    /// Loaded threads with a turn in progress, whether or not the catalog
+    /// page lists them (workers, search results, later pages).
+    pub fn active_turns(&self) -> usize {
+        self.transcripts
+            .values()
+            .filter(|t| t.active_turn().is_some())
+            .count()
+    }
+
     pub fn take_remeasure(&mut self, id: &str) -> Vec<usize> {
         self.transcripts
             .get_mut(id)

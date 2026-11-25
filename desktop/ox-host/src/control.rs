@@ -21,13 +21,16 @@ use std::{
 
 const BOUND_FILE: &str = "drain-bound";
 pub(crate) const DEFAULT_BOUND: Duration = Duration::from_secs(600);
+/// No drain waits longer than a day.
+pub(crate) const MAX_BOUND: Duration = Duration::from_secs(86_400);
 
 /// The bound a running host uses for a drain: what `restart` wrote, or the default.
 pub(crate) fn drain_bound(state_dir: &Path) -> Duration {
     let bound = fs::read_to_string(state_dir.join(BOUND_FILE))
         .ok()
         .and_then(|s| s.trim().parse().ok())
-        .map_or(DEFAULT_BOUND, Duration::from_secs);
+        .map_or(DEFAULT_BOUND, Duration::from_secs)
+        .min(MAX_BOUND);
     let _ = fs::remove_file(state_dir.join(BOUND_FILE));
     bound
 }
@@ -38,7 +41,9 @@ pub(crate) fn timeout(args: &[String]) -> io::Result<Duration> {
         [flag, secs] if flag == "--timeout" => secs
             .parse()
             .map(Duration::from_secs)
-            .map_err(|_| io::Error::other("--timeout takes a number of seconds")),
+            .ok()
+            .filter(|d| *d <= MAX_BOUND)
+            .ok_or_else(|| io::Error::other("--timeout takes 0 to 86400 seconds")),
         _ => Err(io::Error::other("Usage: ox host restart [--timeout SECS]")),
     }
 }
@@ -49,6 +54,9 @@ pub(crate) struct Probe {
     pub version: u32,
     pub host: Option<HostInfo>,
     pub capabilities: Vec<String>,
+    /// The host refused this client's hello, for example over a protocol
+    /// version. It still runs, and can still be stopped by its pid.
+    pub refused: Option<String>,
 }
 
 pub(crate) fn probe(paths: &Paths) -> io::Result<Option<Probe>> {
@@ -66,21 +74,27 @@ pub(crate) fn probe(paths: &Paths) -> io::Result<Option<Probe>> {
     stream.write_all(&hello)?;
     let mut line = String::new();
     BufReader::new(&stream).read_line(&mut line)?;
-    let (version, host, capabilities) = match serde_json::from_str(&line) {
+    let (version, host, capabilities, refused) = match serde_json::from_str(&line) {
         Ok(Server::Hello {
             version,
             host,
             capabilities,
             ..
-        }) => (version, host, capabilities),
-        Ok(Server::Error { message, .. }) => return Err(io::Error::other(message)),
-        _ => (0, None, vec![]),
+        }) => (version, host, capabilities, None),
+        Ok(Server::Error { message, .. }) => (0, None, vec![], Some(message)),
+        _ => (
+            0,
+            None,
+            vec![],
+            Some("the host's hello could not be read".into()),
+        ),
     };
     Ok(Some(Probe {
         pid,
         version,
         host,
         capabilities,
+        refused,
     }))
 }
 
@@ -130,10 +144,27 @@ fn signal(pid: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
     Ok(())
 }
 
-fn wait_stopped(paths: &Paths, within: Duration) -> io::Result<bool> {
-    let until = Instant::now() + within;
+/// Whether a process has exited. A zombie has exited: its parent just has not
+/// reaped it yet.
+fn exited(pid: libc::pid_t) -> bool {
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+        return stat
+            .rsplit_once(')')
+            .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'));
+    }
+    false
+}
+
+/// Wait until the socket is closed and the process has exited, so the service
+/// manager sees the unit stopped before anything starts it again.
+fn wait_stopped(paths: &Paths, pid: libc::pid_t, within: Duration) -> io::Result<bool> {
+    let until = Instant::now() + within.min(MAX_BOUND + Duration::from_secs(60));
     while Instant::now() < until {
-        if !is_running(paths)? {
+        if !is_running(paths)? && exited(pid) {
             return Ok(true);
         }
         thread::sleep(Duration::from_millis(100));
@@ -147,7 +178,7 @@ pub(crate) fn stop(paths: &Paths) -> io::Result<()> {
         return Ok(());
     };
     signal(host.pid, libc::SIGTERM)?;
-    if !wait_stopped(paths, Duration::from_secs(15))? {
+    if !wait_stopped(paths, host.pid, Duration::from_secs(15))? {
         return Err(io::Error::other(format!(
             "OX host (pid {}) did not stop within 15 seconds",
             host.pid
@@ -160,7 +191,7 @@ pub(crate) fn stop(paths: &Paths) -> io::Result<()> {
 pub(crate) fn restart(paths: &Paths, bound: Duration) -> io::Result<()> {
     match probe(paths)? {
         None => println!("OX host was not running."),
-        Some(host) if host.host.is_some() => {
+        Some(host) if host.host.is_some() && host.refused.is_none() => {
             fs::write(
                 paths.state_dir.join(BOUND_FILE),
                 bound.as_secs().to_string(),
@@ -171,7 +202,7 @@ pub(crate) fn restart(paths: &Paths, bound: Duration) -> io::Result<()> {
                 host.host.as_ref().map_or("", |h| h.version.as_str()),
                 bound.as_secs()
             );
-            if !wait_stopped(paths, bound + Duration::from_secs(15))? {
+            if !wait_stopped(paths, host.pid, bound + Duration::from_secs(15))? {
                 return Err(io::Error::other(
                     "The OX host did not stop after its drain bound. Run ox host stop.",
                 ));
@@ -187,10 +218,14 @@ pub(crate) fn restart(paths: &Paths, bound: Duration) -> io::Result<()> {
         }
         Some(host) => {
             println!(
-                "The running OX host predates drain support; stopping it interrupts its running turns."
+                "The running OX host {}; stopping it interrupts its running turns.",
+                host.refused.as_deref().map_or_else(
+                    || "predates drain support".to_owned(),
+                    |why| format!("cannot drain for this version ({why})")
+                )
             );
             signal(host.pid, libc::SIGTERM)?;
-            if !wait_stopped(paths, Duration::from_secs(15))? {
+            if !wait_stopped(paths, host.pid, Duration::from_secs(15))? {
                 return Err(io::Error::other("The old OX host did not stop."));
             }
         }
@@ -206,24 +241,24 @@ pub(crate) fn restart(paths: &Paths, bound: Duration) -> io::Result<()> {
 /// Remove the login service and delete OX host state. Stock client data
 /// (CODEX_HOME, CLAUDE_CONFIG_DIR, native transcripts) is never touched.
 pub(crate) fn purge(paths: &Paths) -> io::Result<()> {
+    let dir = &paths.state_dir;
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    // Only a directory the host has run in: it holds the session ledger that
+    // only `ox-host run` writes. Checked before anything below creates files.
+    let owned = dir.join(crate::durable::LEDGER).is_file()
+        && dir.components().count() > 2
+        && home.is_none_or(|h| !h.starts_with(dir));
+    if dir.exists() && !owned {
+        return Err(io::Error::other(format!(
+            "{} does not look like an OX host state directory; not deleting it",
+            dir.display()
+        )));
+    }
     ox_host_service::manage("uninstall", paths)?;
     if probe(paths)?.is_some() {
         stop(paths)?;
     }
-    let dir = &paths.state_dir;
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    // Only a directory the host created: it holds the host's startup lock,
-    // and it is not the home directory or one of its ancestors.
-    let owned = dir.join("startup.lock").is_file()
-        && dir.components().count() > 2
-        && home.is_none_or(|h| !h.starts_with(dir));
     match fs::symlink_metadata(dir) {
-        Ok(m) if m.is_dir() && !owned => {
-            return Err(io::Error::other(format!(
-                "{} does not look like an OX host state directory; not deleting it",
-                dir.display()
-            )));
-        }
         Ok(m) if m.is_dir() => {
             fs::remove_dir_all(dir)?;
             println!(
