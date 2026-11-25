@@ -661,6 +661,70 @@ impl Store {
         process.controls.insert(request, Control::Interrupt);
         Ok(())
     }
+    /// Drop a session's process, which closes its link and kills the process
+    /// group. The thread stays in the catalog; selecting it resumes it.
+    pub(super) fn claude_end(&mut self, id: &str) -> io::Result<()> {
+        let project = self.claude();
+        if project.blank.as_deref() == Some(id) || !project.sessions.contains_key(id) {
+            return Err(io::Error::other("No active Claude session"));
+        }
+        if project.sessions[id].handoff.is_some() {
+            return Err(io::Error::other("This session is opening in a terminal"));
+        }
+        let mut p = self
+            .claude_mut()
+            .sessions
+            .remove(id)
+            .expect("checked above");
+        let mut unsent: Vec<_> = p
+            .events
+            .take_awaiting_echo()
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect();
+        if let Some((_, text)) = p.first.take() {
+            unsent.push(text);
+        }
+        drop(p);
+        self.restore_claude_drafts(id, unsent);
+        let removed: std::collections::HashSet<_> = self
+            .claude()
+            .asks
+            .iter()
+            .filter(|(_, v)| v.0 == id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        self.asks.retain(|a| !removed.contains(&a.id));
+        self.claude_mut().asks.retain(|k, _| !removed.contains(k));
+        for (key, t) in &mut self.transcripts {
+            if key == id || key.strip_prefix(id).is_some_and(|s| s.starts_with('/')) {
+                t.verified = false;
+                t.ready = false;
+                t.loading = false;
+                t.active_turn = None;
+                t.error = None;
+                self.changed.transcript(key);
+            }
+        }
+        self.changed
+            .mark(Changed::CONNECTION | Changed::ASK | Changed::THREADS);
+        Ok(())
+    }
+    pub(super) fn claude_has_live(&self, id: &str) -> bool {
+        let project = self.claude();
+        project.blank.as_deref() != Some(id) && project.sessions.contains_key(id)
+    }
+    pub(super) fn claude_live(&self) -> Vec<String> {
+        let project = self.claude();
+        let mut ids: Vec<String> = project
+            .sessions
+            .keys()
+            .filter(|k| project.blank.as_deref() != Some(k.as_str()))
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
+    }
     pub(super) fn claude_mode(&mut self, id: &str, mode: Access) -> io::Result<()> {
         let process = self
             .claude_mut()

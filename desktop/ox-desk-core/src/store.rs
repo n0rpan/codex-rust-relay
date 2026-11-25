@@ -49,6 +49,8 @@ enum Pending {
     Limits(u64),
     Discover(commands::Discovery),
     LeaveForTerminal(commands::Handoff),
+    /// Best-effort release of a thread this client ended.
+    Unsubscribe,
     Descendants(workers::Discovery),
     ChildIdentity(String),
     ThreadOp(thread_ops::PendingOp),
@@ -141,7 +143,7 @@ impl Store {
     pub fn opening_thread(&self) -> bool {
         // A replica waits for the host to report the session it asked for.
         if let Some(remote) = self.remote() {
-            return remote.await_new;
+            return remote.await_new.is_some();
         }
         self.pending.values().any(|(_, p)| {
             matches!(p, Pending::Compose(compose::Operation::New(_)))
@@ -464,6 +466,7 @@ impl Store {
                 }
                 self.notice = Some(message);
             }
+            Pending::Unsubscribe => (),
             Pending::Discover(stage) => self.discovery_failed(stage, message),
             Pending::Compose(op) => self.compose_failed(op, message),
             Pending::Initialize | Pending::Account => self.state = Connection::Closed(message),
@@ -496,6 +499,7 @@ impl Store {
                 }
             }
             Pending::ThreadOp(_) => self.changed.mark(Changed::THREADS),
+            Pending::Unsubscribe => (),
             Pending::Initialize | Pending::Account => self.changed.mark(Changed::CONNECTION),
             Pending::PaletteSearch(_)
             | Pending::ChildIdentity(_)
@@ -592,6 +596,7 @@ impl Store {
                     (Pending::LeaveForTerminal(handoff), Reply::Unsubscribed(_)) => {
                         self.handoff_ready = Some(handoff);
                     }
+                    (Pending::Unsubscribe, _) => (),
                     (Pending::ThreadOp(op), reply) => self.finish_thread_op(op, reply)?,
                     (Pending::ChildIdentity(id), Reply::Read(read)) => {
                         self.observe_child_identity(&id, *read.thread);

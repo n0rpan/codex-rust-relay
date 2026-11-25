@@ -18,6 +18,9 @@ impl EventState {
     pub(super) fn lifetime(&self) -> std::sync::Weak<()> {
         Arc::downgrade(&self.alive)
     }
+    pub(super) fn take_awaiting_echo(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.awaiting_echo)
+    }
     // A successful queue write alone cannot attest that the CLI read the prompt.
     pub(super) fn sent(&mut self, id: &str, text: &str) {
         self.awaiting_echo.push((id.into(), text.into()));
@@ -171,7 +174,7 @@ impl Store {
             .mark(Changed::CONNECTION | Changed::NOTICE | Changed::ASK | Changed::THREADS);
     }
 
-    fn restore_claude_drafts(&mut self, owner: &str, mut unsent: Vec<String>) {
+    pub(super) fn restore_claude_drafts(&mut self, owner: &str, mut unsent: Vec<String>) {
         if !unsent.is_empty() {
             let draft = self.draft(Some(owner));
             if !draft.is_empty() && unsent.last().is_none_or(|s| s != draft) {
@@ -906,5 +909,54 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn ending_a_session_drops_its_process_and_keeps_it_resumable() {
+        let (mut s, a, b) = fixture();
+        let alive = s.claude().sessions[&a].events.lifetime();
+        assert!(alive.upgrade().is_some());
+        assert_eq!(s.live_threads(), {
+            let mut both = vec![a.clone(), b.clone()];
+            both.sort();
+            both
+        });
+        assert!(s.has_live_session(&a));
+        let request = decode(
+            json!({"type":"control_request","request_id":"r","request":{"subtype":"can_use_tool","tool_name":"Read","tool_use_id":"tool","input":{"file_path":"a"}}}),
+        );
+        for owner in [&a, &b] {
+            update(
+                &mut s,
+                owner,
+                2,
+                Data::Stock(pipe::Event::Frame(request.clone())),
+            )
+            .unwrap();
+        }
+        assert_eq!(s.asks.len(), 2);
+        s.claude_mut().sessions.get_mut(&a).unwrap().first = Some(("m".into(), "unsent".into()));
+        s.end_session(&a).unwrap();
+        // The process (and with it its link and process group) is gone.
+        assert!(alive.upgrade().is_none());
+        assert!(!s.claude().sessions.contains_key(&a));
+        assert!(s.claude().sessions.contains_key(&b));
+        assert_eq!(s.live_threads(), vec![b.clone()]);
+        assert!(!s.has_live_session(&a));
+        // Still listed, closed for sending, its unsent text back in the draft, no stale approval.
+        assert!(s.catalog_row(&a).is_some());
+        assert!(!s.can_send(Some(&a)));
+        assert_eq!(s.draft(Some(&a)), "unsent");
+        assert_eq!(s.asks.len(), 1);
+        assert_eq!(s.asks[0].thread.as_deref(), Some(b.as_str()));
+        assert_eq!(
+            s.state(),
+            &Connection::Connecting,
+            "ending does not close the route"
+        );
+        assert!(s.transcript(&a).is_none_or(|t| t.error().is_none()));
+        // A second end, and the other session, are unaffected.
+        assert!(s.end_session(&a).is_err());
+        assert!(s.has_live_session(&b));
     }
 }

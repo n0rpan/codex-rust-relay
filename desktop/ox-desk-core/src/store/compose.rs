@@ -362,6 +362,83 @@ impl Store {
         )
     }
 
+    /// End this client's live process for a thread. The thread stays in the
+    /// catalog and opens again (Claude `--resume`, Codex `thread/resume`) on the
+    /// next select. A Claude process is dropped, which kills its process group.
+    /// A Codex thread is unsubscribed; the host drops the app-server once no
+    /// thread in the scope is left.
+    pub fn end_session(&mut self, id: &str) -> io::Result<()> {
+        if self.remote().is_some() {
+            return self.forward(crate::actions::Action::EndSession(id.into()));
+        }
+        if self.is_session_scoped() {
+            return self.claude_end(id);
+        }
+        if self.state != Connection::Ready {
+            return Err(io::Error::other("Reconnect to end this session"));
+        }
+        if !self
+            .transcripts
+            .get(id)
+            .is_some_and(|t| t.ready || t.loading)
+        {
+            return Err(io::Error::other("This thread has no live session"));
+        }
+        if self.in_terminal(id) {
+            return Err(io::Error::other("This thread is open in a terminal"));
+        }
+        if self
+            .transcripts
+            .get(id)
+            .is_some_and(|t| t.active_turn().is_some())
+        {
+            // Ending a running turn: interrupt it; the unsubscribe follows anyway.
+            let _ = self.stop(id);
+        }
+        let t = self.transcripts.get_mut(id).expect("checked above");
+        t.ready = false;
+        t.verified = false;
+        t.loading = false;
+        t.error = None;
+        self.changed.transcript(id);
+        self.changed.mark(Changed::THREADS);
+        self.request(Call::Unsubscribe(id.into()), Pending::Unsubscribe)
+    }
+    /// Threads with a live process or subscription in this local store. A
+    /// Claude process is one session; the blank draft process is not listed.
+    pub fn live_threads(&self) -> Vec<String> {
+        if self.remote().is_some() {
+            return vec![];
+        }
+        if self.is_session_scoped() {
+            return self.claude_live();
+        }
+        self.transcripts
+            .iter()
+            .filter(|(id, t)| (t.ready || t.loading) && !self.terminal_threads.contains(*id))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+    /// This thread has a live process or subscription to end.
+    pub fn has_live_session(&self, id: &str) -> bool {
+        if self.remote().is_some() {
+            return false;
+        }
+        if self.is_session_scoped() {
+            return self.claude_has_live(id);
+        }
+        self.transcripts
+            .get(id)
+            .is_some_and(|t| (t.ready || t.loading) && !self.terminal_threads.contains(id))
+    }
+    /// Something in this thread would be lost by ending it now.
+    pub fn thread_busy(&self, id: &str) -> bool {
+        self.transcript(id)
+            .is_some_and(|t| t.active_turn().is_some())
+            || self.sending(Some(id))
+            || self.asks.iter().any(|a| a.thread.as_deref() == Some(id))
+    }
+
     pub(super) fn compose_failed(&mut self, op: Operation, reason: String) {
         let owner = match op {
             Operation::New(s)

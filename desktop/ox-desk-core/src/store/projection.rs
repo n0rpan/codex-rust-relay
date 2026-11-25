@@ -164,6 +164,9 @@ impl Store {
             if running {
                 caps.push("stop".into());
             }
+            if self.has_live_session(id) {
+                caps.push("end".into());
+            }
             if self.can_send(Some(id)) && self.has_command_schema() && !self.commands_loading() {
                 caps.push("native_commands".into());
                 if !running

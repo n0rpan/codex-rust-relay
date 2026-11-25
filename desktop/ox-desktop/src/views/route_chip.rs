@@ -1,10 +1,10 @@
+use super::model_picker::{self, ModelPicker, ModelPickerEvent};
 use super::workbench::Workbench;
 use crate::{
     appearance::Palette,
-    kit::{button, col, field, small},
+    kit::{button, col, small},
 };
 use gpui::*;
-use gpui_component::input::{Input, InputEvent, InputState};
 use ox_desk_core::runtime::Billing;
 use ox_desk_core::{
     slash::Capabilities,
@@ -13,7 +13,6 @@ use ox_desk_core::{
         routes_thread::{Choice, Options},
     },
 };
-use std::collections::HashMap;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -24,49 +23,25 @@ enum Kind {
 pub(super) struct Picker {
     owner: Option<String>,
     kind: Kind,
-    search: Entity<InputState>,
-    favorites: Vec<String>,
+    /// Only the model picker is a searchable shared `ModelPicker`.
+    models: Option<(Entity<ModelPicker>, Subscription)>,
 }
-fn choices(
-    caps: &Capabilities,
-    settings: &Options,
-    kind: Kind,
-    favorites: &[String],
-    query: &str,
-) -> Vec<(String, Choice)> {
-    let needle = query.trim().to_lowercase();
+fn model_entries(caps: &Capabilities) -> Vec<model_picker::Entry> {
+    caps.models
+        .iter()
+        .map(|(id, m)| model_picker::Entry {
+            id: id.clone(),
+            label: if m.label.is_empty() || m.label == *id {
+                id.clone()
+            } else {
+                format!("{} · {id}", m.label)
+            },
+        })
+        .collect()
+}
+fn choices(caps: &Capabilities, settings: &Options, kind: Kind) -> Vec<(String, Choice)> {
     match kind {
-        Kind::Model => {
-            let rank = favorites
-                .iter()
-                .enumerate()
-                .map(|(i, s)| (s.as_str(), i))
-                .collect::<HashMap<_, _>>();
-            let mut rows = caps
-                .models
-                .iter()
-                .filter(|(id, model)| {
-                    id.to_lowercase().contains(&needle)
-                        || model.label.to_lowercase().contains(&needle)
-                })
-                .collect::<Vec<_>>();
-            rows.sort_unstable_by(|(a, _), (b, _)| {
-                rank.get(a.as_str())
-                    .unwrap_or(&usize::MAX)
-                    .cmp(rank.get(b.as_str()).unwrap_or(&usize::MAX))
-                    .then_with(|| a.cmp(b))
-            });
-            rows.into_iter()
-                .map(|(id, m)| {
-                    let label = if m.label.is_empty() || m.label == *id {
-                        id.clone()
-                    } else {
-                        format!("{} · {id}", m.label)
-                    };
-                    (label, Choice::Model(id.clone()))
-                })
-                .collect()
-        }
+        Kind::Model => vec![],
         Kind::Effort => caps
             .models
             .get(&settings.model)
@@ -95,6 +70,27 @@ pub(super) struct NewModelRoute(pub Route);
 impl EventEmitter<NewModelRoute> for Workbench {}
 
 impl Workbench {
+    /// Pick a model for the owner's thread: a new session when the route changes, otherwise an
+    /// option change on the current one.
+    fn choose_model(&mut self, owner: Option<String>, id: String, cx: &mut Context<Self>) {
+        let new_route = self
+            .store
+            .as_ref()
+            .is_some_and(|store| !store.same_model_route(&id))
+            .then(|| self.route.runtime.route(Some(id.clone())));
+        if self.store.as_ref().and_then(|s| s.selected()) == owner.as_deref() {
+            if let Some(route) = new_route {
+                cx.emit(NewModelRoute(route));
+            } else {
+                self.action(
+                    cx,
+                    ox_desk_core::actions::Action::ModelOptions(owner, Choice::Model(id)),
+                );
+            }
+        }
+        self.model_picker = None;
+        cx.notify();
+    }
     fn choice_row(
         &self,
         index: usize,
@@ -169,37 +165,35 @@ impl Workbench {
             cx.notify();
             return;
         }
-        let search = field("", "Search models", false, window, cx);
-        cx.subscribe(&search, |_, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                cx.notify();
-            }
-        })
-        .detach();
-        if kind == Kind::Model {
-            search.read(cx).focus_handle(cx).focus(window, cx);
-        }
+        let models = (kind == Kind::Model).then(|| {
+            let entries = self
+                .store
+                .as_ref()
+                .map(|store| model_entries(&store.command_caps(owner.as_deref())))
+                .unwrap_or_default();
+            let picker = cx.new(|cx| ModelPicker::new(entries, window, cx));
+            let chosen_owner = owner.clone();
+            let subscription = cx.subscribe_in(
+                &picker,
+                window,
+                move |s: &mut Workbench, _, event: &ModelPickerEvent, _, cx| match event {
+                    ModelPickerEvent::Choose(id) => {
+                        s.choose_model(chosen_owner.clone(), id.clone(), cx)
+                    }
+                    ModelPickerEvent::Close => {
+                        s.model_picker = None;
+                        cx.notify();
+                    }
+                    ModelPickerEvent::Starred(_) => {}
+                },
+            );
+            (picker, subscription)
+        });
         self.model_picker = Some(Picker {
             owner,
             kind,
-            search: search.clone(),
-            favorites: vec![],
+            models,
         });
-        if kind == Kind::Model {
-            let task = cx.background_spawn(async { crate::settings::load().map(|s| s.favorites) });
-            cx.spawn(async move |s, cx| {
-                let Ok(favorites) = task.await else { return };
-                let _ = s.update(cx, |s, cx| {
-                    if let Some(p) = s.model_picker.as_mut()
-                        && p.search == search
-                    {
-                        p.favorites = favorites;
-                        cx.notify();
-                    }
-                });
-            })
-            .detach();
-        }
         cx.notify();
     }
     pub(super) fn model_controls(&self, width: Pixels, cx: &Context<Self>) -> Vec<AnyElement> {
@@ -278,7 +272,7 @@ impl Workbench {
                 let mut panel = col()
                     .id("model-picker-list")
                     .w(px(390.).min(width - px(20.)))
-                    .max_h(px(330.))
+                    .max_h(px(380.))
                     .overflow_y_scroll()
                     .p_2()
                     .gap_1()
@@ -294,50 +288,39 @@ impl Workbench {
                             cx.notify();
                         }
                     }));
-                if kind == Kind::Model {
-                    panel = panel.child(Input::new(&picker.search));
-                }
-                let rows = choices(
-                    &caps,
-                    &settings,
-                    kind,
-                    &picker.favorites,
-                    &picker.search.read(cx).value(),
-                );
-                if store.commands_loading() || !store.has_command_schema() {
-                    panel = panel.child(small(p, "Reading installed model capabilities…"));
-                } else if rows.is_empty() {
-                    panel = panel.child(small(p, "No matching choices reported for this model."));
-                }
-                if !rows.is_empty() {
-                    let count = rows.len();
-                    let selected = owner.map(str::to_owned);
-                    let settings = settings.clone();
-                    let favorites = picker.favorites.clone();
-                    let list = uniform_list(
-                        "model-options",
-                        count,
-                        cx.processor(move |workbench, range: std::ops::Range<usize>, _, cx| {
-                            range
-                                .map(|index| {
-                                    let (label, choice) = &rows[index];
-                                    let starred = matches!(choice, Choice::Model(id) if favorites.contains(id));
-                                    let star = crate::kit::star_column(p, starred);
-                                    crate::kit::row()
-                                        .w_full()
-                                        .gap_1()
-                                        .child(star)
-                                        .child(
-                                            div().flex_1().min_w_0().child(workbench.choice_row(
+                if let Some((models, _)) = &picker.models {
+                    panel = panel.child(models.clone());
+                } else {
+                    let rows = choices(&caps, &settings, kind);
+                    if store.commands_loading() || !store.has_command_schema() {
+                        panel = panel.child(small(p, "Reading installed model capabilities…"));
+                    } else if rows.is_empty() {
+                        panel =
+                            panel.child(small(p, "No matching choices reported for this model."));
+                    }
+                    if !rows.is_empty() {
+                        let count = rows.len();
+                        let selected = owner.map(str::to_owned);
+                        let settings = settings.clone();
+                        let list = uniform_list(
+                            "model-options",
+                            count,
+                            cx.processor(move |workbench, range: std::ops::Range<usize>, _, cx| {
+                                range
+                                    .map(|index| {
+                                        let (label, choice) = &rows[index];
+                                        div()
+                                            .w_full()
+                                            .child(workbench.choice_row(
                                                 index, label, choice, &settings, &selected, cx,
-                                            )),
-                                        )
-                                        .into_any_element()
-                                })
-                                .collect::<Vec<_>>()
-                        }),
-                    );
-                    panel = panel.child(list.h(px((count.min(6) * 32) as f32)).w_full());
+                                            ))
+                                            .into_any_element()
+                                    })
+                                    .collect::<Vec<_>>()
+                            }),
+                        );
+                        panel = panel.child(list.h(px((count.min(6) * 32) as f32)).w_full());
+                    }
                 }
                 panel = panel.child(button(
                     p,

@@ -30,7 +30,9 @@ pub struct Remote {
     pub(super) origins: HashMap<String, crate::origin::Origin>,
     /// Host marks on a session: handoffs from it and its YOLO grant.
     pub(super) marks: HashMap<String, Value>,
-    pub(super) await_new: bool,
+    /// The request that opens the session this client is waiting for. Only its
+    /// own `Opened` selects, and only its own `Error` stops the wait.
+    pub(super) await_new: Option<String>,
 }
 impl Remote {
     pub(super) fn can(&self, id: &str, cap: &str) -> bool {
@@ -72,7 +74,7 @@ impl Store {
             schema: false,
             draft_access: None,
             options: HashMap::new(),
-            await_new: false,
+            await_new: None,
             pending: HashMap::new(),
             origins: HashMap::new(),
             marks: HashMap::new(),
@@ -152,15 +154,22 @@ impl Store {
         action: Action,
         owner: Option<String>,
         from_draft: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<String> {
         let id = (self.remote().unwrap().writer)(action, None)?;
         let draft = if from_draft {
             self.drafts.remove(&owner)
         } else {
             None
         };
-        self.remote_mut().pending.insert(id, (owner, draft));
-        Ok(())
+        self.remote_mut().pending.insert(id.clone(), (owner, draft));
+        Ok(id)
+    }
+    /// Send an action that has no approval token and return its request id.
+    fn forward_id(&self, action: Action) -> io::Result<String> {
+        let r = self
+            .remote()
+            .ok_or_else(|| io::Error::other("No host connection"))?;
+        (r.writer)(action, None)
     }
     fn remote_command(
         &mut self,
@@ -187,13 +196,13 @@ impl Store {
             Some(Command::Hint(message)) => return Err(io::Error::other(message)),
             command => {
                 let opens = owner.is_none() && command.is_some_and(|c| c.starts_thread());
-                self.send_input(
+                let id = self.send_input(
                     Action::PaletteCommand(owner.clone(), text),
                     owner,
                     from_draft,
                 )?;
                 if opens {
-                    self.remote_mut().await_new = true;
+                    self.remote_mut().await_new = Some(id);
                 }
             }
         }
@@ -213,12 +222,12 @@ impl Store {
         match action {
             Action::DraftEdit(id, text) => self.edit(id.as_deref(), text),
             Action::ForkThread(_) => {
-                self.forward(action)?;
-                self.remote_mut().await_new = true;
+                let id = self.forward_id(action)?;
+                self.remote_mut().await_new = Some(id);
             }
             Action::NewDraft => {
                 self.selected = None;
-                self.remote_mut().await_new = false;
+                self.remote_mut().await_new = None;
                 self.forward(Action::NewDraft)?;
             }
             Action::SelectThread(ref id) => {
@@ -229,7 +238,7 @@ impl Store {
                 let id = id.clone();
                 self.forward(action)?;
                 self.select_replica(&id);
-                self.remote_mut().await_new = false;
+                self.remote_mut().await_new = None;
             }
             Action::OpenCatalogRow(ref row) | Action::ConfirmAliasAndResume(ref row) => {
                 if !row.worker {
@@ -238,7 +247,7 @@ impl Store {
                 let id = row.id.clone();
                 self.forward(action)?;
                 self.select_replica(&id);
-                self.remote_mut().await_new = false;
+                self.remote_mut().await_new = None;
             }
             Action::Submit(owner) => {
                 if !self.can_send(owner.as_deref()) || self.sending(owner.as_deref()) {
@@ -261,9 +270,9 @@ impl Store {
                     Action::SendImages(owner.clone(), text, images.to_vec())
                 };
                 let opens = owner.is_none();
-                self.send_input(request, owner, true)?;
+                let id = self.send_input(request, owner, true)?;
                 if opens {
-                    self.remote_mut().await_new = true;
+                    self.remote_mut().await_new = Some(id);
                 }
             }
             Action::ExecuteCommand(owner) => {
@@ -292,8 +301,8 @@ impl Store {
                 self.forward(action)?;
             }
             Action::InjectHandoff(..) => {
-                self.forward(action)?;
-                self.remote_mut().await_new = true;
+                let id = self.forward_id(action)?;
+                self.remote_mut().await_new = Some(id);
             }
             action => self.forward(action)?,
         }
@@ -318,12 +327,12 @@ impl Store {
                 });
                 self.changed.mark(Changed::NOTICE);
             }
-            Server::Opened { scope, thread, .. }
+            Server::Opened { id, scope, thread }
                 if scope.project == self.profile.project && scope.route == self.profile.route =>
             {
-                if self.remote().unwrap().await_new {
+                if self.remote().unwrap().await_new.as_deref() == Some(id.as_str()) {
                     self.select_replica(&thread);
-                    self.remote_mut().await_new = false;
+                    self.remote_mut().await_new = None;
                     self.changed.mark(Changed::THREADS);
                 }
                 self.remote_mut().sending.remove("");
@@ -384,6 +393,7 @@ impl Store {
                 }
             }
             Server::Error { id, message } => {
+                let error_id = id.clone();
                 if let Some(thread) = id
                     .as_ref()
                     .and_then(|id| self.remote_mut().unconfirmed_options.remove(id))
@@ -396,7 +406,11 @@ impl Store {
                     draft.restore_before(self.drafts.entry(owner).or_default());
                 }
                 self.notice = Some(message);
-                self.remote_mut().await_new = false;
+                // An unrelated host error must not cancel the auto-select of the
+                // session being opened. Only the opening request's own error does.
+                if error_id.is_some() && self.remote().unwrap().await_new == error_id {
+                    self.remote_mut().await_new = None;
+                }
                 self.changed.mark(Changed::NOTICE);
             }
             _ => (),
@@ -768,5 +782,62 @@ mod local_command_tests {
             .unwrap();
         assert!(store.decline_reviewed_command(&id, "new-ask").is_err());
         assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn only_the_opening_requests_own_error_cancels_the_auto_select() {
+        let route = Route::CODEX_SUBSCRIPTION;
+        let mut store = Store::remote_client(
+            Profile {
+                project: "/p".into(),
+                route: route.clone(),
+                provider: "openai".into(),
+            },
+            |_, _| Ok("opening".into()),
+        );
+        let scope = crate::host_protocol::Scope {
+            project: "/p".into(),
+            route,
+        };
+        store.dispatch(Action::ForkThread("source".into())).unwrap();
+        assert!(store.opening_thread());
+        for id in [None, Some("another-request".to_owned())] {
+            store
+                .apply_host(Server::Error {
+                    id,
+                    message: "unrelated".into(),
+                })
+                .unwrap();
+            assert!(store.opening_thread(), "an unrelated error keeps waiting");
+        }
+        store
+            .apply_host(Server::Opened {
+                id: "another-request".into(),
+                scope: scope.clone(),
+                thread: "wrong".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            store.selected(),
+            None,
+            "another request's session is not selected"
+        );
+        store
+            .apply_host(Server::Opened {
+                id: "opening".into(),
+                scope: scope.clone(),
+                thread: "new".into(),
+            })
+            .unwrap();
+        assert_eq!(store.selected(), Some("new"));
+        assert!(!store.opening_thread());
+        store.dispatch(Action::ForkThread("source".into())).unwrap();
+        store
+            .apply_host(Server::Error {
+                id: Some("opening".into()),
+                message: "refused".into(),
+            })
+            .unwrap();
+        assert!(!store.opening_thread(), "its own error stops the wait");
     }
 }

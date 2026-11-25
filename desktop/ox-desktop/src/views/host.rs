@@ -5,6 +5,7 @@ use discovery::{Discovery, Location, Scope};
 pub(crate) mod layout;
 mod palette;
 mod shortcuts;
+use super::model_picker::{self, ModelPicker, ModelPickerEvent};
 use super::workbench::{CatalogChanged, Workbench};
 use crate::kit::{DropdownMenu, PopupMenuItem};
 use crate::{
@@ -14,7 +15,7 @@ use crate::{
 use gpui::{prelude::FluentBuilder, *};
 use gpui_component::{FocusTrapElement, button::ButtonVariants};
 use ox_desk_core::actions::Action as DeskAction;
-use ox_desk_core::runtime::Billing;
+use ox_desk_core::runtime::{Billing, Runtime};
 use ox_desk_core::store::{Connection, Route, ThreadRow};
 use std::{ops::Range, path::PathBuf, time::Instant};
 
@@ -63,6 +64,11 @@ fn age(now: i64, timestamp: i64) -> String {
 pub struct Host {
     palette: Option<palette::State>,
     _palette_keys: Subscription,
+    /// The searchable all-models picker, opened from the route menu.
+    model_picker: Option<(Entity<ModelPicker>, Subscription)>,
+    /// Runtime the all-models picker routes to. Claude Code is offered only when aliases exist,
+    /// as the route menu's Claude alias routes were.
+    model_runtime: Runtime,
     sidebar_visible: bool,
     drawer_open: bool,
     drawer_focus: FocusHandle,
@@ -156,6 +162,8 @@ impl Host {
             resizing_sidebar: false,
             saved_layouts,
             _palette_keys: Self::palette_keys(window, cx),
+            model_picker: None,
+            model_runtime: Runtime::Codex,
             filter,
             filter_task: None,
             list_rows: 0,
@@ -288,6 +296,113 @@ impl Host {
             "drains":drains,"notifications":notifications,"rows":rows,"list_rows":self.list_rows,"max_list_range":self.max_range,"furthest_row":self.furthest_row,
             "spawns":spawns,"unknown":unknown,"stop_ns":stop_ns,"tail_ns":tail_ns,"visible":window.is_visible(),"measured_items":measured_items,"uniform_row_budget":uniform_row_budget,
         }).to_string()
+    }
+    /// Open the searchable picker over every model. Settings lists only starred discovered
+    /// models, so the full catalog comes from the same request the Favorites page refreshes with.
+    fn open_all_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active = self.panes[self.active].read(cx).route.runtime;
+        self.model_runtime = if active == Runtime::Claude && self.models.is_empty() {
+            Runtime::Codex
+        } else {
+            active
+        };
+        let entries: Vec<_> = self
+            .models
+            .iter()
+            .map(|id| model_picker::Entry::alias(id))
+            .collect();
+        let picker = cx.new(|cx| ModelPicker::new(entries, window, cx));
+        let subscription = cx.subscribe_in(
+            &picker,
+            window,
+            |s: &mut Host, _, event: &ModelPickerEvent, window, cx| match event {
+                ModelPickerEvent::Choose(alias) => {
+                    s.model_picker = None;
+                    let project = s.panes[s.active].read(cx).project.clone();
+                    let route = s.model_runtime.route(Some(alias.clone()));
+                    s.open(project, route, window, cx);
+                }
+                ModelPickerEvent::Starred(favorites) => s.favorite_models = favorites.clone(),
+                ModelPickerEvent::Close => s.model_picker = None,
+            },
+        );
+        self.model_picker = Some((picker.clone(), subscription));
+        picker.update(cx, |p, cx| p.set_loading(true, cx));
+        let task = cx.background_spawn(async { settings::discover_models() });
+        cx.spawn_in(window, async move |_, cx| {
+            let result = task.await;
+            picker.update(cx, |p, cx| {
+                match result {
+                    Ok(ids) => p.set_entries(
+                        ids.iter()
+                            .map(|id| model_picker::Entry::alias(id))
+                            .collect(),
+                        cx,
+                    ),
+                    Err(error) => p.set_notice(Some(error), cx),
+                }
+                p.set_loading(false, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+    fn model_overlay(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let (picker, _) = self.model_picker.as_ref()?;
+        let p = Palette::get(cx);
+        let runtime = self.model_runtime;
+        let mut runtimes = div().flex().gap_1().child(button(
+            p,
+            "model-runtime-codex",
+            Runtime::Codex.name(),
+            runtime == Runtime::Codex,
+            true,
+            cx.listener(|s, _, _, cx| {
+                s.model_runtime = Runtime::Codex;
+                cx.notify();
+            }),
+        ));
+        if !self.models.is_empty() {
+            runtimes = runtimes.child(button(
+                p,
+                "model-runtime-claude",
+                Runtime::Claude.name(),
+                runtime == Runtime::Claude,
+                true,
+                cx.listener(|s, _, _, cx| {
+                    s.model_runtime = Runtime::Claude;
+                    cx.notify();
+                }),
+            ));
+        }
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .occlude()
+                .flex()
+                .justify_center()
+                .pt(px(72.))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|s, _, _, cx| {
+                        s.model_picker = None;
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .w(px(440.))
+                        .p_2()
+                        .bg(rgb(p.panel))
+                        .border_1()
+                        .border_color(rgb(p.line_strong))
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(runtimes)
+                        .child(picker.clone()),
+                ),
+        )
     }
     fn refresh_routes(window: &mut Window, cx: &mut Context<Self>) {
         let task = cx.background_spawn(async {
@@ -882,8 +997,14 @@ impl Host {
             .as_ref()
             .is_some_and(|s| s.state() == &Connection::Ready);
         let count = self.catalog.len();
-        let models = self.models.clone();
-        let favorites = self.favorite_models.clone();
+        // The route menu lists the two subscriptions and starred aliases; everything else is
+        // one row away in the searchable picker.
+        let starred_routes: Vec<Route> = self
+            .favorite_models
+            .iter()
+            .filter(|alias| self.models.contains(alias))
+            .map(|alias| Route::codex_api(alias.clone()))
+            .collect();
         let host = cx.weak_entity();
         let directory = project.clone();
         let route = button(
@@ -900,11 +1021,11 @@ impl Host {
         .h(px(26.))
         .w_full()
         .dropdown_menu(move |mut menu, _, _| {
-            for route in ox_desk_core::runtime::Runtime::routes(&models) {
+            let subscriptions = ox_desk_core::runtime::Runtime::routes(&[]);
+            for route in subscriptions.chain(starred_routes.iter().cloned()) {
                 let host = host.clone();
                 let directory = directory.clone();
-                let starred =
-                    matches!(&route.billing, Billing::Api(alias) if favorites.contains(alias));
+                let starred = matches!(&route.billing, Billing::Api(_));
                 let label = route.label();
                 menu = menu.item(
                     PopupMenuItem::element(move |_, _| {
@@ -922,7 +1043,13 @@ impl Host {
                     }),
                 );
             }
-            menu
+            let host = host.clone();
+            menu.item(PopupMenuItem::separator())
+                .item(
+                    PopupMenuItem::new("All models…").on_click(move |_, window, cx| {
+                        let _ = host.update(cx, |s, cx| s.open_all_models(window, cx));
+                    }),
+                )
         });
         let label = project
             .file_name()
@@ -1314,6 +1441,7 @@ impl Host {
             )
             .children(drawer)
             .children(self.palette_overlay(cx))
+            .children(self.model_overlay(cx))
     }
 }
 

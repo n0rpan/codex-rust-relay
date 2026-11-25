@@ -10,7 +10,7 @@ use ox_desk_core::{
     actions::Action,
     changed::Changed,
     handoff::HandoffStart,
-    host_protocol::{self as wire, Change, Client, Cursor, Scope, ScopeState, Server},
+    host_protocol::{self as wire, Change, Client, Cursor, ProcessView, Scope, ScopeState, Server},
     inbox::Inbox,
     links::LinkEvent,
     modes::YoloAllowance,
@@ -194,7 +194,78 @@ struct Live {
     generation: u64,
     state: ScopeState,
     tokens: HashMap<RequestId, String>,
+    /// When each live process started and was last used, for the process list and the idle reaper.
+    tracker: Tracker,
+    /// A terminal handoff whose requesting client was gone when it was ready. The
+    /// next subscriber to this scope (or a replayed request) receives it.
+    held_handoff: Option<(String, Server)>,
 }
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+/// Start and last-use times of one process (a Claude session or a Codex scope).
+#[derive(Clone, Copy)]
+struct Seen {
+    started: i64,
+    last: Instant,
+    last_unix: i64,
+}
+impl Seen {
+    fn now() -> Self {
+        Self {
+            started: now_unix(),
+            last: Instant::now(),
+            last_unix: now_unix(),
+        }
+    }
+}
+pub(crate) struct Tracker {
+    scope: Seen,
+    threads: BTreeMap<String, Seen>,
+}
+impl Tracker {
+    pub(crate) fn new() -> Self {
+        Self {
+            scope: Seen::now(),
+            threads: BTreeMap::new(),
+        }
+    }
+    fn touch(&mut self, thread: &str) {
+        let now = Seen::now();
+        self.scope.last = now.last;
+        self.scope.last_unix = now.last_unix;
+        let seen = self.threads.entry(thread.to_owned()).or_insert(now);
+        seen.last = now.last;
+        seen.last_unix = now.last_unix;
+    }
+    /// Track exactly the threads that have a live process.
+    fn sync(&mut self, live: &[String]) {
+        self.threads.retain(|t, _| live.contains(t));
+        for t in live {
+            self.threads.entry(t.clone()).or_insert_with(Seen::now);
+        }
+    }
+}
+
+/// How long a Claude session or empty Codex scope may sit unused before the
+/// host ends it. Zero disables the reaper. `OX_HOST_IDLE_MINUTES` overrides it.
+pub(crate) const DEFAULT_IDLE_MINUTES: u64 = 30;
+pub(crate) fn idle_timeout(setting: Option<&str>) -> Duration {
+    let minutes = setting
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_IDLE_MINUTES);
+    Duration::from_secs(minutes.saturating_mul(60))
+}
+/// Whether the reaper ends a process: it has sat unused for the whole timeout and
+/// ending it would lose nothing (no running turn, pending approval, or worker).
+pub(crate) fn reapable(idle: Duration, timeout: Duration, busy: bool) -> bool {
+    !timeout.is_zero() && !busy && idle >= timeout
+}
+const REAP_EVERY: Duration = Duration::from_secs(60);
+
 pub(crate) struct Engine {
     config: RuntimeConfig,
     ledger: Ledger,
@@ -213,6 +284,8 @@ pub(crate) struct Engine {
     in_flows: bool,
     draining: Option<Instant>,
     state_dir: PathBuf,
+    idle: Duration,
+    next_reap: Instant,
 }
 mod flows;
 fn nonce() -> io::Result<String> {
@@ -260,6 +333,8 @@ impl Engine {
             in_flows: false,
             draining: None,
             state_dir: dir.to_owned(),
+            idle: idle_timeout(std::env::var("OX_HOST_IDLE_MINUTES").ok().as_deref()),
+            next_reap: Instant::now() + REAP_EVERY,
         })
     }
     pub(crate) fn serve(&mut self, rx: Receiver<Message>) -> io::Result<()> {
@@ -290,6 +365,7 @@ impl Engine {
                 )
                 .chain(self.reading.iter().map(|r| r.deadline))
                 .chain(self.draining)
+                .chain((!self.idle.is_zero()).then_some(self.next_reap))
                 .min();
             let msg = if deadline.is_some_and(|at| at <= Instant::now()) {
                 None
@@ -319,7 +395,14 @@ impl Engine {
                         .map(|(k, _)| k.clone())
                         .collect();
                     for scope in due {
-                        self.process(&scope, vec![], false)?;
+                        // An earlier pass in this loop may have ended the scope.
+                        if self.running.contains_key(&scope) {
+                            self.process(&scope, vec![], false)?;
+                        }
+                    }
+                    if now >= self.next_reap {
+                        self.next_reap = now + REAP_EVERY;
+                        self.reap_idle(now)?;
                     }
                     self.advance_flows()?;
                 }
@@ -478,6 +561,8 @@ impl Engine {
                             "approvals",
                             "workers",
                             "live_catalog",
+                            "end",
+                            "processes",
                         ]
                         .map(str::to_owned)
                         .into(),
@@ -522,6 +607,10 @@ impl Engine {
                         },
                     ),
                 }
+            }
+            Client::ListProcesses { id: key } => {
+                let processes = self.processes();
+                self.reply(id, Server::Processes { id: key, processes })
             }
             Client::WatchCatalog => {
                 let client = self.clients.get_mut(&id).expect("connected");
@@ -605,6 +694,13 @@ impl Engine {
                         fail("Subscribe to the target scope before sending actions".into()),
                     );
                 }
+                // A scope the host dropped while idle reopens for a client still subscribed to it.
+                if !self.running.contains_key(&scope)
+                    && self.cold.contains_key(&scope)
+                    && let Err(e) = self.ensure(&scope, self.config.prepare().ok())
+                {
+                    return self.reply(id, fail(e.to_string()));
+                }
                 let Some(generation) = self.running.get(&scope).map(|live| live.generation) else {
                     return self.reply(
                         id,
@@ -631,17 +727,32 @@ impl Engine {
                                     thread,
                                 },
                             )?;
-                        } else if let Some((client, opening)) =
-                            &mut self.running.get_mut(&scope).unwrap().opening
-                            && opening == &key
-                            && !self.clients.contains_key(client)
-                        {
-                            *client = id;
+                        } else {
+                            let live = self.running.get_mut(&scope).unwrap();
+                            if let Some((client, opening)) = &mut live.opening
+                                && opening == &key
+                                && !self.clients.contains_key(client)
+                            {
+                                *client = id;
+                            }
+                            // The same for a terminal handoff the old connection never received.
+                            if let Some((client, terminal)) = &mut live.terminal
+                                && terminal == &key
+                                && !self.clients.contains_key(client)
+                            {
+                                *client = id;
+                            }
+                            if live.held_handoff.as_ref().is_some_and(|(k, _)| k == &key)
+                                && let Some((_, frame)) = live.held_handoff.take()
+                            {
+                                self.reply(id, frame)?;
+                            }
                         }
                         return self.reply(id, receipt.result);
                     }
                     Ok(None) => (),
                 }
+                let ends = matches!(action, Action::EndSession(_));
                 let result = match self.act(id, &key, &scope, action, approval) {
                     Ok(()) => Server::Ack { id: key.clone() },
                     Err(e) => fail(e.to_string()),
@@ -649,8 +760,11 @@ impl Engine {
                 let accepted = matches!(result, Server::Ack { .. });
                 self.receipts
                     .insert(scope.clone(), key, generation, hash, result.clone());
-                if accepted {
+                if accepted && self.running.contains_key(&scope) {
                     self.process(&scope, vec![], true)?;
+                    if ends {
+                        self.reap_empty(&scope)?;
+                    }
                 }
                 self.reply(id, result)
             }
@@ -712,15 +826,21 @@ impl Engine {
         let client = self.clients.get_mut(&id).expect("connected client");
         client.catalog = false;
         client.subscription = Some(scope.clone());
+        let mut replayed = None;
         if !fresh
             && same_subscription
             && let Some(cursor) = after
             && let Some(mut frames) = self.replay.after(scope.as_ref(), &cursor)
         {
-            if !frames.all(|p| client.peer.send(p)) {
+            replayed = Some(frames.all(|p| client.peer.send(p)));
+        }
+        match replayed {
+            Some(true) => return self.deliver_held_handoff(id, scope.as_ref()),
+            Some(false) => {
                 self.clients.remove(&id);
+                return Ok(());
             }
-            return Ok(());
+            None => (),
         }
         let scopes = self
             .running
@@ -736,7 +856,23 @@ impl Engine {
                 cursor: self.replay.cursor.clone(),
                 scopes,
             },
-        )
+        )?;
+        self.deliver_held_handoff(id, scope.as_ref())
+    }
+    /// Give a terminal handoff whose requester disconnected to the next subscriber of its scope.
+    fn deliver_held_handoff(&mut self, id: u64, scope: Option<&Scope>) -> io::Result<()> {
+        let Some(scope) = scope else {
+            return Ok(());
+        };
+        if let Some(frame) = self
+            .running
+            .get_mut(scope)
+            .and_then(|l| l.held_handoff.take())
+            .map(|(_, frame)| frame)
+        {
+            self.reply(id, frame)?;
+        }
+        Ok(())
     }
     fn ensure(
         &mut self,
@@ -833,6 +969,8 @@ impl Engine {
                 generation,
                 state,
                 tokens: Default::default(),
+                tracker: Tracker::new(),
+                held_handoff: None,
             },
         );
         self.broadcast(scope, changes)?;
@@ -867,6 +1005,7 @@ impl Engine {
             ));
         }
         match action {
+            Action::EndSession(thread) => return self.end_thread(scope, &thread),
             Action::StartHandoff(start) => return self.start_handoff(id, key, scope, start),
             Action::YoloGrant(session, on) => return self.set_grant(scope, &session, on),
             Action::InjectHandoff(..) => {
@@ -1035,6 +1174,9 @@ impl Engine {
             }
         }
         let live = self.running.get_mut(scope).expect("validated live scope");
+        if let Some(t) = &target {
+            live.tracker.touch(t);
+        }
         if terminal {
             live.terminal = Some((id, key.into()));
         }
@@ -1122,6 +1264,19 @@ impl Engine {
                 )
             })
         });
+        // The requesting client may have gone while the handoff was prepared. Keep
+        // it for the next subscriber instead of losing it with the terminal mode set.
+        let handoff = match handoff {
+            Some((client, frame)) if !self.clients.contains_key(&client) => {
+                let key = match &frame {
+                    Server::Handoff { id, .. } => id.clone(),
+                    _ => String::new(),
+                };
+                live.held_handoff = Some((key, frame));
+                None
+            }
+            other => other,
+        };
         if live.terminal.is_some() && !live.store.opening_terminal() {
             live.terminal = None;
         }
@@ -1204,6 +1359,16 @@ impl Engine {
             yolo
         };
         dirty.merge(live.store.drain(vec![], Instant::now()));
+        for thread in dirty.dirty_threads() {
+            live.tracker.touch(thread);
+        }
+        let processes = live.store.live_threads();
+        for thread in &processes {
+            if live.store.thread_busy(thread) {
+                live.tracker.touch(thread);
+            }
+        }
+        live.tracker.sync(&processes);
         let mut changes = live.store.host_project(scope, &dirty, &mut live.state);
         crate::yolo::merge(
             &self.asking,
@@ -1680,10 +1845,17 @@ impl Engine {
                     "This worker has not started: {}.",
                     status["status"].as_str().unwrap_or("waiting")
                 )),
-                ParentCall::Cancel { .. } => Ok(self
-                    .withdraw(job_id)
-                    .map_err(|e| e.to_string())?
-                    .unwrap_or(status)),
+                ParentCall::Cancel { .. } => {
+                    if let Some(done) = self.withdraw(job_id).map_err(|e| e.to_string())? {
+                        Ok(done)
+                    } else if let Some(done) =
+                        self.abort_launch(job_id).map_err(|e| e.to_string())?
+                    {
+                        Ok(done)
+                    } else {
+                        Ok(status)
+                    }
+                }
                 _ => Ok(status),
             };
         }
@@ -1749,6 +1921,244 @@ impl Engine {
                 self.job_status(job_id)
             }
         }
+    }
+    /// Cancel a worker whose runtime is still opening: nothing was sent to it yet, so
+    /// the launch is abandoned, its launcher hears "cancelled", and the worker's
+    /// scope is closed again if nothing else uses it. A launch whose first message is
+    /// already on its way cannot be recalled and keeps reporting `starting`.
+    fn abort_launch(&mut self, job_id: u64) -> io::Result<Option<Value>> {
+        let Some(scope) = self
+            .running
+            .iter()
+            .find(|(_, live)| {
+                live.launching.as_ref().is_some_and(|l| {
+                    job_id != 0 && l.origin.job_id == job_id && l.stage != Stage::Sent
+                })
+            })
+            .map(|(scope, _)| scope.clone())
+        else {
+            return Ok(None);
+        };
+        let l = self
+            .running
+            .get_mut(&scope)
+            .and_then(|live| live.launching.take())
+            .expect("found launching");
+        const MESSAGE: &str = "The worker launch was cancelled before it started.";
+        if l.detached {
+            let origin = l.origin.clone();
+            self.ledger.change(|d| {
+                d.outcomes.push(crate::durable::Outcome {
+                    origin,
+                    status: "cancelled".into(),
+                    message: MESSAGE.into(),
+                })
+            })?;
+        }
+        self.answer(l.reply, Err(MESSAGE.into()))?;
+        self.process(&scope, vec![], false)?;
+        self.reap_empty(&scope)?;
+        Ok(Some(json!({"job_id": job_id, "status": "cancelled"})))
+    }
+    /// The live processes this host runs: one per Claude session, one per Codex scope.
+    fn processes(&self) -> Vec<ProcessView> {
+        let mut out = Vec::new();
+        for (scope, live) in &self.running {
+            let threads = live.store.live_threads();
+            if threads.is_empty() {
+                continue;
+            }
+            let claude = scope.route.runtime == ox_desk_core::runtime::Runtime::Claude;
+            let groups: Vec<Vec<String>> = if claude {
+                threads.into_iter().map(|t| vec![t]).collect()
+            } else {
+                vec![threads]
+            };
+            for group in groups {
+                let seen = |t: &String| live.tracker.threads.get(t).copied();
+                let started = group
+                    .iter()
+                    .filter_map(seen)
+                    .map(|s| s.started)
+                    .min()
+                    .unwrap_or(live.tracker.scope.started);
+                let last = group
+                    .iter()
+                    .filter_map(seen)
+                    .map(|s| s.last_unix)
+                    .max()
+                    .unwrap_or(live.tracker.scope.last_unix);
+                let worker = group.iter().all(|t| self.workers.get(scope, t).is_some());
+                out.push(ProcessView {
+                    kind: if worker {
+                        "worker"
+                    } else if claude {
+                        "claude"
+                    } else {
+                        "codex"
+                    }
+                    .into(),
+                    scope: scope.clone(),
+                    project: scope.project.clone(),
+                    route: scope.route.label(),
+                    model: group
+                        .first()
+                        .map(|t| live.store.options(Some(t)).model)
+                        .filter(|m| !m.is_empty()),
+                    started_at: started,
+                    last_activity: last,
+                    running: group.iter().any(|t| live.store.thread_busy(t)),
+                    threads: group,
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| a.threads.cmp(&b.threads))
+        });
+        out
+    }
+    /// End one thread's process and the host-owned workers it started. The thread
+    /// stays in the catalog; selecting it again resumes it.
+    fn end_thread(&mut self, scope: &Scope, thread: &str) -> io::Result<()> {
+        let live = self
+            .running
+            .get(scope)
+            .ok_or_else(|| io::Error::other("This route is not open on the session host."))?;
+        if !live.store.has_live_session(thread) {
+            return Err(io::Error::other("This session has no live process to end."));
+        }
+        self.end_children(scope, thread)?;
+        let live = self.running.get_mut(scope).expect("checked above");
+        let busy = live.store.thread_busy(thread);
+        live.store.end_session(thread)?;
+        live.tracker.threads.remove(thread);
+        if busy && let Some(entry) = self.workers.get_mut(scope, thread) {
+            entry.marks.cancelled = true;
+        }
+        Ok(())
+    }
+    /// Ending a parent ends its host-owned workers: launches still opening are
+    /// aborted and running ones are cancelled and ended.
+    fn end_children(&mut self, scope: &Scope, thread: &str) -> io::Result<()> {
+        let launches: Vec<u64> = self
+            .running
+            .values()
+            .filter_map(|l| l.launching.as_ref())
+            .filter(|l| {
+                l.origin.job_id != 0
+                    && l.origin.parent.scope.as_ref() == Some(scope)
+                    && l.origin.parent.session.as_deref() == Some(thread)
+            })
+            .map(|l| l.origin.job_id)
+            .collect();
+        for job in launches {
+            self.abort_launch(job)?;
+        }
+        let children: Vec<(Scope, String)> = self
+            .workers
+            .children_of(scope, thread)
+            .filter(|(s, id)| {
+                self.running
+                    .get(*s)
+                    .is_some_and(|l| l.store.has_live_session(id))
+            })
+            .map(|(s, id)| (s.clone(), id.to_owned()))
+            .collect();
+        for (child_scope, child) in children {
+            if self.end_thread(&child_scope, &child).is_ok()
+                && self.running.contains_key(&child_scope)
+            {
+                self.process(&child_scope, vec![], true)?;
+                self.reap_empty(&child_scope)?;
+            }
+        }
+        Ok(())
+    }
+    /// Close a route's runtime once it serves nothing: no live process or
+    /// subscription, no turn, approval or launch. Dropping its store kills the
+    /// app-server (or the idle Claude draft process). The saved sessions stay listed
+    /// and the next subscriber or action reopens the route.
+    fn reap_empty(&mut self, scope: &Scope) -> io::Result<()> {
+        let Some(live) = self.running.get(scope) else {
+            return Ok(());
+        };
+        let idle = live.store.live_threads().is_empty()
+            && live.store.active_turns() == 0
+            && live.store.asks().is_empty()
+            && !live.store.opening_thread()
+            && !live.store.opening_terminal()
+            && live.launching.is_none()
+            && live.confirming.is_none()
+            && live.opening.is_none()
+            && live.terminal.is_none()
+            && live.held_handoff.is_none();
+        if !idle {
+            return Ok(());
+        }
+        let live = self.running.remove(scope).expect("checked above");
+        let recovered = SavedScope::from_state(&live.state).recover();
+        drop(live);
+        let changes = vec![
+            Change::State {
+                connection: recovered.connection.clone(),
+                capabilities: vec![],
+                detail: live_detail_after_drop(&recovered),
+            },
+            Change::Sessions {
+                sessions: recovered.sessions.clone(),
+            },
+            Change::Asks { asks: vec![] },
+        ];
+        self.cold.insert(scope.clone(), recovered);
+        self.broadcast(scope, changes)
+    }
+    /// End sessions and empty routes unused for the idle timeout. The sessions stay resumable.
+    fn reap_idle(&mut self, now: Instant) -> io::Result<()> {
+        let mut due: Vec<(Scope, String)> = Vec::new();
+        let mut empty: Vec<Scope> = Vec::new();
+        for (scope, live) in &self.running {
+            let threads = live.store.live_threads();
+            if threads.is_empty() {
+                if reapable(
+                    now.saturating_duration_since(live.tracker.scope.last),
+                    self.idle,
+                    live.store.active_turns() > 0,
+                ) {
+                    empty.push(scope.clone());
+                }
+                continue;
+            }
+            for thread in threads {
+                let Some(seen) = live.tracker.threads.get(&thread) else {
+                    continue;
+                };
+                let workers_busy = self.workers.children_of(scope, &thread).any(|(s, child)| {
+                    self.running
+                        .get(s)
+                        .is_some_and(|l| l.store.thread_busy(child))
+                });
+                let busy = live.store.thread_busy(&thread)
+                    || workers_busy
+                    || live.launching.is_some()
+                    || live.confirming.is_some()
+                    || live.store.in_terminal(&thread);
+                if reapable(now.saturating_duration_since(seen.last), self.idle, busy) {
+                    due.push((scope.clone(), thread));
+                }
+            }
+        }
+        for (scope, thread) in due {
+            if self.end_thread(&scope, &thread).is_ok() && self.running.contains_key(&scope) {
+                self.process(&scope, vec![], true)?;
+            }
+            self.reap_empty(&scope)?;
+        }
+        for scope in empty {
+            self.reap_empty(&scope)?;
+        }
+        Ok(())
     }
     fn broadcast(&mut self, scope: &Scope, changes: Vec<Change>) -> io::Result<()> {
         self.replay.cursor.seq = self.ledger.next_sequence(self.replay.cursor.seq)?;
@@ -1984,6 +2394,13 @@ fn key_ok(reply: &Replier) -> bool {
     }
 }
 
+/// What a scope shows its subscribers after the host closed its idle runtime.
+fn live_detail_after_drop(recovered: &ScopeState) -> Value {
+    let mut detail = recovered.detail.clone();
+    detail["notice"] = json!("Idle session ended. Select a thread to resume it.");
+    detail
+}
+
 fn restore(rows: &mut Vec<wire::SessionView>, recovered: &[wire::SessionView]) {
     for saved in recovered {
         if let Some(row) = rows.iter_mut().find(|r| r.id == saved.id) {
@@ -2044,6 +2461,8 @@ mod tests {
                 inbox: Inbox::new(|| {}),
                 generation: 1,
                 tokens: HashMap::new(),
+                tracker: Tracker::new(),
+                held_handoff: None,
             },
         );
         let read = |line: &[u8]| LinkEvent::Frame(Frame::decode(line, |_| None).unwrap());
@@ -2200,6 +2619,8 @@ mod tests {
                     inbox: Inbox::new(|| {}),
                     generation: 1,
                     tokens: HashMap::new(),
+                    tracker: Tracker::new(),
+                    held_handoff: None,
                 },
                 log,
             )
@@ -3825,6 +4246,204 @@ mod tests {
                 launch: "l".into(),
             });
             assert!(read(&mut engine, terminal, None, None).is_err());
+        }
+
+        /// A Live whose store is a real local Codex store on an inert stdio process.
+        fn local_live(scope: &Scope) -> Live {
+            let link =
+                codex::Link::from_command(std::process::Command::new("/bin/cat"), |_| {}).unwrap();
+            let store = Store::open(
+                ox_desk_core::store::Profile {
+                    project: scope.project.clone(),
+                    route: scope.route.clone(),
+                    provider: "openai".into(),
+                },
+                link,
+            )
+            .unwrap();
+            Live {
+                state: store.host_snapshot(scope),
+                store,
+                launching: None,
+                fork_origin: None,
+                confirming: None,
+                opening: None,
+                terminal: None,
+                schema_started: true,
+                recovered: vec![],
+                inbox: Inbox::new(|| {}),
+                generation: 1,
+                tokens: HashMap::new(),
+                tracker: Tracker::new(),
+                held_handoff: None,
+            }
+        }
+
+        #[test]
+        fn the_reaper_decision_waits_for_the_whole_timeout_and_never_ends_busy_work() {
+            let timeout = Duration::from_secs(30 * 60);
+            assert!(!reapable(Duration::from_secs(29 * 60), timeout, false));
+            assert!(reapable(timeout, timeout, false));
+            assert!(reapable(timeout * 2, timeout, false));
+            assert!(!reapable(timeout * 2, timeout, true));
+            assert!(
+                !reapable(timeout * 2, Duration::ZERO, false),
+                "zero disables"
+            );
+            assert_eq!(idle_timeout(None), timeout);
+            assert_eq!(idle_timeout(Some("5")), Duration::from_secs(300));
+            assert_eq!(idle_timeout(Some(" 0 ")), Duration::ZERO);
+            assert_eq!(idle_timeout(Some("soon")), timeout);
+        }
+
+        #[test]
+        fn an_empty_codex_scope_is_dropped_and_stays_listed_for_a_later_subscriber() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (scope, _) = scopes(root.path());
+            engine.running.insert(scope.clone(), local_live(&scope));
+            assert!(engine.processes().is_empty(), "no thread, no process row");
+            // A thread that is not live cannot be ended.
+            assert!(engine.end_thread(&scope, "gone").is_err());
+            // A held handoff keeps the scope open until its subscriber takes it.
+            engine.running.get_mut(&scope).unwrap().held_handoff = Some((
+                "k".into(),
+                Server::Handoff {
+                    argv: vec![],
+                    id: "k".into(),
+                    scope: scope.clone(),
+                    thread: None,
+                    command: String::new(),
+                },
+            ));
+            engine.reap_empty(&scope).unwrap();
+            assert!(engine.running.contains_key(&scope));
+            engine.running.get_mut(&scope).unwrap().held_handoff = None;
+            engine.reap_empty(&scope).unwrap();
+            assert!(!engine.running.contains_key(&scope), "app-server dropped");
+            assert_eq!(engine.cold[&scope].connection, "disconnected");
+        }
+
+        #[test]
+        fn idle_reaping_ends_nothing_while_unused_time_is_short() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (scope, _) = scopes(root.path());
+            engine.running.insert(scope.clone(), local_live(&scope));
+            engine.idle = Duration::from_secs(60);
+            engine.reap_idle(Instant::now()).unwrap();
+            assert!(engine.running.contains_key(&scope));
+            // An empty scope idle past the timeout is closed.
+            engine
+                .reap_idle(Instant::now() + Duration::from_secs(61))
+                .unwrap();
+            assert!(!engine.running.contains_key(&scope));
+        }
+
+        #[test]
+        fn a_handoff_held_for_a_gone_client_reaches_the_next_subscriber() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (scope, _) = scopes(root.path());
+            let mut live = local_live(&scope);
+            live.held_handoff = Some((
+                "k".into(),
+                Server::Handoff {
+                    argv: vec!["codex".into()],
+                    id: "k".into(),
+                    scope: scope.clone(),
+                    thread: Some("t".into()),
+                    command: String::new(),
+                },
+            ));
+            engine.running.insert(scope.clone(), live);
+            let (peer, frames) = crate::transport::test_peer();
+            engine.clients.insert(
+                9,
+                ClientState {
+                    peer,
+                    hello: true,
+                    prepared: None,
+                    subscription: None,
+                    catalog: false,
+                },
+            );
+            engine.subscribe(9, Some(scope.clone()), None).unwrap();
+            let sent: Vec<String> = frames
+                .try_iter()
+                .map(|p| String::from_utf8_lossy(&p).into_owned())
+                .collect();
+            assert!(sent.iter().any(|f| f.contains("\"handoff\"")), "{sent:?}");
+            assert!(engine.running[&scope].held_handoff.is_none());
+        }
+
+        #[test]
+        fn cancelling_a_worker_that_is_still_launching_aborts_the_launch() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker) = scopes(root.path());
+            let rows = vec![view(&parent, "a", "running", "workspace")];
+            engine
+                .running
+                .insert(parent.clone(), live(&parent, rows, &["a"], vec![]).0);
+            let mut starting = local_live(&worker);
+            let (reply, answered) = std::sync::mpsc::sync_channel(1);
+            starting.launching = Some(Launching {
+                origin: origin(workers_parent(&parent, "a"), Ceiling::Read),
+                payload: Payload::Worker(start(false)),
+                reply: Replier::Channel(reply),
+                stage: Stage::Opening,
+                deadline: Instant::now() + Duration::from_secs(60),
+                detached: false,
+            });
+            engine.running.insert(worker.clone(), starting);
+            let status = engine
+                .parent_call(&hosted(&parent), ParentCall::Status { job_id: 41 })
+                .unwrap();
+            assert_eq!(status["status"], "starting");
+            let done = engine
+                .parent_call(&hosted(&parent), ParentCall::Cancel { job_id: 41 })
+                .unwrap();
+            assert_eq!(done["status"], "cancelled");
+            let told = answered.try_recv().expect("the launcher is answered");
+            assert!(told.unwrap_err().contains("cancelled"));
+            assert!(
+                !engine.running.contains_key(&worker),
+                "the unused worker runtime is closed"
+            );
+            assert!(
+                engine
+                    .unstarted_jobs(&crate::workers::Resolved::Hosted {
+                        scope: parent.clone(),
+                        session: "a".into(),
+                    })
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn a_launch_whose_message_is_already_sent_cannot_be_cancelled() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker) = scopes(root.path());
+            let mut sent = local_live(&worker);
+            let (reply, _answered) = std::sync::mpsc::sync_channel(1);
+            sent.launching = Some(Launching {
+                origin: origin(workers_parent(&parent, "a"), Ceiling::Read),
+                payload: Payload::Worker(start(false)),
+                reply: Replier::Channel(reply),
+                stage: Stage::Sent,
+                deadline: Instant::now() + Duration::from_secs(60),
+                detached: false,
+            });
+            engine.running.insert(worker.clone(), sent);
+            assert!(engine.abort_launch(41).unwrap().is_none());
+            assert!(engine.running[&worker].launching.is_some());
         }
     }
 }

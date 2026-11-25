@@ -94,11 +94,46 @@ pub(super) struct Discovery {
     pub indexed: Option<(usize, String)>,
     pub pending: usize,
     removed: HashMap<Scope, HashMap<PathBuf, HashSet<String>>>,
+    /// Parents whose child rows are folded away, by project and thread id.
+    pub collapsed: HashSet<(PathBuf, String)>,
 }
+
+/// What a parent session has under it, counted over all descendants.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Tree {
+    /// Direct children.
+    pub children: usize,
+    pub running: usize,
+    pub waiting: usize,
+    /// The first running descendant, in catalog order.
+    pub first_running: Option<String>,
+}
+
+/// Tree counts for every parent in the navigation index, keyed by project and thread id.
+/// Set by `index_catalog`; read by the workbench activity line and the sidebar rows.
+#[derive(Default)]
+pub(super) struct TreeIndex(pub HashMap<(PathBuf, String), Tree>);
+impl gpui::Global for TreeIndex {}
+
+/// A child's parent link survives a merge with a richer row that has none.
+fn keep_parent(known: Option<String>, incoming: Option<String>) -> Option<String> {
+    incoming.or(known)
+}
+
+/// The identity of one catalog row: project, scope, thread id and provider.
+type Key = (PathBuf, Scope, String, String);
 
 impl Discovery {
     pub(super) fn all(&self) -> impl Iterator<Item = &Saved> {
         self.hosted.iter().map(|h| &h.saved).chain(&self.rows)
+    }
+    /// Fold or unfold a parent's children in the sidebar.
+    pub(super) fn toggle(&mut self, project: PathBuf, id: String) {
+        let key = (project, id);
+        if !self.collapsed.remove(&key) {
+            self.collapsed.insert(key);
+        }
+        self.revision += 1;
     }
     fn live_event(&mut self, event: platform::CatalogEvent) -> bool {
         use platform::CatalogEvent;
@@ -371,7 +406,75 @@ impl Host {
         self.located(loc, cx)
     }
 
-    pub(super) fn index_catalog(&mut self, cx: &App) {
+    fn status_at(&self, loc: Location, cx: &App) -> Option<&'static str> {
+        let (row, project, scope) = self.located(loc, cx)?;
+        self.project_row_state(project, row, scope, cx).1
+    }
+
+    /// Aggregate of everything under `key`, recording every parent that has children.
+    fn walk_tree(
+        &self,
+        key: &Key,
+        children: &HashMap<&Key, Vec<(&Key, i64, Location)>>,
+        cx: &App,
+        out: &mut HashMap<(PathBuf, String), Tree>,
+    ) -> Tree {
+        let mut total = Tree::default();
+        for (child, _, loc) in children.get(key).into_iter().flatten() {
+            let own = self.status_at(*loc, cx);
+            let below = self.walk_tree(child, children, cx, out);
+            let running = own == Some("Running");
+            total.children += 1;
+            total.running += below.running + usize::from(running);
+            total.waiting += below.waiting + usize::from(own == Some("Needs you"));
+            if running {
+                total.first_running.get_or_insert_with(|| child.2.clone());
+            }
+            if let Some(first) = below.first_running {
+                total.first_running.get_or_insert(first);
+            }
+        }
+        if total.children > 0 {
+            out.insert((key.0.clone(), key.2.clone()), total.clone());
+        }
+        total
+    }
+
+    /// Open a session from the sidebar index, unfolding its parent if needed.
+    pub(super) fn open_thread(
+        &mut self,
+        owner: &Entity<Workbench>,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (project, selected) = {
+            let pane = owner.read(cx);
+            (
+                pane.project.clone(),
+                pane.store
+                    .as_ref()
+                    .and_then(|s| s.selected())
+                    .map(str::to_owned),
+            )
+        };
+        // The target may be a worker folded under the session being viewed.
+        if let Some(selected) = selected
+            && self.discovery.collapsed.remove(&(project.clone(), selected))
+        {
+            self.discovery.revision += 1;
+            self.index_catalog(cx);
+        }
+        let found = self.catalog.iter().find_map(|entry| {
+            let (row, path, scope) = self.located_entry(*entry, cx)?;
+            (row.id == id && path == project.as_path()).then(|| (row.clone(), scope))
+        });
+        if let Some((row, scope)) = found {
+            self.activate_row(project, scope, row, window, cx);
+        }
+    }
+
+    pub(super) fn index_catalog(&mut self, cx: &mut App) {
         let versions: Vec<_> = self
             .panes
             .iter()
@@ -457,7 +560,7 @@ impl Host {
             entry.0 = entry.0.max(order);
             if quality > entry.3 {
                 entry.1 = loc;
-                entry.2 = r.parent_thread_id.clone();
+                entry.2 = keep_parent(entry.2.take(), r.parent_thread_id.clone());
                 entry.3 = quality;
             }
         }
@@ -497,6 +600,13 @@ impl Host {
                 roots.push(node);
             }
         }
+        // Counts cover the whole tree, folded or not, so a collapsed parent can still
+        // say what is running under it.
+        let mut tree = HashMap::new();
+        for (key, _, _) in &roots {
+            self.walk_tree(key, &children, cx, &mut tree);
+        }
+        cx.set_global(TreeIndex(tree));
         let mut catalog = Vec::new();
         let mut previous = None;
         let mut ordinal = 0;
@@ -515,6 +625,13 @@ impl Host {
                     depth,
                 });
                 ordinal += 1;
+                if self
+                    .discovery
+                    .collapsed
+                    .contains(&(key.0.clone(), key.2.clone()))
+                {
+                    continue;
+                }
                 if let Some(next) = children.remove(key) {
                     stack.extend(
                         next.into_iter()
@@ -677,5 +794,18 @@ mod status_filter_tests {
             (Some(StatusFilter::Finished), String::new())
         );
         assert_eq!(split_status_filter("plain"), (None, "plain".into()));
+    }
+}
+
+#[cfg(test)]
+mod parent_merge_tests {
+    use super::keep_parent;
+    #[test]
+    fn a_richer_row_without_a_parent_keeps_the_known_parent() {
+        let p = |s: &str| Some(s.to_owned());
+        assert_eq!(keep_parent(p("parent"), None), p("parent"));
+        assert_eq!(keep_parent(None, p("parent")), p("parent"));
+        assert_eq!(keep_parent(p("old"), p("new")), p("new"));
+        assert_eq!(keep_parent(None, None), None);
     }
 }

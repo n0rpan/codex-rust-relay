@@ -6,6 +6,7 @@ mod terminal_review;
 mod transcript;
 pub mod workbench;
 
+mod model_picker;
 mod route_chip;
 
 mod mention_menu;

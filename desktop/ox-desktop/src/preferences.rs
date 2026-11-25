@@ -894,7 +894,7 @@ impl Preferences {
                     .child("Starred models")
                     .child(button(
                         "save-favorites",
-                        "Save favorites",
+                        "Save starred models",
                         true,
                         p,
                         cx.listener(|s, _, w, cx| s.save(w, cx)),
@@ -1081,7 +1081,7 @@ impl Preferences {
             (Page::Providers, "Providers"),
             (Page::Credentials, "Credentials"),
             (Page::Search, "Search"),
-            (Page::Favorites, "Favorites"),
+            (Page::Favorites, "Starred models"),
             (Page::Behavior, "Appearance & input"),
             (Page::Legacy, "Legacy"),
             (Page::Advanced, "Advanced"),
