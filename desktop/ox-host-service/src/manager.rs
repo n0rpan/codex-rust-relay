@@ -161,22 +161,32 @@ fn service(args: &[&str]) -> io::Result<()> {
     words.extend(args.iter().map(OsStr::new));
     run("systemctl", &words)
 }
-/// The login session's GUI domain, or the per-user background domain when the
-/// account has no GUI session (SSH, a CI user, before first login).
+/// launchd domains to try, in order: the login session's GUI domain, then the
+/// per-user background domain, which exists for accounts without a GUI session
+/// (SSH, a CI user, before first login).
 #[cfg(target_os = "macos")]
-fn domain() -> String {
-    let gui = format!("gui/{}", super::uid());
-    let has_gui = Command::new("launchctl")
-        .args(["print", &gui])
+fn domains() -> [String; 2] {
+    let uid = super::uid();
+    [format!("gui/{uid}"), format!("user/{uid}")]
+}
+#[cfg(target_os = "macos")]
+fn loaded(domain: &str) -> io::Result<bool> {
+    Ok(Command::new("launchctl")
+        .args(["print", &format!("{domain}/{LABEL}")])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if has_gui {
-        gui
-    } else {
-        format!("user/{}", super::uid())
+        .status()?
+        .success())
+}
+/// The domain the agent is loaded in, if any.
+#[cfg(target_os = "macos")]
+fn loaded_domain() -> io::Result<Option<String>> {
+    for domain in domains() {
+        if loaded(&domain)? {
+            return Ok(Some(domain));
+        }
     }
+    Ok(None)
 }
 
 pub(super) fn start() -> io::Result<()> {
@@ -186,25 +196,26 @@ pub(super) fn start() -> io::Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        let domain = domain();
-        let name = format!("{domain}/{LABEL}");
-        if Command::new("launchctl")
-            .args(["print", &name])
-            .output()?
-            .status
-            .success()
-        {
-            run("launchctl", &["kickstart".as_ref(), name.as_ref()])
-        } else {
-            run(
-                "launchctl",
-                &[
-                    "bootstrap".as_ref(),
-                    domain.as_ref(),
-                    unit_path()?.as_os_str(),
-                ],
-            )
+        if let Some(domain) = loaded_domain()? {
+            let name = format!("{domain}/{LABEL}");
+            return run("launchctl", &["kickstart".as_ref(), name.as_ref()]);
         }
+        let plist = unit_path()?;
+        let mut last = None;
+        for domain in domains() {
+            let _ = run(
+                "launchctl",
+                &["enable".as_ref(), format!("{domain}/{LABEL}").as_ref()],
+            );
+            match run(
+                "launchctl",
+                &["bootstrap".as_ref(), domain.as_ref(), plist.as_os_str()],
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| io::Error::other("launchctl bootstrap failed")))
     }
 }
 fn owned_contents(file: &Path) -> io::Result<Option<String>> {
@@ -258,11 +269,6 @@ fn install(paths: &Paths, file: &Path) -> io::Result<()> {
         service(&["daemon-reload"])?;
         service(&["enable", UNIT])?;
     }
-    #[cfg(target_os = "macos")]
-    {
-        let name = format!("{}/{LABEL}", domain());
-        run("launchctl", &["enable".as_ref(), name.as_ref()])?;
-    }
     if !is_running(paths)? {
         start()?;
     }
@@ -277,16 +283,9 @@ fn uninstall(file: &Path) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     service(&["disable", "--now", UNIT])?;
     #[cfg(target_os = "macos")]
-    {
-        let name = format!("{}/{LABEL}", domain());
-        if Command::new("launchctl")
-            .args(["print", &name])
-            .output()?
-            .status
-            .success()
-        {
-            run("launchctl", &["bootout".as_ref(), name.as_ref()])?;
-        }
+    if let Some(domain) = loaded_domain()? {
+        let name = format!("{domain}/{LABEL}");
+        run("launchctl", &["bootout".as_ref(), name.as_ref()])?;
     }
     fs::remove_file(file)?;
     #[cfg(target_os = "linux")]
