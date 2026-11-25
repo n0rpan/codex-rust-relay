@@ -2257,9 +2257,9 @@ impl Engine {
             changes,
         })?;
         self.replay.append(scope.clone(), packet.clone());
-        // Scope-less subscribers get only the catalog deltas above, never transcripts.
         self.clients.retain(|_, c| match c.subscription.as_ref() {
             Some(Some(s)) if s == scope => c.peer.send(packet.clone()),
+            Some(None) if !c.catalog => c.peer.send(packet.clone()),
             _ => true,
         });
         Ok(())
@@ -2267,8 +2267,10 @@ impl Engine {
 }
 
 /// Clients that receive navigation metadata only: the catalog watch and scope-less subscriptions.
+// Only catalog watchers are filtered. A scope-less Subscribe means "every scope"
+// (the phone and web push rely on asks and notifications from it), as on main.
 fn catalog_only(client: &ClientState) -> bool {
-    client.catalog || client.subscription == Some(None)
+    client.catalog
 }
 
 // Sidebar subscribers need just the navigation metadata. Never copy a transcript,
@@ -2636,7 +2638,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_less_subscribers_get_catalog_deltas_and_never_transcripts() {
+    fn catalog_watchers_get_catalog_deltas_and_all_scope_subscribers_get_everything() {
         let root = tempfile::tempdir().unwrap();
         let scope = Scope {
             project: root.path().to_owned(),
@@ -2708,7 +2710,22 @@ mod tests {
                     })
                     .collect()
             };
-        for frames in [decode(legacy), decode(watcher)] {
+        // A scope-less Subscribe means every scope: the phone and web push need its
+        // asks and notifications, so it receives the full packet like on main.
+        let all = decode(legacy);
+        assert_eq!(all.len(), 1);
+        assert!(
+            all[0]
+                .iter()
+                .any(|c| matches!(c, Change::Transcript { .. }))
+        );
+        assert!(
+            all[0]
+                .iter()
+                .any(|c| matches!(c, Change::Notification { .. }))
+        );
+        {
+            let frames = decode(watcher);
             assert_eq!(frames.len(), 1);
             assert!(
                 frames[0]
