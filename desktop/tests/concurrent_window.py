@@ -162,13 +162,22 @@ def run(gui, stock, root):
                     enter(prompt)
                     word("once")
 
+                def switch_to_waiting(project, thread):
+                    def project_control(view):
+                        return next((c for c in view["layout"] if c["id"].startswith("waiting-")
+                                     and c["label"].endswith(f" · {project}") and c["enabled"]), None)
+                    press(project_control(wait_view(project_control))["id"])
+                    wait_view(lambda view: view["selected_thread"] == thread and view["selected_requests"])
+
                 send("Alpha approval")
+                alpha_thread = wait_view(lambda s: s["selected_requests"])["selected_thread"]
                 click(*word("alpha", sidebar=True))
                 click(*word("/beta"))
                 send("Beta approval")
+                beta_thread = wait_view(lambda s: s["selected_requests"])["selected_thread"]
                 for p in (alpha, beta):
                     assert not (p / "approved.txt").exists()
-                click(*word("waiting"))
+                switch_to_waiting("Alpha", alpha_thread)
                 click(*word("once"))
                 word("complete")
                 assert (alpha / "approved.txt").read_text().strip() == "accepted"
@@ -196,12 +205,12 @@ def run(gui, stock, root):
                 worker = wait_view(lambda s: s["selected_parent"] and s["selected_requests"]
                                    and s["visible_turn"])["selected_thread"]
                 enter("Apply the window clarification.")
-                click(*word("waiting"))
+                switch_to_waiting("Beta", beta_thread)
                 word("once")
                 command("xdotool", "key", "ctrl+alt+1")
                 word("complete")
                 assert (beta / "approved.txt").read_text().strip() == "accepted"
-                click(*word("waiting"))
+                switch_to_waiting("Alpha", worker)
                 wait_view(lambda s: s["selected_thread"] == worker and s["selected_requests"])
                 click(*word("once"))
                 assert http.steered.wait(10), "Stock worker did not receive the UI clarification"
