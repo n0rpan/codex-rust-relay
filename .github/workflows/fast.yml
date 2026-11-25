@@ -1,9 +1,9 @@
 name: Fast lane
 
 # The fast lane answers "is this push sane?" in under five minutes on a warm
-# cache. It runs on every push to a branch and on every pull request update.
-# Pull requests from this repository are already covered by the push run on
-# their head commit, so the pull_request trigger only runs jobs for forks.
+# cache. It runs on every push to a branch; a pull request's checks come from
+# the push run on its head commit. (No pull_request trigger: a second run per
+# push only added a row of skipped checks.)
 # On main, tags and manual release runs, ci.yml calls this workflow instead,
 # so the same checks gate the dev and tagged releases.
 #
@@ -20,7 +20,6 @@ name: Fast lane
 on:
   push:
     branches: ['**', '!main']
-  pull_request:
   workflow_dispatch:
   workflow_call:
 
@@ -38,7 +37,6 @@ env:
 jobs:
   root:
     name: ox crate (fmt, clippy, tests)
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -76,7 +74,6 @@ jobs:
 
   workbench:
     name: Fast Linux workbench check
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     env:
@@ -117,7 +114,6 @@ jobs:
 
   protocol:
     name: Stock-client protocol (${{ matrix.track }})
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:

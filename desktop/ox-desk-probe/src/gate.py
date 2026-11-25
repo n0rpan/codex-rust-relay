@@ -463,11 +463,16 @@ def scroll_catalog(f):
     positions = wait(lambda: words if "0000" in (words := f.words()) else None)
     f.x("mousemove", "--window", f.window, *positions["0000"])
     f.stats(reset=True)
-    end = time.monotonic() + 150
+    # Scroll until the end, or until 30 seconds pass without reaching a new row.
+    # A fixed overall deadline failed on slow shared runners at row 4988 of 5000
+    # while still making steady progress.
     stats = f.stats()
-    while stats["furthest_row"] < 5000 and time.monotonic() < end:
+    furthest, stalled = stats["furthest_row"], time.monotonic() + 30
+    while stats["furthest_row"] < 5000 and time.monotonic() < stalled:
         f.x("click", "--repeat", "100", "--delay", "5", "5")
         stats = f.stats()
+        if stats["furthest_row"] > furthest:
+            furthest, stalled = stats["furthest_row"], time.monotonic() + 30
     # Count only the GPUI visible range and its overscan. Window height gives an
     # independent upper bound since every button alone consumes 32 logical pixels.
     size = f.x("getwindowgeometry", "--shell", f.window)

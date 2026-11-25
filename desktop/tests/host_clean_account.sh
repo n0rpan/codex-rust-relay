@@ -45,11 +45,20 @@ if [ "$os" = Linux ]; then
     home="/home/$user"
     uid=$(id -u "$user")
     sudo loginctl enable-linger "$user"
-    for _ in $(seq 1 100); do [ -S "/run/user/$uid/bus" ] && break; sleep 0.1; done
-    [ -S "/run/user/$uid/bus" ] || fail "systemd --user did not start for $user"
+    # Lingering starts user@UID.service. systemctl --user talks to it over
+    # its private socket, so no D-Bus session bus is needed (the runner image
+    # may not ship dbus-user-session).
+    sudo systemctl start "user@$uid.service" || true
+    for _ in $(seq 1 300); do [ -S "/run/user/$uid/systemd/private" ] && break; sleep 0.1; done
+    if [ ! -S "/run/user/$uid/systemd/private" ]; then
+        systemctl status "user@$uid.service" --no-pager || true
+        fail "systemd --user did not start for $user"
+    fi
+    bus=""
+    if [ -S "/run/user/$uid/bus" ]; then bus="unix:path=/run/user/$uid/bus"; fi
     as_user() {
         sudo -u "$user" env -i HOME="$home" USER="$user" LOGNAME="$user" \
-            XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            XDG_RUNTIME_DIR="/run/user/$uid" ${bus:+DBUS_SESSION_BUS_ADDRESS="$bus"} \
             PATH="$home/.local/bin:/usr/local/bin:/usr/bin:/bin" "$@"
     }
     service_active() { as_user systemctl --user is-active --quiet ox-host.service; }

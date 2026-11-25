@@ -276,7 +276,6 @@ jobs:
           key: ${{ steps.deps.outputs.cache-primary-key }}
 
   clean-account:
-    name: Clean-account install (${{ matrix.runner }})
     needs: package
     if: >-
       !cancelled() &&
