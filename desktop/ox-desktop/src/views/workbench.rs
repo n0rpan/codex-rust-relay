@@ -12,6 +12,7 @@ use std::{collections::HashMap, path::PathBuf, time::Instant};
 mod review;
 mod thread_menu;
 mod usage;
+mod worker;
 
 fn current_activity(store: &Store) -> Option<activity::Scene> {
     use activity::Scene;
@@ -100,6 +101,9 @@ pub(super) struct FocusSearch;
 impl EventEmitter<FocusSearch> for Workbench {}
 pub(super) struct CatalogChanged;
 impl EventEmitter<CatalogChanged> for Workbench {}
+/// Ask the host to open the session with this thread id: a worker's parent, or a running worker.
+pub(super) struct OpenThread(pub String);
+impl EventEmitter<OpenThread> for Workbench {}
 
 #[derive(Default)]
 pub(super) struct Stats {
@@ -711,6 +715,9 @@ impl Workbench {
                                                         ),
                                                     )),
                                             )
+                                        })
+                                        .when_some(self.worker_crumb(p, cx), |view, crumb| {
+                                            view.child(crumb)
                                         }),
                                 )
                                 .child(
@@ -781,6 +788,7 @@ impl Workbench {
                         )
                         .child(transcript)
                         .children(activity_status)
+                        .children(self.workers_line(p, cx))
                         .children(inline_sheet)
                         .child(composer)
                         .children(usage),

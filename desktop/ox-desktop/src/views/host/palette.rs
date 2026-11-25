@@ -23,6 +23,11 @@ enum Target {
         pane: usize,
         owner: String,
     },
+    /// End the selected session's live process; the thread stays and resumes on select.
+    EndSession {
+        pane: usize,
+        owner: String,
+    },
     More,
 }
 struct Item {
@@ -316,6 +321,20 @@ impl Host {
             );
         }
         if let Some(store) = &active.store
+            && let Some(owner) = store.selected()
+            && store.can_end_session(owner)
+        {
+            add(
+                "End session".into(),
+                "Stop this thread's live process. It stays in the list and resumes when selected"
+                    .into(),
+                Target::EndSession {
+                    pane: self.active,
+                    owner: owner.to_owned(),
+                },
+            );
+        }
+        if let Some(store) = &active.store
             && store.state() == &Connection::Ready
             && !store.selected().is_some_and(|id| store.in_terminal(id))
         {
@@ -582,6 +601,10 @@ impl Host {
                         p.action(cx, DeskAction::DraftEdit(Some(owner), "/handoff ".into()))
                     });
                 }
+            }
+            Target::EndSession { pane, owner } => {
+                self.close_palette(window, cx);
+                self.panes[pane].update(cx, |p, cx| p.action(cx, DeskAction::EndSession(owner)));
             }
             Target::Command { pane, owner, text } => {
                 if text == "/rename" {

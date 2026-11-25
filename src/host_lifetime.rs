@@ -244,41 +244,7 @@ fn decode(reply: Value) -> Result<Value, String> {
 
 /// The per-user host socket, computed exactly as the host computes it.
 fn host_socket() -> Option<std::path::PathBuf> {
-    use std::path::PathBuf;
-    let absolute = |name: &str| {
-        env::var_os(name)
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-    };
-    if let Some(path) = absolute("OX_HOST_SOCKET") {
-        return Some(path);
-    }
-    let state_dir = match absolute("OX_HOST_STATE_DIR") {
-        Some(root) => root,
-        None => absolute("XDG_STATE_HOME")
-            .or_else(|| {
-                absolute("HOME").map(|h| {
-                    h.join(if cfg!(target_os = "macos") {
-                        "Library/Application Support"
-                    } else {
-                        ".local/state"
-                    })
-                })
-            })?
-            .join("ox/host"),
-    };
-    let hash = state_dir
-        .as_os_str()
-        .as_encoded_bytes()
-        .iter()
-        .fold(0xcbf29ce484222325u64, |v, b| {
-            (v ^ u64::from(*b)).wrapping_mul(0x100000001b3)
-        });
-    let name = format!("ox-host-{}-{hash:016x}", unsafe { libc::geteuid() });
-    absolute("XDG_RUNTIME_DIR")
-        .map(|p| p.join(&name).join("host.sock"))
-        .filter(|p| p.as_os_str().as_encoded_bytes().len() < 100)
-        .or_else(|| Some(Path::new("/tmp").join(name).join("host.sock")))
+    crate::ps::socket_path()
 }
 
 #[cfg(test)]

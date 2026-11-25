@@ -16,6 +16,8 @@ If something is off
   ox doctor          Check everything. The last line is the next command to run
   ox doctor --fix    Repair what ox can repair itself (files are backed up first)
   ox setup           Add a provider, paste a key, sign in, or enable web search
+  ox ps              List the live sessions and workers the OX host runs
+  ox end <id>        End a session (or --idle, --all); ox ps shows the ids
 
 More
   ox codex --model provider/model-id   Skip the picker (same for ox claude)
@@ -195,6 +197,25 @@ const HELP_TOPICS: &[&str] = &[
     "t3",
     "subscriptions",
 ];
+const PS_USAGE: &str = "\
+Usage: ox ps [--json]
+List the sessions and workers that the OX host runs. Run it while OX Desktop
+is closed to see what is still alive. If no host runs, it says so and exits 0.
+  KIND     claude or codex
+  AGE      time since the host started the process
+  IDLE     time since its last event or action
+  STATE    running while a turn or an approval is in progress
+  THREADS  short thread ids. Any unique prefix works with ox end.
+--json prints the host's raw process list.";
+
+const END_USAGE: &str = "\
+Usage: ox end <thread-id-prefix> | ox end --idle | ox end --all [--yes]
+End sessions on the OX host. A thread stays resumable after it ends.
+  <thread-id-prefix>  end the one session whose id starts with this text
+  --idle              end every session that is not running
+  --all               end every session. Asks y/N unless --yes is given.
+A running session loses its current turn when it ends. ox ps lists the ids.";
+
 const TOPICS: &str = "Usage: ox help [install|setup|desktop|share|t3|subscriptions]";
 
 pub(crate) fn overview() {
@@ -235,6 +256,8 @@ pub(crate) fn dispatch(args: &[OsString]) -> Option<Result<u8, RelayError>> {
         [command, flag] if flag == "-h" || flag == "--help" => match command.to_str() {
             Some("setup") => return Some(crate::setup::print_setup_help()),
             Some("login") => println!("{SUBSCRIPTIONS}"),
+            Some("ps") => println!("{PS_USAGE}"),
+            Some("end") => println!("{END_USAGE}"),
             Some(client @ ("codex" | "claude")) => {
                 println!(
                     "Usage: ox {client} [client arguments]\n\

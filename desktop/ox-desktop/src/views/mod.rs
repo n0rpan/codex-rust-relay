@@ -8,5 +8,6 @@ pub mod workbench;
 
 mod model_picker;
 mod route_chip;
+mod running;
 
 mod mention_menu;

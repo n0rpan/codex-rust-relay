@@ -161,6 +161,8 @@ impl Access {
                 self.selected = None;
                 true
             }
+            // A read-only listing of the host's live processes, answered by `Server::Processes`.
+            Client::ListProcesses { id } if self.ready && id.len() <= 96 && !id.is_empty() => true,
             Client::Subscribe { scope, .. } if self.ready => {
                 if scope.as_ref().is_some_and(|s| {
                     (!self.projects.contains(&s.project) || !self.routes.contains(&s.route))
@@ -192,6 +194,7 @@ impl Access {
                     | Action::ModelOptions(..)
                     | Action::LoadOlder(_)
                     | Action::Stop(_)
+                    | Action::EndSession(_)
                     | Action::SendText(..) => approval.is_none(),
                     Action::StartWorker(start) => approval.is_none() && start.validate().is_ok(),
                     Action::StartHandoff(start) => approval.is_none() && start.validate().is_ok(),
@@ -451,5 +454,84 @@ mod tests {
         }
         assert!(!a.permit(&app, &approved));
         assert!(a.invalid(&approved).is_none());
+    }
+
+    #[test]
+    fn end_session_follows_stop_and_process_listing_is_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let app = App {
+            state: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::state::State::load(dir.path()).unwrap(),
+            )),
+            host: Default::default(),
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            discovered: Default::default(),
+        };
+        let route = Route::CODEX_SUBSCRIPTION;
+        let scope = Scope {
+            project: "/approved".into(),
+            route: route.clone(),
+        };
+        let mut other = scope.clone();
+        other.project = "/other".into();
+        let list = || Client::ListProcesses {
+            id: "processes".into(),
+        };
+        let act = |s: Scope, action, approval| Client::Act {
+            id: "request".into(),
+            scope: s,
+            action,
+            approval,
+        };
+
+        // Nothing is allowed before the host's hello.
+        let mut a = Access::default();
+        assert!(!a.permit(&app, &list()));
+        assert!(a.permit(&app, &Client::Hello { version: VERSION }));
+        assert!(!a.permit(&app, &list()));
+        let hello = Server::Hello {
+            version: VERSION,
+            projects: vec![scope.project.clone()],
+            routes: vec![route],
+            capabilities: vec!["end".into(), "processes".into()],
+            host: None,
+        };
+        a.host(&app, &serde_json::to_vec(&hello).unwrap()).unwrap();
+
+        // The process listing needs no subscription, and an empty id is refused.
+        assert!(a.permit(&app, &list()));
+        assert!(!a.permit(&app, &Client::ListProcesses { id: String::new() }));
+
+        // Ending needs the subscribed scope and no approval, as Stop does.
+        assert!(!a.permit(
+            &app,
+            &act(scope.clone(), Action::EndSession("thread".into()), None)
+        ));
+        assert!(a.permit(
+            &app,
+            &Client::Subscribe {
+                scope: Some(scope.clone()),
+                after: None
+            }
+        ));
+        assert!(!a.permit(&app, &act(other, Action::EndSession("thread".into()), None)));
+        assert!(!a.permit(
+            &app,
+            &act(
+                scope.clone(),
+                Action::EndSession("thread".into()),
+                Some("yes".into())
+            )
+        ));
+        assert!(a.permit(
+            &app,
+            &act(scope.clone(), Action::EndSession("thread".into()), None)
+        ));
+        assert!(a.permit(&app, &list()));
     }
 }

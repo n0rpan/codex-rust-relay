@@ -21,6 +21,7 @@ mod host_lifetime;
 mod native;
 mod picker;
 mod provider;
+mod ps;
 mod search;
 mod settings_protocol;
 mod setup;
@@ -159,6 +160,12 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
     }
     if args.first().is_some_and(|arg| arg == "desktop") {
         return desktop_launch::run(&args[1..]);
+    }
+    if args.first().is_some_and(|arg| arg == "ps") {
+        return ps::run_ps(&args[1..]);
+    }
+    if args.first().is_some_and(|arg| arg == "end") {
+        return ps::run_end(&args[1..]);
     }
     if args.first().is_some_and(|arg| arg == "update") {
         return update::run(&args[1..]).await;

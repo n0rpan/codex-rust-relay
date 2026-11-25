@@ -100,7 +100,7 @@ pub(super) struct Discovery {
 
 /// What a parent session has under it, counted over all descendants.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub(super) struct Tree {
+pub(crate) struct Tree {
     /// Direct children.
     pub children: usize,
     pub running: usize,
@@ -112,7 +112,7 @@ pub(super) struct Tree {
 /// Tree counts for every parent in the navigation index, keyed by project and thread id.
 /// Set by `index_catalog`; read by the workbench activity line and the sidebar rows.
 #[derive(Default)]
-pub(super) struct TreeIndex(pub HashMap<(PathBuf, String), Tree>);
+pub(crate) struct TreeIndex(pub HashMap<(PathBuf, String), Tree>);
 impl gpui::Global for TreeIndex {}
 
 /// A child's parent link survives a merge with a richer row that has none.
@@ -460,7 +460,10 @@ impl Host {
         };
         // The target may be a worker folded under the session being viewed.
         if let Some(selected) = selected
-            && self.discovery.collapsed.remove(&(project.clone(), selected))
+            && self
+                .discovery
+                .collapsed
+                .remove(&(project.clone(), selected))
         {
             self.discovery.revision += 1;
             self.index_catalog(cx);

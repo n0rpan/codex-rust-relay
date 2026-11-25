@@ -21,3 +21,5 @@ export const act = (id, scope, action, approval) => ({
   action,
   approval,
 });
+/** @param {string} id @returns {Client} */
+export const listProcesses = (id) => ({ type: "list_processes", id });

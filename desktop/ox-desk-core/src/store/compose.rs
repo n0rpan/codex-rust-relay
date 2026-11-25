@@ -419,6 +419,13 @@ impl Store {
             .map(|(id, _)| id.clone())
             .collect()
     }
+    /// Whether this client can end the thread's live process (the `end` capability).
+    pub fn can_end_session(&self, id: &str) -> bool {
+        if let Some(remote) = self.remote() {
+            return remote.can(id, "end");
+        }
+        self.has_live_session(id)
+    }
     /// This thread has a live process or subscription to end.
     pub fn has_live_session(&self, id: &str) -> bool {
         if self.remote().is_some() {

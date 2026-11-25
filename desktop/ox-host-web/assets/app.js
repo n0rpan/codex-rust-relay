@@ -66,7 +66,17 @@ document.addEventListener("keydown", (event) => {
 });
 function page(id) {
   if (id !== "settings") phoneSettings?.reset?.();
-  for (const view of ["pair", "catalog", "create", "conversation", "settings"])
+  if (id !== "running") stopRunning();
+  clearConfirm($("confirm-slot"));
+  clearConfirm($("running-confirm"));
+  for (const view of [
+    "pair",
+    "catalog",
+    "create",
+    "conversation",
+    "running",
+    "settings",
+  ])
     $(view).hidden = view !== id;
   if (id !== "pair" && !$("camera-panel").hidden) closeCamera();
   $("location").textContent = location.hostname.split(".")[0];
@@ -84,6 +94,9 @@ let key,
   routes = [],
   projects = [],
   scheduled = false;
+let runningTimer = null,
+  processes = null,
+  endBusy = false;
 let cold = new Map(),
   drafts = new Map(),
   timelineRows = new Map(),
@@ -243,6 +256,12 @@ class Link {
       }
       return;
     }
+    if (msg.type === "processes") {
+      const cb = this.pending.get(msg.id);
+      this.pending.delete(msg.id);
+      cb?.(true, msg.processes);
+      return;
+    }
     if (msg.type === "worker_reply") {
       if (!msg.error && msg.result?.relation === "handoff") {
         notice(`Continued in ${routesLabel(msg.result.scope.route)}.`);
@@ -281,7 +300,7 @@ class Link {
   connected() {
     this.ready = true;
     this.attempt = 0;
-    if (this.scope && selected?.id) {
+    if (this === detailLink && this.scope && selected?.id) {
       this.act({ select_thread: selected.id });
     }
     repaint();
@@ -302,6 +321,14 @@ class Link {
         Math.random() * 250,
     );
     repaint();
+  }
+  /** Asks the host for its live processes. The callback gets (true, processes) or (false, message). */
+  listProcesses(cb) {
+    if (!this.ready || this.socket?.readyState !== WebSocket.OPEN) return false;
+    const id = crypto.randomUUID();
+    this.pending.set(id, cb);
+    this.send(wire.listProcesses(id));
+    return true;
   }
   act(action, approval = null, cb) {
     if (
@@ -346,6 +373,157 @@ class Link {
     this.pending.clear();
   }
 }
+// The in-page confirm: a question, Cancel and the action. The app never uses window.confirm.
+function clearConfirm(slot) {
+  slot.hidden = true;
+  slot.replaceChildren();
+}
+function confirmIn(slot, question, label, work) {
+  const cancel = button("Cancel", () => clearConfirm(slot));
+  cancel.className = "quiet";
+  const go = button(label, () => {
+    clearConfirm(slot);
+    work();
+  });
+  go.className = "danger";
+  slot.replaceChildren(el("p", "", question), cancel, go);
+  slot.hidden = false;
+  cancel.focus();
+}
+// Ends every thread of one scope over a short-lived subscription. True when each end was acknowledged.
+function endThreads(scope, threads) {
+  return new Promise((resolve) => {
+    const link = new Link(scope, new Projection());
+    const started = Date.now();
+    let left = threads.length,
+      ok = true;
+    const settle = (done) => {
+      if (!done) ok = false;
+      if (--left === 0) {
+        link.close();
+        resolve(ok);
+      }
+    };
+    const begin = () => {
+      if (!link.ready) {
+        if (Date.now() - started > 10000) {
+          ok = false;
+          link.close();
+          resolve(false);
+        } else setTimeout(begin, 100);
+        return;
+      }
+      for (const thread of threads)
+        if (!link.act({ end_session: thread }, null, (done) => settle(done)))
+          settle(false);
+    };
+    if (!threads.length) resolve(true);
+    else begin();
+  });
+}
+async function endProcesses(list) {
+  endBusy = true;
+  drawRunning();
+  const results = await Promise.all(
+    list.map((p) => endThreads(p.scope, p.threads)),
+  );
+  endBusy = false;
+  if (results.includes(false))
+    notice("Some sessions did not end. Check the host and try again.");
+  refreshRunning();
+}
+const ago = (seconds) => {
+  const s = Math.max(0, Math.floor(seconds));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h";
+  return Math.floor(s / 86400) + "d";
+};
+const kindLabels = { claude: "Claude", codex: "Codex", worker: "Worker" };
+function refreshRunning() {
+  globalLink?.listProcesses((ok, value) => {
+    if (!ok) {
+      if (value) notice(value);
+      return;
+    }
+    processes = value;
+    drawRunning();
+  });
+}
+function drawRunning() {
+  const list = $("running-list");
+  const now = Date.now() / 1000;
+  $("running-empty").hidden = !(processes && !processes.length);
+  $("running-loading").hidden = processes !== null;
+  const idle = (processes ?? []).filter((p) => !p.running);
+  $("end-idle").disabled = endBusy || !idle.length;
+  const rows = [];
+  for (const p of processes ?? []) {
+    const row = el("article", "running-row");
+    row.dataset.running = String(p.running);
+    const head = el("div", "session-top");
+    const name = el("span", "session-name");
+    name.append(el("span", "run-dot"), leaf(p.project));
+    head.append(
+      name,
+      el("span", "status", p.running ? "Turn running" : "Idle"),
+    );
+    const facts = [
+      kindLabels[p.kind] ?? p.kind,
+      p.model || p.route,
+      p.threads.length > 1 ? p.threads.length + " sessions" : null,
+      "age " + ago(now - p.started_at),
+      "idle " + ago(now - p.last_activity),
+    ].filter(Boolean);
+    const actions = el("div", "actions");
+    const end = button("End", () => endRow(p));
+    end.disabled = endBusy;
+    actions.append(end);
+    row.append(head, el("div", "meta", facts.join(" · ")), actions);
+    rows.push(row);
+  }
+  list.replaceChildren(...rows);
+}
+function endRow(p) {
+  const run = () => endProcesses([p]);
+  if (p.running)
+    confirmIn(
+      $("running-confirm"),
+      `End ${leaf(p.project)}? Its running turn or pending approval stops. History is kept.`,
+      "End session",
+      run,
+    );
+  else run();
+}
+function openRunning() {
+  if (!globalLink?.ready) {
+    notice("Reconnect to see running sessions.");
+    return;
+  }
+  processes = null;
+  page("running");
+  notice();
+  drawRunning();
+  refreshRunning();
+  runningTimer = setInterval(() => {
+    if (!document.hidden) refreshRunning();
+  }, 5000);
+}
+function stopRunning() {
+  clearInterval(runningTimer);
+  runningTimer = null;
+}
+$("open-running").onclick = openRunning;
+$("end-idle").onclick = () => {
+  const idle = (processes ?? []).filter((p) => !p.running);
+  if (!idle.length) return;
+  confirmIn(
+    $("running-confirm"),
+    `End ${idle.length} idle session${idle.length === 1 ? "" : "s"}? History is kept.`,
+    "End idle",
+    () => endProcesses(idle),
+  );
+};
 function home() {
   detailLink?.close();
   detailLink = null;
@@ -829,6 +1007,8 @@ function conversation() {
     ready: Boolean(detailLink?.ready),
     act: (action, cb) => detailLink?.act(action, null, cb),
     archived: home,
+    confirm: (question, label, work) =>
+      confirmIn($("confirm-slot"), question, label, work),
     notice,
     routesLabel,
   });
@@ -905,10 +1085,14 @@ function conversation() {
     !!origin ||
     !caps.includes("send") ||
     caps.includes("stop");
-  $("stop").hidden = !caps.includes("stop");
-  $("stop").disabled = !detailLink?.ready;
-  $("stop").onclick = () =>
-    detailLink.act({ stop: id });
+  // Stop keeps its slot. It is enabled only while the host reports a running turn.
+  $("stop").disabled = !detailLink?.ready || !caps.includes("stop");
+  $("stop").onclick = () => detailLink?.act({ stop: id });
+  $("menu-stop").disabled = $("stop").disabled;
+  $("menu-stop").hidden = !id;
+  $("menu-session").hidden = !id;
+  $("menu-workers").hidden = !id || !caps.includes("open");
+  $("menu-settings").hidden = $("session-controls").hidden;
 }
 function render() {
   if (!$("pair").hidden) return;
@@ -917,6 +1101,8 @@ function render() {
   if (!$("catalog").hidden) catalog();
   if (!$("conversation").hidden) conversation();
 }
+$("menu-stop").onclick = () => $("stop").click();
+$("menu-settings").onclick = () => $("open-settings").click();
 $("home").onclick = () => {
   if (key) home();
 };

@@ -1,11 +1,13 @@
 //! One workbench per canonical project and billing route. Each owns its editors,
 //! server requests and connection for the lifetime of the window.
 mod discovery;
+pub(super) use discovery::TreeIndex;
 use discovery::{Discovery, Location, Scope};
 pub(crate) mod layout;
 mod palette;
 mod shortcuts;
 use super::model_picker::{self, ModelPicker, ModelPickerEvent};
+use super::running::Running;
 use super::workbench::{CatalogChanged, Workbench};
 use crate::kit::{DropdownMenu, PopupMenuItem};
 use crate::{
@@ -90,6 +92,7 @@ pub struct Host {
     catalog_versions: Vec<(usize, u64)>,
     catalog: Vec<CatalogEntry>,
     discovery: Discovery,
+    running: Entity<Running>,
     list_focus: FocusHandle,
     list_scroll: UniformListScrollHandle,
     choose_route: Option<(PathBuf, ThreadRow)>,
@@ -183,6 +186,7 @@ impl Host {
             catalog_versions: vec![],
             catalog: vec![],
             discovery: Discovery::default(),
+            running: cx.new(Running::new),
             list_focus: cx.focus_handle().tab_stop(true),
             list_scroll: Default::default(),
             choose_route: None,
@@ -553,6 +557,14 @@ impl Host {
             cx.notify();
         })
         .detach();
+        cx.subscribe_in(
+            &pane,
+            window,
+            |s, owner, event: &super::workbench::OpenThread, window, cx| {
+                s.open_thread(owner, event.0.clone(), window, cx);
+            },
+        )
+        .detach();
         pane
     }
     fn switch(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -878,8 +890,21 @@ impl Host {
                     },
                 )
             };
+            let tree = cx
+                .try_global::<TreeIndex>()
+                .and_then(|index| index.0.get(&(project.to_path_buf(), t.id.clone())))
+                .cloned();
             let row = t.clone();
             let project = project.to_owned();
+            let fold_key = (project.clone(), t.id.clone());
+            let folded = tree.as_ref().is_some_and(|tree| tree.children > 0)
+                && self.discovery.collapsed.contains(&fold_key);
+            // A folded parent speaks for the children that need attention.
+            let status = match tree.as_ref() {
+                Some(tree) if folded && tree.waiting > 0 => Some("Needs you"),
+                Some(tree) if folded && tree.running > 0 => status.or(Some("Running")),
+                _ => status,
+            };
             let cartridge = if depth > 0 || t.worker {
                 activity::Cartridge::Worker
             } else if api {
@@ -896,13 +921,27 @@ impl Host {
                 } else {
                     t.title().into()
                 },
-                route: if !t.worker && t.parent_thread_id.is_some() {
-                    format!("Subagent · {badge}")
-                } else {
-                    format!(
-                        "{} · {badge}",
-                        project.file_name().unwrap_or_default().to_string_lossy()
-                    )
+                route: {
+                    let mut route = if !t.worker && t.parent_thread_id.is_some() {
+                        format!("Subagent · {badge}")
+                    } else {
+                        format!(
+                            "{} · {badge}",
+                            project.file_name().unwrap_or_default().to_string_lossy()
+                        )
+                    };
+                    if let Some(tree) = tree.as_ref().filter(|tree| tree.children > 0) {
+                        let noun = if tree.children == 1 {
+                            "worker"
+                        } else {
+                            "workers"
+                        };
+                        route.push_str(&format!(" · {} {noun}", tree.children));
+                        if tree.running > 0 {
+                            route.push_str(&format!(", {} running", tree.running));
+                        }
+                    }
+                    route
                 },
                 age: age(now.timestamp(), timestamp),
                 status: status.or(t.unread.then_some("Unread")),
@@ -910,23 +949,60 @@ impl Host {
                     && scope.matches(&active.route)
                     && active.store.as_ref().and_then(|s| s.selected()) == Some(&t.id),
             };
-            rows.push(
-                model
-                    .render(
-                        p,
-                        SharedString::from(format!(
-                            "thread-{}-{}-{}",
-                            project.display(),
+            // The disclosure is a sibling of the row, so it folds without selecting.
+            let disclosure = match tree.as_ref().filter(|tree| tree.children > 0) {
+                Some(_) => {
+                    let glyph = if folded { "▸" } else { "▾" };
+                    gpui::div()
+                        .id(SharedString::from(format!(
+                            "fold-{}-{}-{}",
+                            fold_key.0.display(),
                             scope.api,
-                            t.id
-                        )),
-                        cx.listener(move |s, _, window, cx| {
-                            window.focus(&s.list_focus, cx);
-                            s.activate_row(project.clone(), scope, row.clone(), window, cx);
-                        }),
-                    )
+                            fold_key.1
+                        )))
+                        .w(px(16.))
+                        .h(px(37.))
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .text_size(px(11.))
+                        .text_color(rgb(p.fg))
+                        .child(glyph)
+                        .on_click(cx.listener(move |s, _, _, cx| {
+                            s.discovery.toggle(fold_key.0.clone(), fold_key.1.clone());
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                }
+                None => gpui::div().w(px(16.)).flex_none().into_any_element(),
+            };
+            rows.push(
+                gpui::div()
                     .w(width)
+                    .flex()
+                    .items_center()
                     .pl(px(6. + depth.min(4) as f32 * 12.))
+                    .child(disclosure)
+                    .child(
+                        model
+                            .render(
+                                p,
+                                SharedString::from(format!(
+                                    "thread-{}-{}-{}",
+                                    project.display(),
+                                    scope.api,
+                                    t.id
+                                )),
+                                cx.listener(move |s, _, window, cx| {
+                                    window.focus(&s.list_focus, cx);
+                                    s.activate_row(project.clone(), scope, row.clone(), window, cx);
+                                }),
+                            )
+                            .flex_1()
+                            .min_w_0(),
+                    )
                     .into_any_element(),
             );
         }
@@ -970,6 +1046,8 @@ impl Host {
             self.close_drawer(window, cx);
         }
         let inline = !compact && self.sidebar_visible;
+        let shown = inline || self.drawer_open;
+        self.running.update(cx, |r, _| r.shown = shown);
         let pane_width = window.viewport_size().width
             - if inline {
                 px(self.sidebar_width as f32 + DIVIDER_WIDTH)
@@ -1316,6 +1394,7 @@ impl Host {
                         .min_h_0(),
                     ),
             )
+            .child(self.running.clone())
             .child(
                 div().px_2().border_t_1().border_color(rgb(p.line)).child(
                     button(

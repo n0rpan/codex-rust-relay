@@ -848,7 +848,10 @@ def run(harness, screenshot=None):
         assert js("return document.activeElement.matches('#conversation .action-menu > summary:focus-visible')")
         keypress("\ue007")
         keypress("\ue004")
-        assert js("return document.activeElement.id==='operator-project'")
+        # The menu opens on its first visible item (the Session section leads now).
+        assert js("""const a=document.activeElement, m=document.querySelector('#conversation .action-menu');
+            const first=[...m.querySelectorAll('button')].find(b=>b.offsetParent!==null);
+            return m.open && a===first""")
         keypress("\ue00c")
         assert js("return !document.querySelector('#conversation .action-menu').open && document.activeElement.matches('.action-menu > summary')")
         keypress("\ue004")

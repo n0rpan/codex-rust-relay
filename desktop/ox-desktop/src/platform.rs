@@ -1,5 +1,7 @@
 mod host_client;
-pub(crate) use host_client::{CatalogEvent, CatalogWatch, discover, open_store, watch_catalog};
+pub(crate) use host_client::{
+    CatalogEvent, CatalogWatch, discover, end_threads, list_processes, open_store, watch_catalog,
+};
 pub mod onboarding;
 pub(crate) mod remote;
 pub mod versions;

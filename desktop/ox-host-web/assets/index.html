@@ -69,6 +69,7 @@
           <details class="action-menu">
             <summary aria-label="More session list actions">•••</summary>
             <div>
+              <button type="button" id="open-running">Running</button>
               <button type="button" id="operator-home">Host terminal</button>
               <button id="open-phone-settings" type="button">Settings</button>
             </div>
@@ -95,6 +96,18 @@
           ><button data-filter="finished" aria-pressed="false">Finished</button>
         </div>
         <div id="list"></div>
+      </section>
+      <section id="running" hidden aria-labelledby="running-title">
+        <button class="back">← Sessions</button>
+        <div class="heading">
+          <h1 id="running-title">Running</h1>
+          <button id="end-idle" type="button" class="quiet">End all idle</button>
+        </div>
+        <p class="note">Live processes on this host. Ending keeps each session's history.</p>
+        <div id="running-confirm" class="confirm-slot" hidden></div>
+        <p id="running-loading" class="empty">Loading sessions…</p>
+        <p id="running-empty" class="empty" hidden>Nothing is running on this host.</p>
+        <div id="running-list"></div>
       </section>
       <section id="create" hidden>
         <button class="back">← Sessions</button>
@@ -136,15 +149,28 @@
           <details class="action-menu">
             <summary aria-label="More session actions">•••</summary>
             <div>
-              <button type="button" id="operator-project">Project terminal</button>
-              <button type="button" id="operator-session" hidden>Open session in terminal</button>
-              <button type="button" id="start-worker" hidden>Start worker</button>
-              <button type="button" id="continue-in" hidden>Continue in…</button>
+              <section id="menu-session" class="menu-section" aria-label="Session" hidden>
+                <p class="menu-heading">Session</p>
+                <button type="button" id="menu-stop" hidden>Stop</button>
+                <div id="thread-actions" class="menu-items"></div>
+              </section>
+              <section id="menu-workers" class="menu-section" aria-label="Workers and handoff" hidden>
+                <p class="menu-heading">Workers and handoff</p>
+                <button type="button" id="start-worker" hidden>Start worker</button>
+                <button type="button" id="continue-in" hidden>Continue in…</button>
+              </section>
+              <section class="menu-section" aria-label="Settings and terminal">
+                <p class="menu-heading">Settings and terminal</p>
+                <button type="button" id="menu-settings" hidden>Session settings</button>
+                <button type="button" id="operator-project">Project terminal</button>
+                <button type="button" id="operator-session" hidden>Open session in terminal</button>
+              </section>
             </div>
           </details>
         </nav>
         <div id="context"></div>
         <h1 id="title"></h1>
+        <div id="confirm-slot" class="confirm-slot" hidden></div>
         <div id="handoff-marks" class="handoff-marks" hidden></div>
         <button id="older" class="quiet" hidden>Load earlier messages</button
         >
@@ -185,7 +211,6 @@
               />
               <button type="submit">Run command</button>
             </form>
-            <div id="thread-actions" class="actions"></div>
             <div id="session-usage"></div>
             <p id="control-status" role="status" hidden></p>
           </section>
@@ -272,7 +297,7 @@
                 accept="image/png,image/jpeg,image/gif,image/webp"
                 multiple
             /></label>
-            <button type="button" id="stop" hidden>Stop</button
+            <button type="button" id="stop" disabled>Stop</button
             ><button class="primary" id="send">Send</button>
           </div>
         </form>

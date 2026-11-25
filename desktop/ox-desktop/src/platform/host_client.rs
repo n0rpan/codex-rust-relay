@@ -2,12 +2,13 @@
 //! leaves the daemon, native runtimes and outstanding requests alive.
 use ox_desk_core::{
     actions::Action,
-    host_protocol::{Client, Scope, Server, VERSION},
+    host_protocol::{Client, ProcessView, Scope, Server, VERSION},
     links::LinkEvent,
     store::{Profile, Route, Store, ThreadRow, replica},
 };
 use ox_host_service::{Paths, ensure_running};
 use std::{
+    collections::HashSet,
     io::{self, BufRead, BufReader, BufWriter, Read, Write},
     net::Shutdown,
     os::unix::net::UnixStream,
@@ -184,6 +185,74 @@ pub(crate) fn discover() -> io::Result<CatalogResult> {
             _ => (),
         }
     }
+}
+
+/// The live processes the host runs, newest first. A one-shot request on its own socket.
+pub(crate) fn list_processes() -> io::Result<Vec<ProcessView>> {
+    let (mut input, mut socket) = connect()?;
+    write_frame(
+        &mut socket,
+        &Client::ListProcesses {
+            id: "processes".into(),
+        },
+    )?;
+    loop {
+        match read_frame(&mut input)? {
+            Server::Processes { id, processes } if id == "processes" => return Ok(processes),
+            Server::Error { id, message } if id.as_deref().is_none_or(|i| i == "processes") => {
+                return Err(io::Error::other(message));
+            }
+            _ => (),
+        }
+    }
+}
+
+/// End the live process of each thread in `scope`. Acts need a subscription to the
+/// scope on the same socket, so this subscribes first, then waits for every reply.
+pub(crate) fn end_threads(scope: Scope, threads: Vec<String>) -> io::Result<()> {
+    if threads.is_empty() {
+        return Ok(());
+    }
+    let (mut input, mut socket) = connect()?;
+    write_frame(
+        &mut socket,
+        &Client::Subscribe {
+            scope: Some(scope.clone()),
+            after: None,
+        },
+    )?;
+    let nonce = getrandom::u64().map_err(io::Error::other)?;
+    let mut waiting = HashSet::new();
+    for (i, thread) in threads.into_iter().enumerate() {
+        let id = format!("end-{nonce:016x}-{i}");
+        write_frame(
+            &mut socket,
+            &Client::Act {
+                id: id.clone(),
+                scope: scope.clone(),
+                action: Action::EndSession(thread),
+                approval: None,
+            },
+        )?;
+        waiting.insert(id);
+    }
+    let mut failure = None;
+    while !waiting.is_empty() {
+        match read_frame(&mut input)? {
+            Server::Ack { id } => {
+                waiting.remove(&id);
+            }
+            Server::Error {
+                id: Some(id),
+                message,
+            } if waiting.remove(&id) => {
+                failure.get_or_insert(message);
+            }
+            Server::Error { id: None, message } => return Err(io::Error::other(message)),
+            _ => (),
+        }
+    }
+    failure.map_or(Ok(()), |message| Err(io::Error::other(message)))
 }
 
 mod catalog;

@@ -39,7 +39,9 @@ impl Workbench {
     pub(super) fn thread_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let id = self.store.as_ref()?.selected()?.to_owned();
         let store = self.store.as_ref()?;
-        if !store.can_manage_thread(&id) {
+        let manage = store.can_manage_thread(&id);
+        let can_end = store.can_end_session(&id);
+        if !manage && !can_end {
             self.thread_edit = None;
             return None;
         }
@@ -84,8 +86,8 @@ impl Workbench {
             );
         }
         let view = cx.weak_entity();
-        let edit_metadata = store.can_edit_thread_metadata();
-        let can_generate = store.can_generate_title(&id);
+        let edit_metadata = manage && store.can_edit_thread_metadata();
+        let can_generate = manage && store.can_generate_title(&id);
         Some(
             crate::kit::toolbar_button(
                 p,
@@ -105,6 +107,8 @@ impl Workbench {
                 let archived = id.clone();
                 let naming = view.clone();
                 let unnamed = id.clone();
+                let end = view.clone();
+                let ended = id.clone();
                 menu.when(edit_metadata, |menu| menu.item(
                     PopupMenuItem::new("Rename thread").on_click(move |_, window, cx| {
                         let _ = rename.update(cx, |s, cx| {
@@ -131,10 +135,13 @@ impl Workbench {
                         let _ = naming.update(cx, |s, cx| s.action(cx, Action::GenerateTitle(unnamed.clone())));
                     }),
                 ))
-                .item(PopupMenuItem::new("Find in transcript").on_click(move |_,w,cx| {
+                .when(manage, |menu| menu.item(PopupMenuItem::new("Find in transcript").on_click(move |_,w,cx| {
                     let _ = find.update(cx,|s,cx|s.find_in_transcript(w,cx));
-                }))
+                })))
                 .map(|mut menu| {
+                    if !manage {
+                        return menu;
+                    }
                     for (title, expand) in [("Expand all details",Some(true)),("Fold all details",Some(false)),("Show / hide thinking",None)] {
                         let view = view.clone();
                         menu = menu.item(PopupMenuItem::new(title).on_click(move |_,_,cx| {
@@ -143,10 +150,10 @@ impl Workbench {
                     }
                     menu
                 })
-                .item(PopupMenuItem::new("Fork thread").on_click(move |_, _, cx| {
+                .when(manage, |menu| menu.item(PopupMenuItem::new("Fork thread").on_click(move |_, _, cx| {
                     let _ =
                         fork.update(cx, |s, cx| s.action(cx, Action::ForkThread(target.clone())));
-                }))
+                })))
                 .when(edit_metadata, |menu|menu.item(
                     PopupMenuItem::new("Archive thread…").on_click(move |_, _, cx| {
                         let _ = archive.update(cx, |s, cx| {
@@ -158,6 +165,11 @@ impl Workbench {
                                 cx.notify();
                             }
                         });
+                    }),
+                ))
+                .when(can_end, |menu| menu.item(
+                    PopupMenuItem::new("End session").on_click(move |_, _, cx| {
+                        let _ = end.update(cx, |s, cx| s.action(cx, Action::EndSession(ended.clone())));
                     }),
                 ))
             })
