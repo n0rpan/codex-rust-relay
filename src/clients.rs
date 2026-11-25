@@ -686,6 +686,7 @@ fn inject_settings(
 /// job when a stock release lists a root command or alias missing here.
 const CLAUDE_SUBCOMMANDS: &[&str] = &[
     "agents",
+    "attach",
     "auth",
     "auto-mode",
     "design-login",
@@ -701,6 +702,8 @@ const CLAUDE_SUBCOMMANDS: &[&str] = &[
     "import",
     "import-conversations",
     "install",
+    "kill",
+    "logs",
     "mcp",
     "plugin",
     "plugins",
@@ -708,8 +711,11 @@ const CLAUDE_SUBCOMMANDS: &[&str] = &[
     "purge",
     "rc",
     "remote-control",
+    "respawn",
+    "rm",
     "sandbox",
     "setup-token",
+    "stop",
     "ultrareview",
     "update",
     "upgrade",
