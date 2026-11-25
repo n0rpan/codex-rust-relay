@@ -602,7 +602,9 @@ function showAsks(asks) {
       a.choices.forEach((c, i) => {
         const choice = button(c, () => answer({ answer_ask: [a.id, i] }));
         // Permission decisions are deliberately equal-weight choices.
-        choice.className = "decision";
+        choice.className = /^(deny|decline|reject|cancel|no\b)/i.test(c)
+          ? "decision deny"
+          : "decision";
         card.append(choice);
       });
     }
@@ -1138,6 +1140,11 @@ $("handoff-form").onsubmit = (e) => {
   const route = routes[+$("handoff-route").value];
   if (!route) return;
   const mode = $("handoff-mode").value;
+  const request = $("handoff-request").value.trim();
+  if (!request) {
+    notice("Write the request for the new session.");
+    return;
+  }
   const row = detailLink?.model.scopes
     .get(scopeKey(selected.scope))
     ?.sessions.find((x) => x.id === selected.id);
@@ -1158,7 +1165,7 @@ $("handoff-form").onsubmit = (e) => {
     runtime: route.runtime,
     model: route.billing?.api ?? null,
     mode,
-    request: $("handoff-request").value,
+    request,
     yolo_confirmed: confirmed,
   };
   const grant = mode === "yolo" && $("handoff-grant").checked;
@@ -1190,12 +1197,17 @@ $("worker-form").onsubmit = (e) => {
   e.preventDefault();
   if (!selected?.id) return;
   const model = $("worker-model").value.trim() || null;
+  const task = $("worker-task").value.trim();
+  if (!task) {
+    notice("Write the task for the worker.");
+    return;
+  }
   const start = {
     parent: selected.id,
     runtime: $("worker-runtime").value,
     model,
     mode: $("worker-mode").value,
-    task: $("worker-task").value,
+    task,
     permission: $("worker-permission").value,
     yolo_confirmed: false,
   };

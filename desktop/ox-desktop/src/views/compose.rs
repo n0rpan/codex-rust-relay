@@ -370,18 +370,20 @@ impl Workbench {
                             .flex_shrink_0()
                             .justify_end()
                             .gap_2()
-                            .when(running, |r| {
-                                let id = selected.clone().unwrap();
-                                r.child(toolbar_button(
-                                    p,
-                                    "stop-turn",
-                                    "Stop",
-                                    true,
-                                    cx.listener(move |s, _, _, cx| {
-                                        s.action(cx, DeskAction::Stop(id.clone()))
-                                    }),
-                                ))
-                            })
+                            // Stop keeps a fixed slot and is disabled while idle, so the
+                            // send button never moves when a turn starts or ends.
+                            .child(div().w(px(72.)).flex().justify_end().child(button(
+                                p,
+                                "stop-turn",
+                                "Stop",
+                                false,
+                                running && selected.is_some(),
+                                cx.listener(move |s, _, _, cx| {
+                                    if let Some(id) = selected.clone() {
+                                        s.action(cx, DeskAction::Stop(id))
+                                    }
+                                }),
+                            )))
                             .child(
                                 button(
                                     p,

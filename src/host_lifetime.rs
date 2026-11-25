@@ -61,6 +61,23 @@ pub(crate) fn hosted() -> bool {
     env::var_os(ENDPOINT).is_some()
 }
 
+/// This helper's own lease id, once `supervise` has registered it with the host.
+pub(crate) fn own_lease() -> Option<&'static str> {
+    LEASE.get().map(String::as_str)
+}
+
+/// Lets a helper this process starts register under this helper's lease, so the
+/// host retires it when this helper goes. Only a hosted helper with a lease passes it.
+pub(crate) fn set_parent_lease(command: &mut tokio::process::Command) {
+    set_parent_lease_from(command, hosted(), own_lease());
+}
+
+fn set_parent_lease_from(command: &mut tokio::process::Command, hosted: bool, lease: Option<&str>) {
+    if let (true, Some(lease)) = (hosted, lease) {
+        command.env(PARENT_LEASE, lease);
+    }
+}
+
 pub(crate) fn isolate_stock(command: &mut tokio::process::Command) {
     for key in [
         ENDPOINT,
@@ -262,4 +279,40 @@ fn host_socket() -> Option<std::path::PathBuf> {
         .map(|p| p.join(&name).join("host.sock"))
         .filter(|p| p.as_os_str().as_encoded_bytes().len() < 100)
         .or_else(|| Some(Path::new("/tmp").join(name).join("host.sock")))
+}
+
+#[cfg(test)]
+mod parent_lease_tests {
+    use super::*;
+
+    fn parent_env(command: &tokio::process::Command) -> Option<String> {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == PARENT_LEASE)
+            .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn child_gets_own_lease_only_when_hosted() {
+        let mut command = tokio::process::Command::new("ox");
+        set_parent_lease_from(&mut command, true, Some("gateway-lease"));
+        assert_eq!(parent_env(&command).as_deref(), Some("gateway-lease"));
+
+        let mut unhosted = tokio::process::Command::new("ox");
+        set_parent_lease_from(&mut unhosted, false, Some("gateway-lease"));
+        assert_eq!(parent_env(&unhosted), None);
+
+        let mut unleased = tokio::process::Command::new("ox");
+        set_parent_lease_from(&mut unleased, true, None);
+        assert_eq!(parent_env(&unleased), None);
+    }
+
+    #[test]
+    fn isolate_stock_removes_parent_lease() {
+        let mut command = tokio::process::Command::new("claude");
+        set_parent_lease_from(&mut command, true, Some("gateway-lease"));
+        isolate_stock(&mut command);
+        assert_eq!(parent_env(&command), None);
+    }
 }

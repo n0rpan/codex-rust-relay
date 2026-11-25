@@ -129,13 +129,7 @@ impl Host {
             }
         })
         .detach();
-        let filter = crate::kit::field(
-            "",
-            "Search threads… (is:running, is:waiting, is:finished)",
-            false,
-            window,
-            cx,
-        );
+        let filter = crate::kit::field("", "Search threads…", false, window, cx);
         cx.subscribe(
             &filter,
             |s, field, event: &gpui_component::input::InputEvent, cx| {
@@ -519,6 +513,33 @@ impl Host {
         })
         .detach();
     }
+    /// Status filters as chips. Each chip toggles the same `is:` token the search box accepts.
+    fn filter_chips(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        const CHIPS: [(&str, &str, &str); 3] = [
+            ("filter-running", "is:running", "Running"),
+            ("filter-waiting", "is:waiting", "Needs you"),
+            ("filter-finished", "is:finished", "Finished"),
+        ];
+        let current = self.filter.read(cx).value().to_string();
+        let mut chips = crate::kit::row().gap_1().px_2().flex_wrap();
+        for (id, token, label) in CHIPS {
+            let filter = self.filter.clone();
+            let active = current.split_whitespace().any(|word| word == token);
+            chips = chips.child(crate::kit::button(
+                p,
+                id,
+                label,
+                active,
+                true,
+                move |_, window, cx| {
+                    let value = filter.read(cx).value().to_string();
+                    let next = toggle_status_filter(&value, token);
+                    filter.update(cx, |field, cx| field.set_value(next, window, cx));
+                },
+            ));
+        }
+        chips
+    }
     fn search(&mut self, query: String, cx: &mut Context<Self>) {
         for pane in &self.panes {
             if pane.read(cx).query != query {
@@ -882,15 +903,17 @@ impl Host {
             for route in ox_desk_core::runtime::Runtime::routes(&models) {
                 let host = host.clone();
                 let directory = directory.clone();
+                let starred =
+                    matches!(&route.billing, Billing::Api(alias) if favorites.contains(alias));
+                let label = route.label();
                 menu = menu.item(
-                    PopupMenuItem::new(
-                        if matches!(&route.billing,Billing::Api(alias) if favorites.contains(alias))
-                        {
-                            format!("★  {}", route.label())
-                        } else {
-                            route.label()
-                        },
-                    )
+                    PopupMenuItem::element(move |_, _| {
+                        crate::kit::row()
+                            .w_full()
+                            .gap_1()
+                            .child(crate::kit::star_column(p, starred))
+                            .child(label.clone())
+                    })
                     .checked(route == saved_route)
                     .on_click(move |_, window, cx| {
                         let _ = host.update(cx, |s, cx| {
@@ -1041,15 +1064,7 @@ impl Host {
                     .gap_2()
                     .justify_between()
                     .child(activity::horizon(p))
-                    .child(
-                        row().gap_2().child(activity::marquee(p, hot, false)).child(
-                            div()
-                                .italic()
-                                .font_family("monospace")
-                                .text_size(px(14.))
-                                .child("by Oscar"),
-                        ),
-                    )
+                    .child(row().gap_2().child(activity::marquee(p, hot, false)))
                     .child(self.palette_button(cx))
                     .when(compact, |bar| {
                         bar.child(crate::kit::icon_button(
@@ -1093,6 +1108,7 @@ impl Host {
                     .px_2()
                     .child(gpui_component::input::Input::new(&self.filter)),
             )
+            .child(self.filter_chips(p, cx))
             .when_some(self.choose_route.clone(), |sidebar, (project, row)| {
                 let host = cx.weak_entity();
                 let aliases = self.models.clone();
@@ -1190,7 +1206,18 @@ impl Host {
                     .w_full(),
                 ),
             )
-            .when_some(self.message.as_ref(), |d, m| d.child(small(p, m.clone())));
+            .when_some(self.message.clone(), |d, m| {
+                d.child(crate::kit::banner(
+                    p,
+                    "host-error",
+                    "host-error-dismiss",
+                    m,
+                    cx.listener(|s, _, _, cx| {
+                        s.message = None;
+                        cx.notify();
+                    }),
+                ))
+            });
         let (side, drawer) = if inline {
             (Some(sidebar), None)
         } else if self.drawer_open {
@@ -1300,5 +1327,42 @@ mod responsive_tests {
         assert!(!needs_drawer(px(859.), 254));
         assert!(needs_drawer(px(1000.), 540));
         assert!(!needs_drawer(px(1280.), 540));
+    }
+}
+
+/// Turns one `is:` status token on or off. Only one status filter applies at a time.
+fn toggle_status_filter(value: &str, token: &str) -> String {
+    let words: Vec<&str> = value.split_whitespace().collect();
+    if words.contains(&token) {
+        return words
+            .into_iter()
+            .filter(|word| *word != token)
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    let mut next: Vec<&str> = words
+        .into_iter()
+        .filter(|word| !word.starts_with("is:"))
+        .collect();
+    next.push(token);
+    next.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::toggle_status_filter;
+
+    #[test]
+    fn status_chips_toggle_one_filter_and_keep_text() {
+        assert_eq!(toggle_status_filter("", "is:running"), "is:running");
+        assert_eq!(
+            toggle_status_filter("fix bug", "is:waiting"),
+            "fix bug is:waiting"
+        );
+        assert_eq!(
+            toggle_status_filter("is:running fix", "is:waiting"),
+            "fix is:waiting"
+        );
+        assert_eq!(toggle_status_filter("is:running fix", "is:running"), "fix");
     }
 }

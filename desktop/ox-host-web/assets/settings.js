@@ -195,6 +195,12 @@ export function setupSettings({ request, open, close, notifications, login }) {
           ? "light"
           : "dark"
         : local.theme;
+    // Status bar and native form colours follow the active theme (house nav token).
+    const light = css.phoneTheme === "light";
+    document.documentElement.style.colorScheme = light ? "light" : "dark";
+    document
+      .querySelector('meta[name="theme-color"]')
+      ?.setAttribute("content", light ? "#ffffff" : "#12131f");
     css.phoneSize = String(local.font_size);
     css.phoneReducedMotion = String(local.reduce_motion);
   }

@@ -840,6 +840,86 @@ fn keeps_the_first_upstream_id_when_chunks_repeat_it() {
 }
 
 #[test]
+fn gives_parallel_calls_without_upstream_ids_distinct_call_ids() {
+    let mut translator = new_translator();
+    let mut events = push(
+        &mut translator,
+        &chunk(json!({"tool_calls": [
+            {"index": 0, "type": "function", "function": {"name": "shell", "arguments": "{\"command\":"}},
+            {"index": 1, "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":"}}
+        ]})),
+    );
+    events.extend(push(
+        &mut translator,
+        &chunk(json!({"tool_calls": [
+            {"index": 0, "function": {"arguments": "[\"ls\"]}"}},
+            {"index": 1, "function": {"arguments": "\"a.rs\"}"}}
+        ]})),
+    ));
+    events.extend(push(&mut translator, &finish_chunk("tool_calls")));
+    events.extend(translator.push_event("message", "[DONE]").unwrap());
+
+    let added = of_kind(&events, "response.output_item.added");
+    assert_eq!(added.len(), 2);
+    let first_id = added[0]["item"]["call_id"].as_str().unwrap();
+    let second_id = added[1]["item"]["call_id"].as_str().unwrap();
+    assert!(!first_id.is_empty() && !second_id.is_empty());
+    assert_ne!(first_id, second_id);
+    assert_eq!(added[0]["item"]["id"], format!("fc_{first_id}"));
+    assert_eq!(added[1]["item"]["id"], format!("fc_{second_id}"));
+
+    let deltas = of_kind(&events, "response.function_call_arguments.delta");
+    assert!(deltas.iter().all(|delta| {
+        delta["item_id"] == format!("fc_{first_id}")
+            || delta["item_id"] == format!("fc_{second_id}")
+    }));
+    let done = of_kind(&events, "response.function_call_arguments.done");
+    assert_eq!(done[0]["item_id"], format!("fc_{first_id}"));
+    assert_eq!(done[1]["item_id"], format!("fc_{second_id}"));
+
+    let output = one(&events, "response.completed")["response"]["output"].clone();
+    assert_eq!(output[0]["call_id"], first_id);
+    assert_eq!(output[0]["arguments"], "{\"command\":[\"ls\"]}");
+    assert_eq!(output[1]["call_id"], second_id);
+    assert_eq!(output[1]["arguments"], "{\"path\":\"a.rs\"}");
+}
+
+#[test]
+fn keeps_a_generated_call_id_when_a_real_id_arrives_later() {
+    let mut translator = new_translator();
+    let mut events = push(
+        &mut translator,
+        &chunk(json!({"tool_calls": [
+            {"index": 0, "type": "function", "function": {"name": "shell", "arguments": "{}"}}
+        ]})),
+    );
+    let generated = one(&events, "response.output_item.added")["item"]["call_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(!generated.is_empty());
+    events.extend(push(
+        &mut translator,
+        &chunk(
+            json!({"tool_calls": [{"index": 0, "id": "call_late", "function": {"arguments": ""}}]}),
+        ),
+    ));
+    events.extend(push(&mut translator, &finish_chunk("tool_calls")));
+    events.extend(translator.push_event("message", "[DONE]").unwrap());
+
+    let deltas = of_kind(&events, "response.function_call_arguments.delta");
+    assert!(
+        deltas
+            .iter()
+            .all(|delta| delta["item_id"] == format!("fc_{generated}"))
+    );
+    assert_eq!(
+        one(&events, "response.completed")["response"]["output"][0]["call_id"],
+        generated
+    );
+}
+
+#[test]
 fn maps_legacy_function_call_deltas() {
     let mut translator = new_translator();
     let mut events = push(

@@ -670,6 +670,76 @@ fn maps_max_tokens_to_incomplete() {
     );
 }
 
+fn tool_use_stream(partial_json: &str, stop_reason: &str) -> Vec<Result<Vec<Value>, String>> {
+    let mut translator = ResponseTranslator::with_created_at(1_700_000_000);
+    let mut results = Vec::new();
+    let steps = [
+        ("message_start", message_start("claude-x")),
+        (
+            "content_block_start",
+            json!({
+                "index": 0,
+                "content_block": {"type": "tool_use", "id": "toolu_1", "name": "apply_patch", "input": {}}
+            }),
+        ),
+        (
+            "content_block_delta",
+            json!({"index": 0, "delta": {"type": "input_json_delta", "partial_json": partial_json}}),
+        ),
+        ("content_block_stop", json!({"index": 0})),
+        (
+            "message_delta",
+            json!({"delta": {"stop_reason": stop_reason}, "usage": {"output_tokens": 8192}}),
+        ),
+        ("message_stop", json!({"type": "message_stop"})),
+    ];
+    for (event, data) in steps {
+        results.push(translator.push_event(event, &data.to_string()));
+    }
+    results
+}
+
+#[test]
+fn truncated_tool_use_at_max_tokens_is_incomplete_not_an_error() {
+    // Output cut off mid-JSON inside a tool_use block at max_tokens.
+    let results = tool_use_stream("{\"patch\": \"*** Begin Patch\\n+line", "max_tokens");
+    for result in &results {
+        assert!(
+            result.is_ok(),
+            "truncated tool must not fail the stream: {result:?}"
+        );
+    }
+    let events = results.last().unwrap().as_ref().unwrap();
+    // Nothing completed, so the terminal event is the only one at message_stop.
+    assert_eq!(types(events), vec!["response.incomplete"]);
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["response"]["status"], "incomplete");
+    assert_eq!(
+        terminal["response"]["incomplete_details"],
+        json!({"reason": "max_output_tokens"})
+    );
+    // The truncated function_call is dropped, not completed.
+    assert_eq!(terminal["response"]["output"], json!([]));
+    assert!(
+        events
+            .iter()
+            .all(|event| event["item"]["type"] != "function_call"),
+        "truncated call must not be emitted as a function_call item"
+    );
+}
+
+#[test]
+fn invalid_tool_json_with_tool_use_stop_still_errors() {
+    let results = tool_use_stream("{\"command\": ls", "tool_use");
+    let error = results
+        .last()
+        .unwrap()
+        .as_ref()
+        .expect_err("invalid tool JSON must fail the stream");
+    assert!(error.contains("apply_patch"), "{error}");
+    assert!(error.contains("invalid JSON arguments"), "{error}");
+}
+
 #[test]
 fn maps_refusal_to_completed_not_retryable_incomplete() {
     let mut translator = ResponseTranslator::with_created_at(1_700_000_000);

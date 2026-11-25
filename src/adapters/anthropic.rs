@@ -1852,27 +1852,38 @@ impl ResponseTranslator {
                 } else {
                     arguments
                 };
-                let parsed: Value = serde_json::from_str(&arguments).map_err(|error| {
-                    format!("tool \"{name}\" streamed invalid JSON arguments: {error}")
-                })?;
-                if !parsed.is_object() {
-                    return Err(format!(
+                // Unparseable arguments are not fatal here: Anthropic reports
+                // stop_reason=max_tokens after a cut-off tool_use block, and
+                // that must surface as response.incomplete. message_stop decides
+                // whether the problem is an error or a dropped truncated call.
+                let problem = match serde_json::from_str::<Value>(&arguments) {
+                    Err(error) => Some(format!(
+                        "tool \"{name}\" streamed invalid JSON arguments: {error}"
+                    )),
+                    Ok(parsed) if !parsed.is_object() => Some(format!(
                         "tool \"{name}\" streamed arguments that are not a JSON object"
-                    ));
+                    )),
+                    Ok(_) => None,
+                };
+                match problem {
+                    Some(message) => {
+                        let state = self.state_mut()?;
+                        state.invalid_tool.get_or_insert(message);
+                    }
+                    None => {
+                        let item = json!({
+                            "id": item_id,
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": arguments,
+                        });
+                        let state = self.state_mut()?;
+                        state.tool_ids.push(call_id.clone());
+                        state.completed.insert(index, item);
+                    }
                 }
-                let item = json!({
-                    "id": item_id,
-                    "type": "function_call",
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": arguments,
-                });
-                {
-                    let state = self.state_mut()?;
-                    state.tool_ids.push(call_id.clone());
-                    state.completed.insert(index, item.clone());
-                }
-                let mut events = Vec::with_capacity(2);
+                let mut events = Vec::with_capacity(1);
                 let sequence = self.next_sequence();
                 events.push(json!({
                     "type": "response.function_call_arguments.done",
@@ -1955,6 +1966,15 @@ impl ResponseTranslator {
                 .map(|(index, _)| *index)
                 .collect();
             let reasoning_count = reasoning_indices.len();
+            let truncated = matches!(
+                state.stop_reason.as_deref(),
+                Some("max_tokens") | Some("model_context_window_exceeded")
+            );
+            // A truncated tool_use block has partial JSON; drop it and report
+            // incomplete. Otherwise the invalid arguments are a stream error.
+            if let (Some(message), false) = (state.invalid_tool.take(), truncated) {
+                return Err(message);
+            }
             let tool_ids = state.tool_ids.clone();
             let model = configured_model.unwrap_or_else(|| state.model.clone());
             for (reasoning_index, block_index) in reasoning_indices.into_iter().enumerate() {
@@ -2146,6 +2166,9 @@ struct StreamState {
     blocks: BTreeMap<usize, BlockState>,
     completed: BTreeMap<usize, Value>,
     tool_ids: Vec<String>,
+    /// First tool_use block whose arguments were not a JSON object. Decided at
+    /// message_stop: an error for ordinary stops, a dropped call when truncated.
+    invalid_tool: Option<String>,
 }
 
 impl StreamState {
@@ -2162,6 +2185,7 @@ impl StreamState {
             blocks: BTreeMap::new(),
             completed: BTreeMap::new(),
             tool_ids: Vec::new(),
+            invalid_tool: None,
         }
     }
 }

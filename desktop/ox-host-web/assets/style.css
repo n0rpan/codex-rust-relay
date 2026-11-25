@@ -1,16 +1,6 @@
+/* House palette (colour tokens, docs/design/polish-plan.md 2.1). Dark is the
+   default; light applies under data-phone-theme="light", which settings.js sets. */
 :root {
-  color-scheme: dark;
-  --bg: #191a29;
-  --nav: #12131f;
-  --panel: #222538;
-  --raised: #2d3149;
-  --line: #3d415a;
-  --ink: #f0eff8;
-  --muted: #b4b7ce;
-  --accent: #a6b9ff;
-  --amber: #f3bc80;
-  --green: #92d9bc;
-  --mono: ui-monospace, SFMono-Regular, Consolas, monospace;
   font:
     16px/1.5 "Inter",
     system-ui,
@@ -18,6 +8,48 @@
     sans-serif;
   background: var(--bg);
   color: var(--ink);
+}
+:root,
+:root[data-phone-theme="dark"] {
+  color-scheme: dark;
+  --bg: #191a29;
+  --nav: #12131f;
+  --panel: #222538;
+  --raised: #2d3149;
+  --line: #3d415a;
+  --line-strong: #494c6c;
+  --ink: #f0eff8;
+  --muted: #b4b7ce;
+  --accent: #a6b9ff;
+  --accent-dim: #6b81c8;
+  --on-accent: #171b31;
+  --warning: #f3bc80;
+  --success: #92d9bc;
+  --error: #f3a598;
+  --amber: var(--warning);
+  --green: var(--success);
+  --shadow: rgb(0 0 0 / 27%);
+}
+:root[data-phone-theme="light"] {
+  color-scheme: light;
+  --bg: #f5f5fa;
+  --nav: #ffffff;
+  --panel: #eceef8;
+  --raised: #e3e6f4;
+  --line: #a9b0c7;
+  --line-strong: #6875a6;
+  --ink: #191d32;
+  --muted: #47516d;
+  --accent: #465d9c;
+  --accent-dim: #2f4274;
+  --on-accent: #ffffff;
+  --warning: #935119;
+  --success: #216747;
+  --error: #a82f35;
+  --shadow: rgb(25 29 50 / 14%);
+}
+:root {
+  --mono: ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 * {
   box-sizing: border-box;
@@ -43,7 +75,7 @@ button {
   font-weight: 550;
 }
 button:hover {
-  background: #353b55;
+  background: color-mix(in srgb, var(--raised) 40%, var(--line));
 }
 button:focus-visible,
 input:focus-visible,
@@ -59,12 +91,12 @@ button:disabled {
 }
 .primary {
   background: var(--accent);
-  color: #171b31;
-  box-shadow: inset 0 -3px #6b81c8;
+  color: var(--on-accent);
+  box-shadow: inset 0 -3px var(--accent-dim);
   font-weight: 700;
 }
 .primary:hover {
-  background: #bdcbff;
+  background: color-mix(in srgb, var(--accent) 85%, var(--ink));
 }
 .quiet,
 .back,
@@ -88,7 +120,7 @@ header {
   position: relative;
   isolation: isolate;
   height: 64px;
-  border-bottom: 2px solid #494c6c;
+  border-bottom: 2px solid var(--line-strong);
   background: var(--nav);
   display: flex;
   align-items: center;
@@ -203,7 +235,7 @@ h1 {
   height: 2px;
   display: inline-block;
   margin: 0 8px 0.24em 0;
-  background: #8597d5;
+  background: var(--accent-dim);
 }
 .session {
   display: block;
@@ -211,7 +243,7 @@ h1 {
   width: 100%;
   text-align: left;
   border-radius: 0;
-  border-bottom: 1px solid #32354a;
+  border-bottom: 1px solid color-mix(in srgb, var(--line) 60%, var(--bg));
   background: transparent;
   padding: 0.76rem 0.2rem 0.77rem 1.65rem;
 }
@@ -313,10 +345,10 @@ h1 {
   padding: 0.64rem 0.82rem;
   border-right: 2px solid var(--accent);
   border-radius: 5px 2px 2px 5px;
-  background: #303650;
+  background: color-mix(in srgb, var(--line) 50%, var(--panel));
 }
 .user .role {
-  color: #c4d0ff;
+  color: var(--accent);
 }
 .thinking .body {
   color: var(--muted);
@@ -341,7 +373,7 @@ h1 {
 }
 .ask {
   position: relative;
-  background: linear-gradient(100deg, #322d36, #292737);
+  background: var(--panel);
   border-left: 3px solid var(--amber);
   padding: 0.9rem 1rem 1rem;
   margin: 1.1rem 0;
@@ -364,18 +396,34 @@ h1 {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   margin: 0.25rem 0 0.8rem;
-  color: #dddce8;
+  color: var(--ink);
 }
 .ask button {
   margin: 0.2rem 0.45rem 0.2rem 0;
 }
-.decision {
-  background: #454052;
-  color: #f4f0f7;
-  box-shadow: inset 0 -2px #615970;
+.ask .decision {
+  display: block;
+  width: 100%;
+  min-height: 48px;
+  margin: 0 0 8px;
+  text-align: center;
+  background: var(--raised);
+  color: var(--ink);
+  box-shadow: inset 0 -2px var(--line-strong);
+}
+.ask .decision:last-of-type {
+  margin-bottom: 0;
+}
+.ask .decision.deny {
+  background: transparent;
+  color: var(--error);
+  box-shadow: inset 0 0 0 2px var(--error);
 }
 .decision:hover {
-  background: #504b60;
+  background: color-mix(in srgb, var(--raised) 40%, var(--line));
+}
+.ask .decision.deny:hover {
+  background: color-mix(in srgb, var(--error) 14%, transparent);
 }
 .ask fieldset {
   border: 0;
@@ -422,7 +470,7 @@ form > .primary {
   bottom: 0;
   margin: 1.2rem 0 0;
   padding: 0.58rem 0.72rem max(0.55rem, env(safe-area-inset-bottom));
-  border-top: 2px solid #6875a6;
+  border-top: 2px solid var(--line-strong);
   background: var(--panel);
   border-radius: 3px;
 }
@@ -431,12 +479,15 @@ form > .primary {
   display: block;
   background: transparent;
   border-color: transparent;
-  resize: vertical;
-  min-height: 52px;
-  padding: 0.3rem 0.12rem;
+  resize: none;
+  field-sizing: content;
+  font-size: max(16px, 1rem);
+  min-height: 44px;
+  max-height: 25dvh;
+  padding: 0.65rem 0.4rem;
 }
 #composer textarea::placeholder {
-  color: #a9aec5;
+  color: var(--muted);
 }
 .actions {
   justify-content: flex-end;
@@ -446,8 +497,23 @@ form > .primary {
   min-width: 66px;
 }
 #stop {
-  color: var(--muted);
-  background: transparent;
+  color: var(--ink);
+  background: var(--raised);
+  box-shadow: inset 0 -2px var(--line-strong);
+}
+#stop:before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 7px;
+  background: currentColor;
+}
+/* app.js toggles [hidden] on Stop. Keep the slot so Send never moves. */
+#stop[hidden] {
+  display: inline-flex;
+  visibility: hidden;
+  pointer-events: none;
 }
 #send:before {
   content: "";
@@ -460,8 +526,8 @@ form > .primary {
 #message {
   position: sticky;
   bottom: 1rem;
-  background: #343044;
-  color: #ffe0b4;
+  background: color-mix(in srgb, var(--warning) 14%, var(--bg));
+  color: color-mix(in srgb, var(--warning) 40%, var(--ink));
   border-left: 3px solid var(--amber);
   padding: 0.7rem;
 }
@@ -612,7 +678,7 @@ form > .primary {
   max-height: 40vh;
   object-fit: contain;
   margin: 0.75rem 0;
-  background: #10111c;
+  background: var(--nav);
 }
 #camera-status:empty {
   display: none;
@@ -670,7 +736,7 @@ form > .primary {
   overflow: auto;
 }
 #operator-panel::backdrop {
-  background: #101019da;
+  background: color-mix(in srgb, var(--nav) 85%, transparent);
 }
 #operator-panel pre {
   white-space: pre-wrap;
@@ -778,7 +844,7 @@ form > .primary {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 0.85rem;
-  box-shadow: 0 0.5rem 2rem #0004;
+  box-shadow: 0 0.5rem 2rem var(--shadow);
   padding: 0.3rem;
 }
 .action-menu button {
@@ -970,38 +1036,6 @@ form > .primary {
 .table-scroll th {
   background: var(--panel);
 }
-#composer {
-  z-index: 2;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 0.15rem 0.35rem;
-  align-items: end;
-  margin-bottom: 0;
-  padding: 0.4rem 0.45rem max(0.4rem, env(safe-area-inset-bottom));
-  border: 1px solid var(--line);
-  border-radius: 1.1rem;
-  box-shadow: 0 4px 20px #0003;
-}
-#composer textarea {
-  grid-area: 3 / 1;
-  font-size: max(16px, 1rem);
-  padding: 0.65rem 0.4rem;
-  min-height: 44px;
-  max-height: 25dvh;
-  resize: none;
-  field-sizing: content;
-}
-#composer .actions {
-  grid-area: 3 / 2;
-  margin: 0;
-  gap: 0.15rem;
-}
-#composer .actions button {
-  min-width: 44px;
-  border-radius: 0.8rem;
-  padding-inline: 0.7rem;
-  box-shadow: none;
-}
 #mention-choices,
 #attached-images {
   grid-column: 1 / -1;
@@ -1009,9 +1043,6 @@ form > .primary {
 #mention-choices:empty,
 #attached-images:empty {
   display: none;
-}
-#send:before {
-  content: none;
 }
 #attach-label {
   position: relative;

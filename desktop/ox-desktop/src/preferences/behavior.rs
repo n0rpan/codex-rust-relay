@@ -103,21 +103,21 @@ impl Preferences {
                 "Theme",
                 &[
                     (
-                        "System",
+                        "System (Omarchy)",
                         Behavior {
                             theme: ThemeSource::System,
                             ..b
                         },
                     ),
                     (
-                        "Light",
+                        "OX Arcade light",
                         Behavior {
                             theme: ThemeSource::Light,
                             ..b
                         },
                     ),
                     (
-                        "Dark",
+                        "OX Arcade dark",
                         Behavior {
                             theme: ThemeSource::Dark,
                             ..b
@@ -133,7 +133,8 @@ impl Preferences {
                 &[
                     ("Small", Behavior { font_size: 14, ..b }),
                     ("Default", Behavior { font_size: 16, ..b }),
-                    ("Large", Behavior { font_size: 19, ..b }),
+                    ("Large", Behavior { font_size: 18, ..b }),
+                    ("Extra large", Behavior { font_size: 20, ..b }),
                 ],
                 b,
                 p,

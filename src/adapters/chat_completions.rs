@@ -1132,6 +1132,23 @@ impl ResponseTranslator {
     }
 
     /// Track one `tool_calls[]` delta.
+    /// A `call_id` for a tool call that announces without one. It is derived
+    /// from the output index, which is unique within the response, and skips
+    /// any ID another item already holds.
+    fn fallback_call_id(&self, output_index: usize) -> String {
+        let mut candidate = format!("call_{output_index}");
+        let mut suffix = 1;
+        while self
+            .items
+            .iter()
+            .any(|item| matches!(item, StreamItem::Tool(tool) if tool.call_id == candidate))
+        {
+            candidate = format!("call_{output_index}_{suffix}");
+            suffix += 1;
+        }
+        candidate
+    }
+
     fn push_tool_call(&mut self, call: &Value, events: &mut Vec<Value>) -> Result<(), String> {
         let call = call
             .as_object()
@@ -1170,6 +1187,11 @@ impl ResponseTranslator {
             }
         };
 
+        let output_index = match &self.items[position] {
+            StreamItem::Tool(tool) => tool.output_index,
+            StreamItem::Message(_) => unreachable!("position matched a tool item"),
+        };
+        let fallback_call_id = self.fallback_call_id(output_index);
         let mut announce = None;
         {
             let tool = match &mut self.items[position] {
@@ -1196,11 +1218,14 @@ impl ResponseTranslator {
                 tool.arguments.push_str(arguments);
             }
             if !tool.announced && !tool.name.is_empty() {
-                tool.item_id = if tool.call_id.is_empty() {
-                    format!("fc_{}", tool.output_index)
-                } else {
-                    format!("fc_{}", tool.call_id)
-                };
+                // Without an upstream ID at announce time, the call gets a
+                // generated one. It is fixed from here on: a real ID that
+                // arrives in a later delta is ignored, so the announce, delta
+                // and done items all agree.
+                if tool.call_id.is_empty() {
+                    tool.call_id = fallback_call_id;
+                }
+                tool.item_id = format!("fc_{}", tool.call_id);
                 tool.announced = true;
                 announce = Some((tool.output_index, tool.value("in_progress", "")));
             }

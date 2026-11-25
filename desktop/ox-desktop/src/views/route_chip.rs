@@ -63,11 +63,6 @@ fn choices(
                     } else {
                         format!("{} · {id}", m.label)
                     };
-                    let label = if rank.contains_key(id.as_str()) {
-                        format!("★ {label}")
-                    } else {
-                        label
-                    };
                     (label, Choice::Model(id.clone()))
                 })
                 .collect()
@@ -318,6 +313,7 @@ impl Workbench {
                     let count = rows.len();
                     let selected = owner.map(str::to_owned);
                     let settings = settings.clone();
+                    let favorites = picker.favorites.clone();
                     let list = uniform_list(
                         "model-options",
                         count,
@@ -325,8 +321,18 @@ impl Workbench {
                             range
                                 .map(|index| {
                                     let (label, choice) = &rows[index];
-                                    workbench
-                                        .choice_row(index, label, choice, &settings, &selected, cx)
+                                    let starred = matches!(choice, Choice::Model(id) if favorites.contains(id));
+                                    let star = crate::kit::star_column(p, starred);
+                                    crate::kit::row()
+                                        .w_full()
+                                        .gap_1()
+                                        .child(star)
+                                        .child(
+                                            div().flex_1().min_w_0().child(workbench.choice_row(
+                                                index, label, choice, &settings, &selected, cx,
+                                            )),
+                                        )
+                                        .into_any_element()
                                 })
                                 .collect::<Vec<_>>()
                         }),

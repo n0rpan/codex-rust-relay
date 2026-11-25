@@ -882,20 +882,30 @@ impl Preferences {
         view
     }
     fn favorites_view(&self, p: Palette, cx: &mut Context<Self>) -> Div {
-        let mut view = div().flex().flex_col().gap_3().child(
-            div()
-                .flex()
-                .justify_between()
-                .items_center()
-                .child("Starred models")
-                .child(button(
-                    "save-favorites",
-                    "Save favorites",
-                    true,
-                    p,
-                    cx.listener(|s, _, w, cx| s.save(w, cx)),
-                )),
-        );
+        let mut view = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .child("Starred models")
+                    .child(button(
+                        "save-favorites",
+                        "Save favorites",
+                        true,
+                        p,
+                        cx.listener(|s, _, w, cx| s.save(w, cx)),
+                    )),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(p.muted))
+                    .child("Starred models appear first; any model can be used."),
+            );
         for (i, alias) in self.favorites.iter().enumerate() {
             let mut actions = div().flex().gap_1();
             if i > 0 {

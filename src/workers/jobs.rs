@@ -393,6 +393,8 @@ impl Start {
             .current_dir(cwd)
             .env("CODEX_HOME", home)
             .env_remove(super::TOKEN_ENV);
+        // The worker helper registers under this gateway's lease, so the host retires it if the gateway dies.
+        crate::host_lifetime::set_parent_lease(&mut command);
         command
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -510,6 +512,8 @@ async fn run_claude(
     write_rpc(&mut input, user_message(&task)).await?;
     let mut used_workflow = false;
     let mut pending = 1usize;
+    // The error of the latest finished turn, cleared by a later successful turn.
+    let mut turn_failure: Option<String> = None;
     while pending > 0 {
         let line = tokio::select! {
             Some(message) = instructions.recv() => {
@@ -547,10 +551,13 @@ async fn run_claude(
                 }
             }
             Some("result") => {
-                if event["is_error"] == true {
-                    return Err("Claude Code reported a worker error.".into());
-                }
-                if let Some(text) = event["result"].as_str() {
+                // An error turn (overload, max turns, execution error) ends only that turn.
+                // The process stays up so a session can be steered on.
+                turn_failure = turn_error(&event, secrets);
+                state.error = turn_failure.clone();
+                if turn_failure.is_none()
+                    && let Some(text) = event["result"].as_str()
+                {
                     state.result = Some(clean(text, secrets));
                 }
                 pending -= 1;
@@ -560,6 +567,14 @@ async fn run_claude(
         state.can_steer = pending > 0;
     }
     drop(input);
+    // A one-shot job fails with its last turn's error. A session keeps today's end
+    // at the last turn, with the error still visible in its status.
+    if let Some(error) = turn_failure
+        .as_ref()
+        .filter(|_| request.mode != Mode::Session)
+    {
+        return Err(error.clone().into());
+    }
     if request.mode == Mode::Workflow && !used_workflow {
         return Err("Claude Code did not run the Workflow tool. Check the selected model, Claude Code version, and workflow permissions.".into());
     }
@@ -763,7 +778,70 @@ async fn write_rpc(input: &mut ChildStdin, event: Value) -> Result<(), RelayErro
     Ok(())
 }
 
+/// The cleaned error of a stream-json `result` event that ended its turn in failure.
+fn turn_error(event: &Value, secrets: &[String]) -> Option<String> {
+    if event["is_error"] != true {
+        return None;
+    }
+    let text = |value: &Value| {
+        value
+            .as_str()
+            .or_else(|| value["message"].as_str())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    let message = text(&event["result"])
+        .or_else(|| {
+            let errors: Vec<String> = event["errors"]
+                .as_array()?
+                .iter()
+                .filter_map(text)
+                .collect();
+            (!errors.is_empty()).then(|| errors.join("; "))
+        })
+        .unwrap_or_else(|| "Claude Code reported a worker error.".to_owned());
+    Some(clean(&message, secrets))
+}
+
 fn clean(text: &str, secrets: &[String]) -> String {
     let text = crate::upstream::redact(text, secrets);
     text[..text.floor_char_boundary(MAX_TEXT)].to_owned()
+}
+
+#[cfg(test)]
+mod turn_error_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn successful_result_is_not_an_error() {
+        let event = json!({"type":"result","is_error":false,"result":"done"});
+        assert_eq!(turn_error(&event, &[]), None);
+    }
+
+    #[test]
+    fn error_result_uses_its_text_and_redacts_secrets() {
+        let event =
+            json!({"type":"result","is_error":true,"result":"overloaded for key sk-test-123"});
+        let secrets = vec!["sk-test-123".to_owned()];
+        let error = turn_error(&event, &secrets).unwrap();
+        assert!(error.starts_with("overloaded"));
+        assert!(!error.contains("sk-test-123"));
+    }
+
+    #[test]
+    fn error_result_falls_back_to_its_errors_then_a_default() {
+        let event = json!({"type":"result","subtype":"error_during_execution","is_error":true,
+            "errors":["tool crashed", {"message":"retry later"}]});
+        assert_eq!(
+            turn_error(&event, &[]).as_deref(),
+            Some("tool crashed; retry later")
+        );
+        let bare = json!({"type":"result","is_error":true,"result":"  "});
+        assert_eq!(
+            turn_error(&bare, &[]).as_deref(),
+            Some("Claude Code reported a worker error.")
+        );
+    }
 }

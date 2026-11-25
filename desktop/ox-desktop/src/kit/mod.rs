@@ -74,6 +74,41 @@ pub fn small(p: Palette, label: impl Into<SharedString>) -> gpui::Div {
         .text_color(rgb(p.muted))
         .child(label.into())
 }
+/// A dismissable error notice: error-coloured text, a 1 px error rule and a close control.
+pub fn banner(
+    p: Palette,
+    id: &'static str,
+    dismiss_id: &'static str,
+    message: impl Into<SharedString>,
+    dismiss: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    row()
+        .id(id)
+        .gap_2()
+        .p_2()
+        .border_1()
+        .border_color(rgb(p.error))
+        .bg(rgb(p.panel))
+        .child(
+            gpui::div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(12.))
+                .text_color(rgb(p.error))
+                .child(message.into()),
+        )
+        .child(icon_button(p, dismiss_id, "×", "Dismiss", dismiss))
+}
+
+/// Fixed-width leading column for starred rows, so names line up whether or not they are starred.
+pub fn star_column(p: Palette, starred: bool) -> gpui::Div {
+    gpui::div()
+        .w(px(16.))
+        .flex_shrink_0()
+        .text_color(rgb(p.accent))
+        .child(if starred { "★" } else { "" })
+}
+
 pub fn copy_message(p: Palette, id: &'static str, message: &str) -> Button {
     let text = message.to_owned();
     toolbar_button(p, id, "Copy", true, move |_, _, cx| {

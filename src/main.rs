@@ -774,7 +774,20 @@ impl App {
         let models_by_vendor: Vec<_> = vendors
             .iter()
             .zip(discovered)
-            .map(|(vendor, models)| {
+            .map(|(vendor, mut models)| {
+                // A discovered ID that cannot be a model alias (for example a
+                // local server listing "Qwen 2.5 Coder.gguf") is skipped rather
+                // than failing the launch. Static entries are still validated.
+                if let Some(models) = models.as_mut() {
+                    for id in models.retain_ids(|id| {
+                        provider::alias_for(&vendor.key, id, None).is_ok()
+                    }) {
+                        eprintln!(
+                            "ox: provider {:?}: skipping discovered model {id:?}: not a valid model id",
+                            vendor.key
+                        );
+                    }
+                }
                 let specs = catalog::merge_models(models, &vendor.models);
                 if specs.is_empty() {
                     eprintln!(

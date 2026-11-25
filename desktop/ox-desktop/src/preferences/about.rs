@@ -97,5 +97,12 @@ impl About {
                 cx.listener(|s, _, _, cx| s.check(cx)),
             )))
             .children(self.notice.clone().map(|text| div().text_sm().child(text)))
+            .child(
+                div()
+                    .pt_2()
+                    .text_xs()
+                    .text_color(rgb(p.muted))
+                    .child("Made by Oscar"),
+            )
     }
 }

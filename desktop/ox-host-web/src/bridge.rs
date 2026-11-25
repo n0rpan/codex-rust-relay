@@ -118,6 +118,33 @@ impl Access {
         }
         Ok(())
     }
+    /// A start request that passed auth and scope but failed validation: the request id and
+    /// the reason. Protocol, auth and scope violations return `None` and still close the socket.
+    fn invalid(&self, req: &Client) -> Option<(String, String)> {
+        let Client::Act {
+            id,
+            scope,
+            action,
+            approval,
+        } = req
+        else {
+            return None;
+        };
+        if !self.ready
+            || self.selected.as_ref() != Some(scope)
+            || id.is_empty()
+            || id.len() > 96
+            || approval.is_some()
+        {
+            return None;
+        }
+        let message = match action {
+            Action::StartWorker(start) => start.validate().err()?,
+            Action::StartHandoff(start) => start.validate().err()?,
+            _ => return None,
+        };
+        Some((id.clone(), message))
+    }
     fn permit(&mut self, app: &App, req: &Client) -> bool {
         match req {
             Client::Hello { version } if !self.hello && *version == VERSION => {
@@ -229,7 +256,15 @@ pub(crate) async fn session(app: App, id: String, mut ws: WebSocket) {
                 match msg{
                     Message::Text(s)=>{
                         let Ok(req)=serde_json::from_str::<Client>(&s) else{break};
-                        if !access.permit(&app,&req) || !app.state.lock().unwrap().alive(&id){break}
+                        if !access.permit(&app,&req) {
+                            // Answer the refused request with its reason and keep the socket open.
+                            let Some((request,message))=access.invalid(&req) else{break};
+                            if !app.state.lock().unwrap().alive(&id){break}
+                            let Ok(frame)=serde_json::to_string(&Server::Error{id:Some(request),message}) else{break};
+                            if !matches!(timeout(Duration::from_secs(8),ws.send(Message::Text(frame.into()))).await,Ok(Ok(()))){break}
+                            continue;
+                        }
+                        if !app.state.lock().unwrap().alive(&id){break}
                         if !matches!(timeout(Duration::from_secs(5),write(&mut w,&req)).await,Ok(Ok(()))){break}
                     }
                     Message::Ping(_) | Message::Pong(_)=>{},
@@ -337,5 +372,84 @@ mod tests {
                 None
             )
         ));
+    }
+
+    #[test]
+    fn refused_start_answers_its_request_and_keeps_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let app = App {
+            state: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::state::State::load(dir.path()).unwrap(),
+            )),
+            host: Default::default(),
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            discovered: Default::default(),
+        };
+        let route = Route::CODEX_SUBSCRIPTION;
+        let scope = Scope {
+            project: "/approved".into(),
+            route: route.clone(),
+        };
+        let blank_handoff = || Client::Act {
+            id: "handoff-1".into(),
+            scope: scope.clone(),
+            action: Action::StartHandoff(ox_desk_core::handoff::HandoffStart {
+                source: "thread".into(),
+                runtime: route.runtime,
+                model: None,
+                mode: Default::default(),
+                request: "  \n".into(),
+                yolo_confirmed: false,
+            }),
+            approval: None,
+        };
+
+        // Before the device has said hello and subscribed, nothing is answered: close.
+        let mut a = Access::default();
+        assert!(a.invalid(&blank_handoff()).is_none());
+
+        assert!(a.permit(&app, &Client::Hello { version: VERSION }));
+        let hello = Server::Hello {
+            version: VERSION,
+            projects: vec![scope.project.clone()],
+            routes: vec![route.clone()],
+            capabilities: vec![],
+            host: None,
+        };
+        a.host(&app, &serde_json::to_vec(&hello).unwrap()).unwrap();
+        assert!(a.permit(
+            &app,
+            &Client::Subscribe {
+                scope: Some(scope.clone()),
+                after: None
+            }
+        ));
+
+        // The refused start is a validation failure: it gets the reason keyed by its id.
+        let req = blank_handoff();
+        assert!(!a.permit(&app, &req));
+        let (id, message) = a.invalid(&req).expect("validation refusal is answered");
+        assert_eq!(id, "handoff-1");
+        assert_eq!(message, "Write the request for the new session.");
+        let frame = serde_json::to_value(Server::Error {
+            id: Some(id),
+            message,
+        })
+        .unwrap();
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["id"], "handoff-1");
+
+        // A start that carries an approval is a protocol violation: close, do not answer.
+        let mut approved = blank_handoff();
+        if let Client::Act { approval, .. } = &mut approved {
+            *approval = Some("yes".into());
+        }
+        assert!(!a.permit(&app, &approved));
+        assert!(a.invalid(&approved).is_none());
     }
 }
