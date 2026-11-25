@@ -161,9 +161,22 @@ fn service(args: &[&str]) -> io::Result<()> {
     words.extend(args.iter().map(OsStr::new));
     run("systemctl", &words)
 }
+/// The login session's GUI domain, or the per-user background domain when the
+/// account has no GUI session (SSH, a CI user, before first login).
 #[cfg(target_os = "macos")]
 fn domain() -> String {
-    format!("gui/{}", super::uid())
+    let gui = format!("gui/{}", super::uid());
+    let has_gui = Command::new("launchctl")
+        .args(["print", &gui])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if has_gui {
+        gui
+    } else {
+        format!("user/{}", super::uid())
+    }
 }
 
 pub(super) fn start() -> io::Result<()> {

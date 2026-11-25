@@ -280,6 +280,7 @@ mod tests {
             projects: vec![scope.project.clone()],
             routes: vec![route],
             capabilities: vec![],
+            host: None,
         };
         a.host(&app, &serde_json::to_vec(&hello).unwrap()).unwrap();
         assert!(!a.permit(

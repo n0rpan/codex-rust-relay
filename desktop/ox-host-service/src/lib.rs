@@ -1,6 +1,12 @@
 //! Per-user host discovery and lifecycle shared by the daemon and local desktop.
+pub mod errlog;
 mod manager;
 pub use manager::manage;
+
+/// Whether the login service (launchd agent or systemd user unit) is installed.
+pub fn service_installed() -> io::Result<bool> {
+    manager::installed()
+}
 use std::{
     env,
     fs::{self, DirBuilder, File, OpenOptions},

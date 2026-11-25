@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
     io,
-    path::Path,
+    path::{Path, PathBuf},
     sync::mpsc::{Receiver, RecvTimeoutError, SyncSender},
     thread,
     time::{Duration, Instant},
@@ -41,6 +41,9 @@ pub(crate) enum Message {
         reply: Replier,
     },
     Stop,
+    /// Upgrade handover: refuse new turns, let running turns finish until the
+    /// deadline, then stop. The next host reads why the previous one stopped.
+    Drain(Duration),
 }
 /// A handoff target waiting for its first turn to be accepted.
 pub(crate) struct Confirming {
@@ -208,6 +211,8 @@ pub(crate) struct Engine {
     preparing: Vec<Preparing>,
     reading: Vec<Reading>,
     in_flows: bool,
+    draining: Option<Instant>,
+    state_dir: PathBuf,
 }
 mod flows;
 fn nonce() -> io::Result<String> {
@@ -236,7 +241,7 @@ impl Engine {
             }
         }
         ledger.begin(seq)?;
-        ledger.retire()?;
+        ledger.retire(&crate::handover::take(dir))?;
         Ok(Self {
             config,
             ledger,
@@ -253,10 +258,19 @@ impl Engine {
             preparing: Default::default(),
             reading: Default::default(),
             in_flows: false,
+            draining: None,
+            state_dir: dir.to_owned(),
         })
     }
     pub(crate) fn serve(&mut self, rx: Receiver<Message>) -> io::Result<()> {
         loop {
+            if let Some(at) = self.draining {
+                let running = self.running_turns();
+                if running == 0 || Instant::now() >= at {
+                    crate::handover::record(&self.state_dir, "upgrade", running)?;
+                    break;
+                }
+            }
             let deadline = self
                 .running
                 .values()
@@ -275,6 +289,7 @@ impl Engine {
                         .filter(|at| *at > Instant::now()),
                 )
                 .chain(self.reading.iter().map(|r| r.deadline))
+                .chain(self.draining)
                 .min();
             let msg = if deadline.is_some_and(|at| at <= Instant::now()) {
                 None
@@ -308,7 +323,19 @@ impl Engine {
                     }
                     self.advance_flows()?;
                 }
-                Some(Message::Stop) => break,
+                Some(Message::Stop) => {
+                    crate::handover::record(&self.state_dir, "stop", self.running_turns())?;
+                    break;
+                }
+                Some(Message::Drain(bound)) => {
+                    let at = Instant::now() + bound;
+                    self.draining = Some(self.draining.map_or(at, |d| d.min(at)));
+                    eprintln!(
+                        "OX host: draining for an update, {} running turn(s), at most {}s",
+                        self.running_turns(),
+                        bound.as_secs()
+                    );
+                }
                 Some(Message::Schema(scope, generation, caps)) => {
                     if let Some(live) = self.running.get_mut(&scope)
                         && live.generation == generation
@@ -323,6 +350,9 @@ impl Engine {
                     request,
                     reply,
                 }) => match request {
+                    Gateway::Launch(_) if self.draining.is_some() => {
+                        self.answer(reply, Err(crate::handover::REFUSAL.into()))?
+                    }
                     Gateway::Launch(start) => self.launch(caller, start, reply)?,
                     Gateway::Call(call @ ParentCall::ReadThread { .. }) => {
                         self.read_thread(&caller, call, reply)?
@@ -408,7 +438,15 @@ impl Engine {
         match message {
             Client::Hello { version } => {
                 if version != wire::VERSION {
-                    return Err(io::Error::other("Unsupported OX host protocol version"));
+                    let message = wire::version_mismatch(wire::VERSION, version);
+                    let _ = self.reply(
+                        id,
+                        Server::Error {
+                            id: None,
+                            message: message.clone(),
+                        },
+                    );
+                    return Err(io::Error::other(message));
                 }
                 let prepared = self.config.prepare().ok();
                 let routes = prepared
@@ -443,6 +481,10 @@ impl Engine {
                         .into(),
                         routes,
                         projects,
+                        host: Some(wire::HostInfo {
+                            version: crate::handover::version().into(),
+                            epoch: self.replay.cursor.epoch.clone(),
+                        }),
                     },
                 )
             }
@@ -567,6 +609,9 @@ impl Engine {
                         fail("Open this project and billing route before sending actions".into()),
                     );
                 };
+                if self.draining.is_some() && crate::handover::starts_work(&action) {
+                    return self.reply(id, fail(crate::handover::REFUSAL.into()));
+                }
                 let hash = digest(&action, &approval)?;
                 match self
                     .receipts
@@ -1332,6 +1377,24 @@ impl Engine {
     /// starts unless every check passes. The reply waits for the native session,
     /// or, for a YOLO child that needs the operator, returns at once with
     /// `waiting_for_operator`.
+    /// Turns still running in hosted sessions, plus worker launches in flight.
+    fn running_turns(&self) -> usize {
+        self.running
+            .values()
+            .map(|live| {
+                live.store
+                    .threads()
+                    .iter()
+                    .filter(|r| {
+                        live.store
+                            .transcript(&r.id)
+                            .is_some_and(|t| t.active_turn().is_some())
+                    })
+                    .count()
+                    + usize::from(live.launching.is_some())
+            })
+            .sum()
+    }
     fn launch(&mut self, caller: Caller, start: WorkerStart, reply: Replier) -> io::Result<()> {
         match self.accept_launch(&caller, start) {
             Ok(Accepted::Launch(scope, launching)) => {

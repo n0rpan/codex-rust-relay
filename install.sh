@@ -277,6 +277,17 @@ replace_link() {
     if [ "$os" = Darwin ]; then mv -fh "$2.ox-link.$$" "$2"; else mv -fT "$2.ox-link.$$" "$2"; fi
 }
 
+# A running session host keeps the old binary. Let its running turns finish
+# (bounded), then start the new one, so an update never cuts a turn short.
+restart_host() {
+    if [ -x "$install_dir/ox-host" ] &&
+        "$install_dir/ox-host" status 2>/dev/null | grep -q '^OX host: running'; then
+        step "Restarting the OX session host on the new version (running turns finish first)"
+        "$install_dir/ox" host restart ||
+            warn "could not restart the session host. Run: ox host restart"
+    fi
+}
+
 install_desktop_entry() {
     replace_link "$desktop_binary_dir/ox-desktop" "$install_dir/ox-desktop"
     if [ -x "$desktop_binary_dir/ox-host" ]; then replace_link "$desktop_binary_dir/ox-host" "$install_dir/ox-host"; fi
@@ -452,7 +463,10 @@ main() {
 
     info ""
     info "${green}Installed ${installed}${reset} ${dim}(${install_dir}/ox)${reset}"
-    if [ "$desktop" = 1 ]; then install_desktop_entry; fi
+    if [ "$desktop" = 1 ]; then
+        install_desktop_entry
+        restart_host
+    fi
     path_hint
     info ""
     info "Next step:"

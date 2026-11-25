@@ -274,3 +274,28 @@ jobs:
             !desktop/target/release/ox-desktop
             !desktop/target/release/ox-host
           key: ${{ steps.deps.outputs.cache-primary-key }}
+
+  clean-account:
+    name: Clean-account install (${{ matrix.runner }})
+    needs: package
+    if: >-
+      !cancelled() &&
+      (github.event_name != 'pull_request' ||
+       (contains(github.event.pull_request.labels.*.name, 'full-ci') &&
+        (github.event.action != 'labeled' || github.event.label.name == 'full-ci')))
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["ubuntu-24.04","macos-26"]') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ox-desktop-${{ matrix.runner }}
+          path: ${{ runner.temp }}/dist
+      - name: Install, restart, crash, upgrade and uninstall as a new account
+        run: sh desktop/tests/host_clean_account.sh "$RUNNER_TEMP/dist"

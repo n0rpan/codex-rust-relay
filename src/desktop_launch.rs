@@ -77,22 +77,32 @@ fn companion(program: &str) -> Result<PathBuf, RelayError> {
         })
 }
 
+const HOST_USAGE: &str = "Usage: ox host COMMAND
+  install                   start the session host at login
+  status                    show whether the host and its login service run
+  doctor [--errors N]       check the host, Tailscale Serve, paired devices and stock clients
+  restart [--timeout SECS]  let running turns finish, then start the installed host (after an update)
+  stop                      stop the host now; running turns are interrupted
+  uninstall [--purge]       remove the login service; --purge also deletes OX host state.
+                            Codex and Claude Code sessions and sign-ins are never touched.";
+
 pub(crate) fn host(args: &[OsString]) -> Result<u8, RelayError> {
-    match args {
-        [action] if matches!(action.to_str(), Some("install" | "status" | "uninstall")) => {
-            Err(Command::new(companion("ox-host")?)
-                .arg(action)
-                .exec()
-                .into())
+    const COMMANDS: [&str; 6] = [
+        "install",
+        "status",
+        "doctor",
+        "restart",
+        "stop",
+        "uninstall",
+    ];
+    match args.first().and_then(|a| a.to_str()) {
+        Some(command) if COMMANDS.contains(&command) => {
+            Err(Command::new(companion("ox-host")?).args(args).exec().into())
         }
-        [] => {
-            println!("Usage: ox host install|status|uninstall");
+        None | Some("-h" | "--help" | "help") => {
+            println!("{HOST_USAGE}");
             Ok(0)
         }
-        [help] if help == "--help" || help == "-h" => {
-            println!("Usage: ox host install|status|uninstall");
-            Ok(0)
-        }
-        _ => Err("Usage: ox host install|status|uninstall".into()),
+        _ => Err(HOST_USAGE.into()),
     }
 }

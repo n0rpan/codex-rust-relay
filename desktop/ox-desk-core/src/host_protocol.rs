@@ -61,6 +61,26 @@ pub enum Client {
         call: crate::origin::ParentCall,
     },
 }
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct HostInfo {
+    pub version: String,
+    pub epoch: String,
+}
+
+/// Which side to update when a client and host speak different protocol versions.
+pub fn version_mismatch(host: u32, client: u32) -> String {
+    if host < client {
+        format!(
+            "The running OX session host speaks protocol {host}, older than this client's {client}. Run `ox host restart` to start the installed host, or rerun the installer with --desktop."
+        )
+    } else {
+        format!(
+            "This client speaks OX protocol {client}, older than the session host's {host}. Update OX Desktop by rerunning the installer with --desktop; on a phone, reload the OX page."
+        )
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -75,6 +95,9 @@ pub enum Server {
         capabilities: Vec<String>,
         routes: Vec<Route>,
         projects: Vec<PathBuf>,
+        /// The host's build version and boot epoch. Older hosts omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<HostInfo>,
     },
     Discovered {
         id: String,
