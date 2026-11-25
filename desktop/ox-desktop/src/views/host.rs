@@ -114,7 +114,7 @@ pub struct Host {
     before_settings: Option<FocusHandle>,
     panes: Vec<Entity<Workbench>>,
     active: usize,
-    models: Vec<String>,
+    models: Entity<Vec<String>>,
     // Replacing this task cancels delivery of older settings and provider results.
     route_refresh: Task<()>,
     api_provider: Option<String>,
@@ -164,7 +164,16 @@ impl Host {
         let message = LastWorkspace::save(&project, &route)
             .err()
             .map(|e| e.to_string());
-        let pane = Self::pane(project, route, first_frame, stats, window, cx);
+        let models = cx.new(|_| Vec::new());
+        let pane = Self::pane(
+            project,
+            route,
+            first_frame,
+            stats,
+            models.clone(),
+            window,
+            cx,
+        );
         let route_refresh = Self::refresh_routes(window, cx);
         cx.observe_window_visibility(window, |_, _, w, cx| {
             if w.is_visible() {
@@ -214,7 +223,7 @@ impl Host {
             before_settings: None,
             panes: vec![pane],
             active: 0,
-            models: vec![],
+            models,
             route_refresh,
             api_provider: None,
             native_account: false,
@@ -443,13 +452,14 @@ impl Host {
     /// models, so the full catalog comes from the same request the Favorites page refreshes with.
     fn open_all_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active = self.panes[self.active].read(cx).route.runtime;
-        self.model_runtime = if active == Runtime::Claude && self.models.is_empty() {
+        self.model_runtime = if active == Runtime::Claude && self.models.read(cx).is_empty() {
             Runtime::Codex
         } else {
             active
         };
         let entries: Vec<_> = self
             .models
+            .read(cx)
             .iter()
             .map(|id| model_picker::api_entry(id))
             .collect();
@@ -519,7 +529,7 @@ impl Host {
         let picker = cx.new(|cx| {
             ModelPicker::new(entries, window, cx)
                 .with_runtime(runtime)
-                .with_discovered_new_session()
+                .with_route_catalog(&self.models, cx)
         });
         let subscription = cx.subscribe_in(
             &picker,
@@ -569,7 +579,7 @@ impl Host {
                 cx.notify();
             }),
         ));
-        if !self.models.is_empty() {
+        if !self.models.read(cx).is_empty() {
             runtimes = runtimes.child(button(
                 p,
                 "model-runtime-claude",
@@ -631,7 +641,7 @@ impl Host {
                 match result {
                     Ok((models, provider, native_account, favorites)) => {
                         s.favorite_models = favorites;
-                        s.models = models;
+                        s.models.write(cx, models);
                         s.api_provider = provider;
                         if native_account && !s.native_account {
                             // A sign-in started in Accounts has no live app-server to notify
@@ -645,8 +655,12 @@ impl Host {
                         s.native_account = native_account;
                         if s.provider_onboarding.is_some() && s.preferences.is_none() {
                             let before = s.provider_onboarding.take().unwrap_or_default();
-                            if let Some(model) =
-                                s.models.iter().find(|m| !before.contains(m)).cloned()
+                            if let Some(model) = s
+                                .models
+                                .read(cx)
+                                .iter()
+                                .find(|m| !before.contains(m))
+                                .cloned()
                             {
                                 let owner = s.panes[s.active].clone();
                                 let (project, route) = {
@@ -665,9 +679,9 @@ impl Host {
             });
             if let Ok(found) = discovered.await {
                 let _ = this.update(cx, |s, cx| {
-                    let merged = ox_desk_core::ports::ox::merge_catalog(&s.models, found);
-                    if merged != s.models {
-                        s.models = merged;
+                    let merged = ox_desk_core::ports::ox::merge_catalog(s.models.read(cx), found);
+                    if &merged != s.models.read(cx) {
+                        s.models.write(cx, merged);
                         cx.notify();
                     }
                 });
@@ -841,10 +855,12 @@ impl Host {
         route: Route,
         first_frame: Option<Instant>,
         stats: bool,
+        models: Entity<Vec<String>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<Workbench> {
-        let pane = cx.new(|cx| Workbench::new(project, route, first_frame, stats, window, cx));
+        let pane =
+            cx.new(|cx| Workbench::new(project, route, first_frame, stats, models, window, cx));
         cx.subscribe_in(
             &pane,
             window,
@@ -869,10 +885,10 @@ impl Host {
                 let project = owner.read(cx).project.clone();
                 let route = match &event.0 {
                     Some(route) => route.clone(),
-                    None => match s.models.first() {
+                    None => match s.models.read(cx).first() {
                         Some(model) => owner.read(cx).api_route(model.clone()),
                         None => {
-                            s.provider_onboarding = Some(s.models.clone());
+                            s.provider_onboarding = Some(s.models.read(cx).clone());
                             return s.open_providers(owner, window, cx);
                         }
                     },
@@ -885,7 +901,7 @@ impl Host {
             &pane,
             window,
             |s, owner, _: &super::onboarding::ConfigureProvider, window, cx| {
-                s.provider_onboarding = Some(s.models.clone());
+                s.provider_onboarding = Some(s.models.read(cx).clone());
                 s.open_providers(owner, window, cx);
             },
         )
@@ -895,7 +911,7 @@ impl Host {
             window,
             |s, owner, event: &super::route_chip::NewModelRoute, window, cx| {
                 let project = owner.read(cx).project.clone();
-                match new_route_gate(&event.0, &s.models, s.native_account) {
+                match new_route_gate(&event.0, s.models.read(cx), s.native_account) {
                     Ok(()) => {
                         s.open(project, event.0.clone(), window, cx);
                         s.panes[s.active]
@@ -982,8 +998,15 @@ impl Host {
                 p.project == project && p.route == route
             })
             .unwrap_or_else(|| {
-                self.panes
-                    .push(Self::pane(project, route, None, self.stats, window, cx));
+                self.panes.push(Self::pane(
+                    project,
+                    route,
+                    None,
+                    self.stats,
+                    self.models.clone(),
+                    window,
+                    cx,
+                ));
                 self.panes.len() - 1
             });
         self.switch(i, window, cx);
@@ -1177,7 +1200,9 @@ impl Host {
             }
         }
         (
-            owner.or_else(|| scope.saved_route(t, &self.models, self.api_provider.as_deref())),
+            owner.or_else(|| {
+                scope.saved_route(t, self.models.read(cx), self.api_provider.as_deref())
+            }),
             status,
         )
     }
@@ -1196,7 +1221,7 @@ impl Host {
                 s.open_catalog(project, row, route, window, cx);
             } else if (row.needs_claude_alias()
                 || (scope.api && s.api_provider.as_deref() == Some(&row.model_provider)))
-                && !s.models.is_empty()
+                && !s.models.read(cx).is_empty()
             {
                 s.choose_route = Some((project, row));
                 s.reveal_sidebar(window, cx);
@@ -1779,7 +1804,7 @@ impl Host {
             )
             .when_some(self.choose_route.clone(), |sidebar, (project, row)| {
                 let host = cx.weak_entity();
-                let aliases = self.models.clone();
+                let aliases = self.models.read(cx).clone();
                 sidebar.child(
                     div().pt(px(SPACE_S)).px(gutter).child(
                         button(

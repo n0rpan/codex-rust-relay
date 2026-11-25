@@ -315,7 +315,7 @@ impl Workbench {
                 ModelPicker::new(entries, window, cx)
                     .with_runtime(runtime)
                     .with_handoff()
-                    .with_discovered_new_session()
+                    .with_route_catalog(&self.route_models, cx)
             });
             let chosen_owner = owner.clone();
             let subscription = cx.subscribe_in(

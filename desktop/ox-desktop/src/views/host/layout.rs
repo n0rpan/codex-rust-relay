@@ -210,7 +210,15 @@ impl Host {
                 active = Some(panes.len());
                 first.clone()
             } else {
-                let extra = Self::pane(saved.project.clone(), r, None, self.stats, window, cx);
+                let extra = Self::pane(
+                    saved.project.clone(),
+                    r,
+                    None,
+                    self.stats,
+                    self.models.clone(),
+                    window,
+                    cx,
+                );
                 extra.update(cx, |b, cx| b.set_front(false, cx));
                 extra
             };
@@ -247,7 +255,15 @@ impl Host {
             }) {
                 continue;
             }
-            let pane = Self::pane(saved.project.clone(), route, None, self.stats, window, cx);
+            let pane = Self::pane(
+                saved.project.clone(),
+                route,
+                None,
+                self.stats,
+                self.models.clone(),
+                window,
+                cx,
+            );
             pane.update(cx, |view, cx| view.set_front(false, cx));
             saved.restore(&pane, cx);
             self.panes.push(pane);

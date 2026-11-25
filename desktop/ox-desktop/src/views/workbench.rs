@@ -75,6 +75,7 @@ pub struct Workbench {
     pub(super) review_width: u32,
     pub(super) pane_width: Pixels,
     resizing_review: bool,
+    pub(super) route_models: Entity<Vec<String>>,
     pub(super) model_picker: Option<super::route_chip::Picker>,
     /// When an outside press last closed the model panel.
     pub(super) picker_dismissed: Option<std::time::Instant>,
@@ -147,6 +148,7 @@ impl Workbench {
         route: Route,
         first_frame: Option<Instant>,
         stats: bool,
+        route_models: Entity<Vec<String>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -185,6 +187,7 @@ impl Workbench {
             pane_width: window.viewport_size().width,
             resizing_review: false,
             model_picker: None,
+            route_models,
             picker_dismissed: None,
             launch_request: None,
             launch: None,

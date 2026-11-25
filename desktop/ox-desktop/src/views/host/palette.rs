@@ -493,7 +493,7 @@ impl Host {
                 );
             }
         }
-        for route in ox_desk_core::runtime::Runtime::routes(&self.models) {
+        for route in ox_desk_core::runtime::Runtime::routes(self.models.read(cx)) {
             add(
                 route.label(),
                 format!("Billing route · {}", project.display()),
@@ -680,7 +680,7 @@ impl Host {
                     })
                 })
                 .collect(),
-            routes: self.models.clone(),
+            routes: self.models.read(cx).clone(),
             provider: self.api_provider.clone(),
             discovery_revision: self.discovery.revision,
             discovering: self.discovery.pending > 0,

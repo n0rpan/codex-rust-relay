@@ -439,8 +439,22 @@ impl ModelPicker {
         self
     }
 
-    pub(super) fn with_discovered_new_session(mut self) -> Self {
+    /// Keep this picker in sync with the window's existing route discovery, including
+    /// providers that answer after the user opens it. Retain native model labels and choices.
+    pub(super) fn with_route_catalog(
+        mut self,
+        catalog: &Entity<Vec<String>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         self.discovered_new_session = true;
+        let native = self.entries.clone();
+        self.add_aliases(catalog.read(cx).iter().cloned());
+        self._subscriptions
+            .push(cx.observe(catalog, move |s, catalog, cx| {
+                s.entries.clone_from(&native);
+                s.add_aliases(catalog.read(cx).iter().cloned());
+                cx.notify();
+            }));
         self
     }
 
