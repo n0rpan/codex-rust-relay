@@ -94,20 +94,52 @@ def worker_cases(root, stack, binary, env, log):
             request["messages"][-1] for request in native.requests]
         assert all(not any(row["parent"]==thread for row in d["sessions"]) for d in first_frames)
         client.act(scope,"worker-ok",{"send_text":[thread,"HOST-WORKER read"]})
-        def created(frame):
+        # The parent's MCP call returns once the host has created the worker session.
+        def launched(frame):
             if pending:=ask(frame):
                 client.act(scope,uuid.uuid4().hex,{"answer_ask":[pending["id"],0]},pending["token"])
+            return (n:=change(frame,"notification")) and n["event"]=="finished"
+        client.until(launched)
+        assert any('"job_id"' in json.dumps(request["messages"]) for request in native.requests), [
+            request["messages"][-1] for request in native.requests]
+        # A host-owned worker is an ordinary session on its own route, stamped with
+        # its origin and nested under the parent across scopes in the catalog.
+        catalog=Client(env["OX_HOST_SOCKET"])
+        catalog.send(type="watch_catalog")
+        def stamped(frame):
+            for state in frame.get("scopes",[]):
+                for row in state["sessions"]:
+                    if row["parent"]==thread and row["detail"].get("origin"):
+                        return (state["scope"],row)
+        worker_scope,worker=catalog.until(lambda f:f["type"]=="snapshot" and stamped(f))
+        catalog.close()
+        origin=worker["detail"]["origin"]
+        assert origin["relation"]=="worker" and origin["runtime"]=="claude", origin
+        assert origin["ceiling"]=="read" and origin["requested"]=="read", origin
+        assert origin["parent"]["session"]==thread and origin["parent"]["scope"]==scope, origin
+        assert worker_scope["route"]=={"runtime":"claude","billing":{"api":"fixture/demo"}}, worker_scope
+        operator=Client(env["OX_HOST_SOCKET"])
+        operator.open(worker_scope)
+        operator.until(lambda f:f["type"]=="snapshot")
+        # The operator cannot raise a worker above its recorded read ceiling.
+        operator.act(worker_scope,"child-mode",{"set_access":[worker["id"],"bypass_permissions"]})
+        operator.until(lambda f:f["type"]=="error" and f["id"]=="child-mode" and "ceiling" in f["message"])
+        def finished(frame):
+            if pending:=ask(frame):
+                operator.act(worker_scope,uuid.uuid4().hex,{"answer_ask":[pending["id"],0]},pending["token"])
+            for state in frame.get("scopes",[]):
+                if any(r["id"]==worker["id"] and r["status"]=="idle" and r["detail"].get("origin") for r in state["sessions"]):
+                    return True
             for c in frame.get("changes",[]):
                 for row in c.get("sessions",[]) + ([c["session"]] if "session" in c else []):
-                    if row["parent"]==thread and row["id"].startswith("ox:"):
-                        return row
-        worker=client.until(created)
-        assert worker["detail"]["job"]["snapshot"]["runtime"]=="claude"
-        client.act(scope,"child-mode",{"set_access":[worker["id"],"bypass_permissions"]})
-        client.until(lambda f:f["type"]=="error" and f["id"]=="child-mode" and "inherited" in f["message"])
-        client.until(lambda f:(row:=created(f)) and row["status"]=="completed")
+                    if row["id"]==worker["id"] and row["status"]=="idle":
+                        return True
+            return False
+        operator.open(worker_scope)
+        operator.until(finished)
+        operator.close()
         client.close()
-    print("Stock Claude worker: escalating MCP launch refused, read-only worker attached to confirmed parent, status returned, child escalation refused.")
+    print("Stock Claude worker: escalating MCP launch refused, host-owned read worker stamped with its parent, operator escalation above the ceiling refused.")
 
 
 def live_descendants(pid):
