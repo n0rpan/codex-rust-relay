@@ -67,6 +67,21 @@ enum Pending {
     Read(String),
     Resume(String),
     History(String),
+    ReadFullHistory(String),
+    ResumeFullHistory(String),
+}
+
+impl Pending {
+    fn loads_history_for(&self, id: &str) -> bool {
+        match self {
+            Self::Read(thread)
+            | Self::Resume(thread)
+            | Self::History(thread)
+            | Self::ReadFullHistory(thread)
+            | Self::ResumeFullHistory(thread) => thread == id,
+            _ => false,
+        }
+    }
 }
 
 pub struct Store {
@@ -541,8 +556,16 @@ impl Store {
             Pending::Access(id) => {
                 self.transcripts.entry(id).or_default().error = Some(message);
             }
-            Pending::Resume(id) if message.contains(Self::WRITER_LOCK) => self.native_locked(id),
-            Pending::Read(id) | Pending::Resume(id) | Pending::History(id) => {
+            Pending::Resume(id) | Pending::ResumeFullHistory(id)
+                if message.contains(Self::WRITER_LOCK) =>
+            {
+                self.native_locked(id)
+            }
+            Pending::Read(id)
+            | Pending::Resume(id)
+            | Pending::History(id)
+            | Pending::ReadFullHistory(id)
+            | Pending::ResumeFullHistory(id) => {
                 let transcript = self.transcripts.entry(id).or_default();
                 transcript.loading = false;
                 transcript.before_resume.clear();
@@ -578,7 +601,9 @@ impl Store {
             | Pending::Access(id)
             | Pending::Read(id)
             | Pending::Resume(id)
-            | Pending::History(id) => self.changed.transcript(id),
+            | Pending::History(id)
+            | Pending::ReadFullHistory(id)
+            | Pending::ResumeFullHistory(id) => self.changed.transcript(id),
         }
     }
 
@@ -659,7 +684,7 @@ impl Store {
                 let value = match result {
                     Ok(v) => v,
                     Err(err) => {
-                        self.failed(pending, err.message);
+                        self.rpc_failed(pending, err);
                         return Ok(());
                     }
                 };
@@ -669,7 +694,7 @@ impl Store {
                     }
                     (Pending::Unsubscribe, _) => (),
                     (Pending::ThreadOp(op), reply) => self.finish_thread_op(op, reply)?,
-                    (Pending::ChildIdentity(id), Reply::Read(read)) => {
+                    (Pending::ChildIdentity(id), Reply::Read(read, _)) => {
                         self.observe_child_identity(&id, *read.thread);
                     }
                     (Pending::Descendants(discovery), Reply::Threads(page)) => {
@@ -700,8 +725,24 @@ impl Store {
                         self.list_more()?;
                     }
                     (Pending::Account, Reply::Account(_)) => self.connected()?,
-                    (Pending::Read(id), Reply::Read(read)) => self.checked_read(&id, read),
-                    (Pending::Resume(id), Reply::Resume(reply)) => self.checked_resume(&id, *reply),
+                    (Pending::Read(id), Reply::Read(read, _)) => self.checked_read(&id, read),
+                    (Pending::Resume(id), Reply::Resume(reply, _)) => {
+                        self.checked_resume(&id, *reply)
+                    }
+                    (Pending::ResumeFullHistory(id), Reply::Resume(mut reply, Some(page))) => {
+                        reply.initial_turns_page = Some(page);
+                        self.checked_resume(&id, *reply);
+                    }
+                    (Pending::ReadFullHistory(id), Reply::Read(read, Some(page))) => {
+                        self.full_history_read(id, read, page);
+                    }
+                    (pending @ Pending::ReadFullHistory(_), Reply::Read(_, None))
+                    | (pending @ Pending::ResumeFullHistory(_), Reply::Resume(_, None)) => {
+                        self.failed(
+                            pending,
+                            "Codex did not return the requested thread history".into(),
+                        );
+                    }
                     (Pending::History(id), Reply::Turns(page)) => self.history_page(&id, page),
                     (Pending::Mention(version), Reply::Files(files)) => {
                         if version == self.mention.version {

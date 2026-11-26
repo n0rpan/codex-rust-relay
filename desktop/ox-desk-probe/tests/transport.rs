@@ -361,3 +361,88 @@ fn delayed_catalog_reply_cannot_replace_a_newer_search() {
     assert_eq!(store.threads()[0].id, "match");
     assert!(!store.has_more());
 }
+
+#[test]
+fn unsupported_codex_pages_fall_back_once_without_changing_the_thread_owner() {
+    use ox_desk_core::{
+        store::{Profile, Route, Store},
+        transcript::Row,
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let (tx, rx) = mpsc::channel();
+    let link = Link::spawn(
+        Launch {
+            executable: PathBuf::from(env!("CARGO_BIN_EXE_fake-app-server")),
+            arguments: vec![dir.join("fixtures/unsupported-history.jsonl").into()],
+            directory: dir,
+            path: env::var_os("PATH").unwrap_or_default(),
+        },
+        move |event| {
+            let _ = tx.send(event);
+        },
+    )
+    .unwrap();
+    let mut store = Store::open(
+        Profile {
+            project: "/synthetic".into(),
+            route: Route::codex_api("fixture/demo".into()),
+            provider: "codeox".into(),
+        },
+        link,
+    )
+    .unwrap();
+    let apply = |store: &mut Store| store.apply(rx.recv_timeout(Duration::from_secs(3)).unwrap());
+    apply(&mut store);
+    apply(&mut store);
+    for id in ["child", "root", "paged"] {
+        store.select(id).unwrap();
+        while store.transcript(id).unwrap().is_loading() {
+            apply(&mut store);
+        }
+        if id == "paged" {
+            assert!(store.transcript(id).unwrap().has_older());
+            store.load_older(id).unwrap();
+            while store.transcript(id).unwrap().is_loading() {
+                apply(&mut store);
+            }
+        }
+        let t = store.transcript(id).unwrap();
+        assert!(t.is_ready(), "{:?}", t.error());
+        assert_eq!(t.len(), 2);
+        assert!(matches!(t.row(0),Some(Row::Message(k)) if k.turn == "early"));
+        assert!(matches!(t.row(1),Some(Row::Message(k)) if k.turn == "current"));
+        assert!(!t.has_older());
+        if id == "child" {
+            assert_eq!(t.active_turn(), Some("current"));
+            let ask = &store.asks()[0];
+            assert_eq!(ask.thread.as_deref(), Some(id));
+            store.answer(&ask.id.clone(), 0).unwrap();
+        } else if id == "paged" {
+            // The full read contained a newer turn with its notification still
+            // in flight. Loading older rows must not prepend or duplicate it.
+            apply(&mut store);
+            let t = store.transcript(id).unwrap();
+            assert_eq!(t.len(), 3);
+            assert!(matches!(t.row(2), Some(Row::Message(k)) if k.turn == "new"));
+        } else {
+            assert!(store.is_native_live(id));
+            assert!(!store.can_send(Some(id)));
+        }
+    }
+    for (id, expected) in [
+        (
+            "broken",
+            "Open the session again to retry. (list_turns is not supported yet)",
+        ),
+        ("missing", "did not return the requested thread history"),
+        ("moved", "different project"),
+    ] {
+        store.select(id).unwrap();
+        while store.transcript(id).unwrap().is_loading() {
+            apply(&mut store);
+        }
+        let t = store.transcript(id).unwrap();
+        assert!(!t.is_ready());
+        assert!(t.error().unwrap().contains(expected), "{:?}", t.error());
+    }
+}

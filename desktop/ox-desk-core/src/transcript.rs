@@ -42,6 +42,8 @@ pub struct Transcript {
     remeasure: HashSet<i64>,
     cursors: HashSet<String>,
     pub(crate) cursor: Option<String>,
+    // Oldest turn in the paged history, including turns with no displayable items.
+    oldest_paged_turn: Option<String>,
     pub(crate) loading: bool,
     pub(crate) ready: bool,
     pub(crate) unread: bool,
@@ -127,6 +129,18 @@ impl Transcript {
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
+    /// A full read can also contain new activity still on the wire. A load-older
+    /// request only owns the turns before its previous page's exclusive boundary.
+    pub(crate) fn trim_full_history_to_cursor(&self, page: &mut TurnPage) -> io::Result<()> {
+        if self.has_older() {
+            let boundary = page.data.iter()
+                .position(|turn| Some(&turn.id) == self.oldest_paged_turn.as_ref())
+                .ok_or_else(|| io::Error::other("Codex history changed before the previous page. Reconnect to reload the session."))?;
+            page.data.drain(..=boundary);
+        }
+        Ok(())
+    }
+
     pub(crate) fn add_history(&mut self, page: TurnPage) -> io::Result<()> {
         let already_open = self.ready;
         self.loading = false;
@@ -155,6 +169,11 @@ impl Transcript {
         if !already_open {
             self.reviews
                 .initial_history_order(page.data.iter().map(|t| t.id.as_str()));
+        }
+        if page.next_cursor.is_none() {
+            self.oldest_paged_turn = None;
+        } else if !already_open || !page.data.is_empty() {
+            self.oldest_paged_turn = page.data.last().map(|turn| turn.id.clone());
         }
         for turn in page.data {
             let review = self.reviews.turn(&turn.id, true);

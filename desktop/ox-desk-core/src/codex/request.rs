@@ -36,6 +36,7 @@ pub enum Call {
     },
     WorkspaceList(Option<String>),
     Read(String),
+    ReadFullHistory(String),
     Fork {
         thread: String,
         project: PathBuf,
@@ -51,6 +52,7 @@ pub enum Call {
     Resume {
         thread: String,
         project: Option<PathBuf>,
+        full_history: bool,
     },
     History {
         thread: String,
@@ -138,7 +140,7 @@ impl Call {
             Self::Limits => Method::Limits,
             Self::List { .. } | Self::WorkspaceList(_) | Self::Descendants { .. } => Method::List,
             Self::Unsubscribe(_) => Method::Unsubscribe,
-            Self::Read(_) => Method::Read,
+            Self::Read(_) | Self::ReadFullHistory(_) => Method::Read,
             Self::Fork { .. } => Method::Fork,
             Self::Archive(_) => Method::Archive,
             Self::Resume { .. } => Method::Resume,
@@ -199,8 +201,17 @@ impl Call {
             }
             Self::Archive(thread) => json!({"threadId":thread}),
             Self::Read(thread) => json!({"threadId":thread,"includeTurns":false}),
-            Self::Resume { thread, project } => {
-                let mut params = json!({"threadId":thread,"excludeTurns":true,"initialTurnsPage":{"limit":TURNS,"sortDirection":"desc","itemsView":"full"}});
+            Self::ReadFullHistory(thread) => json!({"threadId":thread,"includeTurns":true}),
+            Self::Resume {
+                thread,
+                project,
+                full_history,
+            } => {
+                let mut params = json!({"threadId":thread,"excludeTurns":!full_history});
+                if !full_history {
+                    params["initialTurnsPage"] =
+                        json!({"limit":TURNS,"sortDirection":"desc","itemsView":"full"});
+                }
                 if let Some(project) = project {
                     params["cwd"] = json!(project);
                 }
