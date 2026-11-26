@@ -4794,6 +4794,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "flume",
+ "httpdate",
  "libc",
  "ox-desk-core",
  "ox-pty",

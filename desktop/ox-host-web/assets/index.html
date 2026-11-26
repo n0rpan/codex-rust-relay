@@ -73,7 +73,7 @@
       </section>
       <section id="catalog" hidden>
         <div class="heading">
-          <h1>Sessions</h1>
+          <h1 id="sessions-heading" tabindex="-1">Sessions</h1>
           <button id="new" class="primary">＋ New session</button>
           <details class="action-menu">
             <summary aria-label="More session list actions">•••</summary>
@@ -161,6 +161,7 @@
       <section id="conversation" hidden>
         <nav class="conversation-nav" aria-label="Session navigation">
           <button class="back">‹ Sessions</button>
+          <span id="nav-title" aria-hidden="true" hidden></span>
           <details class="action-menu">
             <summary aria-label="More session actions">•••</summary>
             <div>

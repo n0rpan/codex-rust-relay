@@ -643,7 +643,6 @@ async fn subscribe(
     }
     s.set_push(&id, input.subscription)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    s.changed.send_modify(|v| *v = v.wrapping_add(1));
     Ok(StatusCode::NO_CONTENT)
 }
 async fn upgrade(

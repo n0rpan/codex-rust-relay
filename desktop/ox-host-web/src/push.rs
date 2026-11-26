@@ -8,21 +8,27 @@ use p256::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
-    time::Duration,
+    sync::Arc,
+    time::{Duration, SystemTime},
 };
-use tokio::{io::BufReader, sync::mpsc};
+use tokio::{
+    io::BufReader,
+    sync::{mpsc, watch},
+    time::Instant,
+};
 use url::Url;
 use web_push_native::{Auth, WebPushBuilder};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Subscription {
     pub endpoint: String,
     pub keys: Keys,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Keys {
     pub p256dh: String,
@@ -105,11 +111,12 @@ fn encrypt(
     key: &SecretKey,
     data: &[u8],
     contact: &str,
+    ttl: Duration,
 ) -> Option<(Url, reqwest::header::HeaderMap, Vec<u8>)> {
     let url = sub.url()?;
     let (public, auth) = sub.keys()?;
     let encrypted = WebPushBuilder::new(url.as_str().parse().ok()?, public, Auth::from(auth))
-        .with_valid_duration(Duration::from_secs(3600))
+        .with_valid_duration(ttl)
         .build(data)
         .ok()?;
     let (parts, body) = encrypted.into_parts();
@@ -129,17 +136,60 @@ fn encrypt(
     headers.insert("authorization", auth.parse().ok()?);
     Some((url, headers, body))
 }
-async fn send(sub: &Subscription, key: &SecretKey, data: &[u8], contact: &str) -> Option<u16> {
-    let (url, headers, body) = encrypt(sub, key, data, contact)?;
-    let host = url.host_str()?;
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, 443)).await.ok()?.collect();
-    if addrs.is_empty() || addrs.iter().any(|addr| !public_ip(addr.ip())) {
-        return None;
+#[derive(Debug, PartialEq, Eq)]
+enum DeliveryResult {
+    Done,
+    Gone,
+    Retry(Duration),
+}
+
+fn response(status: u16, retry_after: Option<&str>, now: SystemTime) -> DeliveryResult {
+    match status {
+        404 | 410 => DeliveryResult::Gone,
+        408 | 429 | 500..=599 => {
+            let delay = retry_after
+                .and_then(|value| {
+                    value
+                        .parse::<u64>()
+                        .ok()
+                        .map(Duration::from_secs)
+                        .or_else(|| {
+                            httpdate::parse_http_date(value)
+                                .ok()
+                                .map(|date| date.duration_since(now).unwrap_or_default())
+                        })
+                })
+                .unwrap_or_default();
+            DeliveryResult::Retry(delay)
+        }
+        _ => DeliveryResult::Done,
     }
-    let client = client_builder()
-        .resolve_to_addrs(host, &addrs)
-        .build()
-        .ok()?;
+}
+
+async fn send(
+    sub: &Subscription,
+    key: &SecretKey,
+    data: &[u8],
+    contact: &str,
+    ttl: Duration,
+) -> DeliveryResult {
+    let Some((url, headers, body)) = encrypt(sub, key, data, contact, ttl) else {
+        return DeliveryResult::Done;
+    };
+    let host = url.host_str().expect("validated subscription host");
+    let Ok(resolved) = tokio::net::lookup_host((host, 443)).await else {
+        return DeliveryResult::Retry(Duration::ZERO);
+    };
+    let addrs: Vec<SocketAddr> = resolved.collect();
+    if addrs.is_empty() {
+        return DeliveryResult::Retry(Duration::ZERO);
+    }
+    if addrs.iter().any(|addr| !public_ip(addr.ip())) {
+        return DeliveryResult::Done;
+    }
+    let Ok(client) = client_builder().resolve_to_addrs(host, &addrs).build() else {
+        return DeliveryResult::Done;
+    };
     post(client, url, headers, body).await
 }
 fn client_builder() -> reqwest::ClientBuilder {
@@ -154,77 +204,201 @@ async fn post(
     url: Url,
     headers: reqwest::header::HeaderMap,
     body: Vec<u8>,
-) -> Option<u16> {
-    Some(
-        client
-            .post(url)
-            .headers(headers)
-            .body(body)
-            .send()
-            .await
-            .ok()?
-            .status()
-            .as_u16(),
+) -> DeliveryResult {
+    let Ok(res) = client.post(url).headers(headers).body(body).send().await else {
+        return DeliveryResult::Retry(Duration::ZERO);
+    };
+    response(
+        res.status().as_u16(),
+        res.headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|h| h.to_str().ok()),
+        SystemTime::now(),
     )
 }
+
+struct Notice {
+    bytes: Vec<u8>,
+    expires: Instant,
+    // Closing the sender cancels every device's queued or in-flight copy.
+    ask: Option<watch::Receiver<()>>,
+}
+
+struct Delivery {
+    device: String,
+    subscription: Subscription,
+    notice: Arc<Notice>,
+    attempts: u32,
+}
+
+impl Delivery {
+    async fn attempt(
+        &self,
+        app: &App,
+        transport: &impl AsyncFn(&Subscription, &SecretKey, &[u8], &str, Duration) -> DeliveryResult,
+    ) -> DeliveryResult {
+        let mut changed = app.state.lock().unwrap().changed.subscribe();
+        let mut ask = self.notice.ask.clone();
+        let (key, config) = {
+            let mut state = app.state.lock().unwrap();
+            (state.vapid(), state.configuration())
+        };
+        let (Ok(key), Some((contact, _))) = (key, config) else {
+            return DeliveryResult::Done;
+        };
+        let ttl = self
+            .notice
+            .expires
+            .saturating_duration_since(Instant::now());
+        if ttl.is_zero() {
+            return DeliveryResult::Done;
+        }
+        let post = tokio::time::timeout(
+            Duration::from_secs(7).min(ttl),
+            transport(&self.subscription, &key, &self.notice.bytes, &contact, ttl),
+        );
+        tokio::pin!(post);
+        loop {
+            if !app
+                .state
+                .lock()
+                .unwrap()
+                .is_subscribed(&self.device, &self.subscription)
+            {
+                return DeliveryResult::Done;
+            }
+            tokio::select! {biased;
+                _ = async {
+                    if let Some(rx) = &mut ask { let _ = rx.changed().await; }
+                }, if self.notice.ask.is_some() => return DeliveryResult::Done,
+                _ = changed.changed() => continue,
+                result = &mut post => return result.unwrap_or(DeliveryResult::Retry(Duration::ZERO)),
+            }
+        }
+    }
+
+    fn retry_at(&self, minimum: Duration) -> Option<Instant> {
+        if self.attempts >= 4 {
+            return None;
+        }
+        let backoff = Duration::from_secs(2u64.pow(self.attempts));
+        Instant::now().checked_add(minimum.max(backoff))
+    }
+}
+
+// Keep delayed retries separate so a push service asking us to wait never
+// sleeps the sender for the next phone or session. All payloads stay in memory.
+async fn deliveries(
+    app: App,
+    mut rx: mpsc::Receiver<Notice>,
+    transport: impl AsyncFn(&Subscription, &SecretKey, &[u8], &str, Duration) -> DeliveryResult,
+) {
+    const MAX_RETRIES_QUEUED: usize = 256;
+    let mut fresh = VecDeque::new();
+    let mut retries = BTreeMap::<(Instant, u64), Delivery>::new();
+    let mut cooldowns = HashMap::<String, (Instant, Duration)>::new();
+    let mut sequence = 0u64;
+    loop {
+        let next = retries.first_key_value().map(|((at, _), _)| *at);
+        let mut job = if let Some(job) = fresh.pop_front() {
+            job
+        } else if next.is_some_and(|at| at <= Instant::now()) {
+            retries.pop_first().unwrap().1
+        } else {
+            tokio::select! {
+                notice = rx.recv() => {
+                    let Some(notice) = notice else { return };
+                    let notice = Arc::new(notice);
+                    let subscribers = app.state.lock().unwrap().subscriptions();
+                    cooldowns.retain(|endpoint, (since, delay)| since.elapsed() < *delay
+                        && subscribers.iter().any(|(_, sub)| sub.endpoint == *endpoint));
+                    for (device, subscription) in subscribers {
+                        fresh.push_back(Delivery { device, subscription, notice: notice.clone(), attempts: 0 });
+                    }
+                }
+                _ = async { tokio::time::sleep_until(next.unwrap()).await }, if next.is_some() => {}
+            }
+            continue;
+        };
+        let cooldown = cooldowns
+            .get(&job.subscription.endpoint)
+            .map(|(since, delay)| delay.saturating_sub(since.elapsed()))
+            .unwrap_or_default();
+        let next_attempt = if cooldown.is_zero() {
+            job.attempts += 1;
+            match job.attempt(&app, &transport).await {
+                DeliveryResult::Gone => {
+                    let mut state = app.state.lock().unwrap();
+                    if state.is_subscribed(&job.device, &job.subscription) {
+                        let _ = state.set_push(&job.device, None);
+                    }
+                    None
+                }
+                DeliveryResult::Retry(delay) => {
+                    if !delay.is_zero() {
+                        cooldowns
+                            .insert(job.subscription.endpoint.clone(), (Instant::now(), delay));
+                    }
+                    job.retry_at(delay)
+                }
+                DeliveryResult::Done => None,
+            }
+        } else {
+            Instant::now().checked_add(cooldown)
+        };
+        if let Some(at) = next_attempt
+            && at < job.notice.expires
+            && retries.len() < MAX_RETRIES_QUEUED
+        {
+            sequence = sequence.wrapping_add(1);
+            retries.insert((at, sequence), job);
+        }
+    }
+}
+
 pub(crate) async fn watch(app: App) {
     let mut wake = app.state.lock().unwrap().changed.subscribe();
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
-    let worker = app.clone();
-    tokio::spawn(async move {
-        while let Some(data) = rx.recv().await {
-            let (key, subs, origin) = {
-                let mut s = worker.state.lock().unwrap();
-                (s.vapid(), s.subscriptions(), s.configuration())
-            };
-            let (Ok(key), Some((contact, _))) = (key, origin) else {
-                continue;
-            };
-            for (id, sub) in subs {
-                let mut changed = worker.state.lock().unwrap().changed.subscribe();
-                let deliver =
-                    tokio::time::timeout(Duration::from_secs(7), send(&sub, &key, &data, &contact));
-                tokio::pin!(deliver);
-                loop {
-                    if !worker
-                        .state
-                        .lock()
-                        .unwrap()
-                        .is_subscribed(&id, &sub.endpoint)
-                    {
-                        break;
-                    }
-                    tokio::select! {biased;
-                        _=changed.changed()=>continue,
-                        status=&mut deliver=>{
-                            if matches!(status,Ok(Some(404|410))) {
-                                let mut state=worker.state.lock().unwrap();
-                                if state.is_subscribed(&id,&sub.endpoint){let _=state.set_push(&id,None);}
-                            }
-                            break;
-                        }
+    let (tx, rx) = mpsc::channel(32);
+    tokio::spawn(deliveries(app.clone(), rx, send));
+    let mut cursor = None;
+    let mut asks = ActiveAsks::default();
+    loop {
+        if app.state.lock().unwrap().subscriptions().is_empty() {
+            cursor = None;
+            asks.0.clear();
+            let _ = wake.changed().await;
+            continue;
+        }
+        {
+            let feed = notifications(&app, &mut cursor, &tx, &mut asks);
+            tokio::pin!(feed);
+            loop {
+                tokio::select! {
+                    _ = &mut feed => break,
+                    _ = wake.changed() => {
+                        if app.state.lock().unwrap().subscriptions().is_empty() { break; }
                     }
                 }
             }
         }
-    });
-    let mut cursor = None;
-    loop {
-        if app.state.lock().unwrap().subscriptions().is_empty() {
-            cursor = None;
-            let _ = wake.changed().await;
-            continue;
+        // While disconnected we cannot know whether the user answered. Cancel
+        // pending sends, retaining the known tokens to identify new asks on replay.
+        for scope in asks.0.values_mut() {
+            for sender in scope.values_mut() {
+                *sender = watch::channel(()).0;
+            }
         }
         tokio::select! {
-            _=wake.changed()=>{},
-            _=notifications(&app,&mut cursor,&tx)=>{tokio::select!{_=tokio::time::sleep(Duration::from_secs(3))=>{},_=wake.changed()=>{}}}
+            _ = tokio::time::sleep(Duration::from_secs(3)) => {},
+            _ = wake.changed() => {},
         }
     }
 }
 async fn notifications(
     app: &App,
     cursor: &mut Option<Cursor>,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &mpsc::Sender<Notice>,
+    asks: &mut ActiveAsks,
 ) -> io::Result<()> {
     let host = bridge::connect(&app.host).await?;
     let (r, mut w) = host.into_split();
@@ -251,7 +425,7 @@ async fn notifications(
     .await?;
     loop {
         let bytes = bridge::line(&mut r, &mut buf).await?;
-        match notices(&bytes, cursor.as_ref())? {
+        match notices(&bytes, cursor.as_ref(), asks)? {
             Notices::Skip => {}
             Notices::Snapshot(c) => *cursor = Some(c),
             Notices::Delta(c, payloads) => {
@@ -268,11 +442,50 @@ async fn notifications(
 enum Notices {
     Skip,
     Snapshot(Cursor),
-    Delta(Cursor, Vec<Vec<u8>>),
+    Delta(Cursor, Vec<Notice>),
+}
+// The host gives each live ask a unique token and includes the updated asks in
+// the notification frame. Keep only a digest of that token. A new ask on the
+// same thread must never make a retry for its predecessor valid again.
+#[derive(Default)]
+struct ActiveAsks(HashMap<Scope, HashMap<[u8; 32], watch::Sender<()>>>);
+
+impl ActiveAsks {
+    fn replace(
+        &mut self,
+        scope: &Scope,
+        asks: Vec<NoticeAsk>,
+    ) -> Vec<(String, NotificationKind, watch::Receiver<()>)> {
+        let mut previous = self.0.remove(scope).unwrap_or_default();
+        let mut current = HashMap::new();
+        let mut added = Vec::new();
+        for ask in asks {
+            let Some(thread) = ask.thread else { continue };
+            let token: [u8; 32] = ring::digest::digest(&ring::digest::SHA256, ask.token.as_bytes())
+                .as_ref()
+                .try_into()
+                .unwrap();
+            let sender = previous.remove(&token).unwrap_or_else(|| {
+                let (tx, rx) = watch::channel(());
+                let kind = if ask.questions.is_empty() {
+                    NotificationKind::Approval
+                } else {
+                    NotificationKind::Question
+                };
+                added.push((thread, kind, rx));
+                tx
+            });
+            current.insert(token, sender);
+        }
+        if !current.is_empty() {
+            self.0.insert(scope.clone(), current);
+        }
+        added
+    }
 }
 /// Turn one host frame into Web Push payloads. Each payload holds only the scoped
 /// thread identifier, the session title and the event kind.
-fn notices(bytes: &[u8], cursor: Option<&Cursor>) -> io::Result<Notices> {
+fn notices(bytes: &[u8], cursor: Option<&Cursor>, asks: &mut ActiveAsks) -> io::Result<Notices> {
     let frame: NoticeFrame = serde_json::from_slice(bytes)?;
     let Some(c) = frame.cursor else {
         if frame.kind == "error" {
@@ -281,6 +494,10 @@ fn notices(bytes: &[u8], cursor: Option<&Cursor>) -> io::Result<Notices> {
         return Ok(Notices::Skip);
     };
     if frame.kind == "snapshot" {
+        asks.0.clear();
+        for state in frame.scopes {
+            asks.replace(&state.scope, state.asks);
+        }
         return Ok(Notices::Snapshot(c));
     }
     if frame.kind != "delta" || cursor.is_some_and(|old| old.epoch == c.epoch && old.seq >= c.seq) {
@@ -289,8 +506,15 @@ fn notices(bytes: &[u8], cursor: Option<&Cursor>) -> io::Result<Notices> {
     let Some(scope) = frame.scope else {
         return Ok(Notices::Skip);
     };
+    let mut changes = frame.changes;
+    let mut new_asks = changes
+        .iter_mut()
+        .rev()
+        .find(|change| change.kind == "asks")
+        .map(|change| asks.replace(&scope, std::mem::take(&mut change.asks)))
+        .unwrap_or_default();
     let mut payloads = Vec::new();
-    for change in frame.changes {
+    for change in changes {
         if change.kind != "notification" {
             continue;
         }
@@ -298,6 +522,21 @@ fn notices(bytes: &[u8], cursor: Option<&Cursor>) -> io::Result<Notices> {
         else {
             continue;
         };
+        let ask = if matches!(
+            kind,
+            NotificationKind::Approval | NotificationKind::Question
+        ) {
+            let Some(index) = new_asks
+                .iter()
+                .position(|(id, event, _)| id == &thread && *event == kind)
+            else {
+                continue;
+            };
+            Some(new_asks.remove(index).2)
+        } else {
+            None
+        };
+        let ttl = Duration::from_secs(if ask.is_some() { 300 } else { 3600 });
         let title = title
             .chars()
             .filter(|c| !c.is_control())
@@ -310,11 +549,15 @@ fn notices(bytes: &[u8], cursor: Option<&Cursor>) -> io::Result<Notices> {
         let identity = serde_json::to_vec(&(&scope.project, scope.route.runtime, alias, &thread))?;
         let hash = ring::digest::digest(&ring::digest::SHA256, &identity);
         let thread = format!("{thread}~{}", B64.encode(hash.as_ref()));
-        payloads.push(serde_json::to_vec(&Payload {
-            thread: &thread,
-            title: &title,
-            kind,
-        })?);
+        payloads.push(Notice {
+            ask,
+            expires: Instant::now() + ttl,
+            bytes: serde_json::to_vec(&Payload {
+                thread: &thread,
+                title: &title,
+                kind,
+            })?,
+        });
     }
     Ok(Notices::Delta(c, payloads))
 }
@@ -328,6 +571,21 @@ struct NoticeFrame {
     scope: Option<Scope>,
     #[serde(default)]
     changes: Vec<NoticeChange>,
+    #[serde(default)]
+    scopes: Vec<NoticeScope>,
+}
+#[derive(Deserialize)]
+struct NoticeScope {
+    scope: Scope,
+    #[serde(default)]
+    asks: Vec<NoticeAsk>,
+}
+#[derive(Deserialize)]
+struct NoticeAsk {
+    thread: Option<String>,
+    token: String,
+    #[serde(default)]
+    questions: Vec<serde::de::IgnoredAny>,
 }
 #[derive(Deserialize)]
 struct NoticeChange {
@@ -335,6 +593,8 @@ struct NoticeChange {
     thread: Option<String>,
     title: Option<String>,
     event: Option<NotificationKind>,
+    #[serde(default)]
+    asks: Vec<NoticeAsk>,
 }
 
 #[cfg(test)]
@@ -343,7 +603,7 @@ mod tests {
     use p256::ecdsa::{VerifyingKey, signature::Verifier};
     use p256::elliptic_curve::rand_core::OsRng;
     use serde_json::json;
-    fn fixture() -> (Subscription, SecretKey) {
+    pub(super) fn fixture() -> (Subscription, SecretKey) {
         let phone = SecretKey::random(&mut OsRng);
         (
             Subscription {
@@ -361,8 +621,14 @@ mod tests {
         let (sub, phone) = fixture();
         let vapid = SecretKey::random(&mut OsRng);
         let payload = br#"{"thread":"one","title":"OX session","kind":"approval"}"#;
-        let (_, headers, body) =
-            encrypt(&sub, &vapid, payload, "https://test.tail.ts.net").unwrap();
+        let (_, headers, body) = encrypt(
+            &sub,
+            &vapid,
+            payload,
+            "https://test.tail.ts.net",
+            Duration::from_secs(300),
+        )
+        .unwrap();
         assert!(!body.windows(7).any(|p| p == b"session"));
         let clear = web_push_native::decrypt(body, &phone, &Auth::from([7; 16])).unwrap();
         assert_eq!(clear, payload);
@@ -408,6 +674,7 @@ mod tests {
             &SecretKey::random(&mut OsRng),
             b"fixture",
             "https://host.fixture.ts.net",
+            Duration::from_secs(300),
         )
         .unwrap();
         let cert =
@@ -418,7 +685,7 @@ mod tests {
             .resolve("web.push.apple.com", address)
             .build()
             .unwrap();
-        assert_eq!(post(client, url, headers, body).await, Some(201));
+        assert_eq!(post(client, url, headers, body).await, DeliveryResult::Done);
         assert!(server.wait().unwrap().success());
         let ciphertext = std::fs::read(dir.path().join("encrypted")).unwrap();
         assert_eq!(
@@ -546,11 +813,13 @@ mod tests {
             };
             let bytes = serde_json::to_vec(&frame).unwrap();
             assert!(String::from_utf8_lossy(&bytes).contains(SECRET));
-            let Notices::Delta(_, payloads) = notices(&bytes, None).unwrap() else {
+            let Notices::Delta(_, payloads) =
+                notices(&bytes, None, &mut ActiveAsks::default()).unwrap()
+            else {
                 panic!("delta frame was not processed");
             };
             assert_eq!(payloads.len(), 1, "{kind:?}");
-            let text = String::from_utf8(payloads[0].clone()).unwrap();
+            let text = String::from_utf8(payloads[0].bytes.clone()).unwrap();
             assert!(!text.contains(SECRET), "{kind:?} payload leaked: {text}");
             let v: serde_json::Value = serde_json::from_str(&text).unwrap();
             let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
@@ -593,3 +862,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod retry_tests;

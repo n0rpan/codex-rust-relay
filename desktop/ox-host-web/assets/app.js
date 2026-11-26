@@ -19,6 +19,7 @@ import { setupSettings } from "./settings.js";
 import {
   scopeKey,
   Projection,
+  NotificationTarget,
   emptyScope,
   catalogTree,
   catalogParentResolver,
@@ -99,10 +100,12 @@ document.addEventListener("keydown", (event) => {
   }
 });
 function page(id) {
+  if (id !== "catalog" && id !== "pair") notificationTarget.request(null);
   if (id !== "settings") phoneSettings?.reset?.();
   if (id !== "running") stopRunning();
   clearConfirm($("confirm-slot"));
   clearConfirm($("running-confirm"));
+  const returningToCatalog = id === "catalog" && $("catalog").hidden;
   for (const view of [
     "pair",
     "catalog",
@@ -112,13 +115,19 @@ function page(id) {
     "settings",
   ])
     $(view).hidden = view !== id;
+  if (returningToCatalog) {
+    // Move focus out of the outgoing composer before iOS collapses the keyboard.
+    $("sessions-heading").focus({ preventScroll: true });
+    window.scrollTo({ top: 0, behavior: "instant" });
+  }
   if (id !== "pair" && !$("camera-panel").hidden) closeCamera();
   $("location").textContent = location.hostname.split(".")[0];
   $("location").title = location.host;
 }
 const hash = new URLSearchParams(location.hash.slice(1));
-let code = hash.get("pair"),
-  requested = hash.get("thread");
+const notificationTarget = new NotificationTarget();
+notificationTarget.request(hash.get("thread"));
+let code = hash.get("pair");
 if (location.hash) history.replaceState(null, "", location.pathname);
 // Whether the host has an OX API provider: then every catalog alias is a route for both
 // runtimes, even when the first Hello (before discovery finished) listed none.
@@ -292,9 +301,7 @@ class Link {
           : wire.subscribe(this.scope, this.model.cursor),
       );
       if (!this.scope) {
-        this.discovery = crypto.randomUUID();
-        this.discovering = new Map();
-        this.send(wire.discover(this.discovery));
+        this.discover();
         // Hello may predate model discovery; the settings catalog supplies the API routes
         // (and, once discovery lands, the rest) without a refresh.
         if (key) loadModelChoices();
@@ -314,6 +321,7 @@ class Link {
     }
     if (msg.type === "discovered_end" && msg.id === this.discovery) {
       cold = this.discovering;
+      this.discoveryResult = { complete: !msg.errors.length };
       repaint();
       return;
     }
@@ -360,7 +368,14 @@ class Link {
       return;
     }
     if (msg.type === "ack" || msg.type === "error") {
-      if (msg.type === "error") this.opens.delete(msg.id);
+      if (msg.type === "error") {
+        this.opens.delete(msg.id);
+        if (msg.id && msg.id === this.discovery) {
+          cold = this.discovering;
+          this.discoveryResult = { complete: false };
+          repaint();
+        }
+      }
       const cb = this.pending.get(msg.id);
       this.pending.delete(msg.id);
       if (msg.type === "error")
@@ -379,6 +394,12 @@ class Link {
       if (changed) repaint();
     }
   }
+  discover() {
+    this.discoveryResult = null;
+    this.discovery = crypto.randomUUID();
+    this.discovering = new Map();
+    this.send(wire.discover(this.discovery));
+  }
   connected() {
     this.ready = true;
     this.attempt = 0;
@@ -390,6 +411,10 @@ class Link {
   lost() {
     if (this.closed) return;
     this.ready = false;
+    if (!this.scope) {
+      this.discoveryResult = null;
+      notificationTarget.reconnect();
+    }
     if (this.pending.size) {
       notice(
         "Disconnected before confirmation. Check the conversation before retrying.",
@@ -450,6 +475,7 @@ class Link {
   close() {
     this.closed = true;
     this.ready = false;
+    if (!this.scope) notificationTarget.reconnect();
     clearTimeout(this.timer);
     this.socket?.close();
     this.pending.clear();
@@ -651,6 +677,7 @@ $("end-idle").onclick = () => {
   });
 };
 function home() {
+  notificationTarget.request(null);
   detailLink?.close();
   detailLink = null;
   selected = null;
@@ -693,45 +720,16 @@ function entries() {
 }
 function catalog() {
   const rows = entries();
-  if (requested) {
-    const ref = requested;
-    const cut = ref.lastIndexOf("~");
-    const id = cut < 0 ? ref : ref.slice(0, cut);
-    const matches = rows.filter((v) => v.session.id === id);
-    if (matches.length) {
-      requested = null;
-      (async () => {
-        for (const hit of matches) {
-          const b = hit.scope.route.billing;
-          const bytes = new TextEncoder().encode(
-            JSON.stringify([
-              hit.scope.project,
-              hit.scope.route.runtime,
-              typeof b === "string" ? null : b.api,
-              hit.session.id,
-            ]),
-          );
-          const hash = btoa(
-            String.fromCharCode(
-              ...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
-            ),
-          )
-            .replaceAll("+", "-")
-            .replaceAll("/", "_")
-            .replaceAll("=", "");
-          if (
-            (cut >= 0 && hash === ref.slice(cut + 1)) ||
-            (cut < 0 && matches.length === 1)
-          ) {
-            open(hit.scope, id);
-            return;
-          }
-        }
-        notice(
-          "The notification’s session is unavailable for this project and billing route.",
-        );
-      })();
-    }
+  if (globalLink?.ready) {
+    void notificationTarget.resolve(rows, globalLink.discoveryResult, (match) => {
+      if (match === "ambiguous")
+        notice("This notification matches more than one session. Choose the session from the list.");
+      else if (match === "missing")
+        notice("This notification’s session is no longer in the list.");
+      else if (match === "incomplete")
+        notice("OX couldn’t load the full session list for this notification. Reconnect and look for the session.");
+      else open(match.scope, match.session.id);
+    });
   }
   const needle = $("find-sessions").value.trim().toLocaleLowerCase();
   const visible = [];
@@ -774,10 +772,16 @@ function catalog() {
     byProject.set(entry.scope.project, list);
   }
   const frag = document.createDocumentFragment();
+  const names = new Map();
+  for (const project of byProject.keys())
+    names.set(leaf(project), (names.get(leaf(project)) || 0) + 1);
   for (const [project, list] of [...byProject].sort((a, b) =>
     a[0].localeCompare(b[0]),
   )) {
-    frag.append(el("h2", "project", project));
+    const name = leaf(project);
+    const heading = el("h2", "project", names.get(name) === 1 ? name : project);
+    heading.title = project;
+    frag.append(heading);
     const done = new Set();
     const add = (entry, depth) => {
       const { scope, session, needsInput } = entry,
@@ -815,6 +819,10 @@ function catalog() {
         head,
         el("div", "meta", meta),
       );
+      const worker = session.detail?.worker_notice;
+      if (worker?.status)
+        b.append(el("div", "worker-outcome",
+          `Worker #${worker.job_id} · ${worker.status.replaceAll("_", " ")}`));
       frag.append(b);
       for (const child of tree.children.get(key) || []) add(child, depth + 1);
     };
@@ -1197,6 +1205,11 @@ const jumpLatest = (() => {
   };
 })();
 
+// Keep the session name in reach once the full heading has scrolled past the navigation.
+new IntersectionObserver(([entry]) => {
+  $("nav-title").hidden = $("conversation").hidden || entry.boundingClientRect.bottom >= 0;
+}).observe($("title"));
+
 function conversation() {
   if (!selected) return;
   const { scope, id } = selected,
@@ -1223,6 +1236,7 @@ function conversation() {
     routesLabel,
   });
   $("title").textContent = row?.title || (id ? "Session" : "New session");
+  $("nav-title").textContent = $("title").textContent;
   // A worker says what it runs as: its billing route, the model the runtime
   // confirmed (pending until then), the access ceiling and its checkout.
   const worker = origin && origin.relation !== "handoff";
@@ -2162,8 +2176,12 @@ document.addEventListener("visibilitychange", () => {
 });
 navigator.serviceWorker?.addEventListener("message", (e) => {
   if (typeof e.data?.openThread === "string") {
-    requested = e.data.openThread;
-    home();
+    if (key && $("pair").hidden) home();
+    notificationTarget.request(e.data.openThread);
+    // An existing window may have finished discovery before the alert arrived.
+    if (globalLink?.discoveryResult && globalLink.socket?.readyState === WebSocket.OPEN)
+      globalLink.discover();
+    repaint();
   }
 });
 try {
