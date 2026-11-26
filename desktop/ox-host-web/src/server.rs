@@ -102,6 +102,27 @@ async fn serve(dir: PathBuf, socket: PathBuf) -> io::Result<()> {
         else {
             continue;
         };
+        if let Request::Update { command } = req {
+            let mut reply = app.state.lock().unwrap().reply(None);
+            tokio::spawn(async move {
+                let status =
+                    tokio::task::spawn_blocking(move || crate::host_updates::control(command))
+                        .await;
+                let result = status
+                    .map_err(|_| "The update service stopped".to_owned())
+                    .and_then(|s| s.map_err(|e| e.to_string()))
+                    .map(|s| {
+                        reply.update = Some(s);
+                        reply
+                    });
+                if let Ok(mut bytes) = serde_json::to_vec(&result) {
+                    bytes.push(b'\n');
+                    let _ = tokio::time::timeout(Duration::from_secs(2), stream.write_all(&bytes))
+                        .await;
+                }
+            });
+            continue;
+        }
         let result = administer(&app, &mut listener, &mut staged, req)
             .await
             .map_err(|e| e.to_string());
@@ -172,14 +193,15 @@ async fn administer(
         ));
     }
     match req {
+        Request::Update { .. } => unreachable!("handled before Serve administration"),
         Request::Status => {}
-        Request::Pair { login } => {
+        Request::Pair { login, terminal } => {
             if listener.is_none() || staged.is_some() {
                 return Err(io::Error::other(
                     "Enable the local remote access listener first",
                 ));
             }
-            pairing = Some(app.state.lock().unwrap().invite(login)?);
+            pairing = Some(app.state.lock().unwrap().invite(login, terminal)?);
         }
         Request::TerminalGrant { id, enabled } => {
             app.state.lock().unwrap().terminal_grant(&id, enabled)?
@@ -539,6 +561,8 @@ fn device(app: &App, h: &HeaderMap) -> Result<String, ErrCode> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Pair {
+    #[serde(default)]
+    class: crate::admin::DeviceClass,
     code: String,
     key: String,
     signature: String,
@@ -559,6 +583,7 @@ async fn pair(
             &p.key,
             &p.signature,
             &p.label,
+            p.class,
         )
         .ok_or(DENY)?;
     Ok((
@@ -748,10 +773,17 @@ mod tests {
             state.set_origin(Some(ORIGIN.into()), 0).unwrap();
             let key = SigningKey::random(&mut OsRng);
             let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
-            let invite = state.invite(LOGIN.into()).unwrap();
+            let invite = state.invite(LOGIN.into(), false).unwrap();
             let code = invite.url.split_once("#pair=").unwrap().1;
             let cookie = state
-                .pair(LOGIN, code, &public, &sign(&key, code), "Phone")
+                .pair(
+                    LOGIN,
+                    code,
+                    &public,
+                    &sign(&key, code),
+                    "Phone",
+                    crate::admin::DeviceClass::Phone,
+                )
                 .unwrap();
             let id = state.identity(LOGIN, &cookie).unwrap();
             let socket = dir.path().join("host.sock");

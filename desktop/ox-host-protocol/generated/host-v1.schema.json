@@ -1301,6 +1301,19 @@
         "epoch": {
           "type": "string"
         },
+        "id": {
+          "description": "Stable across host restarts. Legacy hosts supply only version and epoch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "version": {
           "type": "string"
         }

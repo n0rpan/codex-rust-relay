@@ -1,5 +1,6 @@
+pub(crate) use crate::serve::origin;
 use crate::{
-    admin::{Device, Pairing, Reply},
+    admin::{Device, DeviceClass, Pairing, Reply},
     push::Subscription,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
@@ -22,7 +23,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::watch;
-use url::Url;
 
 /// A paired device that is not used for this long is forgotten.
 pub(crate) const INACTIVE: i64 = 30 * 24 * 3600;
@@ -52,20 +52,6 @@ pub(crate) fn random() -> String {
 }
 fn digest(s: &str) -> String {
     B64.encode(digest::digest(&digest::SHA256, s.as_bytes()).as_ref())
-}
-pub(crate) fn origin(input: &str) -> Option<String> {
-    let u = Url::parse(input).ok()?;
-    let host = u.host_str()?;
-    (u.scheme() == "https"
-        && host.ends_with(".ts.net")
-        && host.len() > 7
-        && u.username().is_empty()
-        && u.password().is_none()
-        && u.path() == "/"
-        && u.query().is_none()
-        && u.fragment().is_none()
-        && input.trim_end_matches('/') == u.origin().ascii_serialization())
-    .then(|| u.origin().ascii_serialization())
 }
 pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
     fs::DirBuilder::new()
@@ -101,6 +87,8 @@ struct Disk {
 }
 #[derive(Clone)]
 struct Invite {
+    terminal: bool,
+    short_hash: String,
     login: String,
     issuer: Option<String>,
     expires: i64,
@@ -225,6 +213,7 @@ impl State {
             .collect();
         devices.sort_by(|a, b| b.last_used.cmp(&a.last_used).then(a.id.cmp(&b.id)));
         Reply {
+            update: None,
             enabled: self.disk.origin.is_some(),
             origin: self.disk.origin.clone(),
             port: self.disk.port,
@@ -233,17 +222,22 @@ impl State {
             reservation: None,
         }
     }
-    pub fn invite(&mut self, login: String) -> io::Result<Pairing> {
-        self.create_invite(login, None)
+    pub fn invite(&mut self, login: String, terminal: bool) -> io::Result<Pairing> {
+        self.create_invite(login, None, terminal)
     }
     pub fn device_invite(&mut self, id: &str) -> io::Result<Pairing> {
         if !self.alive(id) {
             return Err(io::Error::other("Device is no longer paired"));
         }
         let login = self.disk.devices[id].device.login.clone();
-        self.create_invite(login, Some(id.to_owned()))
+        self.create_invite(login, Some(id.to_owned()), false)
     }
-    fn create_invite(&mut self, login: String, issuer: Option<String>) -> io::Result<Pairing> {
+    fn create_invite(
+        &mut self,
+        login: String,
+        issuer: Option<String>,
+        terminal: bool,
+    ) -> io::Result<Pairing> {
         let origin = self
             .disk
             .origin
@@ -257,6 +251,16 @@ impl State {
             return Err(io::Error::other("Invalid Tailscale login"));
         }
         let code = random();
+        // Twelve independent base32 symbols (60 bits), with ambiguous letters omitted.
+        const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+        let mut bytes = [0u8; 12];
+        SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| io::Error::other("Pairing needs OS randomness"))?;
+        let short: String = bytes
+            .iter()
+            .map(|b| char::from(ALPHABET[usize::from(b & 31)]))
+            .collect();
         let expires_at = now() + PAIR_TTL;
         self.invites.retain(|_, v| v.expires > now());
         if self.invites.len() >= 16 {
@@ -271,12 +275,15 @@ impl State {
         self.invites.insert(
             digest(&code),
             Invite {
+                terminal,
+                short_hash: digest(&short),
                 issuer,
                 login,
                 expires: expires_at,
             },
         );
         Ok(Pairing {
+            short_code: Some(format!("{}-{}-{}", &short[..4], &short[4..8], &short[8..])),
             url,
             qr_svg,
             expires_at,
@@ -289,15 +296,26 @@ impl State {
         key: &str,
         signature: &str,
         label: &str,
+        class: DeviceClass,
     ) -> Option<String> {
-        if code.len() != 43
+        if code.len() > 43
             || label.trim().is_empty()
             || label.chars().count() > 64
             || label.chars().any(char::is_control)
         {
             return None;
         }
-        let h = digest(code);
+        let h = if code.len() == 43 {
+            digest(code)
+        } else {
+            let normalized = crate::admin::manual_code(code)?;
+            let short_hash = digest(&normalized);
+            self.invites
+                .iter()
+                .find(|(_, invite)| invite.short_hash == short_hash)?
+                .0
+                .clone()
+        };
         let invitation = self.invites.get(&h)?;
         if invitation.login != login
             || invitation.expires <= now()
@@ -314,7 +332,8 @@ impl State {
         let registered = Registered {
             terminal_generation: 0,
             device: Device {
-                terminal: false,
+                class,
+                terminal: invitation.terminal,
                 id: id.clone(),
                 login: login.into(),
                 label: label.trim().into(),
@@ -358,6 +377,9 @@ impl State {
                 .devices
                 .get(id)
                 .is_some_and(|r| r.device.last_used + INACTIVE > now())
+    }
+    pub fn device_class(&self, id: &str) -> Option<DeviceClass> {
+        Some(self.disk.devices.get(id)?.device.class)
     }
     pub fn active_device(&mut self, id: &str) -> bool {
         if !self.alive(id) {
@@ -544,21 +566,42 @@ mod tests {
         let mut s = State::load(dir.path()).unwrap();
         s.set_origin(Some("https://machine.tail.ts.net".into()), 48162)
             .unwrap();
-        let invite = s.invite("a@example.test".into()).unwrap();
+        let invite = s.invite("a@example.test".into(), false).unwrap();
         assert!(invite.qr_svg.contains("<svg"));
         let code = invite.url.split_once("#pair=").unwrap().1;
         let key = SigningKey::random(&mut OsRng);
         let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
         assert!(
-            s.pair("b@example.test", code, &public, &sign(&key, code), "Phone")
-                .is_none()
+            s.pair(
+                "b@example.test",
+                code,
+                &public,
+                &sign(&key, code),
+                "Phone",
+                DeviceClass::Phone
+            )
+            .is_none()
         );
         let cookie = s
-            .pair("a@example.test", code, &public, &sign(&key, code), "Phone")
+            .pair(
+                "a@example.test",
+                code,
+                &public,
+                &sign(&key, code),
+                "Phone",
+                DeviceClass::Phone,
+            )
             .unwrap();
         assert!(
-            s.pair("a@example.test", code, &public, &sign(&key, code), "Replay")
-                .is_none()
+            s.pair(
+                "a@example.test",
+                code,
+                &public,
+                &sign(&key, code),
+                "Replay",
+                DeviceClass::Phone
+            )
+            .is_none()
         );
         let contents = fs::read_to_string(dir.path().join("remote.json")).unwrap();
         assert!(!contents.contains(&cookie) && !contents.contains(code));
@@ -589,13 +632,51 @@ mod tests {
                 pending_code,
                 &public,
                 &sign(&key, pending_code),
-                "Withdrawn invitation"
+                "Withdrawn invitation",
+                DeviceClass::Phone
             )
             .is_none()
         );
         assert!(!s.prove(&id, Purpose::Connect, &next, &sign(&key, &next)));
         assert!(s.identity("a@example.test", &cookie).is_none());
     }
+    #[test]
+    fn manual_code_and_long_link_spend_one_desktop_invitation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let mut state = State::load(dir.path()).unwrap();
+        state
+            .set_origin(Some("https://machine.tail.ts.net".into()), 48162)
+            .unwrap();
+        let login = "operator@example.test";
+        let invite = state.invite(login.into(), false).unwrap();
+        let short = invite.short_code.unwrap().to_lowercase();
+        let long = invite.url.split_once("#pair=").unwrap().1;
+        let key = SigningKey::random(&mut OsRng);
+        let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
+        let pair = |state: &mut State, login: &str, code: &str| {
+            state.pair(
+                login,
+                code,
+                &public,
+                &sign(&key, code),
+                "Laptop",
+                DeviceClass::Desktop,
+            )
+        };
+        assert!(pair(&mut state, "other@example.test", &short).is_none());
+        let token = pair(&mut state, login, &short).unwrap();
+        assert!(pair(&mut state, login, long).is_none());
+        let restored = State::load(dir.path()).unwrap();
+        let id = restored.identity(login, &token).unwrap();
+        assert_eq!(restored.device_class(&id), Some(DeviceClass::Desktop));
+        assert!(restored.terminal_generation(&id).is_none());
+    }
+
     #[test]
     fn terminal_grants_reject_stale_challenges_and_do_not_transfer_to_repaired_devices() {
         let tmp = tempfile::tempdir().unwrap();
@@ -610,15 +691,22 @@ mod tests {
             .unwrap();
         let key = SigningKey::random(&mut OsRng);
         let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
-        let register = |s: &mut State| {
-            let invitation = s.invite("tester".into()).unwrap();
+        let register = |s: &mut State, invitation: Pairing| {
             let secret = invitation.url.split_once("#pair=").unwrap().1;
             let cookie = s
-                .pair("tester", secret, &public, &sign(&key, secret), "Phone")
+                .pair(
+                    "tester",
+                    secret,
+                    &public,
+                    &sign(&key, secret),
+                    "Phone",
+                    DeviceClass::Phone,
+                )
                 .unwrap();
             s.identity("tester", &cookie).unwrap()
         };
-        let id = register(&mut state);
+        let invitation = state.invite("tester".into(), false).unwrap();
+        let id = register(&mut state, invitation);
         assert!(state.terminal_generation(&id).is_none());
         state.terminal_grant(&id, true).unwrap();
         let old = state.terminal_generation(&id).unwrap();
@@ -636,7 +724,11 @@ mod tests {
                 .prove_terminal(&id, &nonce, &sig, r#"{"preset":"claude-login"}"#)
                 .is_none()
         );
-        let paired = register(&mut state);
+        let preauthorized = state.invite("tester".into(), true).unwrap();
+        let trusted = register(&mut state, preauthorized);
+        assert!(state.terminal_generation(&trusted).is_some());
+        let next = state.device_invite(&trusted).unwrap();
+        let paired = register(&mut state, next);
         assert_ne!(id, paired);
         assert!(state.terminal_generation(&paired).is_none());
         assert!(state.terminal_generation(&id).is_some());
@@ -656,18 +748,32 @@ mod tests {
         state.set_origin(Some(origin.into()), 48162).unwrap();
         let key = SigningKey::random(&mut OsRng);
         let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
-        let invite = state.invite("me".into()).unwrap();
+        let invite = state.invite("me".into(), false).unwrap();
         let secret = invite.url.split_once("#pair=").unwrap().1;
         state.invites.get_mut(&digest(secret)).unwrap().expires = now() - 1;
         assert!(
             state
-                .pair("me", secret, &public, &sign(&key, secret), "Phone")
+                .pair(
+                    "me",
+                    secret,
+                    &public,
+                    &sign(&key, secret),
+                    "Phone",
+                    DeviceClass::Phone
+                )
                 .is_none()
         );
-        let invitation = state.invite("me".into()).unwrap();
+        let invitation = state.invite("me".into(), false).unwrap();
         let secret = invitation.url.split_once("#pair=").unwrap().1;
         let cookie = state
-            .pair("me", secret, &public, &sign(&key, secret), "Phone")
+            .pair(
+                "me",
+                secret,
+                &public,
+                &sign(&key, secret),
+                "Phone",
+                DeviceClass::Phone,
+            )
             .unwrap();
         let id = state.identity("me", &cookie).unwrap();
         state.set_origin(None, 0).unwrap();
@@ -710,11 +816,18 @@ mod tests {
         let key = SigningKey::random(&mut OsRng);
         let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
         let pair = |s: &mut State, code: &str, label: &str| {
-            s.pair("me", code, &public, &sign(&key, code), label)
+            s.pair(
+                "me",
+                code,
+                &public,
+                &sign(&key, code),
+                label,
+                DeviceClass::Phone,
+            )
         };
 
         // An invitation expires exactly PAIR_TTL seconds after it is issued.
-        let stale = s.invite("me".into()).unwrap();
+        let stale = s.invite("me".into(), false).unwrap();
         assert_eq!(stale.expires_at, start + PAIR_TTL);
         let stale = stale.url.split_once("#pair=").unwrap().1.to_owned();
         at(start + PAIR_TTL);
@@ -722,7 +835,7 @@ mod tests {
 
         // A fresh invitation works once, one second before its deadline, then never again.
         let issued = start + PAIR_TTL;
-        let fresh = s.invite("me".into()).unwrap();
+        let fresh = s.invite("me".into(), false).unwrap();
         let fresh = fresh.url.split_once("#pair=").unwrap().1.to_owned();
         at(issued + PAIR_TTL - 1);
         let cookie = pair(&mut s, &fresh, "Phone").unwrap();
@@ -740,7 +853,7 @@ mod tests {
         assert!(State::load(dir.path()).unwrap().disk.devices.is_empty());
 
         // Use renews the window: a device used on day 29 survives past day 30.
-        let fresh = s.invite("me".into()).unwrap();
+        let fresh = s.invite("me".into(), false).unwrap();
         let fresh = fresh.url.split_once("#pair=").unwrap().1.to_owned();
         let cookie = pair(&mut s, &fresh, "Phone").unwrap();
         let id = s.identity("me", &cookie).unwrap();

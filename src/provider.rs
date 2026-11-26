@@ -86,7 +86,7 @@ pub fn process_env(name: &str) -> Option<String> {
 
 /// A key the upstream can accept as a bearer token: non-empty and without any
 /// whitespace. Callers trim surrounding whitespace first.
-fn usable_key(value: &str) -> bool {
+pub(crate) fn usable_key(value: &str) -> bool {
     !value.is_empty() && !value.chars().any(char::is_whitespace)
 }
 
@@ -204,7 +204,7 @@ impl SavedKeys {
         }
     }
 
-    fn scoped_value(&self, name: &str, scope: &str) -> Option<String> {
+    pub(crate) fn scoped_value(&self, name: &str, scope: &str) -> Option<String> {
         self.0
             .get(name)
             .filter(|key| key.scope == scope)
@@ -231,6 +231,11 @@ impl SavedKeys {
         scope: &str,
         value: String,
     ) -> Result<String, RelayError> {
+        self.insert_scoped(name, scope, value);
+        serde_json::to_string(self).map_err(|_| "could not encode ox-api-keys.json".into())
+    }
+
+    pub(crate) fn insert_scoped(&mut self, name: &str, scope: &str, value: String) {
         self.0.insert(
             name.to_owned(),
             SavedKey {
@@ -238,7 +243,6 @@ impl SavedKeys {
                 value,
             },
         );
-        serde_json::to_string(self).map_err(|_| "could not encode ox-api-keys.json".into())
     }
 }
 

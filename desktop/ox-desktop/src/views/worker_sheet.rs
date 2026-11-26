@@ -326,7 +326,8 @@ impl Workbench {
         // The target is an OX API alias, so the source session's own native command models
         // (subscription names like "default") are not candidates. Any catalog model may be
         // chosen, starred or not: the picker lists settings and the discovered catalog.
-        let picker = cx.new(|cx| ModelPicker::new(vec![], window, cx).with_catalog(cx));
+        let picker =
+            cx.new(|cx| ModelPicker::new(self.link.clone(), vec![], window, cx).with_catalog(cx));
         let subscription = cx.subscribe_in(
             &picker,
             window,

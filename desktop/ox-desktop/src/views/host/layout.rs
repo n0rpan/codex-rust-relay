@@ -196,7 +196,9 @@ impl Host {
         let mut panes = Vec::new();
         let mut active = None;
         for saved in layout.panes {
-            if !saved.project.is_absolute() || !saved.project.is_dir() {
+            if !saved.project.is_absolute()
+                || (self.link.remote().is_none() && !saved.project.is_dir())
+            {
                 continue;
             }
             let r = saved.route();
@@ -211,6 +213,8 @@ impl Host {
                 first.clone()
             } else {
                 let extra = Self::pane(
+                    self.link.clone(),
+                    self.workers.clone(),
                     saved.project.clone(),
                     r,
                     None,
@@ -256,6 +260,8 @@ impl Host {
                 continue;
             }
             let pane = Self::pane(
+                self.link.clone(),
+                self.workers.clone(),
                 saved.project.clone(),
                 route,
                 None,
@@ -308,7 +314,7 @@ impl Host {
         };
         if self.saved_layouts.current != saved {
             self.saved_layouts.remember(saved.clone());
-            crate::workspace_state::remember_layout(saved);
+            crate::workspace_state::remember_layout(self.link.state_file("layout.json"), saved);
         }
     }
     pub(super) fn divider(&self, p: Palette, cx: &Context<Self>) -> impl IntoElement {

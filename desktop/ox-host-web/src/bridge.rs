@@ -5,7 +5,7 @@ use crate::{
 use axum::extract::ws::{Message, WebSocket};
 use ox_desk_core::{
     actions::Action,
-    host_protocol::{Client, Scope, Server, VERSION},
+    host_protocol::{Client, Scope, Server},
     runtime::Route,
 };
 use serde::Serialize;
@@ -78,7 +78,8 @@ fn valid_upload(image: &ox_desk_core::mentions::ImageInput) -> bool {
 }
 #[derive(Default)]
 struct Access {
-    hello: bool,
+    class: crate::admin::DeviceClass,
+    hello: Option<u32>,
     ready: bool,
     projects: HashSet<PathBuf>,
     routes: HashSet<Route>,
@@ -97,7 +98,9 @@ impl Access {
                     routes,
                     capabilities,
                     ..
-                } if self.hello && version == VERSION => {
+                } if self.hello.is_some_and(|offer| version <= offer)
+                    && ox_desk_core::host_protocol::supported(version) =>
+                {
                     self.ready = true;
                     self.projects = projects.into_iter().collect();
                     self.routes = routes.into_iter().collect();
@@ -108,7 +111,14 @@ impl Access {
                         .any(|c| c == ox_desk_core::surface::CAPABILITY)
                     {
                         return Ok(Some(Client::Surface {
-                            surface: ox_desk_core::surface::Surface::Phone,
+                            surface: match self.class {
+                                crate::admin::DeviceClass::Phone => {
+                                    ox_desk_core::surface::Surface::Phone
+                                }
+                                crate::admin::DeviceClass::Desktop => {
+                                    ox_desk_core::surface::Surface::Desktop
+                                }
+                            },
                         }));
                     }
                 }
@@ -200,14 +210,17 @@ impl Access {
                 "That access mode is not available for this route. Choose another and try again."
                     .into()
             }
+            _ if self.class == crate::admin::DeviceClass::Desktop => {
+                "This action is unavailable over a remote desktop connection.".into()
+            }
             _ => return None,
         };
         Some((Some(id.clone()), message))
     }
     fn permit(&mut self, app: &App, req: &Client) -> bool {
         match req {
-            Client::Hello { version } if !self.hello && *version == VERSION => {
-                self.hello = true;
+            Client::Hello { version } if self.hello.is_none() => {
+                self.hello = Some(*version);
                 true
             }
             Client::Discover { id }
@@ -255,6 +268,22 @@ impl Access {
                     | Action::EndSession(_)
                     | Action::ForceEndSession(_)
                     | Action::SendText(..) => approval.is_none(),
+                    Action::NewDraft
+                    | Action::DismissNotice
+                    | Action::PaletteMore
+                    | Action::MoreThreads
+                    | Action::OpenCatalogRow(_)
+                    | Action::ConfirmAliasAndResume(_)
+                    | Action::ResumeHere(_)
+                        if self.class == crate::admin::DeviceClass::Desktop =>
+                    {
+                        approval.is_none()
+                    }
+                    Action::SearchThreads(query) | Action::PaletteSearch(query)
+                        if self.class == crate::admin::DeviceClass::Desktop =>
+                    {
+                        approval.is_none() && query.len() <= 4096
+                    }
                     Action::StartWorker(start) => approval.is_none() && start.validate().is_ok(),
                     Action::StartHandoff(start) => approval.is_none() && start.validate().is_ok(),
                     Action::YoloGrant(id, _) => {
@@ -293,12 +322,15 @@ pub(crate) async fn session(app: App, id: String, mut ws: WebSocket) {
     let Ok(proof) = serde_json::from_str::<Proof>(&frame) else {
         return;
     };
-    let mut changes = {
+    let (mut changes, class) = {
         let mut s = app.state.lock().unwrap();
         if !s.prove(&id, Purpose::Connect, &proof.nonce, &proof.signature) {
             return;
         }
-        s.changed.subscribe()
+        let Some(class) = s.device_class(&id) else {
+            return;
+        };
+        (s.changed.subscribe(), class)
     };
     let Ok(host) = connect(&app.host).await else {
         return;
@@ -306,7 +338,10 @@ pub(crate) async fn session(app: App, id: String, mut ws: WebSocket) {
     let (r, mut w) = host.into_split();
     let mut r = BufReader::new(r);
     let mut buf = Vec::new();
-    let mut access = Access::default();
+    let mut access = Access {
+        class,
+        ..Access::default()
+    };
     loop {
         if !app.state.lock().unwrap().active_device(&id) {
             break;
@@ -350,6 +385,7 @@ pub(crate) async fn session(app: App, id: String, mut ws: WebSocket) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ox_desk_core::host_protocol::VERSION;
     use ox_desk_core::runtime::Runtime;
     #[test]
     fn the_bridge_declares_the_phone_itself_and_never_forwards_a_declaration() {
@@ -401,6 +437,31 @@ mod tests {
             "a browser cannot claim to be the desktop"
         );
         assert!(a.invalid(&app, &declare).is_none(), "it closes the socket");
+        let mut desktop = Access {
+            class: crate::admin::DeviceClass::Desktop,
+            ..Default::default()
+        };
+        assert!(desktop.permit(
+            &app,
+            &Client::Hello {
+                version: VERSION + 1
+            }
+        ));
+        assert!(matches!(
+            desktop.host(&app, &hello(vec![CAPABILITY.into()])).unwrap(),
+            Some(Client::Surface {
+                surface: Surface::Desktop
+            })
+        ));
+        assert!(!desktop.permit(&app, &declare));
+        assert!(!desktop.permit(
+            &app,
+            &Client::Subscribe {
+                scope: None,
+                after: None,
+                terminal: true
+            }
+        ));
     }
 
     #[test]

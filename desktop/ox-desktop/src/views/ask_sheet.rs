@@ -278,7 +278,8 @@ impl Workbench {
                 body = body.child(small(p, detail.clone()));
             }
         }
-        if let Some(command) = &ask.command
+        if self.link.remote().is_none()
+            && let Some(command) = &ask.command
             && let Some(review) =
                 super::terminal_review::Review::approval(command, &store.profile().project)
             && let Some(token) = store.command_review_token(&id)

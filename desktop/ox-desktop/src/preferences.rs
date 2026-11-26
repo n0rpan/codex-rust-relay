@@ -4,14 +4,16 @@ mod about;
 mod advanced;
 pub mod behavior;
 mod forms;
+mod hosts;
 mod key_field;
+pub(crate) use hosts::{HostDirectory, Hosts};
 mod remote;
 mod sessions;
 use crate::{
     appearance::Palette,
     platform,
     settings::{
-        self, Credential, Settings,
+        Credential, Settings,
         model::{self, Cell, Edit, Key, Values},
         protocol::Request,
     },
@@ -23,6 +25,7 @@ use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {
+    Hosts,
     Remote,
     Accounts,
     Advanced,
@@ -53,6 +56,8 @@ struct Legacy {
 }
 
 pub struct Preferences {
+    link: platform::HostLink,
+    hosts: Entity<hosts::Hosts>,
     focus: FocusHandle,
     about: Entity<about::About>,
     remote: Option<Entity<remote::Remote>>,
@@ -81,7 +86,12 @@ pub struct Preferences {
 }
 
 impl Preferences {
-    pub fn new(project: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        link: platform::HostLink,
+        project: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let alias = forms::input("", "provider/model", window, cx);
         cx.subscribe(&alias, |_, _, _: &gpui_component::input::InputEvent, cx| {
             cx.notify()
@@ -90,6 +100,8 @@ impl Preferences {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let mut ui = Self {
+            link,
+            hosts: cx.new(|cx| hosts::Hosts::new(window, cx)),
             focus,
             advanced: None,
             about: cx.new(about::About::new),
@@ -118,8 +130,13 @@ impl Preferences {
         ui.reload(window, cx);
         ui
     }
-    pub fn providers(project: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut view = Self::new(project, window, cx);
+    pub fn providers(
+        link: platform::HostLink,
+        project: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::new(link, project, window, cx);
         view.prefer_providers = true;
         view
     }
@@ -133,6 +150,11 @@ impl Preferences {
         }
     }
     fn goto(&mut self, page: Page, cx: &mut Context<Self>) {
+        let page = if page == Page::Remote && self.link.remote().is_some() {
+            Page::Hosts
+        } else {
+            page
+        };
         self.remote = (page == Page::Remote)
             .then(|| cx.new(|cx| remote::Remote::new(self.project.clone(), cx)));
         self.page = page;
@@ -158,10 +180,11 @@ impl Preferences {
         }
         self.busy = true;
         cx.notify();
+        let link = self.link.clone();
         cx.spawn_in(w, async move |view, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async { settings::load() })
+                .spawn(async move { link.settings() })
                 .await;
             let _ = view.update_in(cx, |s, w, cx| {
                 s.busy = false;
@@ -298,12 +321,13 @@ impl Preferences {
             return;
         }
         let page = self.page;
+        let link = self.link.clone();
         self.busy = true;
         self.message.clear();
         cx.notify();
         cx.spawn_in(w, async move |view, cx| {
             let (request, result) = cx.background_executor().spawn(async move {
-                let result = settings::apply(&request);
+                let result = link.apply(&request);
                 (request, result)
             }).await;
             let _ = view.update_in(cx, |s, w, cx| {
@@ -364,7 +388,12 @@ impl Preferences {
             Page::Favorites => &self.settings.revisions.favorites,
             Page::Legacy => &self.settings.revisions.legacy,
             Page::Credentials => &self.settings.revisions.keys,
-            Page::Remote | Page::Accounts | Page::Behavior | Page::Advanced | Page::Sessions => {
+            Page::Hosts
+            | Page::Remote
+            | Page::Accounts
+            | Page::Behavior
+            | Page::Advanced
+            | Page::Sessions => {
                 return String::new();
             }
         }
@@ -485,16 +514,15 @@ impl Preferences {
             return;
         }
         let revision = self.settings.revisions.registry.clone();
+        let link = self.link.clone();
         self.busy = true;
         self.message.clear();
         cx.notify();
         cx.spawn(async move |view, cx| {
-            let result =
-                cx.background_executor()
-                    .spawn(async move {
-                        settings::request::<usize>(Request::TestProvider { id, revision })
-                    })
-                    .await;
+            let result = cx
+                .background_executor()
+                .spawn(async move { link.request::<usize>(Request::TestProvider { id, revision }) })
+                .await;
             let _ = view.update(cx, |s, cx| {
                 s.busy = false;
                 match result {
@@ -514,10 +542,11 @@ impl Preferences {
             return;
         }
         self.loading_models = true;
+        let link = self.link.clone();
         cx.spawn(async move |s, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async { settings::discover_models() })
+                .spawn(async move { link.models() })
                 .await;
             let _ = s.update(cx, |s, cx| {
                 s.loading_models = false;
@@ -568,7 +597,16 @@ impl Preferences {
                 true,
                 true,
                 cx.listener(|s, _, _, cx| {
-                    let result = platform::launch_chatgpt_login(&s.project);
+                    let result = s.link.remote().map_or_else(
+                        || platform::launch_chatgpt_login(&s.project),
+                        |h| {
+                            crate::terminal::open_remote(
+                                h.clone(),
+                                ox_host_web::terminal_protocol::OpenTerminal::CodexLogin,
+                                cx,
+                            )
+                        },
+                    );
                     s.report(
                         result,
                         "Complete sign-in in the terminal, then return to your session.",
@@ -609,12 +647,23 @@ impl Preferences {
                     false,
                     true,
                     cx.listener(|s, _, _, cx| {
-                        let result = platform::launch_claude_login(&s.project);
+                        let result = s.link.remote().map_or_else(
+                            || platform::launch_claude_login(&s.project),
+                            |h| {
+                                crate::terminal::open_remote(
+                                    h.clone(),
+                                    ox_host_web::terminal_protocol::OpenTerminal::ClaudeLogin,
+                                    cx,
+                                )
+                            },
+                        );
                         s.report(result, "Complete Claude Code sign-in in the terminal.", cx);
                     }),
                 ))),
             )
-            .child(self.about.clone())
+            .when(self.link.remote().is_none(), |v| {
+                v.child(self.about.clone())
+            })
     }
     fn providers_view(&self, p: Palette, cx: &mut Context<Self>) -> Div {
         let mut view = div().flex().flex_col().gap_4();
@@ -1119,10 +1168,17 @@ impl Preferences {
             .gap_3()
             .border_b_1()
             .border_color(rgb(p.line))
-            .child(div().text_size(p.text(Step::Display)).child("Settings"));
+            .child(
+                div().text_size(p.text(Step::Display)).child(
+                    self.link
+                        .remote()
+                        .map_or_else(|| "Settings".into(), |h| format!("Settings · {}", h.name)),
+                ),
+            );
         let mut tabs = div().flex().flex_wrap().gap_1();
         for (page, title) in [
             (Page::Accounts, "Accounts"),
+            (Page::Hosts, "Hosts"),
             (Page::Remote, "Remote access"),
             (Page::Providers, "Providers & models"),
             (Page::Credentials, "API keys"),
@@ -1133,6 +1189,11 @@ impl Preferences {
             (Page::Legacy, "Legacy Codex provider"),
             (Page::Advanced, "Advanced configuration"),
         ] {
+            if self.link.remote().is_some()
+                && matches!(page, Page::Behavior | Page::Sessions | Page::Remote)
+            {
+                continue;
+            }
             if page == Page::Legacy && self.legacy.is_none() {
                 continue;
             }
@@ -1171,6 +1232,7 @@ impl Preferences {
             div().child("Loading settings…")
         } else {
             match self.page {
+                Page::Hosts => div().child(self.hosts.clone()),
                 Page::Remote => div().children(self.remote.clone()),
                 Page::Accounts => self.account_view(p, cx),
                 Page::Advanced => self.advanced_page(p, cx),

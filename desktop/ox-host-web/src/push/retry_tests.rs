@@ -38,7 +38,7 @@ fn paired_phone() -> (tempfile::TempDir, App, String, Subscription) {
         .set_origin(Some("https://test.tail.ts.net".into()), 0)
         .unwrap();
     let (sub, phone) = fixture();
-    let invite = state.invite("me".into()).unwrap();
+    let invite = state.invite("me".into(), false).unwrap();
     let code = invite.url.split_once("#pair=").unwrap().1;
     let sig: Signature = SigningKey::from(phone).sign(code.as_bytes());
     let cookie = state
@@ -48,6 +48,7 @@ fn paired_phone() -> (tempfile::TempDir, App, String, Subscription) {
             &sub.keys.p256dh,
             &B64.encode(sig.to_bytes()),
             "Phone",
+            crate::admin::DeviceClass::Phone,
         )
         .unwrap();
     let id = state.identity("me", &cookie).unwrap();

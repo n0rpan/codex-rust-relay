@@ -3,7 +3,6 @@ use crate::{
     appearance::Palette,
     kit::{button, col, row, small},
 };
-use base64::{Engine, engine::general_purpose::STANDARD};
 use gpui::*;
 use gpui_component::input::{Textarea, TextareaState};
 use ox_desk_core::{
@@ -12,7 +11,6 @@ use ox_desk_core::{
 };
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
     time::Duration,
 };
 
@@ -123,6 +121,13 @@ impl Workbench {
         if store.selected() != owner {
             return;
         }
+        if self.link.remote().is_some() {
+            let paths = paths.to_vec();
+            let task = cx
+                .background_spawn(async move { crate::platform::attachments::read_images(&paths) });
+            self.prepare_images(owner.map(str::to_owned), task, cx);
+            return;
+        }
         for path in paths {
             if file_image(path) {
                 store.attach_image(owner, ImageInput::File(path.clone()));
@@ -167,41 +172,66 @@ impl Workbench {
             }
         }
         if !images.is_empty() {
-            *self.image_work.entry(owner.clone()).or_default() += 1;
+            let remote = self.link.remote().is_some();
             let convert = cx.background_spawn(async move {
-                images
+                if remote {
+                    crate::platform::attachments::check_limits(
+                        images.len(),
+                        images.iter().map(|(_, b)| b.len()).sum(),
+                    )?;
+                }
+                Ok(images
                     .into_iter()
-                    .map(|(mime, bytes)| {
-                        ImageInput::Clipboard(
-                            mime.into(),
-                            Arc::from(format!("data:{mime};base64,{}", STANDARD.encode(bytes))),
-                        )
-                    })
-                    .collect::<Vec<_>>()
+                    .map(|(mime, bytes)| crate::platform::attachments::encode(mime, &bytes))
+                    .collect())
             });
-            cx.spawn(async move |this, cx| {
-                let inputs = convert.await;
-                let _ = this.update(cx, |s, cx| {
-                    if let Some(store) = &mut s.store {
-                        for image in inputs {
-                            store.attach_image(owner.as_deref(), image);
-                        }
-                    }
-                    if let Some(count) = s.image_work.get_mut(&owner) {
-                        *count -= 1;
-                        if *count == 0 {
-                            s.image_work.remove(&owner);
-                        }
-                    }
-                    cx.notify();
-                });
-            })
-            .detach();
+            self.prepare_images(owner, convert, cx);
         }
         if handled {
             cx.notify();
         }
         handled
+    }
+    fn prepare_images(
+        &mut self,
+        owner: Option<String>,
+        task: Task<Result<Vec<ImageInput>, String>>,
+        cx: &mut Context<Self>,
+    ) {
+        *self.image_work.entry(owner.clone()).or_default() += 1;
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |s, cx| {
+                if let Some(store) = &mut s.store {
+                    let result = result.and_then(|added| {
+                        if s.link.remote().is_some() {
+                            crate::platform::attachments::check_draft(
+                                store.draft_images(owner.as_deref()),
+                                &added,
+                            )?;
+                        }
+                        Ok(added)
+                    });
+                    match result {
+                        Ok(images) => {
+                            for image in images {
+                                store.attach_image(owner.as_deref(), image);
+                            }
+                        }
+                        Err(error) => s.launch_error = Some(error),
+                    }
+                }
+                if let Some(count) = s.image_work.get_mut(&owner) {
+                    *count -= 1;
+                    if *count == 0 {
+                        s.image_work.remove(&owner);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 }
 fn insert_mention(
@@ -314,7 +344,7 @@ pub(super) fn composer_input(
         }
     }
     if encoding {
-        panel = panel.child(small(p, "Preparing pasted image…"));
+        panel = panel.child(small(p, "Preparing attachment…"));
     }
     let mut chips = row().gap_1().flex_wrap();
     for (i, img) in store.draft_images(owner.as_deref()).iter().enumerate() {

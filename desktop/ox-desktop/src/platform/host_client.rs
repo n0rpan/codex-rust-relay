@@ -23,12 +23,12 @@ use std::{
 };
 const MAX_FRAME: u64 = 64 * 1024 * 1024;
 
-fn write_frame(out: &mut impl Write, request: &Client) -> io::Result<()> {
+pub(super) fn write_frame(out: &mut impl Write, request: &Client) -> io::Result<()> {
     serde_json::to_writer(&mut *out, request)?;
     out.write_all(b"\n")?;
     out.flush()
 }
-fn read_frame(input: &mut BufReader<UnixStream>) -> io::Result<Server> {
+pub(super) fn read_frame(input: &mut BufReader<UnixStream>) -> io::Result<Server> {
     let mut bytes = Vec::new();
     let n = input.take(MAX_FRAME).read_until(b'\n', &mut bytes)?;
     if n == 0 {
@@ -45,8 +45,84 @@ fn read_frame(input: &mut BufReader<UnixStream>) -> io::Result<Server> {
     }
     Ok(serde_json::from_slice(&bytes)?)
 }
-fn connect() -> io::Result<(BufReader<UnixStream>, UnixStream)> {
-    handshake().map(|(input, socket, _)| (input, socket))
+#[derive(Clone, Default)]
+pub(crate) enum HostLink {
+    #[default]
+    Local,
+    Remote(super::hosts::SavedHost),
+}
+type StreamHello = (BufReader<UnixStream>, UnixStream, Vec<String>);
+
+impl HostLink {
+    pub fn remote(&self) -> Option<&super::hosts::SavedHost> {
+        match self {
+            Self::Local => None,
+            Self::Remote(host) => Some(host),
+        }
+    }
+    pub fn open_shell(&self, project: PathBuf, cx: &mut gpui::App) -> Result<(), String> {
+        match self {
+            Self::Remote(host) => crate::terminal::open_remote(
+                host.clone(),
+                ox_host_web::terminal_protocol::OpenTerminal::Shell { project },
+                cx,
+            ),
+            Self::Local => crate::terminal::open(project, None, |_, _| {}, cx),
+        }
+    }
+    pub fn settings(&self) -> Result<crate::settings::Settings, String> {
+        self.remote()
+            .map_or_else(crate::settings::load, |h| h.snapshot())
+    }
+    pub fn models(&self) -> Result<Vec<String>, String> {
+        self.remote()
+            .map_or_else(crate::settings::discover_models, |h| h.models())
+    }
+    pub fn request<T: serde::de::DeserializeOwned>(
+        &self,
+        request: crate::settings::protocol::Request,
+    ) -> Result<T, String> {
+        match self.remote() {
+            Some(host) => serde_json::from_value(
+                host.settings(serde_json::to_value(request).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string()),
+            None => crate::settings::request(request),
+        }
+    }
+    pub fn apply(
+        &self,
+        request: &crate::settings::protocol::Request,
+    ) -> Result<Result<crate::settings::Settings, String>, String> {
+        use crate::settings::model::Outcome;
+        let Some(host) = self.remote() else {
+            return crate::settings::apply(request);
+        };
+        let reply = host
+            .settings(serde_json::to_value(request).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        match serde_json::from_value(reply).map_err(|e| e.to_string())? {
+            Outcome::Applied => self.settings().map(Ok),
+            Outcome::ChangedOnDisk { revision } => Ok(Err(revision)),
+        }
+    }
+    pub fn state_file(&self, file: &str) -> String {
+        match self.remote() {
+            Some(host) => format!("{}-{file}", host.id),
+            None => file.to_owned(),
+        }
+    }
+    fn handshake(&self) -> io::Result<StreamHello> {
+        match self {
+            Self::Local => {
+                let paths = Paths::discover()?;
+                ensure_running(&paths)?;
+                open_handshake(&paths)
+            }
+            Self::Remote(host) => handshake_stream(host.connect()?, Some(&host.id)),
+        }
+    }
 }
 pub(crate) enum IdleReservation {
     Running(UnixStream),
@@ -94,11 +170,6 @@ pub(crate) fn reserve_idle_update(store: &std::path::Path) -> io::Result<Option<
 /// Shown when the host is not up. Polls treat it as a quiet state, not an error.
 pub(crate) const HOST_NOT_RUNNING: &str = "Session host not running";
 
-fn handshake() -> io::Result<(BufReader<UnixStream>, UnixStream, Vec<String>)> {
-    let paths = Paths::discover()?;
-    ensure_running(&paths)?;
-    open_handshake(&paths)
-}
 /// Connects to a host that is already up and never starts one, so a background poll
 /// cannot revive a host the user stopped.
 fn connect_existing(paths: &Paths) -> io::Result<BufReader<UnixStream>> {
@@ -111,16 +182,28 @@ fn connect_existing(paths: &Paths) -> io::Result<BufReader<UnixStream>> {
     open_handshake(paths).map(|(input, _, _)| input)
 }
 fn open_handshake(paths: &Paths) -> io::Result<(BufReader<UnixStream>, UnixStream, Vec<String>)> {
-    let mut socket = UnixStream::connect(&paths.socket)?;
+    handshake_stream(UnixStream::connect(&paths.socket)?, None)
+}
+fn handshake_stream(mut socket: UnixStream, remote_id: Option<&str>) -> io::Result<StreamHello> {
     socket.set_read_timeout(Some(Duration::from_secs(15)))?;
     write_frame(&mut socket, &Client::Hello { version: VERSION })?;
     let mut input = BufReader::new(socket.try_clone()?);
     let caps = match read_frame(&mut input)? {
         Server::Hello {
-            version: VERSION,
+            version,
             capabilities,
+            host,
             ..
-        } => capabilities,
+        } if ox_desk_core::host_protocol::supported(version) => {
+            if let Some(id) = remote_id
+                && host.as_ref().and_then(|h| h.id.as_deref()) != Some(id)
+            {
+                return Err(io::Error::other(
+                    "Host identity changed. Pair this host again.",
+                ));
+            }
+            capabilities
+        }
         Server::Hello { version, .. } => {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -136,7 +219,9 @@ fn open_handshake(paths: &Paths) -> io::Result<(BufReader<UnixStream>, UnixStrea
         }
     };
     socket.set_read_timeout(None)?;
-    declare_surface(&mut socket, &caps)?;
+    if remote_id.is_none() {
+        declare_surface(&mut socket, &caps)?;
+    }
     Ok((input, socket, caps))
 }
 /// Tell a host that negotiates it that a person on OX Desktop uses this connection. An
@@ -153,117 +238,148 @@ fn declare_surface(out: &mut impl Write, caps: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn open_store(
     project: PathBuf,
     route: Route,
     receive: impl Fn(LinkEvent) + Send + Sync + 'static,
 ) -> io::Result<Store> {
-    let project = project.canonicalize()?;
-    let scope = Scope {
-        project: project.clone(),
-        route: route.clone(),
-    };
-    let (mut input, mut socket) = connect()?;
-    write_frame(
-        &mut socket,
-        &Client::Subscribe {
-            scope: Some(scope.clone()),
-            after: None,
-            terminal: true,
-        },
-    )?;
-    let client = getrandom::u64().map_err(io::Error::other)?;
-    let (tx, rx) = mpsc::sync_channel::<(String, Action, Option<String>)>(256);
-    let receive = Arc::new(receive);
-    let writer_scope = scope.clone();
-    let fail = receive.clone();
-    thread::Builder::new()
-        .name("ox-host-write".into())
-        .spawn(move || {
-            let mut out = BufWriter::new(socket);
-            for (id, action, approval) in rx {
-                if let Err(e) = write_frame(
-                    &mut out,
-                    &Client::Act {
-                        id,
-                        scope: writer_scope.clone(),
-                        action,
-                        approval,
-                    },
-                ) {
-                    fail(LinkEvent::Closed {
-                        reason: e.to_string(),
-                        stderr_tail: vec![],
-                    });
-                    break;
-                }
+    HostLink::Local.open_store(project, route, receive)
+}
+impl HostLink {
+    pub(crate) fn open_store(
+        &self,
+        project: PathBuf,
+        route: Route,
+        receive: impl Fn(LinkEvent) + Send + Sync + 'static,
+    ) -> io::Result<Store> {
+        let project = match self {
+            Self::Local => project.canonicalize()?,
+            Self::Remote(host) if project.is_absolute() => host.choose(&project, &route)?,
+            Self::Remote(_) => {
+                return Err(io::Error::other(
+                    "Select an absolute project path on the host.",
+                ));
             }
-            let _ = out.get_ref().shutdown(Shutdown::Both);
-        })?;
-    thread::Builder::new()
-        .name("ox-host-read".into())
-        .spawn(move || {
-            loop {
-                match read_frame(&mut input) {
-                    Ok(frame) => receive(LinkEvent::Host(Box::new(frame))),
-                    Err(error) => {
-                        receive(LinkEvent::Closed {
-                            reason: error.to_string(),
+        };
+        let scope = Scope {
+            project: project.clone(),
+            route: route.clone(),
+        };
+        let (mut input, mut socket, _) = self.handshake()?;
+        write_frame(
+            &mut socket,
+            &Client::Subscribe {
+                scope: Some(scope.clone()),
+                after: None,
+                terminal: self.remote().is_none(),
+            },
+        )?;
+        let client = getrandom::u64().map_err(io::Error::other)?;
+        let (tx, rx) = mpsc::sync_channel::<(String, Action, Option<String>)>(256);
+        let receive = Arc::new(receive);
+        let writer_scope = scope.clone();
+        let fail = receive.clone();
+        thread::Builder::new()
+            .name("ox-host-write".into())
+            .spawn(move || {
+                let mut out = BufWriter::new(socket);
+                for (id, action, approval) in rx {
+                    if let Err(e) = write_frame(
+                        &mut out,
+                        &Client::Act {
+                            id,
+                            scope: writer_scope.clone(),
+                            action,
+                            approval,
+                        },
+                    ) {
+                        fail(LinkEvent::Closed {
+                            reason: e.to_string(),
                             stderr_tail: vec![],
                         });
                         break;
                     }
                 }
-            }
-        })?;
-    let seq = AtomicU64::new(0);
-    Ok(Store::remote_client(
-        Profile {
-            project,
-            route,
-            provider: String::new(),
-        },
-        move |action, approval| {
-            let id = format!(
-                "desktop-{client:016x}-{}",
-                seq.fetch_add(1, Ordering::Relaxed)
-            );
-            tx.try_send((id.clone(), action, approval))
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            Ok(id)
-        },
-    ))
+                let _ = out.get_ref().shutdown(Shutdown::Both);
+            })?;
+        thread::Builder::new()
+            .name("ox-host-read".into())
+            .spawn(move || {
+                loop {
+                    match read_frame(&mut input) {
+                        Ok(frame) => receive(LinkEvent::Host(Box::new(frame))),
+                        Err(error) => {
+                            receive(LinkEvent::Closed {
+                                reason: error.to_string(),
+                                stderr_tail: vec![],
+                            });
+                            break;
+                        }
+                    }
+                }
+            })?;
+        let seq = AtomicU64::new(0);
+        let remote = self.remote().is_some();
+        Ok(Store::remote_client(
+            Profile {
+                project,
+                route,
+                provider: String::new(),
+            },
+            move |action, approval| {
+                // The native path revalidates slash commands on the host and cannot
+                // fall through to a local terminal handoff.
+                let action = match action {
+                    Action::PaletteCommand(owner, text) if remote => {
+                        Action::NativeCommand(owner, text)
+                    }
+                    other => other,
+                };
+                let id = format!(
+                    "desktop-{client:016x}-{}",
+                    seq.fetch_add(1, Ordering::Relaxed)
+                );
+                tx.try_send((id.clone(), action, approval))
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                Ok(id)
+            },
+        ))
+    }
 }
 pub(crate) type CatalogResult = (Vec<(Scope, ThreadRow)>, Vec<String>);
-pub(crate) fn discover() -> io::Result<CatalogResult> {
-    let (mut input, mut socket) = connect()?;
-    write_frame(
-        &mut socket,
-        &Client::Discover {
-            id: "catalog".into(),
-        },
-    )?;
-    let mut rows = Vec::new();
-    loop {
-        match read_frame(&mut input)? {
-            Server::Discovered {
-                id,
-                scope,
-                rows: page,
-            } if id == "catalog" => {
-                rows.extend(
-                    page.iter()
-                        .filter_map(replica::row)
-                        .map(|row| (scope.clone(), row)),
-                );
+impl HostLink {
+    pub(crate) fn discover(&self) -> io::Result<CatalogResult> {
+        let (mut input, mut socket, _) = self.handshake()?;
+        write_frame(
+            &mut socket,
+            &Client::Discover {
+                id: "catalog".into(),
+            },
+        )?;
+        let mut rows = Vec::new();
+        loop {
+            match read_frame(&mut input)? {
+                Server::Discovered {
+                    id,
+                    scope,
+                    rows: page,
+                } if id == "catalog" => {
+                    rows.extend(
+                        page.iter()
+                            .filter_map(replica::row)
+                            .map(|row| (scope.clone(), row)),
+                    );
+                }
+                Server::DiscoveredEnd { id, errors } if id == "catalog" => {
+                    return Ok((rows, errors));
+                }
+                Server::Error { message, .. } => return Err(io::Error::other(message)),
+                _ => (),
             }
-            Server::DiscoveredEnd { id, errors } if id == "catalog" => return Ok((rows, errors)),
-            Server::Error { message, .. } => return Err(io::Error::other(message)),
-            _ => (),
         }
     }
 }
-
 /// A sidebar reuses its process-list connection. Each new protocol handshake reads
 /// the operator's route configuration, which an ordinary process poll does not need.
 #[derive(Default)]
@@ -272,11 +388,21 @@ pub(crate) struct ProcessMonitor {
 }
 
 impl ProcessMonitor {
-    pub(crate) fn list(&self) -> io::Result<Vec<ProcessView>> {
-        self.list_at(&Paths::discover()?)
+    pub(crate) fn list(&self, link: &HostLink) -> io::Result<Vec<ProcessView>> {
+        self.poll(|| match link {
+            HostLink::Local => connect_existing(&Paths::discover()?),
+            HostLink::Remote(_) => link.handshake().map(|(input, _, _)| input),
+        })
     }
 
+    #[cfg(test)]
     fn list_at(&self, paths: &Paths) -> io::Result<Vec<ProcessView>> {
+        self.poll(|| connect_existing(paths))
+    }
+    fn poll(
+        &self,
+        connect: impl FnOnce() -> io::Result<BufReader<UnixStream>>,
+    ) -> io::Result<Vec<ProcessView>> {
         let mut socket = self.socket.lock().unwrap();
         if let Some(mut connection) = socket.take()
             && let Ok(rows) = read_processes(&mut connection)
@@ -285,7 +411,7 @@ impl ProcessMonitor {
             return Ok(rows);
         }
         // A host restart closes the old stream. Reconnect only if a host is running.
-        let mut connection = connect_existing(paths)?;
+        let mut connection = connect()?;
         connection
             .get_ref()
             .set_read_timeout(Some(Duration::from_secs(15)))?;
@@ -315,59 +441,65 @@ fn read_processes(input: &mut BufReader<UnixStream>) -> io::Result<Vec<ProcessVi
 
 /// End the live process of each thread in `scope`. Acts need a subscription to the
 /// scope on the same socket, so this subscribes first, then waits for every reply.
-pub(crate) fn end_threads(scope: Scope, threads: Vec<String>, force: bool) -> io::Result<()> {
-    if threads.is_empty() {
-        return Ok(());
-    }
-    let (mut input, mut socket) = connect()?;
-    write_frame(
-        &mut socket,
-        &Client::Subscribe {
-            scope: Some(scope.clone()),
-            after: None,
-            terminal: false,
-        },
-    )?;
-    let nonce = getrandom::u64().map_err(io::Error::other)?;
-    let mut waiting = HashSet::new();
-    for (i, thread) in threads.into_iter().enumerate() {
-        let id = format!("end-{nonce:016x}-{i}");
+impl HostLink {
+    pub(crate) fn end_threads(
+        &self,
+        scope: Scope,
+        threads: Vec<String>,
+        force: bool,
+    ) -> io::Result<()> {
+        if threads.is_empty() {
+            return Ok(());
+        }
+        let (mut input, mut socket, _) = self.handshake()?;
         write_frame(
             &mut socket,
-            &Client::Act {
-                id: id.clone(),
-                scope: scope.clone(),
-                action: if force {
-                    Action::ForceEndSession(thread)
-                } else {
-                    Action::EndSession(thread)
-                },
-                approval: None,
+            &Client::Subscribe {
+                scope: Some(scope.clone()),
+                after: None,
+                terminal: false,
             },
         )?;
-        waiting.insert(id);
-    }
-    let mut failure = None;
-    while !waiting.is_empty() {
-        match read_frame(&mut input)? {
-            Server::Ack { id } => {
-                waiting.remove(&id);
-            }
-            Server::Error {
-                id: Some(id),
-                message,
-            } if waiting.remove(&id) => {
-                failure.get_or_insert(message);
-            }
-            Server::Error { id: None, message } => return Err(io::Error::other(message)),
-            _ => (),
+        let nonce = getrandom::u64().map_err(io::Error::other)?;
+        let mut waiting = HashSet::new();
+        for (i, thread) in threads.into_iter().enumerate() {
+            let id = format!("end-{nonce:016x}-{i}");
+            write_frame(
+                &mut socket,
+                &Client::Act {
+                    id: id.clone(),
+                    scope: scope.clone(),
+                    action: if force {
+                        Action::ForceEndSession(thread)
+                    } else {
+                        Action::EndSession(thread)
+                    },
+                    approval: None,
+                },
+            )?;
+            waiting.insert(id);
         }
+        let mut failure = None;
+        while !waiting.is_empty() {
+            match read_frame(&mut input)? {
+                Server::Ack { id } => {
+                    waiting.remove(&id);
+                }
+                Server::Error {
+                    id: Some(id),
+                    message,
+                } if waiting.remove(&id) => {
+                    failure.get_or_insert(message);
+                }
+                Server::Error { id: None, message } => return Err(io::Error::other(message)),
+                _ => (),
+            }
+        }
+        failure.map_or(Ok(()), |message| Err(io::Error::other(message)))
     }
-    failure.map_or(Ok(()), |message| Err(io::Error::other(message)))
 }
-
 mod catalog;
-pub(crate) use catalog::{CatalogEvent, CatalogWatch, watch_catalog};
+pub(crate) use catalog::{CatalogEvent, CatalogWatch};
 
 #[cfg(test)]
 mod process_monitor_tests {
@@ -384,6 +516,70 @@ mod process_monitor_tests {
             String::from_utf8(out).unwrap(),
             "{\"type\":\"surface\",\"surface\":\"desktop\"}\n"
         );
+    }
+
+    #[test]
+    fn adjacent_releases_exchange_hello_then_session_frames_on_the_selected_protocol() {
+        // The previous release used v1 and returned no stable ID. A future release
+        // selects our maximum and may advertise new capabilities and metadata.
+        let hosts = [
+            (
+                None,
+                serde_json::json!({"version":"0.1", "epoch":"old"}),
+                vec!["snapshot"],
+            ),
+            (
+                Some("stable-id"),
+                serde_json::json!({"version":"next", "epoch":"new", "id":"stable-id", "load":0.5}),
+                vec!["snapshot", "future_feature"],
+            ),
+        ];
+        for (id, info, caps) in hosts {
+            let (client, mut host) = UnixStream::pair().unwrap();
+            let peer = thread::spawn(move || {
+                let mut input = BufReader::new(host.try_clone().unwrap());
+                let read = |input: &mut BufReader<UnixStream>| {
+                    let mut line = String::new();
+                    input.read_line(&mut line).unwrap();
+                    serde_json::from_str::<Client>(&line).unwrap()
+                };
+                let Client::Hello { version } = read(&mut input) else {
+                    panic!("expected hello")
+                };
+                let maximum = if id.is_some() { VERSION + 1 } else { 1 };
+                writeln!(
+                    host,
+                    "{}",
+                    serde_json::json!({"type":"hello", "version":maximum.min(version),
+                    "routes":[], "projects":[], "capabilities":caps,"host":info})
+                )
+                .unwrap();
+                assert!(matches!(
+                    read(&mut input),
+                    Client::Subscribe {
+                        scope: None,
+                        terminal: false,
+                        ..
+                    }
+                ));
+                writeln!(host, "{}", serde_json::json!({"type":"snapshot","cursor":{"epoch":"e","seq":0},"scopes":[]})).unwrap();
+            });
+            let (mut input, mut out, _) = handshake_stream(client, id).unwrap();
+            write_frame(
+                &mut out,
+                &Client::Subscribe {
+                    scope: None,
+                    after: None,
+                    terminal: false,
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                read_frame(&mut input).unwrap(),
+                Server::Snapshot { .. }
+            ));
+            peer.join().unwrap();
+        }
     }
 
     #[test]

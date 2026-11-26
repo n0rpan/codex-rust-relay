@@ -10,6 +10,17 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 pub const IDLE_UPDATE: &str = "idle_update";
 pub const VERSION: u32 = 1;
+pub const MIN_VERSION: u32 = 1;
+
+/// The hello advertises a maximum. Clients check the selected version against
+/// their own floor before sending any actions. Features are capability gated.
+pub fn negotiate(client_max: u32) -> Option<u32> {
+    let selected = client_max.min(VERSION);
+    (selected >= MIN_VERSION).then_some(selected)
+}
+pub fn supported(selected: u32) -> bool {
+    (MIN_VERSION..=VERSION).contains(&selected)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -83,6 +94,11 @@ pub enum Client {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HostInfo {
+    /// Stable across host restarts. Legacy hosts supply only version and epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub version: String,
     pub epoch: String,
 }

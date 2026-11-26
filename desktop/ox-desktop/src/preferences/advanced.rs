@@ -15,10 +15,11 @@ impl Preferences {
         }
         self.goto(Page::Advanced, cx);
         self.busy = true;
+        let link = self.link.clone();
         cx.spawn_in(w, async move |view, cx| {
             let docs = cx
                 .background_executor()
-                .spawn(async { settings::request::<Vec<Document>>(Request::ReadAdvanced) })
+                .spawn(async move { link.request::<Vec<Document>>(Request::ReadAdvanced) })
                 .await;
             let _ = view.update_in(cx, |s, w, cx| {
                 s.busy = false;
@@ -96,13 +97,14 @@ impl Preferences {
         let id = d.id.clone();
         self.busy = true;
         cx.notify();
+        let link = self.link.clone();
         cx.spawn_in(w, async move |view, cx| {
             let result = cx.background_executor().spawn(async move {
-                match settings::request::<model::Outcome>(req)? {
+                match link.request::<model::Outcome>(req)? {
                     model::Outcome::ChangedOnDisk { revision } => Ok(Err(revision)),
                     model::Outcome::Applied => {
-                        let docs = settings::request::<Vec<Document>>(Request::ReadAdvanced)?;
-                        Ok(Ok((docs, settings::load()?)))
+                        let docs = link.request::<Vec<Document>>(Request::ReadAdvanced)?;
+                        Ok(Ok((docs, link.settings()?)))
                     }
                 }
             }).await;

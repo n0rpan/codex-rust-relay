@@ -130,8 +130,10 @@ pub(crate) struct Tree {
 /// Tree counts for every parent in the navigation index, keyed by project and thread id.
 /// Set by `index_catalog`; read by the workbench activity line and the sidebar rows.
 #[derive(Default)]
-pub(crate) struct TreeIndex(pub HashMap<(PathBuf, String), Tree>);
-impl gpui::Global for TreeIndex {}
+pub(crate) struct WorkerIndex {
+    pub trees: HashMap<(PathBuf, String), Tree>,
+    pub parents: HashMap<(PathBuf, String), ParentLink>,
+}
 
 /// Where a worker's recorded parent lives. The origin stamp carries the parent's
 /// full host scope and session key, so navigation works across projects, routes
@@ -167,11 +169,6 @@ impl ParentLink {
         })
     }
 }
-/// Recorded parent links for every indexed worker, visible or filtered away.
-#[derive(Default)]
-pub(crate) struct ParentIndex(pub HashMap<(PathBuf, String), ParentLink>);
-impl gpui::Global for ParentIndex {}
-
 /// Resolve a recorded parent against the entries in the current index. Exact
 /// scope first, then the same project, so a filtered or differently routed view
 /// still groups a worker under its recorded parent when that parent is present.
@@ -282,6 +279,7 @@ impl Discovery {
             Some(format!("Worker #{job} {status}"))
         };
         match event {
+            CatalogEvent::Waiting(..) | CatalogEvent::Disconnected(_) => false,
             CatalogEvent::Reset => {
                 let changed = !self.hosted.is_empty()
                     || !self.archived.is_empty()
@@ -437,7 +435,7 @@ impl Discovery {
 
 impl Host {
     pub(super) fn watch_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (watch, events) = match platform::watch_catalog() {
+        let (watch, events) = match self.link.watch_catalog() {
             Ok(pair) => pair,
             Err(error) => {
                 self.message = Some(error.to_string());
@@ -474,7 +472,8 @@ impl Host {
             return;
         }
         self.discovery.pending = 1;
-        let task = cx.background_spawn(async { platform::discover() });
+        let link = self.link.clone();
+        let task = cx.background_spawn(async move { link.discover() });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |s, cx| {
@@ -933,8 +932,10 @@ impl Host {
         for (key, _, _) in &roots {
             self.walk_tree(key, &children, cx, &mut tree);
         }
-        cx.set_global(TreeIndex(tree));
-        cx.set_global(ParentIndex(links));
+        self.workers.update(cx, |index, _| {
+            index.trees = tree;
+            index.parents = links;
+        });
         self.discovery.parents = parents;
         let mut catalog = Vec::new();
         let mut previous = None;

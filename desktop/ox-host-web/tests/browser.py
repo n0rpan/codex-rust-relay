@@ -1158,6 +1158,17 @@ def run(harness, screenshot=None):
         assert canary in (codex/"ox-api-keys.json").read_text()
         remaining=settings({"action":"read_rows"})
         assert canary not in json.dumps(remaining) and any(k["saved"] and k["name"]=="GARDEN_TOKEN" for k in remaining["credentials"])
+        brave = {"name": "BRAVE_SEARCH_API_KEY", "scope": "https://api.search.brave.com/"}
+        transfer = {"action": "import_keys", "revision": remaining["revisions"]["keys"],
+                    "keys": [dict(brave, value="fixture-transfer-brave")]}
+        assert settings(transfer) == {"status": "applied"}
+        assert settings(transfer)["status"] == "changed_on_disk"
+        after_transfer = settings({"action": "read_rows"})
+        assert "fixture-transfer-brave" not in json.dumps(after_transfer)
+        assert "fixture-transfer-brave" in (codex / "ox-api-keys.json").read_text()
+        export = {"action": "export_keys", "selected": [brave], "revision": after_transfer["revisions"]["keys"]}
+        assert js("return import('./device.js').then(async m=>m.settingsRequest(await m.deviceKey(),"
+                  + json.dumps(export) + ").then(()=>false,e=>e.status===403))")
         docs=settings({"action":"read_advanced"})
         assert canary not in json.dumps(docs)
         registry=next(x for x in docs if x["id"]=="codeox.toml")

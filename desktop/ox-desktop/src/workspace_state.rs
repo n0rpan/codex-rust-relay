@@ -65,8 +65,9 @@ pub(crate) fn update_preference_at<T: serde::de::DeserializeOwned + Serialize>(
 }
 
 enum WriteTask {
-    Layout(crate::views::host::layout::Layout),
-    Save(PathBuf, Route),
+    Layout(String, crate::views::host::layout::Layout),
+    Save(Option<String>, PathBuf, Route),
+    Host(Option<String>),
     Flush(flume::Sender<()>),
 }
 fn writer() -> &'static std::sync::mpsc::Sender<WriteTask> {
@@ -76,26 +77,42 @@ fn writer() -> &'static std::sync::mpsc::Sender<WriteTask> {
         std::thread::spawn(move || {
             for task in rx {
                 match task {
-                    WriteTask::Layout(layout) => {
+                    WriteTask::Layout(name, layout) => {
                         if let Some(path) = path()
                             && let Err(e) = crate::views::host::layout::SavedLayouts::save_at(
-                                &path.with_file_name("layout.json"),
+                                &path.with_file_name(name),
                                 layout,
                             )
                         {
                             eprintln!("Could not save desktop layout: {e}")
                         }
                     }
+                    WriteTask::Host(id) => {
+                        if let Some(path) = path()
+                            && let Err(e) =
+                                write_json(&path.with_file_name("selected-host.json"), &id)
+                        {
+                            eprintln!("Could not remember selected host: {e}");
+                        }
+                    }
                     WriteTask::Flush(done) => {
                         let _ = done.try_send(());
                     }
-                    WriteTask::Save(project, route) => {
+                    WriteTask::Save(name, project, route) => {
                         if let Some(path) = path()
                             && let Err(err) = LastWorkspace::save_at(
-                                &path,
+                                &name
+                                    .as_ref()
+                                    .map_or(path.clone(), |name| path.with_file_name(name)),
                                 &project,
                                 &route,
-                                LastWorkspace::previous,
+                                || {
+                                    if name.is_some() {
+                                        LastWorkspace::default()
+                                    } else {
+                                        LastWorkspace::previous()
+                                    }
+                                },
                             )
                         {
                             eprintln!("Could not remember workspace selection: {err}");
@@ -107,8 +124,12 @@ fn writer() -> &'static std::sync::mpsc::Sender<WriteTask> {
         tx
     })
 }
-pub fn remember_layout(layout: crate::views::host::layout::Layout) {
-    let _ = writer().send(WriteTask::Layout(layout));
+pub fn remember_host(id: Option<String>) {
+    let _ = writer().send(WriteTask::Host(id));
+}
+
+pub fn remember_layout(name: String, layout: crate::views::host::layout::Layout) {
+    let _ = writer().send(WriteTask::Layout(name, layout));
 }
 pub fn finish_writes(cx: &gpui::App) {
     cx.on_app_quit(|_| {
@@ -179,9 +200,9 @@ impl LastWorkspace {
             },
         );
     }
-    pub fn save(project: &Path, route: &Route) -> io::Result<()> {
+    pub fn save(name: Option<String>, project: &Path, route: &Route) -> io::Result<()> {
         writer()
-            .send(WriteTask::Save(project.into(), route.clone()))
+            .send(WriteTask::Save(name, project.into(), route.clone()))
             .map_err(|_| io::Error::other("Workspace writer closed"))
     }
     fn save_at(

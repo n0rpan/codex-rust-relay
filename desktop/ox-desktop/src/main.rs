@@ -27,11 +27,14 @@ fn main() {
     app::install_panic_hook();
     let started = std::time::Instant::now();
     let mut args = std::env::args_os().skip(1).peekable();
+    let mut client_only = false;
     let mut smoke = false;
     let mut stats = false;
     while let Some(arg) = args.peek() {
         if arg == "--desk-smoke" || arg == "--desk-exit-after-first-frame" {
             smoke = true;
+        } else if arg == "--client-only" {
+            client_only = true;
         } else if arg == "--desk-stats" {
             stats = true;
         } else if arg == "--version" || arg == "-V" {
@@ -44,7 +47,13 @@ fn main() {
         }
         args.next();
     }
-    let project = match startup_project(args.next().map(PathBuf::from)) {
+    let explicit = args.next().map(PathBuf::from);
+    let restore_host = explicit.is_none() && !smoke && !stats;
+    let project = match if client_only {
+        Ok(PathBuf::new())
+    } else {
+        startup_project(explicit)
+    } {
         Ok(project) => project,
         Err(message) => {
             eprintln!("ox-desktop: {message}");
@@ -59,6 +68,10 @@ fn main() {
             gpui_component::init(cx);
             appearance::init(cx);
             sky::start(cx);
+            cx.set_global(app::ClientOnly(client_only));
+            cx.set_global(preferences::HostDirectory(
+                platform::hosts::list().unwrap_or_default(),
+            ));
             updates::start(smoke, cx);
             workspace_state::finish_writes(cx);
             let layouts = views::host::layout::SavedLayouts::load();
@@ -78,17 +91,22 @@ fn main() {
                     },
                     |window, cx| {
                         appearance::observe_window(window);
-                        let view = cx.new(|cx| {
-                            views::host::Host::new(
-                                project,
-                                layouts,
-                                smoke.then_some(started),
-                                stats,
-                                window,
-                                cx,
-                            )
+                        let view = (!client_only).then(|| {
+                            cx.new(|cx| {
+                                views::host::Host::new(
+                                    platform::HostLink::Local,
+                                    None,
+                                    project,
+                                    layouts,
+                                    smoke.then_some(started),
+                                    stats,
+                                    window,
+                                    cx,
+                                )
+                            })
                         });
-                        let workspace = cx.new(|cx| app::Workspace::new(view, cx));
+                        let workspace =
+                            cx.new(|cx| app::Workspace::new(view, restore_host, window, cx));
                         cx.new(|cx| Root::new(workspace, window, cx))
                     },
                 )?;

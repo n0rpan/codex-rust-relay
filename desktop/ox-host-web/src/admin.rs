@@ -31,6 +31,9 @@ pub fn socket_path(state_dir: &Path) -> PathBuf {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    Update {
+        command: crate::host_updates::Command,
+    },
     Status,
     Enable {
         origin: String,
@@ -50,6 +53,8 @@ pub enum Request {
     Disable,
     Pair {
         login: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        terminal: bool,
     },
     Revoke {
         id: String,
@@ -60,8 +65,18 @@ pub enum Request {
     },
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceClass {
+    #[default]
+    Phone,
+    Desktop,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Device {
+    #[serde(default)]
+    pub class: DeviceClass,
     #[serde(default)]
     pub terminal: bool,
     pub id: String,
@@ -72,6 +87,8 @@ pub struct Device {
 
 #[derive(Serialize, Deserialize)]
 pub struct Pairing {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_code: Option<String>,
     pub url: String,
     pub qr_svg: String,
     pub expires_at: i64,
@@ -79,6 +96,8 @@ pub struct Pairing {
 
 #[derive(Serialize, Deserialize)]
 pub struct Reply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<crate::host_updates::Status>,
     pub enabled: bool,
     pub origin: Option<String>,
     pub port: u16,
@@ -163,4 +182,19 @@ fn exchange(state_dir: &Path, req: &Request) -> io::Result<(UnixStream, Reply)> 
     }
     let reply: Result<Reply, String> = serde_json::from_slice(&line)?;
     Ok((stream, reply.map_err(io::Error::other)?))
+}
+
+/// Accept the usual Crockford base32 substitutions when typing an invitation.
+pub fn manual_code(input: &str) -> Option<String> {
+    let text: String = input
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'-')
+        .map(|b| match b.to_ascii_uppercase() {
+            b'O' => '0',
+            b'I' | b'L' => '1',
+            b => char::from(b),
+        })
+        .collect();
+    (text.len() == 12 && text.bytes().all(|b| b.is_ascii_alphanumeric() && b != b'U'))
+        .then_some(text)
 }

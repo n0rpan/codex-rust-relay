@@ -217,6 +217,9 @@ Checks and next steps
   ox doctor               Check files, providers and saved accounts. It prints
                           home: and a next: line with the command to run.
   ox doctor --fix         Repair what ox can repair; files are backed up first.
+  ox host pair            Pair a desktop or phone over your tailnet.
+  ox host pair --terminal Include terminal access for the device that pairs.
+  ox host devices         List device IDs for ox host revoke <device-id>.
   ox host doctor          Check the host, Tailscale Serve and paired devices.
   ox help share           Serve one gateway to another device.
   ox help subscriptions   Sign in with a ChatGPT or Claude plan.

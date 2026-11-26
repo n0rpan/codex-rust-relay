@@ -3,7 +3,7 @@
 use crate::appearance::Step;
 mod discovery;
 use discovery::{Discovery, Location, Scope};
-pub(super) use discovery::{ParentIndex, ParentLink, TreeIndex};
+pub(super) use discovery::{ParentLink, WorkerIndex};
 pub(crate) mod layout;
 mod palette;
 mod shortcuts;
@@ -91,6 +91,7 @@ fn new_route_gate(
 }
 
 pub struct Host {
+    link: platform::HostLink,
     palette: Option<palette::State>,
     _palette_keys: Subscription,
     /// The searchable all-models picker, opened from the route menu.
@@ -112,6 +113,7 @@ pub struct Host {
     recent: LastWorkspace,
     preferences: Option<Entity<crate::preferences::Preferences>>,
     before_settings: Option<FocusHandle>,
+    workers: Entity<WorkerIndex>,
     panes: Vec<Entity<Workbench>>,
     active: usize,
     models: Entity<Vec<String>>,
@@ -145,7 +147,10 @@ fn needs_drawer(viewport: Pixels, sidebar_width: u32) -> bool {
 }
 
 impl Host {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        link: platform::HostLink,
+        initial_route: Option<Route>,
         project: PathBuf,
         saved_layouts: layout::SavedLayouts,
         first_frame: Option<Instant>,
@@ -154,18 +159,30 @@ impl Host {
         cx: &mut Context<Self>,
     ) -> Self {
         let probe = if stats { Self::probe(window, cx) } else { None };
-        let mut recent = LastWorkspace::load();
+        let mut recent = if link.remote().is_some() {
+            crate::workspace_state::read_preference(&link.state_file("workspace.json"))
+                .unwrap_or_default()
+        } else {
+            LastWorkspace::load()
+        };
         let layout = saved_layouts.for_project(&project);
-        let route = layout
-            .active_route(&project)
+        let route = initial_route
+            .or_else(|| layout.active_route(&project))
             .or_else(|| recent.saved_route(&project))
             .unwrap_or_else(super::onboarding::first_launch_route);
         recent.remember(&project, &route);
-        let message = LastWorkspace::save(&project, &route)
-            .err()
-            .map(|e| e.to_string());
+        let message = LastWorkspace::save(
+            link.remote().map(|_| link.state_file("workspace.json")),
+            &project,
+            &route,
+        )
+        .err()
+        .map(|e| e.to_string());
         let models = cx.new(|_| Vec::new());
+        let workers = cx.new(|_| WorkerIndex::default());
         let pane = Self::pane(
+            link.clone(),
+            workers.clone(),
             project,
             route,
             first_frame,
@@ -174,7 +191,7 @@ impl Host {
             window,
             cx,
         );
-        let route_refresh = Self::refresh_routes(window, cx);
+        let route_refresh = Self::refresh_routes(link.clone(), window, cx);
         cx.observe_window_visibility(window, |s, _, w, cx| {
             if w.is_visible() {
                 cx.notify()
@@ -201,6 +218,7 @@ impl Host {
         .detach();
 
         let mut host = Self {
+            link: link.clone(),
             palette: None,
             sidebar_visible: !layout.sidebar_hidden,
             drawer_open: false,
@@ -223,6 +241,7 @@ impl Host {
             recent,
             preferences: None,
             before_settings: None,
+            workers,
             panes: vec![pane],
             active: 0,
             models,
@@ -233,7 +252,7 @@ impl Host {
             catalog_versions: vec![],
             catalog: vec![],
             discovery: Discovery::default(),
-            running: cx.new(|_| Running::default()),
+            running: cx.new(|_| Running::new(link)),
             list_focus: cx.focus_handle().tab_stop(true),
             list_scroll: Default::default(),
             choose_route: None,
@@ -465,7 +484,7 @@ impl Host {
             .iter()
             .map(|id| model_picker::api_entry(id))
             .collect();
-        let picker = cx.new(|cx| ModelPicker::new(entries, window, cx));
+        let picker = cx.new(|cx| ModelPicker::new(self.link.clone(), entries, window, cx));
         let subscription = cx.subscribe_in(
             &picker,
             window,
@@ -491,7 +510,11 @@ impl Host {
         self.agent_picker = false;
         self.model_picker = Some((picker.clone(), subscription));
         picker.update(cx, |p, cx| p.set_loading(true, cx));
-        let task = cx.background_spawn(async { settings::discover_models() });
+        let link = self.link.clone();
+        let task = cx.background_spawn(async move {
+            link.remote()
+                .map_or_else(settings::discover_models, |h| h.models())
+        });
         cx.spawn_in(window, async move |_, cx| {
             let result = task.await;
             picker.update(cx, |p, cx| {
@@ -529,7 +552,7 @@ impl Host {
             )
         };
         let picker = cx.new(|cx| {
-            ModelPicker::new(entries, window, cx)
+            ModelPicker::new(self.link.clone(), entries, window, cx)
                 .with_runtime(runtime)
                 .with_route_catalog(&self.models, cx)
         });
@@ -623,9 +646,14 @@ impl Host {
                 ),
         )
     }
-    fn refresh_routes(window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
-        let snapshot = cx.background_spawn(async {
-            settings::load().map(|s| {
+    fn refresh_routes(
+        link: platform::HostLink,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let host = link.remote().cloned();
+        let snapshot = cx.background_spawn(async move {
+            host.map_or_else(settings::load, |h| h.snapshot()).map(|s| {
                 (
                     s.models,
                     s.api_provider,
@@ -636,7 +664,10 @@ impl Host {
         });
         // Start both reads immediately, but publish the local settings first: a slow
         // snapshot must never overwrite the discovered aliases from this refresh.
-        let discovered = cx.background_spawn(async { settings::discover_models() });
+        let discovered = cx.background_spawn(async move {
+            link.remote()
+                .map_or_else(settings::discover_models, |h| h.models())
+        });
         cx.spawn_in(window, async move |this, cx| {
             let result = snapshot.await;
             let _ = this.update_in(cx, |s, window, cx| {
@@ -737,12 +768,13 @@ impl Host {
             if let Some(previous) = self.before_settings.take() {
                 window.focus(&previous, cx);
             }
-            self.route_refresh = Self::refresh_routes(window, cx);
+            self.route_refresh = Self::refresh_routes(self.link.clone(), window, cx);
         } else {
             let project = self.panes[self.active].read(cx).project.clone();
             self.before_settings = window.focused(cx);
-            self.preferences =
-                Some(cx.new(|cx| crate::preferences::Preferences::new(project, window, cx)));
+            self.preferences = Some(cx.new(|cx| {
+                crate::preferences::Preferences::new(self.link.clone(), project, window, cx)
+            }));
         }
         self.panes[self.active].update(cx, |p, cx| p.set_front(self.preferences.is_none(), cx));
         cx.notify();
@@ -852,7 +884,10 @@ impl Host {
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pane(
+        link: platform::HostLink,
+        workers: Entity<WorkerIndex>,
         project: PathBuf,
         route: Route,
         first_frame: Option<Instant>,
@@ -861,8 +896,19 @@ impl Host {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<Workbench> {
-        let pane =
-            cx.new(|cx| Workbench::new(project, route, first_frame, stats, models, window, cx));
+        let pane = cx.new(|cx| {
+            Workbench::new(
+                link,
+                workers,
+                project,
+                route,
+                first_frame,
+                stats,
+                models,
+                window,
+                cx,
+            )
+        });
         cx.subscribe_in(
             &pane,
             window,
@@ -958,8 +1004,9 @@ impl Host {
     ) {
         let project = owner.read(cx).project.clone();
         owner.update(cx, |p, cx| p.set_front(false, cx));
-        self.preferences =
-            Some(cx.new(|cx| crate::preferences::Preferences::providers(project, window, cx)));
+        self.preferences = Some(cx.new(|cx| {
+            crate::preferences::Preferences::providers(self.link.clone(), project, window, cx)
+        }));
         cx.notify();
     }
     fn switch(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -979,7 +1026,13 @@ impl Host {
         self.panes[index].update(cx, |p, cx| p.set_front(true, cx));
         let p = self.panes[index].read(cx);
         self.recent.remember(&p.project, &p.route);
-        if let Err(err) = LastWorkspace::save(&p.project, &p.route) {
+        if let Err(err) = LastWorkspace::save(
+            self.link
+                .remote()
+                .map(|_| self.link.state_file("workspace.json")),
+            &p.project,
+            &p.route,
+        ) {
             self.message = Some(err.to_string());
         }
         cx.notify();
@@ -1001,6 +1054,8 @@ impl Host {
             })
             .unwrap_or_else(|| {
                 self.panes.push(Self::pane(
+                    self.link.clone(),
+                    self.workers.clone(),
                     project,
                     route,
                     None,
@@ -1014,6 +1069,23 @@ impl Host {
         self.switch(i, window, cx);
     }
     fn pick_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(host) = self.link.remote().cloned() {
+            let target = cx.weak_entity();
+            let handle = window.window_handle();
+            let route = self.panes[self.active].read(cx).route.clone();
+            self.message = super::remote_project::open(
+                host,
+                Some(route),
+                move |path, route, cx| {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        target.update(cx, |s, cx| s.open(path, route, window, cx))
+                    });
+                },
+                cx,
+            )
+            .err();
+            return;
+        }
         let choice = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -1050,6 +1122,12 @@ impl Host {
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut Self, PathBuf, &mut Window, &mut Context<Self>) + 'static,
     ) {
+        if self.link.remote().is_some() {
+            if path.is_absolute() {
+                then(self, path, window, cx);
+            }
+            return;
+        }
         let probe = path.clone();
         let task = cx.background_spawn(async move {
             let resolved = if canonical {
@@ -1129,6 +1207,31 @@ impl Host {
             }
         }
         cx.notify();
+    }
+    pub(crate) fn paired_with(&self, host: &crate::platform::hosts::SavedHost) -> bool {
+        self.link
+            .remote()
+            .is_some_and(|other| host.same_pairing(other))
+    }
+    pub(crate) fn show_thread(
+        &mut self,
+        scope: ox_desk_core::host_protocol::Scope,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let owner = self.panes[self.active].clone();
+        self.open_thread(
+            &owner,
+            ParentLink {
+                project: scope.project,
+                route: Some(scope.route),
+                id,
+                title: None,
+            },
+            window,
+            cx,
+        );
     }
     fn open_catalog(
         &mut self,
@@ -1399,15 +1502,19 @@ impl Host {
                 Some(model) => format!("{badge} · {model}"),
                 None => badge,
             };
-            let tree = cx
-                .try_global::<TreeIndex>()
-                .and_then(|index| index.0.get(&(project.to_path_buf(), t.id.clone())))
+            let tree = self
+                .workers
+                .read(cx)
+                .trees
+                .get(&(project.to_path_buf(), t.id.clone()))
                 .cloned();
             // A worker whose parent is hidden by the current filter keeps a
             // readable return reference; opening it shows the full parent link.
-            let parent_hint = cx
-                .try_global::<ParentIndex>()
-                .and_then(|index| index.0.get(&(project.to_path_buf(), t.id.clone())))
+            let parent_hint = self
+                .workers
+                .read(cx)
+                .parents
+                .get(&(project.to_path_buf(), t.id.clone()))
                 .map(|link| {
                     link.title.clone().unwrap_or_else(|| {
                         link.project

@@ -259,6 +259,7 @@ impl Engine {
     }
 
     fn deliver_worker_notice(&mut self, n: &Notice) -> io::Result<bool> {
+        let update_reserved = self.update_reserved();
         let Some(live) = self.running.get_mut(&n.scope) else {
             return Ok(false);
         };
@@ -286,7 +287,7 @@ impl Engine {
         // Only a verified open parent can be woken. Closing the UI leaves its
         // process running; explicitly ending the process holds the event until reopen.
         if self.draining.is_some()
-            || self.idle_update_owner.is_some()
+            || update_reserved
             || store.thread_busy(&n.session)
             || !verified
             || !store.can_compose(Some(&n.session))

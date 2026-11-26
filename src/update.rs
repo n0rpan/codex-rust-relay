@@ -17,6 +17,9 @@ use serde::Deserialize;
 use crate::provider::RelayError;
 
 mod desktop;
+#[path = "update_preferences.rs"]
+mod preferences;
+use preferences::Channel;
 mod standalone;
 
 const REPOSITORY: &str = "oxstack/ox";
@@ -62,12 +65,6 @@ impl fmt::Display for Version {
             None => Ok(()),
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Channel {
-    Stable,
-    Dev,
 }
 
 impl Channel {
@@ -328,7 +325,13 @@ pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
     if let [command, rest @ ..] = args
         && matches!(
             command.to_str(),
-            Some("--stage-desktop" | "--apply-desktop" | "--try-apply-desktop")
+            Some(
+                "--stage-desktop"
+                    | "--apply-desktop"
+                    | "--try-apply-desktop"
+                    | "--stage-host-update"
+                    | "--try-select-host-update"
+            )
         )
     {
         let store = store
@@ -386,13 +389,13 @@ pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
     let target = target_triple(std::env::consts::OS, std::env::consts::ARCH)
         .ok_or("ox releases support Linux and macOS on x86-64 and ARM64")?;
     let running = parse_version(CURRENT).ok_or("this ox build has no update version")?;
+    if let Some(store) = store.as_deref() {
+        return desktop::update(store, requested, check_only, json).await;
+    }
     let channel = requested.unwrap_or(Channel::of(running));
     // An explicit move to the other channel installs that channel's build even
     // when its version number is lower (for example dev back to stable).
     let switching = channel != Channel::of(running);
-    if let Some(store) = store.as_deref() {
-        return desktop::update(store, channel, check_only, json).await;
-    }
     if !check_only && executable.with_file_name("ox-desktop").is_file() {
         return Err(
             "To update this desktop installation, run the installer with --desktop.".into(),

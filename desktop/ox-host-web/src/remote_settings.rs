@@ -27,7 +27,12 @@ pub(super) struct Envelope {
 enum DeviceAction {
     Devices,
     PairDevice,
-    RevokeDevice { id: String },
+    HostUpdate {
+        command: crate::host_updates::Command,
+    },
+    RevokeDevice {
+        id: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -48,13 +53,15 @@ pub(super) async fn settings(
     let Json(body) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
     let text = body.request.expose();
     let identity = login(&headers).ok_or(DENY)?;
+    let device_action = serde_json::from_str::<DeviceAction>(text).ok();
     {
         let mut state = app.state.lock().unwrap();
         if !state.prove_settings(&id, &body.proof.nonce, &body.proof.signature, text) {
             return Err(DENY);
         }
-        if let Ok(op) = serde_json::from_str::<DeviceAction>(text) {
+        if let Some(op) = &device_action {
             let data = match op {
+                DeviceAction::HostUpdate { .. } => None,
                 DeviceAction::Devices => {
                     let reply = state.reply(None);
                     let devices = reply
@@ -62,29 +69,47 @@ pub(super) async fn settings(
                         .into_iter()
                         .filter(|d| d.login == identity)
                         .collect::<Vec<_>>();
-                    json!({"devices":devices,"self":id,"origin":reply.origin})
+                    Some(json!({"devices":devices,"self":id,"origin":reply.origin}))
                 }
-                DeviceAction::PairDevice => serde_json::to_value(
-                    state.device_invite(&id).map_err(|_| StatusCode::CONFLICT)?,
-                )
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                DeviceAction::PairDevice => Some(
+                    serde_json::to_value(
+                        state.device_invite(&id).map_err(|_| StatusCode::CONFLICT)?,
+                    )
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                ),
                 DeviceAction::RevokeDevice { id: target } => {
                     if !state
                         .reply(None)
                         .devices
                         .iter()
-                        .any(|d| d.id == target && d.login == identity)
+                        .any(|d| &d.id == target && d.login == identity)
                     {
                         return Err(DENY);
                     }
                     state
-                        .revoke(&target)
+                        .revoke(target)
                         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                    json!({"status":"applied"})
+                    Some(json!({"status":"applied"}))
                 }
             };
-            return Ok(Json(data));
+            if let Some(data) = data {
+                return Ok(Json(data));
+            }
         }
+    }
+    if let Some(DeviceAction::HostUpdate { command }) = device_action {
+        let active = app.state.clone();
+        return tokio::task::spawn_blocking(move || {
+            if !active.lock().unwrap().alive(&id) {
+                return Err(DENY);
+            }
+            let status = crate::host_updates::control(command).map_err(|_| StatusCode::CONFLICT)?;
+            Ok(Json(
+                serde_json::to_value(status).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            ))
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
     // Type-check and allowlist before a helper can open files. In particular raw v1 Read/Save/Key
     // and profile-directory requests are unavailable through the phone.
@@ -106,6 +131,7 @@ pub(super) async fn settings(
                 | Request::SaveAdvanced { .. }
                 | Request::Edit { .. }
                 | Request::EditKey { .. }
+                | Request::ImportKeys { .. }
                 | Request::Models
                 | Request::TestProvider { .. }
         ) {
@@ -174,7 +200,10 @@ fn helper(request: Request) -> Result<Value, String> {
             });
             encode(serde_json::to_value(docs))
         }
-        Request::Edit { .. } | Request::EditKey { .. } | Request::SaveAdvanced { .. } => {
+        Request::Edit { .. }
+        | Request::EditKey { .. }
+        | Request::ImportKeys { .. }
+        | Request::SaveAdvanced { .. } => {
             let result: protocol::model::Outcome = ox::request(&companion, &path, request)?;
             encode(serde_json::to_value(result))
         }

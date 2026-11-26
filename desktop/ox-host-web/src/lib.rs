@@ -1,7 +1,11 @@
 //! Remote access service and its same-user desktop administration interface.
+pub mod access;
 pub mod admin;
 #[cfg(feature = "server")]
 mod bridge;
+#[cfg(feature = "client")]
+pub mod client;
+pub mod host_updates;
 #[cfg(feature = "server")]
 mod push;
 pub mod serve;
@@ -26,3 +30,6 @@ mod fixture {
 
 #[cfg(feature = "server")]
 mod cartridges;
+
+#[cfg(any(feature = "client", feature = "server"))]
+pub mod terminal_protocol;

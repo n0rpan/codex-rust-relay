@@ -18,9 +18,13 @@ impl Fixture {
         Self(p)
     }
     fn request(&self, request: Value) -> Result<Value, String> {
+        self.request_using(request, &[])
+    }
+    fn request_using(&self, request: Value, env: &[(&str, &str)]) -> Result<Value, String> {
         let mut child = Command::new(env!("CARGO_BIN_EXE_ox"))
             .arg("--ox-desktop-settings-v1")
             .env_clear()
+            .envs(env.iter().copied())
             .env("HOME", &self.0)
             .env("CODEX_HOME", &self.0)
             .stdin(Stdio::piped())
@@ -622,4 +626,71 @@ fn claude_profile_discovery_does_not_create_session_directories() {
     );
     assert!(!fixture.0.join("ox-clients").exists());
     assert!(!fixture.0.join(".claude").exists());
+}
+
+#[test]
+fn transfer_reviews_scoped_provider_and_brave_keys_and_commits_a_batch_once() {
+    let desktop = Fixture::new();
+    let server = Fixture::new();
+    let provider = json!({"name":"DEMO_KEY","scope":"https://example.org/v1"});
+    let brave = json!({"name":"BRAVE_SEARCH_API_KEY","scope":"https://api.search.brave.com/"});
+    let registry = "[providers.demo]\nbase_url='https://example.org/v1'\nenv_key='DEMO_KEY'\n[search]\nenv_key='BRAVE_SEARCH_API_KEY'\n";
+    desktop
+        .request(json!({"action":"save","id":"codeox.toml","revision":"","text":registry}))
+        .unwrap();
+    desktop.request(json!({"action":"key","name":"DEMO_KEY","scope":provider["scope"],"value":"fixture-saved"})).unwrap();
+    let source = row_read(&desktop)["revisions"]["keys"].clone();
+    let dest = row_read(&server)["revisions"]["keys"].clone();
+    let request =
+        |selected: Value| json!({"action":"export_keys","revision":source,"selected":selected});
+    let environment = [
+        ("DEMO_KEY", "fixture-active"),
+        ("BRAVE_SEARCH_API_KEY", "fixture-brave"),
+        ("UNRELATED", "fixture-private"),
+    ];
+    let keys = desktop
+        .request_using(request(json!([provider, brave])), &environment)
+        .unwrap();
+    assert_eq!(keys[0]["value"], "fixture-active");
+    assert_eq!(keys[1]["value"], "fixture-brave");
+    assert!(
+        desktop
+            .request_using(
+                request(json!([{"name":"UNRELATED","scope":brave["scope"]}])),
+                &environment
+            )
+            .is_err()
+    );
+    let import = |keys: Value| json!({"action":"import_keys","revision":dest,"keys":keys});
+    let mut invalid = keys.clone();
+    invalid[1]["name"] = json!("CODEOX_TOKEN");
+    assert!(server.request(import(invalid)).is_err());
+    assert!(!server.0.join("ox-api-keys.json").exists());
+    let conflict = Fixture::new();
+    let alternate = registry.replace("https://example.org/v1", "https://elsewhere.invalid/v1");
+    conflict
+        .request(json!({"action":"save","id":"codeox.toml","revision":"","text":alternate}))
+        .unwrap();
+    assert!(conflict.request(import(keys.clone())).is_err());
+    assert!(!conflict.0.join("ox-api-keys.json").exists());
+    assert_eq!(
+        server.request(import(keys.clone())).unwrap()["status"],
+        "applied"
+    );
+    assert_eq!(
+        server.request(import(keys)).unwrap()["status"],
+        "changed_on_disk"
+    );
+    let snapshot = row_read(&server);
+    assert!(!snapshot.to_string().contains("fixture-"));
+    assert_eq!(snapshot["credentials"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        fs::metadata(server.0.join("ox-api-keys.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert!(server.request(json!({"action":"export_keys","revision":snapshot["revisions"]["keys"],"selected":[{"name":"DEMO_KEY","scope":brave["scope"]}]})).is_err());
 }

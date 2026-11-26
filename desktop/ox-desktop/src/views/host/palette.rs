@@ -591,7 +591,7 @@ impl Host {
             Target::LocalTerminal => {
                 let project = self.panes[self.active].read(cx).project.clone();
                 self.close_palette(window, cx);
-                if let Err(error) = crate::terminal::open(project, None, |_, _| {}, cx) {
+                if let Err(error) = self.link.open_shell(project, cx) {
                     self.message = Some(error);
                     cx.notify();
                 }
@@ -613,13 +613,9 @@ impl Host {
             }
             Target::Project(project, route) | Target::Route(project, route) => {
                 self.close_palette(window, cx);
-                match project.canonicalize() {
-                    Ok(path) if path.is_dir() => self.open(path, route, window, cx),
-                    _ => {
-                        self.message = Some(format!("Project unavailable: {}", project.display()));
-                        cx.notify();
-                    }
-                }
+                self.with_project_dir(project, true, window, cx, move |s, path, window, cx| {
+                    s.open(path, route, window, cx)
+                });
             }
             Target::Handoff { pane, owner } => {
                 self.close_palette(window, cx);

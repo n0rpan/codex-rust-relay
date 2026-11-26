@@ -356,6 +356,7 @@ pub(super) fn footer(entries: &[Entry], providers_configured: bool) -> Footer {
 }
 
 pub(super) struct ModelPicker {
+    link: crate::platform::HostLink,
     entries: Vec<Entry>,
     favorites: Vec<String>,
     search: Entity<InputState>,
@@ -378,7 +379,12 @@ pub(super) struct ModelPicker {
 }
 
 impl ModelPicker {
-    pub(super) fn new(entries: Vec<Entry>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(super) fn new(
+        link: crate::platform::HostLink,
+        entries: Vec<Entry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let search = kit::field("", "Search models", false, window, cx);
         let subscriptions = vec![cx.subscribe_in(
             &search,
@@ -393,7 +399,12 @@ impl ModelPicker {
             },
         )];
         search.read(cx).focus_handle(cx).focus(window, cx);
-        let task = cx.background_spawn(async { settings::picker_settings() });
+        let host = link.remote().cloned();
+        let task = cx.background_spawn(async move {
+            host.map_or_else(settings::picker_settings, |h| {
+                h.snapshot().map(|s| settings::PickerSettings::from(&s))
+            })
+        });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -410,6 +421,7 @@ impl ModelPicker {
         })
         .detach();
         Self {
+            link,
             entries: dedup(entries),
             favorites: vec![],
             search,
@@ -518,7 +530,8 @@ impl ModelPicker {
     /// Refresh the API model list from the installed `ox`.
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.loading = true;
-        let task = cx.background_spawn(async { settings::discover_models() });
+        let link = self.link.clone();
+        let task = cx.background_spawn(async move { link.models() });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -572,7 +585,8 @@ impl ModelPicker {
         self.favorites = apply_delta(&self.favorites, id, add);
         self.pending_stars += 1;
         let id = id.to_owned();
-        let task = cx.background_spawn(async move { write_star(&id, add) });
+        let link = self.link.clone();
+        let task = cx.background_spawn(async move { write_star(link, &id, add) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
@@ -589,10 +603,20 @@ impl ModelPicker {
                     }
                     Err(error) => {
                         this.notice = Some(error);
-                        if this.pending_stars == 0
-                            && let Ok(s) = settings::load()
-                        {
-                            this.favorites = s.favorites;
+                        if this.pending_stars == 0 {
+                            let link = this.link.clone();
+                            let reload = cx.background_spawn(async move { link.settings() });
+                            cx.spawn(async move |this, cx| {
+                                if let Ok(snapshot) = reload.await {
+                                    let _ = this.update(cx, |s, cx| {
+                                        if s.pending_stars == 0 {
+                                            s.favorites = snapshot.favorites;
+                                            cx.notify()
+                                        }
+                                    });
+                                }
+                            })
+                            .detach();
                         }
                     }
                 }
@@ -799,10 +823,9 @@ pub(super) fn star_delta(
     Err("Starred models changed elsewhere. Try again.".into())
 }
 
-struct Settings;
-impl Favorites for Settings {
+impl Favorites for crate::platform::HostLink {
     fn read(&mut self) -> Result<(Vec<String>, String), String> {
-        let s = settings::load()?;
+        let s = self.settings()?;
         Ok((s.favorites, s.revisions.favorites))
     }
     fn write(&mut self, revision: &str, list: Vec<String>) -> Result<Option<Vec<String>>, String> {
@@ -810,16 +833,20 @@ impl Favorites for Settings {
             revision: revision.to_owned(),
             edit: model::Edit::Favorites { models: list },
         };
-        Ok(settings::apply(&request)?.ok().map(|saved| saved.favorites))
+        Ok(self.apply(&request)?.ok().map(|saved| saved.favorites))
     }
 }
 
 /// Writes in one window go one at a time, each reading the list the previous one saved.
 static STAR_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn write_star(id: &str, add: bool) -> Result<Vec<String>, String> {
+fn write_star(
+    mut link: crate::platform::HostLink,
+    id: &str,
+    add: bool,
+) -> Result<Vec<String>, String> {
     let _serial = STAR_WRITES.lock().unwrap_or_else(|e| e.into_inner());
-    star_delta(&mut Settings, id, add)
+    star_delta(&mut link, id, add)
 }
 
 impl Render for ModelPicker {

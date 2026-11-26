@@ -42,6 +42,7 @@ pub(crate) enum Message {
         reply: Replier,
     },
     Stop,
+    Replace(PathBuf, std::os::unix::net::UnixStream),
     /// Upgrade handover: refuse new turns, let running turns finish until the
     /// deadline, then stop. The next host reads why the previous one stopped.
     Drain(Duration),
@@ -193,6 +194,7 @@ struct ReadArgs {
     limit: usize,
 }
 struct ClientState {
+    update_lease: Option<tokio::sync::RwLockWriteGuard<'static, ()>>,
     peer: Peer,
     hello: bool,
     prepared: Option<crate::runtime::Prepared>,
@@ -299,8 +301,11 @@ const OVERDUE_MAILBOX_BURST: u32 = 32;
 const REAP_EVERY: Duration = Duration::from_secs(60);
 
 pub(crate) struct Engine {
+    pub(crate) replacement: Option<PathBuf>,
     config: RuntimeConfig,
     schema_reader: std::sync::Arc<ox_desk_core::codex::installed::SchemaReader>,
+    host_id: uuid::Uuid,
+    host_name: String,
     ledger: Ledger,
     replay: Replay,
     tx: SyncSender<Message>,
@@ -324,7 +329,6 @@ pub(crate) struct Engine {
     reading: Vec<Reading>,
     in_flows: bool,
     draining: Option<Instant>,
-    idle_update_owner: Option<u64>,
     state_dir: PathBuf,
     idle: Duration,
     next_reap: Instant,
@@ -350,6 +354,7 @@ impl Engine {
         tx: SyncSender<Message>,
     ) -> io::Result<Self> {
         let mut ledger = Ledger::open(dir)?;
+        let host_id = crate::identity::load(dir)?;
         let seq = ledger.data.reserved;
         let mut workers = Registry::default();
         for saved in &ledger.data.scopes {
@@ -373,6 +378,9 @@ impl Engine {
         // new epoch discards the previous runtime's tokens.
         ledger.begin(seq)?;
         Ok(Self {
+            replacement: None,
+            host_id,
+            host_name: sysinfo::System::host_name().unwrap_or_else(|| host_id.to_string()),
             config,
             ledger,
             replay: Replay::new(seq, nonce()?),
@@ -394,7 +402,6 @@ impl Engine {
             reading: Default::default(),
             in_flows: false,
             draining: None,
-            idle_update_owner: None,
             state_dir: dir.to_owned(),
             idle: idle_timeout(std::env::var("OX_HOST_IDLE_MINUTES").ok().as_deref()),
             next_reap: Instant::now() + REAP_EVERY,
@@ -489,6 +496,11 @@ impl Engine {
                     }
                     self.advance_flows()?;
                 }
+                Some(Message::Replace(binary, _reservation)) => {
+                    crate::handover::record(&self.state_dir, "upgrade", 0)?;
+                    self.replacement = Some(binary);
+                    break;
+                }
                 Some(Message::Stop) => {
                     crate::handover::record(&self.state_dir, "stop", self.running_turns())?;
                     break;
@@ -534,6 +546,7 @@ impl Engine {
                     self.clients.insert(
                         id,
                         ClientState {
+                            update_lease: None,
                             peer,
                             hello: false,
                             prepared: None,
@@ -546,9 +559,6 @@ impl Engine {
                 }
                 Some(Message::Disconnect(id)) => {
                     self.clients.remove(&id);
-                    if self.idle_update_owner == Some(id) {
-                        self.idle_update_owner = None;
-                    }
                 }
                 Some(Message::Request(id, request)) => {
                     if let Err(e) = self.request(id, *request) {
@@ -625,13 +635,20 @@ impl Engine {
                             && live.opening.is_none()
                             && live.terminal.is_none()
                     });
-                if ready {
-                    self.idle_update_owner = Some(id);
+                let lease = ready
+                    .then(|| ox_host_web::host_updates::TERMINALS.try_write().ok())
+                    .flatten();
+                let ready = lease.is_some();
+                if let Some(lease) = lease {
+                    self.clients
+                        .get_mut(&id)
+                        .expect("connected client")
+                        .update_lease = Some(lease);
                 }
                 self.reply(id, Server::IdleUpdate { ready })
             }
             Client::Hello { version } => {
-                if version != wire::VERSION {
+                let Some(version) = wire::negotiate(version) else {
                     let message = wire::version_mismatch(wire::VERSION, version);
                     let _ = self.reply(
                         id,
@@ -641,7 +658,7 @@ impl Engine {
                         },
                     );
                     return Err(io::Error::other(message));
-                }
+                };
                 let prepared = self.config.prepare().ok();
                 let routes = prepared
                     .as_ref()
@@ -680,6 +697,8 @@ impl Engine {
                         routes,
                         projects,
                         host: Some(wire::HostInfo {
+                            id: Some(self.host_id.to_string()),
+                            name: Some(self.host_name.clone()),
                             version: crate::handover::version().into(),
                             epoch: self.replay.cursor.epoch.clone(),
                         }),
@@ -1809,8 +1828,9 @@ impl Engine {
         self.answer(f.reply, result)
     }
     fn update_reserved(&self) -> bool {
-        self.idle_update_owner
-            .is_some_and(|owner| self.clients.contains_key(&owner))
+        self.clients
+            .values()
+            .any(|client| client.update_lease.is_some())
     }
 
     /// Work a drain waits for: turns in progress in any loaded thread, worker
@@ -3128,6 +3148,7 @@ mod tests {
         engine.clients.insert(
             1,
             ClientState {
+                update_lease: None,
                 peer,
                 hello: true,
                 prepared: None,
@@ -3224,6 +3245,7 @@ mod tests {
         engine.clients.insert(
             1,
             ClientState {
+                update_lease: None,
                 peer,
                 hello: true,
                 prepared: None,
@@ -3270,6 +3292,7 @@ mod tests {
             engine.clients.insert(
                 id,
                 ClientState {
+                    update_lease: None,
                     peer,
                     hello: false,
                     prepared: None,
@@ -3288,13 +3311,13 @@ mod tests {
             .request(
                 1,
                 Client::Hello {
-                    version: wire::VERSION,
+                    version: wire::VERSION + 1,
                 },
             )
             .unwrap();
         let hello: Server = serde_json::from_slice(&frames[0].try_recv().unwrap()).unwrap();
         assert!(
-            matches!(&hello, Server::Hello { capabilities, .. } if capabilities.iter().any(|c| c == CAPABILITY)),
+            matches!(&hello, Server::Hello { version: wire::VERSION, capabilities, .. } if capabilities.iter().any(|c| c == CAPABILITY)),
             "{hello:?}"
         );
         engine.request(1, declare(Surface::Phone)).unwrap();
@@ -3375,6 +3398,7 @@ mod tests {
             engine.clients.insert(
                 id,
                 ClientState {
+                    update_lease: None,
                     peer,
                     hello: true,
                     prepared: None,
@@ -3916,6 +3940,7 @@ mod tests {
                 engine.clients.insert(
                     id,
                     ClientState {
+                        update_lease: None,
                         peer,
                         hello: true,
                         prepared: None,
@@ -6545,6 +6570,7 @@ mod tests {
             engine.clients.insert(
                 1,
                 ClientState {
+                    update_lease: None,
                     peer,
                     hello: true,
                     prepared: None,
@@ -6823,6 +6849,7 @@ mod tests {
                 let (peer, frames) = crate::transport::test_peer();
                 (
                     ClientState {
+                        update_lease: None,
                         peer,
                         hello: true,
                         prepared: None,
@@ -6883,6 +6910,7 @@ mod tests {
             engine.clients.insert(
                 9,
                 ClientState {
+                    update_lease: None,
                     peer,
                     hello: true,
                     prepared: None,

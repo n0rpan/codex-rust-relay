@@ -130,6 +130,9 @@ fn host(paths: &Paths, report: &mut Report) -> bool {
         Ok(Some(probe)) => {
             match &probe.host {
                 Some(info) => {
+                    if let Some(id) = &info.id {
+                        report.info(format!("host identity: {} ({id})", info.name.as_deref().unwrap_or("unnamed")));
+                    }
                     report.info(format!(
                         "host: running, version {}, epoch {}, pid {}, protocol {} ({})",
                         info.version,
@@ -157,7 +160,7 @@ fn host(paths: &Paths, report: &mut Report) -> bool {
                     ),
                 ),
             }
-            if probe.version != ox_desk_core::host_protocol::VERSION {
+            if !ox_desk_core::host_protocol::supported(probe.version) {
                 report.add(
                     Level::Fail,
                     ox_desk_core::host_protocol::version_mismatch(

@@ -162,6 +162,11 @@ pub enum Outcome {
 #[derive(Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Secret(String);
+impl From<String> for Secret {
+    fn from(text: String) -> Self {
+        Self(text)
+    }
+}
 impl Default for Secret {
     fn default() -> Self {
         Self(String::with_capacity(8192))
