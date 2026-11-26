@@ -25,7 +25,7 @@ pub fn action_methods(operation: crate::actions::Operation) -> &'static [names::
         Operation::RenameThread => &[Method::Rename],
         Operation::ArchiveThread => &[Method::Archive],
         Operation::ForkThread => &[Method::Fork],
-        Operation::LoadOlder => &[Method::Turns],
+        Operation::LoadOlder => &[Method::Turns, Method::Read],
         Operation::SearchThreads => &[Method::List],
         Operation::MoreThreads => &[Method::List],
         Operation::ExecuteCommand => &[
