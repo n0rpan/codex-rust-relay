@@ -71,6 +71,21 @@ impl Store {
     pub fn select_from_catalog(&mut self, row: ThreadRow) -> io::Result<()> {
         self.select_catalog_origin(row, false)
     }
+    /// Add a catalog row without opening the thread, so a send can resume a thread the
+    /// freshly reopened route has not listed yet.
+    pub fn adopt_catalog_row(&mut self, row: ThreadRow) -> io::Result<()> {
+        if self.remote().is_some() || row.worker || self.catalog.get(&row.id).is_some() {
+            return Ok(());
+        }
+        self.check_route(&row)?;
+        self.record_lineage(&row);
+        if self.listing {
+            self.created_while_listing.insert(row.id.clone());
+        }
+        self.catalog.insert(row);
+        self.catalog_revision += 1;
+        Ok(())
+    }
     pub fn select_catalog_origin(&mut self, row: ThreadRow, confirm_alias: bool) -> io::Result<()> {
         if self.remote().is_some() {
             let a = if confirm_alias {
@@ -132,6 +147,12 @@ impl Store {
             row.unread = false;
         }
         if entry.ready || entry.loading || self.terminal_threads.contains(id) {
+            return Ok(());
+        }
+        if self.state == Connection::Connecting {
+            // Still connecting: keep the selection and open it once ready.
+            self.queued_open = Some(id.into());
+            self.mark_loading(id);
             return Ok(());
         }
         if self.state != Connection::Ready {
@@ -219,6 +240,7 @@ impl Store {
                 ));
             }
             self.sync_title(&identity);
+            self.transcripts.entry(id.into()).or_default().read_updated = identity.updated_at;
             self.request(
                 Call::Resume {
                     thread: id.into(),
@@ -242,7 +264,7 @@ impl Store {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Codex opened the thread with a different billing route",
+                "Codex opened this thread on a different model route than the one you chose. Reconnect, or pick the thread's original route.",
             ));
         }
         Ok(())
@@ -261,6 +283,9 @@ impl Store {
                 self.history_preview(id, page);
             }
             let t = self.transcripts.entry(id.into()).or_default();
+            // We hold the write lock now: whatever held it before is gone.
+            t.native_live = false;
+            t.native_next = None;
             t.model = Some(reply.model);
             t.tier = reply.service_tier;
             t.effort = reply.reasoning_effort;
@@ -276,6 +301,100 @@ impl Store {
         if let Err(err) = result {
             self.failed(Pending::Resume(id.into()), err.to_string());
         }
+    }
+
+    /// Codex allows one writer per thread. A second resume is refused with this text, which
+    /// is how OX learns that a native Codex client has the thread open right now.
+    pub(super) const WRITER_LOCK: &'static str = "already has an active writer";
+
+    /// Show the thread read-only from its rollout and keep checking until the other client
+    /// lets go; the next successful resume then makes OX the writer.
+    pub(super) fn native_locked(&mut self, id: String) {
+        let now = std::time::Instant::now();
+        let t = self.transcripts.entry(id.clone()).or_default();
+        let fresh = !t.native_live || !t.ready || t.loaded_updated != t.read_updated;
+        let was = t.native_live;
+        t.native_live = true;
+        t.native_next = Some(now + std::time::Duration::from_secs(4));
+        t.error = None;
+        t.loading = false;
+        t.verified = true;
+        if fresh {
+            // The journal moved: replace the shown history rather than splice into it.
+            let seen = t.read_updated;
+            let next = t.native_next;
+            *t = Transcript::default();
+            t.native_live = true;
+            t.native_next = next;
+            t.read_updated = seen;
+            t.loaded_updated = seen;
+            t.verified = true;
+            if let Err(err) = self.request_history(&id, None) {
+                self.transcripts.entry(id.clone()).or_default().error = Some(err.to_string());
+            }
+        }
+        if !was {
+            self.changed.mark(super::Changed::THREADS);
+        }
+        self.changed.transcript(&id);
+    }
+
+    /// Fixture for host tests: the selected thread is held by another Codex client, its
+    /// probe is overdue, and the read it sent is still waiting for the runtime.
+    /// A store over an inert runtime process, for view tests that must stay
+    /// runtime-neutral (they cannot name a runtime's link module).
+    #[doc(hidden)]
+    pub fn inert(profile: super::Profile) -> std::io::Result<Self> {
+        let link = crate::links::codex::Link::spawn(
+            crate::links::codex::Launch {
+                executable: "/bin/cat".into(),
+                arguments: vec![],
+                directory: profile.project.clone(),
+                path: "/usr/bin:/bin".into(),
+            },
+            |_| {},
+        )?;
+        Self::open(profile, link)
+    }
+    #[doc(hidden)]
+    pub fn hold_native_read_for_test(&mut self, id: &str) {
+        let t = self.transcripts.entry(id.into()).or_default();
+        t.native_live = true;
+        t.native_next = Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+        self.selected = Some(id.into());
+        self.pending.insert(
+            -1,
+            (
+                std::time::Instant::now() + std::time::Duration::from_secs(90),
+                Pending::Read(id.into()),
+            ),
+        );
+    }
+
+    /// A read, resume or history request for the thread is still waiting for Codex.
+    pub(super) fn native_request_outstanding(&self, id: &str) -> bool {
+        self.pending.values().any(|(_, p)| {
+            matches!(p, Pending::Read(x) | Pending::Resume(x) | Pending::History(x) if x == id)
+        })
+    }
+
+    /// Probe the selected natively-held Codex thread every few seconds: a resume that is
+    /// accepted means the other client closed it; one that is refused refreshes the view.
+    pub(super) fn refresh_native_codex(&mut self, now: std::time::Instant) {
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        let due = self
+            .transcripts
+            .get(&id)
+            .is_some_and(|t| t.native_live && t.native_next.is_some_and(|at| now >= at));
+        if !due || self.native_request_outstanding(&id) || self.state != Connection::Ready {
+            return;
+        }
+        if let Some(t) = self.transcripts.get_mut(&id) {
+            t.native_next = Some(now + std::time::Duration::from_secs(4));
+        }
+        let _ = self.request(Call::Read(id.clone()), Pending::Read(id));
     }
 
     fn history_preview(&mut self, id: &str, page: &TurnPage) {

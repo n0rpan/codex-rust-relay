@@ -13,7 +13,7 @@ name: Fast lane
 #                ox-host, ...), the protocol schema check and a Wayland smoke run
 #   - protocol:  stock-client protocol fixtures on the baseline and latest
 #                Codex and Claude Code releases (latest reports, never blocks)
-#   - host-sessions: the real host, helper and stock Claude Code (floor)
+#   - host-sessions: the real host, helper and both stock clients (floor)
 #
 # Caches are written only from main, so every branch restores main's warm
 # dependency build and none evicts it. The full lane (packages, window tests,
@@ -190,10 +190,8 @@ jobs:
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
   host-sessions:
-    # The real session host, OX helper and stock Claude Code against a local
-    # Messages API: two clients, approvals, SIGKILL recovery, workers, handoffs
-    # and a mid-turn upgrade. No window and no package, so it belongs here.
-    # It tests the host, so it runs once, on the Claude Code floor.
+    # The real host, helper and floor clients against loopback providers: approvals,
+    # SIGKILL recovery, workers, handoffs and a mid-turn upgrade.
     name: Host sessions (stock Claude floor)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -217,20 +215,32 @@ jobs:
         run: |
           rustup toolchain install 1.100.0 --profile minimal --no-self-update
           rustup default 1.100.0
-      - name: Build the host and helper while Claude Code installs
+      - name: Build the host and helper while stock clients install
         run: |
           nohup sh -c '{ cargo build --locked --bin ox && cargo build --locked --manifest-path desktop/Cargo.toml -p ox-host; } \
             > "$RUNNER_TEMP/build.log" 2>&1; echo $? > "$RUNNER_TEMP/build.status"' > /dev/null 2>&1 &
-      - name: Install stock Claude Code (floor)
-        run: |
-          floor=$(python3 -c 'import tomllib; print(tomllib.load(open("desktop/gate.toml", "rb"))["claude"]["minimum_version"])')
-          npm install --prefix "$RUNNER_TEMP/stock" --no-audit --no-fund --loglevel=error "@anthropic-ai/claude-code@$floor"
+      - name: Install stock clients (floor)
+        run: desktop/ci/stock-clients.sh baseline "$RUNNER_TEMP/stock"
       - name: Wait for the build
         run: |
           until [ -s "$RUNNER_TEMP/build.status" ]; do sleep 1; done
           [ "$(cat "$RUNNER_TEMP/build.status")" = 0 ] || { cat "$RUNNER_TEMP/build.log"; exit 1; }
+      - name: Recover an interrupted stock Codex turn without replaying it
+        run: python3 desktop/tests/host_codex_interrupt.py desktop/target/debug/ox-host desktop/target/debug/ox "$RUNNER_TEMP/stock/node_modules/.bin/codex"
       - name: Two clients, approvals and SIGKILL recovery
         run: python3 desktop/tests/host_stock_session.py desktop/target/debug/ox-host desktop/target/debug/ox "$RUNNER_TEMP/stock/node_modules/.bin/claude"
+      - name: Worker turns across dropped connections, Stop and host restarts
+        run: |
+          if ! command -v bwrap || ! command -v socat; then
+            sudo apt-get update -o Acquire::Retries=3
+            sudo apt-get install -y -o Acquire::Retries=3 bubblewrap socat
+          fi
+          if ! bwrap --ro-bind / / --dev /dev --proc /proc true &&
+              [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --ro-bind / / --dev /dev --proc /proc true
+          python3 desktop/tests/host_interruptions.py desktop/target/debug/ox-host desktop/target/debug/ox "$RUNNER_TEMP/stock/node_modules/.bin/claude"
       - name: Handoff into stock Claude Code
         run: python3 desktop/tests/host_handoff_session.py desktop/target/debug/ox-host desktop/target/debug/ox "$RUNNER_TEMP/stock/node_modules/.bin/claude"
       - name: Upgrade the host in the middle of a turn

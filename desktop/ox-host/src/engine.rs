@@ -10,7 +10,7 @@ use ox_desk_core::{
     actions::Action,
     changed::Changed,
     handoff::HandoffStart,
-    host_protocol::{self as wire, Change, Client, Cursor, Scope, ScopeState, Server},
+    host_protocol::{self as wire, Change, Client, Cursor, ProcessView, Scope, ScopeState, Server},
     inbox::Inbox,
     links::LinkEvent,
     modes::YoloAllowance,
@@ -20,7 +20,7 @@ use ox_desk_core::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     io,
     path::{Path, PathBuf},
     sync::mpsc::{Receiver, RecvTimeoutError, SyncSender},
@@ -77,10 +77,13 @@ pub(crate) struct Finished {
     origin: Origin,
     record: Option<String>,
     detached: bool,
+    /// Retire the new session at once: its parent ended while the launch was in flight.
+    retire: bool,
 }
 impl Finished {
     fn new(l: Launching, result: Result<(), String>, thread: Option<String>) -> Self {
         Self {
+            retire: l.abandoned && result.is_ok() && thread.is_some(),
             record: match &l.payload {
                 Payload::Handoff { record, .. } => Some(record.clone()),
                 Payload::Worker(_) => None,
@@ -135,6 +138,9 @@ pub(crate) struct Launching {
     /// The launcher already has its answer (a YOLO request the operator accepted).
     /// A failure is recorded as the job's outcome instead.
     detached: bool,
+    /// The parent was force-ended after the first message was already sent, so the
+    /// launch cannot be recalled. The session it opens is retired on arrival.
+    abandoned: bool,
 }
 /// A child waiting for the operator to accept YOLO.
 pub(crate) struct Asking {
@@ -177,6 +183,8 @@ struct ClientState {
     prepared: Option<crate::runtime::Prepared>,
     subscription: Option<Option<Scope>>,
     catalog: bool,
+    /// A desktop window that may take a terminal handoff held for its scope.
+    terminal: bool,
 }
 struct Live {
     launching: Option<Launching>,
@@ -194,9 +202,87 @@ struct Live {
     generation: u64,
     state: ScopeState,
     tokens: HashMap<RequestId, String>,
+    /// When each live process started and was last used, for the process list and the idle reaper.
+    tracker: Tracker,
+    /// A terminal handoff whose requesting client was gone when it was ready. The
+    /// next scoped subscriber (or a replayed request) receives it until the
+    /// deadline, after which it is dropped so the runtime can be reaped.
+    held_handoff: Option<(String, Server, Instant)>,
 }
+
+/// How long a terminal handoff waits for a client to take it before it is dropped.
+const HELD_HANDOFF_TTL: Duration = Duration::from_secs(600);
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+/// Start and last-use times of one process (a Claude session or a Codex scope).
+#[derive(Clone, Copy)]
+struct Seen {
+    started: i64,
+    last: Instant,
+    last_unix: i64,
+}
+impl Seen {
+    fn now() -> Self {
+        Self {
+            started: now_unix(),
+            last: Instant::now(),
+            last_unix: now_unix(),
+        }
+    }
+}
+pub(crate) struct Tracker {
+    scope: Seen,
+    threads: BTreeMap<String, Seen>,
+}
+impl Tracker {
+    pub(crate) fn new() -> Self {
+        Self {
+            scope: Seen::now(),
+            threads: BTreeMap::new(),
+        }
+    }
+    fn touch(&mut self, thread: &str) {
+        let now = Seen::now();
+        self.scope.last = now.last;
+        self.scope.last_unix = now.last_unix;
+        let seen = self.threads.entry(thread.to_owned()).or_insert(now);
+        seen.last = now.last;
+        seen.last_unix = now.last_unix;
+    }
+    /// Track exactly the threads that have a live process.
+    fn sync(&mut self, live: &[String]) {
+        self.threads.retain(|t, _| live.contains(t));
+        for t in live {
+            self.threads.entry(t.clone()).or_insert_with(Seen::now);
+        }
+    }
+}
+
+/// How long a Claude session or empty Codex scope may sit unused before the
+/// host ends it. Zero disables the reaper. `OX_HOST_IDLE_MINUTES` overrides it.
+pub(crate) const DEFAULT_IDLE_MINUTES: u64 = 30;
+pub(crate) fn idle_timeout(setting: Option<&str>) -> Duration {
+    let minutes = setting
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_IDLE_MINUTES);
+    Duration::from_secs(minutes.saturating_mul(60))
+}
+/// Whether the reaper ends a process: it has sat unused for the whole timeout and
+/// ending it would lose nothing (no running turn, pending approval, or worker).
+pub(crate) fn reapable(idle: Duration, timeout: Duration, busy: bool) -> bool {
+    !timeout.is_zero() && !busy && idle >= timeout
+}
+/// Messages the main loop reads between timer passes while a timer is overdue.
+const OVERDUE_MAILBOX_BURST: u32 = 32;
+const REAP_EVERY: Duration = Duration::from_secs(60);
+
 pub(crate) struct Engine {
     config: RuntimeConfig,
+    schema_reader: std::sync::Arc<ox_desk_core::codex::installed::SchemaReader>,
     ledger: Ledger,
     replay: Replay,
     tx: SyncSender<Message>,
@@ -206,6 +292,12 @@ pub(crate) struct Engine {
     launched: u64,
     workers: Registry,
     receipts: Receipts,
+    /// Last project default read from the settings snapshot, kept for a failed read.
+    yolo_projects: Vec<PathBuf>,
+    /// Projects whose YOLO default was already announced since the host started.
+    yolo_announced: HashSet<PathBuf>,
+    /// Launch cautions by job number, recorded on the worker when it is stamped.
+    launch_warnings: HashMap<u64, String>,
     discovered: HashMap<(Scope, String), ox_desk_core::store::ThreadRow>,
     asking: BTreeMap<u64, Asking>,
     preparing: Vec<Preparing>,
@@ -213,8 +305,17 @@ pub(crate) struct Engine {
     in_flows: bool,
     draining: Option<Instant>,
     state_dir: PathBuf,
+    idle: Duration,
+    next_reap: Instant,
 }
 mod flows;
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.schema_reader.shutdown();
+    }
+}
+
 fn nonce() -> io::Result<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(io::Error::other)?;
@@ -253,6 +354,9 @@ impl Engine {
             launched: 0,
             workers,
             receipts: Receipts::default(),
+            yolo_projects: Vec::new(),
+            yolo_announced: HashSet::new(),
+            launch_warnings: HashMap::new(),
             discovered: Default::default(),
             asking: Default::default(),
             preparing: Default::default(),
@@ -260,9 +364,14 @@ impl Engine {
             in_flows: false,
             draining: None,
             state_dir: dir.to_owned(),
+            idle: idle_timeout(std::env::var("OX_HOST_IDLE_MINUTES").ok().as_deref()),
+            next_reap: Instant::now() + REAP_EVERY,
+            schema_reader: Default::default(),
         })
     }
     pub(crate) fn serve(&mut self, rx: Receiver<Message>) -> io::Result<()> {
+        // Mailbox messages served in a row while a timer was already overdue.
+        let mut overdue_streak = 0u32;
         loop {
             if let Some(at) = self.draining {
                 let running = self.running_turns();
@@ -290,9 +399,24 @@ impl Engine {
                 )
                 .chain(self.reading.iter().map(|r| r.deadline))
                 .chain(self.draining)
+                .chain(Some(self.next_reap))
                 .min();
             let msg = if deadline.is_some_and(|at| at <= Instant::now()) {
-                None
+                // An overdue timer must not starve the mailbox: a reply, ListProcesses or
+                // Stop may be waiting. Read it first, but let the timers run after a bounded
+                // run of messages so a busy mailbox cannot starve them either.
+                if overdue_streak < OVERDUE_MAILBOX_BURST {
+                    match rx.try_recv() {
+                        Ok(msg) => {
+                            overdue_streak += 1;
+                            Some(msg)
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                } else {
+                    None
+                }
             } else if let Some(deadline) = deadline {
                 match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                     Ok(msg) => Some(msg),
@@ -305,6 +429,9 @@ impl Engine {
                     Err(_) => break,
                 })
             };
+            if msg.is_none() || deadline.is_none_or(|at| at > Instant::now()) {
+                overdue_streak = 0;
+            }
             match msg {
                 None => {
                     let now = Instant::now();
@@ -319,7 +446,14 @@ impl Engine {
                         .map(|(k, _)| k.clone())
                         .collect();
                     for scope in due {
-                        self.process(&scope, vec![], false)?;
+                        // An earlier pass in this loop may have ended the scope.
+                        if self.running.contains_key(&scope) {
+                            self.process(&scope, vec![], false)?;
+                        }
+                    }
+                    if now >= self.next_reap {
+                        self.next_reap = now + REAP_EVERY;
+                        self.reap_idle(now)?;
                     }
                     self.advance_flows()?;
                 }
@@ -373,6 +507,7 @@ impl Engine {
                             prepared: None,
                             subscription: None,
                             catalog: false,
+                            terminal: false,
                         },
                     );
                 }
@@ -478,6 +613,8 @@ impl Engine {
                             "approvals",
                             "workers",
                             "live_catalog",
+                            "end",
+                            "processes",
                         ]
                         .map(str::to_owned)
                         .into(),
@@ -523,6 +660,10 @@ impl Engine {
                     ),
                 }
             }
+            Client::ListProcesses { id: key } => {
+                let processes = self.processes();
+                self.reply(id, Server::Processes { id: key, processes })
+            }
             Client::WatchCatalog => {
                 let client = self.clients.get_mut(&id).expect("connected");
                 client.catalog = true;
@@ -542,7 +683,16 @@ impl Engine {
                     },
                 )
             }
-            Client::Subscribe { scope, after } => self.subscribe(id, scope, after),
+            Client::Subscribe {
+                scope,
+                after,
+                terminal,
+            } => {
+                if let Some(client) = self.clients.get_mut(&id) {
+                    client.terminal = terminal;
+                }
+                self.subscribe(id, scope, after)
+            }
             Client::WorkerLaunch {
                 id: key,
                 mut caller,
@@ -605,6 +755,33 @@ impl Engine {
                         fail("Subscribe to the target scope before sending actions".into()),
                     );
                 }
+                // Ending a thread on a route the host closed needs no process: nothing
+                // there is running, so reopening one only to tell it so would start a runtime
+                // the user just asked to be rid of. The workers and requests under it are
+                // still ended or withdrawn.
+                if !self.running.contains_key(&scope)
+                    && self.cold.contains_key(&scope)
+                    && let Action::EndSession(thread) | Action::ForceEndSession(thread) = &action
+                {
+                    let thread = thread.clone();
+                    if matches!(action, Action::EndSession(_)) && self.thread_busy(&scope, &thread)
+                    {
+                        return self.reply(
+                            id,
+                            fail("This session is busy. Confirm ending it, which cancels its running work.".into()),
+                        );
+                    }
+                    self.drop_grant(&scope, &thread)?;
+                    self.end_children(&scope, &thread)?;
+                    return self.reply(id, Server::Ack { id: key });
+                }
+                // A scope the host dropped while idle reopens for a client still subscribed to it.
+                if !self.running.contains_key(&scope)
+                    && self.cold.contains_key(&scope)
+                    && let Err(e) = self.ensure(&scope, self.config.prepare().ok())
+                {
+                    return self.reply(id, fail(e.to_string()));
+                }
                 let Some(generation) = self.running.get(&scope).map(|live| live.generation) else {
                     return self.reply(
                         id,
@@ -631,26 +808,51 @@ impl Engine {
                                     thread,
                                 },
                             )?;
-                        } else if let Some((client, opening)) =
-                            &mut self.running.get_mut(&scope).unwrap().opening
-                            && opening == &key
-                            && !self.clients.contains_key(client)
-                        {
-                            *client = id;
+                        } else {
+                            let live = self.running.get_mut(&scope).unwrap();
+                            if let Some((client, opening)) = &mut live.opening
+                                && opening == &key
+                                && !self.clients.contains_key(client)
+                            {
+                                *client = id;
+                            }
+                            // The same for a terminal handoff the old connection never received.
+                            if let Some((client, terminal)) = &mut live.terminal
+                                && terminal == &key
+                                && !self.clients.contains_key(client)
+                            {
+                                *client = id;
+                            }
+                            if live
+                                .held_handoff
+                                .as_ref()
+                                .is_some_and(|(k, _, _)| k == &key)
+                                && let Some((_, frame, _)) = live.held_handoff.take()
+                            {
+                                self.reply(id, frame)?;
+                            }
                         }
                         return self.reply(id, receipt.result);
                     }
                     Ok(None) => (),
                 }
+                let ends = matches!(action, Action::EndSession(_) | Action::ForceEndSession(_));
                 let result = match self.act(id, &key, &scope, action, approval) {
                     Ok(()) => Server::Ack { id: key.clone() },
                     Err(e) => fail(e.to_string()),
                 };
                 let accepted = matches!(result, Server::Ack { .. });
-                self.receipts
-                    .insert(scope.clone(), key, generation, hash, result.clone());
+                // Only accepted actions are receipts. A refusal is often transient, so a corrected
+                // retry with the same key must run again rather than replay the refusal.
                 if accepted {
+                    self.receipts
+                        .insert(scope.clone(), key, generation, hash, result.clone());
+                }
+                if accepted && self.running.contains_key(&scope) {
                     self.process(&scope, vec![], true)?;
+                    if ends {
+                        self.reap_empty(&scope)?;
+                    }
                 }
                 self.reply(id, result)
             }
@@ -712,15 +914,21 @@ impl Engine {
         let client = self.clients.get_mut(&id).expect("connected client");
         client.catalog = false;
         client.subscription = Some(scope.clone());
+        let mut replayed = None;
         if !fresh
             && same_subscription
             && let Some(cursor) = after
             && let Some(mut frames) = self.replay.after(scope.as_ref(), &cursor)
         {
-            if !frames.all(|p| client.peer.send(p)) {
+            replayed = Some(frames.all(|p| client.peer.send_for(p, "replay")));
+        }
+        match replayed {
+            Some(true) => return self.deliver_held_handoff(id, scope.as_ref()),
+            Some(false) => {
                 self.clients.remove(&id);
+                return Ok(());
             }
-            return Ok(());
+            None => (),
         }
         let scopes = self
             .running
@@ -736,7 +944,29 @@ impl Engine {
                 cursor: self.replay.cursor.clone(),
                 scopes,
             },
-        )
+        )?;
+        self.deliver_held_handoff(id, scope.as_ref())
+    }
+    /// Give a terminal handoff whose requester disconnected to the next subscriber of its scope.
+    fn deliver_held_handoff(&mut self, id: u64, scope: Option<&Scope>) -> io::Result<()> {
+        let Some(scope) = scope else {
+            return Ok(());
+        };
+        // A phone, push or operator gateway subscribed to the scope must never consume a
+        // desktop's terminal handoff.
+        if !self.clients.get(&id).is_some_and(|c| c.terminal) {
+            return Ok(());
+        }
+        if let Some(frame) = self
+            .running
+            .get_mut(scope)
+            .and_then(|l| l.held_handoff.take())
+            .filter(|(_, _, deadline)| *deadline > Instant::now())
+            .map(|(_, frame, _)| frame)
+        {
+            self.reply(id, frame)?;
+        }
+        Ok(())
     }
     fn ensure(
         &mut self,
@@ -782,13 +1012,22 @@ impl Engine {
             store.recover_from(&mut previous.store);
         }
         annotate(&self.workers, &self.ledger.data, scope, &mut store);
-        let mut state = store.host_snapshot(scope);
         let recovered = self
             .cold
             .remove(scope)
             .or(prior)
             .map(|old| old.sessions)
             .unwrap_or_default();
+        // Threads the host had no process for stay resumable by a send.
+        // The ended thread keeps a row for the send that resumes it even when discovery
+        // has not listed it, and the access mode its Claude session had.
+        for saved in &recovered {
+            let access = serde_json::from_value(saved.detail["resume_access"].clone())
+                .ok()
+                .flatten();
+            store.restore_ended(&saved.id, &saved.title, saved.updated_at, access);
+        }
+        let mut state = store.host_snapshot(scope);
         restore(&mut state.sessions, &recovered);
         let mut changes = vec![
             Change::State {
@@ -833,6 +1072,8 @@ impl Engine {
                 generation,
                 state,
                 tokens: Default::default(),
+                tracker: Tracker::new(),
+                held_handoff: None,
             },
         );
         self.broadcast(scope, changes)?;
@@ -867,6 +1108,8 @@ impl Engine {
             ));
         }
         match action {
+            Action::EndSession(thread) => return self.end_thread(scope, &thread, false),
+            Action::ForceEndSession(thread) => return self.end_thread(scope, &thread, true),
             Action::StartHandoff(start) => return self.start_handoff(id, key, scope, start),
             Action::YoloGrant(session, on) => return self.set_grant(scope, &session, on),
             Action::InjectHandoff(..) => {
@@ -1017,6 +1260,16 @@ impl Engine {
             _ => None,
         };
         let fork = matches!(action, Action::ForkThread(_));
+        // A send to a thread this reopened route has not listed yet: add its row first, so
+        // the store can resume the thread and deliver the message.
+        if operator_turn
+            && let Some(t) = &target
+            && !live.store.has_live_session(t)
+            && live.store.catalog_row(t).is_none()
+            && let Some(row) = from_catalog(t)
+        {
+            live.store.adopt_catalog_row(row)?;
+        }
         live.store.dispatch(action)?;
         if fork && let (Some(origin), Some(source)) = (&origin, &target) {
             live.fork_origin = Some(origin.fork(source));
@@ -1029,12 +1282,20 @@ impl Engine {
             } else if operator_turn {
                 entry.marks.continued += 1;
                 entry.marks.cancelled = false;
+                // A new run: the earlier answer is superseded and the runtime budget
+                // starts over, so an old finished worker is not expired at once.
+                entry.marks.expired = false;
+                entry.marks.last = None;
+                entry.marks.run_started_at = crate::durable::unix_now();
             }
             if access.is_some() {
                 entry.marks.access = access;
             }
         }
         let live = self.running.get_mut(scope).expect("validated live scope");
+        if let Some(t) = &target {
+            live.tracker.touch(t);
+        }
         if terminal {
             live.terminal = Some((id, key.into()));
         }
@@ -1102,8 +1363,9 @@ impl Engine {
             let path = self.config.path.clone();
             let scope = scope.clone();
             let gen_id = live.generation;
+            let reader = self.schema_reader.clone();
             thread::spawn(move || {
-                if let Ok(caps) = ox_desk_core::codex::installed::installed(&path) {
+                if let Ok(caps) = reader.read(&path) {
                     let _ = tx.send(Message::Schema(scope, gen_id, Box::new(caps)));
                 }
             });
@@ -1122,6 +1384,19 @@ impl Engine {
                 )
             })
         });
+        // The requesting client may have gone while the handoff was prepared. Keep
+        // it for the next subscriber instead of losing it with the terminal mode set.
+        let handoff = match handoff {
+            Some((client, frame)) if !self.clients.contains_key(&client) => {
+                let key = match &frame {
+                    Server::Handoff { id, .. } => id.clone(),
+                    _ => String::new(),
+                };
+                live.held_handoff = Some((key, frame, Instant::now() + HELD_HANDOFF_TTL));
+                None
+            }
+            other => other,
+        };
         if live.terminal.is_some() && !live.store.opening_terminal() {
             live.terminal = None;
         }
@@ -1161,6 +1436,15 @@ impl Engine {
                     });
                 } else {
                     self.workers.stamp(scope, thread, l.origin.clone());
+                    if let Payload::Worker(w) = &l.payload
+                        && let Some(entry) = self.workers.get_mut(scope, thread)
+                    {
+                        entry.marks.max_minutes = w.max_minutes.or_else(|| {
+                            crate::workers::env_limit("OX_WORKER_MAX_MINUTES")
+                                .map(|m| m.min(u64::from(u32::MAX)) as u32)
+                        });
+                        entry.marks.warning = self.launch_warnings.remove(&l.origin.job_id);
+                    }
                     launched = Some(Finished::new(l, Ok(()), Some(thread.clone())));
                 }
             }
@@ -1193,6 +1477,7 @@ impl Engine {
         if let Some(error) = launch_failure
             && let Some(l) = live.launching.take()
         {
+            live.store.drop_claude_worker();
             launched = Some(Finished::new(l, Err(error), None));
         }
         annotate(&self.workers, &self.ledger.data, scope, &mut live.store);
@@ -1204,6 +1489,16 @@ impl Engine {
             yolo
         };
         dirty.merge(live.store.drain(vec![], Instant::now()));
+        for thread in dirty.dirty_threads() {
+            live.tracker.touch(thread);
+        }
+        let processes = live.store.live_threads();
+        for thread in &processes {
+            if live.store.thread_busy(thread) {
+                live.tracker.touch(thread);
+            }
+        }
+        live.tracker.sync(&processes);
         let mut changes = live.store.host_project(scope, &dirty, &mut live.state);
         crate::yolo::merge(
             &self.asking,
@@ -1212,20 +1507,35 @@ impl Engine {
             &mut live.state.asks,
             &mut changes,
         );
-        if let Some(sessions) = changes.iter_mut().find_map(|c| {
-            if let Change::Sessions { sessions } = c {
-                Some(sessions)
-            } else {
-                None
+        for change in &mut changes {
+            if live.recovered.is_empty() {
+                break;
             }
-        }) {
-            live.recovered.retain(|old| {
-                !sessions
-                    .iter()
-                    .any(|r| r.id == old.id && r.detail["owned"] == true)
-            });
-            restore(sessions, &live.recovered);
-            live.state.sessions.clone_from(sessions);
+            match change {
+                Change::Sessions { sessions } => {
+                    live.recovered.retain(|old| {
+                        !sessions
+                            .iter()
+                            .any(|r| r.id == old.id && r.detail["owned"] == true)
+                    });
+                    restore(sessions, &live.recovered);
+                    live.state.sessions.clone_from(sessions);
+                }
+                Change::Session { session } => {
+                    if session.detail["owned"] == true {
+                        live.recovered.retain(|old| old.id != session.id);
+                    } else if let Some(old) = live.recovered.iter().find(|old| old.id == session.id)
+                    {
+                        restore_row(session, old);
+                        if let Some(row) =
+                            live.state.sessions.iter_mut().find(|r| r.id == session.id)
+                        {
+                            row.clone_from(session);
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
         if live
             .state
@@ -1301,7 +1611,13 @@ impl Engine {
         if let Some((id, frame)) = created {
             self.reply(id, frame)?;
         }
-        self.finish_launch(scope, launched)
+        self.finish_launch(scope, launched)?;
+        // A worker's run just ended (or restarted): carry its final answer in the saved
+        // rows so it outlives the process and the host.
+        if self.capture_finals(scope) {
+            self.process(scope, vec![], true)?;
+        }
+        Ok(())
     }
     fn answer(&mut self, reply: Replier, result: Result<Value, String>) -> io::Result<()> {
         match reply {
@@ -1350,6 +1666,22 @@ impl Engine {
                 .result
                 .map(|()| json!({"scope": scope, "session": f.thread, "relation": "handoff"}));
             return self.answer(f.reply, result);
+        }
+        if f.retire
+            && let Some(thread) = f.thread.clone()
+        {
+            if let Some(entry) = self.workers.get_mut(scope, &thread) {
+                entry.marks.cancelled = true;
+            }
+            if let Some(live) = self.running.get_mut(scope) {
+                let _ = live.store.stop(&thread);
+            }
+            let _ = self.end_thread(scope, &thread, true);
+            if self.running.contains_key(scope) {
+                self.process(scope, vec![], true)?;
+                self.reap_empty(scope)?;
+            }
+            return self.answer(f.reply, Err(flows::ENDED_PARENT.into()));
         }
         if f.detached
             && let Err(e) = &f.result
@@ -1470,6 +1802,8 @@ impl Engine {
         });
         let resolved =
             crate::workers::grant(source, external, start.mode_request(), start.runtime)?;
+        let this_parent = crate::workers::parent_ref(caller, parent.clone());
+        self.check_worker_cap(&this_parent)?;
         let scope = canonical_scope(Scope {
             project,
             route: start.route(),
@@ -1477,6 +1811,12 @@ impl Engine {
         .map_err(|e| e.to_string())?;
         let job_id = self.new_job_id()?;
         let mut origin = crate::workers::origin(caller, parent.clone(), &start, job_id, resolved);
+        if let Some(warning) = self.write_overlap(&scope, resolved.level) {
+            self.launch_warnings.insert(job_id, warning.clone());
+            if let Some(live) = caller_scope(caller).and_then(|s| self.running.get_mut(s)) {
+                live.store.post_notice(warning);
+            }
+        }
         if resolved.level.needs_person() {
             match caller {
                 Caller::Operator { device, .. } if start.yolo_confirmed => {
@@ -1511,7 +1851,15 @@ impl Engine {
                 }
             }
         }
+        let contract = origin.claude_contract(start.mode);
         let launching = self.prepare_launch(&scope, origin, Payload::Worker(start))?;
+        if let Some(c) = contract
+            && let Some(live) = self.running.get_mut(&scope)
+        {
+            live.store
+                .stage_claude_worker(c)
+                .map_err(|e| e.to_string())?;
+        }
         Ok(Accepted::Launch(scope, launching))
     }
     /// Open the child's route and check that nothing else is opening there.
@@ -1533,6 +1881,7 @@ impl Engine {
             stage: Stage::Opening,
             deadline: Instant::now() + Duration::from_secs(60),
             detached: false,
+            abandoned: false,
         })
     }
     fn job_status(&self, job_id: u64) -> Result<Value, String> {
@@ -1680,10 +2029,17 @@ impl Engine {
                     "This worker has not started: {}.",
                     status["status"].as_str().unwrap_or("waiting")
                 )),
-                ParentCall::Cancel { .. } => Ok(self
-                    .withdraw(job_id)
-                    .map_err(|e| e.to_string())?
-                    .unwrap_or(status)),
+                ParentCall::Cancel { .. } => {
+                    if let Some(done) = self.withdraw(job_id).map_err(|e| e.to_string())? {
+                        Ok(done)
+                    } else if let Some(done) =
+                        self.abort_launch(job_id).map_err(|e| e.to_string())?
+                    {
+                        Ok(done)
+                    } else {
+                        Ok(status)
+                    }
+                }
                 _ => Ok(status),
             };
         }
@@ -1750,9 +2106,355 @@ impl Engine {
             }
         }
     }
+    /// Cancel a worker whose runtime is still opening: nothing was sent to it yet, so
+    /// the launch is abandoned, its launcher hears "cancelled", and the worker's
+    /// scope is closed again if nothing else uses it. A launch whose first message is
+    /// already on its way cannot be recalled and keeps reporting `starting`.
+    fn abort_launch(&mut self, job_id: u64) -> io::Result<Option<Value>> {
+        let Some(scope) = self
+            .running
+            .iter()
+            .find(|(_, live)| {
+                live.launching.as_ref().is_some_and(|l| {
+                    job_id != 0 && l.origin.job_id == job_id && l.stage != Stage::Sent
+                })
+            })
+            .map(|(scope, _)| scope.clone())
+        else {
+            return Ok(None);
+        };
+        let l = self
+            .running
+            .get_mut(&scope)
+            .and_then(|live| {
+                live.store.drop_claude_worker();
+                live.launching.take()
+            })
+            .expect("found launching");
+        const MESSAGE: &str = "The worker launch was cancelled before it started.";
+        if l.detached {
+            let origin = l.origin.clone();
+            self.ledger.change(|d| {
+                d.outcomes.push(crate::durable::Outcome {
+                    origin,
+                    status: "cancelled".into(),
+                    message: MESSAGE.into(),
+                })
+            })?;
+        }
+        self.answer(l.reply, Err(MESSAGE.into()))?;
+        self.process(&scope, vec![], false)?;
+        self.reap_empty(&scope)?;
+        Ok(Some(json!({"job_id": job_id, "status": "cancelled"})))
+    }
+    /// The live processes this host runs: one per Claude session, one per Codex scope.
+    fn processes(&self) -> Vec<ProcessView> {
+        let mut out = Vec::new();
+        for (scope, live) in &self.running {
+            // The warm blank Claude process is a process the host keeps, shown as a draft.
+            let threads = live.store.process_threads();
+            if threads.is_empty() {
+                continue;
+            }
+            out.extend(self.scope_rows(scope, live, threads));
+        }
+        out.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| a.threads.cmp(&b.threads))
+        });
+        out
+    }
+    /// The process rows for one route's live threads: one per Claude session, one per Codex scope.
+    fn scope_rows(&self, scope: &Scope, live: &Live, threads: Vec<String>) -> Vec<ProcessView> {
+        let mut out = Vec::new();
+        let claude = scope.route.runtime == ox_desk_core::runtime::Runtime::Claude;
+        let groups: Vec<Vec<String>> = if claude {
+            threads.into_iter().map(|t| vec![t]).collect()
+        } else {
+            vec![threads]
+        };
+        for group in groups {
+            let seen = |t: &String| live.tracker.threads.get(t).copied();
+            let started = group
+                .iter()
+                .filter_map(seen)
+                .map(|s| s.started)
+                .min()
+                .unwrap_or(live.tracker.scope.started);
+            let last = group
+                .iter()
+                .filter_map(seen)
+                .map(|s| s.last_unix)
+                .max()
+                .unwrap_or(live.tracker.scope.last_unix);
+            let worker = group.iter().all(|t| self.workers.get(scope, t).is_some());
+            out.push(ProcessView {
+                kind: if worker {
+                    "worker"
+                } else if claude {
+                    "claude"
+                } else {
+                    "codex"
+                }
+                .into(),
+                scope: scope.clone(),
+                project: scope.project.clone(),
+                route: scope.route.label(),
+                model: group
+                    .first()
+                    .map(|t| live.store.options(Some(t)).model)
+                    .filter(|m| !m.is_empty()),
+                started_at: started,
+                last_activity: last,
+                running: group.iter().any(|t| self.thread_busy(scope, t)),
+                draft: claude && group.iter().all(|t| live.store.is_draft(t)),
+                threads: group,
+            });
+        }
+        out
+    }
+    /// Whether ending `thread` in `scope` would interrupt work: its own turn, approval,
+    /// sign-in or terminal, a launch still opening for it, or a busy host-owned worker
+    /// it started on any scope, at any depth. The reaper and the process list share this.
+    fn thread_busy(&self, scope: &Scope, thread: &str) -> bool {
+        let mut stack = vec![(scope.clone(), thread.to_owned())];
+        let mut seen = HashSet::new();
+        while let Some((s, t)) = stack.pop() {
+            if !seen.insert((s.clone(), t.clone())) {
+                continue;
+            }
+            let launching = self.running.values().any(|l| {
+                l.launching.as_ref().is_some_and(|launch| {
+                    launch.origin.parent.scope.as_ref() == Some(&s)
+                        && launch.origin.parent.session.as_deref() == Some(t.as_str())
+                })
+            });
+            if launching {
+                return true;
+            }
+            // A YOLO request held for the operator belongs to its parent: ending or
+            // reaping the parent would silently drop a decision a person still owes.
+            if self.asking.values().any(|a| {
+                a.origin.parent.scope.as_ref() == Some(&s)
+                    && a.origin.parent.session.as_deref() == Some(t.as_str())
+            }) {
+                return true;
+            }
+            if let Some(live) = self.running.get(&s)
+                && (live.store.thread_busy(&t)
+                    || live.store.in_terminal(&t)
+                    || live.launching.is_some()
+                    || live.confirming.is_some())
+            {
+                return true;
+            }
+            stack.extend(
+                self.workers
+                    .children_of(&s, &t)
+                    .map(|(cs, cid)| (cs.clone(), cid.to_owned())),
+            );
+        }
+        false
+    }
+    /// End one thread's process and the host-owned workers it started. The thread
+    /// stays in the catalog; selecting it again resumes it.
+    ///
+    /// A busy thread is refused unless `force` is set, so a stale window or remote client
+    /// cannot kill a running turn and its workers by accident.
+    fn end_thread(&mut self, scope: &Scope, thread: &str, force: bool) -> io::Result<()> {
+        if !self.running.contains_key(scope) {
+            return Err(io::Error::other(
+                "This route is not open on the session host.",
+            ));
+        }
+        if !force && self.thread_busy(scope, thread) {
+            return Err(io::Error::other(
+                "This session is busy. Confirm ending it, which cancels its running work.",
+            ));
+        }
+        let live = self
+            .running
+            .get(scope)
+            .ok_or_else(|| io::Error::other("This route is not open on the session host."))?;
+        if !live.store.has_live_session(thread) {
+            return Err(io::Error::other("This session has no live process to end."));
+        }
+        // End the parent first: if the store refuses (not ready, sign-in needed),
+        // its workers must not already be cancelled.
+        let live = self.running.get_mut(scope).expect("checked above");
+        let busy = live.store.thread_busy(thread);
+        self.capture_finals(scope);
+        let live = self.running.get_mut(scope).expect("checked above");
+        live.store.end_session(thread)?;
+        live.tracker.threads.remove(thread);
+        self.drop_grant(scope, thread)?;
+        if busy && let Some(entry) = self.workers.get_mut(scope, thread) {
+            entry.marks.cancelled = true;
+        }
+        self.end_children(scope, thread)?;
+        Ok(())
+    }
+    /// Ending a parent ends its host-owned workers: launches still opening are
+    /// aborted and running ones are cancelled and ended.
+    fn end_children(&mut self, scope: &Scope, thread: &str) -> io::Result<()> {
+        self.withdraw_asks_under(scope, thread)?;
+        // The whole lineage from the durable registry, not only live children: a middle
+        // parent that already exited must not hide its own running workers.
+        let mut tree: Vec<(Scope, String)> = vec![(scope.clone(), thread.to_owned())];
+        let mut next = 0;
+        while next < tree.len() {
+            let (s, t) = tree[next].clone();
+            let kids: Vec<(Scope, String)> = self
+                .workers
+                .children_of(&s, &t)
+                .map(|(cs, cid)| (cs.clone(), cid.to_owned()))
+                .collect();
+            for kid in kids {
+                if !tree.contains(&kid) {
+                    tree.push(kid);
+                }
+            }
+            next += 1;
+        }
+        let launches: Vec<u64> = self
+            .running
+            .values()
+            .filter_map(|l| l.launching.as_ref())
+            .filter(|l| {
+                l.origin.job_id != 0
+                    && tree.iter().any(|(s, t)| {
+                        l.origin.parent.scope.as_ref() == Some(s)
+                            && l.origin.parent.session.as_deref() == Some(t.as_str())
+                    })
+            })
+            .map(|l| l.origin.job_id)
+            .collect();
+        for job in launches {
+            self.abort_launch(job)?;
+        }
+        // A launch whose first message is already on its way cannot be recalled. Mark
+        // it, so the session it opens is retired instead of running without a parent.
+        for live in self.running.values_mut() {
+            if let Some(l) = live.launching.as_mut()
+                && l.stage == Stage::Sent
+                && matches!(l.payload, Payload::Worker(_))
+                && tree.iter().any(|(s, t)| {
+                    l.origin.parent.scope.as_ref() == Some(s)
+                        && l.origin.parent.session.as_deref() == Some(t.as_str())
+                })
+            {
+                l.abandoned = true;
+            }
+        }
+        for (child_scope, child) in tree.into_iter().skip(1) {
+            let live = self
+                .running
+                .get(&child_scope)
+                .is_some_and(|l| l.store.has_live_session(&child));
+            if live
+                && self.end_thread(&child_scope, &child, true).is_ok()
+                && self.running.contains_key(&child_scope)
+            {
+                self.process(&child_scope, vec![], true)?;
+                self.reap_empty(&child_scope)?;
+            }
+        }
+        Ok(())
+    }
+    /// Close a route's runtime once it serves nothing: no live process or
+    /// subscription, no turn, approval or launch. Dropping its store kills the
+    /// app-server (or the idle Claude draft process). The saved sessions stay listed
+    /// and the next subscriber or action reopens the route.
+    fn reap_empty(&mut self, scope: &Scope) -> io::Result<()> {
+        let Some(live) = self.running.get(scope) else {
+            return Ok(());
+        };
+        let idle = live.store.live_threads().is_empty()
+            && live.store.active_turns() == 0
+            && live.store.asks().is_empty()
+            && !live.store.opening_thread()
+            && !live.store.opening_terminal()
+            && live.launching.is_none()
+            && live.confirming.is_none()
+            && live.opening.is_none()
+            && live.terminal.is_none()
+            && live.held_handoff.is_none();
+        if !idle {
+            return Ok(());
+        }
+        // Keep each worker's final answer: the process is about to close.
+        self.capture_finals(scope);
+        let live = self.running.remove(scope).expect("checked above");
+        let recovered = SavedScope::from_state(&live.state).recover();
+        drop(live);
+        let changes = vec![
+            Change::State {
+                connection: recovered.connection.clone(),
+                capabilities: vec![],
+                detail: live_detail_after_drop(&recovered),
+            },
+            Change::Sessions {
+                sessions: recovered.sessions.clone(),
+            },
+            Change::Asks { asks: vec![] },
+        ];
+        self.cold.insert(scope.clone(), recovered);
+        // Carry the workers' marks, final answers included, into the saved rows.
+        self.persist_marks(scope)?;
+        self.broadcast(scope, changes)
+    }
+    /// End sessions and empty routes unused for the idle timeout. The sessions stay resumable.
+    fn reap_idle(&mut self, now: Instant) -> io::Result<()> {
+        let mut due: Vec<(Scope, String)> = Vec::new();
+        let mut empty: Vec<Scope> = Vec::new();
+        for (scope, live) in &mut self.running {
+            if live
+                .held_handoff
+                .as_ref()
+                .is_some_and(|(_, _, deadline)| *deadline <= now)
+            {
+                live.held_handoff = None;
+                empty.push(scope.clone());
+            }
+        }
+        for (scope, live) in &self.running {
+            let threads = live.store.live_threads();
+            if threads.is_empty() {
+                if reapable(
+                    now.saturating_duration_since(live.tracker.scope.last),
+                    self.idle,
+                    live.store.active_turns() > 0,
+                ) {
+                    empty.push(scope.clone());
+                }
+                continue;
+            }
+            for thread in threads {
+                let Some(seen) = live.tracker.threads.get(&thread) else {
+                    continue;
+                };
+                let busy = self.thread_busy(scope, &thread);
+                if reapable(now.saturating_duration_since(seen.last), self.idle, busy) {
+                    due.push((scope.clone(), thread));
+                }
+            }
+        }
+        for (scope, thread) in due {
+            if self.end_thread(&scope, &thread, false).is_ok() && self.running.contains_key(&scope)
+            {
+                self.process(&scope, vec![], true)?;
+            }
+            self.reap_empty(&scope)?;
+        }
+        for scope in empty {
+            self.reap_empty(&scope)?;
+        }
+        self.expire_workers()
+    }
     fn broadcast(&mut self, scope: &Scope, changes: Vec<Change>) -> io::Result<()> {
         self.replay.cursor.seq = self.ledger.next_sequence(self.replay.cursor.seq)?;
-        if self.clients.values().any(|c| c.catalog) {
+        if self.clients.values().any(catalog_only) {
             let mut catalog: Vec<_> = changes
                 .iter()
                 .filter_map(|change| match change {
@@ -1782,14 +2484,23 @@ impl Engine {
                     capabilities: vec![],
                 });
             }
+            // Web push subscribes without a scope and needs notifications, which
+            // carry no transcript content.
+            catalog.extend(
+                changes
+                    .iter()
+                    .filter(|c| matches!(c, Change::Notification { .. }))
+                    .cloned(),
+            );
             if !catalog.is_empty() {
                 let packet = encode(&Server::Delta {
                     cursor: self.replay.cursor.clone(),
                     scope: scope.clone(),
                     changes: catalog,
                 })?;
-                self.clients
-                    .retain(|_, c| !c.catalog || c.peer.send(packet.clone()));
+                self.clients.retain(|_, c| {
+                    !catalog_only(c) || c.peer.send_for(packet.clone(), "catalog watch")
+                });
             }
         }
         let packet = encode(&Server::Delta {
@@ -1798,13 +2509,21 @@ impl Engine {
             changes,
         })?;
         self.replay.append(scope.clone(), packet.clone());
+        let what = format!("{} {}", scope.project.display(), scope.route.label());
         self.clients.retain(|_, c| match c.subscription.as_ref() {
-            Some(None) => c.peer.send(packet.clone()),
-            Some(Some(s)) if s == scope => c.peer.send(packet.clone()),
+            Some(Some(s)) if s == scope => c.peer.send_for(packet.clone(), &what),
+            Some(None) if !c.catalog => c.peer.send_for(packet.clone(), &what),
             _ => true,
         });
         Ok(())
     }
+}
+
+/// Clients that receive navigation metadata only: the catalog watch and scope-less subscriptions.
+// Only catalog watchers are filtered. A scope-less Subscribe means "every scope"
+// (the phone and web push rely on asks and notifications from it), as on main.
+fn catalog_only(client: &ClientState) -> bool {
+    client.catalog
 }
 
 // Sidebar subscribers need just the navigation metadata. Never copy a transcript,
@@ -1872,13 +2591,42 @@ fn advance_launch(live: &mut Live) -> Option<String> {
     if live.store.state() != &Connection::Ready {
         return None;
     }
+    // A Claude worker under the shared contract has its own process, bound to this launch:
+    // it never waits on, or takes, the route's normal blank.
+    match live.store.claude_worker_state() {
+        ox_desk_core::store::claude::WorkerBlank::None => (),
+        ox_desk_core::store::claude::WorkerBlank::Starting => return None,
+        ox_desk_core::store::claude::WorkerBlank::Lost => {
+            live.store.drop_claude_worker();
+            return Some("The worker's Claude process did not start.".into());
+        }
+        ox_desk_core::store::claude::WorkerBlank::Ready => {
+            if l.stage == Stage::Sent {
+                return None;
+            }
+            l.stage = Stage::Sent;
+            let action = match &mut l.payload {
+                Payload::Worker(start) => Action::SendText(None, start.prompt()),
+                Payload::Handoff { text, items, .. } => {
+                    Action::InjectHandoff(std::mem::take(text), std::mem::take(items))
+                }
+            };
+            return live
+                .store
+                .send_on_worker_blank(action)
+                .err()
+                .map(|e| e.to_string());
+        }
+    }
     let preset = l
         .origin
         .started
         .unwrap_or_else(|| l.origin.requested.preset(l.origin.runtime));
     let goal = matches!(&l.payload, Payload::Worker(w) if w.mode == WorkerMode::Goal);
     match l.stage {
-        Stage::Opening if live.store.can_send(None) => {
+        // A warm Claude route has no blank once a send consumed it; choosing the access
+        // is what prepares the next one, so the launch must not wait for it first.
+        Stage::Opening if live.store.can_send(None) || live.store.claude_blank_missing() => {
             l.stage = Stage::AccessRequested;
             if let Err(e) = live.store.dispatch(Action::SetNextAccess(preset)) {
                 return Some(e.to_string());
@@ -1961,7 +2709,12 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
             );
         }
     }
-    for g in data.grants.iter().filter(|g| &g.scope == scope) {
+    let now = crate::durable::unix_now();
+    for g in data
+        .grants
+        .iter()
+        .filter(|g| &g.scope == scope && g.live(now))
+    {
         let children: Vec<Value> = workers
             .all()
             .filter(|(_, _, e)| {
@@ -1971,10 +2724,22 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
             .collect();
         let e = out.entry(g.session.clone()).or_default();
         e.1.insert("yolo_grant".into(), true.into());
+        e.1.insert("yolo_grant_expires".into(), g.expires_at().into());
         e.1.insert("yolo_children".into(), children.into());
+    }
+    for (id, entry) in workers.in_scope(scope) {
+        if let Some(contract) = entry.origin.claude_contract(entry.origin.mode) {
+            store.restore_worker_contract(id, contract);
+        }
     }
     for (id, (parent, detail)) in out {
         store.annotate_session(&id, parent, Value::Object(detail));
+    }
+}
+fn caller_scope(caller: &Caller) -> Option<&Scope> {
+    match caller {
+        Caller::Hosted { scope, .. } | Caller::Operator { scope, .. } => Some(scope),
+        Caller::External(_) => None,
     }
 }
 fn key_ok(reply: &Replier) -> bool {
@@ -1984,22 +2749,41 @@ fn key_ok(reply: &Replier) -> bool {
     }
 }
 
+/// What a scope shows its subscribers after the host closed its idle runtime.
+fn live_detail_after_drop(recovered: &ScopeState) -> Value {
+    let mut detail = recovered.detail.clone();
+    detail["notice"] = json!("Idle session ended. Select a thread to resume it.");
+    detail
+}
+
 fn restore(rows: &mut Vec<wire::SessionView>, recovered: &[wire::SessionView]) {
     for saved in recovered {
         if let Some(row) = rows.iter_mut().find(|r| r.id == saved.id) {
-            if row.detail["owned"] != true && saved.status == "interrupted" {
-                row.status.clone_from(&saved.status);
-            }
-            row.detail["owned"] = true.into();
-            row.detail["recovered"] = true.into();
+            restore_row(row, saved);
         } else {
             rows.push(saved.clone());
         }
     }
 }
 
+// Until the runtime owns the session again, its catalog only describes the journal.
+// Keep the interrupted run and its launch metadata in snapshots and single-row updates.
+fn restore_row(row: &mut wire::SessionView, saved: &wire::SessionView) {
+    if row.detail["owned"] != true && saved.status == "interrupted" {
+        row.status.clone_from(&saved.status);
+    }
+    row.detail["owned"] = true.into();
+    row.detail["recovered"] = true.into();
+    for key in ["resume_access", "worker_marks", "origin"] {
+        if row.detail[key].is_null() && !saved.detail[key].is_null() {
+            row.detail[key] = saved.detail[key].clone();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::flows::ENDED_PARENT;
     use super::*;
     use ox_desk_core::{codex::frame::Frame, links::codex, runtime::Route, store::Profile};
 
@@ -2044,6 +2828,8 @@ mod tests {
                 inbox: Inbox::new(|| {}),
                 generation: 1,
                 tokens: HashMap::new(),
+                tracker: Tracker::new(),
+                held_handoff: None,
             },
         );
         let read = |line: &[u8]| LinkEvent::Frame(Frame::decode(line, |_| None).unwrap());
@@ -2076,6 +2862,322 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_slow_native_read_in_one_scope_does_not_stall_the_host() {
+        let root = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig {
+            ox: "/bin/false".into(),
+            path: "/bin".into(),
+            desktop: root.path().into(),
+        };
+        let (tx, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut engine = Engine::open(config, root.path(), tx).unwrap();
+        let live = |dir: &str, hold: bool| {
+            let project = root.path().join(dir);
+            std::fs::create_dir_all(&project).unwrap();
+            let scope = Scope {
+                project,
+                route: Route::CODEX_SUBSCRIPTION,
+            };
+            let link =
+                codex::Link::from_command(std::process::Command::new("/bin/cat"), |_| {}).unwrap();
+            let mut store = Store::open(
+                Profile {
+                    project: scope.project.clone(),
+                    route: scope.route.clone(),
+                    provider: "openai".into(),
+                },
+                link,
+            )
+            .unwrap();
+            if hold {
+                // The runtime never answers this read: it is "slow" for the whole test.
+                store.hold_native_read_for_test("thread-native");
+            }
+            (
+                scope.clone(),
+                Live {
+                    state: store.host_snapshot(&scope),
+                    store,
+                    launching: None,
+                    fork_origin: None,
+                    confirming: None,
+                    opening: None,
+                    terminal: None,
+                    schema_started: true,
+                    recovered: vec![],
+                    inbox: Inbox::new(|| {}),
+                    generation: 1,
+                    tokens: HashMap::new(),
+                    tracker: Tracker::new(),
+                    held_handoff: None,
+                },
+            )
+        };
+        for (scope, live) in [live("slow", true), live("quick", false)] {
+            engine.running.insert(scope, live);
+        }
+        let (peer, frames) = crate::transport::test_peer();
+        engine.clients.insert(
+            1,
+            ClientState {
+                peer,
+                hello: true,
+                prepared: None,
+                subscription: None,
+                catalog: false,
+                terminal: false,
+            },
+        );
+        let (mailbox, rx) = std::sync::mpsc::sync_channel(64);
+        let host = std::thread::spawn(move || {
+            engine.serve(rx).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let asked = Instant::now();
+        mailbox
+            .send(Message::Request(
+                1,
+                Box::new(Client::ListProcesses { id: "p".into() }),
+            ))
+            .unwrap();
+        let packet = frames
+            .recv_timeout(Duration::from_secs(2))
+            .expect("ListProcesses is answered while a native read is outstanding");
+        assert!(matches!(
+            serde_json::from_slice::<Server>(&packet).unwrap(),
+            Server::Processes { .. }
+        ));
+        assert!(asked.elapsed() < Duration::from_secs(1));
+        mailbox.send(Message::Stop).unwrap();
+        let stopped = Instant::now();
+        while !host.is_finished() && stopped.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(host.is_finished(), "Stop is serviced promptly");
+        host.join().unwrap();
+    }
+
+    #[test]
+    fn a_refused_action_retried_with_the_same_key_runs_once_it_is_valid() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = Scope {
+            project: root.path().to_owned(),
+            route: Route::CODEX_SUBSCRIPTION,
+        };
+        let config = RuntimeConfig {
+            ox: "/bin/false".into(),
+            path: "/bin".into(),
+            desktop: root.path().into(),
+        };
+        let (tx, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut engine = Engine::open(config, root.path(), tx).unwrap();
+        let link =
+            codex::Link::from_command(std::process::Command::new("/bin/cat"), |_| {}).unwrap();
+        let store = Store::open(
+            Profile {
+                project: scope.project.clone(),
+                route: scope.route.clone(),
+                provider: "openai".into(),
+            },
+            link,
+        )
+        .unwrap();
+        engine.running.insert(
+            scope.clone(),
+            Live {
+                state: store.host_snapshot(&scope),
+                store,
+                launching: None,
+                fork_origin: None,
+                confirming: None,
+                opening: None,
+                terminal: None,
+                schema_started: true,
+                recovered: vec![],
+                inbox: Inbox::new(|| {}),
+                generation: 1,
+                tokens: HashMap::new(),
+                tracker: Tracker::new(),
+                held_handoff: None,
+            },
+        );
+        let ask = LinkEvent::Frame(
+            Frame::decode(
+                br#"{"id":7,"method":"item/commandExecution/requestApproval","params":{"threadId":"a","turnId":"t","itemId":"i","command":"test"}}"#,
+                |_| None,
+            )
+            .unwrap(),
+        );
+        engine.process(&scope, vec![ask], false).unwrap();
+        let token = engine.running[&scope].state.asks[0].token.clone();
+        let (peer, frames) = crate::transport::test_peer();
+        engine.clients.insert(
+            1,
+            ClientState {
+                peer,
+                hello: true,
+                prepared: None,
+                subscription: Some(Some(scope.clone())),
+                catalog: false,
+                terminal: false,
+            },
+        );
+        let act = |approval: Option<String>| Client::Act {
+            id: "retry".into(),
+            scope: scope.clone(),
+            action: Action::AnswerAsk(RequestId::Number(7), 0),
+            approval,
+        };
+        // The first attempt is refused for lack of approval; the same key with the approval must run.
+        engine.request(1, act(None)).unwrap();
+        engine.request(1, act(Some(token))).unwrap();
+        let sent: Vec<Server> = frames
+            .try_iter()
+            .map(|p| serde_json::from_slice(&p).unwrap())
+            .filter(|f| !matches!(f, Server::Delta { .. }))
+            .collect();
+        assert!(
+            matches!(sent.as_slice(), [Server::Error { .. }, Server::Ack { .. }]),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn catalog_watchers_get_catalog_deltas_and_all_scope_subscribers_get_everything() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = Scope {
+            project: root.path().to_owned(),
+            route: Route::CODEX_SUBSCRIPTION,
+        };
+        let config = RuntimeConfig {
+            ox: "/bin/false".into(),
+            path: "/bin".into(),
+            desktop: root.path().into(),
+        };
+        let (tx, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut engine = Engine::open(config, root.path(), tx).unwrap();
+        let mut client = |id: u64, subscription: Option<Option<Scope>>, catalog: bool| {
+            let (peer, frames) = crate::transport::test_peer();
+            engine.clients.insert(
+                id,
+                ClientState {
+                    peer,
+                    hello: true,
+                    prepared: None,
+                    subscription,
+                    catalog,
+                    terminal: false,
+                },
+            );
+            frames
+        };
+        let legacy = client(1, Some(None), false);
+        let watcher = client(2, None, true);
+        let scoped = client(3, Some(Some(scope.clone())), false);
+        let session = wire::SessionView {
+            id: "t".into(),
+            title: "Title".into(),
+            parent: None,
+            status: "idle".into(),
+            updated_at: 1,
+            capabilities: vec![],
+            detail: json!({"owned": true, "row": true}),
+        };
+        let transcript = Change::Transcript {
+            thread: "t".into(),
+            timeline: wire::Timeline {
+                items: vec![],
+                detail: Value::Null,
+            },
+        };
+        engine
+            .broadcast(
+                &scope,
+                vec![
+                    Change::Sessions {
+                        sessions: vec![session],
+                    },
+                    transcript,
+                    Change::Notification {
+                        thread: "t".into(),
+                        title: "Title".into(),
+                        event: ox_desk_core::host_protocol::NotificationKind::Finished,
+                    },
+                ],
+            )
+            .unwrap();
+        let decode =
+            |frames: std::sync::mpsc::Receiver<crate::transport::Packet>| -> Vec<Vec<Change>> {
+                frames
+                    .try_iter()
+                    .map(|p| match serde_json::from_slice(&p).unwrap() {
+                        Server::Delta { changes, .. } => changes,
+                        other => panic!("unexpected frame {other:?}"),
+                    })
+                    .collect()
+            };
+        // A scope-less Subscribe means every scope: the phone and web push need its
+        // asks and notifications, so it receives the full packet like on main.
+        let all = decode(legacy);
+        assert_eq!(all.len(), 1);
+        assert!(
+            all[0]
+                .iter()
+                .any(|c| matches!(c, Change::Transcript { .. }))
+        );
+        assert!(
+            all[0]
+                .iter()
+                .any(|c| matches!(c, Change::Notification { .. }))
+        );
+        {
+            let frames = decode(watcher);
+            assert_eq!(frames.len(), 1);
+            assert!(
+                frames[0]
+                    .iter()
+                    .all(|c| !matches!(c, Change::Transcript { .. })),
+                "{frames:?}"
+            );
+            assert!(matches!(
+                frames[0].as_slice(),
+                [Change::Sessions { .. }, Change::Notification { .. }]
+            ));
+        }
+        let scoped = decode(scoped);
+        assert_eq!(scoped.len(), 1);
+        assert!(
+            scoped[0]
+                .iter()
+                .any(|c| matches!(c, Change::Transcript { .. }))
+        );
+    }
+
+    #[test]
+    fn a_failed_settings_read_keeps_the_last_project_default() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = Scope {
+            project: root.path().to_owned(),
+            route: Route::CODEX_SUBSCRIPTION,
+        };
+        let config = RuntimeConfig {
+            ox: "/bin/false".into(),
+            path: "/bin".into(),
+            desktop: root.path().into(),
+        };
+        let (tx, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut engine = Engine::open(config, root.path(), tx).unwrap();
+        // Every settings read fails here, so no default has ever been seen.
+        assert!(engine.yolo_grant(&scope, "session").is_none());
+        // Once a read has succeeded, a later failure keeps honouring that default.
+        engine.yolo_projects = vec![scope.project.clone()];
+        assert!(matches!(
+            engine.yolo_grant(&scope, "session"),
+            Some(YoloAllowance::Grant { session: None, .. })
+        ));
     }
 
     mod workers {
@@ -2200,6 +3302,8 @@ mod tests {
                     inbox: Inbox::new(|| {}),
                     generation: 1,
                     tokens: HashMap::new(),
+                    tracker: Tracker::new(),
+                    held_handoff: None,
                 },
                 log,
             )
@@ -2251,6 +3355,7 @@ mod tests {
                 write: Some(write),
                 permission: None,
                 yolo_confirmed: false,
+                max_minutes: None,
             }
         }
 
@@ -2500,6 +3605,7 @@ mod tests {
                         prepared: None,
                         subscription: Some(Some(worker.clone())),
                         catalog: false,
+                        terminal: false,
                     },
                 );
             }
@@ -2720,6 +3826,7 @@ mod tests {
                     write: Some(true),
                     permission: None,
                     yolo_confirmed: false,
+                    max_minutes: None,
                 },
                 41,
                 ox_desk_core::modes::Resolved {
@@ -3214,6 +4321,118 @@ mod tests {
         }
 
         #[test]
+        fn a_grant_expires_after_twelve_hours_and_ends_with_its_session() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, _worker, _) = routes(root.path());
+            with_parent(&mut engine, &parent, "yolo");
+            engine
+                .act(1, "g1", &parent, Action::YoloGrant("a".into(), true), None)
+                .unwrap();
+            let grant = engine.ledger.data.grants[0].clone();
+            assert!(grant.granted_at > 0);
+            assert_eq!(grant.expires_at(), grant.granted_at + 12 * 3600);
+            assert!(engine.yolo_grant(&parent, "a").is_some());
+            // Past twelve hours the grant no longer covers anything and is pruned.
+            engine
+                .ledger
+                .change(|d| d.grants[0].granted_at -= 12 * 3600 + 1)
+                .unwrap();
+            assert!(engine.yolo_grant(&parent, "a").is_none());
+            assert!(engine.ledger.data.grants.is_empty());
+            // A fresh grant is removed when its session is ended.
+            engine
+                .act(1, "g2", &parent, Action::YoloGrant("a".into(), true), None)
+                .unwrap();
+            engine.drop_grant(&parent, "a").unwrap();
+            assert!(engine.yolo_grant(&parent, "a").is_none());
+        }
+
+        #[test]
+        fn a_project_yolo_default_is_announced_once() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, _worker, _) = routes(root.path());
+            with_parent(&mut engine, &parent, "yolo");
+            engine.yolo_projects = vec![parent.project.clone()];
+            assert!(engine.yolo_grant(&parent, "a").is_some());
+            let notice = engine.running[&parent].store.notice().map(str::to_owned);
+            assert!(
+                notice
+                    .unwrap()
+                    .contains("YOLO is on for this project by default")
+            );
+            engine
+                .running
+                .get_mut(&parent)
+                .unwrap()
+                .store
+                .dismiss_notice();
+            assert!(engine.yolo_grant(&parent, "a").is_some());
+            assert!(
+                engine.running[&parent].store.notice().is_none(),
+                "announced once"
+            );
+        }
+
+        #[test]
+        fn a_parent_runs_at_most_the_capped_number_of_workers_and_expired_ones_stop() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker, _) = routes(root.path());
+            with_parent(&mut engine, &parent, "workspace");
+            let ids = ["w1", "w2", "w3", "w4"];
+            engine.running.insert(
+                worker.clone(),
+                live(
+                    &worker,
+                    ids.iter()
+                        .map(|id| view(&worker, id, "running", "read_only"))
+                        .collect(),
+                    &ids,
+                    vec![],
+                )
+                .0,
+            );
+            let parent_ref = workers_parent(&parent, "a");
+            for (n, id) in ids.iter().enumerate() {
+                let mut o = origin(parent_ref.clone(), Ceiling::Write);
+                o.job_id = 100 + n as u64;
+                engine.workers.stamp(&worker, id, o);
+            }
+            assert!(
+                engine.check_worker_cap_with(&parent_ref, None).is_ok(),
+                "no limit by default"
+            );
+            let err = engine
+                .check_worker_cap_with(&parent_ref, Some(4))
+                .unwrap_err();
+            assert!(err.contains("OX_WORKER_MAX_PER_PARENT"), "{err}");
+            // A write worker beside running write workers is warned, a read one is not.
+            assert!(
+                engine
+                    .write_overlap(&worker, Ceiling::Write)
+                    .unwrap()
+                    .contains("git worktree")
+            );
+            assert!(engine.write_overlap(&worker, Ceiling::Read).is_none());
+            // Past its limit a running worker is stopped and reported as expired.
+            let entry = engine.workers.get_mut(&worker, "w1").unwrap();
+            entry.marks.max_minutes = Some(1);
+            entry.marks.started_at -= 120;
+            entry.marks.run_started_at -= 120;
+            engine.expire_workers().unwrap();
+            let status = engine.job_status(100).unwrap();
+            assert_eq!(status["status"], "cancelled");
+            assert!(status["error"].as_str().unwrap().contains("1 minutes"));
+            assert!(status["elapsed_seconds"].as_i64().unwrap() >= 120);
+            assert_eq!(engine.job_status(101).unwrap()["status"], "running");
+        }
+
+        #[test]
         fn a_grant_covers_descendants_and_revoking_it_makes_the_next_spawn_ask() {
             let root = tempfile::tempdir().unwrap();
             let (tx, _rx) = std::sync::mpsc::sync_channel(64);
@@ -3352,6 +4571,74 @@ mod tests {
             assert!(
                 !engine.running.contains_key(&worker),
                 "nothing is relaunched"
+            );
+        }
+
+        /// A live parent asks for a YOLO worker; the operator has not answered yet.
+        fn waiting_yolo_request(engine: &mut Engine, parent: &Scope, worker: &Scope) -> u64 {
+            with_parent(engine, parent, "yolo");
+            engine
+                .running
+                .insert(worker.clone(), live(worker, vec![], &[], vec![]).0);
+            let (done, result) = std::sync::mpsc::sync_channel(1);
+            let mut s = inherit(Runtime::Codex);
+            s.yolo_confirmed = true;
+            engine
+                .launch(thread(parent, "a"), s, Replier::Channel(done))
+                .unwrap();
+            let waiting = result.try_recv().unwrap().unwrap();
+            assert_eq!(waiting["status"], "waiting_for_operator");
+            let job = waiting["job_id"].as_u64().unwrap();
+            assert!(engine.asking.contains_key(&job));
+            job
+        }
+
+        #[test]
+        fn ending_the_parent_withdraws_its_worker_yolo_request_and_a_late_answer_is_refused() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker, _) = routes(root.path());
+            let job = waiting_yolo_request(&mut engine, &parent, &worker);
+            // The fixture store has no live process to end, so run the step that follows the end.
+            engine.end_children(&parent, "a").unwrap();
+            assert!(!engine.asking.contains_key(&job), "ask withdrawn");
+            assert!(engine.ledger.data.asking.is_empty(), "ledger cleared");
+            let outcome = engine
+                .ledger
+                .data
+                .outcomes
+                .iter()
+                .find(|o| o.origin.job_id == job)
+                .expect("a cancelled outcome");
+            assert_eq!(outcome.status, "cancelled");
+            assert_eq!(outcome.message, ENDED_PARENT);
+            // A late answer cannot start the worker.
+            assert!(engine.answer_yolo(7, &parent, job, 0).is_err());
+            assert!(
+                engine.running[&worker].launching.is_none(),
+                "nothing started"
+            );
+        }
+
+        #[test]
+        fn a_yolo_answer_is_refused_once_its_parent_session_is_no_longer_live() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker, _) = routes(root.path());
+            let job = waiting_yolo_request(&mut engine, &parent, &worker);
+            // The parent's route goes away without the end path running.
+            engine.running.remove(&parent);
+            let refused = engine.answer_yolo(7, &parent, job, 0).unwrap_err();
+            assert_eq!(refused.to_string(), ENDED_PARENT);
+            assert!(
+                !engine.asking.contains_key(&job),
+                "the stale ask is withdrawn"
+            );
+            assert!(
+                engine.running[&worker].launching.is_none(),
+                "nothing started"
             );
         }
 
@@ -3825,6 +5112,1060 @@ mod tests {
                 launch: "l".into(),
             });
             assert!(read(&mut engine, terminal, None, None).is_err());
+        }
+
+        /// A Live whose store is a real local Codex store on an inert stdio process.
+        fn local_live(scope: &Scope) -> Live {
+            let link =
+                codex::Link::from_command(std::process::Command::new("/bin/cat"), |_| {}).unwrap();
+            let store = Store::open(
+                ox_desk_core::store::Profile {
+                    project: scope.project.clone(),
+                    route: scope.route.clone(),
+                    provider: "openai".into(),
+                },
+                link,
+            )
+            .unwrap();
+            Live {
+                state: store.host_snapshot(scope),
+                store,
+                launching: None,
+                fork_origin: None,
+                confirming: None,
+                opening: None,
+                terminal: None,
+                schema_started: true,
+                recovered: vec![],
+                inbox: Inbox::new(|| {}),
+                generation: 1,
+                tokens: HashMap::new(),
+                tracker: Tracker::new(),
+                held_handoff: None,
+            }
+        }
+
+        /// A real Claude store over a fake stock helper, with its first blank consumed by
+        /// a lead turn: the state a warm route is in when a worker starts.
+        fn warm_claude(
+            root: &Path,
+        ) -> (
+            Scope,
+            String,
+            Engine,
+            std::sync::mpsc::Receiver<ox_desk_core::links::LinkEvent>,
+        ) {
+            use ox_desk_core::store::claude::{Launcher, SUBSCRIPTION_PROVIDER};
+            use std::os::unix::fs::PermissionsExt;
+            let helper = root.join("private-fixture");
+            std::fs::write(
+                &helper,
+                r#"#!/usr/bin/python3
+import json,sys
+mode=sys.argv[sys.argv.index("--permission-mode")+1] if "--permission-mode" in sys.argv else "default"
+sid=next((sys.argv[i+1] for i,a in enumerate(sys.argv) if a in ("--session-id","--resume")),"none")
+open("argv-"+sid,"a").write(json.dumps(sys.argv)+"\n")
+if "--session-id" in sys.argv:
+ import os,re
+ d=os.path.join(os.getcwd(),"native","projects",re.sub("[^A-Za-z0-9]","-",os.path.realpath(os.getcwd())))
+ os.makedirs(d,exist_ok=True)
+ u="00000000-0000-4000-8000-0000000000"
+ rows=[{"type":k,"uuid":u+n,"cwd":os.path.realpath(os.getcwd()),"sessionId":sid,"entrypoint":"sdk-cli","message":{"role":k,"id":u+n,"content":"hi" if k=="user" else [{"type":"text","text":"ok"}]}} for k,n in (("user","01"),("assistant","02"))]
+ open(os.path.join(d,sid+".jsonl"),"w").write("".join(json.dumps(r)+"\n" for r in rows))
+for line in sys.stdin:
+ r=json.loads(line)
+ if r.get("type")=="control_request":
+  body=r["request"]
+  if body.get("subtype")=="set_permission_mode":
+   mode=body["mode"]
+   data={"mode":mode}
+  else:
+   data={"claude_code_version":"2.2.0","current_permission_mode":mode,"commands":[],"models":[],"account":{"apiProvider":"firstParty","subscriptionType":"pro"}}
+  print(json.dumps({"type":"control_response","response":{"request_id":r["request_id"],"subtype":"success","response":data}}),flush=True)
+ elif r.get("type")=="user":
+  print(json.dumps({"type":"user","message":r["message"],"uuid":r.get("uuid"),"session_id":sid,"isReplay":True}),flush=True)
+  print(json.dumps({"type":"result","subtype":"success","is_error":False,"session_id":sid,"stop_reason":"end_turn","result":"ok"}),flush=True)
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let scope = Scope {
+                project: root.to_owned(),
+                route: Runtime::Claude.route(None),
+            };
+            let (etx, rx) = std::sync::mpsc::channel();
+            let mut store = Store::open_claude(
+                ox_desk_core::store::Profile {
+                    project: scope.project.clone(),
+                    route: scope.route.clone(),
+                    provider: SUBSCRIPTION_PROVIDER.into(),
+                },
+                Launcher {
+                    ox: helper,
+                    path: "/bin:/usr/bin".into(),
+                    profiles: ox_desk_core::claude::catalog::Profiles {
+                        api: root.join("api"),
+                        subscription: root.join("native"),
+                    },
+                    index: root.join("index.json"),
+                    aliases: vec![],
+                },
+                move |event| {
+                    let _ = etx.send(event);
+                },
+            )
+            .unwrap();
+            while !store.can_send(None) {
+                store.apply(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            }
+            store
+                .dispatch(Action::SendText(None, "lead first turn".into()))
+                .unwrap();
+            let lead = store.take_opened().unwrap();
+            let mut live = local_live(&scope);
+            live.state = store.host_snapshot(&scope);
+            live.store = store;
+            let (tx, _) = std::sync::mpsc::sync_channel(128);
+            let mut engine = Engine::open(config(root), root, tx).unwrap();
+            engine.running.insert(scope.clone(), live);
+            (scope, lead, engine, rx)
+        }
+        /// Start one session worker from `lead` on the lead's own warm route and drive the
+        /// host until its launch answers.
+        fn launch_on_warm_claude(
+            engine: &mut Engine,
+            scope: &Scope,
+            lead: &str,
+            rx: &std::sync::mpsc::Receiver<ox_desk_core::links::LinkEvent>,
+        ) -> Result<Value, String> {
+            let caller = Caller::Operator {
+                scope: scope.clone(),
+                parent: lead.to_owned(),
+                device: "probe".into(),
+            };
+            let mut request = start(false);
+            request.runtime = Runtime::Claude;
+            request.model = None;
+            request.parent = lead.to_owned();
+            request.mode = WorkerMode::Session;
+            let (reply, answered) = std::sync::mpsc::sync_channel(1);
+            engine
+                .launch(caller, request, Replier::Channel(reply))
+                .unwrap();
+            let until = Instant::now() + Duration::from_secs(20);
+            loop {
+                while let Ok(event) = rx.try_recv() {
+                    engine.running.get_mut(scope).unwrap().store.apply(event);
+                }
+                engine.process(scope, vec![], false).unwrap();
+                if let Ok(result) = answered.try_recv() {
+                    return result;
+                }
+                if Instant::now() >= until {
+                    let live = &engine.running[scope];
+                    panic!(
+                        "the launch never answered: stage {:?}, can_send {}, missing {}, next {:?}, applied {:?}, notice {:?}",
+                        live.launching.as_ref().map(|l| match l.stage {
+                            Stage::Opening => "opening",
+                            Stage::AccessRequested => "access",
+                            Stage::Sent => "sent",
+                        }),
+                        live.store.can_send(None),
+                        live.store.claude_blank_missing(),
+                        live.store.next_access(),
+                        live.store.applied_access(None),
+                        live.store.notice(),
+                    );
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        #[test]
+        fn a_worker_starts_on_a_warm_claude_route_whose_blank_was_consumed() {
+            let root = tempfile::tempdir().unwrap();
+            let (scope, lead, mut engine, rx) = warm_claude(root.path());
+            assert!(
+                !engine.running[&scope].store.can_send(None),
+                "the lead's send consumed the blank"
+            );
+            // Two consecutive workers on the lead's own route: each send consumes the
+            // blank again, and each launch prepares the next one itself.
+            let mut sessions = Vec::new();
+            for _ in 0..2 {
+                let done = launch_on_warm_claude(&mut engine, &scope, &lead, &rx)
+                    .expect("a worker starts on a warm route");
+                sessions.push(done["session"].as_str().unwrap().to_owned());
+            }
+            assert_ne!(sessions[0], sessions[1]);
+            assert!(sessions.iter().all(|s| s != &lead));
+        }
+
+        #[test]
+        fn continue_in_claude_starts_on_an_already_used_route_without_a_new_draft() {
+            let root = tempfile::tempdir().unwrap();
+            let (scope, lead, mut engine, rx) = warm_claude(root.path());
+            let mut o = origin(workers_parent(&scope, &lead), Ceiling::Read);
+            o.runtime = Runtime::Claude;
+            o.route = Runtime::Claude.route(None);
+            o.relation = Relation::Handoff;
+            o.started = Some(ox_desk_core::runtime::Access::Plan);
+            let (reply, answered) = std::sync::mpsc::sync_channel(1);
+            engine.running.get_mut(&scope).unwrap().launching = Some(Launching {
+                origin: o,
+                payload: Payload::Handoff {
+                    text: "carry on".into(),
+                    items: vec![],
+                    record: "h1".into(),
+                },
+                reply: Replier::Channel(reply),
+                stage: Stage::Opening,
+                deadline: Instant::now() + Duration::from_secs(60),
+                detached: false,
+                abandoned: false,
+            });
+            let until = Instant::now() + Duration::from_secs(20);
+            let result = loop {
+                while let Ok(event) = rx.try_recv() {
+                    engine.running.get_mut(&scope).unwrap().store.apply(event);
+                }
+                engine.process(&scope, vec![], false).unwrap();
+                if let Ok(result) = answered.try_recv() {
+                    break result;
+                }
+                assert!(Instant::now() < until, "the handoff never started");
+                thread::sleep(Duration::from_millis(20));
+            };
+            let done = result.expect("the handoff target started");
+            assert_ne!(done["session"], json!(lead));
+        }
+
+        #[test]
+        fn a_pending_yolo_request_keeps_its_idle_parent_busy_until_a_confirmed_end() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker, _) = routes(root.path());
+            let job = waiting_yolo_request(&mut engine, &parent, &worker);
+            engine.running.insert(
+                parent.clone(),
+                live(
+                    &parent,
+                    vec![view(&parent, "a", "idle", "yolo")],
+                    &[],
+                    vec![],
+                )
+                .0,
+            );
+            engine.process(&parent, vec![], true).unwrap();
+            assert!(engine.thread_busy(&parent, "a"), "an owed decision is busy");
+            // The process list and the reaper read the same busy state.
+            assert!(
+                engine
+                    .scope_rows(&parent, &engine.running[&parent], vec!["a".into()])
+                    .iter()
+                    .all(|p| p.running)
+            );
+            // End idle and automatic reaping both leave the request for the operator.
+            let refused = engine
+                .act(1, "e1", &parent, Action::EndSession("a".into()), None)
+                .unwrap_err();
+            assert!(refused.to_string().contains("busy"), "{refused}");
+            engine
+                .reap_idle(Instant::now() + Duration::from_secs(86_400))
+                .unwrap();
+            assert!(engine.asking.contains_key(&job), "reaping kept the request");
+            // An explicit, confirmed End withdraws it.
+            engine.end_children(&parent, "a").unwrap();
+            assert!(!engine.asking.contains_key(&job));
+        }
+
+        #[test]
+        fn a_workers_final_answer_survives_reaping_and_a_host_restart() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker) = scopes(root.path());
+            let mut child = live(
+                &worker,
+                vec![view(&worker, "w", "idle", "read_only")],
+                &[],
+                vec![],
+            )
+            .0;
+            let mut hist = timeline(&[("final", "assistant", "finished answer")], false);
+            hist.detail["last_finished"] = json!("final-turn");
+            child.state.transcripts.insert("w".into(), hist);
+            engine.running.insert(worker.clone(), child);
+            engine.workers.stamp(
+                &worker,
+                "w",
+                origin(workers_parent(&parent, "p"), Ceiling::Read),
+            );
+            engine.process(&worker, vec![], true).unwrap();
+            let before = engine.job_status(41).unwrap();
+            assert_eq!(before["status"], "completed");
+            assert_eq!(before["result"], "finished answer");
+            engine.reap_empty(&worker).unwrap();
+            assert!(engine.cold.contains_key(&worker));
+            let after = engine.job_status(41).unwrap();
+            assert_eq!(after["status"], "completed", "{after}");
+            assert_eq!(after["result"], "finished answer");
+            // The host restarts: only the ledger on disk remains.
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let restarted = engine.job_status(41).unwrap();
+            assert_eq!(restarted["status"], "completed", "{restarted}");
+            assert_eq!(restarted["result"], "finished answer");
+            // The ledger holds the answer, not the transcript.
+            let saved = std::fs::read_to_string(root.path().join(crate::durable::LEDGER)).unwrap();
+            assert!(!saved.contains("turn-final"), "no transcript item saved");
+        }
+
+        #[test]
+        fn continuing_an_old_worker_measures_the_limit_from_the_new_run() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker) = scopes(root.path());
+            engine.running.insert(
+                worker.clone(),
+                live(
+                    &worker,
+                    vec![view(&worker, "w", "running", "read_only")],
+                    &["w"],
+                    vec![],
+                )
+                .0,
+            );
+            engine.workers.stamp(
+                &worker,
+                "w",
+                origin(workers_parent(&parent, "p"), Ceiling::Read),
+            );
+            let entry = engine.workers.get_mut(&worker, "w").unwrap();
+            entry.marks.max_minutes = Some(60);
+            // Launched ten hours ago; the operator continued it a minute ago.
+            entry.marks.started_at -= 10 * 3600;
+            entry.marks.run_started_at -= 60;
+            engine.expire_workers().unwrap();
+            assert_eq!(engine.job_status(41).unwrap()["status"], "running");
+            // The same worker really running past the limit in this run still expires.
+            engine
+                .workers
+                .get_mut(&worker, "w")
+                .unwrap()
+                .marks
+                .run_started_at -= 3600;
+            engine.expire_workers().unwrap();
+            assert_eq!(engine.job_status(41).unwrap()["status"], "cancelled");
+        }
+
+        #[test]
+        fn the_process_list_shows_the_warm_blank_as_a_draft_but_reaping_ignores_it() {
+            let root = tempfile::tempdir().unwrap();
+            let (scope, lead, mut engine, rx) = warm_claude(root.path());
+            let live = engine.running.get_mut(&scope).unwrap();
+            live.store.dispatch(Action::NewDraft).unwrap();
+            while !live.store.can_send(None) {
+                live.store
+                    .apply(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+            }
+            engine.process(&scope, vec![], false).unwrap();
+            let rows = engine.processes();
+            assert!(rows.iter().any(|p| p.draft), "{:?}", rows.len());
+            assert!(rows.iter().any(|p| !p.draft && p.threads == [lead.clone()]));
+            // The blank alone never keeps a route open: it is not a session.
+            assert_eq!(engine.running[&scope].store.live_threads(), [lead]);
+        }
+
+        #[test]
+        fn a_staged_worker_contract_binds_to_its_launch_not_to_the_next_new_session() {
+            let root = tempfile::tempdir().unwrap();
+            let (scope, _lead, mut engine, rx) = warm_claude(root.path());
+            let contract =
+                ox_desk_core::claude_worker_contract::Contract::with_support(true, false, true);
+            let live = engine.running.get_mut(&scope).unwrap();
+            live.store.dispatch(Action::NewDraft).unwrap();
+            live.store.stage_claude_worker(contract).unwrap();
+            let pump = |engine: &mut Engine, until: &dyn Fn(&Store) -> bool| {
+                let end = Instant::now() + Duration::from_secs(10);
+                while !until(&engine.running[&scope].store) {
+                    assert!(Instant::now() < end, "runtime never became ready");
+                    if let Ok(e) = rx.recv_timeout(Duration::from_millis(50)) {
+                        engine.running.get_mut(&scope).unwrap().store.apply(e);
+                    }
+                }
+            };
+            use ox_desk_core::store::claude::WorkerBlank;
+            pump(&mut engine, &|s| {
+                s.can_send(None) && s.claude_worker_state() == WorkerBlank::Ready
+            });
+            // The lead starts another session in the same window: a normal draft.
+            let live = engine.running.get_mut(&scope).unwrap();
+            live.store
+                .dispatch(Action::SendText(None, "lead again".into()))
+                .unwrap();
+            let other = live.store.take_opened().unwrap();
+            assert_eq!(
+                live.store.claude_worker_state(),
+                WorkerBlank::Ready,
+                "kept for its launch"
+            );
+            live.store
+                .send_on_worker_blank(Action::SendText(None, "worker task".into()))
+                .unwrap();
+            let worker = live.store.take_opened().unwrap();
+            assert_ne!(worker, other);
+            assert_eq!(live.store.claude_worker_state(), WorkerBlank::None);
+            let argv = |id: &str| {
+                std::fs::read_to_string(
+                    root.path()
+                        .join(format!("argv-{}", id.rsplit(':').next().unwrap())),
+                )
+                .unwrap_or_default()
+            };
+            let flag = contract.args().into_iter().next().expect("contract args");
+            let (w, o) = (argv(&worker), argv(&other));
+            assert!(!w.is_empty() && !o.is_empty(), "{w} / {o}");
+            assert!(w.contains(&flag), "worker lost its contract: {w}");
+            assert!(!o.contains(&flag), "the lead took the worker contract: {o}");
+        }
+
+        #[test]
+        fn a_worker_keeps_its_launch_contract_on_every_relaunch() {
+            use ox_desk_core::claude_worker_contract::Contract;
+            use ox_desk_core::store::claude::WorkerBlank;
+            let root = tempfile::tempdir().unwrap();
+            let (scope, _lead, mut engine, rx) = warm_claude(root.path());
+            let contract = Contract::with_support(true, false, true);
+            let pump = |engine: &mut Engine, until: &dyn Fn(&Store) -> bool| {
+                let end = Instant::now() + Duration::from_secs(10);
+                while !until(&engine.running[&scope].store) {
+                    assert!(Instant::now() < end, "runtime never became ready");
+                    if let Ok(e) = rx.recv_timeout(Duration::from_millis(50)) {
+                        engine.running.get_mut(&scope).unwrap().store.apply(e);
+                    }
+                }
+            };
+            let live = engine.running.get_mut(&scope).unwrap();
+            live.store.dispatch(Action::NewDraft).unwrap();
+            live.store.stage_claude_worker(contract).unwrap();
+            pump(&mut engine, &|s| {
+                s.can_send(None) && s.claude_worker_state() == WorkerBlank::Ready
+            });
+            let live = engine.running.get_mut(&scope).unwrap();
+            live.store
+                .send_on_worker_blank(Action::SendText(None, "worker task".into()))
+                .unwrap();
+            let worker = live.store.take_opened().unwrap();
+            let raw = worker.rsplit(':').next().unwrap().to_owned();
+            let argv = |id: &str| -> Vec<Vec<String>> {
+                std::fs::read_to_string(root.path().join(format!("argv-{id}")))
+                    .unwrap_or_default()
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect()
+            };
+            let policy = contract.args();
+            let has_policy =
+                |argv: &[String]| argv.windows(policy.len()).any(|w| w == policy.as_slice());
+            let at = |a: &[String], flag: &str| {
+                a.iter().position(|x| x == flag).map(|i| a[i + 1].clone())
+            };
+            pump(&mut engine, &|s| s.has_live_session(&worker));
+            let first = argv(&raw);
+            assert_eq!(first.len(), 1, "{first:?}");
+            assert!(has_policy(&first[0]), "initial launch: {:?}", first[0]);
+            // Let the journal and catalog row exist, then end the worker.
+            pump(&mut engine, &|s| s.catalog_row(&worker).is_some());
+            let live = engine.running.get_mut(&scope).unwrap();
+            live.store.end_session(&worker).unwrap();
+            // Cold resume after reap: a follow-up through SendText.
+            live.store
+                .dispatch(Action::DraftEdit(Some(worker.clone()), "follow-up".into()))
+                .unwrap();
+            live.store
+                .dispatch(Action::SendText(Some(worker.clone()), "follow-up".into()))
+                .unwrap();
+            let end = Instant::now() + Duration::from_secs(10);
+            while argv(&raw).len() < 2 {
+                assert!(Instant::now() < end, "no resumed launch");
+                if let Ok(e) = rx.recv_timeout(Duration::from_millis(50)) {
+                    engine.running.get_mut(&scope).unwrap().store.apply(e);
+                }
+            }
+            let resumed = argv(&raw);
+            assert!(has_policy(&resumed[1]), "resumed launch: {:?}", resumed[1]);
+            assert!(resumed[1].contains(&"--resume".to_owned()));
+            assert_eq!(
+                at(&resumed[1], "--permission-mode").as_deref(),
+                Some("acceptEdits")
+            );
+            assert_eq!(at(&resumed[1], "--tools"), at(&first[0], "--tools"));
+            assert_eq!(at(&resumed[1], "--settings"), at(&first[0], "--settings"));
+            // Both launches allow the same ordinary workspace command through Bash.
+            for a in [&first[0], &resumed[1]] {
+                let tools = at(a, "--tools").unwrap();
+                let allowed = at(a, "--allowedTools").unwrap();
+                assert!(tools.split(',').any(|t| t == "Bash"));
+                assert!(allowed.split(',').any(|t| t == "Bash"));
+                assert!(
+                    at(a, "--settings")
+                        .unwrap()
+                        .contains("autoAllowBashIfSandboxed")
+                );
+            }
+            // Fork shares the branch: it launches under the source's contract.
+            pump(&mut engine, &|s| s.can_manage_thread(&worker));
+            let live = engine.running.get_mut(&scope).unwrap();
+            live.store
+                .dispatch(Action::ForkThread(worker.clone()))
+                .unwrap();
+            let end = Instant::now() + Duration::from_secs(10);
+            while argv(&raw).len() < 3 {
+                assert!(Instant::now() < end, "no fork launch");
+                if let Ok(e) = rx.recv_timeout(Duration::from_millis(50)) {
+                    engine.running.get_mut(&scope).unwrap().store.apply(e);
+                }
+            }
+            let forked = argv(&raw);
+            assert!(
+                forked[2].contains(&"--fork-session".to_owned()),
+                "{:?}",
+                forked[2]
+            );
+            assert!(has_policy(&forked[2]), "fork launch: {:?}", forked[2]);
+            // A host restart: a fresh store knows the worker only from its persisted
+            // origin in the ledger, which the host applies when it opens the route.
+            let (parent, _) = scopes(root.path());
+            let mut stamp = origin(workers_parent(&parent, "p"), Ceiling::Write);
+            stamp.runtime = Runtime::Claude;
+            stamp.requested = Ceiling::Write;
+            engine.workers.stamp(&scope, &worker, stamp);
+            let (etx, rx2) = std::sync::mpsc::channel();
+            let mut fresh = Store::open_claude(
+                ox_desk_core::store::Profile {
+                    project: scope.project.clone(),
+                    route: scope.route.clone(),
+                    provider: ox_desk_core::store::claude::SUBSCRIPTION_PROVIDER.into(),
+                },
+                ox_desk_core::store::claude::Launcher {
+                    ox: root.path().join("private-fixture"),
+                    path: "/bin:/usr/bin".into(),
+                    profiles: ox_desk_core::claude::catalog::Profiles {
+                        api: root.path().join("api"),
+                        subscription: root.path().join("native"),
+                    },
+                    index: root.path().join("index.json"),
+                    aliases: vec![],
+                },
+                move |event| {
+                    let _ = etx.send(event);
+                },
+            )
+            .unwrap();
+            annotate(&engine.workers, &engine.ledger.data, &scope, &mut fresh);
+            fresh.restore_ended(&worker, "worker", 0, None);
+            let end = Instant::now() + Duration::from_secs(10);
+            while fresh.catalog_row(&worker).is_none() || !fresh.can_send(None) {
+                assert!(Instant::now() < end, "fresh store never listed the worker");
+                if let Ok(e) = rx2.recv_timeout(Duration::from_millis(50)) {
+                    fresh.apply(e);
+                }
+            }
+            fresh
+                .dispatch(Action::DraftEdit(
+                    Some(worker.clone()),
+                    "after restart".into(),
+                ))
+                .unwrap();
+            // The fork's own process may also log here, so pick the launch that
+            // resumes the worker after the restart rather than a fixed position.
+            let before = argv(&raw).len();
+            fresh
+                .dispatch(Action::SendText(
+                    Some(worker.clone()),
+                    "after restart".into(),
+                ))
+                .unwrap();
+            let resumes = |a: &Vec<String>| {
+                a.windows(2).any(|w| w[0] == "--resume" && w[1] == raw)
+                    && !a.contains(&"--fork-session".to_owned())
+            };
+            let end = Instant::now() + Duration::from_secs(10);
+            let restarted = loop {
+                if let Some(a) = argv(&raw).into_iter().skip(before).find(|a| resumes(a)) {
+                    break a;
+                }
+                assert!(
+                    Instant::now() < end,
+                    "no resume after restart: {:?}",
+                    argv(&raw)
+                );
+                if let Ok(e) = rx2.recv_timeout(Duration::from_millis(50)) {
+                    fresh.apply(e);
+                }
+            };
+            // After a restart the contract is re-derived from the saved origin on
+            // this machine: the same shell either way, sandboxed where Claude Code's
+            // sandbox can run (CI runners may lack bwrap and socat).
+            let here = Contract::detect(true, false).args();
+            assert!(
+                restarted.windows(here.len()).any(|w| w == here.as_slice()),
+                "after restart: {restarted:?}"
+            );
+            assert_eq!(
+                at(&restarted, "--permission-mode").as_deref(),
+                Some("acceptEdits")
+            );
+        }
+
+        #[test]
+        fn ending_a_thread_on_a_closed_route_starts_no_process() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (scope, _) = scopes(root.path());
+            engine.cold.insert(
+                scope.clone(),
+                crate::durable::SavedScope {
+                    scope: scope.clone(),
+                    sessions: vec![],
+                    pending: vec![],
+                }
+                .recover(),
+            );
+            let (peer, frames) = crate::transport::test_peer();
+            engine.clients.insert(
+                1,
+                ClientState {
+                    peer,
+                    hello: true,
+                    prepared: None,
+                    subscription: Some(Some(scope.clone())),
+                    catalog: false,
+                    terminal: false,
+                },
+            );
+            for (key, action) in [
+                ("e1", Action::EndSession("a".into())),
+                ("e2", Action::ForceEndSession("a".into())),
+                ("e1", Action::EndSession("a".into())),
+            ] {
+                engine
+                    .request(
+                        1,
+                        Client::Act {
+                            id: key.into(),
+                            scope: scope.clone(),
+                            action,
+                            approval: None,
+                        },
+                    )
+                    .unwrap();
+            }
+            assert!(
+                !engine.running.contains_key(&scope),
+                "no runtime was started"
+            );
+            let sent: Vec<Server> = frames
+                .try_iter()
+                .map(|p| serde_json::from_slice(&p).unwrap())
+                .collect();
+            assert!(
+                sent.iter().all(|f| matches!(f, Server::Ack { .. })),
+                "{sent:?}"
+            );
+        }
+
+        #[test]
+        fn ending_a_root_ends_a_live_grandchild_under_an_exited_middle_parent() {
+            let root = tempfile::tempdir().unwrap();
+            let (scope, lead, mut engine, rx) = warm_claude(root.path());
+            let middle = launch_on_warm_claude(&mut engine, &scope, &lead, &rx).unwrap()["session"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let leaf = launch_on_warm_claude(&mut engine, &scope, &middle, &rx).unwrap()["session"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let live =
+                |engine: &Engine, id: &str| engine.running[&scope].store.has_live_session(id);
+            assert!(live(&engine, &middle) && live(&engine, &leaf));
+            // The middle parent exits first: its child is no longer a live child of anything.
+            engine
+                .running
+                .get_mut(&scope)
+                .unwrap()
+                .store
+                .end_session(&middle)
+                .unwrap();
+            assert!(!live(&engine, &middle) && live(&engine, &leaf));
+            engine.end_children(&scope, &lead).unwrap();
+            assert!(!live(&engine, &leaf), "the grandchild is still running");
+        }
+
+        #[test]
+        fn a_launch_already_sent_when_its_parent_is_force_ended_retires_the_child_on_arrival() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker) = scopes(root.path());
+            engine.running.insert(
+                parent.clone(),
+                live(
+                    &parent,
+                    vec![view(&parent, "a", "idle", "workspace")],
+                    &[],
+                    vec![],
+                )
+                .0,
+            );
+            let (reply, answered) = std::sync::mpsc::sync_channel(1);
+            let mut starting = local_live(&worker);
+            starting.launching = Some(Launching {
+                origin: origin(workers_parent(&parent, "a"), Ceiling::Read),
+                payload: Payload::Worker(start(false)),
+                reply: Replier::Channel(reply),
+                stage: Stage::Sent,
+                deadline: Instant::now() + Duration::from_secs(60),
+                detached: false,
+                abandoned: false,
+            });
+            engine.running.insert(worker.clone(), starting);
+            engine.end_children(&parent, "a").unwrap();
+            let launch = engine
+                .running
+                .get_mut(&worker)
+                .unwrap()
+                .launching
+                .take()
+                .expect("a sent launch cannot be recalled");
+            assert!(launch.abandoned);
+            // The runtime reports the session after the parent ended.
+            engine.workers.stamp(&worker, "w", launch.origin.clone());
+            engine
+                .finish_launch(
+                    &worker,
+                    Some(Finished::new(launch, Ok(()), Some("w".into()))),
+                )
+                .unwrap();
+            let err = answered.try_recv().unwrap().unwrap_err();
+            assert_eq!(err, ENDED_PARENT);
+            assert_eq!(engine.job_status(41).unwrap()["status"], "cancelled");
+        }
+
+        #[test]
+        fn ending_a_busy_session_needs_force_and_an_idle_one_does_not() {
+            let root = tempfile::tempdir().unwrap();
+            let (scope, _) = scopes(root.path());
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (running, log) = live(
+                &scope,
+                vec![view(&scope, "a", "running", "workspace")],
+                &["a"],
+                vec![],
+            );
+            engine.running.insert(scope.clone(), running);
+            let refused = engine
+                .act(1, "e1", &scope, Action::EndSession("a".into()), None)
+                .unwrap_err();
+            assert!(refused.to_string().contains("busy"), "{refused}");
+            assert!(
+                !log.lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(a, _)| matches!(a, Action::EndSession(_))),
+                "a refused end reaches no runtime"
+            );
+            // Forced, it passes the guard and only then meets the missing live process.
+            let forced = engine
+                .act(1, "e2", &scope, Action::ForceEndSession("a".into()), None)
+                .unwrap_err();
+            assert!(forced.to_string().contains("no live process"), "{forced}");
+        }
+
+        #[test]
+        fn a_parent_stays_running_while_a_worker_it_started_is_busy() {
+            let root = tempfile::tempdir().unwrap();
+            let (parent, worker) = scopes(root.path());
+            let running_of_parent = |worker_turn: &[&str]| {
+                let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+                let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+                engine.running.insert(
+                    parent.clone(),
+                    live(
+                        &parent,
+                        vec![view(&parent, "a", "idle", "workspace")],
+                        &[],
+                        vec![],
+                    )
+                    .0,
+                );
+                engine.running.insert(
+                    worker.clone(),
+                    live(
+                        &worker,
+                        vec![view(&worker, "w", "running", "read_only")],
+                        worker_turn,
+                        vec![],
+                    )
+                    .0,
+                );
+                engine.workers.stamp(
+                    &worker,
+                    "w",
+                    origin(workers_parent(&parent, "a"), Ceiling::Read),
+                );
+                let live = &engine.running[&parent];
+                let rows = engine.scope_rows(&parent, live, vec!["a".into()]);
+                rows.first().expect("parent row").running
+            };
+            // The parent's own turn is done, but its worker is mid-turn on another scope.
+            assert!(running_of_parent(&["w"]));
+            // Both idle: the parent is not running.
+            assert!(!running_of_parent(&[]));
+        }
+
+        #[test]
+        fn the_reaper_decision_waits_for_the_whole_timeout_and_never_ends_busy_work() {
+            let timeout = Duration::from_secs(30 * 60);
+            assert!(!reapable(Duration::from_secs(29 * 60), timeout, false));
+            assert!(reapable(timeout, timeout, false));
+            assert!(reapable(timeout * 2, timeout, false));
+            assert!(!reapable(timeout * 2, timeout, true));
+            assert!(
+                !reapable(timeout * 2, Duration::ZERO, false),
+                "zero disables"
+            );
+            assert_eq!(idle_timeout(None), timeout);
+            assert_eq!(idle_timeout(Some("5")), Duration::from_secs(300));
+            assert_eq!(idle_timeout(Some(" 0 ")), Duration::ZERO);
+            assert_eq!(idle_timeout(Some("soon")), timeout);
+        }
+
+        #[test]
+        fn an_empty_codex_scope_is_dropped_and_stays_listed_for_a_later_subscriber() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (scope, _) = scopes(root.path());
+            engine.running.insert(scope.clone(), local_live(&scope));
+            assert!(engine.processes().is_empty(), "no thread, no process row");
+            // A thread that is not live cannot be ended.
+            assert!(engine.end_thread(&scope, "gone", false).is_err());
+            // A held handoff keeps the scope open until its subscriber takes it.
+            engine.running.get_mut(&scope).unwrap().held_handoff = Some((
+                "k".into(),
+                Server::Handoff {
+                    argv: vec![],
+                    id: "k".into(),
+                    scope: scope.clone(),
+                    thread: None,
+                    command: String::new(),
+                },
+                Instant::now() + Duration::from_secs(600),
+            ));
+            engine.reap_empty(&scope).unwrap();
+            assert!(engine.running.contains_key(&scope));
+            engine.running.get_mut(&scope).unwrap().held_handoff = None;
+            engine.reap_empty(&scope).unwrap();
+            assert!(!engine.running.contains_key(&scope), "app-server dropped");
+            assert_eq!(engine.cold[&scope].connection, "disconnected");
+        }
+
+        #[test]
+        fn idle_reaping_ends_nothing_while_unused_time_is_short() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (scope, _) = scopes(root.path());
+            engine.running.insert(scope.clone(), local_live(&scope));
+            engine.idle = Duration::from_secs(60);
+            engine.reap_idle(Instant::now()).unwrap();
+            assert!(engine.running.contains_key(&scope));
+            // An empty scope idle past the timeout is closed.
+            engine
+                .reap_idle(Instant::now() + Duration::from_secs(61))
+                .unwrap();
+            assert!(!engine.running.contains_key(&scope));
+        }
+
+        #[test]
+        fn a_handoff_held_for_a_gone_client_reaches_the_next_desktop_subscriber_only() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (scope, _) = scopes(root.path());
+            let mut live = local_live(&scope);
+            live.held_handoff = Some((
+                "k".into(),
+                Server::Handoff {
+                    argv: vec!["codex".into()],
+                    id: "k".into(),
+                    scope: scope.clone(),
+                    thread: Some("t".into()),
+                    command: String::new(),
+                },
+                Instant::now() + Duration::from_secs(600),
+            ));
+            engine.running.insert(scope.clone(), live);
+            let client = |terminal| {
+                let (peer, frames) = crate::transport::test_peer();
+                (
+                    ClientState {
+                        peer,
+                        hello: true,
+                        prepared: None,
+                        subscription: None,
+                        catalog: false,
+                        terminal,
+                    },
+                    frames,
+                )
+            };
+            let sent = |frames: &std::sync::mpsc::Receiver<crate::transport::Packet>| {
+                frames
+                    .try_iter()
+                    .map(|p| String::from_utf8_lossy(&p).into_owned())
+                    .collect::<Vec<_>>()
+            };
+            // A phone, push or operator subscriber of the scope never takes it.
+            let (phone, phone_frames) = client(false);
+            engine.clients.insert(8, phone);
+            engine.subscribe(8, Some(scope.clone()), None).unwrap();
+            assert!(
+                !sent(&phone_frames)
+                    .iter()
+                    .any(|f| f.contains("\"handoff\"")),
+                "a non-desktop subscriber received the terminal handoff"
+            );
+            assert!(engine.running[&scope].held_handoff.is_some());
+            let (desktop, frames) = client(true);
+            engine.clients.insert(9, desktop);
+            engine.subscribe(9, Some(scope.clone()), None).unwrap();
+            let sent = sent(&frames);
+            assert!(sent.iter().any(|f| f.contains("\"handoff\"")), "{sent:?}");
+            assert!(engine.running[&scope].held_handoff.is_none());
+        }
+
+        #[test]
+        fn an_expired_held_handoff_is_dropped_and_its_scope_reaped() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (scope, _) = scopes(root.path());
+            let mut live = local_live(&scope);
+            live.held_handoff = Some((
+                "k".into(),
+                Server::Handoff {
+                    argv: vec![],
+                    id: "k".into(),
+                    scope: scope.clone(),
+                    thread: None,
+                    command: String::new(),
+                },
+                Instant::now() + HELD_HANDOFF_TTL,
+            ));
+            engine.running.insert(scope.clone(), live);
+            // A scope-less subscriber never receives it.
+            let (peer, frames) = crate::transport::test_peer();
+            engine.clients.insert(
+                9,
+                ClientState {
+                    peer,
+                    hello: true,
+                    prepared: None,
+                    subscription: None,
+                    catalog: false,
+                    terminal: false,
+                },
+            );
+            engine.subscribe(9, None, None).unwrap();
+            assert!(
+                !frames
+                    .try_iter()
+                    .any(|p| String::from_utf8_lossy(&p).contains("\"handoff\""))
+            );
+            assert!(engine.running[&scope].held_handoff.is_some());
+            engine.idle = Duration::from_secs(3600);
+            engine.reap_idle(Instant::now()).unwrap();
+            assert!(engine.running.contains_key(&scope), "still held");
+            engine
+                .reap_idle(Instant::now() + HELD_HANDOFF_TTL + Duration::from_secs(1))
+                .unwrap();
+            assert!(!engine.running.contains_key(&scope), "expired and reaped");
+        }
+
+        #[test]
+        fn cancelling_a_worker_that_is_still_launching_aborts_the_launch() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker) = scopes(root.path());
+            let rows = vec![view(&parent, "a", "running", "workspace")];
+            engine
+                .running
+                .insert(parent.clone(), live(&parent, rows, &["a"], vec![]).0);
+            let mut starting = local_live(&worker);
+            let (reply, answered) = std::sync::mpsc::sync_channel(1);
+            starting.launching = Some(Launching {
+                origin: origin(workers_parent(&parent, "a"), Ceiling::Read),
+                payload: Payload::Worker(start(false)),
+                reply: Replier::Channel(reply),
+                stage: Stage::Opening,
+                deadline: Instant::now() + Duration::from_secs(60),
+                detached: false,
+                abandoned: false,
+            });
+            engine.running.insert(worker.clone(), starting);
+            let status = engine
+                .parent_call(&hosted(&parent), ParentCall::Status { job_id: 41 })
+                .unwrap();
+            assert_eq!(status["status"], "starting");
+            let done = engine
+                .parent_call(&hosted(&parent), ParentCall::Cancel { job_id: 41 })
+                .unwrap();
+            assert_eq!(done["status"], "cancelled");
+            let told = answered.try_recv().expect("the launcher is answered");
+            assert!(told.unwrap_err().contains("cancelled"));
+            assert!(
+                !engine.running.contains_key(&worker),
+                "the unused worker runtime is closed"
+            );
+            assert!(
+                engine
+                    .unstarted_jobs(&crate::workers::Resolved::Hosted {
+                        scope: parent.clone(),
+                        session: "a".into(),
+                    })
+                    .is_empty()
+            );
+        }
+
+        #[test]
+        fn a_launch_whose_message_is_already_sent_cannot_be_cancelled() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker) = scopes(root.path());
+            let mut sent = local_live(&worker);
+            let (reply, _answered) = std::sync::mpsc::sync_channel(1);
+            sent.launching = Some(Launching {
+                origin: origin(workers_parent(&parent, "a"), Ceiling::Read),
+                payload: Payload::Worker(start(false)),
+                reply: Replier::Channel(reply),
+                stage: Stage::Sent,
+                deadline: Instant::now() + Duration::from_secs(60),
+                detached: false,
+                abandoned: false,
+            });
+            engine.running.insert(worker.clone(), sent);
+            assert!(engine.abort_launch(41).unwrap().is_none());
+            assert!(engine.running[&worker].launching.is_some());
         }
     }
 }

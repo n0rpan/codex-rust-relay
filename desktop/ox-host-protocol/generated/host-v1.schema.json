@@ -455,6 +455,30 @@
         {
           "additionalProperties": false,
           "properties": {
+            "end_session": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "end_session"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "force_end_session": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "force_end_session"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
             "answer_ask": {
               "maxItems": 2,
               "minItems": 2,
@@ -1018,6 +1042,10 @@
                 }
               ]
             },
+            "terminal": {
+              "description": "The client is a desktop window that can take a terminal handoff held for its\nscope. Phones and other gateways never set it, and the web bridge refuses it.",
+              "type": "boolean"
+            },
             "type": {
               "const": "subscribe",
               "type": "string"
@@ -1082,6 +1110,24 @@
             "id",
             "caller",
             "start"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Ask for the live processes the host runs. Answered by `Server::Processes`.\nOnly clients that send this receive that frame, so older clients are unaffected.",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "list_processes",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id"
           ],
           "type": "object"
         },
@@ -1467,6 +1513,66 @@
           "type": "object"
         }
       ]
+    },
+    "ProcessView": {
+      "description": "One live process the host runs for a project and billing route.\n\nA Claude process serves one thread. A Codex app-server serves a scope and lists\nevery thread subscribed on it. To end a process, send `Action::EndSession(thread)`\nfor each id in `threads` (scoped to `scope`). The host refuses `EndSession` on a busy\nthread; `Action::ForceEndSession(thread)` ends it anyway, after the user confirmed.",
+      "properties": {
+        "draft": {
+          "description": "The blank process kept warm for new sessions (the sign-in and version probe), not a\nconversation. `kind` stays `claude`. End all idle skips it, since it respawns.",
+          "type": "boolean"
+        },
+        "kind": {
+          "description": "`claude`, `codex` or `worker` (every thread of the process is a host-owned worker).",
+          "type": "string"
+        },
+        "last_activity": {
+          "description": "Unix seconds of the last event or action on any of its threads.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "project": {
+          "type": "string"
+        },
+        "route": {
+          "description": "The scope's billing route label, such as the model alias.",
+          "type": "string"
+        },
+        "running": {
+          "description": "A turn is in progress or an approval is pending, so ending would lose work.",
+          "type": "boolean"
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "started_at": {
+          "description": "Unix seconds when the host started or first saw the process.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "threads": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "scope",
+        "project",
+        "threads",
+        "route",
+        "started_at",
+        "last_activity",
+        "running"
+      ],
+      "type": "object"
     },
     "Question": {
       "properties": {
@@ -1885,6 +1991,30 @@
           "type": "object"
         },
         {
+          "description": "The live processes of this host, newest first by start. Answers `Client::ListProcesses`.",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "processes": {
+              "items": {
+                "$ref": "#/$defs/ProcessView"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "processes",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "processes"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "id": {
               "type": [
@@ -2087,6 +2217,15 @@
       "additionalProperties": false,
       "description": "An operator's request to start a worker attached to a session in the subscribed scope.",
       "properties": {
+        "max_minutes": {
+          "description": "Wall-clock limit in minutes. Absent means no limit unless the host sets `OX_WORKER_MAX_MINUTES`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/WorkerMode"
         },

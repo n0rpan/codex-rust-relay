@@ -1,4 +1,6 @@
 //! Data shared by the OX desktop workbench and its native services.
+#[path = "../../../src/claude_worker_contract.rs"]
+pub mod claude_worker_contract;
 #[path = "../../../src/settings_protocol.rs"]
 pub mod settings_protocol;
 

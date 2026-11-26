@@ -53,6 +53,7 @@ fn spawn(
             billing,
             session,
             permission_mode: mode.into(),
+            contract: None,
         },
         move |e| {
             let _ = tx.send(e);
@@ -103,7 +104,14 @@ fn stock_version_and_billing_are_checked_before_user_input() {
         (
             minimum(),
             Billing::Subscription,
+            // A key in the environment is not fixed by signing in: no sign-in prompt.
             json!({"apiProvider":"firstParty","apiKeySource":"ANTHROPIC_API_KEY"}),
+            false,
+        ),
+        (
+            minimum(),
+            Billing::Subscription,
+            json!({"apiProvider":"firstParty"}),
             true,
         ),
         (
@@ -217,4 +225,50 @@ fn each_session_owns_its_launch_and_control_frames() {
     );
     drop(two);
     assert!(matches!(next(&other_events), Event::Closed { .. }));
+}
+#[test]
+fn later_turns_may_report_a_moved_shell_directory_but_not_another_session() {
+    // Claude Code repeats init each turn with the Bash tool's current directory,
+    // so a thread that ran `cd sub` must stay open. A different session must not.
+    let temp = TempDir::new().unwrap();
+    let project = temp.path().canonicalize().unwrap();
+    fs::create_dir(project.join("sub")).unwrap();
+    let exe = fixture(
+        &project,
+        minimum(),
+        json!({"apiProvider":"firstParty","subscriptionType":"Claude Max"}),
+    );
+    let init = |session: &str, cwd: &Path| {
+        json!({"type":"system","subtype":"init","session_id":session,"uuid":"u",
+            "model":"m","permissionMode":"default","slash_commands":[],"tools":[],
+            "cwd":cwd})
+        .to_string()
+    };
+    let response = fs::read_to_string(project.join("initialize.response")).unwrap();
+    fs::write(
+        project.join("initialize.response"),
+        format!(
+            "{response}{}\n{}\n{}\n",
+            init(FIRST, &project),
+            init(FIRST, &project.join("sub")),
+            init(SECOND, &project.join("sub")),
+        ),
+    )
+    .unwrap();
+    let (_link, rx) = spawn(
+        &project,
+        exe,
+        Billing::Subscription,
+        Session::New(FIRST.into()),
+        "default",
+    );
+    assert!(matches!(next(&rx), Event::Frame(Frame::ControlReply(_))));
+    assert!(matches!(next(&rx), Event::Frame(Frame::Init(_))));
+    assert!(matches!(next(&rx), Event::Frame(Frame::Init(_))));
+    match next(&rx) {
+        Event::Closed { reason } => {
+            assert!(reason.contains("different project or session"), "{reason}")
+        }
+        other => panic!("expected the session mismatch to close the link, got {other:?}"),
+    }
 }

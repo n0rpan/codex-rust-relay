@@ -6,7 +6,7 @@
       name="viewport"
       content="width=device-width, initial-scale=1, viewport-fit=cover"
     />
-    <meta name="theme-color" content="#171825" />
+    <meta name="theme-color" content="#12131f" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <title>OX Sessions</title>
     <link rel="manifest" href="/manifest.webmanifest" />
@@ -15,6 +15,7 @@
     <link rel="stylesheet" href="/style.css" />
     <link rel="stylesheet" href="/settings.css" />
     <script type="module" src="/app.js"></script>
+    <script type="module" src="/sky.js"></script>
   </head>
   <body>
     <header>
@@ -26,11 +27,16 @@
     <main>
       <section id="pair" hidden>
         <h1>Pair this device</h1>
+        <ol class="pair-steps" aria-label="Pairing steps">
+          <li id="step-scan" aria-current="step"><span class="pix-num">1</span> Scan</li>
+          <li id="step-name"><span class="pix-num">2</span> Name</li>
+          <li id="step-paired"><span class="pix-num">3</span> Paired</li>
+        </ol>
         <p id="pair-hint">
-          Open Remote access in OX Desktop and scan a pairing code for your
-          Tailscale account, or paste its pairing link below.
+          Open OX Desktop → Settings → Remote access and scan a pairing code for
+          your Tailscale account, or paste its pairing link below.
         </p>
-        <button id="scan-pair" type="button">Scan pairing QR</button>
+        <button id="scan-pair" type="button" class="primary">Scan pairing QR</button>
         <div id="camera-panel" hidden>
           <video
             id="camera-preview"
@@ -43,7 +49,7 @@
         <p id="camera-status" role="status"></p>
         <form id="pair-form">
           <div id="paste-pair">
-            <label for="pair-link">Pairing link</label
+            <label for="pair-link">Or paste a pairing link</label
             ><input
               id="pair-link"
               type="url"
@@ -52,14 +58,17 @@
               placeholder="https://…/#pair=…"
             />
           </div>
-          <label for="device-label">Device name</label
-          ><input
-            id="device-label"
-            required
-            maxlength="64"
-            autocomplete="off"
-            placeholder="My phone"
-          /><button class="primary">Pair device</button>
+          <div id="name-pair">
+            <label for="device-label">Name this device</label>
+            <input
+              id="device-label"
+              required
+              maxlength="64"
+              autocomplete="off"
+              placeholder="My phone"
+            />
+          </div>
+          <button id="pair-submit" type="submit">Pair device</button>
         </form>
       </section>
       <section id="catalog" hidden>
@@ -69,18 +78,25 @@
           <details class="action-menu">
             <summary aria-label="More session list actions">•••</summary>
             <div>
+              <button type="button" id="open-running">Running</button>
+              <button type="button" id="open-notifications" hidden>Session alerts</button>
               <button type="button" id="operator-home">Host terminal</button>
               <button id="open-phone-settings" type="button">Settings</button>
             </div>
           </details>
         </div>
-        <details id="notification-setup">
-          <summary id="notification-summary">Session notifications</summary>
-          <p id="notification-guide" role="status"></p>
-          <button id="notifications" type="button" hidden>
-            Enable notifications
+        <div id="notification-banner" hidden>
+          <details id="notification-setup">
+            <summary id="notification-summary">Get session alerts</summary>
+            <p id="notification-guide" role="status"></p>
+            <button id="notifications" type="button" hidden>
+              Enable notifications
+            </button>
+          </details>
+          <button id="notification-dismiss" type="button" class="quiet">
+            Not now
           </button>
-        </details>
+        </div>
         <input
           id="find-sessions"
           type="search"
@@ -90,11 +106,23 @@
         />
         <div id="filters" role="group" aria-label="Session filter">
           <button data-filter="all" aria-pressed="true">All</button
-          ><button data-filter="active" aria-pressed="false">Active</button
-          ><button data-filter="requests" aria-pressed="false">Requests</button
+          ><button data-filter="active" aria-pressed="false">Running</button
+          ><button data-filter="requests" aria-pressed="false">Needs you</button
           ><button data-filter="finished" aria-pressed="false">Finished</button>
         </div>
         <div id="list"></div>
+      </section>
+      <section id="running" hidden aria-labelledby="running-title">
+        <button class="back">← Sessions</button>
+        <div class="heading">
+          <h1 id="running-title">Running</h1>
+          <button id="end-idle" type="button" class="quiet">End all idle</button>
+        </div>
+        <p class="note">Live processes on this host. Ending keeps each session's history.</p>
+        <div id="running-confirm" class="confirm-slot" hidden></div>
+        <p id="running-loading" class="empty">Loading sessions…</p>
+        <p id="running-empty" class="empty" hidden>Nothing is running on this host.</p>
+        <div id="running-list"></div>
       </section>
       <section id="create" hidden>
         <button class="back">← Sessions</button>
@@ -136,15 +164,28 @@
           <details class="action-menu">
             <summary aria-label="More session actions">•••</summary>
             <div>
-              <button type="button" id="operator-project">Project terminal</button>
-              <button type="button" id="operator-session" hidden>Open session in terminal</button>
-              <button type="button" id="start-worker" hidden>Start worker</button>
-              <button type="button" id="continue-in" hidden>Continue in…</button>
+              <section id="menu-session" class="menu-section" aria-label="Session" hidden>
+                <p class="menu-heading">Session</p>
+                <button type="button" id="menu-stop" hidden>Stop</button>
+                <div id="thread-actions" class="menu-items"></div>
+              </section>
+              <section id="menu-workers" class="menu-section" aria-label="Workers and handoff" hidden>
+                <p class="menu-heading">Workers and handoff</p>
+                <button type="button" id="start-worker" hidden>Start worker</button>
+                <button type="button" id="continue-in" hidden>Continue in…</button>
+              </section>
+              <section class="menu-section" aria-label="Settings and terminal">
+                <p class="menu-heading">Settings and terminal</p>
+                <button type="button" id="menu-settings" hidden>Session settings</button>
+                <button type="button" id="operator-project">Project terminal</button>
+                <button type="button" id="operator-session" hidden>Open session in terminal</button>
+              </section>
             </div>
           </details>
         </nav>
         <div id="context"></div>
         <h1 id="title"></h1>
+        <div id="confirm-slot" class="confirm-slot" hidden></div>
         <div id="handoff-marks" class="handoff-marks" hidden></div>
         <button id="older" class="quiet" hidden>Load earlier messages</button
         >
@@ -185,7 +226,6 @@
               />
               <button type="submit">Run command</button>
             </form>
-            <div id="thread-actions" class="actions"></div>
             <div id="session-usage"></div>
             <p id="control-status" role="status" hidden></p>
           </section>
@@ -194,30 +234,38 @@
           <summary>Changes &amp; plan</summary>
           <div id="review-content"></div>
         </details>
-        <form id="worker-form" hidden aria-label="Start worker">
+        <form id="worker-form" class="sheet" hidden aria-label="Start worker">
+          <h2 class="sheet-title">Start worker</h2>
           <label for="worker-runtime">Runtime</label>
           <select id="worker-runtime">
             <option value="codex">Codex</option>
             <option value="claude">Claude Code</option>
           </select>
-          <label for="worker-model">API model</label>
-          <input id="worker-model" list="worker-models" autocomplete="off"
-            placeholder="Leave empty for a Claude subscription worker" />
-          <datalist id="worker-models"></datalist>
-          <label for="worker-mode">Mode</label>
-          <select id="worker-mode">
-            <option value="session">Session</option>
-            <option value="goal">Codex goal</option>
-            <option value="workflow">Claude workflow</option>
-          </select>
+          <label for="worker-model">Model</label>
+          <select id="worker-model"></select>
+          <input
+            id="worker-model-free"
+            hidden
+            aria-label="Model alias"
+            placeholder="provider/model"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+          />
+          <p class="field-label" id="worker-mode-label">Mode</p>
+          <div id="worker-mode-group" class="segmented" role="radiogroup" aria-labelledby="worker-mode-label"></div>
+          <p id="worker-mode-note" class="note"></p>
+          <input type="hidden" id="worker-mode" value="session" />
           <label for="worker-permission">Permission mode</label>
           <select id="worker-permission">
             <option value="inherit">Inherit this session's mode</option>
-            <option value="read">Read (Read only · Plan)</option>
-            <option value="write">Write (Workspace · Accept edits)</option>
-            <option value="classifier">Classifier (Auto-review · Auto)</option>
-            <option value="yolo">YOLO (YOLO · bypass)</option>
+            <option value="read">Read only</option>
+            <option value="write">Workspace</option>
+            <option value="classifier">Auto-review</option>
+            <option value="yolo">YOLO</option>
           </select>
+          <p id="worker-permission-note" class="note"></p>
+          <p id="worker-warning" class="warning-line" hidden></p>
           <label for="worker-task">Task</label>
           <textarea id="worker-task" rows="3" required></textarea>
           <div class="actions">
@@ -225,26 +273,27 @@
             ><button class="primary" id="worker-submit">Start worker</button>
           </div>
         </form>
-        <form id="handoff-form" hidden aria-label="Continue in another runtime">
+        <form id="handoff-form" class="sheet" hidden aria-label="Continue in another runtime">
+          <h2 class="sheet-title">Continue in another runtime</h2>
           <label for="handoff-runtime">Runtime</label>
           <select id="handoff-runtime">
             <option value="codex">Codex</option>
             <option value="claude">Claude Code</option>
           </select>
-          <label for="handoff-route">Route and model</label>
+          <label for="handoff-route">Model</label>
           <select id="handoff-route"></select>
           <label for="handoff-mode">Permission mode</label>
           <select id="handoff-mode">
             <option value="inherit">Inherited from this session</option>
-            <option value="read">Read (Read only · Plan)</option>
-            <option value="write">Write (Workspace · Accept edits)</option>
-            <option value="classifier">Classifier (Auto-review · Auto)</option>
-            <option value="yolo">YOLO (YOLO · bypass)</option>
+            <option value="read">Read only</option>
+            <option value="write">Workspace</option>
+            <option value="classifier">Auto-review</option>
+            <option value="yolo">YOLO</option>
           </select>
-          <label id="handoff-grant-row" hidden
-            ><input type="checkbox" id="handoff-grant" /> Also YOLO for its workers and handoffs</label
-          >
-          <p id="handoff-provider" class="note" hidden></p>
+          <p id="handoff-permission-note" class="note"></p>
+          <label id="handoff-grant-row" class="warning-line" hidden
+            ><input type="checkbox" id="handoff-grant" /> Also YOLO for its workers and handoffs</label>
+          <p id="handoff-provider" class="warning-line" hidden></p>
           <label for="handoff-request">Request</label>
           <textarea id="handoff-request" rows="3" required></textarea>
           <div class="actions">
@@ -253,8 +302,20 @@
           </div>
         </form>
         <div id="timeline" aria-label="Transcript"></div>
+        <div id="activity" class="activity" hidden>
+          <canvas id="activity-sprite" width="20" height="11" aria-hidden="true"></canvas>
+          <span id="activity-label"></span>
+        </div>
         <div id="asks"></div>
         <form id="composer">
+          <button type="button" id="needs-bar" class="needs-bar" hidden></button>
+          <button type="button" id="jump-latest" class="jump-latest" aria-label="Jump to latest" title="Jump to latest" hidden>↓</button>
+          <div id="native-live" class="native-live" hidden>
+            <p id="native-live-text"></p>
+            <button type="button" id="native-live-fork">
+              Continue in a new OX session
+            </button>
+          </div>
           <label class="sr" for="draft">Message</label
           ><textarea
             id="draft"
@@ -272,7 +333,7 @@
                 accept="image/png,image/jpeg,image/gif,image/webp"
                 multiple
             /></label>
-            <button type="button" id="stop" hidden>Stop</button
+            <button type="button" id="stop" disabled>Stop</button
             ><button class="primary" id="send">Send</button>
           </div>
         </form>

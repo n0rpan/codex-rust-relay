@@ -195,6 +195,12 @@ export function setupSettings({ request, open, close, notifications, login }) {
           ? "light"
           : "dark"
         : local.theme;
+    // Status bar and native form colours follow the active theme (house nav token).
+    const light = css.phoneTheme === "light";
+    document.documentElement.style.colorScheme = light ? "light" : "dark";
+    document
+      .querySelector('meta[name="theme-color"]')
+      ?.setAttribute("content", light ? "#ffffff" : "#12131f");
     css.phoneSize = String(local.font_size);
     css.phoneReducedMotion = String(local.reduce_motion);
   }
@@ -459,7 +465,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
     );
   }
   function providers() {
-    screen("Providers & models");
+    screen("Providers");
     if (!snapshot.registry) {
       body.append(node("p", "The host could not read its provider registry."));
       return;
@@ -661,7 +667,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
     }
   }
   function favorites() {
-    screen("Favorites");
+    screen("Starred models");
     const ordered = [...snapshot.favorites];
     const list = node("ol", undefined, "phone-favorites");
     function draw() {
@@ -725,7 +731,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
     );
   }
   function search() {
-    screen("Web search");
+    screen("Search");
     if (!snapshot.registry) {
       body.append(node("p", "The provider registry is unavailable."));
       return;
@@ -743,7 +749,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
   }
   function legacy() {
     const current = snapshot.legacy;
-    screen("Legacy Codex provider");
+    screen("Legacy");
     const form = node("form");
     const data = fields(form, legacyFields, {
       ...current.fields,
@@ -759,7 +765,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
     body.append(node("p", current.id), form);
   }
   async function advanced() {
-    const id = screen("Advanced configuration");
+    const id = screen("Advanced");
     const docs = await readPage(id, { action: "read_advanced" });
     if (!docs) return;
     for (const doc of docs) {
@@ -885,9 +891,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
     }
   }
   async function behaviorForm(onPhone) {
-    const id = screen(
-      onPhone ? "Phone appearance & input" : "Desktop appearance & input",
-    );
+    const id = screen("Appearance & input");
     const record = onPhone
       ? { behavior: local }
       : await readPage(id, { action: "read_behavior" });
@@ -925,6 +929,11 @@ export function setupSettings({ request, open, close, notifications, login }) {
       "checkbox",
     );
     motion.checked = prefs.reduce_motion;
+    // Only a city-level place derived from the laptop's timezone reaches api.met.no.
+    const weatherBox = onPhone
+      ? null
+      : textField(form, "Live weather (MET Norway)", "live_weather", "checkbox");
+    if (weatherBox) weatherBox.checked = prefs.live_weather !== false;
     submit(
       form,
       onPhone ? "Save phone preferences" : "Save desktop preferences",
@@ -935,6 +944,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
           enter_sends: enter.value === "send",
           reduce_motion: motion.checked,
         };
+        if (weatherBox) behavior.live_weather = weatherBox.checked;
         if (onPhone) {
           local = behavior;
           applyLocal();

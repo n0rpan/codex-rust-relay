@@ -71,8 +71,8 @@ pub struct SourceItem {
     pub text: String,
 }
 
-/// Reduce a host timeline to carryable items, in order. Drops reasoning, plans,
-/// tool internals and attachments; turns commands and file changes into outcomes.
+/// Reduce a host timeline to carryable items, in order. Drops reasoning, plans
+/// and tool internals; names attachments by path without carrying them; turns commands and file changes into outcomes.
 pub fn items(timeline: &Timeline) -> Vec<SourceItem> {
     timeline
         .items
@@ -97,12 +97,20 @@ pub fn items(timeline: &Timeline) -> Vec<SourceItem> {
         .collect()
 }
 
+/// Prefix of the line that stands in for an attachment. Attachments (images,
+/// files) are not carried as content; the line names the file so the target
+/// can open it, and `select` counts these lines for the preamble.
+const ATTACHMENT_NOTE: &str = "[attachment not carried: ";
+
 fn user_text(detail: &Value) -> Option<String> {
     let parts = detail["UserMessage"]["content"].as_array()?;
     Some(
         parts
             .iter()
-            .filter_map(|p| p["text"].as_str())
+            .map(|p| match (p["text"].as_str(), p["path"].as_str()) {
+                (Some(text), _) => text.to_owned(),
+                (None, path) => format!("{ATTACHMENT_NOTE}{}]", path.unwrap_or("unnamed")),
+            })
             .collect::<Vec<_>>()
             .join("\n"),
     )
@@ -210,6 +218,10 @@ pub struct SelectionRefs {
     pub total: u32,
     pub carried: u32,
     pub omitted: u32,
+    /// Attachments in the source items (carried or omitted). They are never
+    /// carried as content, only named by path in the message text.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub attachments: u32,
     /// Carried item IDs in order.
     pub items: Vec<String>,
     /// Carried items that were cut. Their full text is in the source.
@@ -225,6 +237,10 @@ pub struct SelectionRefs {
     /// to its request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stripped: Option<String>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// An earlier session in a handoff chain, readable through read_ox_thread.
@@ -362,7 +378,7 @@ pub fn select(
     }
     if used > budget.available {
         return Err(format!(
-            "The new request and the minimum earlier context (the first request and the latest exchange, about {used} tokens) do not fit the target model's {}-token context. Shorten the request or choose a model with a larger context.",
+            "This request does not fit the target model's {}-token context, even with the first message and the latest reply kept (about {used} tokens). Shorten the request or choose a model with a larger context.",
             budget.window
         ));
     }
@@ -400,6 +416,10 @@ pub fn select(
         total: items.len() as u32,
         carried: selected.len() as u32,
         omitted: (items.len() - selected.len()) as u32,
+        attachments: items
+            .iter()
+            .map(|i| i.text.matches(ATTACHMENT_NOTE).count() as u32)
+            .sum(),
         items: selected.iter().map(|c| c.id.clone()).collect(),
         cut: selected
             .iter()
@@ -452,6 +472,14 @@ impl HandoffSource {
                     .join(", ")
             )
         };
+        let attachments = if r.attachments == 0 {
+            String::new()
+        } else {
+            format!(
+                " {} attachment(s) (images or files) from earlier messages were not carried; each is marked \"{ATTACHMENT_NOTE}path]\" in its message, so open the file if you need it.",
+                r.attachments
+            )
+        };
         let chain = if r.earlier.is_empty() {
             String::new()
         } else {
@@ -470,7 +498,7 @@ impl HandoffSource {
             )
         };
         format!(
-            "OX handoff: this session continues \"{}\" (session {}, {}, {}). The messages that follow are real earlier messages from it, in order, not a summary: {} of {} carried. {omitted}{chain} Use the read_ox_thread tool to read the source session's omitted or cut items by ID. Answer the request after them.",
+            "OX handoff: this session continues \"{}\" (session {}, {}, {}). The messages that follow are real earlier messages from it, in order, not a summary: {} of {} carried. {omitted}{attachments}{chain} Use the read_ox_thread tool to read the source session's omitted or cut items by ID. Answer the request after them.",
             self.title.replace('"', "'"),
             self.session,
             self.runtime.name(),
@@ -550,10 +578,12 @@ pub fn provider(route: &Route) -> String {
         (crate::runtime::Billing::Subscription, Runtime::Claude) => {
             "Anthropic (Claude subscription)".into()
         }
-        (crate::runtime::Billing::Api(alias), _) => format!(
-            "the {} API provider",
-            alias.split_once('/').map_or(alias.as_str(), |(p, _)| p)
-        ),
+        // A qualified alias names its provider. A bare one does not, so say only
+        // which route receives it rather than inventing a provider name.
+        (crate::runtime::Billing::Api(alias), _) => match alias.split_once('/') {
+            Some((provider, _)) => format!("the {provider} API provider"),
+            None => format!("the API route for {alias}"),
+        },
     }
 }
 
@@ -806,7 +836,7 @@ mod tests {
         long[2].text = "a".repeat(10_000);
         let request = "q".repeat(Budget::new(Some(48_000), "").available as usize * 3 - 300);
         let err = select(&long, &request, Some(48_000)).unwrap_err();
-        assert!(err.contains("minimum earlier context"), "{err}");
+        assert!(err.contains("does not fit the target model"), "{err}");
         assert!(select(&h, "  ", None).is_err());
         assert!(select(&h, &"r".repeat(MAX_REQUEST + 1), Some(2_000_000)).is_err());
     }
@@ -827,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn timelines_drop_reasoning_internals_and_attachments_and_keep_partial_text() {
+    fn timelines_drop_reasoning_internals_and_name_attachments_and_keep_partial_text() {
         use crate::host_protocol::TimelineItem;
         let t = |id: &str, role: &str, text: &str, detail: Value| TimelineItem {
             turn: "t".into(),
@@ -844,6 +874,12 @@ mod tests {
                     "user",
                     "fix it\n/tmp/shot.png",
                     json!({"UserMessage":{"content":[{"text":"fix it"},{"path":"/tmp/shot.png"}]}}),
+                ),
+                t(
+                    "i",
+                    "user",
+                    "/tmp/only.png",
+                    json!({"UserMessage":{"content":[{"path":"/tmp/only.png"}]}}),
                 ),
                 t("r", "thinking", "secret reasoning", Value::Null),
                 t("p", "plan", "1. do", Value::Null),
@@ -879,13 +915,35 @@ mod tests {
         assert_eq!(
             texts,
             vec![
-                (Kind::User, "fix it"),
+                (
+                    Kind::User,
+                    "fix it\n[attachment not carried: /tmp/shot.png]"
+                ),
+                (Kind::User, "[attachment not carried: /tmp/only.png]"),
                 (Kind::Outcome, "Command `cargo test` exited 0"),
                 (Kind::Outcome, "Files completed: src/a.rs, b.md"),
                 (Kind::Outcome, "Tool search_docs (failed)"),
                 (Kind::Assistant, "partial answer that was interr"),
             ]
         );
+    }
+
+    #[test]
+    fn the_preamble_reports_attachments_and_stays_silent_without_them() {
+        let with = items_with_attachment();
+        let s = select(&with, "next", Some(200_000)).unwrap();
+        assert_eq!(s.refs.attachments, 1);
+        let text = source(s.refs).preamble();
+        assert!(text.contains("1 attachment(s)"), "{text}");
+        let plain = select(&history(1, 10), "next", Some(200_000)).unwrap();
+        assert_eq!(plain.refs.attachments, 0);
+        assert!(!source(plain.refs).preamble().contains("attachment"));
+    }
+
+    fn items_with_attachment() -> Vec<SourceItem> {
+        let mut h = history(1, 10);
+        h[0].text = format!("look\n{ATTACHMENT_NOTE}/tmp/a.png]");
+        h
     }
 
     fn source(refs: SelectionRefs) -> HandoffSource {
@@ -1149,6 +1207,9 @@ mod tests {
         let claude_api = Runtime::Claude.route(Some("openrouter/sonnet".into()));
         let notice = provider_notice(&claude, &codex_api).unwrap();
         assert!(notice.contains("openrouter API provider"), "{notice}");
+        let bare = Runtime::Codex.route(Some("sonnet".into()));
+        let notice = provider_notice(&claude, &bare).unwrap();
+        assert!(notice.contains("the API route for sonnet"), "{notice}");
         assert!(
             provider_notice(&codex_api, &claude_api).is_none(),
             "same provider"

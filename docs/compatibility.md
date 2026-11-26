@@ -79,12 +79,12 @@ domain check use its own direct connection to `api.anthropic.com`.
   functions, namespaced calls such as `web.run`, and freeform `apply_patch` into the
   upstream tool format. Code-mode `additional_tools` and arbitrary provider-hosted
   tools are outside that mapping. Native Anthropic server tools depend on the upstream.
-- **Attachments and output formats.** Codex to Anthropic rejects images, files and
-  structured output. The Chat Completions adapter maps supported user images and
-  structured-output requests, but rejects images in tool results. Claude Code's
-  translated paths handle supported inline or URL images and reject document and
-  file-ID blocks. Use the native route if your workflow relies on attachments or
-  provider-specific output.
+- **Attachments and output formats.** Codex to Anthropic maps user and tool-result
+  images (base64 data URLs and URLs) but rejects files, audio and structured output.
+  The Chat Completions adapter maps supported user and tool-result images, and
+  structured-output requests. Claude Code's translated paths handle supported
+  inline or URL images and reject document and file-ID blocks. Use the native
+  route if your workflow relies on attachments or provider-specific output.
 - **Conversation state.** Translated Codex requests require streaming and client
   replay. They reject provider-side continuation via `previous_response_id`,
   `conversation`, `store: true`, background mode, and item references. Compaction

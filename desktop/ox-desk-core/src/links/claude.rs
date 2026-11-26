@@ -23,6 +23,9 @@ pub struct Launch {
     pub billing: Billing,
     pub session: Session,
     pub permission_mode: String,
+    /// A worker launch carries the shared worker contract (tools, sandbox
+    /// settings); an ordinary session passes `None`.
+    pub contract: Option<crate::claude_worker_contract::Contract>,
 }
 #[derive(Clone, Debug)]
 pub enum Session {
@@ -96,6 +99,9 @@ impl Launch {
         } else {
             "--allow-dangerously-skip-permissions"
         });
+        if let Some(contract) = &self.contract {
+            cmd.args(contract.args());
+        }
         match &self.session {
             Session::New(id) => {
                 cmd.args(["--session-id", id]);
@@ -132,6 +138,7 @@ impl Link {
         let receive = Arc::new(receive);
         let output = receive.clone();
         let mut decoder = Decoder::default();
+        let mut project_checked = false;
         let process = process::Process::spawn(
             launch.command(),
             move |line| {
@@ -152,13 +159,19 @@ impl Link {
                     if !initialized.load(Ordering::Acquire) {
                         continue;
                     }
-                    if let Frame::Init(init) = &frame
-                        && (init.session_id != session_id
-                            || std::path::Path::new(&init.cwd).canonicalize()? != project)
-                    {
-                        return Err(io::Error::other(
-                            "Claude Code opened a different project or session",
-                        ));
+                    if let Frame::Init(init) = &frame {
+                        // Claude Code repeats init on every turn and reports the Bash
+                        // tool's current directory, which follows `cd`. Only the
+                        // first init must match the project; later ones only the session.
+                        let first = !project_checked;
+                        project_checked = true;
+                        if init.session_id != session_id
+                            || first && std::path::Path::new(&init.cwd).canonicalize()? != project
+                        {
+                            return Err(io::Error::other(
+                                "Claude Code opened a different project or session",
+                            ));
+                        }
                     }
                     output(Event::Frame(frame));
                 }
@@ -268,16 +281,50 @@ fn verify_initialization(reply: &ControlReply, billing: &Billing) -> io::Result<
     if !actual.is_some_and(|(n, pre)| n > required || n == required && !pre) {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            format!(
-                "OX Desktop requires Claude Code {} or later. Check claude --version.",
-                minimum()
-            ),
+            match caps.claude_code_version.as_deref() {
+                Some(found) => format!(
+                    "Claude Code {found} found; OX Desktop needs {} or later. Update Claude Code, then press Reconnect.",
+                    minimum()
+                ),
+                None => format!(
+                    "OX Desktop needs Claude Code {} or later. Update Claude Code, then press Reconnect.",
+                    minimum()
+                ),
+            },
         ));
     }
     if !matches_account(billing, &caps.account) {
+        let key = caps
+            .account
+            .api_key_source
+            .as_deref()
+            .filter(|s| *s != "none")
+            .or_else(|| {
+                caps.account
+                    .token_source
+                    .as_deref()
+                    .filter(|s| *s != "none")
+                    .filter(|_| *billing == Billing::Subscription)
+            });
+        // A key in the environment is not fixed by signing in, so it is not a sign-in error.
+        if let (Some(source), Billing::Subscription) = (key, billing) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Claude Code is using {source} from your environment instead of your Claude subscription. Unset it, or choose an API model route, then press Reconnect."
+                ),
+            ));
+        }
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "Claude Code reported a different billing route",
+            match billing {
+                Billing::Subscription => {
+                    "Claude Code is not signed in to a Claude subscription. Sign in, then press Reconnect."
+                }
+                Billing::Api(_) => {
+                    "Claude Code is not using the saved OX API key for this model route. Press Reconnect, or choose another model route."
+                }
+            },
         ));
     }
     Ok(())
@@ -301,5 +348,55 @@ fn matches_account(billing: &Billing, account: &Account) -> bool {
                     .is_some_and(|s| !s.is_empty())
         }
         Billing::Api(_) => source == Some("ANTHROPIC_AUTH_TOKEN"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claude_worker_contract::Contract;
+
+    fn args(billing: Billing, contract: Option<Contract>) -> Vec<String> {
+        let launch = Launch {
+            ox: "ox".into(),
+            path: "/usr/bin".into(),
+            project: "/".into(),
+            billing,
+            session: Session::New("id".into()),
+            permission_mode: "acceptEdits".into(),
+            contract,
+        };
+        launch
+            .command()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The hosted launch carries exactly the policy arguments the standalone
+    /// builder passes, for both billing routes; an ordinary session carries none.
+    #[test]
+    fn hosted_write_launch_matches_the_shared_contract() {
+        for sandboxed in [true, false] {
+            let contract = Contract::with_support(true, false, sandboxed);
+            for billing in [Billing::Subscription, Billing::Api("alias".into())] {
+                let hosted = args(billing.clone(), Some(contract));
+                let policy = contract.args();
+                assert!(
+                    hosted.windows(policy.len()).any(|w| w == policy.as_slice()),
+                    "{hosted:?}"
+                );
+                // A write worker has its shell and the sandbox settings either way;
+                // Claude Code decides whether the sandbox runs.
+                assert!(hosted.iter().any(|a| a == "--settings"));
+                let tools = hosted.iter().position(|a| a == "--tools").unwrap();
+                assert!(hosted[tools + 1].contains("Bash"));
+                let plain = args(billing, None);
+                assert!(!plain.iter().any(|a| a == "--tools" || a == "--settings"));
+            }
+        }
+        let mode = args(Billing::Subscription, None);
+        let at = mode.iter().position(|a| a == "--permission-mode").unwrap();
+        assert_eq!(mode[at + 1], "acceptEdits");
     }
 }

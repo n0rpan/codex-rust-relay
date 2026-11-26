@@ -35,7 +35,8 @@ impl Store {
         if let Some(remote) = self.remote() {
             return remote.can(id, "fork");
         }
-        self.can_change_access(id)
+        // A session another client is running can still be forked into a new OX one.
+        (self.can_change_access(id) || self.is_native_live(id))
             && self.catalog.get(id).is_some_and(|r| !r.worker)
             && !self
                 .pending
@@ -45,6 +46,11 @@ impl Store {
     pub(crate) fn manage_thread(&mut self, id: &str, op: ThreadOperation) -> io::Result<()> {
         if !self.can_manage_thread(id) {
             return Err(io::Error::other("Select an idle thread to change it"));
+        }
+        if matches!(op, ThreadOperation::Archive) && self.is_native_live(id) {
+            return Err(io::Error::other(
+                "Another client is running this thread; it can't be archived from here",
+            ));
         }
         if self.is_session_scoped() {
             return match op {

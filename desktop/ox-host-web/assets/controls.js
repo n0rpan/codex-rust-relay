@@ -218,8 +218,11 @@ export class SessionControls {
         ? (modes[planned] ?? planned) + " on start"
         : "Permission mode";
     badge.dataset.bypass = String(bypass(confirmed));
+    // An active YOLO grant is part of the chip, so its state is visible without opening settings.
+    const grant = own.yolo_grant === true && bypass(confirmed);
+    badge.dataset.grant = String(grant);
     if (bypass(confirmed)) {
-      badge.textContent = "YOLO";
+      badge.textContent = grant ? "YOLO + workers" : "YOLO";
       badge.setAttribute(
         "aria-label",
         modes[confirmed] + ", change permission mode",
@@ -252,6 +255,8 @@ export class SessionControls {
     this.allowed = (detail.access_choices ?? []).filter(
       (x) => Object.hasOwn(modes, x) && withinCeiling(x),
     );
+    // Thread actions live in the conversation menu, so they render whether or not settings are open.
+    this.threadActions();
     if ($("session-settings").hidden) return;
     const options = this.allowed.map((v) => [v, modes[v]]);
     if (!this.allowed.includes(current))
@@ -281,7 +286,15 @@ export class SessionControls {
             id.split("/")[0] === billing.api.split("/")[0])));
     const modelRows = Object.entries(models)
       .filter(([k]) => compatible(k))
-      .map(([k, v]) => [k, v.label && v.label !== k ? v.label + " · " + k : k]);
+      .map(([k, v]) => [
+        k,
+        // The default entry's label already names the model it resolves to.
+        v.label && v.label !== k
+          ? k === "default"
+            ? v.label
+            : v.label + " · " + k
+          : k,
+      ]);
     const edit =
       this.enabled("model_options") &&
       !own.changing &&
@@ -327,7 +340,6 @@ export class SessionControls {
     choices($("native-command"), this.commandRows, undefined);
     $("native-command-form").querySelector("button").disabled =
       !ready || this.pending.has("command");
-    this.threadActions();
     const timeline = state.transcripts[id];
     const readLimits =
       scope.route.runtime === "codex" &&
@@ -361,30 +373,57 @@ export class SessionControls {
     container.replaceChildren();
     if (!id) return;
     for (const [cap, label] of [
-      ["fork", "Fork"],
+      ["end", "End session"],
       ["rename", "Rename"],
-      ["generate_title", "Generate title"],
       ["archive", "Archive"],
+      ["fork", "Fork"],
+      ["generate_title", "Generate title"],
     ]) {
       if (!this.caps.includes(cap)) continue;
       const b = button(label, () => {
-        let action;
         if (cap === "rename") {
           const value = window
             .prompt("New session name", this.ctx.row.title)
             ?.trim();
           if (!value) return;
-          action = { rename_thread: [id, value] };
+          this.apply({ rename_thread: [id, value] }, "thread");
         } else if (cap === "archive") {
-          if (!window.confirm("Archive this session?")) return;
-          action = { archive_thread: id };
+          this.ctx.confirm("Archive this session?", "Archive", () =>
+            this.apply({ archive_thread: id }, "thread", archived),
+          );
+        } else if (cap === "end") {
+          this.endSession();
         } else
-          action =
-            cap === "fork" ? { fork_thread: id } : { generate_title: id };
-        this.apply(action, "thread", cap === "archive" ? archived : undefined);
+          this.apply(
+            cap === "fork" ? { fork_thread: id } : { generate_title: id },
+            "thread",
+          );
       });
       b.disabled = !ready || this.pending.has("thread");
       container.append(b);
     }
+  }
+  // Ending a turn or a worker that is running, or an approval that waits, asks first.
+  endSession() {
+    const { id, state, row } = this.ctx;
+    const live = (x) => ["running", "needs_input"].includes(x.status);
+    const workers = (state?.sessions ?? []).filter(
+      (x) => x.parent === id && live(x),
+    ).length;
+    const busy =
+      workers > 0 ||
+      live(row ?? {}) ||
+      !!state?.asks?.some((a) => a.thread === id);
+    const run = (force) =>
+      this.apply({ [force ? "force_end_session" : "end_session"]: id }, "thread");
+    if (!busy) return run();
+    const who = workers
+      ? ` and ${workers} worker${workers === 1 ? "" : "s"}`
+      : "";
+    this.ctx.confirm(
+      `End session${who}? A running turn stops. History is kept.`,
+      "End session",
+      () => run(true),
+    );
   }
 }

@@ -2116,8 +2116,17 @@ fn chat_usage(model: &str) -> Value {
     })
 }
 
+/// Reasoning text every Chat tool turn streams before its call; the history
+/// assertions require it back on the replayed assistant message.
+const CHAT_REASONING: &str = "fixture thought";
+
 fn chat_tool_call(model: &str, call_id: &str, name: &str, arguments: &str) -> Vec<Value> {
     vec![
+        chat_chunk(
+            model,
+            json!({ "role": "assistant", "reasoning_content": CHAT_REASONING }),
+            None,
+        ),
         chat_chunk(
             model,
             json!({
@@ -2437,6 +2446,14 @@ fn assert_history(wire: Wire, body: &Value, calls: &CodingStream, search: bool, 
                 assert!(
                     has_call(name),
                     "the Chat resume must replay the {name} call: {body}"
+                );
+            }
+            // Stock Claude Code returns the ox-marked thinking block it was
+            // sent, and the relay must restore it as reasoning_content.
+            for message in messages.iter().filter(|m| m["tool_calls"].is_array()) {
+                assert_eq!(
+                    message["reasoning_content"], CHAT_REASONING,
+                    "a replayed Chat assistant tool turn lost reasoning_content: {body}"
                 );
             }
             let has_output = |needle: &str| {

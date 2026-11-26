@@ -1,5 +1,6 @@
 //! A paste/type-only field for ASCII API credentials, with no text editor or undo history.
 use crate::appearance::Palette;
+use crate::appearance::Step;
 use gpui::{prelude::*, *};
 use ox_desk_core::settings_protocol::model::Secret;
 
@@ -58,7 +59,7 @@ impl KeyField {
             .border_color(rgb(if focused { p.accent } else { p.line }))
             .rounded_md()
             .p_2()
-            .text_sm()
+            .text_size(p.text(Step::Ui))
             .text_color(rgb(if empty { p.muted } else { p.fg }))
             .bg(rgb(if self.selected { p.hover } else { p.bg }))
             .child(if empty {

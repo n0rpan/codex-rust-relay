@@ -2,18 +2,19 @@
 //! leaves the daemon, native runtimes and outstanding requests alive.
 use ox_desk_core::{
     actions::Action,
-    host_protocol::{Client, Scope, Server, VERSION},
+    host_protocol::{Client, ProcessView, Scope, Server, VERSION},
     links::LinkEvent,
     store::{Profile, Route, Store, ThreadRow, replica},
 };
-use ox_host_service::{Paths, ensure_running};
+use ox_host_service::{Paths, ensure_running, is_running};
 use std::{
+    collections::HashSet,
     io::{self, BufRead, BufReader, BufWriter, Read, Write},
     net::Shutdown,
     os::unix::net::UnixStream,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
@@ -47,9 +48,26 @@ fn read_frame(input: &mut BufReader<UnixStream>) -> io::Result<Server> {
 fn connect() -> io::Result<(BufReader<UnixStream>, UnixStream)> {
     handshake().map(|(input, socket, _)| (input, socket))
 }
+/// Shown when the host is not up. Polls treat it as a quiet state, not an error.
+pub(crate) const HOST_NOT_RUNNING: &str = "Session host not running";
+
 fn handshake() -> io::Result<(BufReader<UnixStream>, UnixStream, Vec<String>)> {
     let paths = Paths::discover()?;
     ensure_running(&paths)?;
+    open_handshake(&paths)
+}
+/// Connects to a host that is already up and never starts one, so a background poll
+/// cannot revive a host the user stopped.
+fn connect_existing(paths: &Paths) -> io::Result<BufReader<UnixStream>> {
+    if !is_running(paths)? {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            HOST_NOT_RUNNING,
+        ));
+    }
+    open_handshake(paths).map(|(input, _, _)| input)
+}
+fn open_handshake(paths: &Paths) -> io::Result<(BufReader<UnixStream>, UnixStream, Vec<String>)> {
     let mut socket = UnixStream::connect(&paths.socket)?;
     socket.set_read_timeout(Some(Duration::from_secs(15)))?;
     write_frame(&mut socket, &Client::Hello { version: VERSION })?;
@@ -92,6 +110,7 @@ pub(crate) fn open_store(
         &Client::Subscribe {
             scope: Some(scope.clone()),
             after: None,
+            terminal: true,
         },
     )?;
     let client = getrandom::u64().map_err(io::Error::other)?;
@@ -186,5 +205,169 @@ pub(crate) fn discover() -> io::Result<CatalogResult> {
     }
 }
 
+/// A sidebar reuses its process-list connection. Each new protocol handshake reads
+/// the operator's route configuration, which an ordinary process poll does not need.
+#[derive(Default)]
+pub(crate) struct ProcessMonitor {
+    socket: Mutex<Option<BufReader<UnixStream>>>,
+}
+
+impl ProcessMonitor {
+    pub(crate) fn list(&self) -> io::Result<Vec<ProcessView>> {
+        self.list_at(&Paths::discover()?)
+    }
+
+    fn list_at(&self, paths: &Paths) -> io::Result<Vec<ProcessView>> {
+        let mut socket = self.socket.lock().unwrap();
+        if let Some(mut connection) = socket.take()
+            && let Ok(rows) = read_processes(&mut connection)
+        {
+            *socket = Some(connection);
+            return Ok(rows);
+        }
+        // A host restart closes the old stream. Reconnect only if a host is running.
+        let mut connection = connect_existing(paths)?;
+        connection
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(15)))?;
+        let rows = read_processes(&mut connection)?;
+        *socket = Some(connection);
+        Ok(rows)
+    }
+}
+
+fn read_processes(input: &mut BufReader<UnixStream>) -> io::Result<Vec<ProcessView>> {
+    write_frame(
+        input.get_mut(),
+        &Client::ListProcesses {
+            id: "processes".into(),
+        },
+    )?;
+    loop {
+        match read_frame(input)? {
+            Server::Processes { id, processes } if id == "processes" => return Ok(processes),
+            Server::Error { id, message } if id.as_deref().is_none_or(|i| i == "processes") => {
+                return Err(io::Error::other(message));
+            }
+            _ => (),
+        }
+    }
+}
+
+/// End the live process of each thread in `scope`. Acts need a subscription to the
+/// scope on the same socket, so this subscribes first, then waits for every reply.
+pub(crate) fn end_threads(scope: Scope, threads: Vec<String>, force: bool) -> io::Result<()> {
+    if threads.is_empty() {
+        return Ok(());
+    }
+    let (mut input, mut socket) = connect()?;
+    write_frame(
+        &mut socket,
+        &Client::Subscribe {
+            scope: Some(scope.clone()),
+            after: None,
+            terminal: false,
+        },
+    )?;
+    let nonce = getrandom::u64().map_err(io::Error::other)?;
+    let mut waiting = HashSet::new();
+    for (i, thread) in threads.into_iter().enumerate() {
+        let id = format!("end-{nonce:016x}-{i}");
+        write_frame(
+            &mut socket,
+            &Client::Act {
+                id: id.clone(),
+                scope: scope.clone(),
+                action: if force {
+                    Action::ForceEndSession(thread)
+                } else {
+                    Action::EndSession(thread)
+                },
+                approval: None,
+            },
+        )?;
+        waiting.insert(id);
+    }
+    let mut failure = None;
+    while !waiting.is_empty() {
+        match read_frame(&mut input)? {
+            Server::Ack { id } => {
+                waiting.remove(&id);
+            }
+            Server::Error {
+                id: Some(id),
+                message,
+            } if waiting.remove(&id) => {
+                failure.get_or_insert(message);
+            }
+            Server::Error { id: None, message } => return Err(io::Error::other(message)),
+            _ => (),
+        }
+    }
+    failure.map_or(Ok(()), |message| Err(io::Error::other(message)))
+}
+
 mod catalog;
 pub(crate) use catalog::{CatalogEvent, CatalogWatch, watch_catalog};
+
+#[cfg(test)]
+mod process_monitor_tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn polls_reuse_the_handshake_and_reconnect_after_host_exit() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            socket: root.path().join("host.sock"),
+            state_dir: root.path().to_owned(),
+        };
+        let monitor = ProcessMonitor::default();
+        let start = |polls| {
+            let listener = UnixListener::bind(&paths.socket).unwrap();
+            thread::spawn(move || {
+                // connect_existing checks that the socket belongs to a live host.
+                drop(listener.accept().unwrap());
+                let (mut out, _) = listener.accept().unwrap();
+                out.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut input = BufReader::new(out.try_clone().unwrap());
+                let mut line = String::new();
+                input.read_line(&mut line).unwrap();
+                assert!(matches!(
+                    serde_json::from_str(&line),
+                    Ok(Client::Hello { version: VERSION })
+                ));
+                writeln!(
+                    out,
+                    r#"{{"type":"hello","version":1,"capabilities":[],"routes":[],"projects":[]}}"#
+                )
+                .unwrap();
+                for _ in 0..polls {
+                    line.clear();
+                    input.read_line(&mut line).unwrap();
+                    assert!(matches!(
+                        serde_json::from_str(&line),
+                        Ok(Client::ListProcesses { .. })
+                    ));
+                    writeln!(
+                        out,
+                        r#"{{"type":"processes","id":"processes","processes":[]}}"#
+                    )
+                    .unwrap();
+                }
+            })
+        };
+        let first = start(2);
+        assert!(monitor.list_at(&paths).unwrap().is_empty());
+        assert!(monitor.list_at(&paths).unwrap().is_empty());
+        first.join().unwrap();
+        std::fs::remove_file(&paths.socket).unwrap();
+        assert_eq!(
+            monitor.list_at(&paths).unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
+        let next = start(1);
+        assert!(monitor.list_at(&paths).unwrap().is_empty());
+        next.join().unwrap();
+    }
+}

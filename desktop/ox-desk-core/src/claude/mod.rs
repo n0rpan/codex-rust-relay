@@ -1,6 +1,7 @@
 //! Decode stock Claude Code stream-json and normalized, read-only history records.
 pub mod catalog;
 mod events;
+pub mod live;
 mod tasks;
 mod tools;
 use crate::transcript::item::{Content, Item};

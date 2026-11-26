@@ -18,6 +18,22 @@ pub struct ProviderModels {
     data: Vec<ProviderModel>,
 }
 
+impl ProviderModels {
+    /// Removes discovered models whose IDs `keep` rejects, returning the
+    /// rejected IDs in upstream order.
+    pub fn retain_ids(&mut self, mut keep: impl FnMut(&str) -> bool) -> Vec<String> {
+        let mut dropped = Vec::new();
+        self.data.retain(|model| {
+            let kept = keep(&model.id);
+            if !kept {
+                dropped.push(model.id.clone());
+            }
+            kept
+        });
+        dropped
+    }
+}
+
 #[derive(Default, Deserialize)]
 pub struct BundledModels {
     models: Vec<Value>,
@@ -474,6 +490,26 @@ mod tests {
             .map(|spec| spec.id)
             .collect::<Vec<_>>();
         assert_eq!(ids, ["with-tools"]);
+    }
+
+    #[test]
+    fn invalid_discovered_ids_are_dropped_before_routes_are_built() {
+        let mut discovered = serde_json::from_value::<ProviderModels>(json!({
+            "data": [
+                {"id": "Qwen 2.5 Coder.gguf"},
+                {"id": "good-model"},
+                {"id": "quoted\"id"}
+            ]
+        }))
+        .unwrap();
+        let dropped =
+            discovered.retain_ids(|id| crate::provider::alias_for("local", id, None).is_ok());
+        assert_eq!(dropped, ["Qwen 2.5 Coder.gguf", "quoted\"id"]);
+        let ids = merge_models(Some(discovered), &[])
+            .into_iter()
+            .map(|spec| spec.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["good-model"]);
     }
 
     #[test]

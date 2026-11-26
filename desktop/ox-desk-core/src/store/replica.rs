@@ -26,11 +26,31 @@ pub struct Remote {
     pub(super) schema: bool,
     pub(super) options: HashMap<String, routes_thread::Options>,
     pub(super) draft_access: Option<Access>,
-    pending: HashMap<String, (Option<String>, Option<compose::Draft>)>,
+    /// The newest host draft restore applied per session.
+    restored_seen: HashMap<String, String>,
+    /// Input sent but not yet acknowledged by the host: the owner, the draft it came from
+    /// and how many identical user messages the transcript held when it was sent.
+    pending: HashMap<String, (Option<String>, Option<compose::Draft>, usize)>,
+    /// Input a replacement replica got back from its predecessor because the host never
+    /// acknowledged it. The host may still have received it, so it waits in the composer
+    /// until the transcript shows it (then it is cleared) and is never sent again for
+    /// the user.
+    unconfirmed: Vec<Unconfirmed>,
     pub(super) origins: HashMap<String, crate::origin::Origin>,
     /// Host marks on a session: handoffs from it and its YOLO grant.
     pub(super) marks: HashMap<String, Value>,
-    pub(super) await_new: bool,
+    /// The request that opens the session this client is waiting for. Only its
+    /// own `Opened` selects, and only its own `Error` stops the wait.
+    pub(super) await_new: Option<String>,
+    /// Rows the catalog held before a fresh snapshot replaced it, and the
+    /// loaded length at the last page request made to get back to them.
+    pub(super) restore: Option<(usize, Option<usize>)>,
+}
+struct Unconfirmed {
+    owner: Option<String>,
+    text: String,
+    attachments: Vec<Option<String>>,
+    seen: usize,
 }
 impl Remote {
     pub(super) fn can(&self, id: &str, cap: &str) -> bool {
@@ -71,9 +91,12 @@ impl Store {
             sending: HashSet::new(),
             schema: false,
             draft_access: None,
+            restored_seen: HashMap::new(),
             options: HashMap::new(),
-            await_new: false,
+            await_new: None,
+            restore: None,
             pending: HashMap::new(),
+            unconfirmed: vec![],
             origins: HashMap::new(),
             marks: HashMap::new(),
         };
@@ -102,7 +125,7 @@ impl Store {
             None
         }
     }
-    fn remote_mut(&mut self) -> &mut Remote {
+    pub(super) fn remote_mut(&mut self) -> &mut Remote {
         match &mut self.link {
             Link::Host(r) => r,
             _ => unreachable!("remote state requires a host subscription"),
@@ -145,22 +168,38 @@ impl Store {
     }
     pub(super) fn pending_input(&self, owner: Option<&str>) -> bool {
         self.remote()
-            .is_some_and(|r| r.pending.values().any(|(id, _)| id.as_deref() == owner))
+            .is_some_and(|r| r.pending.values().any(|(id, ..)| id.as_deref() == owner))
     }
     fn send_input(
         &mut self,
         action: Action,
         owner: Option<String>,
         from_draft: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<String> {
         let id = (self.remote().unwrap().writer)(action, None)?;
         let draft = if from_draft {
             self.drafts.remove(&owner)
         } else {
             None
         };
-        self.remote_mut().pending.insert(id, (owner, draft));
-        Ok(())
+        let seen = draft
+            .as_ref()
+            .zip(owner.as_deref().and_then(|o| self.transcripts.get(o)))
+            .map_or(0, |(d, t)| {
+                let (text, attachments) = d.signature();
+                t.user_messages(&text, &attachments)
+            });
+        self.remote_mut()
+            .pending
+            .insert(id.clone(), (owner, draft, seen));
+        Ok(id)
+    }
+    /// Send an action that has no approval token and return its request id.
+    fn forward_id(&self, action: Action) -> io::Result<String> {
+        let r = self
+            .remote()
+            .ok_or_else(|| io::Error::other("No host connection"))?;
+        (r.writer)(action, None)
     }
     fn remote_command(
         &mut self,
@@ -187,13 +226,13 @@ impl Store {
             Some(Command::Hint(message)) => return Err(io::Error::other(message)),
             command => {
                 let opens = owner.is_none() && command.is_some_and(|c| c.starts_thread());
-                self.send_input(
+                let id = self.send_input(
                     Action::PaletteCommand(owner.clone(), text),
                     owner,
                     from_draft,
                 )?;
                 if opens {
-                    self.remote_mut().await_new = true;
+                    self.remote_mut().await_new = Some(id);
                 }
             }
         }
@@ -213,12 +252,12 @@ impl Store {
         match action {
             Action::DraftEdit(id, text) => self.edit(id.as_deref(), text),
             Action::ForkThread(_) => {
-                self.forward(action)?;
-                self.remote_mut().await_new = true;
+                let id = self.forward_id(action)?;
+                self.remote_mut().await_new = Some(id);
             }
             Action::NewDraft => {
                 self.selected = None;
-                self.remote_mut().await_new = false;
+                self.remote_mut().await_new = None;
                 self.forward(Action::NewDraft)?;
             }
             Action::SelectThread(ref id) => {
@@ -229,7 +268,7 @@ impl Store {
                 let id = id.clone();
                 self.forward(action)?;
                 self.select_replica(&id);
-                self.remote_mut().await_new = false;
+                self.remote_mut().await_new = None;
             }
             Action::OpenCatalogRow(ref row) | Action::ConfirmAliasAndResume(ref row) => {
                 if !row.worker {
@@ -238,7 +277,7 @@ impl Store {
                 let id = row.id.clone();
                 self.forward(action)?;
                 self.select_replica(&id);
-                self.remote_mut().await_new = false;
+                self.remote_mut().await_new = None;
             }
             Action::Submit(owner) => {
                 if !self.can_send(owner.as_deref()) || self.sending(owner.as_deref()) {
@@ -261,9 +300,9 @@ impl Store {
                     Action::SendImages(owner.clone(), text, images.to_vec())
                 };
                 let opens = owner.is_none();
-                self.send_input(request, owner, true)?;
+                let id = self.send_input(request, owner, true)?;
                 if opens {
-                    self.remote_mut().await_new = true;
+                    self.remote_mut().await_new = Some(id);
                 }
             }
             Action::ExecuteCommand(owner) => {
@@ -292,8 +331,8 @@ impl Store {
                 self.forward(action)?;
             }
             Action::InjectHandoff(..) => {
-                self.forward(action)?;
-                self.remote_mut().await_new = true;
+                let id = self.forward_id(action)?;
+                self.remote_mut().await_new = Some(id);
             }
             action => self.forward(action)?,
         }
@@ -318,12 +357,12 @@ impl Store {
                 });
                 self.changed.mark(Changed::NOTICE);
             }
-            Server::Opened { scope, thread, .. }
+            Server::Opened { id, scope, thread }
                 if scope.project == self.profile.project && scope.route == self.profile.route =>
             {
-                if self.remote().unwrap().await_new {
+                if self.remote().unwrap().await_new.as_deref() == Some(id.as_str()) {
                     self.select_replica(&thread);
-                    self.remote_mut().await_new = false;
+                    self.remote_mut().await_new = None;
                     self.changed.mark(Changed::THREADS);
                 }
                 self.remote_mut().sending.remove("");
@@ -350,6 +389,23 @@ impl Store {
                     self.changed.mark(Changed::NOTICE | Changed::THREADS);
                     return Ok(());
                 }
+                // A worker waiting for YOLO is already an ask on this store; the
+                // notice would only repeat it. Keep it when the ask has not arrived.
+                if let Some(status) = result
+                    .as_ref()
+                    .filter(|s| error.is_none() && s["status"] == "waiting_for_operator")
+                {
+                    let ask_id = RequestId::Text(format!(
+                        "{}{}",
+                        crate::asks::YOLO_REQUEST_PREFIX,
+                        status["job_id"].to_string().trim_matches('"')
+                    ));
+                    if self.asks.iter().any(|a| a.id == ask_id) {
+                        self.notice = None;
+                        self.changed.mark(Changed::NOTICE);
+                        return Ok(());
+                    }
+                }
                 self.notice = Some(match (result, error) {
                     (_, Some(error)) => error,
                     (Some(status), None) if status["status"] == "waiting_for_operator" => format!(
@@ -369,11 +425,15 @@ impl Store {
                 for scope in scopes {
                     self.apply_scope(scope)?;
                 }
+                self.continue_restore();
+                self.reconcile_unconfirmed();
             }
             Server::Delta { changes, .. } => {
                 for change in changes {
                     self.apply_change(change)?;
                 }
+                self.continue_restore();
+                self.reconcile_unconfirmed();
             }
             Server::Ack { id } => {
                 if let Some(thread) = self.remote_mut().unconfirmed_options.remove(&id) {
@@ -384,26 +444,133 @@ impl Store {
                 }
             }
             Server::Error { id, message } => {
+                let error_id = id.clone();
                 if let Some(thread) = id
                     .as_ref()
                     .and_then(|id| self.remote_mut().unconfirmed_options.remove(id))
                 {
                     self.changed.transcript(&thread);
                 }
-                if let Some((owner, Some(draft))) =
+                if let Some((owner, Some(draft), _)) =
                     id.and_then(|id| self.remote_mut().pending.remove(&id))
                 {
                     draft.restore_before(self.drafts.entry(owner).or_default());
                 }
                 self.notice = Some(message);
-                self.remote_mut().await_new = false;
+                // An unrelated host error must not cancel the auto-select of the
+                // session being opened. Only the opening request's own error does.
+                if error_id.is_some() && self.remote().unwrap().await_new == error_id {
+                    self.remote_mut().await_new = None;
+                }
                 self.changed.mark(Changed::NOTICE);
             }
             _ => (),
         }
         Ok(())
     }
+    /// The replacement of a dead replica carries what the old one had not finished:
+    /// the paging target, and input the host never acknowledged (the connection closed
+    /// before or after the host took it, so delivery is unknown).
+    pub(super) fn recover_replica(&mut self, previous: &mut Self) {
+        let kept = previous
+            .remote()
+            .and_then(|r| r.restore)
+            .map_or(0, |(t, _)| t);
+        let loaded = previous.threads().len().max(kept);
+        if loaded > 0 {
+            self.remote_mut().restore = Some((loaded, None));
+        }
+        let Link::Host(old) = &mut previous.link else {
+            return;
+        };
+        self.remote_mut().restored_seen = std::mem::take(&mut old.restored_seen);
+        let mut unsent: Vec<_> = std::mem::take(&mut old.pending).into_values().collect();
+        // Input the old replica was already holding back for the same reason.
+        let waiting = std::mem::take(&mut old.unconfirmed);
+        self.remote_mut().unconfirmed = waiting;
+        unsent.sort_by_key(|(_, _, seen)| *seen);
+        let mut restored = false;
+        for (owner, draft, seen) in unsent {
+            let Some(draft) = draft else { continue };
+            let (text, attachments) = draft.signature();
+            draft.restore_before(self.drafts.entry(owner.clone()).or_default());
+            self.remote_mut().unconfirmed.push(Unconfirmed {
+                owner,
+                text,
+                attachments,
+                seen,
+            });
+            restored = true;
+        }
+        if restored {
+            self.notice = Some(
+                "The connection dropped while sending. Your message is back in the composer; check the conversation before sending it again.".into(),
+            );
+            self.changed.mark(Changed::NOTICE);
+        }
+    }
+    /// A restored message the host did take shows up in its thread as a new identical
+    /// user message: clear the composer copy so it is not sent twice. Whatever the
+    /// transcript does not show stays, the safe side of an unknown delivery.
+    fn reconcile_unconfirmed(&mut self) {
+        let waiting = std::mem::take(&mut self.remote_mut().unconfirmed);
+        for u in waiting {
+            let still_unsent = self
+                .drafts
+                .get(&u.owner)
+                .is_some_and(|d| d.signature() == (u.text.clone(), u.attachments.clone()));
+            if !still_unsent {
+                continue;
+            }
+            // A pasted image cannot be told from another one of the same kind in the
+            // transcript: that is not proof this message arrived, so it stays.
+            let delivered = u.attachments.iter().all(Option::is_some)
+                && u.owner
+                    .as_deref()
+                    .and_then(|o| self.transcripts.get(o))
+                    .is_some_and(|t| {
+                        t.is_ready() && t.user_messages(&u.text, &u.attachments) > u.seen
+                    });
+            if delivered {
+                self.drafts.remove(&u.owner);
+                self.notice = None;
+                self.changed.mark(Changed::NOTICE);
+                if let Some(o) = &u.owner {
+                    self.changed.transcript(o);
+                }
+            } else {
+                self.remote_mut().unconfirmed.push(u);
+            }
+        }
+    }
+    /// A fresh snapshot carries only the host's own loaded catalog. When that is
+    /// shorter than what this client had paged in (the host evicted a slow
+    /// client past its replay window, or restarted), page back up to the old
+    /// length instead of making the user scroll through every page again.
+    fn continue_restore(&mut self) {
+        let loaded = self.threads().len();
+        let more = self.cursor.is_some();
+        let Some((target, asked)) = self.remote().and_then(|r| r.restore) else {
+            return;
+        };
+        if loaded >= target || !more {
+            self.remote_mut().restore = None;
+            return;
+        }
+        // One request per loaded length: a page in flight is not asked for twice.
+        if asked == Some(loaded) {
+            return;
+        }
+        self.remote_mut().restore = Some((target, Some(loaded)));
+        if self.forward(Action::MoreThreads).is_err() {
+            self.remote_mut().restore = None;
+        }
+    }
     fn apply_scope(&mut self, s: ScopeState) -> io::Result<()> {
+        let before = self.threads().len();
+        for id in self.transcripts.keys() {
+            self.changed.replace_transcript(id);
+        }
         self.transcripts.clear();
         self.apply_change(Change::State {
             connection: s.connection,
@@ -413,6 +580,10 @@ impl Store {
         self.apply_change(Change::Sessions {
             sessions: s.sessions,
         })?;
+        if before > self.threads().len() && self.cursor.is_some() {
+            let kept = self.remote().and_then(|r| r.restore).map_or(0, |(t, _)| t);
+            self.remote_mut().restore = Some((before.max(kept), None));
+        }
         self.apply_change(Change::Asks { asks: s.asks })?;
         for (thread, timeline) in s.transcripts {
             self.apply_change(Change::Transcript { thread, timeline })?;
@@ -527,7 +698,11 @@ impl Store {
                 }
                 t.host_history_replaced(old_len);
                 apply_meta(t, timeline.detail);
-                self.changed.transcript(&thread);
+                if old_len > 0 {
+                    self.changed.replace_transcript(&thread);
+                } else {
+                    self.changed.transcript(&thread);
+                }
             }
             Change::TimelineState { thread, detail } => {
                 apply_meta(self.transcripts.entry(thread.clone()).or_default(), detail);
@@ -558,7 +733,7 @@ impl Store {
             }
             Change::Retired { thread } => {
                 self.transcripts.remove(&thread);
-                self.changed.transcript(&thread);
+                self.changed.replace_transcript(&thread);
             }
             Change::Notification { .. } => (),
         }
@@ -585,6 +760,28 @@ impl Store {
             self.terminal_threads.insert(id.clone());
         } else {
             self.terminal_threads.remove(&id);
+        }
+        if let (Some(message), Some(text)) = (
+            data["restored_draft"]["message"].as_str(),
+            data["restored_draft"]["text"].as_str(),
+        ) && self
+            .remote()
+            .is_some_and(|r| r.restored_seen.get(&id).is_none_or(|seen| seen != message))
+        {
+            self.remote_mut()
+                .restored_seen
+                .insert(id.clone(), message.to_owned());
+            // The host took the send and then lost it: the text is back in its
+            // composer, so it comes back here too, before anything typed since.
+            let current = self.drafts.entry(Some(id.clone())).or_default();
+            if current.text != text {
+                current.text = if current.text.is_empty() {
+                    text.to_owned()
+                } else {
+                    format!("{text}\n{}", current.text)
+                };
+            }
+            self.changed.mark(Changed::NOTICE);
         }
         let r = self.remote_mut();
         r.caps.insert(id.clone(), s.capabilities);
@@ -614,6 +811,7 @@ impl Store {
             "handed_off_to",
             "handoff_attempts",
             "yolo_grant",
+            "yolo_grant_expires",
             "yolo_children",
         ]
         .into_iter()
@@ -637,6 +835,7 @@ impl Store {
 fn apply_meta(t: &mut Transcript, d: Value) {
     t.active_turn = bits(&d["active"]);
     t.last_finished = bits(&d["last_finished"]);
+    t.interrupted = d["interrupted"] == true;
     t.ready = d["ready"] == true;
     t.verified = t.ready;
     t.loading = d["loading"] == true;
@@ -706,6 +905,34 @@ mod local_command_tests {
             None,
         ));
         assert!(store.notice().unwrap().contains("accept YOLO"));
+        // Once the host's YOLO ask is on the store, the reply adds no duplicate notice.
+        store
+            .apply_change(Change::Asks {
+                asks: vec![AskView {
+                    id: RequestId::Text("ox-yolo-9".into()),
+                    token: "t".into(),
+                    thread: Some("t".into()),
+                    turn: None,
+                    item: None,
+                    choices: vec![
+                        "Accept YOLO".into(),
+                        "Start in Auto".into(),
+                        "Decline".into(),
+                    ],
+                    choice_details: vec![],
+                    command: None,
+                    title: "Start a Codex worker in YOLO?".into(),
+                    detail: String::new(),
+                    questions: vec![],
+                }],
+            })
+            .unwrap();
+        store.apply(reply(
+            serde_json::json!({"status":"waiting_for_operator","job_id":9}),
+            None,
+        ));
+        assert_eq!(store.notice(), None);
+        assert!(store.asks()[0].waits_for_yolo());
         store.apply(reply(
             serde_json::json!({}),
             Some("This session cannot be handed off yet"),
@@ -768,5 +995,411 @@ mod local_command_tests {
             .unwrap();
         assert!(store.decline_reviewed_command(&id, "new-ask").is_err());
         assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn only_the_opening_requests_own_error_cancels_the_auto_select() {
+        let route = Route::CODEX_SUBSCRIPTION;
+        let mut store = Store::remote_client(
+            Profile {
+                project: "/p".into(),
+                route: route.clone(),
+                provider: "openai".into(),
+            },
+            |_, _| Ok("opening".into()),
+        );
+        let scope = crate::host_protocol::Scope {
+            project: "/p".into(),
+            route,
+        };
+        store.dispatch(Action::ForkThread("source".into())).unwrap();
+        assert!(store.opening_thread());
+        for id in [None, Some("another-request".to_owned())] {
+            store
+                .apply_host(Server::Error {
+                    id,
+                    message: "unrelated".into(),
+                })
+                .unwrap();
+            assert!(store.opening_thread(), "an unrelated error keeps waiting");
+        }
+        store
+            .apply_host(Server::Opened {
+                id: "another-request".into(),
+                scope: scope.clone(),
+                thread: "wrong".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            store.selected(),
+            None,
+            "another request's session is not selected"
+        );
+        store
+            .apply_host(Server::Opened {
+                id: "opening".into(),
+                scope: scope.clone(),
+                thread: "new".into(),
+            })
+            .unwrap();
+        assert_eq!(store.selected(), Some("new"));
+        assert!(!store.opening_thread());
+        store.dispatch(Action::ForkThread("source".into())).unwrap();
+        store
+            .apply_host(Server::Error {
+                id: Some("opening".into()),
+                message: "refused".into(),
+            })
+            .unwrap();
+        assert!(!store.opening_thread(), "its own error stops the wait");
+    }
+
+    fn page(from: usize, to: usize) -> Vec<SessionView> {
+        (from..to)
+            .map(|n| SessionView {
+                id: format!("t{n:05}"),
+                title: format!("T{n}"),
+                parent: None,
+                updated_at: 0,
+                status: "idle".into(),
+                capabilities: vec![],
+                detail: serde_json::json!({
+                    "row": {"id": format!("t{n:05}"), "cwd": "/p", "modelProvider": "openai",
+                        "model": null, "name": null, "preview": format!("T{n}"),
+                        "updatedAt": 0, "status": null, "parentThreadId": null,
+                        "agentNickname": null},
+                    "order": (100_000 - n).to_string(),
+                }),
+            })
+            .collect()
+    }
+    fn scope_state(sessions: Vec<SessionView>) -> ScopeState {
+        let route = Route::CODEX_SUBSCRIPTION;
+        ScopeState {
+            scope: crate::host_protocol::Scope {
+                project: "/p".into(),
+                route,
+            },
+            connection: "ready".into(),
+            capabilities: vec![],
+            sessions,
+            asks: vec![],
+            transcripts: Default::default(),
+            detail: serde_json::json!({"more": true}),
+        }
+    }
+    #[test]
+    fn a_fresh_snapshot_keeps_the_paged_in_catalog_length() {
+        use std::sync::{Arc, Mutex};
+        let asked = Arc::new(Mutex::new(0usize));
+        let counter = asked.clone();
+        let mut store = Store::remote_client(
+            Profile {
+                project: "/p".into(),
+                route: Route::CODEX_SUBSCRIPTION,
+                provider: "openai".into(),
+            },
+            move |action, _| {
+                if matches!(action, Action::MoreThreads) {
+                    *counter.lock().unwrap() += 1;
+                }
+                Ok("sent".into())
+            },
+        );
+        let snapshot = |sessions| Server::Snapshot {
+            cursor: crate::host_protocol::Cursor {
+                epoch: "e".into(),
+                seq: 1,
+            },
+            scopes: vec![scope_state(sessions)],
+        };
+        let delta = |changes| Server::Delta {
+            cursor: crate::host_protocol::Cursor {
+                epoch: "e".into(),
+                seq: 2,
+            },
+            scope: crate::host_protocol::Scope {
+                project: "/p".into(),
+                route: Route::CODEX_SUBSCRIPTION,
+            },
+            changes,
+        };
+        store.apply_host(snapshot(page(0, 50))).unwrap();
+        for n in 1..5 {
+            let rows = page(n * 50, n * 50 + 50);
+            store
+                .apply_host(delta(
+                    rows.into_iter()
+                        .map(|session| Change::Session { session })
+                        .collect(),
+                ))
+                .unwrap();
+        }
+        assert_eq!(store.threads().len(), 250);
+        assert_eq!(*asked.lock().unwrap(), 0);
+        // The client fell behind the replay window: the host sends a fresh snapshot.
+        store.apply_host(snapshot(page(0, 50))).unwrap();
+        assert_eq!(store.threads().len(), 50, "the snapshot itself is short");
+        assert_eq!(*asked.lock().unwrap(), 1, "asks for the next page at once");
+        // A delta that is not a page does not ask again while the page is in flight.
+        store.apply_host(delta(vec![])).unwrap();
+        assert_eq!(*asked.lock().unwrap(), 1);
+        for n in 1..5 {
+            let rows = page(n * 50, n * 50 + 50);
+            store
+                .apply_host(delta(
+                    rows.into_iter()
+                        .map(|session| Change::Session { session })
+                        .collect(),
+                ))
+                .unwrap();
+        }
+        let ids: Vec<_> = store.threads().iter().map(|r| r.id.clone()).collect();
+        assert_eq!(ids.len(), 250, "no row lost or duplicated");
+        assert_eq!(ids[249], "t00249");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            4,
+            "one request per missing page, then stop"
+        );
+        store.apply_host(delta(vec![])).unwrap();
+        assert_eq!(*asked.lock().unwrap(), 4);
+    }
+
+    fn profile() -> Profile {
+        Profile {
+            project: "/p".into(),
+            route: Route::CODEX_SUBSCRIPTION,
+            provider: "openai".into(),
+        }
+    }
+    fn snapshot(seq: u64, sessions: Vec<SessionView>) -> Server {
+        Server::Snapshot {
+            cursor: crate::host_protocol::Cursor {
+                epoch: "e".into(),
+                seq,
+            },
+            scopes: vec![scope_state(sessions)],
+        }
+    }
+    /// A store over a real unix socket whose peer (the host) is gone: the writer thread
+    /// fails like `open_store`'s and reports the close. The store had paged in 150 rows
+    /// and sent a message with an image that never reached the host.
+    fn store_whose_host_closed_the_socket() -> Store {
+        use std::io::Write;
+        let (client, host) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(String, Action)>(16);
+        let (closed, closes) = std::sync::mpsc::channel::<String>();
+        let writer = std::thread::spawn(move || {
+            let mut out = client;
+            for (id, action) in rx {
+                let mut frame = serde_json::to_vec(&(id, &action)).unwrap();
+                frame.push(b'\n');
+                if let Err(e) = out.write_all(&frame).and_then(|_| out.flush()) {
+                    let _ = closed.send(e.to_string());
+                    return;
+                }
+            }
+        });
+        let seq = std::sync::atomic::AtomicU64::new(0);
+        let mut old = Store::remote_client(profile(), move |action, _| {
+            let n = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let id = format!("a-{n}");
+            tx.try_send((id.clone(), action))
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            Ok(id)
+        });
+        let mut rows = page(0, 150);
+        rows[0].capabilities = vec!["send".into()];
+        old.apply_host(snapshot(1, rows)).unwrap();
+        old.cursor = Some("more".into());
+        old.select_replica("t00000");
+        // Shutdown, not just drop: a process forked by a parallel test may briefly hold a copy.
+        host.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(host);
+        old.edit(Some("t00000"), "do not lose me".into());
+        old.attach_image(
+            Some("t00000"),
+            crate::mentions::ImageInput::File("/tmp/shot.png".into()),
+        );
+        old.submit(Some("t00000")).unwrap();
+        assert!(old.sending(Some("t00000")));
+        assert_eq!(
+            old.draft(Some("t00000")),
+            "",
+            "pending, not in the composer"
+        );
+        let reason = closes
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        old.apply(LinkEvent::Closed {
+            reason,
+            stderr_tail: vec![],
+        });
+        writer.join().unwrap();
+        old
+    }
+    fn counting_replica() -> (Store, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let more = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = more.clone();
+        let store = Store::remote_client(profile(), move |action, _| {
+            match action {
+                Action::MoreThreads => counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                // A resend of the input would be a duplicate.
+                Action::SendText(..) | Action::SendImages(..) => panic!("auto-sent {action:?}"),
+                _ => 0,
+            };
+            Ok("n".into())
+        });
+        (store, more)
+    }
+    #[test]
+    fn a_replacement_replica_repages_and_keeps_input_the_host_never_acknowledged() {
+        let mut old = store_whose_host_closed_the_socket();
+        let (mut fresh, more) = counting_replica();
+        fresh.recover_from(&mut old);
+        assert_eq!(fresh.draft(Some("t00000")), "do not lose me");
+        assert_eq!(fresh.draft_images(Some("t00000")).len(), 1);
+        assert!(
+            !fresh.sending(Some("t00000")),
+            "nothing is sent for the user"
+        );
+        assert!(
+            fresh
+                .notice()
+                .is_some_and(|n| n.contains("check the conversation"))
+        );
+        // The host's replacement snapshot is shorter than what the old store had paged in.
+        fresh.apply_host(snapshot(1, page(0, 50))).unwrap();
+        assert_eq!(fresh.threads().len(), 50);
+        assert_eq!(more.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for n in 1..3 {
+            let changes = page(n * 50, n * 50 + 50)
+                .into_iter()
+                .map(|session| Change::Session { session })
+                .collect();
+            fresh
+                .apply_host(Server::Delta {
+                    cursor: crate::host_protocol::Cursor {
+                        epoch: "e".into(),
+                        seq: 1 + n as u64,
+                    },
+                    scope: crate::host_protocol::Scope {
+                        project: "/p".into(),
+                        route: Route::CODEX_SUBSCRIPTION,
+                    },
+                    changes,
+                })
+                .unwrap();
+        }
+        assert_eq!(fresh.threads().len(), 150, "back to the old length");
+        assert_eq!(more.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(fresh.draft(Some("t00000")), "do not lose me");
+    }
+    /// The host took the message but its acknowledgement was lost with the socket. The
+    /// replacement's transcript shows it, so the restored composer copy is dropped
+    /// instead of waiting to be sent twice; a transcript without it keeps the copy.
+    #[test]
+    fn a_message_the_host_received_is_reconciled_by_its_echo() {
+        let echo = |text: &str| {
+            let mut scope = scope_state(page(0, 150));
+            scope.sessions[0].capabilities = vec!["send".into()];
+            scope.transcripts.insert(
+                "t00000".into(),
+                crate::host_protocol::Timeline {
+                    items: vec![TimelineItem {
+                        turn: "turn-1".into(),
+                        id: "item-1".into(),
+                        role: "user".into(),
+                        text: text.into(),
+                        revision: 1,
+                        detail: serde_json::to_value(Item::UserMessage {
+                            content: vec![
+                                crate::transcript::item::Content {
+                                    text: Some(text.into()),
+                                    path: None,
+                                },
+                                crate::transcript::item::Content {
+                                    text: None,
+                                    path: Some("/tmp/shot.png".into()),
+                                },
+                            ],
+                        })
+                        .unwrap(),
+                    }],
+                    detail: serde_json::json!({"ready": true}),
+                },
+            );
+            Server::Snapshot {
+                cursor: crate::host_protocol::Cursor {
+                    epoch: "e".into(),
+                    seq: 1,
+                },
+                scopes: vec![scope],
+            }
+        };
+        let mut old = store_whose_host_closed_the_socket();
+        let (mut fresh, _) = counting_replica();
+        fresh.recover_from(&mut old);
+        fresh.apply_host(echo("something else")).unwrap();
+        assert_eq!(
+            fresh.draft(Some("t00000")),
+            "do not lose me",
+            "delivery unknown: preserved"
+        );
+        fresh.apply_host(echo("do not lose me")).unwrap();
+        assert_eq!(fresh.draft(Some("t00000")), "");
+        assert!(fresh.draft_images(Some("t00000")).is_empty());
+    }
+    /// The same text arrives with a different image (a second device): that is not the
+    /// message this client lost, so its composer keeps text and image A.
+    #[test]
+    fn the_same_text_with_a_different_image_is_not_the_lost_message() {
+        let echo = |path: &str| {
+            let mut scope = scope_state(page(0, 150));
+            scope.sessions[0].capabilities = vec!["send".into()];
+            scope.transcripts.insert(
+                "t00000".into(),
+                crate::host_protocol::Timeline {
+                    items: vec![TimelineItem {
+                        turn: "turn-1".into(),
+                        id: "item-1".into(),
+                        role: "user".into(),
+                        text: "do not lose me".into(),
+                        revision: 1,
+                        detail: serde_json::to_value(Item::UserMessage {
+                            content: vec![
+                                crate::transcript::item::Content {
+                                    text: Some("do not lose me".into()),
+                                    path: None,
+                                },
+                                crate::transcript::item::Content {
+                                    text: None,
+                                    path: Some(path.into()),
+                                },
+                            ],
+                        })
+                        .unwrap(),
+                    }],
+                    detail: serde_json::json!({"ready": true}),
+                },
+            );
+            Server::Snapshot {
+                cursor: crate::host_protocol::Cursor {
+                    epoch: "e".into(),
+                    seq: 1,
+                },
+                scopes: vec![scope],
+            }
+        };
+        let mut old = store_whose_host_closed_the_socket();
+        let (mut fresh, _) = counting_replica();
+        fresh.recover_from(&mut old);
+        fresh.apply_host(echo("/tmp/other-device.png")).unwrap();
+        assert_eq!(fresh.draft(Some("t00000")), "do not lose me");
+        assert_eq!(fresh.draft_images(Some("t00000")).len(), 1);
+        // Its own echo (same path) still reconciles.
+        fresh.apply_host(echo("/tmp/shot.png")).unwrap();
+        assert_eq!(fresh.draft(Some("t00000")), "");
     }
 }

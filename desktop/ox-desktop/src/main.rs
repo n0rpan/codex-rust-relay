@@ -6,6 +6,7 @@ mod kit;
 mod platform;
 mod preferences;
 mod settings;
+mod sky;
 mod terminal;
 #[path = "../../../src/version.rs"]
 mod version;
@@ -47,55 +48,58 @@ fn main() {
             std::process::exit(2);
         }
     };
-    gpui_platform::application().run(move |cx| {
-        #[cfg(target_os = "macos")]
-        platform::set_application_icon();
-        gpui_component::init(cx);
-        appearance::init(cx);
-        workspace_state::finish_writes(cx);
-        let layouts = views::host::layout::SavedLayouts::load();
-        let bounds = Bounds::centered(None, layouts.for_project(&project).window_size(), cx);
-        // Let AppKit finish its launch notification before creating the first NSWindow.
-        cx.spawn(async move |cx| -> gpui::Result<()> {
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("OX Desktop".into()),
+    gpui_platform::application()
+        .with_assets(gpui_kit_assets::Assets)
+        .run(move |cx| {
+            #[cfg(target_os = "macos")]
+            platform::set_application_icon();
+            gpui_component::init(cx);
+            appearance::init(cx);
+            sky::start(cx);
+            workspace_state::finish_writes(cx);
+            let layouts = views::host::layout::SavedLayouts::load();
+            let bounds = Bounds::centered(None, layouts.for_project(&project).window_size(), cx);
+            // Let AppKit finish its launch notification before creating the first NSWindow.
+            cx.spawn(async move |cx| -> gpui::Result<()> {
+                cx.open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        titlebar: Some(TitlebarOptions {
+                            title: Some("OX Desktop".into()),
+                            ..Default::default()
+                        }),
+                        window_min_size: Some(size(px(360.), px(480.))),
+                        app_id: Some("dev.ox.desktop".into()),
                         ..Default::default()
-                    }),
-                    window_min_size: Some(size(px(360.), px(480.))),
-                    app_id: Some("dev.ox.desktop".into()),
-                    ..Default::default()
-                },
-                |window, cx| {
-                    appearance::observe_window(window);
-                    let view = cx.new(|cx| {
-                        views::host::Host::new(
-                            project,
-                            layouts,
-                            smoke.then_some(started),
-                            stats,
-                            window,
-                            cx,
-                        )
-                    });
-                    let workspace = cx.new(|cx| app::Workspace::new(view, cx));
-                    cx.new(|cx| Root::new(workspace, window, cx))
-                },
-            )?;
-            cx.update(|cx| cx.activate(true));
-            Ok(())
-        })
-        .detach_and_log_err(cx);
-        cx.on_window_closed(|cx, window| {
-            platform::layout_probe::forget(window);
-            if cx.windows().is_empty() {
-                cx.quit()
-            }
-        })
-        .detach();
-    });
+                    },
+                    |window, cx| {
+                        appearance::observe_window(window);
+                        let view = cx.new(|cx| {
+                            views::host::Host::new(
+                                project,
+                                layouts,
+                                smoke.then_some(started),
+                                stats,
+                                window,
+                                cx,
+                            )
+                        });
+                        let workspace = cx.new(|cx| app::Workspace::new(view, cx));
+                        cx.new(|cx| Root::new(workspace, window, cx))
+                    },
+                )?;
+                cx.update(|cx| cx.activate(true));
+                Ok(())
+            })
+            .detach_and_log_err(cx);
+            cx.on_window_closed(|cx, window| {
+                platform::layout_probe::forget(window);
+                if cx.windows().is_empty() {
+                    cx.quit()
+                }
+            })
+            .detach();
+        });
 }
 
 fn startup_project(explicit: Option<PathBuf>) -> Result<PathBuf, String> {

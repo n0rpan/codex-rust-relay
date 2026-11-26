@@ -114,8 +114,14 @@ fn translates_function_tools_with_and_without_optional_fields() {
 
 #[test]
 fn forwards_baseline_tool_choice_strings() {
+    // Tool controls are forwarded only alongside a tools array.
     for mode in ["auto", "none", "required"] {
-        let body = translate_request(&json!({"input": "hi", "tool_choice": mode}), "m").unwrap();
+        let input = json!({
+            "input": "hi",
+            "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            "tool_choice": mode
+        });
+        let body = translate_request(&input, "m").unwrap();
         assert_eq!(body["tool_choice"], mode);
     }
 }
@@ -150,6 +156,25 @@ fn rejects_hosted_tool_choices() {
     let error = translate_request(&input, "m").unwrap_err();
     assert!(error.contains("web_search_preview"), "{error}");
     assert!(error.contains("tool_choice"), "{error}");
+}
+
+#[test]
+fn drops_tool_controls_when_no_tools_remain() {
+    // Stock Codex always sends these; with every tool dropped, Chat Completions
+    // rejects them, so only the messages should reach the upstream.
+    let input = json!({"input": "hi", "tool_choice": "auto", "parallel_tool_calls": true});
+    let body = translate_request(&input, "m").unwrap();
+    assert!(body.get("tools").is_none());
+    assert!(body.get("tool_choice").is_none());
+    assert!(body.get("parallel_tool_calls").is_none());
+
+    // A bad parallel flag is still a request error, even with no tools.
+    let input = json!({"input": "hi", "parallel_tool_calls": "yes"});
+    assert!(
+        translate_request(&input, "m")
+            .unwrap_err()
+            .contains("parallel_tool_calls")
+    );
 }
 
 #[test]
@@ -365,10 +390,36 @@ fn maps_image_parts_only_for_user_messages() {
             .contains("cannot carry image")
     );
 
+    // Codex view_image returns an image as tool output. Tool messages are text-only,
+    // so the image follows the last tool result of the turn as a user message.
+    let input = json!({"input": [
+        {"type": "function_call", "call_id": "call_a", "name": "view_image", "arguments": "{}"},
+        {"type": "function_call", "call_id": "call_b", "name": "shell", "arguments": "{}"},
+        {
+            "type": "function_call_output",
+            "call_id": "call_a",
+            "output": [{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]
+        },
+        {"type": "function_call_output", "call_id": "call_b", "output": "ok"},
+        {"type": "message", "role": "user", "content": "next"}
+    ]});
+    let body = translate_request(&input, "m").unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    let roles: Vec<_> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["assistant", "tool", "tool", "user", "user"]);
+    assert_eq!(messages[1]["content"], "[image attached below]");
+    assert_eq!(
+        messages[3]["content"][2],
+        json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}})
+    );
+
     let input = json!({"input": [{
         "type": "function_call_output",
         "call_id": "call_a",
-        "output": [{"type": "input_image", "image_url": "https://example.com/x.png"}]
+        "output": [{"type": "input_audio", "data": "x"}]
     }]});
     assert!(
         translate_request(&input, "m")
@@ -814,6 +865,86 @@ fn keeps_the_first_upstream_id_when_chunks_repeat_it() {
 }
 
 #[test]
+fn gives_parallel_calls_without_upstream_ids_distinct_call_ids() {
+    let mut translator = new_translator();
+    let mut events = push(
+        &mut translator,
+        &chunk(json!({"tool_calls": [
+            {"index": 0, "type": "function", "function": {"name": "shell", "arguments": "{\"command\":"}},
+            {"index": 1, "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":"}}
+        ]})),
+    );
+    events.extend(push(
+        &mut translator,
+        &chunk(json!({"tool_calls": [
+            {"index": 0, "function": {"arguments": "[\"ls\"]}"}},
+            {"index": 1, "function": {"arguments": "\"a.rs\"}"}}
+        ]})),
+    ));
+    events.extend(push(&mut translator, &finish_chunk("tool_calls")));
+    events.extend(translator.push_event("message", "[DONE]").unwrap());
+
+    let added = of_kind(&events, "response.output_item.added");
+    assert_eq!(added.len(), 2);
+    let first_id = added[0]["item"]["call_id"].as_str().unwrap();
+    let second_id = added[1]["item"]["call_id"].as_str().unwrap();
+    assert!(!first_id.is_empty() && !second_id.is_empty());
+    assert_ne!(first_id, second_id);
+    assert_eq!(added[0]["item"]["id"], format!("fc_{first_id}"));
+    assert_eq!(added[1]["item"]["id"], format!("fc_{second_id}"));
+
+    let deltas = of_kind(&events, "response.function_call_arguments.delta");
+    assert!(deltas.iter().all(|delta| {
+        delta["item_id"] == format!("fc_{first_id}")
+            || delta["item_id"] == format!("fc_{second_id}")
+    }));
+    let done = of_kind(&events, "response.function_call_arguments.done");
+    assert_eq!(done[0]["item_id"], format!("fc_{first_id}"));
+    assert_eq!(done[1]["item_id"], format!("fc_{second_id}"));
+
+    let output = one(&events, "response.completed")["response"]["output"].clone();
+    assert_eq!(output[0]["call_id"], first_id);
+    assert_eq!(output[0]["arguments"], "{\"command\":[\"ls\"]}");
+    assert_eq!(output[1]["call_id"], second_id);
+    assert_eq!(output[1]["arguments"], "{\"path\":\"a.rs\"}");
+}
+
+#[test]
+fn keeps_a_generated_call_id_when_a_real_id_arrives_later() {
+    let mut translator = new_translator();
+    let mut events = push(
+        &mut translator,
+        &chunk(json!({"tool_calls": [
+            {"index": 0, "type": "function", "function": {"name": "shell", "arguments": "{}"}}
+        ]})),
+    );
+    let generated = one(&events, "response.output_item.added")["item"]["call_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(!generated.is_empty());
+    events.extend(push(
+        &mut translator,
+        &chunk(
+            json!({"tool_calls": [{"index": 0, "id": "call_late", "function": {"arguments": ""}}]}),
+        ),
+    ));
+    events.extend(push(&mut translator, &finish_chunk("tool_calls")));
+    events.extend(translator.push_event("message", "[DONE]").unwrap());
+
+    let deltas = of_kind(&events, "response.function_call_arguments.delta");
+    assert!(
+        deltas
+            .iter()
+            .all(|delta| delta["item_id"] == format!("fc_{generated}"))
+    );
+    assert_eq!(
+        one(&events, "response.completed")["response"]["output"][0]["call_id"],
+        generated
+    );
+}
+
+#[test]
 fn maps_legacy_function_call_deltas() {
     let mut translator = new_translator();
     let mut events = push(
@@ -832,10 +963,10 @@ fn maps_legacy_function_call_deltas() {
     assert_eq!(
         completed["response"]["output"],
         json!([{
-            "id": "fc_call_compat_0",
+            "id": "fc_call_compat_resp_test_0",
             "type": "function_call",
             "status": "completed",
-            "call_id": "call_compat_0",
+            "call_id": "call_compat_resp_test_0",
             "name": "shell",
             "arguments": "{\"x\":1}"
         }])
@@ -898,17 +1029,22 @@ fn reports_content_filter_as_an_incomplete_response() {
 }
 
 #[test]
-fn rejects_unknown_finish_reasons() {
+fn completes_after_an_unknown_finish_reason_without_losing_the_answer() {
+    // A provider-specific reason after a full answer must not discard the streamed text.
     let mut translator = new_translator();
-    let events = push(&mut translator, &chunk(json!({"content": "x"})));
-    assert!(!events.is_empty());
-    // The unknown reason fails as soon as it arrives, before any item is closed.
-    let error = translator
-        .push_event("message", &finish_chunk("abort").to_string())
-        .unwrap_err();
-    assert!(error.contains("abort"), "{error}");
-    assert!(!translator.is_finished());
-    assert!(translator.finish().unwrap_err().contains("finish_reason"));
+    let mut events = push(&mut translator, &chunk(json!({"content": "kept"})));
+    events.extend(push(
+        &mut translator,
+        &finish_chunk("insufficient_system_resource"),
+    ));
+    events.extend(translator.push_event("message", "[DONE]").unwrap());
+    let completed = one(&events, "response.completed");
+    assert_eq!(completed["response"]["status"], "completed");
+    assert_eq!(
+        completed["response"]["output"][0]["content"][0]["text"],
+        "kept"
+    );
+    assert!(translator.is_finished());
 }
 
 #[test]
@@ -968,6 +1104,19 @@ fn rejects_interrupted_streams() {
     // A stream that ends before its first chunk is still an error.
     let mut translator = new_translator();
     assert!(translator.finish().unwrap_err().contains("finish_reason"));
+}
+
+#[test]
+fn reports_a_finish_reason_before_the_stream_closes() {
+    // The relay bounds the wait for `[DONE]` only once the finish_reason is known.
+    let mut translator = new_translator();
+    push(&mut translator, &chunk(json!({"content": "done"})));
+    assert!(!translator.has_finish_reason());
+    push(&mut translator, &finish_chunk("stop"));
+    assert!(translator.has_finish_reason());
+    assert!(!translator.is_finished());
+    translator.finish().unwrap();
+    assert!(translator.is_finished());
 }
 
 #[test]
@@ -1291,4 +1440,174 @@ fn still_requires_a_call_id_for_real_tool_outputs() {
     ]});
     let error = translate_request(&input, "m").unwrap_err();
     assert!(error.contains("needs a call_id"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// Tool-result images keep their originating call
+// ---------------------------------------------------------------------------
+
+fn screenshot_request(a: &[&str], b: &[&str]) -> Value {
+    let output = |urls: &[&str]| {
+        let mut parts = vec![json!({"type": "input_text", "text": "screenshots"})];
+        parts.extend(
+            urls.iter()
+                .map(|url| json!({"type": "input_image", "image_url": url})),
+        );
+        Value::Array(parts)
+    };
+    json!({"input": [
+        {"type": "function_call", "call_id": "left", "name": "take_screens", "arguments": "{}"},
+        {"type": "function_call", "call_id": "right", "name": "take_screens", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "left", "output": output(a)},
+        {"type": "function_call_output", "call_id": "right", "output": output(b)}
+    ]})
+}
+
+#[test]
+fn image_grouping_across_tool_calls_survives_translation() {
+    let first = translate_request(&screenshot_request(&["1"], &["2", "3"]), "m").unwrap();
+    let second = translate_request(&screenshot_request(&["1", "2"], &["3"]), "m").unwrap();
+    assert_ne!(first["messages"], second["messages"]);
+
+    let user = first["messages"].as_array().unwrap().last().unwrap();
+    let parts = user["content"].as_array().unwrap();
+    let shape: Vec<String> = parts
+        .iter()
+        .map(|part| match part["type"].as_str().unwrap() {
+            "text" => part["text"].as_str().unwrap().to_owned(),
+            _ => part["image_url"]["url"].as_str().unwrap().to_owned(),
+        })
+        .collect();
+    assert_eq!(
+        &shape[1..],
+        [
+            "Images from tool call left (take_screens):",
+            "1",
+            "Images from tool call right (take_screens):",
+            "2",
+            "3"
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Legacy function_call ids and reasoning_content
+// ---------------------------------------------------------------------------
+
+#[test]
+fn legacy_function_call_ids_are_scoped_to_their_response() {
+    let mut ids = Vec::new();
+    for response in ["resp_a", "resp_b"] {
+        let mut translator = ResponseTranslator::new(response, "m", 0);
+        let mut chunk = finish_chunk("function_call");
+        chunk["choices"][0]["delta"] =
+            json!({"function_call": {"name": "read", "arguments": "{}"}});
+        push(&mut translator, &chunk);
+        let events = translator.finish().unwrap();
+        ids.push(events.last().unwrap()["response"]["output"][0]["call_id"].clone());
+    }
+    assert_ne!(ids[0], ids[1]);
+}
+
+/// Mimics DeepSeek thinking mode: with tools in the request, every earlier
+/// assistant turn that used reasoning must come back with reasoning_content.
+fn strict_deepseek(body: &Value, reasoning_turns: usize) -> Result<(), String> {
+    if body.get("tools").is_none() {
+        return Ok(());
+    }
+    let with = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .filter(|m| {
+            m["reasoning_content"]
+                .as_str()
+                .is_some_and(|t| !t.is_empty())
+        })
+        .count();
+    if with == reasoning_turns {
+        Ok(())
+    } else {
+        Err(format!(
+            "400: reasoning_content must be passed back ({with}/{reasoning_turns})"
+        ))
+    }
+}
+
+#[test]
+fn reasoning_content_round_trips_across_two_tool_turns_against_a_strict_fixture() {
+    let tools = json!([{"type": "function", "name": "read", "parameters": {"type": "object"}}]);
+    let mut history = vec![json!({"type": "message", "role": "user", "content": "go"})];
+
+    for (turn, response) in ["resp_1", "resp_2"].into_iter().enumerate() {
+        let body = translate_request(&json!({"input": history, "tools": tools}), "m").unwrap();
+        strict_deepseek(&body, turn).expect("strict fixture rejects the request");
+
+        let mut translator = ResponseTranslator::new(response, "m", 0);
+        let mut events = push(
+            &mut translator,
+            &chunk(json!({"reasoning_content": "think "})),
+        );
+        events.extend(push(
+            &mut translator,
+            &chunk(json!({"reasoning_content": "hard"})),
+        ));
+        events.extend(push(
+            &mut translator,
+            &chunk(
+                json!({"tool_calls": [{"index": 0, "id": format!("call_{turn}"),
+                "function": {"name": "read", "arguments": "{}"}}]}),
+            ),
+        ));
+        events.extend(push(&mut translator, &finish_chunk("tool_calls")));
+        events.extend(translator.push_event("message", "[DONE]").unwrap());
+        assert_eq!(
+            of_kind(&events, "response.output_item.added")[0]["item"]["type"],
+            "reasoning"
+        );
+        let output = events.last().unwrap()["response"]["output"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[1]["type"], "function_call");
+        for item in output {
+            let mut item = item;
+            item.as_object_mut().unwrap().remove("status");
+            history.push(item);
+        }
+        history.push(json!({"type": "function_call_output", "call_id": format!("call_{turn}"), "output": "ok"}));
+    }
+
+    let body = translate_request(&json!({"input": history, "tools": tools}), "m").unwrap();
+    strict_deepseek(&body, 2).expect("two reasoning turns replayed");
+    let assistants: Vec<&Value> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .collect();
+    assert_eq!(assistants[0]["reasoning_content"], "think hard");
+    assert_eq!(assistants[0]["tool_calls"][0]["id"], "call_0");
+    assert_eq!(assistants[1]["tool_calls"][0]["id"], "call_1");
+
+    // Without tools the field is not sent.
+    let body = translate_request(&json!({"input": history}), "m").unwrap();
+    assert!(
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m.get("reasoning_content").is_none())
+    );
+
+    // Dropping the reasoning items is what the strict fixture rejects.
+    let stripped: Vec<Value> = history
+        .iter()
+        .filter(|i| i["type"] != "reasoning")
+        .cloned()
+        .collect();
+    let body = translate_request(&json!({"input": stripped, "tools": tools}), "m").unwrap();
+    assert!(strict_deepseek(&body, 2).is_err());
 }

@@ -1,6 +1,7 @@
 //! Desktop-owned display and input preferences.
-use super::{Preferences, button};
+use super::Preferences;
 use crate::appearance::Palette;
+use crate::appearance::Step;
 use gpui::{prelude::*, *};
 pub use ox_desk_core::desktop_behavior::{Behavior, ThemeSource};
 pub struct Active(pub Behavior);
@@ -22,12 +23,7 @@ impl Preferences {
     ) -> Div {
         let mut controls = div().flex().gap_1().flex_wrap();
         for &(caption, next) in options {
-            controls = controls.child(button(
-                caption,
-                caption,
-                next == current,
-                p,
-                cx.listener(move |s, _, _, cx| {
+            controls = controls.child(crate::kit::button(p, caption, caption, next == current, true, cx.listener(move |s, _, _, cx| {
                     if current == next || s.busy {
                         return;
                     }
@@ -44,6 +40,7 @@ impl Preferences {
                                 Ok(()) => {
                                     cx.set_global(Active(next));
                                     crate::appearance::refresh(cx);
+                                    crate::sky::reload(cx);
                                     s.report(Ok(()), "Preference saved.", cx);
                                 }
                                 Err(e) => s.report(
@@ -55,8 +52,7 @@ impl Preferences {
                         });
                     })
                     .detach();
-                }),
-            ));
+                })));
         }
         div()
             .flex()
@@ -65,7 +61,7 @@ impl Preferences {
             .child(
                 div()
                     .w(px(162.))
-                    .text_sm()
+                    .text_size(p.text(Step::Ui))
                     .text_color(rgb(p.muted))
                     .child(label),
             )
@@ -81,14 +77,14 @@ impl Preferences {
                 "Send messages",
                 &[
                     (
-                        "Ctrl / Cmd + Enter",
+                        "Ctrl/Cmd+Enter sends · Enter for newline",
                         Behavior {
                             enter_sends: false,
                             ..b
                         },
                     ),
                     (
-                        "Enter",
+                        "Enter sends · Shift+Enter for newline (default)",
                         Behavior {
                             enter_sends: true,
                             ..b
@@ -103,21 +99,21 @@ impl Preferences {
                 "Theme",
                 &[
                     (
-                        "System",
+                        "Follow system",
                         Behavior {
                             theme: ThemeSource::System,
                             ..b
                         },
                     ),
                     (
-                        "Light",
+                        "OX Arcade light",
                         Behavior {
                             theme: ThemeSource::Light,
                             ..b
                         },
                     ),
                     (
-                        "Dark",
+                        "OX Arcade dark",
                         Behavior {
                             theme: ThemeSource::Dark,
                             ..b
@@ -133,7 +129,8 @@ impl Preferences {
                 &[
                     ("Small", Behavior { font_size: 14, ..b }),
                     ("Default", Behavior { font_size: 16, ..b }),
-                    ("Large", Behavior { font_size: 19, ..b }),
+                    ("Large", Behavior { font_size: 18, ..b }),
+                    ("Extra large", Behavior { font_size: 20, ..b }),
                 ],
                 b,
                 p,
@@ -161,6 +158,34 @@ impl Preferences {
                 p,
                 cx,
             ))
+            .child(self.preference_choices(
+                "Live weather (MET Norway)",
+                &[
+                    (
+                        "Weather on",
+                        Behavior {
+                            live_weather: true,
+                            ..b
+                        },
+                    ),
+                    (
+                        "Weather off",
+                        Behavior {
+                            live_weather: false,
+                            ..b
+                        },
+                    ),
+                ],
+                b,
+                p,
+                cx,
+            ))
+            .child(
+                div()
+                    .text_size(p.text(Step::Meta))
+                    .text_color(rgb(p.muted))
+                    .child("Only a city-level location derived from your timezone is sent to api.met.no. Time of day works without it."),
+            )
     }
 }
 

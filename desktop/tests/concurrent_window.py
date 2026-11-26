@@ -108,11 +108,45 @@ def run(gui, stock, root):
                 def click(x, y):
                     command("xdotool", "mousemove", "--window", window, str(x), str(y), "click", "1")
 
+                def press(label, sock=child["OX_DESK_STATS_SOCKET"]):
+                    """Click a control by its id or accessible label through the layout probe;
+                    icon buttons carry no visible word for OCR."""
+                    end = time.monotonic() + 12
+                    while time.monotonic() < end:
+                        if not Path(sock).exists():
+                            time.sleep(.06)
+                            continue
+                        probe.sendto(b"snapshot", sock)
+                        view = json.loads(probe.recv(1 << 20))
+                        for control in view.get("layout", []):
+                            if (control["window"] == "OX Desktop" and label in (control["label"], control["id"])
+                                    and control["enabled"]):
+                                click(control["x"] + control["w"] // 2, control["y"] + control["h"] // 2)
+                                return
+                        time.sleep(.06)
+                    raise AssertionError(f"No enabled {label!r} control in the window")
+
+                def press_choice(*needles):
+                    """Press the picker row (model or setting choice) whose probe label contains a needle."""
+                    end = time.monotonic() + 12
+                    seen = []
+                    while time.monotonic() < end:
+                        probe.sendto(b"snapshot", child["OX_DESK_STATS_SOCKET"])
+                        layout = json.loads(probe.recv(1 << 20)).get("layout", [])
+                        seen = [(c["id"], c["label"]) for c in layout if c["id"].startswith(("model-row", "model-choice"))]
+                        for control in layout:
+                            if (control["id"].startswith(("model-row", "model-choice")) and control["enabled"]
+                                    and any(n in control["label"].casefold() for n in needles)):
+                                press(control["id"])
+                                return
+                        time.sleep(.06)
+                    raise AssertionError(f"No picker row matching {needles}; the layout has {seen}")
+
                 def wait_view(predicate):
                     end = time.monotonic() + 12
                     while time.monotonic() < end:
                         probe.sendto(b"snapshot", child["OX_DESK_STATS_SOCKET"])
-                        view = json.loads(probe.recv(16384))
+                        view = json.loads(probe.recv(1 << 20))
                         if predicate(view):
                             return view
                         time.sleep(.06)
@@ -128,13 +162,22 @@ def run(gui, stock, root):
                     enter(prompt)
                     word("once")
 
+                def switch_to_waiting(project, thread):
+                    def project_control(view):
+                        return next((c for c in view["layout"] if c["id"].startswith("waiting-")
+                                     and c["label"].endswith(f" · {project}") and c["enabled"]), None)
+                    press(project_control(wait_view(project_control))["id"])
+                    wait_view(lambda view: view["selected_thread"] == thread and view["selected_requests"])
+
                 send("Alpha approval")
+                alpha_thread = wait_view(lambda s: s["selected_requests"])["selected_thread"]
                 click(*word("alpha", sidebar=True))
                 click(*word("/beta"))
                 send("Beta approval")
+                beta_thread = wait_view(lambda s: s["selected_requests"])["selected_thread"]
                 for p in (alpha, beta):
                     assert not (p / "approved.txt").exists()
-                click(*word("waiting"))
+                switch_to_waiting("Alpha", alpha_thread)
                 click(*word("once"))
                 word("complete")
                 assert (alpha / "approved.txt").read_text().strip() == "accepted"
@@ -162,12 +205,12 @@ def run(gui, stock, root):
                 worker = wait_view(lambda s: s["selected_parent"] and s["selected_requests"]
                                    and s["visible_turn"])["selected_thread"]
                 enter("Apply the window clarification.")
-                click(*word("waiting"))
+                switch_to_waiting("Beta", beta_thread)
                 word("once")
                 command("xdotool", "key", "ctrl+alt+1")
                 word("complete")
                 assert (beta / "approved.txt").read_text().strip() == "accepted"
-                click(*word("waiting"))
+                switch_to_waiting("Alpha", worker)
                 wait_view(lambda s: s["selected_thread"] == worker and s["selected_requests"])
                 click(*word("once"))
                 assert http.steered.wait(10), "Stock worker did not receive the UI clarification"
@@ -175,24 +218,38 @@ def run(gui, stock, root):
                 enter("Confirm the worker follow-up.")
                 assert http.followup_requested.wait(10), "Stock worker did not receive the follow-up from its composer"
                 wait_view(lambda s: s["selected_thread"] == worker and s["selected_requests"] and s["visible_turn"])
-                click(*word("stop"))
+                press("stop-turn")
                 wait_view(lambda s: s["selected_thread"] == worker and not s["visible_turn"])
                 click(*word("once"))  # Alpha parent's remaining approval
                 click(*word("alpha", sidebar=True))
                 click(*word("/beta"))
                 beta_thread = wait_view(lambda s: s["selected_thread"] and not s["visible_turn"])["selected_thread"]
-                _, controls = word("speed")
+                def control_label(control_id):
+                    probe.sendto(b"snapshot", child["OX_DESK_STATS_SOCKET"])
+                    view = json.loads(probe.recv(1 << 20))
+                    return next((c["label"] for c in view.get("layout", [])
+                                 if c["window"] == "OX Desktop" and c["id"] == control_id), "")
 
-                def chip(label):
-                    return word(label, between_rows=(controls - 18, controls + 18))
+                def expect_label(control_id, wanted):
+                    # The chips show display names ("codeox · demo"), so read them from the layout probe.
+                    end = time.monotonic() + 12
+                    while time.monotonic() < end:
+                        if wanted in control_label(control_id).casefold():
+                            return
+                        time.sleep(.1)
+                    raise AssertionError(f"{control_id} never showed {wanted!r}; read {control_label(control_id)!r}")
 
-                click(*chip("fixture/demo"))
-                click(*word("orchard"))
-                click(*chip("fixture/alternate"))
-                click(*word("meadow"))
-                click(*chip("effort"))
-                click(*word("high"))
-                chip("high")
+                # Chip ids are model-setting-0 (model), -1 (effort), -2 (speed).
+                expect_label("model-setting-0", "demo")
+                press("model-setting-0")
+                press_choice("orchard", "alternate")
+                expect_label("model-setting-0", "alternate")
+                press("model-setting-0")
+                press_choice("meadow", "demo")
+                expect_label("model-setting-0", "demo")
+                press("model-setting-1")
+                press_choice("high")
+                expect_label("model-setting-1", "high")
                 wait_view(lambda s: s["selected_thread"] == beta_thread)
                 enter("/speed default")
                 word("default")  # Codex acknowledged the requested speed.
@@ -204,11 +261,11 @@ def run(gui, stock, root):
                 click(*word("here"))
                 word("complete")
                 original = argv[-1]
-                click(*word("actions"))
+                press("thread-menu")
                 click(*word("fork"))
                 fork = wait_view(lambda s: s["selected_thread"] and s["selected_thread"] != original)["selected_thread"]
                 word("complete")
-                click(*word("actions"))
+                press("thread-menu")
                 click(*word("rename"))
                 word("cancel")
                 command("xdotool", "key", "ctrl+a")
@@ -223,10 +280,10 @@ def run(gui, stock, root):
                         time.sleep(.06)
                     else:
                         raise AssertionError(f"Rename did not reach stock Codex: {result['thread']['name']!r}")
-                click(*word("actions"))
+                press("thread-menu")
                 click(*word("archive"))
                 click(*word("cancel"))
-                click(*word("actions"))
+                press("thread-menu")
                 click(*word("archive"))
                 # The confirmation precedes Cancel in keyboard focus order.
                 x, y = word("cancel")
@@ -242,25 +299,26 @@ def run(gui, stock, root):
         fresh = root / "fresh"
         fresh.mkdir(mode=0o700)
         fresh_env = {**child, "HOME": str(fresh), "CODEX_HOME": str(fresh / ".codex"),
-                     "XDG_STATE_HOME": str(fresh / "state")}
-        with session_host(gui.with_name("ox-host"),root,fresh_env), subprocess.Popen([gui, alpha], env=fresh_env) as app:
+                     "XDG_STATE_HOME": str(fresh / "state"),
+                     "OX_DESK_STATS_SOCKET": str(fresh / "stats")}
+        with session_host(gui.with_name("ox-host"),root,fresh_env), subprocess.Popen([gui, "--desk-stats", alpha], env=fresh_env) as app, \
+                socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as probe:
+            probe.bind(str(fresh / "probe"))
+            probe.settimeout(2)
             try:
                 window = command("xdotool", "search", "--sync", "--onlyvisible", "--pid",
                                  str(app.pid), "--name", "OX Desktop").splitlines()[-1]
                 command("xdotool", "windowfocus", window)
-                heading = word("connect")
-                configure = word("configure")
-                # The primary sign-in button sits between the last line of the
-                # account description and the secondary provider button. Its
-                # tinted label is unreadable to OCR on some Ubuntu fonts.
-                description = word("subscription", between_rows=(heading[1], configure[1]))
-                click(configure[0], (description[1] + configure[1]) // 2)
+                word("connect")
+                # The onboarding buttons carry ids: the tinted primary label is unreadable
+                # to OCR on some fonts, and the description wording is free to change.
+                press("native-sign-in", fresh_env["OX_DESK_STATS_SOCKET"])
                 terminal_file = fresh / "terminal.json"
                 end = time.monotonic() + 5
                 while not terminal_file.exists() and time.monotonic() < end:
                     time.sleep(.05)
                 assert json.loads(terminal_file.read_text())[-2:] == ["login", "chatgpt"]
-                click(*word("configure"))
+                press("setup-provider", fresh_env["OX_DESK_STATS_SOCKET"])
                 word("custom")
                 print("A fresh profile reached native sign-in and the provider settings form.")
             finally:

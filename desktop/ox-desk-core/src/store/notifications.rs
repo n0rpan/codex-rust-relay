@@ -94,6 +94,8 @@ impl Store {
                     if settings.provider != self.profile.provider || mismatch {
                         t.verified = false;
                         t.ready = false;
+                        // Its TurnCompleted is dropped while unverified, so the running turn can never clear itself.
+                        t.active_turn = None;
                         t.error=Some("Codex changed this thread’s billing route. Reopen it on its current route.".into());
                     }
                     self.changed.transcript(&thread);

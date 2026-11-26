@@ -77,6 +77,8 @@ actions! {
     SendText(Option<String>,String)=>Target::Runtime(Operation::Submit),
     Submit(Option<String>)=>Target::Runtime(Operation::Submit),
     Stop(String)=>Target::Runtime(Operation::Stop),
+    EndSession(String)=>Target::Host,
+    ForceEndSession(String)=>Target::Host,
     AnswerAsk(RequestId,usize)=>Target::ServerReply,
     AnswerQuestions(RequestId,Vec<String>)=>Target::ServerReply,
     SetNextAccess(Access)=>Target::Local,
@@ -131,9 +133,10 @@ impl Store {
                         return Err(io::Error::other(message));
                     }
                     _ => {
-                        return Err(io::Error::other(
-                            "This command is unavailable on this route.",
-                        ));
+                        let name = text.split_whitespace().next().unwrap_or("This command");
+                        return Err(io::Error::other(format!(
+                            "{name} is not available on this model route. Type /status to see what this session supports."
+                        )));
                     }
                 }
             }
@@ -154,6 +157,7 @@ impl Store {
             Action::SendText(owner, text) => self.send_client_message(owner, text, vec![])?,
             Action::Submit(id) => self.submit(id.as_deref())?,
             Action::Stop(id) => self.stop(&id)?,
+            Action::EndSession(id) | Action::ForceEndSession(id) => self.end_session(&id)?,
             Action::AnswerAsk(id, choice) => self.answer(&id, choice)?,
             Action::AnswerQuestions(id, answers) => self.answer_questions(&id, &answers)?,
             Action::SetNextAccess(preset) => self.set_next_access(preset),

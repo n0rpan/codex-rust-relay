@@ -31,10 +31,13 @@ pub fn discover(
     let mut errors = Vec::new();
     let index = Index::load(titles).unwrap_or_default();
     let settings = ox::snapshot(ox, path);
-    let aliases = settings
+    let reduced = settings
         .as_ref()
         .map(|s| s.models.as_slice())
         .unwrap_or_default();
+    // Saved history on an alias nobody starred is still that alias's session: validate against
+    // the full catalog, asked once and only when a row names an alias the reduced list lacks.
+    let full = std::cell::OnceCell::<Vec<String>>::new();
     let codex_provider = settings
         .as_ref()
         .ok()
@@ -43,7 +46,7 @@ pub fn discover(
         let mut groups = HashMap::<Scope, Vec<SessionView>>::new();
         for mut row in rows.into_iter().filter(|r| r.cwd.is_absolute()) {
             index.decorate(&mut row);
-            let known = match runtime {
+            let known_in = |aliases: &[String]| match runtime {
                 Runtime::Claude => row.saved_runtime_route(aliases),
                 Runtime::Codex if !api && row.model_provider == "openai" => {
                     Some(Route::CODEX_SUBSCRIPTION)
@@ -56,6 +59,10 @@ pub fn discover(
                     .map(Route::codex_api),
                 _ => None,
             };
+            let known = known_in(reduced).or_else(|| {
+                row.model.as_ref()?;
+                known_in(full.get_or_init(|| ox::catalog(ox, path, reduced)))
+            });
             let available = known.is_some();
             // Unknown providers remain visible. The host must verify the binding before opening.
             let route = known.unwrap_or_else(|| {

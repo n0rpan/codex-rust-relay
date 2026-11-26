@@ -85,6 +85,20 @@ pub struct Origin {
 }
 
 impl Origin {
+    /// The shared worker contract a hosted Claude Write worker starts under, with
+    /// the same Bash permissions, sandbox settings and Workflow rule as a standalone worker.
+    pub fn claude_contract(
+        &self,
+        mode: WorkerMode,
+    ) -> Option<crate::claude_worker_contract::Contract> {
+        (self.runtime == Runtime::Claude
+            && matches!(self.relation, Relation::Worker | Relation::Fork)
+            && self.handoff.is_none()
+            && self.requested == Ceiling::Write)
+            .then(|| {
+                crate::claude_worker_contract::Contract::detect(true, mode == WorkerMode::Workflow)
+            })
+    }
     /// The stamp a fork of this session carries. It can only keep or narrow the ceiling.
     pub fn fork(&self, source: &str) -> Self {
         Self {
@@ -124,6 +138,9 @@ pub struct WorkerStart {
     /// An operator start whose client showed the YOLO confirmation.
     #[serde(default)]
     pub yolo_confirmed: bool,
+    /// Wall-clock limit in minutes. Absent means no limit unless the host sets `OX_WORKER_MAX_MINUTES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_minutes: Option<u32>,
 }
 
 impl WorkerStart {
@@ -185,11 +202,15 @@ impl WorkerStart {
             write,
             permission,
             yolo_confirmed: false,
+            max_minutes: None,
         };
         Some(start.validate().map(|()| start))
     }
     /// The checks the standalone OX gateway applies, shared by every launcher.
     pub fn validate(&self) -> Result<(), String> {
+        if self.max_minutes.is_some_and(|m| m == 0 || m > 7 * 24 * 60) {
+            return Err("max_minutes must be between 1 and 10080.".into());
+        }
         if self.task.trim().is_empty() || self.task.len() > 32 * 1024 {
             return Err("Provide a task of up to 32 KiB.".into());
         }

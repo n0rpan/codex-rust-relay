@@ -186,6 +186,13 @@ export function imagesFor(key) {
 export function clearImages(key, sent) {
   if (drafts.get(key) === sent) drafts.delete(key);
 }
+// A provisional composer becomes the real session's: what was attached since the send
+// (anything but the images already sent) moves along.
+export function moveImages(from, to, sent) {
+  const images = drafts.get(from);
+  drafts.delete(from);
+  if (images && images !== sent && images.length) drafts.set(to, images);
+}
 export function setComposerOwner(key, render, notice) {
   clearTimeout(queryTimer);
   query = null;

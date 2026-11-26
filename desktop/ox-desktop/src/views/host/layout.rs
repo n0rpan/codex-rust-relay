@@ -147,14 +147,15 @@ impl Layout {
         })
     }
     pub fn window_size(&self) -> Size<Pixels> {
-        if self.width >= 360 && self.height >= 480 {
-            size(
-                px(self.width.min(10000) as f32),
-                px(self.height.min(10000) as f32),
-            )
-        } else {
-            size(px(1130.), px(760.))
+        // Never saved: use the default. Otherwise clamp each axis on its own, so a short
+        // tile keeps its valid width.
+        if self.width == 0 || self.height == 0 {
+            return size(px(1130.), px(760.));
         }
+        size(
+            px(self.width.clamp(360, 10000) as f32),
+            px(self.height.clamp(480, 10000) as f32),
+        )
     }
     pub(super) fn side_width(&self) -> u32 {
         if self.sidebar_width == 0 {
@@ -209,7 +210,15 @@ impl Host {
                 active = Some(panes.len());
                 first.clone()
             } else {
-                let extra = Self::pane(saved.project.clone(), r, None, self.stats, window, cx);
+                let extra = Self::pane(
+                    saved.project.clone(),
+                    r,
+                    None,
+                    self.stats,
+                    self.models.clone(),
+                    window,
+                    cx,
+                );
                 extra.update(cx, |b, cx| b.set_front(false, cx));
                 extra
             };
@@ -246,7 +255,15 @@ impl Host {
             }) {
                 continue;
             }
-            let pane = Self::pane(saved.project.clone(), route, None, self.stats, window, cx);
+            let pane = Self::pane(
+                saved.project.clone(),
+                route,
+                None,
+                self.stats,
+                self.models.clone(),
+                window,
+                cx,
+            );
             pane.update(cx, |view, cx| view.set_front(false, cx));
             saved.restore(&pane, cx);
             self.panes.push(pane);
@@ -334,6 +351,14 @@ mod tests {
             ..layout
         };
         assert_eq!(minimum.window_size(), size(px(360.), px(480.)));
+        // A short tile keeps its valid width; a never-saved layout gets the default.
+        let short = Layout {
+            width: 1000,
+            height: 400,
+            ..Default::default()
+        };
+        assert_eq!(short.window_size(), size(px(1000.), px(480.)));
+        assert_eq!(Layout::default().window_size(), size(px(1130.), px(760.)));
     }
 
     fn fixture(path: &str, thread: &str, width: u32) -> Layout {

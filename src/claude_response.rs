@@ -31,10 +31,15 @@
 //!   when the block closes. Argument accumulation is bounded by
 //!   [`MAX_TOOL_ARGUMENT_BYTES`]. Parallel tool calls may interleave their
 //!   deltas; each event carries its own block index.
-//! * Reasoning items and reasoning-summary deltas are ignored. A foreign vendor
-//!   cannot supply Claude's signed thinking blocks, and this module never
-//!   fabricates a signature for them. Native Claude thinking already bypasses
-//!   this module.
+//! * Reasoning-summary deltas are ignored. A foreign vendor cannot supply
+//!   Claude's signed thinking blocks, and this module never fabricates an
+//!   Anthropic signature. The one exception is a finished reasoning item that
+//!   wraps a Chat Completions `reasoning_content` (the chat adapter's
+//!   `codeox.chat.reasoning.v1:` envelope): it becomes a `thinking` block
+//!   whose `signature` is that ox-owned marker, which Claude Code returns
+//!   verbatim with the assistant turn and `claude_request` turns back into
+//!   `reasoning_content` for the provider. Other reasoning items are dropped.
+//!   Native Claude thinking already bypasses this module.
 //! * A completed response maps to `end_turn` or, when any tool block was
 //!   emitted, `tool_use`. An incomplete response maps `max_output_tokens` to
 //!   `max_tokens` and `content_filter` to `refusal`; an open tool block is
@@ -45,6 +50,7 @@
 //! * An empty completed response is rendered as one empty `text` block so the
 //!   stream still describes a well-formed Messages response.
 
+use crate::adapters::chat_completions::CHAT_REASONING_PREFIX;
 use serde_json::{Map, Value, json};
 
 /// Ceiling for one tool call's accumulated JSON arguments.
@@ -524,13 +530,53 @@ impl MessagesStream {
                 events.extend(self.reconcile_tool_arguments(block, arguments)?);
                 events.extend(self.finish_tool_block(block, true)?);
             }
-            _ => {
+            other => {
                 if position.is_none() {
                     self.items.push(Item {
                         output_index,
                         item_id,
                         kind: ItemKind::Ignored,
                     });
+                }
+                // A Chat Completions `reasoning_content` is carried to the
+                // client as a thinking block whose signature is the adapter's
+                // own marker (never an Anthropic signature), so the next
+                // request can restore it. Other reasoning stays dropped.
+                if other == "reasoning"
+                    && let Some(marker) = item
+                        .get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .filter(|raw| {
+                            raw.strip_prefix(CHAT_REASONING_PREFIX)
+                                .is_some_and(|text| !text.is_empty())
+                        })
+                {
+                    let text = marker[CHAT_REASONING_PREFIX.len()..].to_owned();
+                    let block = self.blocks.len();
+                    self.blocks.push(Block {
+                        kind: BlockKind::Thinking {
+                            text: text.clone(),
+                            signature: marker.to_owned(),
+                        },
+                        closed: true,
+                        valid: true,
+                    });
+                    events.push(json!({
+                        "type": "content_block_start",
+                        "index": block,
+                        "content_block": { "type": "thinking", "thinking": "", "signature": "" },
+                    }));
+                    events.push(json!({
+                        "type": "content_block_delta",
+                        "index": block,
+                        "delta": { "type": "thinking_delta", "thinking": text },
+                    }));
+                    events.push(json!({
+                        "type": "content_block_delta",
+                        "index": block,
+                        "delta": { "type": "signature_delta", "signature": marker },
+                    }));
+                    events.push(block_stop(block));
                 }
             }
         }
@@ -851,8 +897,8 @@ impl MessagesStream {
                 current.push_str(text);
                 Ok(vec![text_delta(block, text)])
             }
-            BlockKind::Tool { .. } => Err(format!(
-                "text arrived for content block {block}, which is a tool call"
+            BlockKind::Tool { .. } | BlockKind::Thinking { .. } => Err(format!(
+                "text arrived for content block {block}, which is not text"
             )),
         }
     }
@@ -860,7 +906,7 @@ impl MessagesStream {
     fn text_of(&self, block: usize) -> Option<String> {
         match &self.blocks[block].kind {
             BlockKind::Text { text } => Some(text.clone()),
-            BlockKind::Tool { .. } => None,
+            BlockKind::Tool { .. } | BlockKind::Thinking { .. } => None,
         }
     }
 
@@ -892,7 +938,7 @@ impl MessagesStream {
                 arguments.push_str(partial);
                 Ok(vec![tool_argument_delta(block, partial)])
             }
-            BlockKind::Text { .. } => Err(format!(
+            BlockKind::Text { .. } | BlockKind::Thinking { .. } => Err(format!(
                 "tool arguments arrived for content block {block}, which is text"
             )),
         }
@@ -910,7 +956,7 @@ impl MessagesStream {
             BlockKind::Tool {
                 name, arguments, ..
             } => (name.clone(), arguments.clone()),
-            BlockKind::Text { .. } => {
+            BlockKind::Text { .. } | BlockKind::Thinking { .. } => {
                 return Err(format!(
                     "tool arguments arrived for content block {block}, which is text"
                 ));
@@ -938,7 +984,7 @@ impl MessagesStream {
                 input,
                 ..
             } => (name.clone(), arguments.clone(), input.clone()),
-            BlockKind::Text { .. } => {
+            BlockKind::Text { .. } | BlockKind::Thinking { .. } => {
                 return Err(format!("content block {block} is text, not a tool call"));
             }
         };
@@ -1161,6 +1207,9 @@ impl Block {
         }
         match &self.kind {
             BlockKind::Text { text } => Some(json!({ "type": "text", "text": text })),
+            BlockKind::Thinking { text, signature } => {
+                Some(json!({ "type": "thinking", "thinking": text, "signature": signature }))
+            }
             BlockKind::Tool {
                 id, name, input, ..
             } => Some(json!({
@@ -1177,6 +1226,11 @@ impl Block {
 enum BlockKind {
     Text {
         text: String,
+    },
+    /// A replayable Chat Completions reasoning text; see `output_item_done`.
+    Thinking {
+        text: String,
+        signature: String,
     },
     Tool {
         id: String,

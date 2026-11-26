@@ -154,38 +154,65 @@ async fn mock(home: &Home) -> (Arc<Mutex<Vec<Hit>>>, tokio::task::JoinHandle<()>
     (hits, task)
 }
 
-async fn start_gateway(home: &Home, port: u16, client: &Client) -> Child {
-    let child = home
+// The CLI serves a fixed port. A released test port can be taken by another parallel
+// test before the child binds it. Wait for this child's own readiness announcement so
+// another listener on the candidate port cannot answer its health check.
+async fn launch_gateway(home: &Home, port: u16) -> Option<Child> {
+    let mut child = home
         .command()
         .args(["serve", "--port", &port.to_string()])
         .env("OX_GATEWAY_KEY", GATEWAY_KEY)
         .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let url = format!("http://127.0.0.1:{port}/v1/catalog");
-    for _ in 0..100 {
-        if let Ok(reply) = client.get(&url).bearer_auth(GATEWAY_KEY).send().await
-            && reply.status().is_success()
-        {
-            return child;
+    let ready = format!("ox: serving on http://127.0.0.1:{port}");
+    let busy = format!("ox: port {port} is already in use");
+    let mut lines = BufReader::new(child.stderr.as_mut().unwrap()).lines();
+    let mut diagnostic = String::new();
+    let listening = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if line == ready {
+                return true;
+            }
+            diagnostic.push_str(&line);
+            diagnostic.push('\n');
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        false
+    })
+    .await
+    .expect("timed out waiting for ox serve to bind");
+    if listening {
+        return Some(child);
     }
-    panic!("persistent relay did not start");
+    let status = child.wait().await.unwrap();
+    assert!(
+        diagnostic.lines().any(|line| line == busy),
+        "ox serve exited with {status}: {diagnostic}"
+    );
+    None
 }
 
+async fn start_gateway(home: &Home) -> (u16, Child) {
+    for _ in 0..10 {
+        let port = loopback_port().await;
+        if let Some(child) = launch_gateway(home, port).await {
+            return (port, child);
+        }
+    }
+    panic!("could not obtain an unused gateway port");
+}
 #[tokio::test]
 async fn a_fixed_endpoint_serves_both_client_protocols_and_survives_restart() {
     let home = Home::new();
     let (hits, mock) = mock(&home).await;
-    let port = loopback_port().await;
     let client = Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(3))
         .build()
         .unwrap();
+    let (port, mut child) = start_gateway(&home).await;
     let base = format!("http://127.0.0.1:{port}/v1");
-    let mut child = start_gateway(&home, port, &client).await;
 
     for path in ["catalog", "models", "responses", "messages"] {
         let reply = client.get(format!("{base}/{path}")).send().await.unwrap();
@@ -245,7 +272,9 @@ async fn a_fixed_endpoint_serves_both_client_protocols_and_survives_restart() {
     assert_eq!(messages.text().await.unwrap(), MESSAGES_SSE);
 
     child.kill().await.unwrap();
-    let mut child = start_gateway(&home, port, &client).await;
+    let mut child = launch_gateway(&home, port)
+        .await
+        .expect("rebind the same port");
     let reply = client
         .get(format!("{base}/models"))
         .bearer_auth(GATEWAY_KEY)
@@ -282,8 +311,7 @@ async fn token_counts_follow_the_selected_inference_route() {
         .timeout(Duration::from_secs(3))
         .build()
         .unwrap();
-    let port = loopback_port().await;
-    let mut child = start_gateway(&home, port, &client).await;
+    let (port, mut child) = start_gateway(&home).await;
     let base = format!("http://127.0.0.1:{port}");
     let endpoint = format!("{base}/v1/messages/count_tokens?beta=true");
     let warmup = client
@@ -390,8 +418,7 @@ async fn desktop_gateway_preserves_cache_tool_review_and_recovery_contracts() {
         .timeout(Duration::from_secs(3))
         .build()
         .unwrap();
-    let port = loopback_port().await;
-    let mut child = start_gateway(&home, port, &client).await;
+    let (port, mut child) = start_gateway(&home).await;
     let base = format!("http://127.0.0.1:{port}/v1");
 
     let models: Value = client
@@ -554,13 +581,7 @@ async fn loopback_port() -> u16 {
 async fn stock_app_server_and_claude_use_the_same_fixed_gateway() {
     let home = Home::new();
     let (hits, mock) = mock(&home).await;
-    let port = loopback_port().await;
-    let client = Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .unwrap();
-    let mut gateway = start_gateway(&home, port, &client).await;
+    let (port, mut gateway) = start_gateway(&home).await;
     let origin = format!("http://127.0.0.1:{port}");
 
     let codex_home = Home::new();

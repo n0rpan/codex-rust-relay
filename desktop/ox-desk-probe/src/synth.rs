@@ -109,6 +109,12 @@ fn admin(pipe: Pipe, opened: Arc<Mutex<HashSet<String>>>) -> io::Result<()> {
 }
 
 pub fn run() -> io::Result<()> {
+    // The desktop's header asks the helper for weather at startup. Answer nothing: running
+    // as a synthetic server here would bind the control socket first and leave it behind,
+    // so the real synthetic server would fail to bind it and the catalog would never load.
+    if env::args().any(|s| s == "weather") {
+        return Ok(());
+    }
     if env::args().any(|s| s == "--ox-desktop-settings-v1") {
         let q: Value = serde_json::from_reader(io::stdin().lock())?;
         trace("helper", q["action"].as_str().unwrap_or_default());
@@ -118,6 +124,9 @@ pub fn run() -> io::Result<()> {
             Some("claude_profiles") => {
                 let home = std::path::PathBuf::from(env::var_os("HOME").unwrap_or_default());
                 json!({"subscription":home.join("absent-native"),"api":home.join("absent-api")})
+            }
+            Some("models") if env::var_os("OX_DESK_SYNTH_ROUTES").is_some() => {
+                json!(["fixture-model", "fixture-discovered"])
             }
             Some("read" | "read_rows") => {
                 let models: Vec<&str> = if env::var_os("OX_DESK_SYNTH_ROUTES").is_some() {

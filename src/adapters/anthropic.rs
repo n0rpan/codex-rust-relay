@@ -47,8 +47,9 @@
 //!
 //! # Known gaps in this slice
 //!
-//! Rejected explicitly: hosted/server tools, custom (freeform) tools, image and
-//! file inputs, structured outputs (`text.format`), non-streaming requests,
+//! Images (`input_image`, in user messages and tool results) map to Anthropic
+//! image blocks. Rejected explicitly: hosted/server tools, custom (freeform)
+//! tools, file inputs and assistant-side images, structured outputs (`text.format`), non-streaming requests,
 //! `item_reference`, unknown content blocks, and citations.
 //!
 //! Current Codex sends its base instructions as a leading `developer` input
@@ -448,11 +449,13 @@ fn translate_input_item(
             } else {
                 raw_arguments
             };
-            let arguments: Value = serde_json::from_str(raw_arguments)
-                .map_err(|error| format!("{path}.arguments is not valid JSON: {error}"))?;
-            if !arguments.is_object() {
-                return Err(format!("{path}.arguments must encode a JSON object"));
-            }
+            // A historical call whose arguments were truncated or came from another
+            // model must not fail every later turn. Replay the raw text as an object
+            // so the upstream still sees a valid tool_use input.
+            let arguments = match serde_json::from_str::<Value>(raw_arguments) {
+                Ok(arguments) if arguments.is_object() => arguments,
+                _ => json!({"_raw": raw_arguments}),
+            };
             builder.push_tool(
                 json!({
                     "type": "tool_use",
@@ -598,13 +601,13 @@ fn translate_message_item(
             Ok(())
         }
         "user" => {
-            for block in content_blocks(content, path)? {
+            for block in content_blocks(content, path, true)? {
                 builder.push_block("user", block)?;
             }
             Ok(())
         }
         "assistant" => {
-            for block in content_blocks(content, path)? {
+            for block in content_blocks(content, path, false)? {
                 builder.push_block("assistant", block)?;
             }
             Ok(())
@@ -645,7 +648,7 @@ fn content_texts(content: &Value, path: &str) -> Result<Vec<String>, String> {
     }
 }
 
-fn content_blocks(content: &Value, path: &str) -> Result<Vec<Value>, String> {
+fn content_blocks(content: &Value, path: &str, allow_images: bool) -> Result<Vec<Value>, String> {
     match content {
         Value::String(text) => Ok(text_blocks(text)),
         Value::Array(parts) => {
@@ -659,6 +662,9 @@ fn content_blocks(content: &Value, path: &str) -> Result<Vec<Value>, String> {
                     }
                     "refusal" => {
                         blocks.extend(text_blocks(required_string(part, "refusal", &part_path)?));
+                    }
+                    "input_image" if allow_images => {
+                        blocks.push(image_block(part, &part_path)?);
                     }
                     "input_image" | "input_file" | "output_audio" | "audio" => {
                         return Err(format!(
@@ -679,6 +685,34 @@ fn content_blocks(content: &Value, path: &str) -> Result<Vec<Value>, String> {
         Value::Null => Err(format!("{path}.content must not be null")),
         _ => Err(format!("{path}.content must be a string or an array")),
     }
+}
+
+/// Map a Responses `input_image` part to an Anthropic image block: base64
+/// data URLs become inline sources, anything else is passed as a URL source.
+fn image_block(part: &Map<String, Value>, path: &str) -> Result<Value, String> {
+    let url = part
+        .get("image_url")
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| format!("{path} is an input_image without an image_url"))?;
+    if let Some(rest) = url.strip_prefix("data:") {
+        let (meta, data) = rest
+            .split_once(',')
+            .ok_or_else(|| format!("{path}.image_url is a malformed data URL"))?;
+        let media_type = meta.strip_suffix(";base64").ok_or_else(|| {
+            format!("{path}.image_url must be a base64 data URL for an Anthropic image")
+        })?;
+        if !media_type.starts_with("image/") {
+            return Err(format!(
+                "{path}.image_url media type \"{media_type}\" is not an image type"
+            ));
+        }
+        return Ok(json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": data}
+        }));
+    }
+    Ok(json!({"type": "image", "source": {"type": "url", "url": url}}))
 }
 
 fn text_blocks(text: &str) -> Vec<Value> {
@@ -738,11 +772,7 @@ fn tool_result_content(output: &Value, path: &str) -> Result<Value, String> {
                     "input_text" | "output_text" | "text" => {
                         blocks.extend(text_blocks(required_string(part, "text", &part_path)?));
                     }
-                    "input_image" => {
-                        return Err(format!(
-                            "{part_path} is an image, which this adapter slice does not support in tool results"
-                        ));
-                    }
+                    "input_image" => blocks.push(image_block(part, &part_path)?),
                     other => {
                         return Err(format!(
                             "unsupported tool result content type \"{other}\" at {part_path}"
@@ -1517,6 +1547,7 @@ impl ResponseTranslator {
                         kind: BlockKind::Tool {
                             call_id: call_id.to_owned(),
                             name: name.to_owned(),
+                            saw_json: !initial.is_empty(),
                             arguments: initial.clone(),
                             item_id: item_id.clone(),
                         },
@@ -1666,12 +1697,19 @@ impl ResponseTranslator {
                 }
                 (
                     BlockKind::Tool {
-                        arguments, item_id, ..
+                        arguments,
+                        item_id,
+                        saw_json,
+                        ..
                     },
                     "input_json_delta",
                 ) => {
                     let partial =
                         required_string(delta, "partial_json", "content_block_delta.delta")?;
+                    // An empty fragment proves nothing about the arguments.
+                    if !partial.is_empty() {
+                        *saw_json = true;
+                    }
                     arguments.push_str(partial);
                     DeltaAction::Arguments {
                         item_id: item_id.clone(),
@@ -1789,7 +1827,9 @@ impl ResponseTranslator {
                     name,
                     arguments,
                     item_id,
+                    saw_json,
                 } => StopAction::Tool {
+                    saw_json: *saw_json,
                     item_id: item_id.clone(),
                     call_id: call_id.clone(),
                     name: name.clone(),
@@ -1846,33 +1886,52 @@ impl ResponseTranslator {
                 call_id,
                 name,
                 arguments,
+                saw_json,
             } => {
                 let arguments = if arguments.trim().is_empty() {
                     "{}".to_owned()
                 } else {
                     arguments
                 };
-                let parsed: Value = serde_json::from_str(&arguments).map_err(|error| {
-                    format!("tool \"{name}\" streamed invalid JSON arguments: {error}")
-                })?;
-                if !parsed.is_object() {
-                    return Err(format!(
+                // Unparseable arguments are not fatal here: Anthropic reports
+                // stop_reason=max_tokens after a cut-off tool_use block, and
+                // that must surface as response.incomplete. message_stop decides
+                // whether the problem is an error or a dropped truncated call.
+                let problem = match serde_json::from_str::<Value>(&arguments) {
+                    Err(error) => Some(format!(
+                        "tool \"{name}\" streamed invalid JSON arguments: {error}"
+                    )),
+                    Ok(parsed) if !parsed.is_object() => Some(format!(
                         "tool \"{name}\" streamed arguments that are not a JSON object"
-                    ));
+                    )),
+                    Ok(_) => None,
+                };
+                match problem {
+                    Some(message) => {
+                        let state = self.state_mut()?;
+                        state.invalid_tool.get_or_insert(message);
+                    }
+                    None => {
+                        if !saw_json {
+                            // No JSON delta ever arrived: either a genuine
+                            // no-argument call or a cut before the first
+                            // delta. message_stop decides once the stop
+                            // reason is known.
+                            self.state_mut()?.unproven.push(index);
+                        }
+                        let item = json!({
+                            "id": item_id,
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": arguments,
+                        });
+                        let state = self.state_mut()?;
+                        state.tool_ids.push(call_id.clone());
+                        state.completed.insert(index, item);
+                    }
                 }
-                let item = json!({
-                    "id": item_id,
-                    "type": "function_call",
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": arguments,
-                });
-                {
-                    let state = self.state_mut()?;
-                    state.tool_ids.push(call_id.clone());
-                    state.completed.insert(index, item.clone());
-                }
-                let mut events = Vec::with_capacity(2);
+                let mut events = Vec::with_capacity(1);
                 let sequence = self.next_sequence();
                 events.push(json!({
                     "type": "response.function_call_arguments.done",
@@ -1955,6 +2014,32 @@ impl ResponseTranslator {
                 .map(|(index, _)| *index)
                 .collect();
             let reasoning_count = reasoning_indices.len();
+            let truncated = matches!(
+                state.stop_reason.as_deref(),
+                Some("max_tokens") | Some("model_context_window_exceeded")
+            );
+            // A truncated tool_use block has partial JSON; drop it and report
+            // incomplete. Otherwise the invalid arguments are a stream error.
+            if let (Some(message), false) = (state.invalid_tool.take(), truncated) {
+                return Err(message);
+            }
+            if truncated {
+                // Only the final block can have been cut before its arguments;
+                // a no-argument call that a later block follows was closed by
+                // the model and is complete.
+                let last_block = state.blocks.keys().next_back().copied();
+                let (cut, closed): (Vec<usize>, Vec<usize>) = std::mem::take(&mut state.unproven)
+                    .into_iter()
+                    .partition(|index| Some(*index) == last_block);
+                drop(closed);
+                for index in cut {
+                    if let Some(item) = state.completed.remove(&index)
+                        && let Some(call_id) = item.get("call_id").and_then(Value::as_str)
+                    {
+                        state.tool_ids.retain(|id| id != call_id);
+                    }
+                }
+            }
             let tool_ids = state.tool_ids.clone();
             let model = configured_model.unwrap_or_else(|| state.model.clone());
             for (reasoning_index, block_index) in reasoning_indices.into_iter().enumerate() {
@@ -2146,6 +2231,12 @@ struct StreamState {
     blocks: BTreeMap<usize, BlockState>,
     completed: BTreeMap<usize, Value>,
     tool_ids: Vec<String>,
+    /// First tool_use block whose arguments were not a JSON object. Decided at
+    /// message_stop: an error for ordinary stops, a dropped call when truncated.
+    invalid_tool: Option<String>,
+    /// Tool blocks closed without any JSON delta; dropped when the turn was
+    /// truncated because the cut may have preceded their arguments.
+    unproven: Vec<usize>,
 }
 
 impl StreamState {
@@ -2162,6 +2253,8 @@ impl StreamState {
             blocks: BTreeMap::new(),
             completed: BTreeMap::new(),
             tool_ids: Vec::new(),
+            invalid_tool: None,
+            unproven: Vec::new(),
         }
     }
 }
@@ -2183,6 +2276,7 @@ enum BlockKind {
         name: String,
         arguments: String,
         item_id: String,
+        saw_json: bool,
     },
     Thinking {
         text: String,
@@ -2223,6 +2317,7 @@ enum StopAction {
         call_id: String,
         name: String,
         arguments: String,
+        saw_json: bool,
     },
     Thinking {
         item_id: String,

@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value, json};
 
 use crate::adapters::anthropic::THINKING_ENVELOPE_PREFIX;
+use crate::adapters::chat_completions::CHAT_REASONING_PREFIX;
 use crate::provider::Wire;
 
 /// Keep visible conversation and tool history across a stock Codex model
@@ -49,9 +50,10 @@ pub fn sanitize_replayed_history(request: &mut Value, wire: Wire) -> bool {
         let old_model = switch.is_some_and(|switch| position < switch);
         position += 1;
         let anthropic_envelope = wire == Wire::Responses
-            && item["encrypted_content"]
-                .as_str()
-                .is_some_and(|value| value.starts_with(THINKING_ENVELOPE_PREFIX));
+            && item["encrypted_content"].as_str().is_some_and(|value| {
+                value.starts_with(THINKING_ENVELOPE_PREFIX)
+                    || value.starts_with(CHAT_REASONING_PREFIX)
+            });
         item["type"] != "reasoning" || !(old_model || anthropic_envelope)
     });
     first_request
@@ -583,6 +585,15 @@ impl EventRewriter {
                         .get("arguments")
                         .and_then(Value::as_str)
                         .unwrap_or("{}");
+                    if serde_json::from_str::<Value>(arguments.trim()).is_err()
+                        && !arguments.trim().is_empty()
+                    {
+                        // Possibly a call cut off by max_tokens. The upstream
+                        // adapter decides at its terminal event whether this
+                        // is an error (before output_item.done) or a dropped
+                        // incomplete call, so emit nothing executable now.
+                        return Ok(Vec::new());
+                    }
                     let input = custom_argument_input(arguments)?;
                     let sequence = self.sequence();
                     let mut delta = custom_event(
@@ -977,5 +988,148 @@ mod tests {
         assert_eq!(output[0]["name"], "spawn_agent");
         assert_eq!(output[1]["type"], "custom_tool_call");
         assert_eq!(output[1]["input"], "x");
+    }
+
+    /// Run Anthropic stream events through the adapter and the event rewriter,
+    /// as the gateway does, and return every rewritten event.
+    fn gateway(events: Vec<(&str, Value)>) -> Result<Vec<Value>, String> {
+        let mut request = json!({"tools": [
+            {"type": "function", "name": "list_files", "parameters": {"type": "object"}},
+            {"type": "custom", "name": "apply_patch", "format": {"type": "text"}}
+        ]});
+        let normalized = normalize_request(&mut request)?;
+        let mut rewriter = EventRewriter::new(normalized.map);
+        let mut translator = crate::adapters::anthropic::ResponseTranslator::with_created_at(1);
+        let mut out = Vec::new();
+        for (event, data) in events {
+            for event in translator.push_event(event, &data.to_string())? {
+                out.extend(rewriter.rewrite(event)?);
+            }
+        }
+        Ok(out)
+    }
+
+    fn cut_stream(first_call_complete: bool, json_delta: bool) -> Vec<(&'static str, Value)> {
+        let mut events = vec![(
+            "message_start",
+            json!({"message": {"id": "abc", "type": "message", "role": "assistant", "model": "claude-x",
+                "usage": {"input_tokens": 4, "output_tokens": 0}, "content": []}}),
+        )];
+        let mut index = 0;
+        if first_call_complete {
+            events.push((
+                "content_block_start",
+                json!({"index": 0, "content_block":
+                {"type": "tool_use", "id": "toolu_ok", "name": "list_files", "input": {}}}),
+            ));
+            events.push((
+                "content_block_delta",
+                json!({"index": 0, "delta":
+                {"type": "input_json_delta", "partial_json": "{}"}}),
+            ));
+            events.push(("content_block_stop", json!({"index": 0})));
+            index = 1;
+        }
+        events.push((
+            "content_block_start",
+            json!({"index": index, "content_block":
+            {"type": "tool_use", "id": "toolu_cut", "name": "apply_patch", "input": {}}}),
+        ));
+        if json_delta {
+            events.push((
+                "content_block_delta",
+                json!({"index": index, "delta":
+                {"type": "input_json_delta", "partial_json": "{\"input\":\"*** Begin Pa"}}),
+            ));
+        }
+        events.push(("content_block_stop", json!({"index": index})));
+        events.push((
+            "message_delta",
+            json!({"delta": {"stop_reason": "max_tokens"},
+            "usage": {"output_tokens": 8192}}),
+        ));
+        events.push(("message_stop", json!({"type": "message_stop"})));
+        events
+    }
+
+    #[test]
+    fn max_tokens_inside_custom_tool_arguments_finishes_incomplete_through_the_gateway() {
+        let out = gateway(cut_stream(true, true)).expect("a cut call is not a stream error");
+        let last = out.last().unwrap();
+        assert_eq!(last["type"], "response.incomplete");
+        let output = last["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1, "{output:?}");
+        assert_eq!(output[0]["call_id"], "toolu_ok");
+        let done: Vec<&Value> = out
+            .iter()
+            .filter(|event| event["type"] == "response.output_item.done")
+            .collect();
+        assert_eq!(done.len(), 1);
+        assert!(!out.iter().any(|event| {
+            event["type"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("response.custom_tool_call_input"))
+                || (event["type"] == "response.output_item.done"
+                    && event["item"]["type"] == "custom_tool_call")
+        }));
+    }
+
+    #[test]
+    fn max_tokens_before_the_first_json_delta_emits_no_empty_tool_item() {
+        let out = gateway(cut_stream(false, false)).unwrap();
+        let last = out.last().unwrap();
+        assert_eq!(last["type"], "response.incomplete");
+        assert_eq!(last["response"]["output"], json!([]));
+        assert!(
+            !out.iter()
+                .any(|event| event["type"] == "response.output_item.done")
+        );
+    }
+
+    #[test]
+    fn an_uncut_custom_call_with_bad_json_is_still_an_error() {
+        let mut events = cut_stream(false, true);
+        let stop = events.len() - 2;
+        events[stop] = (
+            "message_delta",
+            json!({"delta": {"stop_reason": "tool_use"}}),
+        );
+        assert!(gateway(events).is_err());
+    }
+
+    #[test]
+    fn legacy_function_call_ids_stay_unique_across_turns_and_replay_into_claude_requests() {
+        use crate::adapters::chat_completions::ResponseTranslator;
+        let mut messages = vec![json!({"role": "user", "content": "Run both steps"})];
+        let mut ids = Vec::new();
+        for response in ["resp_1", "resp_2"] {
+            let mut translator = ResponseTranslator::new(response, "m", 0);
+            let chunk = json!({"choices": [{"index": 0,
+                "delta": {"function_call": {"name": "read", "arguments": "{}"}},
+                "finish_reason": "function_call"}]});
+            translator
+                .push_event("message", &chunk.to_string())
+                .unwrap();
+            let events = translator.finish().unwrap();
+            let item = events.last().unwrap()["response"]["output"][0].clone();
+            let id = item["call_id"].as_str().unwrap().to_owned();
+            messages.push(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": id, "name": "read", "input": {}}]}));
+            messages.push(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": id, "content": "done"}]}));
+            ids.push(id);
+        }
+        assert_ne!(ids[0], ids[1]);
+        let request = json!({"model": "m", "max_tokens": 512, "messages": messages});
+        let replayed = crate::claude_request::into_responses(&request, "m")
+            .expect("the third request must not hit a duplicate id");
+        let calls: Vec<&str> = replayed["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "function_call")
+            .filter_map(|item| item["call_id"].as_str())
+            .collect();
+        assert_eq!(calls, [ids[0].as_str(), ids[1].as_str()]);
     }
 }

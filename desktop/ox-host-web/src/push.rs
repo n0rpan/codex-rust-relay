@@ -245,6 +245,7 @@ async fn notifications(
         &Client::Subscribe {
             scope: None,
             after: cursor.clone(),
+            terminal: false,
         },
     )
     .await?;

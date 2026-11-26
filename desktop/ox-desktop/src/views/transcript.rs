@@ -1,8 +1,15 @@
+use crate::appearance::Step;
 mod cards;
 mod tools;
 use super::workbench::Workbench;
-use crate::{appearance::Palette, col, kit::button, small};
+use crate::{
+    appearance::Palette,
+    col,
+    kit::{button, row},
+    small,
+};
 use gpui::{prelude::FluentBuilder, *};
+use gpui_component::button::Button;
 use gpui_component::text::{TextView, TextViewState};
 use gpui_component::{ActiveTheme, menu::ContextMenuExt};
 use ox_desk_core::actions::Action as DeskAction;
@@ -13,6 +20,17 @@ use ox_desk_core::{
 use std::collections::HashSet;
 
 const OVERDRAW: f32 = 240.;
+/// The jump control shows once the view is this many viewport heights above the bottom.
+const FAR: f32 = 1.5;
+
+/// How far the view sits above the bottom, in pixels (0 when pinned to it).
+fn above_bottom(list: &ListState) -> Pixels {
+    (list.max_offset_for_scrollbar().y + list.scroll_px_offset_for_scrollbar().y).max(px(0.))
+}
+fn is_far(list: &ListState) -> bool {
+    let viewport = list.viewport_bounds().size.height;
+    viewport > px(0.) && above_bottom(list) > viewport * FAR
+}
 
 struct CachedMessage {
     key: ItemKey,
@@ -25,16 +43,25 @@ pub(super) struct TranscriptView {
     list: ListState,
     expanded: HashSet<ItemKey>,
     tool_limits: std::collections::HashMap<ItemKey, usize>,
+    /// Tool items whose long output is shown in full instead of head and tail.
+    show_all: HashSet<ItemKey>,
     all_expanded: bool,
     hide_thinking: bool,
     find: Option<tools::Find>,
     prepended: usize,
     following: bool,
+    /// Scrolled up more than `FAR` viewport heights from the bottom.
+    far: bool,
+    /// Items that existed the last time the view was at (or near) the bottom.
+    seen: usize,
     document_height: Pixels,
     markdown: std::collections::VecDeque<CachedMessage>,
 }
 
 impl TranscriptView {
+    pub(super) fn invalidate_messages(&mut self) {
+        self.markdown.clear();
+    }
     fn message(
         &mut self,
         key: &ItemKey,
@@ -86,6 +113,75 @@ impl TranscriptView {
     }
 }
 
+/// The round "Jump to latest" control floating over the bottom-right of the transcript,
+/// with a "N new" count while content arrived below the viewport.
+fn jump_to_latest(
+    p: Palette,
+    list: ListState,
+    unseen: usize,
+    motion: bool,
+    cx: &mut Context<Workbench>,
+) -> Div {
+    div().absolute().bottom_3().right_4().child(
+        crate::row()
+            .items_center()
+            .gap_1()
+            .pl_2()
+            .when(unseen == 0, |d| d.pl_0())
+            .rounded_full()
+            .bg(rgb(p.raised))
+            .border_1()
+            .border_color(rgb(p.line_strong))
+            .when(unseen > 0, |d| {
+                d.child(
+                    div()
+                        .text_size(p.text(Step::Meta))
+                        .text_color(rgb(p.accent))
+                        .child(format!("{unseen} new")),
+                )
+            })
+            .child(
+                crate::kit::icon_button(
+                    p,
+                    "jump-latest",
+                    "↓",
+                    "Jump to latest",
+                    cx.listener(move |_, _, _, cx| {
+                        glide_to_end(list.clone(), motion, cx);
+                    }),
+                )
+                .rounded(px(14.)),
+            ),
+    )
+}
+
+/// Scroll to the newest content and resume following it. With motion this eases over a
+/// few frames; reduced motion jumps.
+fn glide_to_end(list: ListState, motion: bool, cx: &mut Context<Workbench>) {
+    if !motion {
+        list.scroll_to_end();
+        cx.notify();
+        return;
+    }
+    cx.spawn(async move |this, cx| {
+        for _ in 0..12 {
+            let left = above_bottom(&list);
+            if left < px(2.) {
+                break;
+            }
+            list.scroll_by(left * 0.35 + px(1.));
+            let _ = this.update(cx, |_, cx| cx.notify());
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(16))
+                .await;
+        }
+        // Anchor to the end so following resumes and later content stays in view.
+        list.scroll_to_end();
+        let _ = this.update(cx, |_, cx| cx.notify());
+    })
+    .detach();
+}
+
 impl Workbench {
     pub(super) fn transcript_panel(&mut self, cx: &mut Context<Self>) -> Div {
         let p = Palette::get(cx);
@@ -111,6 +207,20 @@ impl Workbench {
                     view.following = event.is_following_tail;
                     cx.notify();
                 }
+                // The list is still borrowed here: measure the distance once it is free.
+                let workbench = cx.weak_entity();
+                let watched = owner.clone();
+                cx.defer(move |cx| {
+                    let _ = workbench.update(cx, |s, cx| {
+                        if let Some(view) = s.transcript_views.get_mut(&watched) {
+                            let far = is_far(&view.list);
+                            if far != view.far {
+                                view.far = far;
+                                cx.notify();
+                            }
+                        }
+                    });
+                });
                 if event.visible_range.start <= 2
                     && !event.is_following_tail
                     && s.store
@@ -125,11 +235,14 @@ impl Workbench {
                 list,
                 expanded: HashSet::new(),
                 tool_limits: Default::default(),
+                show_all: HashSet::new(),
                 all_expanded: false,
                 hide_thinking: false,
                 find: None,
                 prepended: transcript.prepended(),
                 following: true,
+                far: false,
+                seen: count,
                 document_height: px(360.),
                 markdown: Default::default(),
             }
@@ -142,6 +255,8 @@ impl Workbench {
         let previous = view.list.item_count();
         if count > previous {
             view.list.splice(previous..previous, count - previous);
+        } else if count < previous {
+            view.list.splice(count..previous, 0);
         }
         for row in changed_rows {
             view.list.remeasure_items(row..row + 1);
@@ -165,7 +280,15 @@ impl Workbench {
                 });
             });
         }
+        // Pinned to the bottom (or close): new content is already in view.
+        view.far = is_far(&view.list);
+        if !view.far {
+            view.seen = count;
+        }
+        let (far, unseen) = (view.far, count.saturating_sub(view.seen));
+        let motion = p.motion;
         let list_state = view.list.clone();
+        let jump_state = view.list.clone();
         let find_bar = tools::find_bar(view, &id, p, cx);
         let banner = handoff_banner(store, &id, p, cx);
         col()
@@ -173,19 +296,6 @@ impl Workbench {
             .min_h_0()
             .children(banner)
             .children(find_bar)
-            .when(!view.following, |d| {
-                let state = view.list.clone();
-                d.child(crate::kit::icon_button(
-                    p,
-                    "jump-latest",
-                    "↓",
-                    "Jump to latest",
-                    cx.listener(move |_, _, _, cx| {
-                        state.scroll_to_end();
-                        cx.notify();
-                    }),
-                ))
-            })
             .when(transcript.is_loading(), |d| {
                 d.child(
                     crate::row()
@@ -215,14 +325,22 @@ impl Workbench {
                 ))
             })
             .child(
-                list(
-                    list_state,
-                    cx.processor(move |s, index, _, cx| {
-                        crate::app::guard(cx, |cx| s.transcript_row(&id, index, cx))
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        list(
+                            list_state,
+                            cx.processor(move |s, index, _, cx| {
+                                crate::app::guard(cx, |cx| s.transcript_row(&id, index, cx))
+                            }),
+                        )
+                        .size_full(),
+                    )
+                    .when(far, |d| {
+                        d.child(jump_to_latest(p, jump_state, unseen, motion, cx))
                     }),
-                )
-                .flex_1()
-                .min_h_0(),
             )
     }
 
@@ -303,7 +421,7 @@ impl Workbench {
                                 .id(SharedString::from(format!("reasoning-{index}")))
                                 .cursor_pointer()
                                 .italic()
-                                .text_xs()
+                                .text_size(p.text(Step::Meta))
                                 .text_color(rgb(p.muted))
                                 .when(!expanded, |d| d.truncate())
                                 .child(body)
@@ -335,7 +453,7 @@ impl Workbench {
                                 div()
                                     .id(SharedString::from(format!("handoff-context-{index}")))
                                     .cursor_pointer()
-                                    .text_xs()
+                                    .text_size(p.text(Step::Meta))
                                     .text_color(rgb(p.muted))
                                     .child(if expanded {
                                         "Hide carried handoff context"
@@ -416,6 +534,7 @@ impl Workbench {
                 let expanded = view.all_expanded ^ view.expanded.contains(&key);
                 let binding = key.clone();
                 let group_size = keys.len();
+                let shown_all = view.show_all.clone();
                 let visible = view.tool_limits.get(&key).copied().unwrap_or(cards::PAGE);
                 let mut group = col()
                     .id(("tool-card", index))
@@ -447,14 +566,28 @@ impl Workbench {
                                     super::terminal_review::Review::failed(entry, &self.project)
                                 })
                                 .flatten();
+                            let show_all = shown_all.contains(item_key);
                             let view = cx.weak_entity();
                             let (id, item) = (owner.clone(), item_key.clone());
+                            let toggle_all = {
+                                let (id, item) = (owner.clone(), item_key.clone());
+                                cx.listener(move |s, _, _, cx| {
+                                    if let Some(v) = s.transcript_views.get_mut(&id)
+                                        && !v.show_all.remove(&item)
+                                    {
+                                        v.show_all.insert(item.clone());
+                                    }
+                                    cx.notify();
+                                })
+                            };
                             group = group.child(cards::detail(
                                 entry,
                                 offset,
                                 group_size > 1,
                                 p,
                                 &mono,
+                                show_all,
+                                toggle_all,
                                 move |_, _, cx| {
                                     if let Some(view) = view.upgrade()
                                         && let Some(entry) = view
@@ -537,8 +670,62 @@ fn handoff_fold(
         .map(|(block, request)| (block.to_owned(), request.to_owned()))
 }
 
-/// The handoff marker at the top of a target, the marks on a source, and a
-/// session's YOLO grant with the running children it allowed.
+/// A handoff link as a card: the other session's title, the route it is on, and a state tone.
+/// Success and failure read differently at a glance; the open control is optional.
+fn handoff_card(
+    p: Palette,
+    id: impl Into<ElementId>,
+    eyebrow: &str,
+    title: String,
+    detail: String,
+    tone: u32,
+    open: Option<Button>,
+) -> AnyElement {
+    row()
+        .id(id)
+        .w_full()
+        .gap_3()
+        .p_2()
+        .border_1()
+        .border_color(rgb(p.line))
+        .bg(rgb(p.panel))
+        .child(div().w(px(3.)).min_h(px(36.)).flex_shrink_0().bg(rgb(tone)))
+        .child(
+            col()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(p.text(Step::Label))
+                        .font_family("monospace")
+                        .text_color(rgb(tone))
+                        .child(eyebrow.to_owned()),
+                )
+                .child(
+                    div()
+                        .text_size(p.text(Step::Ui))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(p.fg))
+                        .truncate()
+                        .child(title),
+                )
+                .child(small(p, detail)),
+        )
+        .children(open)
+        .into_any_element()
+}
+
+/// The session's title when this client has it, else a readable stand-in. Never a session id.
+fn session_title(store: &ox_desk_core::store::Store, session: &str, fallback: String) -> String {
+    store
+        .catalog_row(session)
+        .map(|row| row.title().to_owned())
+        .unwrap_or(fallback)
+}
+
+/// The handoff link cards at the top of a session: where it came from, where it went, and
+/// each attempt still running or failed.
 fn handoff_banner(
     store: &ox_desk_core::store::Store,
     id: &str,
@@ -551,26 +738,33 @@ fn handoff_banner(
         && let Some(text) = ox_desk_core::handoff::marker(origin)
         && let Some(h) = &origin.handoff
     {
-        let mut line = crate::row().gap_2().flex_wrap().child(small(p, text));
-        if &h.route == route {
-            let source = h.session.clone();
-            line = line.child(button(
+        let source = h.session.clone();
+        let title = session_title(
+            store,
+            &source,
+            format!("Earlier session on {}", h.route.label()),
+        );
+        let open = (&h.route == route).then(|| {
+            button(
                 p,
                 "handoff-source",
-                "Open source",
+                "Open",
                 false,
                 true,
                 cx.listener(move |s, _, _, cx| {
                     s.action(cx, DeskAction::SelectThread(source.clone()))
                 }),
-            ));
-        } else {
-            line = line.child(small(
-                p,
-                format!("Source {} on {}", h.session, h.route.label()),
-            ));
-        }
-        lines.push(line.into_any_element());
+            )
+        });
+        lines.push(handoff_card(
+            p,
+            "handoff-source-card",
+            "CONTINUED FROM",
+            title,
+            format!("{} · {text}", h.route.label()),
+            p.line_strong,
+            open,
+        ));
     }
     let list = |key: &str| {
         store
@@ -584,12 +778,9 @@ fn handoff_banner(
         let session = to["session"].as_str().unwrap_or_default().to_owned();
         let same = serde_json::from_value::<ox_desk_core::runtime::Route>(to["route"].clone())
             .is_ok_and(|r| &r == route);
-        let mut line = crate::row()
-            .gap_2()
-            .flex_wrap()
-            .child(small(p, format!("Handed off to {label} · {session}")));
-        if same {
-            line = line.child(button(
+        let title = session_title(store, &session, format!("Continued in {label}"));
+        let open = same.then(|| {
+            button(
                 p,
                 ("handoff-target", i),
                 "Open",
@@ -598,49 +789,48 @@ fn handoff_banner(
                 cx.listener(move |s, _, _, cx| {
                     s.action(cx, DeskAction::SelectThread(session.clone()))
                 }),
-            ));
-        }
-        lines.push(line.into_any_element());
+            )
+        });
+        lines.push(handoff_card(
+            p,
+            ("handoff-target-card", i),
+            "HANDED OFF TO",
+            title,
+            label,
+            p.success,
+            open,
+        ));
     }
-    for attempt in list("handoff_attempts") {
+    for (i, attempt) in list("handoff_attempts").into_iter().enumerate() {
         let label = attempt["label"].as_str().unwrap_or("another route");
-        let text = match attempt["status"].as_str() {
-            Some("failed") => format!(
-                "Handoff to {label} failed: {}",
-                attempt["message"].as_str().unwrap_or("unknown error")
-            ),
-            _ => format!("Handing off to {label}…"),
+        let title = format!("Continue in {label}");
+        let card = if attempt["status"].as_str() == Some("failed") {
+            handoff_card(
+                p,
+                ("handoff-attempt", i),
+                "HANDOFF FAILED",
+                title,
+                attempt["message"]
+                    .as_str()
+                    .unwrap_or("unknown error")
+                    .to_owned(),
+                p.error,
+                None,
+            )
+        } else {
+            handoff_card(
+                p,
+                ("handoff-attempt", i),
+                "HANDING OFF",
+                title,
+                "Starting the new session…".into(),
+                p.accent,
+                None,
+            )
         };
-        lines.push(small(p, text).into_any_element());
+        lines.push(card);
     }
-    if store
-        .session_mark(id, "yolo_grant")
-        .is_some_and(|v| v == true)
-    {
-        let running = list("yolo_children").len();
-        let session = id.to_owned();
-        lines.push(
-            crate::row()
-                .gap_2()
-                .flex_wrap()
-                .child(small(
-                    p,
-                    format!("YOLO also allowed for this session's workers and handoffs · {running} started under it"),
-                ))
-                .child(button(
-                    p,
-                    "revoke-yolo-grant",
-                    "Revoke",
-                    false,
-                    true,
-                    cx.listener(move |s, _, _, cx| {
-                        s.action(cx, DeskAction::YoloGrant(session.clone(), false))
-                    }),
-                ))
-                .into_any_element(),
-        );
-    }
-    (!lines.is_empty()).then(|| col().gap_1().px_3().py_2().children(lines))
+    (!lines.is_empty()).then(|| col().gap_2().px_3().py_2().children(lines))
 }
 
 fn markdown(owner: &str, key: &ItemKey, text: String) -> impl IntoElement {

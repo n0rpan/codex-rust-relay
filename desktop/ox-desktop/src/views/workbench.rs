@@ -1,4 +1,6 @@
 //! A workbench owns the visible state for one project and billing route.
+use crate::appearance::Step;
+use crate::kit::{SPACE_S, SPACE_XS};
 use crate::platform::open_store;
 use crate::{activity, appearance::Palette, col, platform, row};
 use gpui::{prelude::FluentBuilder, *};
@@ -9,24 +11,43 @@ use ox_desk_core::{
 };
 use std::{collections::HashMap, path::PathBuf, time::Instant};
 
+pub(super) mod empty;
 mod review;
 mod thread_menu;
 mod usage;
+mod worker;
 
-fn current_activity(store: &Store) -> Option<activity::Scene> {
+/// Plain wording for the connection errors users meet most, each with its next step.
+/// Anything unrecognised is shown as is.
+fn plain_status(message: &str) -> String {
+    match message {
+        "Session host disconnected" | "Connection closed" => {
+            "The session host stopped. Reconnect to start it.".into()
+        }
+        "Incomplete or oversized host frame" => {
+            "The session host sent an unreadable reply. Reconnect, or restart OX Desktop if it keeps happening.".into()
+        }
+        "Claude Code closed its output" => {
+            "Claude Code stopped unexpectedly. Reconnect to start it again.".into()
+        }
+        _ => message.to_owned(),
+    }
+}
+
+fn current_activity(store: &Store) -> Option<(activity::Scene, u64)> {
     use activity::Scene;
-    use ox_desk_core::transcript::{Row, item::Item};
+    use ox_desk_core::transcript::Row;
     let id = store.selected()?;
     if store
         .asks()
         .iter()
         .any(|ask| ask.thread.as_deref() == Some(id))
     {
-        return Some(Scene::Waiting);
+        return Some((Scene::Waiting, 0));
     }
     let transcript = store.transcript(id)?;
     if transcript.is_loading() {
-        return Some(Scene::Loading);
+        return Some((Scene::Loading, 0));
     }
     let active = transcript.active_turn()?;
     let tail = transcript
@@ -41,21 +62,10 @@ fn current_activity(store: &Store) -> Option<activity::Scene> {
     let item = key
         .filter(|key| key.turn == active)
         .and_then(|key| transcript.entry(key));
-    Some(match item.map(|entry| &entry.item) {
-        Some(Item::AgentMessage { .. } | Item::Plan { .. }) => Scene::Typing,
-        Some(Item::AgentOperation { status, .. }) if active_tool(status) => Scene::Worker,
-        Some(
-            Item::CommandExecution { status, .. }
-            | Item::McpToolCall { status, .. }
-            | Item::FileChange { status, .. }
-            | Item::ToolCall { status, .. },
-        ) if active_tool(status) => Scene::Tool,
-        Some(Item::WebSearch { .. }) => Scene::Tool,
-        _ => Scene::Thinking,
-    })
-}
-fn active_tool(status: &str) -> bool {
-    matches!(status, "inProgress" | "in_progress" | "running" | "started")
+    Some((
+        Scene::for_item(item.map(|entry| &entry.item)),
+        activity::seed(id, active),
+    ))
 }
 
 pub struct Workbench {
@@ -65,8 +75,18 @@ pub struct Workbench {
     pub(super) review_width: u32,
     pub(super) pane_width: Pixels,
     resizing_review: bool,
+    pub(super) route_models: Entity<Vec<String>>,
     pub(super) model_picker: Option<super::route_chip::Picker>,
+    /// When an outside press last closed the model panel.
+    pub(super) picker_dismissed: Option<std::time::Instant>,
     thread_edit: Option<thread_menu::ThreadEdit>,
+    pub(super) launch_request: Option<super::worker_sheet::LaunchKind>,
+    pub(super) launch: Option<super::worker_sheet::Launch>,
+    pub(super) launch_picker: Option<(
+        super::worker_sheet::LaunchKind,
+        Entity<super::model_picker::ModelPicker>,
+        Subscription,
+    )>,
     pub(super) project: PathBuf,
     pub(super) route: Route,
     pub(super) front: bool,
@@ -92,6 +112,11 @@ pub struct Workbench {
         HashMap<ox_desk_core::runtime::RequestId, Vec<Entity<gpui_component::input::InputState>>>,
     pub(super) fire: Option<Entity<activity::Runner>>,
     pub(super) runner: Option<Entity<activity::Runner>>,
+    /// The selected thread's running turn at the last render, to notice it ending.
+    last_turn: Option<(String, String)>,
+    /// A just-ended turn's one-shot scene, kept until it has been seen once.
+    finale: Option<(String, activity::Scene)>,
+    finale_watch: Option<Subscription>,
     pub(super) transcript_views: HashMap<String, super::transcript::TranscriptView>,
     _pump: Task<()>,
 }
@@ -100,6 +125,9 @@ pub(super) struct FocusSearch;
 impl EventEmitter<FocusSearch> for Workbench {}
 pub(super) struct CatalogChanged;
 impl EventEmitter<CatalogChanged> for Workbench {}
+/// Ask the host to open the session with this thread id: a worker's parent, or a running worker.
+pub(super) struct OpenThread(pub String);
+impl EventEmitter<OpenThread> for Workbench {}
 
 #[derive(Default)]
 pub(super) struct Stats {
@@ -120,6 +148,7 @@ impl Workbench {
         route: Route,
         first_frame: Option<Instant>,
         stats: bool,
+        route_models: Entity<Vec<String>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -158,6 +187,11 @@ impl Workbench {
             pane_width: window.viewport_size().width,
             resizing_review: false,
             model_picker: None,
+            route_models,
+            picker_dismissed: None,
+            launch_request: None,
+            launch: None,
+            launch_picker: None,
             front: true,
             query: String::new(),
             pending_selection: None,
@@ -179,6 +213,9 @@ impl Workbench {
             wake,
             waiting_frame: None,
             runner: None,
+            last_turn: None,
+            finale: None,
+            finale_watch: None,
             fire: None,
             focused_ask: None,
             editors: HashMap::new(),
@@ -238,8 +275,13 @@ impl Workbench {
                             }
                         }
                         Err(error) => {
-                            s.launch_error = Some(error.to_string());
-                            s.retry_once(window, cx);
+                            let message = error.to_string();
+                            // Retrying cannot repair a folder's permissions.
+                            let fixable = ox_host_service::unsafe_folder(&message).is_some();
+                            s.launch_error = Some(message);
+                            if !fixable {
+                                s.retry_once(window, cx);
+                            }
                         }
                     }
                     if window.is_visible() {
@@ -321,6 +363,11 @@ impl Workbench {
                                 stats.drains += 1;
                             }
                             let changed = store.drain(batch, Instant::now());
+                            for id in changed.replaced_threads() {
+                                if let Some(view) = s.transcript_views.get_mut(id) {
+                                    view.invalidate_messages();
+                                }
+                            }
                             if store.profile().route == Route::CODEX_SUBSCRIPTION
                                 && store.state() == &Connection::Ready
                             {
@@ -413,6 +460,36 @@ impl Workbench {
             self.reconnect(window, cx);
         }
     }
+    /// The error this pane shows in its own header, if any.
+    pub(super) fn visible_error(&self) -> Option<&str> {
+        self.launch_error
+            .as_deref()
+            .or_else(|| match self.store.as_ref()?.state() {
+                Connection::Closed(message) => Some(message),
+                _ => None,
+            })
+    }
+    /// Make an unsafe OX state folder private again off the UI thread, then reconnect.
+    /// If that fails, name the exact command instead.
+    fn fix_permissions(&mut self, folder: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let target = folder.clone();
+        let task =
+            cx.background_spawn(async move { ox_host_service::fix_folder_permissions(&target) });
+        cx.spawn_in(window, async move |s, cx| {
+            let result = task.await;
+            let _ = s.update_in(cx, |s, window, cx| match result {
+                Ok(()) => s.reconnect(window, cx),
+                Err(e) => {
+                    s.launch_error = Some(format!(
+                        "Could not fix permissions ({e}). In a terminal, run: {}",
+                        ox_host_service::fix_command(&folder)
+                    ));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
 
     pub(super) fn select_catalog(
         &mut self,
@@ -469,6 +546,8 @@ impl Workbench {
             self.model_picker = None;
             self.thread_edit = None;
             self.pending_command = None;
+            self.launch = None;
+            self.launch_picker = None;
         }
         if matches!(action, DeskAction::Stop(_))
             && let Some(stats) = &mut self.stats
@@ -536,6 +615,44 @@ impl Workbench {
         })
         .detach();
     }
+    /// What the activity slot shows: the live scene, or the finale of a turn that just ended.
+    fn activity_scene(&mut self) -> Option<(activity::Scene, u64)> {
+        use activity::Scene;
+        let store = self.store.as_ref()?;
+        let id = store.selected();
+        let transcript = id.and_then(|id| store.transcript(id));
+        let turn = id
+            .zip(transcript.and_then(|t| t.active_turn()))
+            .map(|(id, turn)| (id.to_owned(), turn.to_owned()));
+        if turn != self.last_turn {
+            self.finale = match (self.last_turn.take(), &turn) {
+                (Some((thread, _)), None) if id == Some(thread.as_str()) => {
+                    let failed = transcript.is_some_and(|t| t.error().is_some());
+                    let stopped = transcript.is_some_and(|t| t.interrupted());
+                    Some((
+                        thread,
+                        if stopped {
+                            Scene::Stopped
+                        } else if failed {
+                            Scene::GameOver
+                        } else {
+                            Scene::Done
+                        },
+                    ))
+                }
+                _ => None,
+            };
+            self.last_turn = turn;
+        }
+        if self
+            .finale
+            .as_ref()
+            .is_some_and(|(thread, _)| id != Some(thread.as_str()))
+        {
+            self.finale = None;
+        }
+        current_activity(store).or(self.finale.as_ref().map(|(_, scene)| (*scene, 0)))
+    }
     pub(super) fn set_front(&mut self, front: bool, cx: &mut Context<Self>) {
         self.front = front;
         if let Some(store) = &mut self.store {
@@ -568,6 +685,9 @@ impl Workbench {
         if let Some(issue) = self.first_run_issue() {
             return self.onboarding(issue, cx);
         }
+        if let Some(kind) = self.launch_request.take() {
+            self.open_launch(kind, window, cx);
+        }
         let unavailable = !self.connecting
             && self.store.as_ref().is_none_or(|s| {
                 matches!(
@@ -598,39 +718,58 @@ impl Workbench {
             })
             .and_then(|store| store.catalog_row(store.selected()?))
             .map(|row| row.title().to_owned());
-        let status = status.to_owned();
-        let scene = self.store.as_ref().and_then(current_activity);
-        let animate = p.motion && self.front && window.is_visible() && window.is_window_active();
-        if let Some(scene) = scene.filter(|scene| animate && *scene != activity::Scene::Waiting) {
-            if self
-                .runner
-                .as_ref()
-                .is_none_or(|r| r.read(cx).scene != scene)
-            {
-                self.runner = Some(cx.new(|_| activity::Runner::new(scene)));
+        let status = plain_status(status);
+        let unsafe_folder = ox_host_service::unsafe_folder(&status);
+        let live = self.activity_scene();
+        let seen = self.front && window.is_visible();
+        let animate = p.motion && seen && window.is_window_active();
+        // A finale plays once even with motion off: it is a still that leaves on one timer.
+        if let Some((scene, seed)) =
+            live.filter(|(scene, _)| animate || (seen && scene.one_shot().is_some()))
+        {
+            if self.runner.as_ref().is_none_or(|r| {
+                let r = r.read(cx);
+                (r.scene, r.seed) != (scene, seed)
+            }) {
+                let runner = cx.new(|_| activity::Runner::new(scene, seed));
+                self.finale_watch = scene.one_shot().map(|_| {
+                    cx.subscribe(&runner, |s, _, _: &activity::Finished, cx| {
+                        s.finale = None;
+                        s.runner = None;
+                        cx.notify();
+                    })
+                });
+                self.runner = Some(runner);
             }
         } else {
             self.runner = None;
         }
-        let activity_status = scene
-            .filter(|s| *s != activity::Scene::Loading)
-            .map(|scene| {
+        let activity_status = live
+            .filter(|(scene, _)| *scene != activity::Scene::Loading)
+            .map(|(scene, seed)| {
                 let icon = self
                     .runner
                     .as_ref()
                     .map(|r| r.clone().into_any_element())
-                    .unwrap_or_else(|| scene.sprite(p, 0));
+                    .unwrap_or_else(|| scene.still(p, seed));
                 row()
                     .gap_2()
                     .py_1()
                     .child(icon)
                     .child(crate::kit::small(p, scene.label()))
             });
-        let transcript = self.transcript_panel(cx);
+        let ready = self.launch_error.is_none()
+            && !self.connecting
+            && self
+                .store
+                .as_ref()
+                .is_some_and(|s| s.state() == &Connection::Ready && s.selected().is_none());
+        let transcript = (!ready).then(|| self.transcript_panel(cx));
         let controls = self.thread_menu(cx);
         let review_toggle = self.review_toggle(cx);
         let inline_request = self.pane_width < px(825.);
         let asks = self.ask_sheet(inline_request, window, cx);
+        let launch = self.launch_sheet(window.viewport_size().height * 0.6, cx);
         let usage = self.usage_bar(cx);
         let review = asks.is_none().then(|| self.review_panel(cx)).flatten();
         let review_width = px(self.review_width as f32 + 5.);
@@ -643,6 +782,23 @@ impl Workbench {
             self.pane_width
         };
         let composer = self.composer(detail_width, window, cx);
+        let terminal = (status == "Connected").then(|| {
+            let project = self.project.clone();
+            crate::kit::icon(
+                p,
+                "open-terminal",
+                gpui_component::IconName::SquareTerminal,
+                "Open a terminal in this project",
+                true,
+                cx.listener(move |s, _, _, cx| {
+                    if let Err(error) = crate::terminal::open(project.clone(), None, |_, _| {}, cx)
+                    {
+                        s.launch_error = Some(error);
+                        cx.notify();
+                    }
+                }),
+            )
+        });
         let (inline_sheet, side_sheet) = if inline_request {
             (asks, None)
         } else {
@@ -664,6 +820,11 @@ impl Workbench {
                             row()
                                 .gap_2()
                                 .justify_between()
+                                .items_start()
+                                .flex_shrink_0()
+                                // Text and icons share the transcript's content edges.
+                                .px(px(crate::kit::SPACE_M))
+                                .pb(px(SPACE_S))
                                 .when(detail_width < px(500.), |header| {
                                     header.flex_col().items_start()
                                 })
@@ -672,53 +833,63 @@ impl Workbench {
                                         .min_w_0()
                                         .max_w_full()
                                         .when(detail_width >= px(500.), |col| col.flex_1())
-                                        .when_some(title, |col, title| {
-                                            col.child(
-                                                div()
-                                                    .id("current-thread-title")
-                                                    .text_size(px(20.))
-                                                    .truncate()
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .child(title.clone())
-                                                    .tooltip(move |window, cx| {
-                                                        gpui_component::tooltip::Tooltip::new(
-                                                            title.clone(),
-                                                        )
-                                                        .build(window, cx)
-                                                    }),
-                                            )
-                                        })
-                                        .when(status != "Connected", |view| {
-                                            view.child(crate::small(p, status.clone()))
-                                        })
-                                        .when(status == "Connected", |view| {
+                                        .child({
                                             let project = self
                                                 .project
                                                 .file_name()
                                                 .unwrap_or_default()
-                                                .to_string_lossy();
-                                            view.child(
-                                                row()
-                                                    .gap_2()
-                                                    .child(
-                                                        div().w(px(5.)).h(px(5.)).bg(rgb(p.accent)),
-                                                    )
-                                                    .child(crate::small(
-                                                        p,
-                                                        format!(
-                                                            "{project}   /   {}",
-                                                            self.route.label()
-                                                        ),
-                                                    )),
-                                            )
+                                                .to_string_lossy()
+                                                .into_owned();
+                                            let leaf = title
+                                                .clone()
+                                                .unwrap_or_else(|| "New session".into());
+                                            row()
+                                                .h(px(crate::kit::ICON_SIZE))
+                                                .min_w_0()
+                                                .gap(px(SPACE_S))
+                                                .text_size(p.text(Step::Ui))
+                                                .child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .text_color(rgb(p.muted))
+                                                        .child(project),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .text_color(rgb(p.quiet()))
+                                                        .child("/"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("current-thread-title")
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .text_color(rgb(p.fg))
+                                                        .child(leaf.clone())
+                                                        .tooltip(move |window, cx| {
+                                                            gpui_component::tooltip::Tooltip::new(
+                                                                leaf.clone(),
+                                                            )
+                                                            .build(window, cx)
+                                                        }),
+                                                )
+                                        })
+                                        .when(status != "Connected", |view| {
+                                            view.child(crate::small(p, status.clone()))
+                                        })
+                                        .when_some(self.worker_crumb(p, cx), |view, crumb| {
+                                            view.child(crumb)
                                         }),
                                 )
                                 .child(
                                     row()
                                         .flex_wrap()
                                         .min_w_0()
-                                        .gap_2()
+                                        .gap(px(SPACE_XS))
                                         .children(review_toggle)
+                                        .children(terminal)
                                         .children(controls),
                                 ),
                         )
@@ -744,14 +915,26 @@ impl Workbench {
                             },
                         )
                         .when(unavailable, |view| {
-                            view.child(crate::kit::button(
-                                p,
-                                "retry-connection",
-                                "Reconnect",
-                                false,
-                                true,
-                                cx.listener(|s, _, window, cx| s.reconnect(window, cx)),
-                            ))
+                            view.child(match unsafe_folder.clone() {
+                                Some(folder) => row().child(crate::kit::button(
+                                    p,
+                                    "fix-permissions",
+                                    "Fix permissions",
+                                    true,
+                                    true,
+                                    cx.listener(move |s, _, window, cx| {
+                                        s.fix_permissions(folder.clone(), window, cx)
+                                    }),
+                                )),
+                                None => row().child(crate::kit::button(
+                                    p,
+                                    "retry-connection",
+                                    "Reconnect",
+                                    false,
+                                    true,
+                                    cx.listener(|s, _, window, cx| s.reconnect(window, cx)),
+                                )),
+                            })
                         })
                         .when_some(
                             self.store.as_ref().and_then(Store::command_notice),
@@ -779,11 +962,27 @@ impl Workbench {
                                 )
                             },
                         )
-                        .child(transcript)
-                        .children(activity_status)
-                        .children(inline_sheet)
-                        .child(composer)
-                        .children(usage),
+                        .children(transcript)
+                        .map(|view| {
+                            // One centred column holds the composer and what belongs to it:
+                            // 680 px under the empty-state greeting, 760 px docked.
+                            let dock = col()
+                                .w_full()
+                                .max_w(px(if ready { 680. } else { 760. }))
+                                .gap(px(SPACE_S))
+                                .children(activity_status)
+                                .children(self.workers_line(p, cx))
+                                .children(launch)
+                                .children(inline_sheet)
+                                .child(composer)
+                                .children(usage);
+                            let dock = row().w_full().justify_center().child(dock);
+                            if ready {
+                                view.child(self.empty_state(p, dock))
+                            } else {
+                                view.child(dock.flex_shrink_0().pt(px(SPACE_S)))
+                            }
+                        }),
                 )
             })
             .on_mouse_move(cx.listener(|s, event: &MouseMoveEvent, window, cx| {

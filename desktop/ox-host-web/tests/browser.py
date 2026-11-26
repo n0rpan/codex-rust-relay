@@ -128,10 +128,15 @@ def build_report_items():
     ]
 
 
+WRITE = threading.Lock()
+
+
 class Host(socketserver.StreamRequestHandler):
     def handle(self):
         def send(value):
-            self.wfile.write(json.dumps(value).encode() + b"\n")
+            with WRITE:
+                self.wfile.write(json.dumps(value).encode() + b"\n")
+                self.wfile.flush()
 
         f = self.server
         sequence = 20
@@ -271,23 +276,40 @@ class Host(socketserver.StreamRequestHandler):
                     if changes:
                         sequence += 1
                         send({"type":"delta", "scope":f.scope, "cursor":{"epoch":"fixture","seq":sequence}, "changes":changes})
+                    late = None
                     if "send_text" in action and action["send_text"][0] is None:
+                        said = action["send_text"][1]
+                        # "Ack first" and "Opened first" hold the other reply until the
+                        # test releases it, so the phone can be edited in between.
+                        late = {"Ack first": "opened", "Opened first": "ack"}.get(said)
+                        ident = {"Ack first": "new-ack", "Opened first": "new-opened"}.get(said, "new")
                         f.sessions.append(
                             dict(
                                 f.sessions[0],
-                                id="new",
-                                title="Newly created phone session",
+                                id=ident,
+                                title=ident if late else "Newly created phone session",
                                 parent=None,
                             )
                         )
-                        send(
-                            {
-                                "type": "opened",
-                                "id": frame["id"],
-                                "scope": f.scope,
-                                "thread": "new",
-                            }
-                        )
+                        opened = {
+                            "type": "opened",
+                            "id": frame["id"],
+                            "scope": f.scope,
+                            "thread": ident,
+                        }
+                        if late == "opened":
+                            def later():
+                                f.release.wait(20)
+                                send(opened)
+                            threading.Thread(target=later, daemon=True).start()
+                        elif late == "ack":
+                            def later():
+                                f.release.wait(20)
+                                send(opened)
+                                send({"type": "ack", "id": frame["id"]})
+                            threading.Thread(target=later, daemon=True).start()
+                        else:
+                            send(opened)
                     if "answer_ask" in action:
                         q = {
                             "id": "q",
@@ -334,7 +356,8 @@ class Host(socketserver.StreamRequestHandler):
                             }
                         )
                     f.actions.append(frame["action"])
-                    send({"type": "ack", "id": frame["id"]})
+                    if late != "ack":
+                        send({"type": "ack", "id": frame["id"]})
         except (OSError, ValueError):
             pass
 
@@ -755,6 +778,7 @@ def run(harness, screenshot=None):
         host.sessions.append(dict(host.sessions[0], id="typed-block", title="Typed block", status="idle",
                                   updated_at=0, capabilities=["open", "send"], detail={"access": "default"}))
         host.actions = []
+        host.release = threading.Event()
         host.resumes = []
         host.connections = []
         host.answered = False
@@ -765,7 +789,7 @@ def run(harness, screenshot=None):
         (codex/"codeox.toml").write_text('[providers.garden]\nname="Garden"\nbase_url="https://garden.invalid/v1"\nenv_key="GARDEN_TOKEN"\nwire_api="chat_completions"\ndiscovery=false\n[[providers.garden.models]]\nid="orchard"\n')
         service = subprocess.Popen(
             [harness, "--exact", "fixture::browser_service", "--ignored"],
-            env=dict(os.environ, SHELL="/bin/sh", HOME=str(isolated), CODEX_HOME=str(codex), CLAUDE_CONFIG_DIR=str(isolated/".claude"), XDG_STATE_HOME=str(isolated/"state"), XDG_CONFIG_HOME=str(isolated/"config"), OX_TEST_REMOTE_DIR=str(d)),
+            env=dict(os.environ, SHELL="/bin/sh", GARDEN_TOKEN="fixture-env-token", HOME=str(isolated), CODEX_HOME=str(codex), CLAUDE_CONFIG_DIR=str(isolated/".claude"), XDG_STATE_HOME=str(isolated/"state"), XDG_CONFIG_HOME=str(isolated/"config"), OX_TEST_REMOTE_DIR=str(d)),
             stdout=subprocess.DEVNULL,
         )
         stack.callback(service.wait, 5)
@@ -782,9 +806,9 @@ def run(harness, screenshot=None):
         icons=js("""return Object.fromEntries([...document.querySelectorAll('.session')].map(b=>[
             b.dataset.threadId,[b.dataset.source,b.querySelector('.status').textContent,getComputedStyle(b,'::before').boxShadow.replace(/rgba?[(][^)]*[)]/g,'')]
         ]));""")
-        assert icons["parent"][:2]==["claude","Needs input"] and icons["child"][0]=="worker", icons
+        assert icons["parent"][:2]==["claude","Needs you"] and icons["child"][0]=="worker", icons
         for ident,source in [("codex-source","codex"),("api-source","api"),("codex-api-source","api")]:
-            assert icons[ident][:2]==[source,"idle"] and icons[ident+"-running"][:2]==[source,"running"]
+            assert icons[ident][:2]==[source,""] and icons[ident+"-running"][:2]==[source,"Running"]
             assert icons[ident][2]==icons[ident+"-running"][2] and icons[ident][2]!="none"
         assert len({icons[k][2] for k in ("parent","child","codex-source","api-source")})==4
 
@@ -848,7 +872,10 @@ def run(harness, screenshot=None):
         assert js("return document.activeElement.matches('#conversation .action-menu > summary:focus-visible')")
         keypress("\ue007")
         keypress("\ue004")
-        assert js("return document.activeElement.id==='operator-project'")
+        # The menu opens on its first visible item (the Session section leads now).
+        assert js("""const a=document.activeElement, m=document.querySelector('#conversation .action-menu');
+            const first=[...m.querySelectorAll('button')].find(b=>b.offsetParent!==null);
+            return m.open && a===first""")
         keypress("\ue00c")
         assert js("return !document.querySelector('#conversation .action-menu').open && document.activeElement.matches('.action-menu > summary')")
         keypress("\ue004")
@@ -903,7 +930,7 @@ def run(harness, screenshot=None):
             js("document.getElementById('apply-permission').click()")
         js("document.getElementById('access-mode').click()")
         mode("plan")
-        wait(lambda: js("return document.getElementById('control-status').textContent.includes('Claude · Subscription · Mode disabled')"))
+        wait(lambda: js("return document.getElementById('control-status').textContent.includes('Claude subscription · Mode disabled')"))
         mode("bypass_permissions")
         wait(host.mode_requested.is_set)
         assert js("return document.getElementById('access-mode').dataset.bypass==='false' && document.getElementById('access-mode').textContent==='Default'")
@@ -942,6 +969,15 @@ def run(harness, screenshot=None):
         wait(lambda: any(isinstance(a, dict) and a.get("start_handoff", {}).get("source") == "child"
                          and a["start_handoff"]["mode"] == "inherit" and not a["start_handoff"]["yolo_confirmed"]
                          and a["start_handoff"]["request"] == "Carry on elsewhere" for a in host.actions))
+        # A runtime with no configured route never falls back to index 0 of another runtime.
+        starts = lambda: sum(1 for a in host.actions if isinstance(a, dict) and "start_handoff" in a)
+        before = starts()
+        js("document.getElementById('continue-in').click();document.getElementById('handoff-route').replaceChildren();"
+           "document.getElementById('handoff-request').value='Nowhere';document.getElementById('handoff-form').requestSubmit()")
+        wait(lambda: js("return document.getElementById('message').textContent.includes('is configured on this host')"))
+        time.sleep(0.3)
+        assert starts() == before, "an empty route selection must not start a handoff"
+        js("document.getElementById('handoff-cancel').click()")
         # The handoff marker and the folded block appear only on a handoff target's first user message.
         def bubbles(thread, title):
             js("document.getElementById('home').click()")
@@ -957,6 +993,14 @@ def run(harness, screenshot=None):
         assert typed and not typed[0][0] and typed[0][1].startswith("<ox-handoff>"), typed
         assert js("return document.getElementById('handoff-marks').hidden")
         phone_report(js, port, base, keypress, capture, screenshot)
+        # Cold discovery through the real New action: the Hello listed one Claude subscription
+        # route and no API route, and the connected tab never refreshes. The unstarred provider
+        # alias must still be offered for BOTH runtimes once its catalog lands.
+        js("document.getElementById('home').click();document.getElementById('new').click()")
+        wait(lambda: js(
+            "const o=[...document.querySelectorAll('#route option')].map(x=>x.textContent);"
+            "return ['codex','claude'].every(r=>o.some(t=>t.toLowerCase().includes(r)&&t.includes('orchard')))"
+        ))
         js(
             "document.getElementById('home').click();document.getElementById('new').click();document.getElementById('new-form').requestSubmit()"
         )
@@ -979,6 +1023,31 @@ def run(harness, screenshot=None):
                 "return document.getElementById('title').innerText==='Newly created phone session'"
             )
         )
+        # The first message of a new thread is followed at once by more typing; the
+        # real thread's Opened must keep it, whichever of Ack and Opened comes first.
+        def type_draft(text):
+            js("const d=document.getElementById('draft');d.value=arguments[0];d.dispatchEvent(new Event('input'))", text)
+        def new_thread(first):
+            host.release.clear()
+            js("document.getElementById('home').click();document.getElementById('new').click();document.getElementById('new-form').requestSubmit()")
+            wait(lambda: js("return document.getElementById('network').innerText==='Connected' && document.getElementById('title').innerText==='New session'"))
+            type_draft(first)
+            js("document.getElementById('composer').requestSubmit()")
+            wait(lambda: {"send_text": [None, first]} in host.actions)
+        new_thread("Ack first")
+        wait(lambda: js("return document.getElementById('draft').value===''"))  # the Ack cleared it
+        type_draft("follow-up one")
+        host.release.set()  # Opened arrives after the Ack
+        wait(lambda: js("return document.getElementById('title').innerText==='new-ack'"))
+        assert js("return document.getElementById('draft').value")=="follow-up one"
+        type_draft("")
+        new_thread("Opened first")
+        type_draft("Opened first and the rest")  # before either reply
+        host.release.set()  # Opened, then the Ack
+        wait(lambda: js("return document.getElementById('title').innerText==='new-opened'"))
+        time.sleep(0.5)
+        assert js("return document.getElementById('draft').value")=="Opened first and the rest"
+        type_draft("")
         from phone_settings import exercise
         exercise(js, wait)
 

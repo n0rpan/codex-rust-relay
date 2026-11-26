@@ -2,7 +2,7 @@
 use super::{TranscriptView, Workbench, cards};
 use crate::{
     appearance::Palette,
-    kit::{PopupMenuItem, button, field},
+    kit::{button, field},
     row,
 };
 use gpui::{prelude::FluentBuilder, *};
@@ -11,13 +11,16 @@ use gpui_component::{
     menu::PopupMenu,
 };
 use ox_desk_core::transcript::{Entry, ItemKey, Row, Transcript, item::Item};
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::HashMap};
 
 pub(super) struct Find {
     input: Entity<InputState>,
     pub(super) selected: Option<ItemKey>,
     result: String,
     pub(super) paging: bool,
+    /// Lowercased searchable text per item with a cheap size signature, so a keystroke does not
+    /// rebuild and re-lowercase every output.
+    lowered: HashMap<ItemKey, (usize, String)>,
     _events: Subscription,
 }
 
@@ -35,17 +38,49 @@ fn entry_text(entry: &Entry) -> Cow<'_, str> {
     }
 }
 
-fn matches(t: &Transcript, query: &str, hide_thinking: bool) -> Vec<(usize, ItemKey)> {
+/// Cheap change signature: streamed items only grow, so their text lengths identify a revision.
+fn signature(entry: &Entry) -> usize {
+    let own = match &entry.item {
+        Item::UserMessage { content } => content
+            .iter()
+            .map(|c| c.text.as_deref().or(c.path.as_deref()).map_or(0, str::len))
+            .sum(),
+        Item::Reasoning { summary } => summary.iter().map(String::len).sum(),
+        Item::Plan { text } | Item::AgentMessage { text, .. } => text.len(),
+        Item::CommandExecution {
+            aggregated_output,
+            exit_code,
+            ..
+        } => aggregated_output.as_deref().map_or(0, str::len) + exit_code.is_some() as usize,
+        Item::FileChange { changes, .. } => changes.iter().map(|c| c.diff.len()).sum(),
+        _ => 0,
+    };
+    own + entry.output.len()
+}
+
+fn matches(
+    t: &Transcript,
+    query: &str,
+    hide_thinking: bool,
+    cache: &mut HashMap<ItemKey, (usize, String)>,
+) -> Vec<(usize, ItemKey)> {
     let query = query.to_lowercase();
     let mut found = Vec::new();
     if query.is_empty() {
         return found;
     }
     for index in 0..t.len() {
-        let has_text = |k: &ItemKey| {
+        let mut has_text = |k: &ItemKey| {
             t.entry(k).is_some_and(|entry| {
-                !(hide_thinking && matches!(entry.item, Item::Reasoning { .. }))
-                    && entry_text(entry).to_lowercase().contains(&query)
+                if hide_thinking && matches!(entry.item, Item::Reasoning { .. }) {
+                    return false;
+                }
+                let sig = signature(entry);
+                let cached = cache.entry(k.clone()).or_default();
+                if cached.0 != sig || cached.1.is_empty() {
+                    *cached = (sig, entry_text(entry).to_lowercase());
+                }
+                cached.1.contains(&query)
             })
         };
         let key = match t.row(index) {
@@ -88,12 +123,12 @@ pub(super) fn copy_menu(mut menu: PopupMenu, t: &Transcript, key: &ItemKey) -> P
     let text = entry_text(entry).into_owned();
     let blocks = code_blocks(&text);
     menu = menu.item(
-        PopupMenuItem::new("Copy message").on_click(move |_, _, cx| {
+        crate::kit::menu_item("Copy message").on_click(move |_, _, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))
         }),
     );
     for (label, value) in blocks {
-        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+        menu = menu.item(crate::kit::menu_item(label).on_click(move |_, _, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(value.clone()))
         }));
     }
@@ -136,6 +171,7 @@ impl Workbench {
             selected: None,
             result: String::new(),
             paging: false,
+            lowered: HashMap::new(),
             _events: events,
         });
         cx.notify();
@@ -152,7 +188,7 @@ impl Workbench {
         };
         let Some(find) = &mut view.find else { return };
         let query = find.input.read(cx).value();
-        let hits = matches(t, query.trim(), view.hide_thinking);
+        let hits = matches(t, query.trim(), view.hide_thinking, &mut find.lowered);
         find.paging = false;
         if hits.is_empty() {
             find.selected = None;

@@ -18,6 +18,47 @@ pub struct Capabilities {
     pub provider: String,
 }
 
+/// "claude-opus-5-5-20261101" becomes "Opus 5.5"; "gpt-6.2-sol" becomes "GPT 6.2 Sol". Ids that
+/// are not hyphenated words are returned unchanged.
+pub fn readable_model(id: &str) -> String {
+    let id = id.rsplit('/').next().unwrap_or(id);
+    let id = id.strip_prefix("claude-").unwrap_or(id);
+    let mut words: Vec<String> = Vec::new();
+    let mut version: Vec<&str> = Vec::new();
+    let parts: Vec<&str> = id.split('-').filter(|p| !p.is_empty()).collect();
+    if parts.len() < 2 && !id.contains('.') {
+        return id.to_owned();
+    }
+    for part in parts {
+        let digits = part.chars().all(|c| c.is_ascii_digit());
+        if digits && part.len() >= 8 {
+            continue; // A date stamp.
+        }
+        if digits || (part.contains('.') && part.chars().all(|c| c.is_ascii_digit() || c == '.')) {
+            version.push(part);
+            continue;
+        }
+        if !version.is_empty() {
+            words.push(version.join("."));
+            version.clear();
+        }
+        let mut chars = part.chars();
+        let name = if part.eq_ignore_ascii_case("gpt") {
+            "GPT".to_owned()
+        } else {
+            chars
+                .next()
+                .map(|c| c.to_uppercase().chain(chars).collect())
+                .unwrap_or_default()
+        };
+        words.push(name);
+    }
+    if !version.is_empty() {
+        words.push(version.join("."));
+    }
+    words.join(" ")
+}
+
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct Tier {
     pub id: String,
@@ -45,6 +86,7 @@ impl Capabilities {
     }
     pub fn add_model(&mut self, model: crate::codex::commands::Model) {
         let id = model.model.unwrap_or(model.id);
+        let rank = self.models.len() as u32;
         Arc::make_mut(&mut self.models).insert(
             id.clone(),
             crate::store::routes_thread::ModelInfo {
@@ -53,6 +95,9 @@ impl Capabilities {
                 default_effort: model.default_reasoning_effort,
                 default_tier: model.default_service_tier.clone(),
                 input_modalities: model.input_modalities,
+                rank: Some(rank),
+                is_default: model.is_default,
+                resolved: None,
             },
         );
         if model.is_default {
@@ -73,6 +118,69 @@ impl Capabilities {
             model.service_tiers
         };
         Arc::make_mut(&mut self.catalog).insert(id, tiers);
+    }
+    /// The default model's id and the human name the runtime gives it, when it reports one.
+    pub fn default_model(&self) -> Option<&str> {
+        self.models
+            .iter()
+            .find(|(_, m)| m.is_default)
+            .map(|(id, _)| id.as_str())
+            .or_else(|| self.models.contains_key("default").then_some("default"))
+    }
+    /// Human name for a model id: the runtime's display name, else a readable form of the id.
+    /// Claude Code's symbolic `default` resolves to the model it currently maps to.
+    pub fn model_name(&self, id: &str) -> String {
+        let id = if id.is_empty() {
+            self.model.as_str()
+        } else {
+            id
+        };
+        let resolved = |resolved: &str| {
+            self.models
+                .iter()
+                .find(|(key, m)| {
+                    key.as_str() != "default" && m.resolved.as_deref() == Some(resolved)
+                })
+                .map(|(_, m)| m.label.clone())
+                .filter(|label| !label.is_empty())
+                .unwrap_or_else(|| readable_model(resolved))
+        };
+        match self.models.get(id) {
+            Some(info) if id == "default" => match info.resolved.as_deref() {
+                Some(target) => resolved(target),
+                None => id.to_owned(),
+            },
+            Some(info) if !info.label.is_empty() => info.label.clone(),
+            Some(_) => readable_model(id),
+            None if id == "default" => id.to_owned(),
+            None => self
+                .models
+                .get("default")
+                .and_then(|d| d.resolved.as_deref())
+                .filter(|target| *target == id)
+                .map_or_else(|| readable_model(id), resolved),
+        }
+    }
+    /// `model_name` plus " (default)" when this is the runtime's default model.
+    pub fn model_display(&self, id: &str) -> String {
+        let id = if id.is_empty() {
+            self.model.as_str()
+        } else {
+            id
+        };
+        let name = self.model_name(id);
+        let default = self.models.get(id).is_some_and(|m| m.is_default)
+            || id == "default"
+            || self
+                .models
+                .get("default")
+                .and_then(|d| d.resolved.as_deref())
+                .is_some_and(|target| target == id);
+        if default && name != "default" {
+            format!("{name} (default)")
+        } else {
+            name
+        }
     }
     pub fn tiers(&self) -> &[Tier] {
         self.catalog
@@ -287,6 +395,42 @@ pub fn completions(text: &str, caps: &Capabilities) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_names_come_from_the_runtime_then_the_id() {
+        use crate::store::routes_thread::ModelInfo;
+        let mut caps = Capabilities::default();
+        let models = std::sync::Arc::make_mut(&mut caps.models);
+        models.insert(
+            "default".into(),
+            ModelInfo {
+                label: "Default (recommended)".into(),
+                is_default: true,
+                resolved: Some("claude-opus-5-5-20261101".into()),
+                ..Default::default()
+            },
+        );
+        models.insert(
+            "sonnet".into(),
+            ModelInfo {
+                label: "Sonnet 5".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(caps.model_display("default"), "Opus 5.5 (default)");
+        assert_eq!(
+            caps.model_display("claude-opus-5-5-20261101"),
+            "Opus 5.5 (default)"
+        );
+        assert_eq!(caps.model_display("sonnet"), "Sonnet 5");
+        assert_eq!(readable_model("claude-fable-5-2"), "Fable 5.2");
+        assert_eq!(readable_model("opencode/gpt-6.2-sol"), "GPT 6.2 Sol");
+        assert_eq!(readable_model("o3"), "o3");
+        let mut unresolved = Capabilities::default();
+        std::sync::Arc::make_mut(&mut unresolved.models)
+            .insert("default".into(), ModelInfo::default());
+        assert_eq!(unresolved.model_display("default"), "default");
+    }
+
     use super::*;
     use serde_json::json;
 

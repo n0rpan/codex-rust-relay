@@ -15,10 +15,17 @@ use tokio::{
 
 use crate::provider::RelayError;
 
-const MAX_RUNNING: usize = 4;
+/// A worker limit from an environment variable. Unset or zero means no limit.
+fn env_limit(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+}
 const MAX_RETAINED: usize = 24;
 const MAX_TEXT: usize = 24 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const CODEX_FLUSH_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 pub(super) struct Jobs {
@@ -36,10 +43,13 @@ pub(super) struct Start {
     /// Legacy: false means read, true means write. Capped by the parent's mode.
     #[serde(default)]
     workspace_write: Option<bool>,
-    /// `inherit` (default) or a lower level: read, write, classifier, yolo, or a
-    /// native preset name. Never above the parent's own mode.
+    /// `inherit` (default) or a lower level: read, write, classifier or yolo.
+    /// Never above the parent's own mode.
     #[serde(default)]
     permission_mode: Option<String>,
+    /// Wall-clock limit in minutes. Falls back to OX_WORKER_MAX_MINUTES when set.
+    #[serde(default)]
+    max_minutes: Option<u32>,
 }
 
 /// The canonical level name of a permission mode, or None for inherit.
@@ -102,6 +112,7 @@ struct Job {
     sender: mpsc::Sender<Instruction>,
     state: Arc<Mutex<State>>,
     task: AbortHandle,
+    writes: bool,
 }
 
 struct State {
@@ -115,6 +126,9 @@ struct State {
     result: Option<String>,
     error: Option<String>,
     model: String,
+    started: std::time::Instant,
+    max_minutes: Option<u64>,
+    warning: Option<String>,
 }
 
 impl State {
@@ -139,6 +153,9 @@ impl State {
             "progress": self.progress,
             "result": self.result,
             "error": self.error,
+            "elapsed_seconds": self.started.elapsed().as_secs(),
+            "max_minutes": self.max_minutes,
+            "warning": self.warning,
         })
     }
     fn snapshot(&self, job_id: u64) -> Value {
@@ -180,6 +197,16 @@ impl Jobs {
         Ok(received)
     }
 
+    /// Whether the opt-in worker count limit is reached. No limit never is.
+    fn slots_full(&self, cap: Option<u64>) -> bool {
+        cap.is_some_and(|cap| {
+            self.entries
+                .values()
+                .filter(|job| !job.task.is_finished())
+                .count()
+                >= cap as usize
+        })
+    }
     pub(super) fn start(
         &mut self,
         request: Start,
@@ -189,15 +216,15 @@ impl Jobs {
     ) -> Result<Value, String> {
         request.validate()?;
         request.writes()?;
-        if self
-            .entries
-            .values()
-            .filter(|job| !job.task.is_finished())
-            .count()
-            >= MAX_RUNNING
-        {
-            return Err("All background worker slots are in use.".into());
+        if self.slots_full(env_limit("OX_WORKER_MAX_PER_PARENT")) {
+            return Err("All background worker slots are in use. Wait for one to finish or cancel one. The limit is OX_WORKER_MAX_PER_PARENT.".into());
         }
+        let writes = request.writes()?;
+        let warning = self.write_overlap(writes);
+        let max_minutes = request
+            .max_minutes
+            .map(u64::from)
+            .or_else(|| env_limit("OX_WORKER_MAX_MINUTES"));
         if self.entries.len() >= MAX_RETAINED
             && let Some(id) = self
                 .entries
@@ -229,9 +256,15 @@ impl Jobs {
                 .clone()
                 .unwrap_or_else(|| "Claude subscription".to_owned()),
             native_session: None,
-            progress: "Starting the stock client".to_owned(),
+            progress: request
+                .claude_fallback_notice()
+                .unwrap_or("Starting the stock client")
+                .to_owned(),
             result: None,
             error: None,
+            started: std::time::Instant::now(),
+            max_minutes,
+            warning,
         }));
         state
             .lock()
@@ -241,12 +274,26 @@ impl Jobs {
         let handle = tokio::spawn({
             let state = Arc::clone(&state);
             async move {
-                let result = match request.runtime {
-                    Runtime::Codex => {
-                        run_codex(command, &request, &state, &secrets, instructions).await
+                let work = async {
+                    match request.runtime {
+                        Runtime::Codex => {
+                            run_codex(command, &request, &state, &secrets, instructions).await
+                        }
+                        Runtime::Claude => {
+                            run_claude(command, &request, &state, &secrets, instructions).await
+                        }
                     }
-                    Runtime::Claude => {
-                        run_claude(command, &request, &state, &secrets, instructions).await
+                };
+                let result = match max_minutes {
+                    None => work.await,
+                    Some(minutes) => {
+                        match tokio::time::timeout(Duration::from_secs(minutes * 60), work).await {
+                            Ok(result) => result,
+                            Err(_) => Err(format!(
+                                "Worker stopped after {minutes} minutes (time limit)."
+                            )
+                            .into()),
+                        }
                     }
                 };
                 let mut state = state.lock().unwrap();
@@ -268,9 +315,23 @@ impl Jobs {
                 sender,
                 state,
                 task: handle.abort_handle(),
+                writes,
             },
         );
         Ok(initial)
+    }
+
+    /// A caution when this write worker starts beside another running write worker.
+    fn write_overlap(&self, writes: bool) -> Option<String> {
+        (writes
+            && self
+                .entries
+                .values()
+                .any(|job| job.writes && !job.task.is_finished()))
+        .then(|| {
+            "Another write worker is editing this project. Consider a separate git worktree."
+                .to_owned()
+        })
     }
 
     pub(super) fn has(&self, id: u64) -> bool {
@@ -316,6 +377,7 @@ impl Start {
             "mode": self.mode,
             "task": crate::upstream::redact(&self.task, secrets),
             "write": self.workspace_write,
+            "max_minutes": self.max_minutes,
             "permission": self.permission_mode.as_deref().map(|m| permission_level(m).ok().flatten().unwrap_or("inherit")),
         })
     }
@@ -336,6 +398,9 @@ impl Start {
         }
     }
     pub(super) fn validate(&self) -> Result<(), String> {
+        if self.max_minutes.is_some_and(|m| m == 0 || m > 7 * 24 * 60) {
+            return Err("max_minutes must be between 1 and 10080.".into());
+        }
         if let Some(mode) = &self.permission_mode {
             permission_level(mode)?;
         }
@@ -364,6 +429,9 @@ impl Start {
     }
 
     fn command(&self, home: &Path, cwd: &Path) -> Result<Command, RelayError> {
+        // A no-host subscription worker carries its sandbox settings inside the
+        // checked account overlay, so the contract's own --settings is dropped.
+        let mut overlay = false;
         let mut command = if let Some(model) = &self.model {
             let mut command = Command::new(std::env::current_exe()?);
             let client = match self.runtime {
@@ -386,13 +454,17 @@ impl Start {
                 wrapper.args(["claude", "--subscription"]);
                 wrapper
             } else {
-                crate::native::claude_account_command(home)?
+                overlay = true;
+                let sandbox = self.claude_contract()?.settings().is_some();
+                crate::native::claude_subscription_worker_command(home, sandbox)?
             }
         };
         command
             .current_dir(cwd)
             .env("CODEX_HOME", home)
             .env_remove(super::TOKEN_ENV);
+        // The worker helper registers under this gateway's lease, so the host retires it if the gateway dies.
+        crate::host_lifetime::set_parent_lease(&mut command);
         command
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -408,42 +480,43 @@ impl Start {
                     .args(["--no-daemon", "app-server", "--listen", "stdio://"])
                     .stdin(Stdio::piped());
             }
-            (Runtime::Claude, mode) => {
-                let writes = self.writes()?;
-                let tools = if writes {
-                    "Read,Glob,Grep,Edit,Write,Bash,Workflow"
-                } else {
-                    "Read,Glob,Grep,Workflow"
-                };
-                if !writes {
-                    command.args([
-                        "--disallowedTools",
-                        "Bash,Edit,Write,MultiEdit,NotebookEdit",
-                    ]);
+            (Runtime::Claude, _) => {
+                let contract = self.claude_contract()?;
+                command.args([
+                    "--print",
+                    "--input-format",
+                    "stream-json",
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
+                    "--permission-mode",
+                    contract.permission_mode(),
+                ]);
+                // Stock Claude Code merges the sandbox settings with the account settings ox builds.
+                let mut policy = contract.args();
+                if overlay && let Some(at) = policy.iter().position(|a| a == "--settings") {
+                    policy.drain(at..=at + 1);
                 }
-                command
-                    .args([
-                        "--print",
-                        "--input-format",
-                        "stream-json",
-                        "--output-format",
-                        "stream-json",
-                        "--verbose",
-                        "--permission-mode",
-                        if writes { "acceptEdits" } else { "dontAsk" },
-                        "--tools",
-                        tools,
-                        "--allowedTools",
-                        if mode == Mode::Workflow {
-                            "Read,Glob,Grep,Workflow"
-                        } else {
-                            "Read,Glob,Grep"
-                        },
-                    ])
-                    .stdin(Stdio::piped());
+                command.args(policy);
+                command.stdin(Stdio::piped());
             }
         }
         Ok(command)
+    }
+
+    /// The shared Claude worker contract for this request.
+    fn claude_contract(&self) -> Result<crate::claude_worker_contract::Contract, RelayError> {
+        Ok(crate::claude_worker_contract::Contract::detect(
+            self.writes()?,
+            self.mode == Mode::Workflow,
+        ))
+    }
+
+    /// Warn when a Claude write worker's Bash commands can run unsandboxed.
+    pub(super) fn claude_fallback_notice(&self) -> Option<&'static str> {
+        (self.runtime == Runtime::Claude)
+            .then(|| self.claude_contract().ok()?.fallback_notice())
+            .flatten()
     }
 
     fn sandbox(&self) -> &'static str {
@@ -510,6 +583,8 @@ async fn run_claude(
     write_rpc(&mut input, user_message(&task)).await?;
     let mut used_workflow = false;
     let mut pending = 1usize;
+    // The error of the latest finished turn, cleared by a later successful turn.
+    let mut turn_failure: Option<String> = None;
     while pending > 0 {
         let line = tokio::select! {
             Some(message) = instructions.recv() => {
@@ -547,10 +622,13 @@ async fn run_claude(
                 }
             }
             Some("result") => {
-                if event["is_error"] == true {
-                    return Err("Claude Code reported a worker error.".into());
-                }
-                if let Some(text) = event["result"].as_str() {
+                // An error turn (overload, max turns, execution error) ends only that turn.
+                // The process stays up so a session can be steered on.
+                turn_failure = turn_error(&event, secrets);
+                state.error = turn_failure.clone();
+                if turn_failure.is_none()
+                    && let Some(text) = event["result"].as_str()
+                {
                     state.result = Some(clean(text, secrets));
                 }
                 pending -= 1;
@@ -560,8 +638,13 @@ async fn run_claude(
         state.can_steer = pending > 0;
     }
     drop(input);
-    if request.mode == Mode::Workflow && !used_workflow {
-        return Err("Claude Code did not run the Workflow tool. Check the selected model, Claude Code version, and workflow permissions.".into());
+    // The job ends with its last turn's error, whatever its mode. A session stays
+    // steerable while turns are pending; once the last turn errors, nothing is left to steer.
+    if let Some(error) = turn_failure {
+        return Err(error.into());
+    }
+    if request.runtime == Runtime::Claude {
+        request.claude_contract()?.check_workflow(used_workflow)?;
     }
     // Closing input lets the client flush its final session state before leaving the process group.
     if let Ok(status) = tokio::time::timeout(Duration::from_secs(5), process.child.wait()).await {
@@ -630,7 +713,7 @@ async fn run_codex(
     let mut awaiting_start = true;
     let start_timeout = tokio::time::sleep(RPC_TIMEOUT);
     tokio::pin!(start_timeout);
-    loop {
+    let status = loop {
         let line = tokio::select! {
             _ = &mut start_timeout, if awaiting_start => return Err(format!("Codex did not answer {method}.").into()),
             Some(message) = instructions.recv() => {
@@ -722,9 +805,14 @@ async fn run_codex(
         if turn.is_none()
             && let Some(status) = terminal
         {
-            return Ok(status);
+            break status;
         }
-    }
+    };
+    // Closing input lets the app-server flush its final session state before the
+    // process group is killed on drop. Wait briefly, then let drop kill it.
+    drop(input);
+    let _ = tokio::time::timeout(CODEX_FLUSH_GRACE, process.child.wait()).await;
+    Ok(status)
 }
 
 async fn rpc(
@@ -763,7 +851,289 @@ async fn write_rpc(input: &mut ChildStdin, event: Value) -> Result<(), RelayErro
     Ok(())
 }
 
+/// The cleaned error of a stream-json `result` event that ended its turn in failure.
+fn turn_error(event: &Value, secrets: &[String]) -> Option<String> {
+    if event["is_error"] != true {
+        return None;
+    }
+    let text = |value: &Value| {
+        value
+            .as_str()
+            .or_else(|| value["message"].as_str())
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    let message = text(&event["result"])
+        .or_else(|| {
+            let errors: Vec<String> = event["errors"]
+                .as_array()?
+                .iter()
+                .filter_map(text)
+                .collect();
+            (!errors.is_empty()).then(|| errors.join("; "))
+        })
+        .unwrap_or_else(|| "Claude Code reported a worker error.".to_owned());
+    Some(clean(&message, secrets))
+}
+
 fn clean(text: &str, secrets: &[String]) -> String {
     let text = crate::upstream::redact(text, secrets);
     text[..text.floor_char_boundary(MAX_TEXT)].to_owned()
+}
+
+#[cfg(test)]
+mod turn_error_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn successful_result_is_not_an_error() {
+        let event = json!({"type":"result","is_error":false,"result":"done"});
+        assert_eq!(turn_error(&event, &[]), None);
+    }
+
+    #[test]
+    fn error_result_uses_its_text_and_redacts_secrets() {
+        let event =
+            json!({"type":"result","is_error":true,"result":"overloaded for key sk-test-123"});
+        let secrets = vec!["sk-test-123".to_owned()];
+        let error = turn_error(&event, &secrets).unwrap();
+        assert!(error.starts_with("overloaded"));
+        assert!(!error.contains("sk-test-123"));
+    }
+
+    #[test]
+    fn error_result_falls_back_to_its_errors_then_a_default() {
+        let event = json!({"type":"result","subtype":"error_during_execution","is_error":true,
+            "errors":["tool crashed", {"message":"retry later"}]});
+        assert_eq!(
+            turn_error(&event, &[]).as_deref(),
+            Some("tool crashed; retry later")
+        );
+        let bare = json!({"type":"result","is_error":true,"result":"  "});
+        assert_eq!(
+            turn_error(&bare, &[]).as_deref(),
+            Some("Claude Code reported a worker error.")
+        );
+    }
+}
+
+#[cfg(test)]
+mod worker_contract_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn start(value: Value) -> Start {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn args_of(command: &Command) -> Vec<String> {
+        command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn value_after<'a>(args: &'a [String], flag: &str) -> &'a str {
+        let index = args.iter().position(|arg| arg == flag).expect(flag);
+        &args[index + 1]
+    }
+
+    #[test]
+    fn write_claude_workers_get_bash_with_or_without_a_sandbox() {
+        let request = start(json!({
+            "runtime": "claude", "mode": "session", "task": "fix it",
+            "model": "fixture", "permission_mode": "write"
+        }));
+        let command = request.command(Path::new("/"), Path::new("/")).unwrap();
+        let args = args_of(&command);
+        assert_eq!(value_after(&args, "--permission-mode"), "acceptEdits");
+        // The shell does not depend on the sandbox: Claude Code runs it sandboxed
+        // where it can and otherwise unsandboxed, as in a terminal.
+        assert_eq!(
+            value_after(&args, "--tools"),
+            "Read,Glob,Grep,Edit,Write,Bash,Workflow"
+        );
+        assert_eq!(value_after(&args, "--allowedTools"), "Read,Glob,Grep,Bash");
+        let settings = value_after(&args, "--settings");
+        assert_eq!(
+            serde_json::from_str::<Value>(settings).unwrap(),
+            crate::clients::claude_sandbox_document()
+        );
+
+        let read = start(json!({
+            "runtime": "claude", "mode": "session", "task": "look",
+            "model": "fixture", "permission_mode": "read"
+        }));
+        let args = args_of(&read.command(Path::new("/"), Path::new("/")).unwrap());
+        assert_eq!(value_after(&args, "--tools"), "Read,Glob,Grep,Workflow");
+        assert_eq!(
+            value_after(&args, "--disallowedTools"),
+            "Bash,Edit,Write,MultiEdit,NotebookEdit"
+        );
+        assert!(!args.iter().any(|arg| arg == "--settings"));
+    }
+
+    /// A fake Codex app-server that answers the RPCs, reports the turn as completed,
+    /// and only writes its marker after stdin closes, as a client flushing state would.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_worker_gets_a_flush_window_after_turn_completed() {
+        const SCRIPT: &str = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-1"}}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}' ;;
+  esac
+done
+printf flushed > "$MARKER"
+"#;
+        let marker = std::env::temp_dir().join(format!("ox-codex-flush-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", SCRIPT])
+            .env("MARKER", &marker)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0);
+        let request = start(json!({
+            "runtime": "codex", "mode": "session", "task": "say hi", "model": "fixture"
+        }));
+        let state = Mutex::new(State {
+            runtime: Runtime::Codex,
+            mode: Mode::Session,
+            can_steer: false,
+            messages: VecDeque::new(),
+            status: "running",
+            native_session: None,
+            progress: String::new(),
+            result: None,
+            error: None,
+            model: "fixture".into(),
+            started: std::time::Instant::now(),
+            max_minutes: None,
+            warning: None,
+        });
+        let (_instructions, receiver) = mpsc::channel::<Instruction>(1);
+        let status = run_codex(command, &request, &state, &[], receiver)
+            .await
+            .expect("the scripted turn completes");
+        assert_eq!(status, "completed");
+        // The worker was not killed the moment turn/completed arrived.
+        assert_eq!(
+            std::fs::read_to_string(&marker).ok().as_deref(),
+            Some("flushed")
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// A session whose last turn errors ends failed with that error, not "completed".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_whose_last_turn_errors_ends_failed() {
+        const SCRIPT: &str = r#"
+read -r _line
+printf '%s\n' '{"type":"result","is_error":true,"result":"overloaded right now"}'
+"#;
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", SCRIPT])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0);
+        let request = start(json!({
+            "runtime": "claude", "mode": "session", "task": "say hi", "model": "fixture"
+        }));
+        let state = Mutex::new(State {
+            runtime: Runtime::Claude,
+            mode: Mode::Session,
+            can_steer: false,
+            messages: VecDeque::new(),
+            status: "running",
+            native_session: None,
+            progress: String::new(),
+            result: None,
+            error: None,
+            model: "fixture".into(),
+            started: std::time::Instant::now(),
+            max_minutes: None,
+            warning: None,
+        });
+        let (_instructions, receiver) = mpsc::channel::<Instruction>(1);
+        let error = run_claude(command, &request, &state, &[], receiver)
+            .await
+            .expect_err("an errored last turn fails the session");
+        assert!(error.to_string().contains("overloaded right now"));
+    }
+
+    fn pending_job(writes: bool) -> Job {
+        let (sender, _) = mpsc::channel(1);
+        let task = tokio::spawn(std::future::pending::<()>());
+        Job {
+            sender,
+            state: Arc::new(Mutex::new(State {
+                runtime: Runtime::Codex,
+                mode: Mode::Session,
+                can_steer: false,
+                messages: VecDeque::new(),
+                status: "running",
+                native_session: None,
+                progress: String::new(),
+                result: None,
+                error: None,
+                model: String::new(),
+                started: std::time::Instant::now(),
+                max_minutes: None,
+                warning: None,
+            })),
+            task: task.abort_handle(),
+            writes,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_opt_in_cap_limits_workers_and_no_cap_does_not() {
+        let mut jobs = Jobs::default();
+        for id in 1..=4 {
+            jobs.entries.insert(id, pending_job(false));
+        }
+        assert!(!jobs.slots_full(None), "no limit by default");
+        assert!(!jobs.slots_full(Some(5)));
+        assert!(jobs.slots_full(Some(4)));
+    }
+
+    #[tokio::test]
+    async fn a_second_write_worker_gets_a_warning_and_a_read_worker_does_not() {
+        let mut jobs = Jobs::default();
+        assert!(jobs.write_overlap(true).is_none());
+        jobs.entries.insert(1, pending_job(true));
+        assert!(jobs.write_overlap(true).unwrap().contains("git worktree"));
+        assert!(jobs.write_overlap(false).is_none());
+    }
+
+    #[test]
+    fn max_minutes_is_bounded() {
+        let ok = |m: u32| {
+            start(json!({"runtime":"claude","mode":"session","task":"x","max_minutes":m}))
+                .validate()
+        };
+        assert!(ok(30).is_ok());
+        assert!(ok(0).is_err());
+        assert!(ok(100_000).is_err());
+        assert_eq!(
+            start(json!({"runtime":"claude","mode":"session","task":"x","max_minutes":5}))
+                .host_start(&[])["max_minutes"],
+            5
+        );
+    }
 }

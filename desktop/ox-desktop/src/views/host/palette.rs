@@ -1,5 +1,7 @@
 use super::*;
+use crate::appearance::Step;
 use crate::kit::field;
+use crate::views::worker_sheet::LaunchKind;
 use gpui_component::input::{Input, InputEvent, InputState};
 use std::collections::{HashMap, HashSet};
 
@@ -18,8 +20,18 @@ enum Target {
         owner: Option<String>,
         text: String,
     },
-    /// Start a `/handoff` for the selected session in its composer.
+    /// Open the "Continue in…" sheet for the selected session.
     Handoff {
+        pane: usize,
+        owner: String,
+    },
+    /// Open the "Start worker" sheet for the selected session.
+    Worker {
+        pane: usize,
+        owner: String,
+    },
+    /// End the selected session's live process; the thread stays and resumes on select.
+    EndSession {
         pane: usize,
         owner: String,
     },
@@ -142,20 +154,16 @@ impl Host {
         } else {
             "Ctrl K"
         };
-        button(
-            Palette::get(cx),
+        let p = Palette::get(cx);
+        crate::kit::icon_button(
+            p,
             "command-palette",
             ">_",
-            false,
-            true,
+            format!("Commands · {shortcut}"),
             cx.listener(|s, _, window, cx| s.show_palette(window, cx)),
         )
-        .ghost()
-        .border_0()
-        .p_0()
-        .bg(rgb(Palette::get(cx).nav))
-        .w(px(30.))
-        .tooltip(format!("Commands · {shortcut}"))
+        .text_color(rgb(p.fg))
+        .font_family(crate::appearance::LABEL_FONT)
     }
     fn show_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_drawer(window, cx);
@@ -278,6 +286,23 @@ impl Host {
         self.reset_palette_search(cx);
         cx.notify();
     }
+    fn open_launch_sheet(
+        &mut self,
+        pane: usize,
+        owner: String,
+        kind: LaunchKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active == pane {
+            self.switch(pane, window, cx);
+            self.panes[pane].update(cx, |p, cx| {
+                if p.store.as_ref().and_then(|s| s.selected()) == Some(owner.as_str()) {
+                    p.request_launch(kind, cx);
+                }
+            });
+        }
+    }
     fn palette_items(&self, query: &str, cx: &App) -> Vec<Item> {
         let active = self.panes[self.active].read(cx);
         let project = &active.project;
@@ -307,9 +332,31 @@ impl Host {
             && !store.in_terminal(owner)
         {
             add(
+                "Start worker…".into(),
+                "Run a task in a worker under this session · /worker codex:<model> [--mode <mode>] [--goal] <task>".into(),
+                Target::Worker {
+                    pane: self.active,
+                    owner: owner.to_owned(),
+                },
+            );
+            add(
                 "Continue in…".into(),
                 "Hand off this conversation to another runtime, billing route or model · /handoff <codex|claude>[:<alias>] [--mode <mode>] <request>".into(),
                 Target::Handoff {
+                    pane: self.active,
+                    owner: owner.to_owned(),
+                },
+            );
+        }
+        if let Some(store) = &active.store
+            && let Some(owner) = store.selected()
+            && store.can_end_session(owner)
+        {
+            add(
+                "End session".into(),
+                "Stop this thread's live process. It stays in the list and resumes when selected"
+                    .into(),
+                Target::EndSession {
                     pane: self.active,
                     owner: owner.to_owned(),
                 },
@@ -446,7 +493,7 @@ impl Host {
                 );
             }
         }
-        for route in ox_desk_core::runtime::Runtime::routes(&self.models) {
+        for route in ox_desk_core::runtime::Runtime::routes(self.models.read(cx)) {
             add(
                 route.label(),
                 format!("Billing route · {}", project.display()),
@@ -576,12 +623,15 @@ impl Host {
             }
             Target::Handoff { pane, owner } => {
                 self.close_palette(window, cx);
-                if self.active == pane {
-                    self.switch(pane, window, cx);
-                    self.panes[pane].update(cx, |p, cx| {
-                        p.action(cx, DeskAction::DraftEdit(Some(owner), "/handoff ".into()))
-                    });
-                }
+                self.open_launch_sheet(pane, owner, LaunchKind::Handoff, window, cx);
+            }
+            Target::Worker { pane, owner } => {
+                self.close_palette(window, cx);
+                self.open_launch_sheet(pane, owner, LaunchKind::Worker, window, cx);
+            }
+            Target::EndSession { pane, owner } => {
+                self.close_palette(window, cx);
+                self.panes[pane].update(cx, |p, cx| p.request_end(owner, cx));
             }
             Target::Command { pane, owner, text } => {
                 if text == "/rename" {
@@ -630,7 +680,7 @@ impl Host {
                     })
                 })
                 .collect(),
-            routes: self.models.clone(),
+            routes: self.models.read(cx).clone(),
             provider: self.api_provider.clone(),
             discovery_revision: self.discovery.revision,
             discovering: self.discovery.pending > 0,
@@ -719,7 +769,7 @@ impl Host {
                                                         .hover(|d| d.bg(rgb(p.hover)))
                                                         .child(
                                                             div()
-                                                                .text_size(px(14.))
+                                                                .text_size(p.text(Step::Ui))
                                                                 .truncate()
                                                                 .child(item.title.clone()),
                                                         )

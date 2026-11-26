@@ -73,7 +73,7 @@ fn item_view(k: &ItemKey, e: &Entry) -> TimelineItem {
     }
 }
 fn timeline_detail(t: &Transcript) -> Value {
-    json!({"active":t.active_turn(),"last_finished":t.last_finished,"error":t.error(),"ready":t.is_ready(),"loading":t.is_loading(),"older":t.has_older(),"access":t.access(),"reviews":t.reviews,"usage":t.usage,"command_notice":t.command_notice,"model":t.model,"effort":t.effort,"tier":t.tier,"unread":t.unread()})
+    json!({"active":t.active_turn(),"last_finished":t.last_finished,"interrupted":t.interrupted,"error":t.error(),"ready":t.is_ready(),"loading":t.is_loading(),"older":t.has_older(),"access":t.access(),"reviews":t.reviews,"usage":t.usage,"command_notice":t.command_notice,"model":t.model,"effort":t.effort,"tier":t.tier,"unread":t.unread()})
 }
 fn timeline(t: &Transcript) -> Timeline {
     Timeline {
@@ -160,9 +160,22 @@ impl Store {
             if self.can_send(Some(id)) {
                 caps.push(if running { "steer" } else { "send" }.into());
                 self.composer_caps(Some(id), &mut caps);
+            } else if self.can_resume_send(id) {
+                // An ended thread keeps its composer: a send reopens it, so what the
+                // composer could attach before the reap stays attachable.
+                caps.push("send".into());
+                self.composer_caps(Some(id), &mut caps);
             }
             if running {
                 caps.push("stop".into());
+            }
+            if self.is_native_live(id) {
+                caps.push("native_live".into());
+            }
+            if self.has_live_session(id) {
+                caps.push("end".into());
+            } else if self.is_ended(id) {
+                caps.push("ended".into());
             }
             if self.can_send(Some(id)) && self.has_command_schema() && !self.commands_loading() {
                 caps.push("native_commands".into());
@@ -183,13 +196,19 @@ impl Store {
             if self.can_manage_thread(id) {
                 caps.push("fork".into());
                 if self.can_edit_thread_metadata() {
-                    caps.extend(["archive".into(), "rename".into()]);
+                    // Codex accepts a rename from a non-owner but refuses Archive.
+                    if !self.is_native_live(id) {
+                        caps.push("archive".into());
+                    }
+                    caps.push("rename".into());
                 }
             }
             if self.can_generate_title(id) {
                 caps.push("generate_title".into());
             }
-            if self.asks().iter().any(|a| a.thread.as_deref() == Some(id)) {
+            if self.is_native_live(id) {
+                "native_live"
+            } else if self.asks().iter().any(|a| a.thread.as_deref() == Some(id)) {
                 "needs_input"
             } else if running || r.status.as_ref().is_some_and(|s| s.kind == "active") {
                 "running"
@@ -202,8 +221,8 @@ impl Store {
             }
         };
         let detail = json!({"row":r,"worker":r.worker,"unread":r.unread,"order":r.activity_order.to_string(),"generated":r.generated_title,
-            "owned":t.is_some(),"changing":self.changing_options(id),"terminal":self.in_terminal(id),"sending":self.sending(Some(id)),
-            "route":self.thread_route(Some(id)),"options":t.map(|_|self.options(Some(id))),"access":self.applied_access(Some(id)),"command_caps":(self.is_session_scoped() && t.is_some()).then(||self.command_caps(Some(id)))});
+            "owned":t.is_some(),"native_live":self.is_native_live(id).then(||self.native_app()),"changing":self.changing_options(id),"terminal":self.in_terminal(id),"sending":self.sending(Some(id)),
+            "route":self.thread_route(Some(id)),"options":t.map(|_|self.options(Some(id))),"access":self.applied_access(Some(id)),"resume_access":self.resume_access.get(id),"restored_draft":self.restored_drafts.get(id).map(|(message,text)|json!({"message":message,"text":text})),"command_caps":(self.is_session_scoped() && t.is_some()).then(||self.command_caps(Some(id)))});
         let mut detail = detail;
         let mut parent = r.parent_thread_id.clone();
         if let Some((nest, extra)) = self.host_annotations.get(id) {
@@ -334,6 +353,18 @@ impl Store {
                 });
                 continue;
             };
+            if changed.replaced_threads().contains(id) {
+                // A reread can correct text with the same message ID and revision.
+                let current = timeline(t);
+                if *previous != current {
+                    *previous = current.clone();
+                    out.push(Change::Transcript {
+                        thread: id.clone(),
+                        timeline: current,
+                    });
+                }
+                continue;
+            }
             let detail = timeline_detail(t);
             if previous.detail["last_finished"] != detail["last_finished"]
                 && !detail["last_finished"].is_null()

@@ -128,7 +128,7 @@ class Fixture:
         stage = self.root / str(self.sequence)
         stage.mkdir(mode=0o700)
         self.sock = str(stage / "stats")
-        self.control = str(stage / "control")
+        self.control_socket = str(stage / "control")
         self.trace = stage / "trace"
         self.env = {key: os.environ[key] for key in
                     ["PATH", "LD_LIBRARY_PATH", "DISPLAY", "XAUTHORITY", "VK_DRIVER_FILES"]
@@ -136,7 +136,7 @@ class Fixture:
         self.env.update(HOME=str(stage), CODEX_HOME=str(stage / ".codex"),
                         XDG_RUNTIME_DIR=str(stage), XDG_STATE_HOME=str(stage / "state"),
                         XDG_CONFIG_HOME=str(stage / "config"), XDG_SESSION_TYPE="x11",
-                        OX_DESK_STATS_SOCKET=self.sock, OX_DESK_SYNTH_CONTROL=self.control,
+                        OX_DESK_STATS_SOCKET=self.sock, OX_DESK_SYNTH_CONTROL=self.control_socket,
                         OX_DESK_SYNTH_TRACE=str(self.trace), OX_DESK_SYNTH_THREADS=str(threads),
                         OX_DESK_SYNTH_ITEMS=str(items))
         if sys.platform == "darwin":
@@ -149,6 +149,11 @@ class Fixture:
                 self.env[key] = previous[key]
         if routes:
             self.env["OX_DESK_SYNTH_ROUTES"] = "1"
+            # The synthetic settings report a saved subscription. Give the
+            # desktop's first-launch probe the matching local sign-in state.
+            profile = Path(self.env["CODEX_HOME"])
+            profile.mkdir(parents=True, exist_ok=True)
+            (profile / "auth.json").write_text('{"auth_mode":"chatgpt"}')
         if args.wayland:
             self.env.pop("DISPLAY", None)
             self.env.update(WAYLAND_DISPLAY=os.path.join(os.environ["XDG_RUNTIME_DIR"], os.environ["WAYLAND_DISPLAY"]),
@@ -192,8 +197,47 @@ class Fixture:
             self.window = self.x("search", "--sync", "--onlyvisible", "--pid", self.proc.pid,
                              "--name", "OX Desktop").splitlines()[-1]
             self.x("windowfocus", self.window)
-        wait(lambda: Path(self.sock).is_socket() and self.stats()["catalog_len"] > 0)
+        try:
+            wait(lambda: Path(self.sock).is_socket() and self.stats()["catalog_len"] > 0)
+        except Exception as error:
+            # Say why the app never listed its catalog: log, last stats, helper trace, host log.
+            self.log.flush()
+            print(f"::group::Startup failed: {type(error).__name__}", file=sys.stderr)
+            try:
+                print("stats:", json.dumps(self.stats())[:2000], file=sys.stderr)
+            except Exception as stats_error:
+                print(f"stats unavailable: {stats_error!r}", file=sys.stderr)
+            print("socket exists:", Path(self.sock).is_socket(), "app exited:", self.proc.poll(), file=sys.stderr)
+            for name, path in (("app.log", self.root / "app.log"), ("trace", self.trace)):
+                try:
+                    print(f"--- {name}\n{path.read_text()[-3000:]}", file=sys.stderr)
+                except OSError as read_error:
+                    print(f"--- {name}: {read_error}", file=sys.stderr)
+            print("::endgroup::", file=sys.stderr)
+            raise
         return None
+
+    def wait_for(self, what, fn, timeout=12):
+        """wait(), but a timeout first says what was awaited and what the app showed."""
+        try:
+            return wait(fn, timeout)
+        except TimeoutError:
+            self.log.flush()
+            print(f"::group::Timed out waiting for {what}", file=sys.stderr)
+            try:
+                view = self.stats()
+                layout = [f"{c['id']}={c['label']!r}{'' if c['enabled'] else ' (disabled)'}"
+                          for c in view.pop("layout", [])]
+                print("stats:", json.dumps(view)[:2000], file=sys.stderr)
+                print("controls:", "; ".join(layout)[:3000], file=sys.stderr)
+            except Exception as stats_error:
+                print(f"stats unavailable: {stats_error!r}", file=sys.stderr)
+            try:
+                print("--- app.log\n" + (self.root / "app.log").read_text()[-3000:], file=sys.stderr)
+            except OSError as read_error:
+                print(f"--- app.log: {read_error}", file=sys.stderr)
+            print("::endgroup::", file=sys.stderr)
+            raise
 
     def remote_setup(self, stage):
         fixture = stage / "fixture-bin"
@@ -280,10 +324,10 @@ if len(sys.argv) == 2 and "Tailscale" in sys.argv[1]:
         )
         project = home / "ox-clients/claude/projects" / key
         project.mkdir(parents=True)
-        self.claude_ids = {}
+        self.claude_ids = []
         for i, name in enumerate(("Mercury", "Venus", "Saturn", "Neptune"), 1):
             ident = f"00000000-0000-4000-8000-{i:012d}"
-            self.claude_ids[name.lower()] = ident
+            self.claude_ids.append(ident)
             rows = [
                 {
                     "type": "user",
@@ -306,13 +350,57 @@ if len(sys.argv) == 2 and "Tailscale" in sys.argv[1]:
                     },
                 },
             ]
-            (project / (ident + ".jsonl")).write_text(
-                "".join(json.dumps(r) + "\n" for r in rows)
-            )
+            journal = project / (ident + ".jsonl")
+            journal.write_text("".join(json.dumps(r) + "\n" for r in rows))
+            # Saved sessions open read/write. Start them in an earlier date group so
+            # the sidebar exercises the same reorder regardless of the runner's clock.
+            old = time.time() - 24 * 3600
+            os.utime(journal, (old, old))
 
     def stats(self, reset=False):
         self.client.sendto(b"reset" if reset else b"snapshot", self.sock)
-        return json.loads(self.client.recv(65536))
+        return json.loads(self.client.recv(1 << 20))
+
+    def control(self, label):
+        """A laid-out, enabled control by id or label, or None. Icon buttons carry no word to OCR."""
+        return next((c for c in self.stats().get("layout", [])
+                     if label in (c["id"], c["label"]) and c["enabled"]), None)
+
+    def search_pos(self):
+        """Centre of the sidebar's thread search field in window pixels, from the layout probe."""
+        c = self.control("thread-search")
+        return (c["x"] + c["w"] // 2, c["y"] + c["h"] // 2) if c else None
+
+    def press(self, label):
+        """Click a marked control inside the app (no OS pointer), so it works on X11 and Wayland."""
+        self.client.sendto(b"press " + label.encode(), self.sock)
+        reply = json.loads(self.client.recv(1 << 20))
+        if "error" in reply:
+            raise RuntimeError(f"press {label!r}: {reply['error']}")
+
+    def agent(self, query, control="billing-route"):
+        """Switch the active window's route with the requested model picker: open it and press the
+        model row whose probe label (display name · id) names `query`. Picker ids are namespaced:
+        an API alias is "@api:<alias>" and a subscription plan "@plan:<name>", and a runtime's own
+        model can share a bare id with an API alias, so an API query prefers the "@api:" row and
+        a plan query the "@plan:" row; a runtime-model row matches only when neither exists."""
+        self.press(control)
+        needle = query.casefold()
+        preferred = (f"@api:{needle}", f"@plan:{needle}")
+
+        def row():
+            rows = [
+                (c["id"], c["label"].casefold())
+                for c in self.stats().get("layout", [])
+                if c["id"].startswith("model-row") and c["enabled"]
+            ]
+            for want in preferred:
+                for ident, label in rows:
+                    if want in label:
+                        return ident
+            return None
+
+        self.press(self.wait_for(f"a model picker row matching {query!r}", row))
 
     def sample(self):
         desktop = json.loads(subprocess.check_output([probe, str(self.proc.pid)]))
@@ -368,7 +456,7 @@ if len(sys.argv) == 2 and "Tailscale" in sys.argv[1]:
             elif argv[0] == "key":
                 if argv[1] in ("ctrl+a", "ctrl+l", "ctrl+Return"):
                     subprocess.run(["wtype", "-s", "120", "-M", "ctrl", "-k", argv[1].split("+")[1], "-m", "ctrl"], check=True)
-                elif argv[1] in ("Up", "Down", "Home", "End"):
+                elif argv[1] in ("Up", "Down", "Home", "End", "Return"):
                     subprocess.run(["wtype", "-s", "120", "-k", argv[1]], check=True)
                 else:
                     raise ValueError(argv)
@@ -416,7 +504,7 @@ if len(sys.argv) == 2 and "Tailscale" in sys.argv[1]:
                 if (d := json.loads(line))["event"] == name]
 
     def admin(self, instruction):
-        self.client.sendto(instruction.encode(), self.control)
+        self.client.sendto(instruction.encode(), self.control_socket)
 
 
 def idle_footprint(before, after, seconds):
@@ -453,7 +541,8 @@ def idle(f):
 
 def memory(f):
     positions = wait(lambda: words if "0000" in (words := f.words()) else None)
-    search, first = positions["search"], positions["0000"]
+    first = positions["0000"]
+    search = f.wait_for("the thread search field", f.search_pos)
     for i in range(30):
         f.click(search)
         f.x("key", "ctrl+a")
@@ -484,9 +573,17 @@ def scroll_catalog(f):
     # reloaded the catalog from its first page and paged all 5,000 threads again.
     started = time.monotonic()
     stats = f.stats()
+    trace, traced = [], started
     while stats["furthest_row"] < 5000 and time.monotonic() < started + 150:
         f.x("click", "--repeat", "100", "--delay", "5", "5")
         stats = f.stats()
+        # A catalog_len that falls back (issue 9) is a reset to the first page.
+        if time.monotonic() - traced >= 0.5:
+            traced = time.monotonic()
+            trace.append((round(traced - started, 1), stats["furthest_row"], stats["catalog_len"]))
+    resets = sum(1 for a, b in zip(trace, trace[1:]) if b[2] < a[2])
+    if resets:
+        print(f"G6 trace (s, furthest_row, catalog_len), {resets} reset(s): {trace}", file=sys.stderr)
     seconds = round(time.monotonic() - started, 1)
     # Count only the GPUI visible range and its overscan. Window height gives an
     # independent upper bound since every button alone consumes 32 logical pixels.
@@ -552,7 +649,7 @@ def streaming(f):
         start = f.stats(reset=True)
         f.admin("stream")
         wait(lambda: f.events("stream-start"))
-        f.click((475, 645))
+        f.press("composer")
         f.x("type", "draft during streaming")
         wait(lambda: f.events("stream-end"), 18)
         # The final stream event has crossed the UI pump when the turn controls return to idle.
@@ -571,14 +668,22 @@ def streaming(f):
                present_interval_p95_ms=end["present_interval_p95_ns"]/1e6,
                drains=end["drains"]-start["drains"], frames=end["frames_drawn"], typed_draft_visible=typed)
     if "G10" in selected:
+        # With text in the composer the submit slot is Send; it turns into Stop only for an
+        # empty draft. G7 leaves its typed draft behind, so clear it first.
+        if f.stats().get("draft"):
+            f.press("composer")
+            f.x("key", "ctrl+a")
+            f.x("key", "BackSpace")
+            f.wait_for("an empty composer draft", lambda: not f.stats().get("draft"))
         f.admin("busy")
-        wait(lambda: f.stats()["visible_turn"])
-        stop = wait(lambda: f.words().get("stop") or f.words(scale=2).get("stop"))
-        search = wait(lambda: f.words().get("search"))
+        f.wait_for("the busy turn to show", lambda: f.stats()["visible_turn"])
+        f.wait_for("the Stop control (shown only while a turn runs and the draft is empty)",
+                   lambda: f.control("stop-turn"))
+        search = f.wait_for("the thread search field", f.search_pos)
         f.click(search)
         f.x("type", "hold")
         wait(lambda: f.events("list-held"))
-        f.click(stop)
+        f.press("stop-turn")
         end = wait(lambda: f.events("stop-read"))
         elapsed = (end[-1]["ns"] - f.stats()["stop_ns"])/1e6
         # Stop must reach the runtime promptly; 250 ms catches a hang, the frame
@@ -602,23 +707,24 @@ def recovery(f):
     pos = wait(lambda: f.words().get("0000"))
     f.click(pos)
     wait(lambda: f.events("history-reply") and f.stats()["tail_ns"] > 0)
-    f.click((475, 645))
+    f.press("composer")
     f.x("type", "preserve this draft")
     wait(lambda: "preserve" in f.words())
     def disconnect():
         pid = f.events("spawn")[-1]["pid"]
-        Path(f.control).unlink()
+        Path(f.control_socket).unlink()
         os.kill(pid, signal.SIGKILL)
     disconnect()
     wait(lambda: len(f.events("spawn")) == 2 and len(f.events("history-reply")) == 2)
     wait(lambda: "preserve" in f.words())
     disconnect()
     wait(lambda: not f.stats()["connected"])
-    words = wait(lambda: words if "closed" in (words := f.words()) else None)
-    button = words.get("reconnect", (315, words["closed"][1] + 30))
+    # The recovery screen words its message ("The session host stopped"), so wait for the
+    # Reconnect button itself rather than any one word.
+    wait(lambda: f.control("retry-connection"))
     time.sleep(.5)
     automatic = len(f.events("spawn")) - 1
-    f.click(button)
+    f.press("retry-connection")
     wait(lambda: len(f.events("spawn")) == 3 and len(f.events("history-reply")) == 3)
     survived = "preserve" in f.words()
     record("reconnect", automatic == 1 and survived and not f.events("send"), automatic_restarts=automatic,
@@ -628,23 +734,22 @@ def recovery(f):
 def reuse(f):
     words = wait(lambda: w if "0000" in (w := f.words()) else None)
     first = words["0000"]
-    search = words["search"]
-    new_button = (search[0], search[1] - 40)
-    billing = (search[0], search[1] - 80)
     wait(lambda: f.stats()["discovery_pending"] == 0 and len(f.events("spawn")) == 1)
     before_open = len(f.events("spawn")) + len(f.events("helper"))
-    f.click(billing)
-    f.click((billing[0] + 42, billing[1] + 62))
-    wait(lambda: f.stats()["pane"] == 1 and f.stats()["connected"] and len(f.events("spawn")) == 2)
+    f.agent("fixture-model")
+    f.wait_for(
+        "the fixture-model route pane to open and connect",
+        lambda: f.stats()["pane"] == 1 and f.stats()["connected"] and len(f.events("spawn")) == 2,
+    )
     cold_route_spawns = len(f.events("spawn")) + len(f.events("helper")) - before_open
-    f.click(billing)
-    f.click((billing[0] + 42, billing[1] + 31))
-    wait(lambda: f.stats()["pane"] == 0)
+    f.agent("codex")
+    f.wait_for("the codex pane to be active again", lambda: f.stats()["pane"] == 0)
     base = len(f.events("spawn")) + len(f.events("helper"))
     for i in range(20):
         f.click(first)
-        f.click(new_button)
-        f.click((475, 645))
+        f.press("new-session")
+        f.wait_for("composer", lambda: f.control("composer"))
+        f.press("composer")
         f.x("type", f"Create thread {i}")
         f.x("key", "ctrl+Return")
         wait(lambda: len(f.events("send")) == i + 1)
@@ -653,31 +758,36 @@ def reuse(f):
     first_route_spawns = 0
     for i in range(20):
         target = 1 - i % 2
-        f.click(billing)
-        # Open menu is anchored below the billing button. Its items are in
-        # subscription/API order regardless of the active checkmark.
-        f.click((billing[0] + 42, billing[1] + (62 if target else 31)))
+        f.agent("fixture-model" if target else "codex")
         wait(lambda: f.stats()["pane"] == target)
         if i == 0:
             wait(lambda: len(f.events("spawn")) == 2)
             first_route_spawns = len(f.events("spawn")) + len(f.events("helper")) - before_route
-    total = len(f.events("spawn")) + len(f.events("helper"))
+    servers = f.events("spawn")
+    total = len(servers) + len(f.events("helper"))
+    # Both pickers must also offer a model reported only by provider discovery.
+    # This third route opens after the process-reuse measurement.
+    f.agent("fixture-discovered")
+    wait(lambda: f.stats()["pane"] == 2 and f.stats()["connected"])
+    f.agent("codex")
+    wait(lambda: f.stats()["pane"] == 0)
+    f.agent("fixture-discovered", "model-setting-0")
+    wait(lambda: f.stats()["pane"] == 2)
     record("G9", created == 20 and base == before_route and cold_route_spawns == 2 and first_route_spawns == 0 and
-           total == before_route + first_route_spawns and len(f.events("spawn")) == 2,
+           total == before_route + first_route_spawns and len(servers) == 2,
            new_threads=created, thread_selections=20, route_changes=20, cold_route_spawns=cold_route_spawns,
            new_and_switch_spawns=before_route-base, first_api_route_spawns=first_route_spawns,
            subsequent_route_spawns=total-before_route-first_route_spawns,
-           app_servers=[e["id"] for e in f.events("spawn")])
+           app_servers=[e["id"] for e in servers], discovery_only_route="fixture-discovered")
 
 
 def saved_layout(f):
     f.start(30, 1, routes=True)
     # A new window creates only its selected route. Use the same billing picker
     # as the route-reuse gate to create both panes before saving their layout.
-    x, y = wait(lambda: f.words().get("search"))
+    f.wait_for("the thread search field", f.search_pos)
     for target in (1, 0):
-        f.click((x, y - 80))
-        f.click((x + 42, y - 80 + (62 if target else 31)))
+        f.agent("fixture-model" if target else "codex")
         wait(lambda: f.stats()["pane"] == target and f.stats()["connected"])
     f.click(wait(lambda: f.words().get("0000")))
     selected = wait(lambda: f.stats()["selected_thread"])
@@ -731,7 +841,7 @@ def saved_layout(f):
 def remote_access(f):
     # The GUI talks to the real packaged host and a private synthetic Serve CLI.
     # Every domain and identity here is local test data.
-    f.click(wait(lambda: f.words().get("settings")))
+    f.press("settings")
     f.click(wait(lambda: f.words().get("remote")))
     f.click(wait(lambda: f.words().get("enable")))
     mapping = Path(f.env["HOME"]) / "fixture-serve.json"
@@ -756,15 +866,14 @@ def remote_access(f):
 def secure_key(f):
     import secrets
     since = int(time.time())
-    f.click(wait(lambda: f.words().get("settings")))
-    f.click(wait(lambda: f.words().get("credentials")))
+    f.press("settings")
+    f.press("API keys")
     words = wait(lambda: w if "enter" in (w := f.words()) else None)
     f.click(words["enter"])
     canary = ("ox-probe-" + secrets.token_hex(16)).encode()
     command = ["wtype", "-s", "120", "-"] if args.wayland else ["xdotool", "type", "--file", "-"]
     subprocess.run(command, input=canary, check=True)
-    width = int(next(s[6:] for s in f.x("getwindowgeometry", "--shell", f.window).splitlines() if s.startswith("WIDTH=")))
-    f.click(words.get("save", (width - 75, words["enter"][1])))
+    f.press("key-save-0")
     keyfile = Path(f.env["CODEX_HOME"]) / "ox-api-keys.json"
     wait(lambda: keyfile.exists() and canary in keyfile.read_bytes())
     f.stop()  # Snapshot files after the desktop stops replacing its state atomically.
@@ -873,16 +982,24 @@ def claude_gate(f):
         / idle_start["clock_ticks_per_second"]
         / seconds
     )
-    for name, ident in f.claude_ids.items():
-        f.click(wait(lambda: f.words().get(name)))
-        wait(lambda: f.stats()["selected_thread"] == "claude:api:" + ident)
+    for ident in f.claude_ids:
+        thread = "claude:api:" + ident
+        # Sending moves the previous row into today's group. Resolve the intended
+        # sidebar control at click time instead of clicking old screenshot coordinates.
+        row = f"thread-{f.project}-true-{thread}"
+        f.wait_for(f"Claude sidebar row {thread}", lambda: f.control(row))
+        f.press(row)
+        f.wait_for(f"Claude session {thread} to be selected", lambda: f.stats()["selected_thread"] == thread)
         f.x("key", "ctrl+l")
         f.x("type", "Generate a measured Claude stream")
         f.x("key", "ctrl+Return")
-        wait(lambda: any(e["id"] == ident for e in f.events("claude-user")))
+        f.wait_for(
+            f"the Claude fixture to receive the user turn for {ident}",
+            lambda: any(e["id"] == ident for e in f.events("claude-user")),
+        )
     first = f.stats(reset=True)
-    for ident in f.claude_ids.values():
-        f.client.sendto(b"stream", str(Path(f.control).with_name("c-" + ident)))
+    for ident in f.claude_ids:
+        f.client.sendto(b"stream", str(Path(f.control_socket).with_name("c-" + ident)))
     wait(lambda: len(f.events("claude-stream-start")) == 4)
     f.x("key", "ctrl+l")
     f.x("type", "draft during streaming")
@@ -895,7 +1012,8 @@ def claude_gate(f):
     f.x("key", "ctrl+Return")
     wait(lambda: len(f.events("claude-user")) == 5)
     wait(lambda: f.stats()["visible_turn"])
-    f.click(wait(lambda: f.words().get("stop") or f.words(scale=2).get("stop")))
+    wait(lambda: f.control("stop-turn"))
+    f.press("stop-turn")
     stop = wait(lambda: f.events("claude-stop-read"))[-1]
     elapsed = (stop["ns"] - f.stats()["stop_ns"]) / 1e6
     started = f.events("claude-stream-start")

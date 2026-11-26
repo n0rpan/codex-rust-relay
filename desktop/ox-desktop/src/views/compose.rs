@@ -1,5 +1,6 @@
 use super::workbench::Workbench;
-use crate::kit::{DropdownMenu, PopupMenuItem, toolbar_button};
+use crate::appearance::Step;
+use crate::kit::{DropdownMenu, PopupMenuItem};
 use crate::{appearance::Palette, col, kit::button, row};
 use gpui::{prelude::FluentBuilder, *};
 use gpui_component::input::{InputEvent, TextareaState};
@@ -112,7 +113,7 @@ impl Workbench {
         let running = key
             .and_then(|id| store.transcript(id))
             .is_some_and(|t| t.active_turn().is_some());
-        let enabled = store.can_send(key)
+        let enabled = store.can_compose(key)
             && !self.image_work.contains_key(&selected)
             && (store.draft_images(key).is_empty()
                 || draft.trim_start().starts_with('/')
@@ -137,7 +138,8 @@ impl Workbench {
             {
                 "Send an instruction to this worker…".to_owned()
             } else {
-                format!("Ask {} about this project…", store.runtime_name())
+                // The model and route show in the chips below; the placeholder teaches.
+                "Ask anything · @ files · / commands".to_owned()
             };
             let editor = cx.new(|cx| {
                 TextareaState::new(window, cx)
@@ -215,10 +217,25 @@ impl Workbench {
         } else {
             effective.or_else(|| store.next_access())
         };
-        let label = match (key, mode) {
-            (None, Some(m)) => format!("Next thread · {}", m.label()),
-            (_, Some(m)) => m.label().to_owned(),
-            _ => "Permissions".into(),
+        let granted = key
+            .and_then(|id| store.session_mark(id, "yolo_grant"))
+            .is_some_and(|v| v == true);
+        // A live grant shows on the chip whatever the session's current mode is.
+        let value = match (key, mode) {
+            (Some(_), Some(m)) if granted && m.bypasses_permissions() => {
+                "YOLO + workers".to_owned()
+            }
+            (Some(_), Some(m)) if granted => {
+                format!("{} · YOLO allowed for workers", permission_value(m))
+            }
+            (Some(_), None) if granted => "YOLO allowed for workers".to_owned(),
+            (_, Some(m)) => permission_value(m),
+            _ => default_permission(self.route.runtime).to_owned(),
+        };
+        let access_hint = if key.is_none() {
+            format!("Permissions for the next thread: {value}")
+        } else {
+            format!("Permissions: {value}")
         };
         if effective.is_some_and(Access::bypasses_permissions)
             && p.motion
@@ -234,24 +251,26 @@ impl Workbench {
         let owner = selected.clone();
         let view = cx.weak_entity();
         let presets = Access::choices(self.route.runtime);
-        let granted = key
-            .and_then(|id| store.session_mark(id, "yolo_grant"))
-            .is_some_and(|v| v == true);
-        let grant_offer = key.is_some() && effective.is_some_and(Access::bypasses_permissions);
-        let access = toolbar_button(
+        // The grant menu (and its Revoke) follows the grant, not the current mode, so a
+        // grant stays visible and revocable after the session drops back to Default.
+        let grant_offer =
+            key.is_some() && (granted || effective.is_some_and(Access::bypasses_permissions));
+        let access = crate::kit::chip(
             p,
             "access-preset",
-            label,
+            "",
+            value,
+            false,
             key.map_or_else(|| store.can_send(None), |id| store.can_change_access(id)),
             |_, _, _| {},
         )
-        .icon(gpui_component::IconName::ChevronDown)
+        .tooltip(access_hint)
         .dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
             for &preset in presets {
                 let id = owner.clone();
                 let view = view.clone();
                 menu = menu.item(
-                    PopupMenuItem::new(preset.label())
+                    crate::kit::menu_item(preset.label())
                         .checked(mode == Some(preset))
                         .on_click(move |_, _, cx| {
                             let _ = view.update(cx, |s, cx| {
@@ -267,19 +286,45 @@ impl Workbench {
                 );
             }
             if grant_offer {
+                // The grant and its revoke share one group: the consequence is said in the menu.
                 let id = owner.clone();
                 let view = view.clone();
-                menu = menu.separator().item(
-                    PopupMenuItem::new("Also YOLO for its workers and handoffs")
-                        .checked(granted)
-                        .on_click(move |_, _, cx| {
-                            let _ = view.update(cx, |s, cx| {
-                                if let Some(id) = &id {
-                                    s.action(cx, DeskAction::YoloGrant(id.clone(), !granted));
-                                }
-                            });
-                        }),
-                );
+                menu = menu
+                    .separator()
+                    .item(PopupMenuItem::label("Workers and handoffs"));
+                if granted {
+                    menu = menu
+                        .item(PopupMenuItem::label(
+                            "YOLO is allowed for workers and handoffs started here.",
+                        ))
+                        .item(
+                            crate::kit::menu_item("Revoke YOLO for workers and handoffs").on_click(
+                                move |_, _, cx| {
+                                    let _ = view.update(cx, |s, cx| {
+                                        if let Some(id) = &id {
+                                            s.action(cx, DeskAction::YoloGrant(id.clone(), false));
+                                        }
+                                    });
+                                },
+                            ),
+                        );
+                } else {
+                    menu = menu
+                        .item(PopupMenuItem::label(
+                            "Lets workers and handoffs start in YOLO without asking.",
+                        ))
+                        .item(
+                            crate::kit::menu_item("Allow YOLO for workers and handoffs").on_click(
+                                move |_, _, cx| {
+                                    let _ = view.update(cx, |s, cx| {
+                                        if let Some(id) = &id {
+                                            s.action(cx, DeskAction::YoloGrant(id.clone(), true));
+                                        }
+                                    });
+                                },
+                            ),
+                        );
+                }
             }
             menu
         });
@@ -292,15 +337,55 @@ impl Workbench {
         } else {
             vec![]
         };
-        let owner = selected.clone();
+        // One fixed 28 px submit slot: ↑ sends (or steers, or runs a command); while a
+        // turn runs and nothing is typed it becomes ■ Stop, so nothing ever moves.
+        let stops = running
+            && selected.is_some()
+            && draft.trim().is_empty()
+            && store.draft_images(key).is_empty();
+        let submit = if stops {
+            let stop_owner = selected.clone();
+            crate::kit::icon_button(
+                p,
+                "stop-turn",
+                "",
+                format!("Stop · {}", stop_key()),
+                cx.listener(move |s, _, _, cx| {
+                    if let Some(id) = stop_owner.clone() {
+                        s.action(cx, DeskAction::Stop(id))
+                    }
+                }),
+            )
+            .bg(rgb(p.raised))
+            .child(gpui::div().size(px(10.)).bg(rgb(p.fg)))
+        } else {
+            let send_owner = selected.clone();
+            crate::kit::icon(
+                p,
+                "send-message",
+                gpui_component::IconName::ArrowUp,
+                send,
+                enabled,
+                cx.listener(move |s, _, _, cx| s.send_input(send_owner.as_deref(), cx)),
+            )
+            .when(enabled, |b| {
+                b.bg(rgb(p.accent))
+                    .text_color(rgb(p.on_accent))
+                    .hover(move |h| h.bg(rgb(crate::appearance::mix(p.accent, p.fg, 14))))
+            })
+            .when(!enabled, |b| b.bg(rgb(p.raised)).text_color(rgb(p.quiet())))
+        };
+        let native = key.filter(|id| store.is_native_live(id)).map(str::to_owned);
         let editor_for_menu = editor.clone();
         col()
             .flex_shrink_0()
-            .gap_2()
-            .p_3()
-            .rounded_sm()
-            .border_t_2()
-            .border_color(rgb(crate::appearance::mix(p.line, p.accent, 46)))
+            .gap(px(crate::kit::SPACE_M))
+            .pt(px(crate::kit::SPACE_M))
+            .pb(px(crate::kit::SPACE_M))
+            .px(px(crate::kit::SPACE_M))
+            .rounded(px(crate::kit::OVERLAY_RADIUS))
+            .border_1()
+            .border_color(rgb(p.line))
             .bg(rgb(p.panel))
             .when(!suggestions.is_empty(), |panel| {
                 let mut choices = row().gap_1().flex_wrap();
@@ -325,37 +410,65 @@ impl Workbench {
                 }
                 panel.child(choices)
             })
+            .when_some(native, |panel, id| {
+                panel.child(
+                    col()
+                        .id("native-live-notice")
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(p.text(Step::Meta))
+                                .text_color(rgb(p.muted))
+                                .child(store.native_live_hint()),
+                        )
+                        .child(row().child(button(
+                            p,
+                            "continue-native",
+                            "Continue in a new OX session".to_owned(),
+                            false,
+                            true,
+                            cx.listener(move |s, _, _, cx| {
+                                s.action(cx, DeskAction::ForkThread(id.clone()))
+                            }),
+                        ))),
+                )
+            })
             .when_some(handoff_notice, |panel, notice| {
                 panel.child(
                     div()
                         .id("handoff-provider-notice")
-                        .text_xs()
+                        .text_size(p.text(Step::Meta))
                         .text_color(rgb(p.muted))
                         .child(notice),
                 )
             })
-            .child(super::mention_menu::composer_input(
-                editor.clone(),
-                selected.clone(),
-                store,
-                self.image_work.contains_key(&selected),
-                self.mention_index,
-                cx,
+            // Marked for the test probe so window tests focus the composer by id.
+            .child(crate::platform::layout_probe::mark_element(
+                div().w_full().child(super::mention_menu::composer_input(
+                    editor.clone(),
+                    selected.clone(),
+                    store,
+                    self.image_work.contains_key(&selected),
+                    self.mention_index,
+                    cx,
+                )),
+                &gpui::ElementId::from("composer"),
+                &gpui::SharedString::from("Composer"),
+                true,
             ))
             .child(
                 row()
                     .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .when(width < px(760.), |controls| {
-                        controls.flex_col().items_stretch()
-                    })
+                    .gap(px(crate::kit::SPACE_XS))
                     .child(
                         row()
+                            .flex_1()
                             .min_w_0()
                             .flex_wrap()
                             .items_center()
-                            .gap_2()
+                            .gap(px(crate::kit::SPACE_XS))
+                            // Chip text lines up with the textarea's text inset.
+                            .pl(px(2.))
                             .children(model_controls)
                             .child(access)
                             .when(effective.is_some_and(Access::bypasses_permissions), |r| {
@@ -365,46 +478,31 @@ impl Workbench {
                                 })
                             }),
                     )
-                    .child(
-                        row()
-                            .flex_shrink_0()
-                            .justify_end()
-                            .gap_2()
-                            .when(running, |r| {
-                                let id = selected.clone().unwrap();
-                                r.child(toolbar_button(
-                                    p,
-                                    "stop-turn",
-                                    "Stop",
-                                    true,
-                                    cx.listener(move |s, _, _, cx| {
-                                        s.action(cx, DeskAction::Stop(id.clone()))
-                                    }),
-                                ))
-                            })
-                            .child(
-                                button(
-                                    p,
-                                    "send-message",
-                                    send,
-                                    true,
-                                    enabled,
-                                    cx.listener(move |s, _, _, cx| {
-                                        s.send_input(owner.as_deref(), cx)
-                                    }),
-                                )
-                                .rounded(px(3.))
-                                .min_w(px(68.))
-                                .border_b_2()
-                                .border_color(rgb(
-                                    crate::appearance::mix(
-                                        p.panel,
-                                        p.accent,
-                                        if enabled { 65 } else { 24 },
-                                    ),
-                                )),
-                            ),
-                    ),
+                    .child(submit),
             )
+    }
+}
+
+/// What a runtime does when no permission mode has been chosen yet.
+fn default_permission(runtime: ox_desk_core::runtime::Runtime) -> &'static str {
+    match runtime {
+        ox_desk_core::runtime::Runtime::Claude => "Ask before edits",
+        ox_desk_core::runtime::Runtime::Codex => "Configured in Codex",
+    }
+}
+
+/// The permission chip's value: the mode alone, with Claude's "Default" spelled out.
+fn permission_value(mode: Access) -> String {
+    match mode {
+        Access::Default => "Ask before edits".to_owned(),
+        other => other.label().to_owned(),
+    }
+}
+
+fn stop_key() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⌘⇧X"
+    } else {
+        "Ctrl Shift X"
     }
 }

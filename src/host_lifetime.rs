@@ -61,6 +61,23 @@ pub(crate) fn hosted() -> bool {
     env::var_os(ENDPOINT).is_some()
 }
 
+/// This helper's own lease id, once `supervise` has registered it with the host.
+pub(crate) fn own_lease() -> Option<&'static str> {
+    LEASE.get().map(String::as_str)
+}
+
+/// Lets a helper this process starts register under this helper's lease, so the
+/// host retires it when this helper goes. Only a hosted helper with a lease passes it.
+pub(crate) fn set_parent_lease(command: &mut tokio::process::Command) {
+    set_parent_lease_from(command, hosted(), own_lease());
+}
+
+fn set_parent_lease_from(command: &mut tokio::process::Command, hosted: bool, lease: Option<&str>) {
+    if let (true, Some(lease)) = (hosted, lease) {
+        command.env(PARENT_LEASE, lease);
+    }
+}
+
 pub(crate) fn isolate_stock(command: &mut tokio::process::Command) {
     for key in [
         ENDPOINT,
@@ -227,39 +244,41 @@ fn decode(reply: Value) -> Result<Value, String> {
 
 /// The per-user host socket, computed exactly as the host computes it.
 fn host_socket() -> Option<std::path::PathBuf> {
-    use std::path::PathBuf;
-    let absolute = |name: &str| {
-        env::var_os(name)
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-    };
-    if let Some(path) = absolute("OX_HOST_SOCKET") {
-        return Some(path);
+    crate::ps::socket_path()
+}
+
+#[cfg(test)]
+mod parent_lease_tests {
+    use super::*;
+
+    fn parent_env(command: &tokio::process::Command) -> Option<String> {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == PARENT_LEASE)
+            .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
     }
-    let state_dir = match absolute("OX_HOST_STATE_DIR") {
-        Some(root) => root,
-        None => absolute("XDG_STATE_HOME")
-            .or_else(|| {
-                absolute("HOME").map(|h| {
-                    h.join(if cfg!(target_os = "macos") {
-                        "Library/Application Support"
-                    } else {
-                        ".local/state"
-                    })
-                })
-            })?
-            .join("ox/host"),
-    };
-    let hash = state_dir
-        .as_os_str()
-        .as_encoded_bytes()
-        .iter()
-        .fold(0xcbf29ce484222325u64, |v, b| {
-            (v ^ u64::from(*b)).wrapping_mul(0x100000001b3)
-        });
-    let name = format!("ox-host-{}-{hash:016x}", unsafe { libc::geteuid() });
-    absolute("XDG_RUNTIME_DIR")
-        .map(|p| p.join(&name).join("host.sock"))
-        .filter(|p| p.as_os_str().as_encoded_bytes().len() < 100)
-        .or_else(|| Some(Path::new("/tmp").join(name).join("host.sock")))
+
+    #[test]
+    fn child_gets_own_lease_only_when_hosted() {
+        let mut command = tokio::process::Command::new("ox");
+        set_parent_lease_from(&mut command, true, Some("gateway-lease"));
+        assert_eq!(parent_env(&command).as_deref(), Some("gateway-lease"));
+
+        let mut unhosted = tokio::process::Command::new("ox");
+        set_parent_lease_from(&mut unhosted, false, Some("gateway-lease"));
+        assert_eq!(parent_env(&unhosted), None);
+
+        let mut unleased = tokio::process::Command::new("ox");
+        set_parent_lease_from(&mut unleased, true, None);
+        assert_eq!(parent_env(&unleased), None);
+    }
+
+    #[test]
+    fn isolate_stock_removes_parent_lease() {
+        let mut command = tokio::process::Command::new("claude");
+        set_parent_lease_from(&mut command, true, Some("gateway-lease"));
+        isolate_stock(&mut command);
+        assert_eq!(parent_env(&command), None);
+    }
 }

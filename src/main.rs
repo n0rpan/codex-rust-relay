@@ -11,6 +11,7 @@ mod claude_gateway;
 mod claude_request;
 mod claude_response;
 mod claude_search;
+mod claude_worker_contract;
 mod clients;
 mod daemon;
 mod desktop_launch;
@@ -21,6 +22,7 @@ mod host_lifetime;
 mod native;
 mod picker;
 mod provider;
+mod ps;
 mod search;
 mod settings_protocol;
 mod setup;
@@ -31,6 +33,7 @@ mod ui;
 mod update;
 mod upstream;
 mod version;
+mod weather;
 mod workers;
 
 use std::collections::BTreeSet;
@@ -107,6 +110,8 @@ enum Mode {
 struct VendorState {
     vendor: provider::Vendor,
     auth: Option<SecretKey>,
+    /// Why `auth` is missing, worked out while the environment is still at hand.
+    unavailable: String,
 }
 
 pub(crate) use version::VERSION;
@@ -159,6 +164,15 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
     }
     if args.first().is_some_and(|arg| arg == "desktop") {
         return desktop_launch::run(&args[1..]);
+    }
+    if args.first().is_some_and(|arg| arg == "ps") {
+        return ps::run_ps(&args[1..]);
+    }
+    if args.first().is_some_and(|arg| arg == "end") {
+        return ps::run_end(&args[1..]);
+    }
+    if args.first().is_some_and(|arg| arg == "weather") {
+        return weather::run(&args[1..]).await;
     }
     if args.first().is_some_and(|arg| arg == "update") {
         return update::run(&args[1..]).await;
@@ -476,7 +490,7 @@ fn exempt_loopback_proxy(command: &mut Command) {
 const NO_PROVIDER: &str = "no ox API provider configured. Run `ox setup` to add one, or `ox help subscriptions` for native sign-in";
 
 const OX_COMMANDS: &[&str] = &[
-    "setup", "doctor", "provider", "serve", "update", "login", "help", "codex", "claude",
+    "setup", "doctor", "provider", "serve", "update", "weather", "login", "help", "codex", "claude",
 ];
 /// Stock Codex subcommands that `ox <word>` forwards unchanged.
 const CODEX_COMMANDS: &[&str] = &[
@@ -727,7 +741,7 @@ impl App {
                     eprintln!(
                         "ox: provider {:?}: {}. Run `ox doctor` to check setup.",
                         vendor.key,
-                        vendor.unavailable_reason()
+                        vendor.unavailable_reason_with(env)
                     );
                 }
                 auth
@@ -774,7 +788,20 @@ impl App {
         let models_by_vendor: Vec<_> = vendors
             .iter()
             .zip(discovered)
-            .map(|(vendor, models)| {
+            .map(|(vendor, mut models)| {
+                // A discovered ID that cannot be a model alias (for example a
+                // local server listing "Qwen 2.5 Coder.gguf") is skipped rather
+                // than failing the launch. Static entries are still validated.
+                if let Some(models) = models.as_mut() {
+                    for id in models.retain_ids(|id| {
+                        provider::alias_for(&vendor.key, id, None).is_ok()
+                    }) {
+                        eprintln!(
+                            "ox: provider {:?}: skipping discovered model {id:?}: not a valid model id",
+                            vendor.key
+                        );
+                    }
+                }
                 let specs = catalog::merge_models(models, &vendor.models);
                 if specs.is_empty() {
                     eprintln!(
@@ -812,7 +839,14 @@ impl App {
         let states = vendors
             .into_iter()
             .zip(auths)
-            .map(|(vendor, auth)| VendorState { vendor, auth })
+            .map(|(vendor, auth)| {
+                let unavailable = vendor.unavailable_reason_with(env);
+                VendorState {
+                    vendor,
+                    auth,
+                    unavailable,
+                }
+            })
             .collect();
         Ok(Self {
             mode: Mode::Codeox {
@@ -922,6 +956,11 @@ impl App {
             return Ok(());
         };
         let Some((prefix, rest)) = requested.split_once('/') else {
+            // A bare id that several providers serve fails on every turn. Report it here,
+            // where the flag was typed, with the same candidates the request path gives.
+            if let Resolution::Ambiguous(aliases) = routes.resolve(requested) {
+                return Err(ambiguous_model_message(requested, &aliases).into());
+            }
             return Ok(());
         };
         let keys: Vec<&str> = vendors
@@ -1226,6 +1265,14 @@ fn http1_only(value: Option<&std::ffi::OsStr>) -> bool {
     value.is_some_and(|value| !value.is_empty() && value != "0")
 }
 
+fn ambiguous_model_message(requested: &str, aliases: &[String]) -> String {
+    format!(
+        "model {:?} is provided by multiple providers; use a provider-qualified alias such as {}",
+        short(requested),
+        aliases.join(", ")
+    )
+}
+
 fn resolve_model<'a>(
     vendors: &'a [VendorState],
     routes: &Routes,
@@ -1236,11 +1283,7 @@ fn resolve_model<'a>(
         Resolution::Ambiguous(aliases) => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                format!(
-                    "model {:?} is provided by multiple providers; use a provider-qualified alias such as {}",
-                    short(requested),
-                    aliases.join(", ")
-                ),
+                ambiguous_model_message(requested, &aliases),
             ));
         }
         Resolution::Unknown => {
@@ -1259,8 +1302,7 @@ fn resolve_model<'a>(
             StatusCode::BAD_GATEWAY,
             format!(
                 "provider {:?} is unavailable; {}",
-                state.vendor.key,
-                state.vendor.unavailable_reason()
+                state.vendor.key, state.unavailable
             ),
         )
     })?;
@@ -2043,6 +2085,51 @@ id = "fast-coder"
             .unwrap_err()
             .to_string();
         assert!(error.contains("fix: ox doctor"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn launch_model_check_reports_a_bare_model_served_by_two_providers() {
+        let config = r#"
+[providers.groq]
+base_url = "https://groq.example/v1"
+env_key = "GROQ_KEY"
+discovery = false
+
+[[providers.groq.models]]
+id = "llama-3.3-70b"
+alias = "groq-llama"
+
+[providers.together]
+base_url = "https://together.example/v1"
+env_key = "TOGETHER_KEY"
+discovery = false
+
+[[providers.together.models]]
+id = "llama-3.3-70b"
+alias = "together-llama"
+"#;
+        let app = App::codeox(
+            CodeoxConfig::load_from_str(config).unwrap(),
+            bundled_fixture(),
+            RELAY_TOKEN,
+            test_client(),
+            MAX_REQUEST_BYTES,
+            &|_| None,
+            None,
+        )
+        .await
+        .unwrap();
+        // The bare id is ambiguous, so launch fails and names both candidates.
+        let error = app
+            .check_launch_model("llama-3.3-70b")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("multiple providers"), "{error}");
+        assert!(error.contains("groq-llama"), "{error}");
+        assert!(error.contains("together-llama"), "{error}");
+        // The provider-qualified and alias forms still launch.
+        assert!(app.check_launch_model("groq-llama").is_ok());
+        assert!(app.check_launch_model("groq/llama-3.3-70b").is_ok());
     }
 
     fn bundled_fixture() -> BundledModels {

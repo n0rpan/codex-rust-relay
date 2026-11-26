@@ -101,6 +101,19 @@ class Window:
                      str(control["y"] + control["h"] // 2), "click", "1")
         return control
 
+    def route(self, runtime, model, timeout=20):
+        """Wait until the sidebar AGENT row (id billing-route, label "agent <runtime> · <model>")
+        shows this runtime and a model containing `model`. The composer's model pill shows the
+        same value."""
+        deadline = time.monotonic() + timeout
+        label = ""
+        while time.monotonic() < deadline:
+            label = self.control("billing-route", timeout=5)["label"].casefold()
+            if runtime.casefold() in label and model.casefold() in label:
+                return label
+            time.sleep(.1)
+        raise AssertionError(f"The agent row never showed {runtime!r} with {model!r}; last read {label!r}")
+
     def key(self, chord):
         self.command("xdotool", "key", "--clearmodifiers", chord)
 
@@ -224,13 +237,12 @@ def run(gui, codex, claude, root, failure_image=None):
                 probe.settimeout(1)
                 w = Window(root, app, env["OX_DESK_STATS_SOCKET"], probe)
                 w.wait(lambda s: s["connected"], "Codex connection")
-                w.word("copper/demo", after_x=200)
+                w.route("Codex", "demo")
                 w.prompt("Copper meadow model-switch-window")
                 copper = w.wait(lambda s: codex_vendor.replied.is_set() and s["selected_thread"] and not s["visible_turn"], "stock Codex reply")["selected_thread"]
                 w.choose("Claude Code fixture/demo billing route")
                 w.wait(lambda s: s["pane"] != 0 and s["connected"], "Claude connection")
-                w.word("Claude", after_x=200)
-                w.word("fixture/demo", after_x=200)
+                w.route("Claude Code", "demo")
                 w.prompt("APPROVAL Cedar window")
                 cedar = w.wait(lambda s: s["selected_requests"] and s["visible_turn"], "Claude permission request")["selected_thread"]
                 assert cedar and cedar != copper
@@ -241,7 +253,7 @@ def run(gui, codex, claude, root, failure_image=None):
                 assert not marker.exists(), "A backgrounded approval executed before user input"
                 # The background button reads “1 waiting · Alpha”. A still-painted
                 # Claude approval or transcript can also contain the word “waiting”.
-                w.word("waiting", click=True, same_row=project.name)
+                w.press(f"1 waiting · {project.name}")
                 w.wait(lambda s: s["selected_thread"] == cedar and s["selected_requests"], "Claude background approval")
                 w.key("ctrl+alt+1")
                 w.wait(lambda s: s["selected_thread"] == cedar and not s["visible_turn"] and marker.exists(), "approved Claude tool")
@@ -249,9 +261,14 @@ def run(gui, codex, claude, root, failure_image=None):
                 assert any("Cedar clarification while waiting" in json.dumps(r["messages"]) for r in vendor.requests)
                 assert not vendor.errors, vendor.errors
                 print("One project retained its Codex and Claude sessions. Enter, live Claude steering and background approval reached stock.", flush=True)
-                w.word("Default", click=True, bottom=True)
+                # The permission chip (id access-preset) names the mode: "Ask before edits" is
+                # Claude's Default. Its menu item reads "YOLO · bypass permissions".
+                w.press("access-preset")
                 w.word("YOLO", click=True, bottom=True)
-                w.word("YOLO", after_x=200, bottom=True)
+                deadline = time.monotonic() + 10
+                while "yolo" not in w.control("access-preset")["label"].casefold():
+                    assert time.monotonic() < deadline, "The permission chip never showed YOLO"
+                    time.sleep(.1)
                 marker.rename(project / "approved-manually.txt")
                 w.prompt("APPROVAL Verify confirmed mode")
                 w.wait(lambda s: not s["visible_turn"] and marker.exists(), "stock Claude bypassPermissions execution")

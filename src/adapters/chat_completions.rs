@@ -200,7 +200,16 @@ pub fn translate_request_with(
     }
     match request.get("input") {
         Some(Value::String(text)) => messages.push(json!({"role": "user", "content": text})),
-        Some(Value::Array(items)) => push_input_items(items, options, &mut messages)?,
+        Some(Value::Array(items)) => {
+            // DeepSeek-style thinking modes reject a tool-bearing request whose
+            // earlier assistant turns lost their reasoning_content, and ignore it
+            // otherwise, so it is replayed only when tools are present.
+            let with_tools = request
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|tools| !tools.is_empty());
+            push_input_items(items, options, with_tools, &mut messages)?
+        }
         Some(Value::Null) | None => return Err("the response request is missing input".into()),
         Some(_) => return Err("input must be a string or an array of input items".into()),
     }
@@ -216,19 +225,23 @@ pub fn translate_request_with(
     let mut body = Map::new();
     body.insert("model".into(), json!(upstream_model));
     body.insert("messages".into(), Value::Array(messages));
-    if !tools.is_empty() {
+    let has_tools = !tools.is_empty();
+    if has_tools {
         body.insert("tools".into(), Value::Array(tools));
     }
-    if let Some(tool_choice) = tool_choice {
-        body.insert("tool_choice".into(), tool_choice);
-    }
-    if let Some(parallel) = request.get("parallel_tool_calls") {
-        match parallel {
-            Value::Bool(_) => {
-                body.insert("parallel_tool_calls".into(), parallel.clone());
-            }
-            Value::Null => {}
-            _ => return Err("parallel_tool_calls must be a boolean".into()),
+    // Chat Completions rejects tool controls when no tools are sent. Still validate
+    // the parallel flag, but only forward the controls alongside a non-empty tools array.
+    let parallel = match request.get("parallel_tool_calls") {
+        Some(Value::Bool(parallel)) => Some(*parallel),
+        Some(Value::Null) | None => None,
+        Some(_) => return Err("parallel_tool_calls must be a boolean".into()),
+    };
+    if has_tools {
+        if let Some(tool_choice) = tool_choice {
+            body.insert("tool_choice".into(), tool_choice);
+        }
+        if let Some(parallel) = parallel {
+            body.insert("parallel_tool_calls".into(), json!(parallel));
         }
     }
     if let Some(response_format) = response_format {
@@ -314,8 +327,13 @@ fn reject_non_streaming(request: &Map<String, Value>) -> Result<(), String> {
 fn push_input_items(
     items: &[Value],
     options: &AdapterOptions,
+    replay_reasoning: bool,
     messages: &mut Vec<Value>,
 ) -> Result<(), String> {
+    // Images returned by tool calls, grouped by the call that produced them.
+    let mut pending_images: Vec<(String, Vec<Value>)> = Vec::new();
+    let mut call_names: std::collections::HashMap<String, String> = Default::default();
+    let mut pending_reasoning: Option<String> = None;
     for (position, item) in items.iter().enumerate() {
         let item = item
             .as_object()
@@ -326,7 +344,17 @@ fn push_input_items(
             None => return Err(format!("input item {position} needs a type")),
         };
         match kind {
-            "message" => push_message(item, position, options, messages)?,
+            "message" => {
+                push_message(item, position, options, messages)?;
+                let assistant = messages
+                    .last()
+                    .is_some_and(|message| message["role"] == "assistant");
+                if assistant {
+                    attach_reasoning(messages, &mut pending_reasoning);
+                } else {
+                    pending_reasoning = None;
+                }
+            }
             "function_call" => {
                 let call_id = item
                     .get("call_id")
@@ -341,6 +369,8 @@ fn push_input_items(
                     .and_then(Value::as_str)
                     .ok_or_else(|| format!("input item {position} needs arguments"))?;
                 push_function_call(messages, call_id, name, arguments);
+                call_names.insert(call_id.to_owned(), name.to_owned());
+                attach_reasoning(messages, &mut pending_reasoning);
             }
             "function_call_output" => {
                 // Codex injects goal context as a namespaced pseudo-tool result
@@ -358,15 +388,57 @@ fn push_input_items(
                 let output = item
                     .get("output")
                     .ok_or_else(|| format!("input item {position} needs output"))?;
+                let (text, images) = tool_output(output, position)?;
                 messages.push(json!({
                     "role": "tool",
                     "tool_call_id": call_id,
-                    "content": tool_output(output, position)?,
+                    "content": text,
                 }));
+                // Chat Completions tool messages are text-only. Images a tool returned
+                // (Codex view_image, screenshots) follow as one user message after the
+                // last tool result of the turn, so every tool_call still answers first.
+                if !images.is_empty() {
+                    pending_images.push((call_id.to_owned(), images));
+                }
+                let next_is_output = items
+                    .get(position + 1)
+                    .and_then(Value::as_object)
+                    .is_some_and(|next| {
+                        next.get("type").and_then(Value::as_str) == Some("function_call_output")
+                            && !is_injected_context(next)
+                    });
+                if !next_is_output && !pending_images.is_empty() {
+                    let mut content = vec![json!({
+                        "type": "text",
+                        "text": "Images returned by the tool calls above, grouped by call:"
+                    })];
+                    for (call_id, mut images) in std::mem::take(&mut pending_images) {
+                        let label = match call_names.get(&call_id) {
+                            Some(name) => format!("Images from tool call {call_id} ({name}):"),
+                            None => format!("Images from tool call {call_id}:"),
+                        };
+                        content.push(json!({"type": "text", "text": label}));
+                        content.append(&mut images);
+                    }
+                    messages.push(json!({"role": "user", "content": content}));
+                }
             }
             // Reasoning is replayable only against the store that produced it, so
             // it is dropped rather than forwarded as a bogus assistant message.
-            "reasoning" => {}
+            // The one exception is this adapter's own envelope, which carries a
+            // Chat Completions `reasoning_content` back to its assistant turn.
+            "reasoning" => {
+                if replay_reasoning
+                    && let Some(text) = item
+                        .get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .and_then(|raw| raw.strip_prefix(CHAT_REASONING_PREFIX))
+                {
+                    pending_reasoning
+                        .get_or_insert_with(String::new)
+                        .push_str(text);
+                }
+            }
             other => {
                 return Err(format!(
                     "the {other} input item type is not supported by the chat completions adapter"
@@ -375,6 +447,23 @@ fn push_input_items(
         }
     }
     Ok(())
+}
+
+/// Prefix of a Responses reasoning item's `encrypted_content` that wraps a Chat
+/// Completions `reasoning_content` string for replay on the next request.
+pub const CHAT_REASONING_PREFIX: &str = "codeox.chat.reasoning.v1:";
+
+/// Move reasoning waiting for an assistant turn onto the assistant message at the
+/// tail of `messages`.
+fn attach_reasoning(messages: &mut [Value], pending: &mut Option<String>) {
+    let Some(text) = pending.take() else { return };
+    if let Some(message) = messages.last_mut().and_then(Value::as_object_mut) {
+        let merged = match message.get("reasoning_content").and_then(Value::as_str) {
+            Some(existing) => format!("{existing}{text}"),
+            None => text,
+        };
+        message.insert("reasoning_content".into(), json!(merged));
+    }
 }
 
 /// A `function_call_output` that stands in for tool output Codex holds itself
@@ -403,7 +492,8 @@ fn push_injected_context(
     let output = item
         .get("output")
         .ok_or_else(|| format!("input item {position} needs output"))?;
-    let text = tool_output(output, position)?;
+    // Injected context is text; images only ever come from real tool calls.
+    let (text, _) = tool_output(output, position)?;
     if text.trim().is_empty() {
         return Ok(());
     }
@@ -518,11 +608,13 @@ fn message_content(
     }
 }
 
-fn tool_output(output: &Value, position: usize) -> Result<String, String> {
+/// Text of a tool result plus any images it carried, as Chat Completions image parts.
+fn tool_output(output: &Value, position: usize) -> Result<(String, Vec<Value>), String> {
     match output {
-        Value::String(text) => Ok(text.clone()),
+        Value::String(text) => Ok((text.clone(), Vec::new())),
         Value::Array(parts) => {
             let mut text = String::new();
+            let mut images = Vec::new();
             for part in parts {
                 let part = part.as_object().ok_or_else(|| {
                     format!("the function_call_output in input item {position} has a part that is not an object")
@@ -537,6 +629,22 @@ fn tool_output(output: &Value, position: usize) -> Result<String, String> {
                             },
                         )?);
                     }
+                    Some("input_image") => {
+                        let url = part.get("image_url").and_then(Value::as_str).ok_or_else(
+                            || format!("a tool output image part in input item {position} needs image_url"),
+                        )?;
+                        let mut image = Map::new();
+                        image.insert("url".into(), json!(url));
+                        if let Some(detail) = part.get("detail").filter(|detail| !detail.is_null())
+                        {
+                            image.insert("detail".into(), detail.clone());
+                        }
+                        images
+                            .push(json!({"type": "image_url", "image_url": Value::Object(image)}));
+                        if text.is_empty() {
+                            text.push_str("[image attached below]");
+                        }
+                    }
                     Some(other) => {
                         return Err(format!(
                             "the {other} tool output part is not supported by the chat completions adapter"
@@ -549,7 +657,7 @@ fn tool_output(output: &Value, position: usize) -> Result<String, String> {
                     }
                 }
             }
-            Ok(text)
+            Ok((text, images))
         }
         _ => Err(format!(
             "the function_call_output in input item {position} must be a string or an array of content parts"
@@ -816,9 +924,31 @@ struct ToolState {
     announced: bool,
 }
 
+struct ReasoningState {
+    item_id: String,
+    output_index: usize,
+    text: String,
+}
+
+impl ReasoningState {
+    fn value(&self, status: &str) -> Value {
+        let mut item = json!({
+            "id": self.item_id,
+            "type": "reasoning",
+            "status": status,
+            "summary": [],
+        });
+        if status == "completed" {
+            item["encrypted_content"] = json!(format!("{CHAT_REASONING_PREFIX}{}", self.text));
+        }
+        item
+    }
+}
+
 enum StreamItem {
     Message(MessageState),
     Tool(ToolState),
+    Reasoning(ReasoningState),
 }
 
 impl MessageState {
@@ -874,6 +1004,12 @@ impl ResponseTranslator {
     /// Whether `[DONE]` or [`finish`](Self::finish) already completed the stream.
     pub fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    /// Whether a `finish_reason` arrived. Once it has, the upstream has said it is
+    /// done; only the transport end (or `[DONE]`) remains to be read.
+    pub fn has_finish_reason(&self) -> bool {
+        self.finish_reason.is_some()
     }
 
     /// Handle one already-framed SSE event.
@@ -983,6 +1119,12 @@ impl ResponseTranslator {
         delta: &Map<String, Value>,
         events: &mut Vec<Value>,
     ) -> Result<(), String> {
+        match delta.get("reasoning_content") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(text)) if text.is_empty() => {}
+            Some(Value::String(text)) => self.push_reasoning(text, events),
+            Some(_) => return Err("a delta reasoning_content value must be a string".into()),
+        }
         match delta.get("content") {
             None | Some(Value::Null) => {}
             // An empty delta carries no text; opening a part for it would leave a
@@ -1008,12 +1150,35 @@ impl ResponseTranslator {
         // Deprecated single-call delta, still emitted by some compatible servers.
         // It carries no ID, so the adapter generates a stable one for the response.
         if let Some(function) = delta.get("function_call").filter(|call| !call.is_null()) {
-            let call_id = format!("call_compat_{}", self.compat_calls);
+            let call_id = format!("call_compat_{}_{}", self.response_id, self.compat_calls);
             self.compat_calls += 1;
             let wrapped = json!({"index": 0, "id": call_id, "function": function.clone()});
             self.push_tool_call(&wrapped, events)?;
         }
         Ok(())
+    }
+
+    fn push_reasoning(&mut self, text: &str, events: &mut Vec<Value>) {
+        if let Some(StreamItem::Reasoning(reasoning)) = self
+            .items
+            .iter_mut()
+            .find(|item| matches!(item, StreamItem::Reasoning(_)))
+        {
+            reasoning.text.push_str(text);
+            return;
+        }
+        let output_index = self.next_output_index;
+        self.next_output_index += 1;
+        let reasoning = ReasoningState {
+            item_id: format!("rs_{}_{output_index}", self.response_id),
+            output_index,
+            text: text.to_owned(),
+        };
+        let mut added = Map::new();
+        added.insert("output_index".into(), json!(output_index));
+        added.insert("item".into(), reasoning.value("in_progress"));
+        events.push(self.event("response.output_item.added", added));
+        self.items.push(StreamItem::Reasoning(reasoning));
     }
 
     fn push_part(&mut self, kind: PartKind, text: &str, events: &mut Vec<Value>) {
@@ -1044,7 +1209,7 @@ impl ResponseTranslator {
         let (item_id, output_index, content_index, part_added) = {
             let message = match &mut self.items[position] {
                 StreamItem::Message(message) => message,
-                StreamItem::Tool(_) => unreachable!("position matched a message item"),
+                _ => unreachable!("position matched a message item"),
             };
             let existing = message.parts.iter().position(|part| part.kind == kind);
             let content_index = match existing {
@@ -1091,7 +1256,52 @@ impl ResponseTranslator {
         events.push(self.event(kind.delta_event(), delta));
     }
 
-    /// Track one `tool_calls[]` delta.
+    /// The `call_id` for a tool call that must be announced before the upstream
+    /// sent one. It is scoped to this response, so calls in different responses
+    /// never share it, and it skips any ID another item already holds.
+    fn fallback_call_id(&self, output_index: usize) -> String {
+        let base = format!("call_{}_{output_index}", self.response_id);
+        let mut candidate = base.clone();
+        let mut suffix = 1;
+        while self
+            .items
+            .iter()
+            .any(|item| matches!(item, StreamItem::Tool(tool) if tool.call_id == candidate))
+        {
+            candidate = format!("{base}_{suffix}");
+            suffix += 1;
+        }
+        candidate
+    }
+
+    /// Announce a named tool call and return its `response.output_item.added`
+    /// event. A call that still has no upstream ID gets a generated one here, and
+    /// that ID is fixed from now on: the announce, deltas and done item all use it.
+    fn announce_tool(&mut self, index: usize) -> Value {
+        let (output_index, fallback) = match &self.items[index] {
+            StreamItem::Tool(tool) if tool.call_id.is_empty() => (
+                tool.output_index,
+                Some(self.fallback_call_id(tool.output_index)),
+            ),
+            StreamItem::Tool(tool) => (tool.output_index, None),
+            _ => unreachable!("announce_tool is only called for tool items"),
+        };
+        let tool = match &mut self.items[index] {
+            StreamItem::Tool(tool) => tool,
+            _ => unreachable!("announce_tool is only called for tool items"),
+        };
+        if let Some(fallback) = fallback {
+            tool.call_id = fallback;
+        }
+        tool.item_id = format!("fc_{}", tool.call_id);
+        tool.announced = true;
+        let item = tool.value("in_progress", "");
+        let mut added = Map::new();
+        added.insert("output_index".into(), json!(output_index));
+        added.insert("item".into(), item);
+        self.event("response.output_item.added", added)
+    }
+
     fn push_tool_call(&mut self, call: &Value, events: &mut Vec<Value>) -> Result<(), String> {
         let call = call
             .as_object()
@@ -1134,7 +1344,7 @@ impl ResponseTranslator {
         {
             let tool = match &mut self.items[position] {
                 StreamItem::Tool(tool) => tool,
-                StreamItem::Message(_) => unreachable!("position matched a tool item"),
+                _ => unreachable!("position matched a tool item"),
             };
             // The first non-empty upstream ID wins, so later chunks that repeat or
             // omit it cannot change the ID the client already saw.
@@ -1155,28 +1365,25 @@ impl ResponseTranslator {
             if !arguments.is_empty() {
                 tool.arguments.push_str(arguments);
             }
-            if !tool.announced && !tool.name.is_empty() {
-                tool.item_id = if tool.call_id.is_empty() {
-                    format!("fc_{}", tool.output_index)
-                } else {
-                    format!("fc_{}", tool.call_id)
-                };
-                tool.announced = true;
-                announce = Some((tool.output_index, tool.value("in_progress", "")));
+            // Announce once the call has a name and either its upstream ID or some
+            // arguments. A name that arrives before its ID waits for that ID, so the
+            // real one is kept; only arguments that start first force a fallback ID.
+            if !tool.announced
+                && !tool.name.is_empty()
+                && (!tool.call_id.is_empty() || !tool.arguments.is_empty())
+            {
+                announce = Some(position);
             }
         }
-        if let Some((output_index, item)) = announce {
-            let mut added = Map::new();
-            added.insert("output_index".into(), json!(output_index));
-            added.insert("item".into(), item);
-            events.push(self.event("response.output_item.added", added));
+        if let Some(index) = announce {
+            events.push(self.announce_tool(index));
         }
 
         let mut pending = None;
         {
             let tool = match &mut self.items[position] {
                 StreamItem::Tool(tool) => tool,
-                StreamItem::Message(_) => unreachable!("position matched a tool item"),
+                _ => unreachable!("position matched a tool item"),
             };
             if tool.announced && tool.emitted < tool.arguments.len() {
                 pending = Some((
@@ -1205,10 +1412,10 @@ impl ResponseTranslator {
         if !complete_tools {
             // A partial call must not become an executable Codex tool item.
             self.items
-                .retain(|item| matches!(item, StreamItem::Message(_)));
+                .retain(|item| !matches!(item, StreamItem::Tool(_)));
         }
         if let Some(tool) = self.items.iter().find_map(|item| match item {
-            StreamItem::Tool(tool) if !tool.announced => Some(tool),
+            StreamItem::Tool(tool) if !tool.announced && tool.name.is_empty() => Some(tool),
             _ => None,
         }) {
             return Err(format!(
@@ -1216,8 +1423,21 @@ impl ResponseTranslator {
                 tool.chunk_index
             ));
         }
-        let items = std::mem::take(&mut self.items);
+        // A named call that never reached an ID or arguments is announced now.
         let mut events = Vec::new();
+        let unannounced: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| match item {
+                StreamItem::Tool(tool) if !tool.announced => Some(index),
+                _ => None,
+            })
+            .collect();
+        for index in unannounced {
+            events.push(self.announce_tool(index));
+        }
+        let items = std::mem::take(&mut self.items);
         for item in items {
             match item {
                 StreamItem::Message(message) => {
@@ -1244,6 +1464,13 @@ impl ResponseTranslator {
                     item_done.insert("item".into(), message.value("completed"));
                     events.push(self.event("response.output_item.done", item_done));
                     self.output.push(message.value("completed"));
+                }
+                StreamItem::Reasoning(reasoning) => {
+                    let mut item_done = Map::new();
+                    item_done.insert("output_index".into(), json!(reasoning.output_index));
+                    item_done.insert("item".into(), reasoning.value("completed"));
+                    events.push(self.event("response.output_item.done", item_done));
+                    self.output.push(reasoning.value("completed"));
                 }
                 StreamItem::Tool(tool) => {
                     let mut done = Map::new();
@@ -1312,9 +1539,10 @@ fn finish_status(reason: &str) -> Result<(&'static str, Option<Value>), String> 
         "stop" | "tool_calls" | "function_call" => Ok(("completed", None)),
         "length" => Ok(("incomplete", Some(json!({"reason": "max_output_tokens"})))),
         "content_filter" => Ok(("incomplete", Some(json!({"reason": "content_filter"})))),
-        other => Err(format!(
-            "the chat completion finished with an unsupported finish_reason: {other}"
-        )),
+        // Providers add reasons outside the standard set (for example
+        // `insufficient_system_resource`) after a complete answer. Treat them as a
+        // normal completion so the streamed answer is not discarded.
+        _ => Ok(("completed", None)),
     }
 }
 
@@ -1361,5 +1589,83 @@ fn error_message(data: &str) -> String {
         }
         Ok(Value::String(message)) => message,
         _ => data.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tool_call_id_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn chunk(tool_calls: Value) -> String {
+        json!({"choices": [{"index": 0, "delta": {"tool_calls": tool_calls}}]}).to_string()
+    }
+
+    fn finish_chunk() -> String {
+        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}).to_string()
+    }
+
+    /// Every event whose `type` is `kind`, in order.
+    fn of_type<'a>(events: &'a [Value], kind: &str) -> Vec<&'a Value> {
+        events.iter().filter(|e| e["type"] == kind).collect()
+    }
+
+    #[test]
+    fn a_name_that_arrives_before_its_id_keeps_the_real_id() {
+        let mut translator = ResponseTranslator::new("resp_a", "m", 0);
+        let mut events = translator
+            .push_event(
+                "",
+                &chunk(json!([{"index": 0, "function": {"name": "shell"}}])),
+            )
+            .unwrap();
+        // Nothing is announced yet: the call has no ID and no arguments.
+        assert!(of_type(&events, "response.output_item.added").is_empty());
+        events = translator
+            .push_event(
+                "",
+                &chunk(json!([{"index": 0, "id": "call_real", "function": {"arguments": "{}"}}])),
+            )
+            .unwrap();
+        let added = of_type(&events, "response.output_item.added");
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0]["item"]["call_id"], "call_real");
+        events.extend(translator.push_event("", &finish_chunk()).unwrap());
+        let done = of_type(&events, "response.output_item.done");
+        assert_eq!(done[0]["item"]["call_id"], "call_real");
+        assert_eq!(done[0]["item"]["name"], "shell");
+    }
+
+    #[test]
+    fn fallback_ids_are_unique_across_responses() {
+        let call = chunk(json!([{"index": 0, "function": {"name": "shell", "arguments": "{}"}}]));
+        let mut first = ResponseTranslator::new("resp_one", "m", 0);
+        let mut second = ResponseTranslator::new("resp_two", "m", 0);
+        let mut ids = Vec::new();
+        for translator in [&mut first, &mut second] {
+            let mut events = translator.push_event("", &call).unwrap();
+            events.extend(translator.push_event("", &finish_chunk()).unwrap());
+            let done = of_type(&events, "response.output_item.done");
+            ids.push(done[0]["item"]["call_id"].as_str().unwrap().to_owned());
+        }
+        assert!(ids[0].starts_with("call_"), "{ids:?}");
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn a_call_without_any_id_still_completes_with_a_fallback() {
+        let mut translator = ResponseTranslator::new("resp_c", "m", 0);
+        let mut events = translator
+            .push_event(
+                "",
+                &chunk(json!([{"index": 0, "function": {"name": "shell", "arguments": "{}"}}])),
+            )
+            .unwrap();
+        events.extend(translator.push_event("", &finish_chunk()).unwrap());
+        let added = of_type(&events, "response.output_item.added");
+        let done = of_type(&events, "response.output_item.done");
+        let call_id = added[0]["item"]["call_id"].as_str().unwrap();
+        assert!(call_id.starts_with("call_resp_c_"), "{call_id}");
+        assert_eq!(done[0]["item"]["call_id"], call_id);
     }
 }

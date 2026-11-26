@@ -17,6 +17,20 @@ pub(super) struct Draft {
     sent: Option<SentInput>,
 }
 impl Draft {
+    /// What a delivered copy of this draft looks like in a transcript: trimmed text and
+    /// its attachments. A pasted image has no identity the transcript echoes, so two
+    /// different pastes look alike (`None`).
+    pub(super) fn signature(&self) -> (String, Vec<Option<String>>) {
+        let images = self
+            .images
+            .iter()
+            .map(|i| match i {
+                crate::mentions::ImageInput::File(p) => Some(p.to_string_lossy().into_owned()),
+                crate::mentions::ImageInput::Clipboard(..) => None,
+            })
+            .collect();
+        (self.text.trim().to_owned(), images)
+    }
     pub(super) fn restore_before(mut self, newer: &mut Draft) {
         if !self.text.is_empty() && !newer.text.is_empty() {
             self.text.push('\n');
@@ -121,9 +135,11 @@ impl Store {
         if let Some(remote) = self.remote() {
             return remote.sending.contains(id.unwrap_or("")) || self.pending_input(id);
         }
-        self.drafts
-            .get(&id.map(str::to_owned))
-            .is_some_and(|d| d.sent.is_some())
+        id.is_some_and(|id| self.resume_sends.contains(id))
+            || self
+                .drafts
+                .get(&id.map(str::to_owned))
+                .is_some_and(|d| d.sent.is_some())
     }
     pub fn can_send(&self, id: Option<&str>) -> bool {
         if let Some(remote) = self.remote() {
@@ -138,11 +154,105 @@ impl Store {
             && id.is_none_or(|thread| !self.changing_options(thread))
             && id.is_none_or(|id| {
                 !self.in_terminal(id)
+                    && !self.is_native_live(id)
                     && self
                         .transcripts
                         .get(id)
                         .is_some_and(|t| t.ready && t.verified)
             })
+    }
+    /// The composer is usable: the thread can take a message now, or it is ended and a
+    /// send reopens it first. Ending or reaping a process never disables the composer.
+    pub fn can_compose(&self, id: Option<&str>) -> bool {
+        self.can_send(id) || id.is_some_and(|id| self.can_resume_send(id))
+    }
+    /// An ended thread (no live process) that a send can reopen. Local stores only; a
+    /// remote client reads the host's `send` capability instead.
+    pub(super) fn can_resume_send(&self, id: &str) -> bool {
+        self.remote().is_none()
+            && self.ended_threads.contains(id)
+            && !self.is_native_live(id)
+            && matches!(self.state, Connection::Ready | Connection::Connecting)
+            && !self.has_live_session(id)
+            && !self.in_terminal(id)
+            && !self.sending(Some(id))
+            && self.catalog.get(id).is_some()
+            // A Claude route still connecting can start the resumed process itself: it
+            // never waits on the blank draft process, so a reaped route's first send works.
+            && !(self.is_session_scoped() && id.contains('/'))
+    }
+    /// Reopen an ended thread and keep the draft to send once it is ready. Claude resumes
+    /// with the message as the process's first input; Codex resumes, then `flush_resume_sends`
+    /// submits the draft when the thread is verified.
+    fn resume_and_send(&mut self, id: &str) -> io::Result<()> {
+        let draft = self.drafts.get(&Some(id.to_owned()));
+        let text = draft.map_or("", |d| d.text.as_str());
+        let has_images = draft.is_some_and(|d| !d.images.is_empty());
+        if text.trim().is_empty() && !has_images {
+            return Err(io::Error::other("Enter a message"));
+        }
+        if self.is_session_scoped() {
+            if has_images {
+                return Err(io::Error::other(
+                    "Remove the attachment before submitting to Claude Code",
+                ));
+            }
+            return self.claude_resume_send(id);
+        }
+        if text.trim_start().starts_with('/') {
+            return Err(io::Error::other("Open this command in stock Codex"));
+        }
+        self.ended_threads.remove(id);
+        self.resume_sends.insert(id.into());
+        let opened = if self.state == Connection::Ready {
+            self.open_catalog_id(id)
+        } else {
+            // The runtime is still connecting; `connected` reopens what is listed here.
+            self.selection += 1;
+            self.selected = Some(id.into());
+            self.reopen.push(id.into());
+            self.mark_loading(id);
+            Ok(())
+        };
+        if let Err(error) = opened {
+            self.resume_sends.remove(id);
+            self.ended_threads.insert(id.into());
+            return Err(error);
+        }
+        self.changed.transcript(id);
+        self.changed.mark(Changed::THREADS);
+        Ok(())
+    }
+    /// Submit drafts waiting on a reopened thread once it can take them. A reopen that
+    /// failed drops the wait and leaves the draft in the composer.
+    pub(super) fn flush_resume_sends(&mut self) {
+        if self.resume_sends.is_empty() {
+            return;
+        }
+        let waiting: Vec<String> = self.resume_sends.iter().cloned().collect();
+        for id in waiting {
+            self.resume_sends.remove(&id);
+            if self.can_send(Some(&id)) {
+                if let Err(error) = self.submit(Some(&id)) {
+                    self.notice = Some(error.to_string());
+                    self.changed.mark(Changed::NOTICE);
+                }
+                continue;
+            }
+            let t = self.transcripts.get(&id);
+            let opening = matches!(self.state, Connection::Connecting)
+                || t.is_some_and(|t| t.loading || (t.ready && !t.verified));
+            if opening && t.is_none_or(|t| t.error.is_none()) {
+                self.resume_sends.insert(id);
+            } else {
+                self.ended_threads.insert(id.clone());
+                self.notice = Some(
+                    "The thread did not resume. Your message is still in the composer.".into(),
+                );
+                self.changed.mark(Changed::NOTICE);
+                self.changed.transcript(&id);
+            }
+        }
     }
     pub(crate) fn send_client_message(
         &mut self,
@@ -191,6 +301,11 @@ impl Store {
             return self
                 .dispatch_remote(crate::actions::Action::Submit(id.map(str::to_owned)))
                 .map(|_| ());
+        }
+        if let Some(thread) = id
+            && self.can_resume_send(thread)
+        {
+            return self.resume_and_send(thread);
         }
         if self.is_session_scoped() {
             return self.claude_submit(id, None);
@@ -352,7 +467,12 @@ impl Store {
             .transcripts
             .get(id)
             .and_then(|t| t.active_turn())
-            .ok_or_else(|| io::Error::other("This thread has no active turn"))?;
+            .ok_or_else(|| io::Error::other("This thread has no active turn"))?
+            .to_owned();
+        let turn = turn.as_str();
+        if let Some(t) = self.transcripts.get_mut(id) {
+            t.stop_requested = Some(turn.to_owned());
+        }
         self.request(
             Call::Stop {
                 thread: id.into(),
@@ -360,6 +480,178 @@ impl Store {
             },
             Pending::Compose(Operation::Stop(id.into())),
         )
+    }
+
+    /// End this client's live process for a thread. The thread stays in the
+    /// catalog and opens again (Claude `--resume`, Codex `thread/resume`) on the
+    /// next select. A Claude process is dropped, which kills its process group.
+    /// A Codex thread is unsubscribed; the host drops the app-server once no
+    /// thread in the scope is left.
+    pub fn end_session(&mut self, id: &str) -> io::Result<()> {
+        if self.remote().is_some() {
+            return self.forward(crate::actions::Action::EndSession(id.into()));
+        }
+        if self.is_session_scoped() {
+            self.claude_end(id)?;
+            self.ended_threads.insert(id.into());
+            return Ok(());
+        }
+        if self.state != Connection::Ready {
+            return Err(io::Error::other("Reconnect to end this session"));
+        }
+        // Another client holds the writer lock: OX only views it, so there is nothing of
+        // OX's to end (an unsubscribe would only answer notLoaded).
+        if self.is_native_live(id) {
+            return Err(io::Error::other(
+                "Another client is running this thread; OX only follows it",
+            ));
+        }
+        if !self
+            .transcripts
+            .get(id)
+            .is_some_and(|t| t.ready || t.loading)
+        {
+            return Err(io::Error::other("This thread has no live session"));
+        }
+        if self.in_terminal(id) {
+            return Err(io::Error::other("This thread is open in a terminal"));
+        }
+        if self
+            .transcripts
+            .get(id)
+            .is_some_and(|t| t.active_turn().is_some())
+        {
+            // Ending a running turn: interrupt it; the unsubscribe follows anyway.
+            let _ = self.stop(id);
+        }
+        let t = self.transcripts.get_mut(id).expect("checked above");
+        t.ready = false;
+        t.verified = false;
+        t.loading = false;
+        t.active_turn = None;
+        t.error = None;
+        self.ended_threads.insert(id.into());
+        // A Read, Resume or History still in flight must not reopen the thread when its
+        // reply lands after the End: a sibling keeps this scope's runtime up, so nothing
+        // else would close it again. The Unsubscribe below follows them on the wire.
+        self.pending.retain(|_, (_, p)| {
+            !matches!(p, Pending::Read(x) | Pending::Resume(x) | Pending::History(x)
+                if x.as_str() == id)
+        });
+        self.changed.transcript(id);
+        self.changed.mark(Changed::THREADS);
+        self.request(Call::Unsubscribe(id.into()), Pending::Unsubscribe)
+    }
+    /// Threads with a live process or subscription in this local store. A
+    /// Claude process is one session; the blank draft process is not listed.
+    pub fn live_threads(&self) -> Vec<String> {
+        if self.remote().is_some() {
+            return vec![];
+        }
+        if self.is_session_scoped() {
+            return self.claude_live();
+        }
+        self.transcripts
+            .iter()
+            .filter(|(id, t)| {
+                (t.ready || t.loading) && !t.native_live && !self.terminal_threads.contains(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+    /// The thread is the blank Claude process kept warm for new sessions.
+    pub fn is_draft(&self, id: &str) -> bool {
+        self.remote().is_none() && self.is_session_scoped() && self.claude_is_blank(id)
+    }
+    /// Whether this client can end the thread's live process (the `end` capability).
+    pub fn can_end_session(&self, id: &str) -> bool {
+        if let Some(remote) = self.remote() {
+            return remote.can(id, "end");
+        }
+        self.has_live_session(id)
+    }
+    /// Mark a thread as having no live process (the host seeds this for a route it reopened
+    /// after reaping it), so a send to it resumes it.
+    pub fn mark_ended(&mut self, id: &str) {
+        if self.remote().is_none() {
+            self.ended_threads.insert(id.into());
+        }
+    }
+    /// Restore a thread the host knew before it reaped or replaced this route's runtime.
+    /// The thread is ended (a send resumes it) even when discovery has not listed it:
+    /// Codex gets a minimal row in this project and route, whose resume verifies identity
+    /// with the server. `access` is the Claude mode the user had chosen.
+    /// Remember a worker session's launch contract (from the host's persisted origin)
+    /// unless the live store already knows the exact one it launched under.
+    pub fn restore_worker_contract(
+        &mut self,
+        id: &str,
+        contract: crate::claude_worker_contract::Contract,
+    ) {
+        self.worker_contracts.entry(id.into()).or_insert(contract);
+    }
+    pub fn restore_ended(
+        &mut self,
+        id: &str,
+        title: &str,
+        updated_at: i64,
+        access: Option<crate::runtime::Access>,
+    ) {
+        if self.remote().is_some() {
+            return;
+        }
+        self.ended_threads.insert(id.into());
+        if let Some(access) = access {
+            self.resume_access.insert(id.into(), access);
+        }
+        if !self.is_session_scoped() && self.catalog.get(id).is_none() {
+            self.catalog.insert(crate::codex::history::ThreadRow {
+                worker: false,
+                parent_thread_id: None,
+                agent_nickname: None,
+                id: id.into(),
+                cwd: self.profile.project.clone(),
+                model_provider: self.profile.provider.clone(),
+                model: None,
+                name: (!title.trim().is_empty()).then(|| title.to_owned()),
+                preview: String::new(),
+                generated_title: None,
+                updated_at,
+                status: None,
+                unread: false,
+                activity_order: 0,
+            });
+            self.catalog_revision += 1;
+            self.changed.mark(Changed::THREADS);
+        }
+    }
+    /// The live process was ended and nothing has started it again. The row stays
+    /// in the catalog; selecting it resumes the thread. A remote client reads the
+    /// host's `ended` capability.
+    pub fn is_ended(&self, id: &str) -> bool {
+        if let Some(remote) = self.remote() {
+            return remote.can(id, "ended");
+        }
+        self.ended_threads.contains(id) && !self.has_live_session(id)
+    }
+    /// This thread has a live process or subscription to end.
+    pub fn has_live_session(&self, id: &str) -> bool {
+        if self.remote().is_some() {
+            return false;
+        }
+        if self.is_session_scoped() {
+            return self.claude_has_live(id);
+        }
+        self.transcripts.get(id).is_some_and(|t| {
+            (t.ready || t.loading) && !t.native_live && !self.terminal_threads.contains(id)
+        })
+    }
+    /// Something in this thread would be lost by ending it now.
+    pub fn thread_busy(&self, id: &str) -> bool {
+        self.transcript(id)
+            .is_some_and(|t| t.active_turn().is_some())
+            || self.sending(Some(id))
+            || self.asks.iter().any(|a| a.thread.as_deref() == Some(id))
     }
 
     pub(super) fn compose_failed(&mut self, op: Operation, reason: String) {
@@ -383,7 +675,14 @@ impl Store {
                 }
                 s.owner
             }
-            Operation::Stop(id) => Some(id),
+            Operation::Stop(id) => {
+                // A refused Stop leaves the turn running: when it completes it did so on
+                // its own, and must not render as Stopped.
+                if let Some(t) = self.transcripts.get_mut(&id) {
+                    t.stop_requested = None;
+                }
+                Some(id)
+            }
         };
         if let Some(t) = owner.and_then(|id| self.transcripts.get_mut(&id)) {
             t.error = Some(reason);
@@ -508,7 +807,10 @@ impl Store {
             self.next_preset = None;
             self.next_options = None;
         } else {
-            self.edit(None, std::mem::take(&mut draft.text));
+            // The composer moved on. Its text and images stay together with the new chat.
+            let composer = self.drafts.entry(None).or_default();
+            composer.text = std::mem::take(&mut draft.text);
+            composer.images = std::mem::take(&mut draft.images);
         }
         let mut row = reply.thread;
         row.model = Some(reply.model.clone());
@@ -578,6 +880,31 @@ mod tests {
     }
 
     #[test]
+    fn ending_a_ready_codex_thread_unsubscribes_and_marks_it_not_ready() {
+        let mut store = ready();
+        let id = "thread-ready".to_owned();
+        let t = store.transcripts.entry(id.clone()).or_default();
+        t.ready = true;
+        t.verified = true;
+        t.active_turn = Some("turn-1".into());
+        assert!(store.can_end_session(&id));
+        store.end_session(&id).unwrap();
+        let t = store.transcripts.get(&id).unwrap();
+        assert!(!t.ready && !t.verified && !t.loading);
+        assert!(t.active_turn().is_none(), "an ended turn is not running");
+        assert!(
+            store
+                .pending
+                .values()
+                .any(|(_, pending)| matches!(pending, Pending::Unsubscribe)),
+            "the host must receive the unsubscribe"
+        );
+        assert!(store.is_ended(&id));
+        assert!(!store.can_end_session(&id));
+        assert!(store.end_session(&id).is_err());
+    }
+
+    #[test]
     fn text_only_model_preserves_image_for_the_next_choice() {
         let mut store = ready();
         let mut caps = crate::slash::Capabilities::default();
@@ -593,6 +920,46 @@ mod tests {
         assert!(error.to_string().contains("accepts text only"));
         assert_eq!(store.draft_images(None)[0].label(), "art.png");
         assert!(!store.sending(None));
+    }
+
+    #[test]
+    fn new_chat_images_stay_with_its_text_when_the_thread_opens_elsewhere() {
+        let mut store = ready();
+        let project = store.profile.project.clone();
+        let submit = Submit {
+            options: None,
+            owner: None,
+            expected_turn: None,
+            selection: store.selection,
+            command: None,
+            inject: vec![],
+        };
+        // While the thread opens, the new-chat composer gets text and an image; the operator
+        // then selects another thread, so the opened thread must not take either.
+        store.edit(None, "typed while pending".into());
+        store.attach_image(None, ImageInput::File("/tmp/next.png".into()));
+        store.selection += 1;
+        let reply: ResumedThread = serde_json::from_value(serde_json::json!({
+            "thread": {"id":"new-thread","cwd":project,"modelProvider":"openai"},
+            "modelProvider":"openai",
+            "model":"fixture/model",
+            "serviceTier":null,
+            "reasoningEffort":null,
+            "initialTurnsPage":null
+        }))
+        .unwrap();
+        store.first_send(submit, reply).unwrap();
+        assert_eq!(store.draft(None), "typed while pending");
+        assert_eq!(
+            store
+                .draft_images(None)
+                .iter()
+                .map(ImageInput::label)
+                .collect::<Vec<_>>(),
+            ["next.png"]
+        );
+        assert_eq!(store.draft(Some("new-thread")), "");
+        assert!(store.draft_images(Some("new-thread")).is_empty());
     }
 
     #[test]
@@ -623,5 +990,454 @@ mod tests {
         store.remove_image(None, 0);
         assert_eq!(store.draft_images(None)[0].label(), "second.png");
         assert!(store.draft_images(Some("another-thread")).is_empty());
+    }
+
+    #[test]
+    fn sending_to_an_ended_codex_thread_reopens_it_then_delivers_the_message() {
+        let mut store = ready();
+        let id = "thread-ended".to_owned();
+        let row: crate::codex::history::ThreadRow = serde_json::from_value(serde_json::json!({
+            "id": id, "cwd": store.profile.project, "modelProvider": "openai", "preview": "hi"
+        }))
+        .unwrap();
+        store.catalog.insert(row);
+        let t = store.transcripts.entry(id.clone()).or_default();
+        t.ready = true;
+        t.verified = true;
+        store.end_session(&id).unwrap();
+        // The composer stays usable, and a plain send is accepted rather than refused.
+        assert!(store.is_ended(&id) && !store.can_send(Some(&id)));
+        assert!(store.can_compose(Some(&id)));
+        store.edit(Some(&id), "back again".into());
+        store.submit(Some(&id)).unwrap();
+        assert!(store.sending(Some(&id)), "the message waits for the resume");
+        assert!(!store.is_ended(&id), "live again, so no ended marker");
+        assert_eq!(store.draft(Some(&id)), "back again");
+        assert!(
+            store
+                .pending
+                .values()
+                .any(|(_, p)| matches!(p, Pending::Read(t) if t == &id)),
+            "the thread is read and resumed"
+        );
+        // Still resuming: nothing is sent yet.
+        store.drain(vec![], std::time::Instant::now());
+        assert!(store.sending(Some(&id)));
+        // Once the thread is verified and ready the queued message is submitted.
+        let t = store.transcripts.get_mut(&id).unwrap();
+        t.loading = false;
+        t.ready = true;
+        t.verified = true;
+        store.drain(vec![], std::time::Instant::now());
+        assert!(
+            store.pending.values().any(|(_, p)| matches!(
+                p,
+                Pending::Compose(Operation::Account(s)) if s.owner.as_deref() == Some(id.as_str())
+            )),
+            "the draft is submitted"
+        );
+        assert_eq!(store.draft(Some(&id)), "");
+    }
+
+    /// The host reaped the route and reopened it for a send: the replacement store is
+    /// connecting, and the thread (fresh, so absent from discovery) exists only as a
+    /// recovered id.
+    #[test]
+    fn a_connecting_codex_store_resumes_a_recovered_thread_absent_from_discovery() {
+        let mut store = ready();
+        store.state = Connection::Connecting;
+        store.restore_ended("fresh", "Fresh thread", 7, None);
+        assert!(store.can_compose(Some("fresh")));
+        // The send arrives while the runtime is still connecting.
+        store.edit(Some("fresh"), "after the reap".into());
+        store.submit(Some("fresh")).unwrap();
+        assert!(store.sending(Some("fresh")));
+        assert_eq!(
+            store.draft(Some("fresh")),
+            "after the reap",
+            "kept until delivery"
+        );
+        // The route comes up and lists the project; discovery does not know the thread.
+        store.connected().unwrap();
+        let list = store
+            .pending
+            .iter()
+            .find_map(|(id, (_, p))| matches!(p, Pending::List { .. }).then_some(*id))
+            .expect("first listing");
+        store.apply(LinkEvent::Frame(Frame::Reply {
+            id: RequestId::Number(list),
+            result: Ok(Reply::Threads(crate::codex::history::ThreadPage {
+                data: vec![],
+                next_cursor: None,
+            })),
+        }));
+        assert!(store.catalog.get("fresh").is_some(), "the listing keeps it");
+        assert!(
+            store
+                .pending
+                .values()
+                .any(|(_, p)| matches!(p, Pending::Read(t) if t == "fresh"))
+        );
+        let t = store.transcripts.get_mut("fresh").unwrap();
+        t.loading = false;
+        t.ready = true;
+        t.verified = true;
+        store.drain(vec![], std::time::Instant::now());
+        let delivered = store
+            .pending
+            .values()
+            .filter(|(_, p)| matches!(p, Pending::Compose(Operation::Account(s) | Operation::Send(s)) if s.owner.as_deref() == Some("fresh")))
+            .count();
+        assert_eq!(delivered, 1, "exactly one delivery");
+        assert_eq!(store.draft(Some("fresh")), "");
+    }
+
+    /// End with a sibling keeping the runtime up: a Read, Resume or History that was
+    /// already in flight must not bring the ended thread back when its reply lands.
+    #[test]
+    fn replies_in_flight_when_a_codex_thread_ends_do_not_reopen_it() {
+        let mut store = ready();
+        let t = store.transcripts.entry("gone".into()).or_default();
+        t.ready = true;
+        t.verified = true;
+        for (n, p) in [
+            Pending::Read("gone".into()),
+            Pending::Resume("gone".into()),
+            Pending::History("gone".into()),
+            Pending::Read("sibling".into()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store.pending.insert(
+                900 + n as i64,
+                (
+                    std::time::Instant::now() + std::time::Duration::from_secs(60),
+                    p,
+                ),
+            );
+        }
+        store.end_session("gone").unwrap();
+        assert!(
+            store.pending.values().all(|(_, p)| !matches!(
+                p,
+                Pending::Read(t) | Pending::Resume(t) | Pending::History(t) if t == "gone"
+            )),
+            "late replies for the ended thread are dropped"
+        );
+        assert!(
+            store
+                .pending
+                .values()
+                .any(|(_, p)| matches!(p, Pending::Read(t) if t == "sibling")),
+            "other threads keep their requests"
+        );
+        assert!(!store.has_live_session("gone"));
+    }
+
+    #[test]
+    fn a_recovered_thread_on_the_api_route_is_delivered_once_without_an_account_check() {
+        let mut store = ready();
+        store.profile.route = crate::runtime::Runtime::Codex.route(Some("alias".into()));
+        store.state = Connection::Connecting;
+        store.restore_ended("fresh", "Fresh", 1, None);
+        store.edit(Some("fresh"), "api send".into());
+        store.submit(Some("fresh")).unwrap();
+        store.connected().unwrap();
+        let t = store.transcripts.get_mut("fresh").unwrap();
+        t.loading = false;
+        t.ready = true;
+        t.verified = true;
+        store.drain(vec![], std::time::Instant::now());
+        let sends: Vec<_> = store
+            .pending
+            .values()
+            .filter(|(_, p)| matches!(p, Pending::Compose(_)))
+            .collect();
+        assert_eq!(sends.len(), 1, "exactly one delivery");
+        assert!(matches!(sends[0].1, Pending::Compose(Operation::Send(_))));
+    }
+
+    #[test]
+    fn an_image_only_draft_resumes_an_ended_codex_thread_and_the_ended_row_keeps_attach_image() {
+        let mut store = ready();
+        store.restore_ended("pics", "Pictures", 1, None);
+        let view = store.host_snapshot(&crate::host_protocol::Scope {
+            project: store.profile.project.clone(),
+            route: store.profile.route.clone(),
+        });
+        let caps = &view
+            .sessions
+            .iter()
+            .find(|s| s.id == "pics")
+            .unwrap()
+            .capabilities;
+        assert!(caps.iter().any(|c| c == "send") && caps.iter().any(|c| c == "ended"));
+        assert!(caps.iter().any(|c| c == "attach_image"), "{caps:?}");
+        store.attach_image(Some("pics"), ImageInput::File("/tmp/shot.png".into()));
+        store.submit(Some("pics")).unwrap();
+        assert!(store.sending(Some("pics")), "an image alone is a message");
+        assert_eq!(
+            store.draft_images(Some("pics")).len(),
+            1,
+            "kept until delivery"
+        );
+    }
+
+    #[test]
+    fn a_failed_resume_keeps_the_message_in_the_composer() {
+        let mut store = ready();
+        let id = "thread-gone".to_owned();
+        let row: crate::codex::history::ThreadRow = serde_json::from_value(serde_json::json!({
+            "id": id, "cwd": store.profile.project, "modelProvider": "openai"
+        }))
+        .unwrap();
+        store.catalog.insert(row);
+        store.mark_ended(&id);
+        store.edit(Some(&id), "keep me".into());
+        store.submit(Some(&id)).unwrap();
+        let t = store.transcripts.get_mut(&id).unwrap();
+        t.loading = false;
+        t.error = Some("gone".into());
+        store.drain(vec![], std::time::Instant::now());
+        assert!(!store.sending(Some(&id)));
+        assert_eq!(store.draft(Some(&id)), "keep me");
+        assert!(store.is_ended(&id));
+    }
+
+    #[test]
+    fn a_codex_thread_held_by_another_client_is_read_only_and_forkable() {
+        let mut store = ready();
+        let id = "thread-native".to_owned();
+        let row: crate::codex::history::ThreadRow = serde_json::from_value(serde_json::json!({
+            "id": id, "cwd": store.profile.project, "modelProvider": "openai"
+        }))
+        .unwrap();
+        store.catalog.insert(row);
+        store.selected = Some(id.clone());
+        store.transcripts.entry(id.clone()).or_default().loading = true;
+        // Codex refuses a second writer with this text; it is not a failure of the thread.
+        store.failed(
+            Pending::Resume(id.clone()),
+            format!("thread {id} already has an active writer"),
+        );
+        let t = store.transcript(&id).unwrap();
+        assert!(t.error().is_none());
+        assert!(store.is_native_live(&id));
+        assert!(!store.can_send(Some(&id)) && !store.can_compose(Some(&id)));
+        assert!(store.can_manage_thread(&id), "forkable into a new session");
+        assert!(
+            store
+                .pending
+                .values()
+                .any(|(_, p)| matches!(p, Pending::History(t) if t == &id)),
+            "the history is read without resuming"
+        );
+        assert_eq!(store.native_app(), "Codex");
+        assert!(store.native_live_hint().contains("running in Codex"));
+    }
+
+    #[test]
+    fn a_viewed_codex_thread_offers_only_what_a_viewer_can_own() {
+        let mut store = ready();
+        let id = "thread-viewed".to_owned();
+        let row: crate::codex::history::ThreadRow = serde_json::from_value(serde_json::json!({
+            "id": id, "cwd": store.profile.project, "modelProvider": "openai"
+        }))
+        .unwrap();
+        store.catalog.insert(row);
+        store.selected = Some(id.clone());
+        store.transcripts.entry(id.clone()).or_default().loading = true;
+        store.failed(
+            Pending::Resume(id.clone()),
+            format!("thread {id} already has an active writer"),
+        );
+        // The rollout read lands: the viewer now has a ready transcript.
+        let page: crate::codex::history::TurnPage = serde_json::from_value(serde_json::json!({
+            "data": [], "nextCursor": null
+        }))
+        .unwrap();
+        store.history_page(&id, page);
+        let t = store.transcripts.get_mut(&id).unwrap();
+        t.ready = true;
+        t.loading = false;
+        assert!(store.is_native_live(&id));
+        // Not a process OX owns: no End, not counted, not reaped as a process.
+        assert!(!store.has_live_session(&id) && !store.can_end_session(&id));
+        assert!(store.live_threads().is_empty());
+        assert!(store.end_session(&id).is_err());
+        assert!(
+            store
+                .pending
+                .values()
+                .all(|(_, p)| !matches!(p, Pending::Unsubscribe)),
+            "no unsubscribe is sent for a thread OX does not hold"
+        );
+        // Fork stays; Archive is refused by Codex for a non-owner, Rename is accepted.
+        assert!(store.can_manage_thread(&id));
+        assert!(
+            store
+                .manage_thread(&id, crate::store::ThreadOperation::Archive)
+                .is_err()
+        );
+        let scope = crate::host_protocol::Scope {
+            project: store.profile.project.clone(),
+            route: store.profile.route.clone(),
+        };
+        let view = store.host_snapshot(&scope);
+        let caps = &view
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap()
+            .capabilities;
+        assert!(caps.iter().any(|c| c == "fork") && caps.iter().any(|c| c == "rename"));
+        assert!(
+            !caps
+                .iter()
+                .any(|c| c == "archive" || c == "end" || c == "send"),
+            "{caps:?}"
+        );
+    }
+
+    #[test]
+    fn an_outstanding_native_read_does_not_leave_an_overdue_deadline() {
+        let mut store = ready();
+        let id = "thread-slow";
+        store.hold_native_read_for_test(id);
+        let overdue = |s: &Store| {
+            s.next_deadline()
+                .is_some_and(|at| at <= std::time::Instant::now())
+        };
+        assert!(
+            !overdue(&store),
+            "the host must sleep, not spin, on a slow read"
+        );
+        store.refresh_native(std::time::Instant::now(), false);
+        assert!(!overdue(&store));
+        // Once the read is answered the probe is due again at once.
+        store.pending.clear();
+        assert!(overdue(&store));
+    }
+
+    #[test]
+    fn an_ended_selected_thread_loads_its_history_after_a_rebuild() {
+        let mut old = ready();
+        let id = "thread-ended".to_owned();
+        let row: crate::codex::history::ThreadRow = serde_json::from_value(serde_json::json!({
+            "id": id, "cwd": old.profile.project, "modelProvider": "openai", "preview": "hi"
+        }))
+        .unwrap();
+        old.catalog.insert(row);
+        old.selected = Some(id.clone());
+        old.mark_ended(&id);
+        old.transcripts.entry(id.clone()).or_default();
+        let mut store = ready();
+        store.recover_from(&mut old);
+        assert!(store.is_ended(&id));
+        store.connected().unwrap();
+        assert!(
+            store
+                .pending
+                .values()
+                .any(|(_, p)| matches!(p, Pending::Read(t) if t == &id)),
+            "the selected ended thread is read again"
+        );
+        assert!(store.transcript(&id).unwrap().is_loading());
+        let page: crate::codex::history::TurnPage = serde_json::from_value(serde_json::json!({
+            "data": [], "nextCursor": null
+        }))
+        .unwrap();
+        store.history_page(&id, page);
+        assert!(!store.transcript(&id).unwrap().is_loading());
+        // An ended thread that is not selected stays closed.
+        let mut other = ready();
+        other.mark_ended("quiet");
+        other.transcripts.entry("quiet".into()).or_default().loading = true;
+        let mut next = ready();
+        next.recover_from(&mut other);
+        next.connected().unwrap();
+        assert!(
+            next.pending
+                .values()
+                .all(|(_, p)| !matches!(p, Pending::Read(_)))
+        );
+    }
+
+    #[test]
+    fn a_refused_stop_finishes_done() {
+        use crate::codex::activity::{Activity, Change};
+        let mut store = ready();
+        let id = "thread-stop".to_owned();
+        let t = store.transcripts.entry(id.clone()).or_default();
+        t.ready = true;
+        t.verified = true;
+        t.active_turn = Some("turn-1".into());
+        store.stop(&id).unwrap();
+        store.compose_failed(Operation::Stop(id.clone()), "stop refused".into());
+        let t = store.transcripts.get_mut(&id).unwrap();
+        t.apply_activity(Activity {
+            thread: id.clone(),
+            turn: "turn-1".into(),
+            change: Change::TurnCompleted {
+                error: None,
+                interrupted: false,
+            },
+        });
+        assert!(
+            !t.interrupted() && t.active_turn().is_none(),
+            "rejected stop must finish normally"
+        );
+        t.apply_activity(Activity {
+            thread: id.clone(),
+            turn: "turn-2".into(),
+            change: Change::TurnStarted,
+        });
+        assert!(!t.interrupted(), "a new turn clears the marker");
+        t.apply_activity(Activity {
+            thread: id,
+            turn: "turn-2".into(),
+            change: Change::TurnCompleted {
+                error: None,
+                interrupted: false,
+            },
+        });
+        assert!(!t.interrupted(), "a finished turn is done");
+    }
+    #[test]
+    fn a_stopped_turn_completes_as_interrupted_not_done() {
+        use crate::codex::activity::{Activity, Change};
+        let mut store = ready();
+        let id = "thread-stop".to_owned();
+        let t = store.transcripts.entry(id.clone()).or_default();
+        t.ready = true;
+        t.verified = true;
+        t.active_turn = Some("turn-1".into());
+        store.stop(&id).unwrap();
+        let t = store.transcripts.get_mut(&id).unwrap();
+        t.apply_activity(Activity {
+            thread: id.clone(),
+            turn: "turn-1".into(),
+            change: Change::TurnCompleted {
+                error: None,
+                interrupted: false,
+            },
+        });
+        assert!(t.interrupted() && t.active_turn().is_none());
+        t.apply_activity(Activity {
+            thread: id.clone(),
+            turn: "turn-2".into(),
+            change: Change::TurnStarted,
+        });
+        assert!(!t.interrupted(), "a new turn clears the marker");
+        t.apply_activity(Activity {
+            thread: id,
+            turn: "turn-2".into(),
+            change: Change::TurnCompleted {
+                error: None,
+                interrupted: false,
+            },
+        });
+        assert!(!t.interrupted(), "a finished turn is done");
     }
 }

@@ -20,7 +20,12 @@ impl Engine {
     /// The grant covering a YOLO child of this session: one stored with the
     /// session or an ancestor (worker parents and handoff sources), or the
     /// project default from `[workers] yolo_grant_projects`.
-    pub(super) fn yolo_grant(&self, scope: &Scope, session: &str) -> Option<YoloAllowance> {
+    pub(super) fn yolo_grant(&mut self, scope: &Scope, session: &str) -> Option<YoloAllowance> {
+        let now = crate::durable::unix_now();
+        if self.ledger.data.grants.iter().any(|g| !g.live(now)) {
+            // Expired grants stop counting and are dropped from the ledger.
+            let _ = self.ledger.change(|d| d.grants.retain(|g| g.live(now)));
+        }
         let mut current = Some((scope.clone(), session.to_owned()));
         for _ in 0..64 {
             let Some((s, id)) = current.take() else { break };
@@ -29,7 +34,7 @@ impl Engine {
                 .data
                 .grants
                 .iter()
-                .any(|g| g.scope == s && g.session == id)
+                .any(|g| g.scope == s && g.session == id && g.live(now))
             {
                 return Some(YoloAllowance::Grant {
                     project: s.project.clone(),
@@ -43,14 +48,228 @@ impl Engine {
                 ))
             });
         }
-        let projects = self.config.prepare().ok()?.yolo_grant_projects;
-        projects
+        let by_default = self
+            .yolo_projects()
             .iter()
-            .any(|p| p == &scope.project || p.canonicalize().ok().as_ref() == Some(&scope.project))
-            .then(|| YoloAllowance::Grant {
-                project: scope.project.clone(),
-                session: None,
+            .any(|p| p == &scope.project || p.canonicalize().ok().as_ref() == Some(&scope.project));
+        if by_default {
+            self.announce_yolo_default(scope);
+        }
+        by_default.then(|| YoloAllowance::Grant {
+            project: scope.project.clone(),
+            session: None,
+        })
+    }
+
+    /// Tell the operator, once per project and host run, that a session started under the
+    /// project's YOLO default, and log it.
+    fn announce_yolo_default(&mut self, scope: &Scope) {
+        if !self.yolo_announced.insert(scope.project.clone()) {
+            return;
+        }
+        ox_host_service::errlog::record(&format!(
+            "YOLO default applied for {}",
+            scope.project.display()
+        ));
+        if let Some(live) = self.running.get_mut(scope) {
+            live.store
+                .post_notice("YOLO is on for this project by default. Change it in Settings.");
+        }
+    }
+
+    /// Whether the worker of this job is running or waiting for the operator.
+    fn worker_active(&self, job_id: u64) -> bool {
+        self.job_status(job_id).is_ok_and(|s| {
+            matches!(
+                s["status"].as_str(),
+                Some("running" | "waiting_for_operator")
+            )
+        })
+    }
+
+    /// Refuse a worker start when this parent already runs the maximum number of workers.
+    pub(super) fn check_worker_cap(&self, parent: &ParentRef) -> Result<(), String> {
+        self.check_worker_cap_with(
+            parent,
+            crate::workers::env_limit("OX_WORKER_MAX_PER_PARENT").map(|c| c as usize),
+        )
+    }
+
+    /// The cap check with the limit given. No limit by default: it is opt-in.
+    pub(super) fn check_worker_cap_with(
+        &self,
+        parent: &ParentRef,
+        cap: Option<usize>,
+    ) -> Result<(), String> {
+        let Some(cap) = cap else {
+            return Ok(());
+        };
+        let started = self
+            .workers
+            .jobs()
+            .filter(|(_, _, e)| &e.origin.parent == parent)
+            .filter(|(_, _, e)| self.worker_active(e.origin.job_id))
+            .count();
+        let starting = self
+            .running
+            .values()
+            .filter_map(|l| l.launching.as_ref())
+            .filter(|l| l.origin.job_id != 0 && &l.origin.parent == parent)
+            .count()
+            + self
+                .asking
+                .values()
+                .filter(|a| &a.origin.parent == parent)
+                .count();
+        if started + starting >= cap {
+            return Err(format!(
+                "This session already runs {cap} workers. Wait for one to finish or cancel one. The limit is OX_WORKER_MAX_PER_PARENT."
+            ));
+        }
+        Ok(())
+    }
+
+    /// A caution when another running worker can write in the same project.
+    pub(super) fn write_overlap(
+        &self,
+        scope: &Scope,
+        level: ox_desk_core::origin::Ceiling,
+    ) -> Option<String> {
+        if level < ox_desk_core::origin::Ceiling::Write {
+            return None;
+        }
+        self.workers
+            .jobs()
+            .any(|(_, _, e)| {
+                e.origin.parent.project == scope.project
+                    && e.origin.ceiling >= ox_desk_core::origin::Ceiling::Write
+                    && self.worker_active(e.origin.job_id)
             })
+            .then(|| {
+                "Another write worker is editing this project. Consider a separate git worktree."
+                    .to_owned()
+            })
+    }
+
+    /// Record how each worker's latest run ended, from the live store, while the
+    /// answer is still readable. The record is only the final answer: the transcript
+    /// stays in the runtime's own history. A run in progress clears it. Returns whether
+    /// any record changed, so the caller can republish the rows that carry it.
+    pub(super) fn capture_finals(&mut self, scope: &Scope) -> bool {
+        let Some(live) = self.running.get(scope) else {
+            return false;
+        };
+        let ready = live.store.state() == &Connection::Ready;
+        let operators = self.operators();
+        let mut updates: Vec<(String, Option<crate::workers::Last>)> = Vec::new();
+        for (id, entry) in self.workers.in_scope(scope) {
+            if entry.origin.relation != Relation::Worker || entry.marks.cancelled {
+                continue;
+            }
+            let view = live.state.sessions.iter().find(|v| v.id == id);
+            let timeline = live.state.transcripts.get(id);
+            let native = id.rsplit(':').next().unwrap_or(id);
+            let status =
+                crate::workers::status(entry, id, native, view, timeline, ready, operators);
+            let next = match status["status"].as_str() {
+                Some("completed" | "failed") if timeline.is_some() => {
+                    Some(Some(crate::workers::Last {
+                        status: status["status"].as_str().unwrap_or("completed").to_owned(),
+                        result: status["result"].as_str().map(str::to_owned),
+                        error: status["error"].as_str().map(str::to_owned),
+                    }))
+                }
+                // A stop the runtime confirmed, with the partial text it left. A route that
+                // merely closed is interrupted too, but says nothing about the run's end.
+                Some("interrupted")
+                    if timeline.is_some_and(|t| t.detail["interrupted"] == true) =>
+                {
+                    Some(Some(crate::workers::Last {
+                        status: "interrupted".to_owned(),
+                        result: status["result"].as_str().map(str::to_owned),
+                        error: None,
+                    }))
+                }
+                Some("running" | "waiting_for_operator") => Some(None),
+                _ => None,
+            };
+            if let Some(next) = next
+                && entry.marks.last != next
+            {
+                updates.push((id.to_owned(), next));
+            }
+        }
+        let changed = !updates.is_empty();
+        for (id, last) in updates {
+            if let Some(entry) = self.workers.get_mut(scope, &id) {
+                entry.marks.last = last;
+            }
+        }
+        changed
+    }
+
+    /// Stop workers that ran past their wall-clock limit.
+    pub(super) fn expire_workers(&mut self) -> io::Result<()> {
+        let now = crate::durable::unix_now();
+        let due: Vec<(Scope, String)> = self
+            .workers
+            .jobs()
+            .filter(|(_, _, e)| {
+                let m = &e.marks;
+                !m.expired
+                    && !m.cancelled
+                    && m.max_minutes.is_some_and(|max| {
+                        // The current run's start: a continued worker is measured from
+                        // its continuation, not from the original launch.
+                        let began = if m.run_started_at > 0 {
+                            m.run_started_at
+                        } else {
+                            m.started_at
+                        };
+                        began > 0 && now - began >= i64::from(max) * 60
+                    })
+            })
+            .filter(|(_, _, e)| self.worker_active(e.origin.job_id))
+            .map(|(s, id, _)| (s.clone(), id.to_owned()))
+            .collect();
+        for (scope, id) in due {
+            if let Some(live) = self.running.get_mut(&scope) {
+                let _ = live.store.stop(&id);
+            }
+            if let Some(entry) = self.workers.get_mut(&scope, &id) {
+                entry.marks.expired = true;
+                entry.marks.cancelled = true;
+            }
+            self.persist_marks(&scope)?;
+        }
+        Ok(())
+    }
+
+    /// Drop the grants a session gave: they end with the session.
+    pub(super) fn drop_grant(&mut self, scope: &Scope, session: &str) -> io::Result<()> {
+        if self
+            .ledger
+            .data
+            .grants
+            .iter()
+            .any(|g| &g.scope == scope && g.session == session)
+        {
+            self.ledger.change(|d| {
+                d.grants
+                    .retain(|g| !(&g.scope == scope && g.session == session))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// The project default from the settings snapshot. A failed read is retried once, and when
+    /// it still fails the last value read is kept, so a transient failure cannot deny a project
+    /// the operator already allowed.
+    fn yolo_projects(&mut self) -> Vec<PathBuf> {
+        if let Some(prepared) = (0..2).find_map(|_| self.config.prepare().ok()) {
+            self.yolo_projects = prepared.yolo_grant_projects;
+        }
+        self.yolo_projects.clone()
     }
 
     /// Hold a YOLO child for the operator and tell the parent at once.
@@ -84,6 +303,16 @@ impl Engine {
             .filter(|a| a.origin.parent.scope.as_ref() == Some(scope))
             .ok_or_else(|| io::Error::other("This YOLO request was already answered."))?;
         let mut origin = a.origin.clone();
+        // The worker starts only for a parent that is still live.
+        let parent_live = a.origin.parent.session.as_deref().is_some_and(|t| {
+            self.running
+                .get(scope)
+                .is_some_and(|l| l.store.catalog_row(t).is_some() && !l.store.is_ended(t))
+        });
+        if !parent_live {
+            self.withdraw_with(job, ENDED_PARENT)?;
+            return Err(io::Error::other(ENDED_PARENT));
+        }
         match answer {
             crate::yolo::Answer::Decline => {
                 self.asking.remove(&job);
@@ -150,9 +379,15 @@ impl Engine {
         let grant = Grant {
             scope: scope.clone(),
             session: session.to_owned(),
+            granted_at: crate::durable::unix_now(),
         };
+        if on && let Some(live) = self.running.get_mut(scope) {
+            live.store
+                .post_notice("YOLO grant on for this session. It expires after 12 hours or when the session ends.");
+        }
         self.ledger.change(|d| {
-            d.grants.retain(|g| g != &grant);
+            d.grants
+                .retain(|g| !(g.scope == grant.scope && g.session == grant.session));
             if on {
                 d.grants.push(grant);
             }
@@ -667,6 +902,13 @@ impl Engine {
     }
     /// A parent may withdraw its own YOLO request before the operator answers.
     pub(super) fn withdraw(&mut self, job_id: u64) -> io::Result<Option<Value>> {
+        self.withdraw_with(
+            job_id,
+            "The parent withdrew the request before the operator answered.",
+        )
+    }
+    /// Withdraw a pending YOLO request, recording `message` as why it was cancelled.
+    fn withdraw_with(&mut self, job_id: u64, message: &str) -> io::Result<Option<Value>> {
         let Some(a) = self.asking.remove(&job_id) else {
             return Ok(None);
         };
@@ -676,7 +918,7 @@ impl Engine {
             d.outcomes.push(Outcome {
                 origin,
                 status: "cancelled".into(),
-                message: "The parent withdrew the request before the operator answered.".into(),
+                message: message.into(),
             });
         })?;
         if let Some(parent) = a
@@ -690,7 +932,65 @@ impl Engine {
         }
         Ok(Some(json!({"job_id": job_id, "status": "cancelled"})))
     }
+    /// Withdraw every pending YOLO request whose parent is this session or one of its
+    /// workers (at any depth), so an ended session leaves no request to answer.
+    pub(super) fn withdraw_asks_under(&mut self, scope: &Scope, thread: &str) -> io::Result<()> {
+        let mut parents = vec![(scope.clone(), thread.to_owned())];
+        let mut next = 0;
+        while next < parents.len() {
+            let (s, t) = parents[next].clone();
+            let kids: Vec<(Scope, String)> = self
+                .workers
+                .children_of(&s, &t)
+                .map(|(cs, cid)| (cs.clone(), cid.to_owned()))
+                .collect();
+            for kid in kids {
+                if !parents.contains(&kid) {
+                    parents.push(kid);
+                }
+            }
+            next += 1;
+        }
+        let under = |o: &Origin| match (o.parent.scope.as_ref(), o.parent.session.as_deref()) {
+            (Some(s), Some(t)) => parents.iter().any(|(ps, pt)| ps == s && pt == t),
+            _ => false,
+        };
+        let jobs: Vec<u64> = self
+            .asking
+            .iter()
+            .filter(|(_, a)| under(&a.origin))
+            .map(|(job, _)| *job)
+            .collect();
+        for job in jobs {
+            self.withdraw_with(job, ENDED_PARENT)?;
+        }
+        // A request recorded in the ledger but not held in memory is cancelled too.
+        let stale: Vec<Origin> = self
+            .ledger
+            .data
+            .asking
+            .iter()
+            .filter(|o| under(o))
+            .cloned()
+            .collect();
+        if !stale.is_empty() {
+            self.ledger.change(|d| {
+                d.asking.retain(|o| !under(o));
+                for origin in stale {
+                    d.outcomes.push(Outcome {
+                        origin,
+                        status: "cancelled".into(),
+                        message: ENDED_PARENT.into(),
+                    });
+                }
+            })?;
+        }
+        Ok(())
+    }
 }
+
+/// Why a YOLO request is refused or cancelled once the session that asked for it is gone.
+pub(super) const ENDED_PARENT: &str = "The session that asked for this worker has ended.";
 
 enum Step {
     Wait(Reading),

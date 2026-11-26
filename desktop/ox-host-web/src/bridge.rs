@@ -118,6 +118,79 @@ impl Access {
         }
         Ok(())
     }
+    /// Whether a scope may be subscribed: listed in the hello, or discovered on this host.
+    fn reachable(&self, app: &App, scope: &Scope) -> bool {
+        // Any catalog alias may run on either runtime, starred or not, and the Hello can
+        // predate model discovery (no routes at all), so a new scope for an API route needs
+        // no listed route: the host validates the provider and alias at launch. Subscription
+        // routes still have to be listed.
+        (self.projects.contains(&scope.project)
+            && (self.routes.contains(&scope.route) || scope.route.is_api()))
+            || app.discovered.lock().unwrap().contains(scope)
+    }
+    /// A request that passed auth but was refused for its content: the request id, if it has
+    /// one, and the reason. Those are answered with an error frame. Protocol and auth violations
+    /// return `None` and still close the socket.
+    fn invalid(&self, app: &App, req: &Client) -> Option<(Option<String>, String)> {
+        if let Client::Subscribe {
+            scope: Some(scope), ..
+        } = req
+        {
+            if !self.ready || self.reachable(app, scope) {
+                return None;
+            }
+            return Some((
+                None,
+                "This session's route is not available on this host. Check that the host can read its settings, then try again."
+                    .into(),
+            ));
+        }
+        let Client::Act {
+            id,
+            scope,
+            action,
+            approval,
+        } = req
+        else {
+            return None;
+        };
+        if !self.ready
+            || self.selected.as_ref() != Some(scope)
+            || id.is_empty()
+            || id.len() > 96
+            || approval.is_some()
+        {
+            return None;
+        }
+        let message = match action {
+            Action::StartWorker(start) => start.validate().err()?,
+            Action::StartHandoff(start) => start.validate().err()?,
+            Action::YoloGrant(grant, _) if grant.is_empty() || grant.len() > 512 => {
+                "This approval target is not valid. Reopen the session and try again.".into()
+            }
+            Action::Mention(_, Some(query)) if query.len() > 512 => {
+                "That mention search is too long. Shorten it and try again.".into()
+            }
+            Action::SendImages(_, text, images) => {
+                if text.len() > 128 * 1024 {
+                    "This message is too long to send with images. Shorten it and try again.".into()
+                } else if images.is_empty() || images.len() > 4 || !images.iter().all(valid_upload)
+                {
+                    "Attach up to 4 images pasted from this device, then send again.".into()
+                } else {
+                    return None;
+                }
+            }
+            Action::SetNextAccess(mode) | Action::SetAccess(_, mode)
+                if !ox_desk_core::runtime::Access::choices(scope.route.runtime).contains(mode) =>
+            {
+                "That access mode is not available for this route. Choose another and try again."
+                    .into()
+            }
+            _ => return None,
+        };
+        Some((Some(id.clone()), message))
+    }
     fn permit(&mut self, app: &App, req: &Client) -> bool {
         match req {
             Client::Hello { version } if !self.hello && *version == VERSION => {
@@ -134,11 +207,12 @@ impl Access {
                 self.selected = None;
                 true
             }
-            Client::Subscribe { scope, .. } if self.ready => {
-                if scope.as_ref().is_some_and(|s| {
-                    (!self.projects.contains(&s.project) || !self.routes.contains(&s.route))
-                        && !app.discovered.lock().unwrap().contains(s)
-                }) {
+            // A read-only listing of the host's live processes, answered by `Server::Processes`.
+            Client::ListProcesses { id } if self.ready && id.len() <= 96 && !id.is_empty() => true,
+            Client::Subscribe {
+                scope, terminal, ..
+            } if self.ready && !terminal => {
+                if scope.as_ref().is_some_and(|s| !self.reachable(app, s)) {
                     return false;
                 }
                 self.selected = scope.clone();
@@ -165,6 +239,8 @@ impl Access {
                     | Action::ModelOptions(..)
                     | Action::LoadOlder(_)
                     | Action::Stop(_)
+                    | Action::EndSession(_)
+                    | Action::ForceEndSession(_)
                     | Action::SendText(..) => approval.is_none(),
                     Action::StartWorker(start) => approval.is_none() && start.validate().is_ok(),
                     Action::StartHandoff(start) => approval.is_none() && start.validate().is_ok(),
@@ -229,7 +305,15 @@ pub(crate) async fn session(app: App, id: String, mut ws: WebSocket) {
                 match msg{
                     Message::Text(s)=>{
                         let Ok(req)=serde_json::from_str::<Client>(&s) else{break};
-                        if !access.permit(&app,&req) || !app.state.lock().unwrap().alive(&id){break}
+                        if !access.permit(&app,&req) {
+                            // Answer the refused request with its reason and keep the socket open.
+                            let Some((request,message))=access.invalid(&app,&req) else{break};
+                            if !app.state.lock().unwrap().alive(&id){break}
+                            let Ok(frame)=serde_json::to_string(&Server::Error{id:request,message}) else{break};
+                            if !matches!(timeout(Duration::from_secs(8),ws.send(Message::Text(frame.into()))).await,Ok(Ok(()))){break}
+                            continue;
+                        }
+                        if !app.state.lock().unwrap().alive(&id){break}
                         if !matches!(timeout(Duration::from_secs(5),write(&mut w,&req)).await,Ok(Ok(()))){break}
                     }
                     Message::Ping(_) | Message::Pong(_)=>{},
@@ -250,6 +334,7 @@ pub(crate) async fn session(app: App, id: String, mut ws: WebSocket) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ox_desk_core::runtime::Runtime;
     #[test]
     fn browser_actions_use_subscribed_route_and_native_permission_modes() {
         let dir = tempfile::tempdir().unwrap();
@@ -287,14 +372,16 @@ mod tests {
             &app,
             &Client::Subscribe {
                 scope: Some(other.clone()),
-                after: None
+                after: None,
+                terminal: false,
             }
         ));
         assert!(a.permit(
             &app,
             &Client::Subscribe {
                 scope: Some(scope.clone()),
-                after: None
+                after: None,
+                terminal: false,
             }
         ));
         let act = |s: Scope, action, approval| Client::Act {
@@ -335,6 +422,403 @@ mod tests {
                 scope,
                 Action::AnswerAsk(ox_desk_core::runtime::RequestId::Number(1), 0),
                 None
+            )
+        ));
+    }
+
+    #[test]
+    fn refused_content_answers_its_request_and_keeps_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let app = App {
+            state: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::state::State::load(dir.path()).unwrap(),
+            )),
+            host: Default::default(),
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            discovered: Default::default(),
+        };
+        let route = Route::CODEX_SUBSCRIPTION;
+        let scope = Scope {
+            project: "/approved".into(),
+            route: route.clone(),
+        };
+        let mut a = Access::default();
+        assert!(a.permit(&app, &Client::Hello { version: VERSION }));
+        let hello = Server::Hello {
+            version: VERSION,
+            projects: vec![scope.project.clone()],
+            routes: vec![route.clone()],
+            capabilities: vec![],
+            host: None,
+        };
+        a.host(&app, &serde_json::to_vec(&hello).unwrap()).unwrap();
+        assert!(a.permit(
+            &app,
+            &Client::Subscribe {
+                scope: Some(scope.clone()),
+                after: None,
+                terminal: false,
+            }
+        ));
+        let act = |action, approval: Option<String>| Client::Act {
+            id: "request".into(),
+            scope: scope.clone(),
+            action,
+            approval,
+        };
+        let image = || {
+            ox_desk_core::mentions::ImageInput::Clipboard(
+                "image/png".into(),
+                "data:image/png;base64,AAAA".into(),
+            )
+        };
+        let refused = [
+            act(
+                Action::SendImages(None, "x".repeat(128 * 1024 + 1), vec![image()]),
+                None,
+            ),
+            act(Action::SendImages(None, "hi".into(), vec![]), None),
+            act(
+                Action::SendImages(
+                    None,
+                    "hi".into(),
+                    vec![ox_desk_core::mentions::ImageInput::File(
+                        "/etc/passwd".into(),
+                    )],
+                ),
+                None,
+            ),
+            act(Action::Mention(None, Some("q".repeat(513))), None),
+            act(Action::YoloGrant(String::new(), true), None),
+            act(
+                Action::SetAccess(
+                    "thread".into(),
+                    ox_desk_core::runtime::Access::BypassPermissions,
+                ),
+                None,
+            ),
+            act(
+                Action::SetNextAccess(ox_desk_core::runtime::Access::BypassPermissions),
+                None,
+            ),
+        ];
+        for req in &refused {
+            assert!(!a.permit(&app, req));
+            let (id, message) = a.invalid(&app, req).expect("content refusal is answered");
+            assert_eq!(id.as_deref(), Some("request"));
+            assert!(!message.is_empty());
+            let frame = serde_json::to_value(Server::Error { id, message }).unwrap();
+            assert_eq!(frame["type"], "error");
+            assert_eq!(frame["id"], "request");
+        }
+
+        // Content that passes is not answered as a refusal.
+        assert!(a.permit(
+            &app,
+            &act(Action::SendImages(None, "hi".into(), vec![image()]), None)
+        ));
+        assert!(
+            a.invalid(
+                &app,
+                &act(Action::SendImages(None, "hi".into(), vec![image()]), None)
+            )
+            .is_none()
+        );
+
+        // Protocol violations still close: an approval on a content refusal is not answered.
+        let approved = act(
+            Action::SendImages(None, "hi".into(), vec![]),
+            Some("yes".into()),
+        );
+        assert!(!a.permit(&app, &approved));
+        assert!(a.invalid(&app, &approved).is_none());
+    }
+
+    #[test]
+    fn refused_start_answers_its_request_and_keeps_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let app = App {
+            state: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::state::State::load(dir.path()).unwrap(),
+            )),
+            host: Default::default(),
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            discovered: Default::default(),
+        };
+        let route = Route::CODEX_SUBSCRIPTION;
+        let scope = Scope {
+            project: "/approved".into(),
+            route: route.clone(),
+        };
+        let blank_handoff = || Client::Act {
+            id: "handoff-1".into(),
+            scope: scope.clone(),
+            action: Action::StartHandoff(ox_desk_core::handoff::HandoffStart {
+                source: "thread".into(),
+                runtime: route.runtime,
+                model: None,
+                mode: Default::default(),
+                request: "  \n".into(),
+                yolo_confirmed: false,
+            }),
+            approval: None,
+        };
+
+        // Before the device has said hello and subscribed, nothing is answered: close.
+        let mut a = Access::default();
+        assert!(a.invalid(&app, &blank_handoff()).is_none());
+
+        assert!(a.permit(&app, &Client::Hello { version: VERSION }));
+        let hello = Server::Hello {
+            version: VERSION,
+            projects: vec![scope.project.clone()],
+            routes: vec![route.clone()],
+            capabilities: vec![],
+            host: None,
+        };
+        a.host(&app, &serde_json::to_vec(&hello).unwrap()).unwrap();
+        assert!(a.permit(
+            &app,
+            &Client::Subscribe {
+                scope: Some(scope.clone()),
+                after: None,
+                terminal: false,
+            }
+        ));
+
+        // The refused start is a validation failure: it gets the reason keyed by its id.
+        let req = blank_handoff();
+        assert!(!a.permit(&app, &req));
+        let (id, message) = a
+            .invalid(&app, &req)
+            .expect("validation refusal is answered");
+        assert_eq!(id.as_deref(), Some("handoff-1"));
+        assert_eq!(message, "Write the request for the new session.");
+        let frame = serde_json::to_value(Server::Error { id, message }).unwrap();
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["id"], "handoff-1");
+
+        // A start that carries an approval is a protocol violation: close, do not answer.
+        let mut approved = blank_handoff();
+        if let Client::Act { approval, .. } = &mut approved {
+            *approval = Some("yes".into());
+        }
+        assert!(!a.permit(&app, &approved));
+        assert!(a.invalid(&app, &approved).is_none());
+    }
+
+    #[test]
+    fn refused_subscribe_answers_with_an_error_and_keeps_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let app = App {
+            state: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::state::State::load(dir.path()).unwrap(),
+            )),
+            host: Default::default(),
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            discovered: Default::default(),
+        };
+        let route = Route::CODEX_SUBSCRIPTION;
+        let scope = Scope {
+            project: "/approved".into(),
+            route: route.clone(),
+        };
+        let subscribe = |s: &Scope| Client::Subscribe {
+            scope: Some(s.clone()),
+            after: None,
+            terminal: false,
+        };
+        let mut unlisted = scope.clone();
+        unlisted.project = "/unlisted".into();
+
+        // Before the hello is accepted, a subscribe is a protocol violation: close, do not answer.
+        let mut a = Access::default();
+        assert!(a.invalid(&app, &subscribe(&scope)).is_none());
+
+        assert!(a.permit(&app, &Client::Hello { version: VERSION }));
+        let hello = Server::Hello {
+            version: VERSION,
+            projects: vec![scope.project.clone()],
+            routes: vec![route.clone()],
+            capabilities: vec![],
+            host: None,
+        };
+        a.host(&app, &serde_json::to_vec(&hello).unwrap()).unwrap();
+        assert!(a.permit(&app, &subscribe(&scope)));
+
+        // A scope outside the hello is refused with a reason that carries no request id.
+        let req = subscribe(&unlisted);
+        assert!(!a.permit(&app, &req));
+        let (id, message) = a
+            .invalid(&app, &req)
+            .expect("refused subscribe is answered");
+        assert_eq!(id, None);
+        assert!(message.contains("not available on this host"));
+        let frame = serde_json::to_value(Server::Error { id, message }).unwrap();
+        assert_eq!(frame["type"], "error");
+        assert!(frame.get("id").is_none_or(|v| v.is_null()));
+
+        // A discovered scope stays subscribable even when the hello does not list it.
+        app.discovered.lock().unwrap().insert(unlisted.clone());
+        assert!(a.permit(&app, &req));
+    }
+
+    #[test]
+    fn end_session_follows_stop_and_process_listing_is_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let app = App {
+            state: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::state::State::load(dir.path()).unwrap(),
+            )),
+            host: Default::default(),
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            discovered: Default::default(),
+        };
+        let route = Route::CODEX_SUBSCRIPTION;
+        let scope = Scope {
+            project: "/approved".into(),
+            route: route.clone(),
+        };
+        let mut other = scope.clone();
+        other.project = "/other".into();
+        let list = || Client::ListProcesses {
+            id: "processes".into(),
+        };
+        let act = |s: Scope, action, approval| Client::Act {
+            id: "request".into(),
+            scope: s,
+            action,
+            approval,
+        };
+
+        // Nothing is allowed before the host's hello.
+        let mut a = Access::default();
+        assert!(!a.permit(&app, &list()));
+        assert!(a.permit(&app, &Client::Hello { version: VERSION }));
+        assert!(!a.permit(&app, &list()));
+        let hello = Server::Hello {
+            version: VERSION,
+            projects: vec![scope.project.clone()],
+            routes: vec![route],
+            capabilities: vec!["end".into(), "processes".into()],
+            host: None,
+        };
+        a.host(&app, &serde_json::to_vec(&hello).unwrap()).unwrap();
+
+        // The process listing needs no subscription, and an empty id is refused.
+        assert!(a.permit(&app, &list()));
+        assert!(!a.permit(&app, &Client::ListProcesses { id: String::new() }));
+
+        // Ending needs the subscribed scope and no approval, as Stop does.
+        assert!(!a.permit(
+            &app,
+            &act(scope.clone(), Action::EndSession("thread".into()), None)
+        ));
+        assert!(a.permit(
+            &app,
+            &Client::Subscribe {
+                scope: Some(scope.clone()),
+                after: None,
+                terminal: false,
+            }
+        ));
+        assert!(!a.permit(&app, &act(other, Action::EndSession("thread".into()), None)));
+        assert!(!a.permit(
+            &app,
+            &act(
+                scope.clone(),
+                Action::EndSession("thread".into()),
+                Some("yes".into())
+            )
+        ));
+        assert!(a.permit(
+            &app,
+            &act(scope.clone(), Action::EndSession("thread".into()), None)
+        ));
+        assert!(a.permit(
+            &app,
+            &act(
+                scope.clone(),
+                Action::ForceEndSession("thread".into()),
+                None
+            )
+        ));
+        assert!(a.permit(&app, &list()));
+    }
+
+    fn cold_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let app = App {
+            state: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::state::State::load(dir.path()).unwrap(),
+            )),
+            host: Default::default(),
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            discovered: Default::default(),
+        };
+        (dir, app)
+    }
+
+    #[test]
+    fn a_cold_hello_without_routes_still_accepts_any_catalog_alias_for_a_new_scope() {
+        let (_dir, app) = cold_app();
+        let mut a = Access::default();
+        assert!(a.permit(&app, &Client::Hello { version: VERSION }));
+        let hello = Server::Hello {
+            version: VERSION,
+            projects: vec!["/approved".into()],
+            routes: vec![],
+            capabilities: vec![],
+            host: None,
+        };
+        a.host(&app, &serde_json::to_vec(&hello).unwrap()).unwrap();
+        let subscribe = |project: &str, route: Route| Client::Subscribe {
+            scope: Some(Scope {
+                project: project.into(),
+                route,
+            }),
+            after: None,
+            terminal: false,
+        };
+        // Discovery finished after the Hello: an unstarred alias opens on both runtimes.
+        for runtime in [Runtime::Codex, Runtime::Claude] {
+            assert!(a.permit(
+                &app,
+                &subscribe("/approved", runtime.route(Some("fixture/unstarred".into())))
+            ));
+        }
+        // A subscription route nobody listed, and a project nobody approved, stay refused.
+        assert!(!a.permit(&app, &subscribe("/approved", Route::CODEX_SUBSCRIPTION)));
+        assert!(!a.permit(
+            &app,
+            &subscribe(
+                "/other",
+                Runtime::Claude.route(Some("fixture/unstarred".into()))
             )
         ));
     }

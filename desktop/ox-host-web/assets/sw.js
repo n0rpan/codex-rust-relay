@@ -1,12 +1,14 @@
 // Only the static shell is cached. Device proofs, session frames and approvals stay off disk.
-const shell = "ox-remote-shell-v5";
+const shell = "ox-remote-shell-v9";
 const files = [
   "/",
   "/app.js",
   "/operator.js",
   "/composer-tools.js",
+  "/activity.js",
   "/model.js",
   "/controls.js",
+  "/sky.js",
   "/settings.js",
   "/settings.css",
   "/device.js",
@@ -64,8 +66,8 @@ self.addEventListener("fetch", (event) => {
 const labels = {
   finished: "Turn finished",
   failed: "Turn failed",
-  approval: "Approval needed",
-  question: "Question waiting",
+  approval: "Needs you · approval",
+  question: "Needs you · question",
 };
 self.addEventListener("push", (event) => {
   let p;

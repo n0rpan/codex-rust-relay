@@ -56,7 +56,17 @@ pub struct Transcript {
     // Number of history rows inserted at the front, used to preserve the viewport.
     prepended: usize,
     pub(crate) last_finished: Option<String>,
+    /// The turn the user asked to stop, so its completion reads as stopped, not done.
+    pub(crate) stop_requested: Option<String>,
+    /// The last finished turn was interrupted by the user.
+    pub(crate) interrupted: bool,
     pub(crate) verified: bool,
+    /// Another client holds this thread's write lock (Codex refuses a second resume).
+    pub(crate) native_live: bool,
+    pub(crate) native_next: Option<std::time::Instant>,
+    /// `updatedAt` from the last metadata read, and from the read the shown history is of.
+    pub(crate) read_updated: i64,
+    pub(crate) loaded_updated: i64,
     pub(crate) before_resume: Vec<crate::codex::activity::Activity>,
 }
 
@@ -76,6 +86,29 @@ impl Transcript {
     pub fn prepended(&self) -> usize {
         self.prepended
     }
+    /// How many user messages carry exactly this text and these attachments (a local
+    /// file by its path, anything else as `None`). A client compares it before and after
+    /// a send it could not confirm to see whether the host took the message.
+    pub fn user_messages(&self, text: &str, attachments: &[Option<String>]) -> usize {
+        self.entries
+            .values()
+            .filter(|e| match &e.item {
+                Item::UserMessage { content } => {
+                    let said: Vec<_> = content
+                        .iter()
+                        .filter_map(|c| c.text.as_deref())
+                        .collect::<Vec<_>>();
+                    said.join("\n").trim() == text
+                        && content
+                            .iter()
+                            .filter(|c| c.text.is_none())
+                            .map(|c| c.path.as_ref())
+                            .eq(attachments.iter().map(Option::as_ref))
+                }
+                _ => false,
+            })
+            .count()
+    }
     pub fn is_ready(&self) -> bool {
         self.ready && self.verified
     }
@@ -84,6 +117,10 @@ impl Transcript {
     }
     pub fn has_older(&self) -> bool {
         self.cursor.is_some()
+    }
+    /// The last turn ended because the user stopped it.
+    pub fn interrupted(&self) -> bool {
+        self.interrupted
     }
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
@@ -97,6 +134,15 @@ impl Transcript {
         // Reverse just the items when prepending. Live items received during the request win.
         let mut added = 0;
         let buffered = std::mem::take(&mut self.before_resume);
+        if !already_open {
+            // The first page is authoritative for the running turn. A stale id from an earlier
+            // session must not survive a reopen; live events replayed below still apply.
+            self.active_turn = page
+                .data
+                .iter()
+                .find(|t| t.status == "inProgress")
+                .map(|t| t.id.clone());
+        }
         // A resume and its first page can both arrive after stream notifications.
         // The page is authoritative for the turns and items it includes.
         let mut snapshot_turns = HashSet::new();
@@ -112,9 +158,6 @@ impl Transcript {
             let review = self.reviews.turn(&turn.id, true);
             for row in &turn.items {
                 review.observe_item(&row.id, &row.item, true);
-            }
-            if !already_open && turn.status == "inProgress" {
-                self.active_turn = Some(turn.id.clone());
             }
             if !buffered.is_empty() {
                 snapshot_turns.insert(turn.id.clone());
@@ -258,15 +301,18 @@ impl Transcript {
         use crate::codex::activity::Change;
         match event.change {
             Change::TurnStarted => {
+                self.interrupted = false;
                 self.reviews.turn(&event.turn, false);
                 if self.last_finished.as_deref() != Some(event.turn.as_str()) {
                     self.active_turn = Some(event.turn);
                 }
             }
-            Change::TurnCompleted { error } => {
+            Change::TurnCompleted { error, interrupted } => {
                 if self.active_turn.as_ref() == Some(&event.turn) {
                     self.active_turn = None;
                 }
+                self.interrupted = interrupted || self.stop_requested.as_ref() == Some(&event.turn);
+                self.stop_requested = None;
                 self.last_finished = Some(event.turn);
                 if let Some(error) = error {
                     self.error = Some(error);
@@ -415,5 +461,37 @@ mod tests {
             panic!("missing second live message")
         };
         assert!(matches!(&t.entry(key).unwrap().item,Item::AgentMessage{text,..} if text=="world"));
+    }
+
+    #[test]
+    fn reopen_reconciles_active_turn_with_the_first_snapshot() {
+        let page = |turns: serde_json::Value| -> TurnPage {
+            serde_json::from_value(json!({"data": turns})).unwrap()
+        };
+        let mut t = Transcript {
+            active_turn: Some("stale".into()),
+            ..Default::default()
+        };
+        t.add_history(page(json!([
+            {"id":"done","status":"completed","items":[]}
+        ])))
+        .unwrap();
+        assert_eq!(t.active_turn(), None);
+
+        t.active_turn = Some("stale".into());
+        t.ready = false;
+        t.add_history(page(json!([
+            {"id":"live","status":"inProgress","items":[]},
+            {"id":"done","status":"completed","items":[]}
+        ])))
+        .unwrap();
+        assert_eq!(t.active_turn(), Some("live"));
+
+        // A later page of older history must not touch the running turn.
+        t.add_history(page(json!([
+            {"id":"older","status":"completed","items":[]}
+        ])))
+        .unwrap();
+        assert_eq!(t.active_turn(), Some("live"));
     }
 }

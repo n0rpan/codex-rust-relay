@@ -49,6 +49,8 @@ enum Pending {
     Limits(u64),
     Discover(commands::Discovery),
     LeaveForTerminal(commands::Handoff),
+    /// Best-effort release of a thread this client ended.
+    Unsubscribe,
     Descendants(workers::Discovery),
     ChildIdentity(String),
     ThreadOp(thread_ops::PendingOp),
@@ -84,6 +86,22 @@ pub struct Store {
     commands: commands::Catalog,
     handoff_ready: Option<commands::Handoff>,
     terminal_threads: HashSet<String>,
+    /// Threads whose live process this client ended. Cleared lazily: a thread
+    /// that is live again is not reported as ended.
+    ended_threads: HashSet<String>,
+    /// Ended threads a message is waiting on: reopened, and the draft is sent once ready.
+    resume_sends: HashSet<String>,
+    /// The Claude access mode an ended session had when its process went away, whether
+    /// this client ended it or the host reaped the idle route. A send that reopens the
+    /// session starts it in that mode; opening it from the list does not (see
+    /// `claude_resume_send`).
+    resume_access: HashMap<String, crate::runtime::Access>,
+    /// Text the host put back in a session's composer after a send it had acknowledged
+    /// failed (identified by the last unsent message). Cleared by the next send.
+    restored_drafts: HashMap<String, (String, String)>,
+    /// The launch contract of each hosted Claude worker session, kept with the session so
+    /// every relaunch (cold resume, resume after a host restart, fork) starts under it.
+    worker_contracts: HashMap<String, crate::claude_worker_contract::Contract>,
     child_threads: HashMap<String, (String, PathBuf)>,
     next_preset: Option<crate::codex::access::Access>,
     selection: u64,
@@ -110,6 +128,8 @@ pub struct Store {
     transcripts: HashMap<String, Transcript>,
     selected: Option<String>,
     reopen: Vec<String>,
+    /// A thread selected before the connection was ready; it opens as soon as it is.
+    queued_open: Option<String>,
 }
 
 impl Store {
@@ -141,7 +161,7 @@ impl Store {
     pub fn opening_thread(&self) -> bool {
         // A replica waits for the host to report the session it asked for.
         if let Some(remote) = self.remote() {
-            return remote.await_new;
+            return remote.await_new.is_some();
         }
         self.pending.values().any(|(_, p)| {
             matches!(p, Pending::Compose(compose::Operation::New(_)))
@@ -169,6 +189,11 @@ impl Store {
             commands: Default::default(),
             handoff_ready: None,
             terminal_threads: Default::default(),
+            ended_threads: Default::default(),
+            resume_sends: Default::default(),
+            resume_access: Default::default(),
+            restored_drafts: Default::default(),
+            worker_contracts: Default::default(),
             child_threads: Default::default(),
             next_preset: None,
             selection: 0,
@@ -195,6 +220,7 @@ impl Store {
             transcripts: HashMap::new(),
             selected: None,
             reopen: vec![],
+            queued_open: None,
         }
     }
 
@@ -232,6 +258,7 @@ impl Store {
                 self.selected.clone_from(&previous.selected);
                 self.front = previous.front;
                 self.query.clone_from(&previous.query);
+                self.recover_replica(previous);
             }
             return;
         }
@@ -240,6 +267,9 @@ impl Store {
         }
         self.child_threads = std::mem::take(&mut previous.child_threads);
         self.terminal_threads = std::mem::take(&mut previous.terminal_threads);
+        self.ended_threads = previous.ended_threads.clone();
+        self.resume_access = std::mem::take(&mut previous.resume_access);
+        self.worker_contracts = std::mem::take(&mut previous.worker_contracts);
         self.authorized_models = std::mem::take(&mut previous.authorized_models);
         self.next_options = previous.next_options.take();
         self.selected = previous.selected.clone();
@@ -248,7 +278,11 @@ impl Store {
             .transcripts
             .iter()
             .filter(|(id, t)| {
-                self.selected.as_ref() == Some(*id) || t.active_turn().is_some() || t.is_loading()
+                // The selected thread always loads its history, ended or not; an
+                // ended thread that is merely open elsewhere stays closed.
+                self.selected.as_ref() == Some(*id)
+                    || (!previous.ended_threads.contains(*id)
+                        && (t.active_turn().is_some() || t.is_loading()))
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -280,6 +314,10 @@ impl Store {
     }
     pub fn threads(&self) -> &[ThreadRow] {
         &self.catalog.rows
+    }
+    /// Show `text` as the scope's notice, for host flows that warn the operator.
+    pub fn post_notice(&mut self, text: impl Into<String>) {
+        self.notice = Some(text.into());
     }
     pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
@@ -341,7 +379,11 @@ impl Store {
         if self.remote().is_some() {
             return None;
         }
-        self.pending.values().map(|(when, _)| *when).min()
+        self.pending
+            .values()
+            .map(|(when, _)| *when)
+            .chain(self.native_deadline())
+            .min()
     }
 
     fn request(&mut self, call: Call, pending: Pending) -> io::Result<()> {
@@ -366,6 +408,7 @@ impl Store {
                 return Ok(());
             }
             self.query = query.clone();
+            self.remote_mut().restore = None;
             return self.forward(crate::actions::Action::SearchThreads(query));
         }
         if self.query == query {
@@ -414,6 +457,7 @@ impl Store {
         if self.remote().is_some() {
             return;
         }
+        self.refresh_native(now, false);
         let expired: Vec<_> = self
             .pending
             .iter()
@@ -464,12 +508,14 @@ impl Store {
                 }
                 self.notice = Some(message);
             }
+            Pending::Unsubscribe => (),
             Pending::Discover(stage) => self.discovery_failed(stage, message),
             Pending::Compose(op) => self.compose_failed(op, message),
             Pending::Initialize | Pending::Account => self.state = Connection::Closed(message),
             Pending::Access(id) => {
                 self.transcripts.entry(id).or_default().error = Some(message);
             }
+            Pending::Resume(id) if message.contains(Self::WRITER_LOCK) => self.native_locked(id),
             Pending::Read(id) | Pending::Resume(id) | Pending::History(id) => {
                 let transcript = self.transcripts.entry(id).or_default();
                 transcript.loading = false;
@@ -496,6 +542,7 @@ impl Store {
                 }
             }
             Pending::ThreadOp(_) => self.changed.mark(Changed::THREADS),
+            Pending::Unsubscribe => (),
             Pending::Initialize | Pending::Account => self.changed.mark(Changed::CONNECTION),
             Pending::PaletteSearch(_)
             | Pending::ChildIdentity(_)
@@ -514,6 +561,7 @@ impl Store {
             self.apply(event);
         }
         self.tick(now);
+        self.flush_resume_sends();
         std::mem::take(&mut self.changed)
     }
 
@@ -555,9 +603,9 @@ impl Store {
                     row.status = None;
                 }
                 for (id, thread) in &mut self.transcripts {
-                    if thread.active_turn.take().is_some()
-                        || thread.is_loading()
-                        || self.selected.as_ref() == Some(id)
+                    let was_busy = thread.active_turn.take().is_some() || thread.is_loading();
+                    if self.selected.as_ref() == Some(id)
+                        || (was_busy && !self.ended_threads.contains(id))
                     {
                         self.reopen.push(id.clone());
                     }
@@ -592,6 +640,7 @@ impl Store {
                     (Pending::LeaveForTerminal(handoff), Reply::Unsubscribed(_)) => {
                         self.handoff_ready = Some(handoff);
                     }
+                    (Pending::Unsubscribe, _) => (),
                     (Pending::ThreadOp(op), reply) => self.finish_thread_op(op, reply)?,
                     (Pending::ChildIdentity(id), Reply::Read(read)) => {
                         self.observe_child_identity(&id, *read.thread);
@@ -646,7 +695,21 @@ impl Store {
                         self.listing = false;
                         self.catalog_revision += 1;
                         if cursor.is_none() {
-                            self.catalog.keep(&self.created_while_listing);
+                            // Rows the listing returned stay, and so do the workers of those
+                            // parents (they live in subdirectories the page loop skips).
+                            let mut retained = self.created_while_listing.clone();
+                            // A thread the host knows but discovery has not listed yet
+                            // (a fresh one, or one reaped before it was indexed) stays
+                            // resumable by a send.
+                            retained.extend(self.ended_threads.iter().cloned());
+                            retained.extend(self.resume_sends.iter().cloned());
+                            retained.extend(
+                                page.data
+                                    .iter()
+                                    .filter(|row| row.cwd == self.profile.project)
+                                    .map(|row| row.id.clone()),
+                            );
+                            self.catalog.keep(&retained);
                         }
                         self.created_while_listing.clear();
                         for row in page.data {
@@ -674,7 +737,7 @@ impl Store {
             Frame::Activity(activity) => {
                 if matches!(
                     activity.change,
-                    crate::codex::activity::Change::TurnCompleted { error: None }
+                    crate::codex::activity::Change::TurnCompleted { error: None, .. }
                 ) {
                     self.title_after_turn(&activity.thread);
                 }
@@ -752,12 +815,23 @@ impl Store {
     fn connected(&mut self) -> io::Result<()> {
         self.state = Connection::Ready;
         self.list_more()?;
-        for id in std::mem::take(&mut self.reopen) {
-            if self.in_terminal(&id) {
+        let reopened = std::mem::take(&mut self.reopen);
+        for id in &reopened {
+            if self.in_terminal(id) {
                 continue;
             }
             self.request(Call::Read(id.clone()), Pending::Read(id.clone()))?;
-            self.mark_loading(&id);
+            self.mark_loading(id);
+        }
+        if let Some(id) = self.queued_open.take()
+            && self.selected.as_deref() == Some(id.as_str())
+            && !reopened.contains(&id)
+            && !self.in_terminal(&id)
+        {
+            if let Some(t) = self.transcripts.get_mut(&id) {
+                t.loading = false;
+            }
+            self.open_catalog_id(&id)?;
         }
         Ok(())
     }

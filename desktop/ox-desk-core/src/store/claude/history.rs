@@ -15,6 +15,16 @@ pub(super) struct Snapshot {
     transcript: Transcript,
     turn: String,
     pending: HashMap<String, String>,
+    /// A follower keeps no transcript: it records what to apply to the one the UI holds.
+    log: Option<Vec<Op>>,
+}
+/// One projected item for the UI thread to apply to an existing transcript.
+pub(super) struct Op {
+    turn: String,
+    id: String,
+    item: Item,
+    completed: bool,
+    output: Option<String>,
 }
 impl Snapshot {
     fn new(id: &str) -> Self {
@@ -24,6 +34,7 @@ impl Snapshot {
             transcript: Default::default(),
             turn: String::new(),
             pending: Default::default(),
+            log: None,
         }
     }
     fn item(&mut self, id: String, item: Item, completed: bool, output: Option<String>) {
@@ -40,35 +51,69 @@ impl Snapshot {
                 .or_insert_with(|| self.turn.clone())
                 .clone()
         };
-        self.transcript
-            .observe_item(turn, id, item, completed, output);
+        if let Some(log) = &mut self.log {
+            log.push(Op {
+                turn,
+                id,
+                item,
+                completed,
+                output,
+            });
+        } else {
+            self.transcript
+                .observe_item(turn, id, item, completed, output);
+        }
     }
 }
-struct Projection<'a> {
-    owner: &'a str,
-    profile: &'a Profile,
+struct Projection {
+    owner: String,
+    profile: Profile,
     updated: i64,
     threads: HashMap<String, Snapshot>,
+    /// Children first seen while following: their rows go to the UI with the next tail.
+    born: Vec<ThreadRow>,
 }
-impl<'a> Projection<'a> {
-    fn new(owner: &'a str, profile: &'a Profile, updated: i64) -> Self {
+impl Projection {
+    fn new(owner: &str, profile: &Profile, updated: i64) -> Self {
         let mut root = Snapshot::new(owner);
         root.transcript.loading = true;
         Self {
-            owner,
-            profile,
+            owner: owner.into(),
+            profile: profile.clone(),
             updated,
             threads: HashMap::from([(owner.into(), root)]),
+            born: Vec::new(),
         }
     }
-    fn child(&mut self, id: &str, parent: &str, label: &str) {
-        let snapshot = self
+    /// After the first full load: keep only the turn and pending state, and record from now on.
+    fn follow(self) -> Self {
+        let threads = self
             .threads
-            .entry(id.into())
-            .or_insert_with(|| Snapshot::new(id));
+            .into_iter()
+            .map(|(k, s)| {
+                let kept = Snapshot {
+                    id: s.id,
+                    row: None,
+                    transcript: Default::default(),
+                    turn: s.turn,
+                    pending: s.pending,
+                    log: Some(Vec::new()),
+                };
+                (k, kept)
+            })
+            .collect();
+        Self { threads, ..self }
+    }
+    fn child(&mut self, id: &str, parent: &str, label: &str) {
+        let recording = self.threads.values().any(|s| s.log.is_some());
+        let snapshot = self.threads.entry(id.into()).or_insert_with(|| {
+            let mut s = Snapshot::new(id);
+            s.log = recording.then(Vec::new);
+            s
+        });
         let r = snapshot
             .row
-            .get_or_insert_with(|| row(self.profile, id.into(), label.into(), self.updated));
+            .get_or_insert_with(|| row(&self.profile, id.into(), label.into(), self.updated));
         r.parent_thread_id = Some(parent.into());
         r.agent_nickname = Some(label.into());
         r.worker = true;
@@ -76,6 +121,11 @@ impl<'a> Projection<'a> {
         // already been verified, and Store::can_send never permits sending into a child.
         snapshot.transcript.ready = true;
         snapshot.transcript.verified = true;
+        if snapshot.log.is_some()
+            && let Some(row) = snapshot.row.take()
+        {
+            self.born.push(row);
+        }
     }
     fn observe(&mut self, event: wire::Event) {
         // Catalog::history yields canonical per-block assistant and user records only.
@@ -89,7 +139,8 @@ impl<'a> Projection<'a> {
         else {
             return;
         };
-        let owner = self.owner;
+        let owner = self.owner.clone();
+        let owner = owner.as_str();
         let display = scope
             .parent_tool_use_id
             .as_deref()
@@ -111,20 +162,28 @@ impl<'a> Projection<'a> {
 type Retired = (Transcript, Option<HashMap<String, String>>);
 pub(super) struct Batch {
     snapshots: Arc<Mutex<Vec<Snapshot>>>,
+    removed: Vec<String>,
     applied: mpsc::Sender<Vec<Retired>>,
 }
 impl Batch {
     pub(super) fn apply(self, store: &mut Store, owner: &str) {
         let snapshots = std::mem::take(&mut *self.snapshots.lock().unwrap());
+        let viewing = store.is_viewer(owner);
         let mut retired = Vec::with_capacity(snapshots.len());
         for snapshot in snapshots {
             let Snapshot {
                 id,
                 row,
-                transcript,
+                mut transcript,
                 pending,
                 ..
             } = snapshot;
+            if viewing {
+                // A foreign client owns the process: the journal is all there is to read.
+                transcript.loading = false;
+                transcript.ready = true;
+                transcript.verified = true;
+            }
             if let Some(row) = row {
                 store.remember_claude(row);
             }
@@ -136,13 +195,40 @@ impl Batch {
                 .events
                 .pending
                 .insert(id.clone(), pending);
-            store.changed.transcript(&id);
+            if viewing && store.transcripts.get(&id).is_some_and(|t| !t.is_empty()) {
+                store.changed.replace_transcript(&id);
+            } else {
+                store.changed.transcript(&id);
+            }
             match store.transcripts.entry(id) {
                 Entry::Occupied(mut e) => retired.push((e.insert(transcript), old_pending)),
                 Entry::Vacant(e) => {
                     e.insert(transcript);
                 }
             }
+        }
+        for id in self.removed {
+            let p = store.claude_mut();
+            p.catalog.remove(&id);
+            let pending = p
+                .sessions
+                .get_mut(owner)
+                .unwrap()
+                .events
+                .pending
+                .remove(&id);
+            store.catalog.forget_child(&id);
+            store.child_threads.remove(&id);
+            store.authorized_models.remove(&id);
+            if let Some(transcript) = store.transcripts.remove(&id) {
+                retired.push((transcript, pending));
+            }
+            if store.selected() == Some(&id) {
+                let _ = store.open_catalog_id(owner);
+            }
+            store.catalog_revision += 1;
+            store.changed.transcript(&id);
+            store.changed.mark(Changed::THREADS);
         }
         let _ = self.applied.send(retired);
     }
@@ -166,22 +252,173 @@ pub(super) fn load(
         }
         Ok(())
     })?;
-    publish(projection.threads.into_values(), alive, emit)
+    publish(
+        projection.threads.into_values(),
+        std::iter::empty(),
+        alive,
+        emit,
+    )
+}
+
+/// What a read-only viewer keeps between ticks so only appended journal bytes are parsed:
+/// the decoder and projection state, and where the last complete line ended.
+pub(super) struct Follower {
+    saved: wire::catalog::Session,
+    decoder: wire::Decoder,
+    projection: Projection,
+    cursor: wire::catalog::HistoryCursor,
+}
+/// The items one tick appended, for the UI thread to apply in place.
+pub(super) struct Tail {
+    ops: Vec<(String, Vec<Op>)>,
+    born: Vec<ThreadRow>,
+}
+impl Tail {
+    pub(super) fn apply(self, store: &mut Store) {
+        for row in self.born {
+            let key = row.id.clone();
+            store.remember_claude(row);
+            let t = store.transcripts.entry(key).or_default();
+            t.loading = false;
+            t.ready = true;
+            t.verified = true;
+        }
+        for (key, ops) in self.ops {
+            let t = store.transcripts.entry(key.clone()).or_default();
+            for op in ops {
+                t.observe_item(op.turn, op.id, op.item, op.completed, op.output);
+            }
+            store.changed.transcript(&key);
+        }
+    }
+}
+impl Follower {
+    pub(super) fn last_child_write(&self) -> Option<std::time::SystemTime> {
+        self.cursor.last_child_write()
+    }
+    pub(super) fn watches_children(&self) -> bool {
+        self.cursor.watches_children()
+    }
+
+    /// Read the whole journal, publish it, and keep what following needs.
+    pub(super) fn load(
+        profile: &Profile,
+        owner: &str,
+        saved: wire::catalog::Session,
+        previous: Option<&Follower>,
+        alive: &Weak<()>,
+        emit: impl FnMut(Batch),
+    ) -> io::Result<Self> {
+        let mut projection = Projection::new(owner, profile, saved.updated_at);
+        let mut decoder = wire::Decoder::default();
+        let mut cursor = wire::catalog::HistoryCursor::default();
+        saved.history_from(&mut cursor, |record| {
+            if alive.strong_count() == 0 {
+                return Err(io::Error::other("Claude history was closed"));
+            }
+            for e in decoder.decode_value(record)? {
+                projection.observe(e);
+            }
+            Ok(())
+        })?;
+        // The snapshots are consumed by the UI; a follower keeps copies of their state.
+        let kept: Vec<(String, String, HashMap<String, String>)> = projection
+            .threads
+            .values()
+            .map(|s| (s.id.clone(), s.turn.clone(), s.pending.clone()))
+            .collect();
+        // A replacement can drop an entire nested tool call. Retire just the child
+        // threads that vanished from this viewer, including their remote projections.
+        let removed: Vec<_> = previous
+            .into_iter()
+            .flat_map(|f| f.projection.threads.keys())
+            .filter(|id| !projection.threads.contains_key(*id))
+            .cloned()
+            .collect();
+        publish(
+            projection.threads.into_values(),
+            removed.into_iter(),
+            alive,
+            emit,
+        )?;
+        let mut follow = Projection::new(owner, profile, saved.updated_at);
+        follow.threads = kept
+            .into_iter()
+            .map(|(id, turn, pending)| {
+                let mut s = Snapshot::new(&id);
+                s.turn = turn;
+                s.pending = pending;
+                (id, s)
+            })
+            .collect();
+        Ok(Self {
+            saved,
+            decoder,
+            projection: follow.follow(),
+            cursor,
+        })
+    }
+
+    /// Parse what was appended since the last read. `false` when the journal was truncated
+    /// or replaced: the caller reads it again from the start.
+    pub(super) fn advance(
+        &mut self,
+        alive: &Weak<()>,
+        mut emit: impl FnMut(Tail),
+    ) -> io::Result<bool> {
+        let Self {
+            saved,
+            decoder,
+            projection,
+            cursor,
+        } = self;
+        let current = saved.history_from(cursor, |record| {
+            if alive.strong_count() == 0 {
+                return Err(io::Error::other("Claude history was closed"));
+            }
+            for e in decoder.decode_value(record)? {
+                projection.observe(e);
+            }
+            Ok(())
+        })?;
+        if !current {
+            return Ok(false);
+        }
+        let ops: Vec<_> = projection
+            .threads
+            .values_mut()
+            .filter_map(|s| {
+                let log = s.log.as_mut().map(std::mem::take)?;
+                (!log.is_empty()).then(|| (s.id.clone(), log))
+            })
+            .collect();
+        let born = std::mem::take(&mut projection.born);
+        if !ops.is_empty() || !born.is_empty() {
+            emit(Tail { ops, born });
+        }
+        Ok(true)
+    }
 }
 fn publish(
     mut snapshots: impl Iterator<Item = Snapshot>,
+    mut removed: impl Iterator<Item = String>,
     alive: &Weak<()>,
     mut emit: impl FnMut(Batch),
 ) -> io::Result<()> {
     loop {
         let contents: Vec<_> = snapshots.by_ref().take(THREADS_PER_BATCH).collect();
-        if contents.is_empty() {
+        let removed: Vec<_> = removed
+            .by_ref()
+            .take(THREADS_PER_BATCH - contents.len())
+            .collect();
+        if contents.is_empty() && removed.is_empty() {
             return Ok(());
         }
         let contents = Arc::new(Mutex::new(contents));
         let (tx, rx) = mpsc::channel();
         emit(Batch {
             snapshots: contents.clone(),
+            removed,
             applied: tx,
         });
         loop {
@@ -208,6 +445,7 @@ pub(super) fn fixture(profile: &Profile, owner: &str, events: Vec<wire::Event>) 
     Batch {
         snapshots: Arc::new(Mutex::new(projection.threads.into_values().collect())),
         applied,
+        removed: Vec::new(),
     }
 }
 
@@ -221,7 +459,9 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let reader = std::thread::spawn(move || {
             let snapshots = (0..(THREADS_PER_BATCH * 3)).map(|i| Snapshot::new(&i.to_string()));
-            publish(snapshots, &alive, |batch| tx.send(batch).unwrap())
+            publish(snapshots, std::iter::empty(), &alive, |batch| {
+                tx.send(batch).unwrap()
+            })
         });
         let first = rx.recv().unwrap();
         assert_eq!(first.snapshots.lock().unwrap().len(), THREADS_PER_BATCH);

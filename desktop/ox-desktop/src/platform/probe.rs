@@ -8,7 +8,15 @@ use std::{
     time::Duration,
 };
 
+/// In-process input for tests and dogfood reviews: no OS pointer or keyboard involved.
+pub enum Input {
+    /// `press <id-or-label>`: click a marked control at its centre.
+    Press(String),
+    /// `key <keystroke>`: a GPUI keystroke such as `escape` or `ctrl-n`.
+    Key(String),
+}
 pub struct Sample {
+    pub input: Option<Input>,
     pub reset: bool,
     /// Redraw every window after replying, so the client can wait for a frame
     /// that reflects the state it just observed (`frame` in each window's entry).
@@ -23,25 +31,42 @@ impl Socket {
         let Some(path) = env::var_os("OX_DESK_STATS_SOCKET").map(PathBuf::from) else {
             return Ok(None);
         };
+        // The probe can press buttons: create a missing parent directory 0700.
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
+            && !dir.exists()
+        {
+            fs::create_dir_all(dir)?;
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
         let socket = UnixDatagram::bind(&path)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         socket.set_write_timeout(Some(Duration::from_millis(100)))?;
         let (send, receive) = flume::unbounded();
         std::thread::spawn(move || {
-            let mut command = [0; 16];
+            let mut command = [0; 256];
             while let Ok((n, address)) = socket.recv_from(&mut command) {
                 let Some(client) = address.as_pathname() else {
                     break;
                 };
-                let (reset, refresh) = match &command[..n] {
-                    b"snapshot" => (false, false),
-                    b"reset" => (true, false),
-                    b"frame" => (false, true),
-                    _ => continue,
+                let text = String::from_utf8_lossy(&command[..n]);
+                let (reset, refresh, input) = match &*text {
+                    "snapshot" => (false, false, None),
+                    "reset" => (true, false, None),
+                    "frame" => (false, true, None),
+                    other => match other.split_once(' ') {
+                        Some(("press", q)) if !q.trim().is_empty() => {
+                            (false, true, Some(Input::Press(q.trim().into())))
+                        }
+                        Some(("key", k)) if !k.trim().is_empty() => {
+                            (false, true, Some(Input::Key(k.trim().into())))
+                        }
+                        _ => continue,
+                    },
                 };
                 let (reply, result) = mpsc::channel();
                 if send
                     .send(Sample {
+                        input,
                         reset,
                         refresh,
                         reply,

@@ -801,6 +801,48 @@ fn new_session_id() -> Result<String, RelayError> {
     ))
 }
 
+/// The settings document that enables Claude Code's sandbox for write workers.
+/// The worker contract also pre-approves Bash when assembling the tool arguments.
+pub(crate) fn claude_sandbox_document() -> Value {
+    crate::claude_worker_contract::sandbox_document()
+}
+
+/// Subscription launches own their authentication settings, so they accept
+/// one `--settings` only when it is exactly [`claude_sandbox_document`]. Returns
+/// the remaining arguments and whether that document was present.
+pub(crate) fn take_subscription_sandbox(
+    args: &[OsString],
+) -> Result<(Vec<OsString>, bool), RelayError> {
+    const REJECT: &str = "subscription launches own their authentication settings";
+    let sandbox = claude_sandbox_document().to_string();
+    let mut kept = Vec::with_capacity(args.len());
+    let mut found = false;
+    let mut index = 0;
+    while index < args.len() {
+        let text = args[index].to_string_lossy();
+        if text == "--settings" {
+            let value = args.get(index + 1).map(|value| value.to_string_lossy());
+            if value.as_deref() != Some(sandbox.as_str()) {
+                return Err(REJECT.into());
+            }
+            found = true;
+            index += 2;
+            continue;
+        }
+        if let Some(value) = text.strip_prefix("--settings=") {
+            if value != sandbox {
+                return Err(REJECT.into());
+            }
+            found = true;
+            index += 1;
+            continue;
+        }
+        kept.push(args[index].clone());
+        index += 1;
+    }
+    Ok((kept, found))
+}
+
 /// Removes every `--settings` option before `--` and loads the last one, which
 /// is the only one stock Claude Code honours. Arguments after `--` are
 /// positional and are left untouched.
@@ -1235,6 +1277,26 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn subscription_accepts_only_the_sandbox_settings_document() {
+        let sandbox = claude_sandbox_document().to_string();
+        let (kept, found) =
+            take_subscription_sandbox(&strings(&["--print", "--settings", &sandbox, "hi"]))
+                .unwrap();
+        assert!(found);
+        assert_eq!(kept, strings(&["--print", "hi"]));
+        let inline = format!("--settings={sandbox}");
+        let (kept, found) = take_subscription_sandbox(&strings(&[&inline])).unwrap();
+        assert!(found && kept.is_empty());
+        let (kept, found) = take_subscription_sandbox(&strings(&["--print"])).unwrap();
+        assert!(!found && kept == strings(&["--print"]));
+        // Anything else could replace the account settings, so it is refused.
+        assert!(take_subscription_sandbox(&strings(&["--settings", "{\"env\":{}}"])).is_err());
+        assert!(take_subscription_sandbox(&strings(&["--settings"])).is_err());
+        let loose = r#"{"sandbox":{"enabled":false}}"#;
+        assert!(take_subscription_sandbox(&strings(&["--settings", loose])).is_err());
     }
 
     fn words(values: &[&str]) -> Vec<String> {

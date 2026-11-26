@@ -1,10 +1,62 @@
 //! First-run actions are scoped to the project and route of the visible pane.
 use super::workbench::Workbench;
-use crate::{activity, appearance::Palette, col, kit::button, platform, small};
+use crate::appearance::Step;
+use crate::{activity, appearance::Palette, col, kit::button, platform, row, small};
 use gpui::*;
+use ox_desk_core::runtime::Runtime;
+use ox_desk_core::store::Route;
+use std::time::{Duration, Instant};
 
 pub(super) struct ConfigureProvider;
 impl EventEmitter<ConfigureProvider> for Workbench {}
+/// Switch this project to another route; `None` means the first API model (or add one).
+pub(super) struct SwitchRoute(pub Option<Route>);
+impl EventEmitter<SwitchRoute> for Workbench {}
+
+const POLL_EVERY: Duration = Duration::from_millis(1500);
+const POLL_FOR: Duration = Duration::from_secs(600);
+
+/// Route for a fresh install, from local CLI state and any already-saved API model.
+pub(super) fn first_launch_route() -> Route {
+    platform::onboarding::initial_route(
+        platform::onboarding::probe(Runtime::Codex),
+        platform::onboarding::probe(Runtime::Claude),
+        || {
+            crate::settings::load()
+                .ok()
+                .and_then(|s| s.models.first().cloned())
+        },
+    )
+}
+
+/// Secondary choices beside the main action of an onboarding card.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Extras {
+    pub configure_api: bool,
+    pub use_other: bool,
+}
+pub(super) fn extras(issue: &Issue, other_installed: bool) -> Extras {
+    match issue {
+        Issue::Missing | Issue::Old(_) => Extras {
+            configure_api: true,
+            use_other: other_installed,
+        },
+        Issue::SignIn => Extras {
+            configure_api: true,
+            use_other: false,
+        },
+        Issue::Provider => Extras {
+            configure_api: false,
+            use_other: false,
+        },
+    }
+}
+fn other(runtime: Runtime) -> Runtime {
+    match runtime {
+        Runtime::Codex => Runtime::Claude,
+        Runtime::Claude => Runtime::Codex,
+    }
+}
 
 pub(super) enum Issue {
     Missing,
@@ -13,6 +65,16 @@ pub(super) enum Issue {
     Provider,
 }
 impl Workbench {
+    /// API route for `model`, driven by this window's CLI when installed.
+    pub(super) fn api_route(&self, model: String) -> Route {
+        let missing = |r| platform::onboarding::missing(r);
+        let runtime = if !missing(self.route.runtime) {
+            self.route.runtime
+        } else {
+            platform::onboarding::api_runtime(!missing(Runtime::Codex), !missing(Runtime::Claude))
+        };
+        runtime.route(Some(model))
+    }
     pub(super) fn first_run_issue(&self) -> Option<Issue> {
         if self.connecting {
             return None;
@@ -54,36 +116,72 @@ impl Workbench {
         let (title, note) = match &issue {
             Issue::Missing => (
                 format!("Install {name}"),
-                format!("Install the stock {name} executable on this computer to open a session."),
+                format!(
+                    "OX runs the official {name} CLI locally on your computer, also for API models. Install it to open a session."
+                ),
             ),
             Issue::Old(v) => (format!("Update {name}"), v.clone()),
             Issue::Provider => (
                 "Configure an API provider".into(),
-                "This project’s saved API route needs an OX provider connection.".into(),
+                "Add an API key (Anthropic, OpenAI, OpenRouter or a local server) to use this model route.".into(),
             ),
             Issue::SignIn => (
-                "Connect your account".into(),
+                format!("Connect {name}"),
                 format!(
-                    "Sign in with {name} to use your {} subscription.",
+                    "Sign in to your {} account so the official {name} CLI can run here — or use your own API key.",
                     runtime.account()
                 ),
             ),
+        };
+        let other_installed = !platform::onboarding::missing(other(runtime));
+        let extras = extras(&issue, other_installed);
+        let api_active = self.route.is_api();
+        let segment = |id: &'static str, label: &'static str, active: bool, to: Option<Route>| {
+            button(
+                p,
+                id,
+                label,
+                active,
+                true,
+                cx.listener(move |_, _, _, cx| {
+                    if !active {
+                        cx.emit(SwitchRoute(to.clone()))
+                    }
+                }),
+            )
         };
         let mut panel = col()
             .w_full()
             .max_w(px(470.))
             .gap_3()
+            .child(
+                row()
+                    .gap_2()
+                    .child(segment(
+                        "route-codex",
+                        "Codex",
+                        !api_active && runtime == Runtime::Codex,
+                        Some(Route::CODEX_SUBSCRIPTION),
+                    ))
+                    .child(segment(
+                        "route-claude",
+                        "Claude Code",
+                        !api_active && runtime == Runtime::Claude,
+                        Some(Runtime::Claude.route(None)),
+                    ))
+                    .child(segment("route-api", "API key", api_active, None)),
+            )
             .child(activity::ox(p, 0, 3.))
-            .child(div().text_2xl().child(title))
+            .child(div().text_size(p.text(Step::Display)).child(title))
             .child(small(p, note));
         match issue {
             Issue::Missing | Issue::Old(_) => {
                 if let Some((label, args)) =
                     platform::onboarding::installer(runtime, matches!(issue, Issue::Old(_)))
                 {
-                    panel=panel.child(button(p,"install-codex",label,true,true,cx.listener(move|s,_,_,cx|{
+                    panel=panel.child(button(p,"install-runtime",label,true,true,cx.listener(move|s,_,w,cx|{
                         match platform::onboarding::repair(&s.project,&args){
-                            Ok(())=>{s.awaiting_login=true;s.launch_error=Some("Finish installing Codex in the terminal, then return here.".into());}
+                            Ok(())=>{s.awaiting_login=true;s.launch_error=Some(format!("Finish installing {name} in the terminal, then return here."));s.poll_ready(w,cx);}
                             Err(e)=>s.launch_error=Some(e),
                         }
                         cx.notify()
@@ -91,12 +189,13 @@ impl Workbench {
                 } else {
                     panel = panel.child(button(
                         p,
-                        "codex-guide",
+                        "runtime-guide",
                         format!("Open {name} installation guide ↗"),
                         true,
                         true,
-                        cx.listener(move |s, _, _, cx| {
+                        cx.listener(move |s, _, w, cx| {
                             s.awaiting_login = true;
+                            s.poll_ready(w, cx);
                             cx.open_url(runtime.install_guide())
                         }),
                     ));
@@ -113,24 +212,55 @@ impl Workbench {
                 ))
             }
             Issue::SignIn => {
-                panel = panel
-                    .child(button(
+                panel = panel.child(button(
+                    p,
+                    "native-sign-in",
+                    format!("Sign in with {} ↗", runtime.account()),
+                    true,
+                    true,
+                    cx.listener(|s, _, w, cx| s.start_sign_in(w, cx)),
+                ));
+            }
+        }
+        if extras.configure_api {
+            panel = panel.child(button(
+                p,
+                "setup-provider",
+                "Configure an API provider",
+                false,
+                true,
+                cx.listener(|_, _, _, cx| cx.emit(ConfigureProvider)),
+            ));
+        }
+        if extras.use_other {
+            let target = other(runtime);
+            panel = panel.child(button(
+                p,
+                "use-other-runtime",
+                format!("Use installed {} instead", target.name()),
+                false,
+                true,
+                cx.listener(move |_, _, _, cx| cx.emit(SwitchRoute(Some(target.route(None))))),
+            ));
+        }
+        if platform::onboarding::is_home(&self.project) {
+            panel = panel.child(
+                row()
+                    .gap_2()
+                    .items_center()
+                    .child(small(
                         p,
-                        "native-sign-in",
-                        format!("Sign in with {} ↗", runtime.account()),
-                        true,
-                        true,
-                        cx.listener(|s, _, _, cx| s.start_sign_in(cx)),
+                        "Your project folder is your home directory. Sessions can edit files there.",
                     ))
                     .child(button(
                         p,
-                        "setup-provider",
-                        "Configure an API provider",
+                        "choose-project",
+                        "Choose project folder…",
                         false,
                         true,
-                        cx.listener(|_, _, _, cx| cx.emit(ConfigureProvider)),
-                    ));
-            }
+                        cx.listener(|_, _, _, cx| cx.emit(super::workbench::empty::OpenProject)),
+                    )),
+            );
         }
         if self.awaiting_login {
             panel = panel.child(button(
@@ -156,7 +286,38 @@ impl Workbench {
             .text_color(rgb(p.fg))
             .child(panel)
     }
-    fn start_sign_in(&mut self, cx: &mut Context<Self>) {
+    /// While an install or sign-in finishes elsewhere, reconnect by itself once the CLI turns
+    /// ready. Checks are file lookups only. Stops on success, when waiting ends, or after 10 min.
+    pub(super) fn poll_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let runtime = self.route.runtime;
+        let api = self.route.is_api();
+        cx.spawn_in(window, async move |view, cx| {
+            let start = Instant::now();
+            let mut was_ready = platform::onboarding::ready(runtime, api);
+            while start.elapsed() < POLL_FOR {
+                cx.background_executor().timer(POLL_EVERY).await;
+                let now = cx
+                    .background_spawn(async move { platform::onboarding::ready(runtime, api) })
+                    .await;
+                let keep = view.update_in(cx, |s, w, cx| {
+                    if !s.awaiting_login {
+                        return false;
+                    }
+                    if now && !was_ready {
+                        s.reconnect(w, cx);
+                    }
+                    true
+                });
+                was_ready = now;
+                if !keep.unwrap_or(false) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+    fn start_sign_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.poll_ready(window, cx);
         let project = self.project.clone();
         self.awaiting_login = true;
         let runtime = self.route.runtime;
@@ -182,5 +343,22 @@ impl Workbench {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[core::prelude::v1::test]
+    fn issues_offer_the_right_extra_actions() {
+        let both = |c, o| Extras {
+            configure_api: c,
+            use_other: o,
+        };
+        assert_eq!(extras(&Issue::Missing, true), both(true, true));
+        assert_eq!(extras(&Issue::Old("x".into()), false), both(true, false));
+        assert_eq!(extras(&Issue::SignIn, true), both(true, false));
+        assert_eq!(extras(&Issue::Provider, true), both(false, false));
+        assert_eq!(other(Runtime::Codex), Runtime::Claude);
     }
 }

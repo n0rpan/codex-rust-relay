@@ -5,12 +5,14 @@ import {
   showReview,
   imagesFor,
   clearImages,
+  moveImages,
   setComposerOwner,
   updateExtras,
   mentionInput,
   forgetComposer,
 } from "./composer-tools.js";
 import { pairingCode, setupCamera } from "./pair-camera.js";
+import { ActivityLine } from "./activity.js";
 import * as wire from "./wire.js";
 import { SessionControls } from "./controls.js";
 import { setupSettings } from "./settings.js";
@@ -37,10 +39,31 @@ const button = (text, fn) => {
   b.onclick = fn;
   return b;
 };
+// Same wording as the desktop's Route::label (ox-desk-core runtime.rs).
 const routesLabel = (r) =>
-  r.runtime.replace(/^./, (x) => x.toUpperCase()) +
-  " · " +
-  (r.billing === "subscription" ? "Subscription" : r.billing.api);
+  r.billing === "subscription"
+    ? r.runtime === "codex"
+      ? "ChatGPT subscription"
+      : "Claude subscription"
+    : r.runtime.replace(/^./, (x) => x.toUpperCase()) + " · " + r.billing.api;
+// Desktop status words (views/host/discovery.rs route_status, views/host.rs).
+// Same wording as the desktop (ox-desk-core store/claude/native.rs); `app` is the host's
+// `detail.native_live`: the stock client that has the session open.
+const nativeLiveText = (app) =>
+  `This conversation is running in ${app} right now. OX shows it read-only so the two don't collide. When it's closed there, you can continue it here.`;
+const statusText = (session, needsInput) =>
+  session.capabilities.includes("native_live")
+    ? `Live in ${session.detail?.native_live ?? "Claude Code"}`
+    : needsInput
+      ? "Needs you"
+      : session.capabilities.includes("ended")
+        ? "Ended"
+        : ({
+            running: "Running",
+            needs_input: "Needs you",
+            failed: "Error",
+            interrupted: "Interrupted",
+          })[session.status] ?? "";
 const leaf = (path) => path.split("/").filter(Boolean).pop() || path;
 const keyOf = (scope, id) => scopeKey(scope) + " " + id;
 function notice(s = "") {
@@ -66,7 +89,17 @@ document.addEventListener("keydown", (event) => {
 });
 function page(id) {
   if (id !== "settings") phoneSettings?.reset?.();
-  for (const view of ["pair", "catalog", "create", "conversation", "settings"])
+  if (id !== "running") stopRunning();
+  clearConfirm($("confirm-slot"));
+  clearConfirm($("running-confirm"));
+  for (const view of [
+    "pair",
+    "catalog",
+    "create",
+    "conversation",
+    "running",
+    "settings",
+  ])
     $(view).hidden = view !== id;
   if (id !== "pair" && !$("camera-panel").hidden) closeCamera();
   $("location").textContent = location.hostname.split(".")[0];
@@ -76,6 +109,9 @@ const hash = new URLSearchParams(location.hash.slice(1));
 let code = hash.get("pair"),
   requested = hash.get("thread");
 if (location.hash) history.replaceState(null, "", location.pathname);
+// Whether the host has an OX API provider: then every catalog alias is a route for both
+// runtimes, even when the first Hello (before discovery finished) listed none.
+let apiProvider = false;
 let key,
   globalLink,
   detailLink,
@@ -84,14 +120,27 @@ let key,
   routes = [],
   projects = [],
   scheduled = false;
+let runningTimer = null,
+  processes = null,
+  endBusy = false,
+  endChecking = false;
 let cold = new Map(),
   drafts = new Map(),
   timelineRows = new Map(),
   askKeys = "",
   pendingNew = null,
+  // Message and images sent from a composer whose Ack has not come back, by owner.
+  unacked = new Map(),
+  // The last `restored_draft.message` applied per owner, so each host restore lands once.
+  restoredSeen = new Map(),
   visibleRows = 200;
 const global = new Projection(true);
 const controls = new SessionControls();
+const activityLine = new ActivityLine(
+  $("activity"),
+  $("activity-sprite"),
+  $("activity-label"),
+);
 const phoneSettings = setupSettings({
   request: (operation) => settingsRequest(key, operation),
   open: () => page("settings"),
@@ -107,6 +156,28 @@ const phoneSettings = setupSettings({
     );
   },
 });
+/** The host took a send and then lost it (a resume that failed after the Ack): its text
+ * comes back into the composer once per lost message, before anything typed since, as in
+ * the desktop replica. */
+function restoreHostDrafts(model) {
+  for (const s of model.scopes.values())
+    for (const session of s.sessions) {
+      const r = session.detail?.restored_draft;
+      if (typeof r?.message !== "string" || typeof r.text !== "string") continue;
+      const owner = keyOf(s.scope, session.id);
+      if (restoredSeen.get(owner) === r.message) continue;
+      restoredSeen.set(owner, r.message);
+      // An Ack still on its way must not clear the restored text.
+      const sent = unacked.get(owner);
+      if (sent) sent.restored = true;
+      const current = drafts.get(owner) || "";
+      const text =
+        !current || current === r.text ? r.text : `${r.text}\n${current}`;
+      drafts.set(owner, text);
+      if (selected && keyOf(selected.scope, selected.id) === owner)
+        $("draft").value = text;
+    }
+}
 const repaint = () => {
   if (!scheduled) {
     scheduled = true;
@@ -176,6 +247,7 @@ class Link {
           global.cursor = null;
           cold.clear();
           drafts.clear();
+          restoredSeen.clear();
           timelineRows.clear();
           pickedProjects.clear();
           forgetComposer();
@@ -212,6 +284,9 @@ class Link {
         this.discovery = crypto.randomUUID();
         this.discovering = new Map();
         this.send(wire.discover(this.discovery));
+        // Hello may predate model discovery; the settings catalog supplies the API routes
+        // (and, once discovery lands, the rest) without a refresh.
+        if (key) loadModelChoices();
       }
       // Replayed deltas may be empty. A subscription without a cursor requires its snapshot.
       if (this.model.cursor && !liveCatalog) this.connected();
@@ -238,9 +313,23 @@ class Link {
         scopeKey(this.scope) === scopeKey(msg.scope)
       ) {
         const old = keyOf(selected.scope, null);
+        // Opened can land before or after the Ack. What is in the provisional
+        // composer now is the user's own newer text unless it is still exactly the
+        // message just sent (its Ack has not arrived to clear it).
+        const typed = drafts.get(old),
+          sent = unacked.get(old);
         drafts.delete(old);
+        const fresh = keyOf(msg.scope, msg.thread);
+        if (typed?.trim() && typed !== sent?.content) drafts.set(fresh, typed);
+        moveImages(old, fresh, sent?.images);
         open(msg.scope, msg.thread);
       }
+      return;
+    }
+    if (msg.type === "processes") {
+      const cb = this.pending.get(msg.id);
+      this.pending.delete(msg.id);
+      cb?.(true, msg.processes);
       return;
     }
     if (msg.type === "worker_reply") {
@@ -274,6 +363,7 @@ class Link {
     }
     if (msg.type === "snapshot" || msg.type === "delta") {
       const changed = this.model.apply(msg);
+      if (changed && this.scope) restoreHostDrafts(this.model);
       if (!this.ready) this.connected();
       if (changed) repaint();
     }
@@ -281,7 +371,7 @@ class Link {
   connected() {
     this.ready = true;
     this.attempt = 0;
-    if (this.scope && selected?.id) {
+    if (this === detailLink && this.scope && selected?.id) {
       this.act({ select_thread: selected.id });
     }
     repaint();
@@ -302,6 +392,14 @@ class Link {
         Math.random() * 250,
     );
     repaint();
+  }
+  /** Asks the host for its live processes. The callback gets (true, processes) or (false, message). */
+  listProcesses(cb) {
+    if (!this.ready || this.socket?.readyState !== WebSocket.OPEN) return false;
+    const id = crypto.randomUUID();
+    this.pending.set(id, cb);
+    this.send(wire.listProcesses(id));
+    return true;
   }
   act(action, approval = null, cb) {
     if (
@@ -346,6 +444,201 @@ class Link {
     this.pending.clear();
   }
 }
+// The in-page confirm: a question, Cancel and the action. The app never uses window.confirm.
+function clearConfirm(slot) {
+  slot.hidden = true;
+  slot.replaceChildren();
+}
+function confirmIn(slot, question, label, work) {
+  const cancel = button("Cancel", () => clearConfirm(slot));
+  cancel.className = "quiet";
+  const go = button(label, () => {
+    clearConfirm(slot);
+    work();
+  });
+  go.className = "danger";
+  slot.replaceChildren(el("p", "", question), cancel, go);
+  slot.hidden = false;
+  cancel.focus();
+}
+// Ends every thread of one scope over a short-lived subscription. True when each end was acknowledged.
+function endThreads(scope, threads, force) {
+  return new Promise((resolve) => {
+    const link = new Link(scope, new Projection());
+    const started = Date.now();
+    let left = threads.length,
+      ok = true;
+    const settle = (done) => {
+      if (!done) ok = false;
+      if (--left === 0) {
+        link.close();
+        resolve(ok);
+      }
+    };
+    const begin = () => {
+      if (!link.ready) {
+        if (Date.now() - started > 10000) {
+          ok = false;
+          link.close();
+          resolve(false);
+        } else setTimeout(begin, 100);
+        return;
+      }
+      for (const thread of threads)
+        if (!link.act(force ? { force_end_session: thread } : { end_session: thread }, null, (done) => settle(done)))
+          settle(false);
+    };
+    if (!threads.length) resolve(true);
+    else begin();
+  });
+}
+async function endProcesses(list, force) {
+  endBusy = true;
+  drawRunning();
+  const results = await Promise.all(
+    list.map((p) => endThreads(p.scope, p.threads, force)),
+  );
+  endBusy = false;
+  if (results.includes(false))
+    notice("Some sessions did not end. Check the host and try again.");
+  refreshRunning();
+}
+const ago = (seconds) => {
+  const s = Math.max(0, Math.floor(seconds));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h";
+  return Math.floor(s / 86400) + "d";
+};
+const kindLabels = { claude: "Claude", codex: "Codex", worker: "Worker" };
+function refreshRunning() {
+  globalLink?.listProcesses((ok, value) => {
+    if (!ok) {
+      if (value) notice(value);
+      return;
+    }
+    processes = value;
+    drawRunning();
+  });
+}
+function drawRunning() {
+  const list = $("running-list");
+  const now = Date.now() / 1000;
+  $("running-empty").hidden = !(processes && !processes.length);
+  $("running-loading").hidden = processes !== null;
+  const idle = (processes ?? []).filter((p) => !p.running && !p.draft);
+  $("end-idle").disabled = endBusy || !idle.length;
+  const rows = [];
+  for (const p of processes ?? []) {
+    const row = el("article", "running-row");
+    row.dataset.running = String(p.running);
+    const head = el("div", "session-top");
+    const name = el("span", "session-name");
+    name.append(el("span", "run-dot"), leaf(p.project));
+    head.append(
+      name,
+      el("span", "status", p.running ? "Running" : p.draft ? "Ready" : "Idle"),
+    );
+    if (p.draft) row.title = "Keeps Claude Code warm for new sessions";
+    const facts = [
+      kindLabels[p.kind] ?? p.kind,
+      p.draft ? "ready (idle)" : p.model || p.route,
+      p.threads.length > 1 ? p.threads.length + " sessions" : null,
+      "age " + ago(now - p.started_at),
+      p.draft ? null : "idle " + ago(now - p.last_activity),
+    ].filter(Boolean);
+    const actions = el("div", "actions");
+    const end = button("End", () => endRow(p));
+    end.disabled = endBusy;
+    actions.append(end);
+    row.append(head, el("div", "meta", facts.join(" · ")), actions);
+    rows.push(row);
+  }
+  list.replaceChildren(...rows);
+}
+// Asks the host for a fresh process list and draws it. Calls done with the list, or null when none came back.
+function freshProcesses(done) {
+  const sent = globalLink?.listProcesses((ok, value) => {
+    if (!ok) {
+      if (value) notice(value);
+      done(null);
+      return;
+    }
+    processes = value;
+    drawRunning();
+    done(value);
+  });
+  if (!sent) {
+    notice("Reconnect to see running sessions.");
+    done(null);
+  }
+}
+// Ends are decided on a fresh snapshot, never the cached one, which may be seconds old.
+function endRow(p) {
+  if (endChecking) return;
+  endChecking = true;
+  freshProcesses((list) => {
+    endChecking = false;
+    if (!list) return;
+    // Several Claude sessions can share a scope, so the row must match its thread set too.
+    const key = JSON.stringify(p.scope);
+    const threads = [...p.threads].sort().join("\n");
+    const fresh = list.find(
+      (q) =>
+        JSON.stringify(q.scope) === key && [...q.threads].sort().join("\n") === threads,
+    );
+    if (!fresh) {
+      notice("That session has already ended.");
+      return;
+    }
+    if (fresh.running)
+      confirmIn(
+        $("running-confirm"),
+        `End ${leaf(fresh.project)}? Its running turn or pending approval stops. History is kept.`,
+        "End session",
+        () => endProcesses([fresh], true),
+      );
+    else endProcesses([fresh], false);
+  });
+}
+function openRunning() {
+  if (!globalLink?.ready) {
+    notice("Reconnect to see running sessions.");
+    return;
+  }
+  processes = null;
+  page("running");
+  notice();
+  drawRunning();
+  refreshRunning();
+  runningTimer = setInterval(() => {
+    if (!document.hidden) refreshRunning();
+  }, 5000);
+}
+function stopRunning() {
+  clearInterval(runningTimer);
+  runningTimer = null;
+}
+$("open-running").onclick = openRunning;
+$("end-idle").onclick = () => {
+  if (endChecking) return;
+  endChecking = true;
+  freshProcesses((list) => {
+    endChecking = false;
+    if (!list) return;
+    const idle = list.filter((p) => !p.running && !p.draft);
+    if (!idle.length) {
+      notice("No idle sessions to end.");
+      return;
+    }
+    confirmIn(
+      $("running-confirm"),
+      `End ${idle.length} idle session${idle.length === 1 ? "" : "s"}? History is kept.`,
+      "End idle",
+      () => endProcesses(idle, false),
+    );
+  });
+};
 function home() {
   detailLink?.close();
   detailLink = null;
@@ -450,8 +743,9 @@ function catalog() {
       continue;
     if (
       (filter === "requests" && !needsInput) ||
+      // "Running" is the desktop chip: a live turn that is not waiting on you.
       (filter === "active" &&
-        !session.capabilities.some((c) => c === "stop" || c === "steer")) ||
+        (needsInput || session.status !== "running")) ||
       (filter === "finished" &&
         (needsInput || ["running", "needs_input"].includes(session.status)))
     )
@@ -499,7 +793,7 @@ function catalog() {
       const head = el("div", "session-top");
       head.append(
         el("span", "session-name", session.title || "Untitled session"),
-        el("span", "status", needsInput ? "Needs input" : session.status),
+        el("span", "status", statusText(session, needsInput)),
       );
       b.append(
         head,
@@ -518,16 +812,16 @@ function catalog() {
         "p",
         "empty",
         filter === "requests"
-          ? "No pending requests."
+          ? "Nothing needs you."
           : filter === "active"
-            ? "No active sessions."
+            ? "No running sessions."
             : filter === "finished"
               ? "No finished sessions."
             : "No sessions found.",
       ),
     );
   $("list").replaceChildren(frag);
-  $("new").disabled = !globalLink?.ready || !routes.length;
+  $("new").disabled = !globalLink?.ready || !(routes.length || apiProvider);
 }
 function showAsks(asks) {
   const stamp = JSON.stringify(asks);
@@ -537,8 +831,18 @@ function showAsks(asks) {
   root.replaceChildren();
   for (const a of asks) {
     const card = el("article", "ask");
+    // A child that would run in YOLO waits here for the operator (ox-host yolo.rs).
+    if (String(a.id).startsWith("ox-yolo-")) {
+      card.classList.add("yolo");
+      card.append(el("p", "ask-kicker", "Worker waits for YOLO"));
+    }
     card.append(el("h2", "", a.title));
     if (a.detail) card.append(el("p", "", a.detail));
+    // The command a shell approval would run, as the desktop card shows it.
+    if (a.command?.command) {
+      card.append(el("pre", "ask-command", a.command.command));
+      if (a.command.cwd) card.append(el("p", "ask-kicker", String(a.command.cwd)));
+    }
     const answer = (action) => {
       for (const b of card.querySelectorAll("button")) b.disabled = true;
       if (
@@ -602,7 +906,9 @@ function showAsks(asks) {
       a.choices.forEach((c, i) => {
         const choice = button(c, () => answer({ answer_ask: [a.id, i] }));
         // Permission decisions are deliberately equal-weight choices.
-        choice.className = "decision";
+        choice.className = /^(deny|decline|reject|cancel|no\b)/i.test(c)
+          ? "decision deny"
+          : "decision";
         card.append(choice);
       });
     }
@@ -622,14 +928,42 @@ function syncChildren(root, nodes) {
   }
 }
 
+// Mirrors the desktop shell_summary: a wrapped script loses both quotes.
+function shellSummary(command) {
+  const m = command?.match(/^(?:\S*\/)?(?:bash|zsh|sh)\s+-[a-z]*c\s+(['"]?)([\s\S]*)$/i);
+  let text = m ? m[2] : (command ?? "");
+  if (m && m[1] && text.endsWith(m[1])) text = text.slice(0, -1);
+  return text.slice(0, 120);
+}
+function fileChanges(data) {
+  return Array.isArray(data?.changes) ? data.changes : [];
+}
+// Added and removed lines of a unified diff, ignoring the ---/+++ headers.
+function diffStats(changes) {
+  let added = 0,
+    removed = 0;
+  for (const c of changes)
+    for (const line of String(c.diff ?? "").split("\n")) {
+      if (line.startsWith("+") && !line.startsWith("+++")) added++;
+      else if (line.startsWith("-") && !line.startsWith("---")) removed++;
+    }
+  return `+${added} −${removed}`;
+}
+function fileChangeTitle(data) {
+  const changes = fileChanges(data);
+  if (!changes.length) return "File changes";
+  const name =
+    changes.length === 1
+      ? String(changes[0].path ?? "File")
+      : `${changes.length} changed files`;
+  return `${name} · ${diffStats(changes)}`;
+}
+
 function toolInfo(item) {
   const [kind, data] = Object.entries(item.detail?.item ?? {})[0] ?? [];
   const labels = {
-    CommandExecution:
-      data?.command
-        ?.replace(/^(?:\S*\/)?(?:bash|zsh|sh)\s+-[a-z]*c\s+['"]?/i, "")
-        .slice(0, 120) || "Shell command",
-    FileChange: "File changes",
+    CommandExecution: shellSummary(data?.command) || "Shell command",
+    FileChange: fileChangeTitle(data),
     WebSearch: "Web search",
   };
   const title =
@@ -649,6 +983,11 @@ function toolText(item, info) {
     if (output) return [data.command, output].filter(Boolean).join("\n\n");
     return item.text;
   }
+  if (info.kind === "FileChange" && fileChanges(data).length)
+    // Same layout as the desktop write_detail: path, then the patch text.
+    return fileChanges(data)
+      .map((c) => `${c.path ?? ""}\n${c.diff ?? ""}`)
+      .join("\n\n");
   return [
     item.text,
     item.detail?.output,
@@ -807,6 +1146,42 @@ function transcript(items, handoffTarget = false) {
   timelineRows = nextRows;
 }
 
+// "Jump to latest": shown once the reader is well above the bottom, with a count of what
+// arrived meanwhile. At the bottom, new content keeps the view pinned there.
+const jumpLatest = (() => {
+  const gap = () =>
+    document.documentElement.scrollHeight - innerHeight - scrollY;
+  const reduced = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+  let seen = 0,
+    last = 0;
+  const sync = () => {
+    const b = $("jump-latest");
+    b.onclick ??= () =>
+      scrollTo({
+        top: document.documentElement.scrollHeight,
+        behavior: reduced() ? "instant" : "smooth",
+      });
+    const far = !$("conversation").hidden && gap() > innerHeight * 1.5;
+    if (!far) seen = last;
+    b.hidden = !far;
+    const fresh = Math.max(0, last - seen);
+    b.textContent = fresh ? `↓ ${fresh} new` : "↓";
+    b.setAttribute(
+      "aria-label",
+      fresh ? `Jump to latest, ${fresh} new` : "Jump to latest",
+    );
+  };
+  addEventListener("scroll", sync, { passive: true });
+  return {
+    pinned: () => scrollY > 2 && gap() < 80,
+    update(count, pinned) {
+      last = count;
+      if (pinned) scrollTo(0, document.documentElement.scrollHeight);
+      sync();
+    },
+  };
+})();
+
 function conversation() {
   if (!selected) return;
   const { scope, id } = selected,
@@ -827,6 +1202,8 @@ function conversation() {
     ready: Boolean(detailLink?.ready),
     act: (action, cb) => detailLink?.act(action, null, cb),
     archived: home,
+    confirm: (question, label, work) =>
+      confirmIn($("confirm-slot"), question, label, work),
     notice,
     routesLabel,
   });
@@ -853,15 +1230,30 @@ function conversation() {
   const inputCaps = id ? caps : (s?.capabilities ?? []);
   updateExtras(s, inputCaps, detailLink, id);
   showReview(timeline?.detail?.reviews);
+  const pinnedBottom = jumpLatest.pinned();
   transcript(
     timeline?.items || [],
     !!origin?.handoff && !timeline?.detail?.older,
   );
+  jumpLatest.update(timeline?.items?.length ?? 0, pinnedBottom);
   $("older").hidden = !timeline?.detail?.older;
   $("older").onclick = () => detailLink.act({ load_older: id });
   $("start-worker").hidden = !id || !caps.includes("open");
   $("continue-in").hidden = !id || !caps.includes("open");
-  showAsks((s?.asks || []).filter((a) => a.thread === id));
+  const asks = (s?.asks || []).filter((a) => a.thread === id);
+  showAsks(asks);
+  // The activity line only trusts a live link: a reconnect must not look like a finished turn.
+  if (detailLink?.ready && s) {
+    const items = timeline?.items || [];
+    activityLine.update({
+      session: keyOf(scope, id),
+      items,
+      running: caps.includes("stop"),
+      waiting: asks.length > 0,
+      failed: items[items.length - 1]?.role === "error",
+      stopped: timeline?.detail?.interrupted === true,
+    });
+  }
   if (selected.revealLatest && timeline?.items?.length) {
     selected.revealLatest = false;
     const answers = $("timeline").querySelectorAll(".assistant, .result");
@@ -886,6 +1278,15 @@ function conversation() {
       }
     }
   }
+  // A session another client is running is read-only here; it can be forked instead.
+  const nativeLive = !!id && caps.includes("native_live");
+  $("native-live").hidden = !nativeLive;
+  $("native-live-text").textContent = nativeLiveText(
+    row?.detail?.native_live ?? "Claude Code",
+  );
+  $("native-live-fork").hidden = !caps.includes("fork");
+  $("native-live-fork").onclick = () => detailLink?.act({ fork_thread: id });
+  $("draft").disabled = nativeLive;
   const canSend = id
     ? caps.some((c) => c === "send" || c === "steer")
     : s?.capabilities.includes("start");
@@ -897,16 +1298,23 @@ function conversation() {
     (imagesFor(keyOf(scope, id)).length > 0 &&
       !inputCaps.includes("attach_image")) ||
     Boolean(pendingNew);
+  // A running turn that waits on an approval still gets the session terminal, so the
+  // person can review the command there (the desktop offers the same path).
+  const awaitingApproval =
+    caps.includes("stop") && (s?.asks || []).some((a) => a.thread === id);
   $("operator-session").hidden =
     !id ||
     !!row?.parent ||
     !!origin ||
-    !caps.includes("send") ||
-    caps.includes("stop");
-  $("stop").hidden = !caps.includes("stop");
-  $("stop").disabled = !detailLink?.ready;
-  $("stop").onclick = () =>
-    detailLink.act({ stop: id });
+    !(caps.includes("send") || awaitingApproval);
+  // Stop keeps its slot. It is enabled only while the host reports a running turn.
+  $("stop").disabled = !detailLink?.ready || !caps.includes("stop");
+  $("stop").onclick = () => detailLink?.act({ stop: id });
+  $("menu-stop").disabled = $("stop").disabled;
+  $("menu-stop").hidden = !id;
+  $("menu-session").hidden = !id;
+  $("menu-workers").hidden = !id || !caps.includes("open");
+  $("menu-settings").hidden = $("session-controls").hidden;
 }
 function render() {
   if (!$("pair").hidden) return;
@@ -914,7 +1322,35 @@ function render() {
   net(live ? "Connected" : "Reconnecting", live);
   if (!$("catalog").hidden) catalog();
   if (!$("conversation").hidden) conversation();
+  updateNeedsBar();
 }
+// A sticky "needs you" bar in the composer stack whenever any session has a pending ask.
+function updateNeedsBar() {
+  const bar = $("needs-bar");
+  const seen = new Set(),
+    asks = [];
+  for (const model of [global, detailLink?.model]) {
+    for (const s of model?.scopes.values() ?? []) {
+      for (const a of s.asks ?? []) {
+        const id = scopeKey(s.scope) + " " + a.id;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        asks.push({ scope: s.scope, thread: a.thread });
+      }
+    }
+  }
+  bar.hidden = !asks.length;
+  if (!asks.length) return;
+  const n = asks.length;
+  bar.textContent = `NEEDS YOU · ${n === 1 ? "1 request" : `${n} requests`}`;
+  bar.onclick = () => {
+    const here = $("asks").firstElementChild;
+    if (here) here.scrollIntoView({ behavior: "smooth", block: "center" });
+    else open(asks[0].scope, asks[0].thread);
+  };
+}
+$("menu-stop").onclick = () => $("stop").click();
+$("menu-settings").onclick = () => $("open-settings").click();
 $("home").onclick = () => {
   if (key) home();
 };
@@ -944,6 +1380,11 @@ $("new").onclick = () => {
   options($("project"), projects, projects);
   options($("route"), routes, routes.map(routesLabel));
   page("create");
+  loadModelChoices().then(() => {
+    const keep = $("route").value;
+    options($("route"), routes, routes.map(routesLabel));
+    if (keep !== "") $("route").value = keep;
+  });
 };
 let browseSequence = 0,
   folderPage,
@@ -1029,6 +1470,22 @@ const provider = (route) =>
     : route.runtime === "codex"
       ? "OpenAI (ChatGPT subscription)"
       : "Anthropic (Claude subscription)";
+function linkCard({ label, title, meta, tone = "", action }) {
+  const card = el("article", "link-card " + tone);
+  const body = el("div", "link-card-body");
+  body.append(
+    el("p", "link-card-label", label),
+    el("strong", "link-card-title", title),
+  );
+  if (meta) body.append(el("span", "meta", meta));
+  card.append(el("span", "link-card-icon"), body);
+  if (action) {
+    const b = button(action[0], action[1]);
+    b.className = "quiet link-card-action";
+    card.append(b);
+  }
+  return card;
+}
 function handoffMarks(row) {
   const box = $("handoff-marks"),
     d = row?.detail ?? {},
@@ -1044,28 +1501,34 @@ function handoffMarks(row) {
         operator: "chosen by you",
         capped: "capped below YOLO",
       }[origin.decided] ?? "unknown";
-    const p = el(
-      "p",
-      "handoff-marker",
-      `Continued from “${h.title}” · ${routesLabel(h.route)} · mode ${modeLabel(origin.started)} (${why}) · ${sel.carried ?? 0} messages carried, ${sel.omitted ?? 0} omitted`,
+    nodes.push(
+      linkCard({
+        label: "Continued from",
+        title: h.title,
+        meta: `${routesLabel(h.route)} · mode ${modeLabel(origin.started)} (${why}) · ${sel.carried ?? 0} messages carried, ${sel.omitted ?? 0} omitted`,
+        action: ["Open source", () => open(h.scope, h.session)],
+      }),
     );
-    p.append(button("Open source", () => open(h.scope, h.session)));
-    nodes.push(p);
   }
-  for (const to of d.handed_off_to ?? []) {
-    const p = el("p", "handoff-marker", `Handed off to ${to.label}`);
-    p.append(button("Open", () => open(to.scope, to.session)));
-    nodes.push(p);
-  }
+  for (const to of d.handed_off_to ?? [])
+    nodes.push(
+      linkCard({
+        label: "Handed off to",
+        title: to.label,
+        action: ["Open", () => open(to.scope, to.session)],
+      }),
+    );
   for (const a of d.handoff_attempts ?? [])
     nodes.push(
-      el(
-        "p",
-        "handoff-marker",
-        a.status === "failed"
-          ? `Handoff to ${a.label} failed: ${a.message ?? "unknown error"}`
-          : `Handing off to ${a.label}…`,
-      ),
+      a.status === "failed"
+        ? linkCard({
+            label: "Handoff failed",
+            title: a.label,
+            meta: a.message ?? "unknown error",
+            tone: "failed",
+            action: ["Retry", () => $("continue-in").click()],
+          })
+        : linkCard({ label: "Handing off", title: a.label, tone: "pending" }),
     );
   box.replaceChildren(...nodes);
   box.hidden = !nodes.length;
@@ -1104,27 +1567,68 @@ const modeLabel = (m) =>
     bypass_permissions: "bypass permissions",
   })[m] ?? "unverified";
 function handoffRoutes() {
-  const runtime = $("handoff-runtime").value;
-  const list = routes.filter((r) => r.runtime === runtime);
-  $("handoff-route").replaceChildren(
-    ...list.map((r, n) => new Option(routesLabel(r), String(routes.indexOf(r)))),
-  );
+  const runtime = $("handoff-runtime").value,
+    select = $("handoff-route"),
+    keep = select.value;
+  const list = routes.filter((r) => r.runtime === runtime),
+    rank = (r) => {
+      const i = modelChoices.starred.indexOf(r.billing?.api);
+      return i < 0 ? Infinity : i;
+    };
+  const starred = list
+      .filter((r) => rank(r) !== Infinity)
+      .sort((x, y) => rank(x) - rank(y)),
+    rest = list.filter((r) => rank(r) === Infinity);
+  const option = (r) => new Option(routesLabel(r), String(routes.indexOf(r)));
+  const groups = [];
+  if (starred.length)
+    groups.push(optgroup("Starred", starred.map(option)));
+  if (rest.length) groups.push(optgroup("All models", rest.map(option)));
+  select.replaceChildren(...groups);
+  if (keep !== "" && routes[+keep]?.runtime === runtime) select.value = keep;
   handoffNotice();
 }
+// The route the handoff form currently targets. An empty selection (no route of
+// the chosen runtime is configured) is no route, never index 0 of another runtime.
+const handoffTarget = () => {
+  const index = $("handoff-route").value;
+  const route = index === "" ? undefined : routes[+index];
+  return route?.runtime === $("handoff-runtime").value ? route : undefined;
+};
+const runtimeName = (r) => (r === "codex" ? "ChatGPT/Codex" : "Claude");
 function handoffNotice() {
-  const target = routes[+$("handoff-route").value],
+  const target = handoffTarget(),
     source = selected?.scope?.route;
   const line = $("handoff-provider");
-  if (target && source && provider(target) !== provider(source)) {
+  if (!target) {
+    line.textContent = `No ${runtimeName($("handoff-runtime").value)} model or subscription is configured on this host. Choose another runtime or sign in on the host.`;
+    line.hidden = false;
+  } else if (source && provider(target) !== provider(source)) {
     line.textContent = `This handoff sends the carried conversation to ${provider(target)} (${routesLabel(target)}).`;
     line.hidden = false;
   } else line.hidden = true;
   $("handoff-grant-row").hidden = $("handoff-mode").value !== "yolo";
+  labelPermissions(
+    $("handoff-mode"),
+    $("handoff-runtime").value,
+    $("handoff-permission-note"),
+  );
 }
 $("continue-in").onclick = () => {
-  $("handoff-runtime").value =
-    selected?.scope?.route?.runtime === "codex" ? "claude" : "codex";
+  // Starts on the session's own runtime and route, as the desktop handoff sheet does.
+  const from = selected?.scope?.route;
+  if (from) $("handoff-runtime").value = from.runtime;
   handoffRoutes();
+  const same = routes.findIndex(
+    (r) =>
+      r.runtime === from?.runtime &&
+      (r.billing === "subscription"
+        ? from.billing === "subscription"
+        : r.billing?.api === from?.billing?.api),
+  );
+  if (same >= 0) $("handoff-route").value = String(same);
+  handoffNotice();
+  loadModelChoices();
   $("handoff-form").hidden = false;
   $("handoff-request").focus();
 };
@@ -1135,9 +1639,19 @@ $("handoff-cancel").onclick = () => ($("handoff-form").hidden = true);
 $("handoff-form").onsubmit = (e) => {
   e.preventDefault();
   if (!selected?.id) return;
-  const route = routes[+$("handoff-route").value];
-  if (!route) return;
+  const route = handoffTarget();
+  if (!route) {
+    notice(
+      `No ${runtimeName($("handoff-runtime").value)} model or subscription is configured on this host.`,
+    );
+    return;
+  }
   const mode = $("handoff-mode").value;
+  const request = $("handoff-request").value.trim();
+  if (!request) {
+    notice("Write the request for the new session.");
+    return;
+  }
   const row = detailLink?.model.scopes
     .get(scopeKey(selected.scope))
     ?.sessions.find((x) => x.id === selected.id);
@@ -1158,7 +1672,7 @@ $("handoff-form").onsubmit = (e) => {
     runtime: route.runtime,
     model: route.billing?.api ?? null,
     mode,
-    request: $("handoff-request").value,
+    request,
     yolo_confirmed: confirmed,
   };
   const grant = mode === "yolo" && $("handoff-grant").checked;
@@ -1176,31 +1690,213 @@ $("handoff-form").onsubmit = (e) => {
   // handoff reply can arrive before its acknowledgement.
   if (grant && key) pendingGrant = { key };
 };
-$("start-worker").onclick = () => {
-  $("worker-models").replaceChildren(
-    ...routes
-      .filter((r) => r.billing?.api)
-      .map((r) => new Option(r.billing.api)),
+// Model lists for the worker and handoff sheets: the host's starred models first,
+// then every known model and every API route the phone already has.
+let modelChoices = { starred: [], all: [] };
+const optgroup = (label, options) => {
+  const g = document.createElement("optgroup");
+  g.label = label;
+  g.append(...options);
+  return g;
+};
+async function loadModelChoices() {
+  let starred = [],
+    known = [];
+  const clean = (list) => [
+    ...new Set(list.filter((m) => typeof m === "string" && m)),
+  ];
+  const publish = () => {
+    modelChoices = {
+      starred,
+      all: clean([...starred, ...known, ...routes.map((r) => r.billing?.api)]),
+    };
+    addCatalogRoutes();
+    fillWorkerModels();
+    handoffRoutes();
+    repaint();
+  };
+  try {
+    const rows = await settingsRequest(key, { action: "read_rows" });
+    starred = clean(rows.favorites ?? []);
+    known = rows.models ?? [];
+    apiProvider = !!rows.api_provider;
+  } catch {
+    // The route list alone still works.
+  }
+  // Settings are quick: show the configured aliases before discovery returns.
+  publish();
+  try {
+    // The full discovered catalog: stars only order, any model can be used.
+    const found = await settingsRequest(key, { action: "models" });
+    if (Array.isArray(found)) known = [...known, ...found];
+  } catch {
+    // Discovery needs the providers; the starred and configured models still work.
+  }
+  publish();
+}
+// Routes are only appended, so the indexes the forms hold stay valid.
+function addCatalogRoutes() {
+  const have = new Set(routes.map((r) => `${r.runtime} ${r.billing?.api ?? ""}`));
+  for (const runtime of ["codex", "claude"]) {
+    if (!apiProvider && !routes.some((r) => r.runtime === runtime)) continue;
+    for (const m of modelChoices.all) {
+      if (have.has(`${runtime} ${m}`)) continue;
+      routes.push({ runtime, billing: { api: m } });
+    }
+  }
+}
+// The model the worker sheet should start from: the parent session's route, set when
+// the sheet opens (desktop worker_sheet.rs Choice::new). Cleared when the runtime changes.
+let workerSeed = null;
+function fillWorkerModels() {
+  const select = $("worker-model"),
+    runtime = $("worker-runtime").value,
+    current = workerSeed ? workerSeed.model : select.value,
+    starred = modelChoices.starred,
+    rest = modelChoices.all.filter((m) => !starred.includes(m));
+  const option = (m) => new Option(m, m);
+  // A Codex worker needs an OX API model (desktop worker_sheet.rs subscription_ok).
+  const subscription = new Option(
+    runtime === "codex" ? "ChatGPT subscription" : "Claude subscription",
+    "",
   );
+  subscription.disabled = runtime === "codex";
+  select.replaceChildren(
+    subscription,
+    ...(starred.length ? [optgroup("Starred", starred.map(option))] : []),
+    ...(rest.length ? [optgroup("All models", rest.map(option))] : []),
+  );
+  select.value = [...select.options].some((o) => o.value === current)
+    ? current
+    : "";
+  if (runtime === "codex" && !select.value && select.options.length > 1)
+    select.value = select.options[1].value;
+  // Free text is the fallback only when the phone has no model list at all.
+  const free = !modelChoices.all.length;
+  select.hidden = free;
+  $("worker-model-free").hidden = !free;
+}
+const workerModelValue = () =>
+  ($("worker-model-free").hidden
+    ? $("worker-model").value
+    : $("worker-model-free").value.trim()) || null;
+// Labels and one-line notes are the desktop's (worker_sheet.rs mode_label / mode_note).
+const workerModes = {
+  session: "Session",
+  goal: "Goal",
+  workflow: "Workflow",
+};
+const workerModeNotes = {
+  session: "The task starts a new session under this one.",
+  goal: "Codex keeps working toward the task as an objective.",
+  workflow: "Claude Code runs the task with its Workflow tool.",
+};
+const modesFor = (runtime) =>
+  runtime === "codex" ? ["session", "goal"] : ["session", "workflow"];
+function renderWorkerMode() {
+  const allowed = modesFor($("worker-runtime").value);
+  if (!allowed.includes($("worker-mode").value)) $("worker-mode").value = "session";
+  const current = $("worker-mode").value;
+  $("worker-mode-note").textContent = workerModeNotes[current] ?? "";
+  $("worker-mode-group").replaceChildren(
+    ...allowed.map((m) => {
+      const b = button(workerModes[m], () => {
+        $("worker-mode").value = m;
+        renderWorkerMode();
+      });
+      b.className = "segment";
+      b.setAttribute("role", "radio");
+      b.setAttribute("aria-checked", String(m === current));
+      return b;
+    }),
+  );
+}
+// Each shared level names the native preset it starts in (ox-desk-core modes.rs preset),
+// so the labels and one-line descriptions are the desktop's for that runtime.
+const permissionPresets = {
+  codex: {
+    read: ["Read only", "Read files. Ask before writing or running outside the sandbox."],
+    write: ["Workspace", "Edit the workspace. Ask you before leaving the sandbox."],
+    classifier: ["Auto-review", "Edit the workspace. Let Codex review approval requests."],
+    yolo: ["YOLO", "Full filesystem and network access. Run commands without approval."],
+  },
+  claude: {
+    read: ["Plan mode", "Let Claude Code explore and plan before making changes."],
+    write: ["Accept edits", "Let Claude Code apply edits without asking about each edit."],
+    classifier: ["Auto", "Let Claude Code’s classifier review tool actions before they run."],
+    yolo: ["YOLO · bypass permissions", "Run Claude Code tools without permission prompts."],
+  },
+};
+function labelPermissions(select, runtime, note) {
+  const table = permissionPresets[runtime] ?? permissionPresets.codex;
+  for (const o of select.options) if (table[o.value]) o.textContent = table[o.value][0];
+  note.textContent =
+    select.value === "inherit"
+      ? "Uses this session's current permission mode."
+      : (table[select.value]?.[1] ?? "");
+}
+function renderWorkerPermission() {
+  const yolo = $("worker-permission").value === "yolo";
+  labelPermissions($("worker-permission"), $("worker-runtime").value, $("worker-permission-note"));
+  $("worker-warning").textContent =
+    "YOLO runs this worker's commands and edits without asking. Choosing it here confirms that.";
+  $("worker-warning").hidden = !yolo;
+}
+$("worker-runtime").onchange = () => {
+  // A new runtime starts from its own subscription or first starred model, not the old one.
+  workerSeed = null;
+  fillWorkerModels();
+  renderWorkerMode();
+  renderWorkerPermission();
+};
+$("worker-permission").onchange = renderWorkerPermission;
+$("start-worker").onclick = () => {
+  // Start from the parent session's route, as the desktop sheet does.
+  const route = selected?.scope?.route;
+  if (route) {
+    $("worker-runtime").value = route.runtime;
+    workerSeed = { model: route.billing?.api ?? "" };
+  }
+  fillWorkerModels();
+  renderWorkerMode();
+  renderWorkerPermission();
   $("worker-form").hidden = false;
   $("worker-task").focus();
+  loadModelChoices();
 };
 $("worker-cancel").onclick = () => ($("worker-form").hidden = true);
 $("worker-form").onsubmit = (e) => {
   e.preventDefault();
   if (!selected?.id) return;
-  const model = $("worker-model").value.trim() || null;
+  const task = $("worker-task").value.trim();
+  if (!task) {
+    notice("Write the task for the worker.");
+    return;
+  }
+  const runtime = $("worker-runtime").value,
+    permission = $("worker-permission").value;
+  // No model chosen means the runtime's subscription, which must be configured.
+  if (
+    !workerModelValue() &&
+    !routes.some((r) => r.runtime === runtime && r.billing === "subscription")
+  ) {
+    notice(
+      `${runtimeName(runtime)} has no subscription configured on this host. Choose an OX API model or sign in on the host.`,
+    );
+    return;
+  }
   const start = {
     parent: selected.id,
-    runtime: $("worker-runtime").value,
-    model,
-    mode: $("worker-mode").value,
-    task: $("worker-task").value,
-    permission: $("worker-permission").value,
-    yolo_confirmed: false,
+    runtime,
+    model: workerModelValue(),
+    mode: modesFor(runtime).includes($("worker-mode").value)
+      ? $("worker-mode").value
+      : "session",
+    task,
+    permission,
+    // Choosing YOLO in the sheet is the confirmation, as for any YOLO change.
+    yolo_confirmed: permission === "yolo",
   };
-  // Choosing YOLO in the sheet is the confirmation, as for any YOLO change.
-  start.yolo_confirmed = start.permission === "yolo";
   detailLink?.act({ start_worker: start }, null, (ok, message) => {
     if (!ok) notice(message || "The host refused this worker.");
     else {
@@ -1229,10 +1925,13 @@ $("composer").onsubmit = (e) => {
       ? { send_images: [id, content, images.map((v) => v.image)] }
       : { send_text: [id, content] };
   pendingNew = { owner };
+  const sentNow = { content, images };
+  unacked.set(owner, sentNow);
   if (
     !link.act(action, null, (ok) => {
+      if (unacked.get(owner) === sentNow) unacked.delete(owner);
       pendingNew = null;
-      if (ok) {
+      if (ok && !sentNow.restored) {
         clearImages(owner, images);
         if (drafts.get(owner) === content) drafts.delete(owner);
         if (
@@ -1244,8 +1943,10 @@ $("composer").onsubmit = (e) => {
       }
       repaint();
     })
-  )
+  ) {
     pendingNew = null;
+    unacked.delete(owner);
+  }
   repaint();
 };
 const closeCamera = setupCamera((secret) => {
@@ -1288,8 +1989,27 @@ function notificationGuide(text, buttonLabel) {
   $("notifications").hidden = !buttonLabel;
   if (buttonLabel) $("notifications").textContent = buttonLabel;
 }
+const alertsKey = "ox-phone-alerts-dismissed";
+function alertsDismissed() {
+  try {
+    return localStorage.getItem(alertsKey) === "1";
+  } catch {
+    return false;
+  }
+}
+function setAlertsDismissed(on) {
+  try {
+    if (on) localStorage.setItem(alertsKey, "1");
+    else localStorage.removeItem(alertsKey);
+  } catch {
+    // Private windows may refuse storage; the banner then simply returns.
+  }
+}
 function notificationSetup(justPaired) {
-  if (justPaired) $("notification-setup").open = true;
+  if (justPaired) {
+    setAlertsDismissed(false);
+    $("notification-setup").open = true;
+  }
   const supportsPush =
     "serviceWorker" in navigator &&
     "Notification" in window &&
@@ -1315,7 +2035,23 @@ function notificationSetup(justPaired) {
     );
     if (Notification.permission === "granted") registerNotifications(false);
   }
+  // One-time banner until alerts are on or the user dismisses it; then it lives in the menu.
+  const granted =
+    "Notification" in window && Notification.permission === "granted";
+  const dismissed = alertsDismissed();
+  $("notification-banner").hidden = granted || dismissed;
+  $("open-notifications").hidden = granted || !dismissed;
 }
+$("notification-dismiss").onclick = () => {
+  setAlertsDismissed(true);
+  notificationSetup(false);
+};
+$("open-notifications").onclick = () => {
+  closeActionMenus();
+  setAlertsDismissed(false);
+  notificationSetup(false);
+  $("notification-setup").open = true;
+};
 let registering = false;
 async function registerNotifications(explicit) {
   if (registering) return;
@@ -1340,6 +2076,11 @@ $("notifications").onclick = () => registerNotifications(true);
 function pairingPage() {
   page("pair");
   net("Pair device");
+  const scanned = Boolean(code);
+  $("step-scan").toggleAttribute("aria-current", !scanned);
+  $("step-name").toggleAttribute("aria-current", scanned);
+  $("scan-pair").hidden = scanned;
+  $("pair-submit").classList.toggle("primary", scanned);
   $("paste-pair").hidden = Boolean(code);
   $("pair-link").required = !code;
   $("pair-hint").textContent = code

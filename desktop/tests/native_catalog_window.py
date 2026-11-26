@@ -80,9 +80,10 @@ def run(gui, codex, claude, root, failure_image=None):
                 window.word("Maple")
                 window.word("Birch", click=True)
                 window.wait(lambda s: s["connected"] and s["selected_thread"] == thread, "imported relay session")
-                window.word("Default", after_x=220, bottom=True)
+                # The permission chip (id access-preset) spells Claude's Default as "Ask before edits".
+                assert "ask before edits" in window.control("access-preset")["label"].casefold()
                 assert len(vendor.requests) == calls_before_refresh, "Refreshing or resuming generated a model request"
-                window.word("actions", click=True, after_x=220)
+                window.press("Thread actions")  # An icon button: no visible word to OCR.
                 window.word("Generate", click=True)
                 window.word("Orchard")
                 assert len(vendor.requests) == calls_before_refresh + 1, "Expected one title request"

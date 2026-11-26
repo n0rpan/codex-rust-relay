@@ -18,6 +18,9 @@ impl EventState {
     pub(super) fn lifetime(&self) -> std::sync::Weak<()> {
         Arc::downgrade(&self.alive)
     }
+    pub(super) fn take_awaiting_echo(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.awaiting_echo)
+    }
     // A successful queue write alone cannot attest that the CLI read the prompt.
     pub(super) fn sent(&mut self, id: &str, text: &str) {
         self.awaiting_echo.push((id.into(), text.into()));
@@ -80,6 +83,16 @@ impl Store {
                 batch.apply(self, &owner);
                 Ok(())
             }
+            Data::Tail(tail) => {
+                if self.is_viewer(&owner) {
+                    tail.apply(self);
+                }
+                Ok(())
+            }
+            Data::Viewed(follower) => {
+                self.viewed(&owner, follower);
+                Ok(())
+            }
             Data::Stock(pipe::Event::Frame(event)) => self.claude_frame(&owner, event),
         };
         if let Err(err) = &outcome {
@@ -98,6 +111,7 @@ impl Store {
         let t = self.transcripts.entry(owner.into()).or_default();
         t.access = mode;
         t.error = None;
+        self.resume_access.remove(owner);
         t.model = model;
         self.state = Connection::Ready;
         self.changed.mark(Changed::CONNECTION);
@@ -122,15 +136,8 @@ impl Store {
         let Some(mut p) = self.claude_mut().sessions.remove(owner) else {
             return;
         };
-        let mut unsent: Vec<_> = p
-            .events
-            .awaiting_echo
-            .into_iter()
-            .map(|(_, text)| text)
-            .collect();
-        if let Some((_, text)) = p.first.take() {
-            unsent.push(text);
-        }
+        let mut unsent = p.events.awaiting_echo;
+        unsent.extend(p.first.take());
         self.restore_claude_drafts(owner, unsent);
         if self.claude().blank.as_deref() == Some(owner) {
             self.claude_mut().blank = None;
@@ -171,13 +178,19 @@ impl Store {
             .mark(Changed::CONNECTION | Changed::NOTICE | Changed::ASK | Changed::THREADS);
     }
 
-    fn restore_claude_drafts(&mut self, owner: &str, mut unsent: Vec<String>) {
-        if !unsent.is_empty() {
+    pub(super) fn restore_claude_drafts(&mut self, owner: &str, messages: Vec<(String, String)>) {
+        if let Some((id, _)) = messages.last() {
+            let id = id.clone();
+            let mut unsent: Vec<_> = messages.into_iter().map(|(_, text)| text).collect();
             let draft = self.draft(Some(owner));
             if !draft.is_empty() && unsent.last().is_none_or(|s| s != draft) {
                 unsent.push(draft.to_owned());
             }
-            self.edit(Some(owner), unsent.join("\n"));
+            let text = unsent.join("\n");
+            self.restored_drafts
+                .insert(owner.to_owned(), (id, text.clone()));
+            self.edit(Some(owner), text);
+            self.changed.mark(Changed::THREADS);
         }
     }
 
@@ -216,7 +229,17 @@ impl Store {
             }
             Event::Init(init) => {
                 let cwd = Path::new(&init.cwd);
-                if cwd != self.profile.project
+                let first = !std::mem::replace(
+                    &mut self
+                        .claude_mut()
+                        .sessions
+                        .get_mut(owner)
+                        .unwrap()
+                        .project_checked,
+                    true,
+                );
+                if first
+                    && cwd != self.profile.project
                     && cwd
                         .canonicalize()
                         .ok()
@@ -236,6 +259,16 @@ impl Store {
                 let p = self.claude_mut().sessions.get_mut(owner).unwrap();
                 p.mode = mode;
                 if let Some(caps) = &mut p.capabilities {
+                    // The stream reports the concrete model the symbolic default resolves to.
+                    if caps.model == "default" && init.model != "default" {
+                        if let Some(info) = Arc::make_mut(&mut caps.models).get_mut("default") {
+                            info.resolved = Some(init.model.clone());
+                        }
+                        let name = caps.model_display("default");
+                        if let Some(info) = Arc::make_mut(&mut caps.models).get_mut("default") {
+                            info.label = name;
+                        }
+                    }
                     caps.model = init.model.clone();
                     let offered: HashSet<_> = init
                         .slash_commands
@@ -361,15 +394,25 @@ impl Store {
                     self.title_after_turn(owner);
                 }
                 let t = self.transcripts.entry(owner.into()).or_default();
-                t.last_finished = t.active_turn.take().or_else(|| t.last_finished.clone());
-                if r.is_error {
+                let finished = t.active_turn.take();
+                t.interrupted = finished.is_some() && finished == t.stop_requested.take();
+                t.last_finished = finished.or_else(|| t.last_finished.clone());
+                let interrupted = t.interrupted;
+                if r.is_error && !interrupted {
                     t.error = Some(if r.errors.is_empty() {
                         format!("Claude turn ended ({})", r.subtype)
                     } else {
                         r.errors.join("\n")
                     });
                 }
-                self.claude_status(owner, if r.is_error { "systemError" } else { "idle" });
+                self.claude_status(
+                    owner,
+                    if r.is_error && !interrupted {
+                        "systemError"
+                    } else {
+                        "idle"
+                    },
+                );
                 self.claude_activity(owner);
                 self.changed.mark(Changed::THREADS);
             }
@@ -541,18 +584,33 @@ impl Store {
                     }
                 }
                 Billing::Subscription => {
-                    for model in native.models {
-                        if model.value == "default" {
+                    for (rank, model) in native.models.into_iter().enumerate() {
+                        let is_default = model.value == "default";
+                        if is_default {
                             caps.model = model.value.clone();
                         }
                         models.insert(
                             model.value,
                             ModelInfo {
                                 label: model.display_name,
+                                rank: Some(rank as u32),
+                                is_default,
+                                resolved: model.resolved_model,
                                 ..Default::default()
                             },
                         );
                     }
+                }
+            }
+            // The symbolic default is listed under the model it resolves to.
+            if caps
+                .models
+                .get("default")
+                .is_some_and(|m| m.resolved.is_some())
+            {
+                let name = caps.model_display("default");
+                if let Some(info) = Arc::make_mut(&mut caps.models).get_mut("default") {
+                    info.label = name;
                 }
             }
             let mode = native
@@ -579,6 +637,13 @@ impl Store {
         let result = match r.payload {
             Ok(r) => r,
             Err(reason) => {
+                // A refused interrupt leaves the turn running: it must not later read as
+                // Stopped, which would also hide the error a failing turn reports.
+                if matches!(control, Control::Interrupt)
+                    && let Some(t) = self.transcripts.get_mut(owner)
+                {
+                    t.stop_requested = None;
+                }
                 self.notice = Some(reason);
                 self.changed.mark(Changed::NOTICE);
                 return Ok(());
@@ -629,10 +694,7 @@ impl Store {
                         .into_iter()
                         .partition(|(id, _)| cancelled.contains(id.as_str()));
                     *pending = survivors;
-                    self.restore_claude_drafts(
-                        owner,
-                        cancelled.into_iter().map(|(_, t)| t).collect(),
-                    );
+                    self.restore_claude_drafts(owner, cancelled);
                 }
                 if let Some(count) = result["still_queued"]
                     .as_array()
@@ -767,7 +829,10 @@ mod tests {
             catalog: Default::default(),
             asks: Default::default(),
             blank: None,
+            worker: None,
+            worker_blank: None,
             serial: 2,
+            native: Default::default(),
         };
         let mut store = Store::with_link(profile, links::Link::Claude(Box::new(project)));
         for k in [&a, &b] {
@@ -776,6 +841,7 @@ mod tests {
                 Process {
                     generation: 2,
                     initialized: true,
+                    project_checked: false,
                     ..Default::default()
                 },
             );
@@ -796,6 +862,178 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap()
+    }
+    /// The replica clears its composer when the host acknowledges a resume send. When the
+    /// native startup then fails, the host restores the text; that restore must reach
+    /// the replica (by delta and by a later full snapshot) instead of leaving it empty.
+    #[test]
+    fn a_resume_that_fails_after_the_ack_puts_the_text_back_in_the_replica_composer() {
+        use crate::actions::Action;
+        use crate::host_protocol::{Cursor, Scope, Server};
+        let (mut host, a, _b) = fixture();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        host.claude_mut().deliver = Arc::new(move |event| {
+            let _ = tx.lock().unwrap().send(event);
+        });
+        host.state = Connection::Ready;
+        host.end_session(&a).unwrap();
+        let profile = host.profile.clone();
+        let scope = Scope {
+            project: profile.project.clone(),
+            route: profile.route.clone(),
+        };
+        let (actions, requests) = std::sync::mpsc::channel();
+        let mut replica = Store::remote_client(profile, move |action, _| {
+            actions.send(action).unwrap();
+            Ok("a1".into())
+        });
+        let snapshot = |host: &Store, seq| Server::Snapshot {
+            cursor: Cursor {
+                epoch: "e".into(),
+                seq,
+            },
+            scopes: vec![host.host_snapshot(&scope)],
+        };
+        replica.apply_host(snapshot(&host, 1)).unwrap();
+        replica.edit(Some(&a), "back again".into());
+        replica.submit(Some(&a)).unwrap();
+        let action = requests.recv().unwrap();
+        assert!(matches!(action, Action::SendText(..)));
+        host.dispatch(action).unwrap();
+        replica.apply_host(Server::Ack { id: "a1".into() }).unwrap();
+        assert_eq!(replica.draft(Some(&a)), "", "cleared on the ack");
+        let e = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        host.apply(e);
+        assert_eq!(host.draft(Some(&a)), "back again");
+        replica.edit(Some(&a), "please come back again tomorrow".into());
+        replica.apply_host(snapshot(&host, 2)).unwrap();
+        assert_eq!(
+            replica.draft(Some(&a)),
+            "back again\nplease come back again tomorrow"
+        );
+        replica.edit(Some(&a), "back again".into());
+        // The same snapshot again (reconnect) does not duplicate it, and text typed in
+        // the meantime is kept after it.
+        replica.apply_host(snapshot(&host, 3)).unwrap();
+        assert_eq!(replica.draft(Some(&a)), "back again");
+        replica.edit(Some(&a), "back again\nmore".into());
+        replica.apply_host(snapshot(&host, 4)).unwrap();
+        assert_eq!(replica.draft(Some(&a)), "back again\nmore");
+    }
+    #[test]
+    fn sending_to_an_ended_session_resumes_it_with_the_message_as_first_input() {
+        let (mut s, a, _b) = fixture();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        s.claude_mut().deliver = Arc::new(move |event| {
+            let _ = tx.lock().unwrap().send(event);
+        });
+        s.state = Connection::Ready;
+        s.end_session(&a).unwrap();
+        assert!(s.is_ended(&a) && !s.can_send(Some(&a)) && s.can_compose(Some(&a)));
+        s.edit(Some(&a), "back again".into());
+        s.submit(Some(&a)).unwrap();
+        // A Resume process now exists and holds the message until it initialises.
+        let process = &s.claude().sessions[&a];
+        assert!(!process.initialized);
+        assert_eq!(
+            process.first.as_ref().map(|f| f.1.as_str()),
+            Some("back again")
+        );
+        assert!(!s.is_ended(&a) && s.has_live_session(&a));
+        assert!(s.transcript(&a).unwrap().is_loading());
+        assert_eq!(s.draft(Some(&a)), "");
+        // The fixture has no saved session to resume, so the launch fails (proving the
+        // Resume path ran). The unsent message returns to the composer, not lost.
+        let event = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        s.apply(event);
+        assert_eq!(s.draft(Some(&a)), "back again");
+        assert!(!s.claude().sessions.contains_key(&a));
+    }
+    /// A host reaps an idle route and reopens it for the next send: the new store is still
+    /// connecting, its catalog holds the saved row and no process exists for it yet.
+    #[test]
+    fn a_connecting_claude_store_resumes_a_saved_row_on_the_first_send() {
+        let (mut s, a, _b) = fixture();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        s.claude_mut().deliver = Arc::new(move |event| {
+            let _ = tx.lock().unwrap().send(event);
+        });
+        s.claude_mut().sessions.remove(&a);
+        s.mark_ended(&a);
+        assert_eq!(s.state, Connection::Connecting);
+        assert!(s.can_compose(Some(&a)));
+        s.edit(Some(&a), "after the reap".into());
+        s.submit(Some(&a)).unwrap();
+        assert_eq!(
+            s.claude().sessions[&a].first.as_ref().map(|f| f.1.as_str()),
+            Some("after the reap")
+        );
+        assert_eq!(s.draft(Some(&a)), "");
+        // The saved session is missing in this fixture, so the launch fails and the
+        // message comes back to the composer exactly once.
+        let event = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        s.apply(event);
+        assert_eq!(s.draft(Some(&a)), "after the reap");
+        assert!(rx.try_recv().is_err());
+    }
+    /// A send that reopens an ended session runs its first turn in the access mode the
+    /// user had chosen, whether they ended the session or the host reaped the route
+    /// (the replacement store is seeded through `restore_ended`). Opening the session from
+    /// the list is a fresh start and keeps `default`.
+    #[test]
+    fn a_resumed_send_keeps_the_access_mode_but_opening_from_the_list_does_not() {
+        let (mut s, a, b) = fixture();
+        s.claude_mut().deliver = Arc::new(|_| ());
+        for k in [&a, &b] {
+            s.claude_mut().sessions.remove(k);
+            s.restore_ended(k, "Session", 1, Some(Access::Plan));
+        }
+        s.edit(Some(&a), "go on".into());
+        s.submit(Some(&a)).unwrap();
+        assert_eq!(s.claude().sessions[&a].launch_mode, "plan");
+        s.claude_open(&b).unwrap();
+        assert_eq!(s.claude().sessions[&b].launch_mode, "default");
+        // A resume that fails keeps the mode for the retry.
+        s.claude_mut().sessions.remove(&a);
+        s.mark_ended(&a);
+        s.edit(Some(&a), "again".into());
+        s.submit(Some(&a)).unwrap();
+        assert_eq!(s.claude().sessions[&a].launch_mode, "plan");
+    }
+    #[test]
+    fn a_later_init_after_cd_keeps_the_session_but_a_first_init_elsewhere_does_not() {
+        let (mut s, a, b) = fixture();
+        let init = |cwd: &str| {
+            decode(
+                json!({"type":"system","subtype":"init","session_id":A,"uuid":"u",
+                "model":"m","permissionMode":"default","slash_commands":[],"tools":[],"cwd":cwd}),
+            )
+        };
+        // Claude Code repeats init each turn with the Bash tool's current directory.
+        update(
+            &mut s,
+            &a,
+            2,
+            Data::Stock(pipe::Event::Frame(init("/fixture"))),
+        )
+        .unwrap();
+        update(
+            &mut s,
+            &a,
+            2,
+            Data::Stock(pipe::Event::Frame(init("/fixture/sub"))),
+        )
+        .unwrap();
+        assert!(s.claude().sessions.contains_key(&a));
+        // The first init of a session must still be in the project.
+        let elsewhere = decode(
+            json!({"type":"system","subtype":"init","session_id":B,"uuid":"u",
+            "model":"m","permissionMode":"default","slash_commands":[],"tools":[],"cwd":"/elsewhere"}),
+        );
+        assert!(update(&mut s, &b, 2, Data::Stock(pipe::Event::Frame(elsewhere))).is_err());
     }
     #[test]
     fn palette_shows_only_headless_builtins_and_advertised_custom_skills() {
@@ -906,5 +1144,55 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn ending_a_session_drops_its_process_and_keeps_it_resumable() {
+        let (mut s, a, b) = fixture();
+        let alive = s.claude().sessions[&a].events.lifetime();
+        assert!(alive.upgrade().is_some());
+        assert_eq!(s.live_threads(), {
+            let mut both = vec![a.clone(), b.clone()];
+            both.sort();
+            both
+        });
+        assert!(s.has_live_session(&a));
+        let request = decode(
+            json!({"type":"control_request","request_id":"r","request":{"subtype":"can_use_tool","tool_name":"Read","tool_use_id":"tool","input":{"file_path":"a"}}}),
+        );
+        for owner in [&a, &b] {
+            update(
+                &mut s,
+                owner,
+                2,
+                Data::Stock(pipe::Event::Frame(request.clone())),
+            )
+            .unwrap();
+        }
+        assert_eq!(s.asks.len(), 2);
+        s.claude_mut().sessions.get_mut(&a).unwrap().first = Some(("m".into(), "unsent".into()));
+        s.end_session(&a).unwrap();
+        // The process (and with it its link and process group) is gone.
+        assert!(alive.upgrade().is_none());
+        assert!(!s.claude().sessions.contains_key(&a));
+        assert!(s.claude().sessions.contains_key(&b));
+        assert_eq!(s.live_threads(), vec![b.clone()]);
+        assert!(!s.has_live_session(&a));
+        assert!(s.is_ended(&a) && !s.is_ended(&b));
+        // Still listed, closed for sending, its unsent text back in the draft, no stale approval.
+        assert!(s.catalog_row(&a).is_some());
+        assert!(!s.can_send(Some(&a)));
+        assert_eq!(s.draft(Some(&a)), "unsent");
+        assert_eq!(s.asks.len(), 1);
+        assert_eq!(s.asks[0].thread.as_deref(), Some(b.as_str()));
+        assert_eq!(
+            s.state(),
+            &Connection::Connecting,
+            "ending does not close the route"
+        );
+        assert!(s.transcript(&a).is_none_or(|t| t.error().is_none()));
+        // A second end, and the other session, are unaffected.
+        assert!(s.end_session(&a).is_err());
+        assert!(s.has_live_session(&b));
     }
 }

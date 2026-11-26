@@ -42,6 +42,11 @@ const MAX_ERROR_CHARS: usize = 400;
 /// Longest a finished stream may take to deliver the end of its HTTP body
 /// before its connection is closed instead of reused.
 const RECYCLE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a chat completions stream may stay silent after its `finish_reason`
+/// before the relay closes the response itself. Without this, an upstream that
+/// sends the finish chunk and then never sends `[DONE]` or closes would hold the
+/// response open forever.
+const FINISH_GRACE: Duration = Duration::from_secs(5);
 /// Most trailing bytes read after a terminal event before giving up on reuse.
 const RECYCLE_MAX_BYTES: usize = 64 * 1024;
 
@@ -143,6 +148,8 @@ pub async fn translated(
         done: false,
         terminal_sent: false,
         failed: false,
+        finish_grace: FINISH_GRACE,
+        finish_deadline: None,
     };
     let body = stream::unfold(state, |mut state| async move {
         loop {
@@ -327,6 +334,16 @@ impl Translator {
             Self::Chat(translator) => translator.is_finished(),
         }
     }
+
+    /// Whether the upstream has already announced the end of its answer. Only
+    /// chat completions has a separate finish_reason; the Anthropic translator
+    /// keeps the unbounded wait.
+    fn has_finish_reason(&self) -> bool {
+        match self {
+            Self::Anthropic(_) => false,
+            Self::Chat(translator) => translator.has_finish_reason(),
+        }
+    }
 }
 
 struct SseState {
@@ -341,6 +358,13 @@ struct SseState {
     done: bool,
     terminal_sent: bool,
     failed: bool,
+    /// Bound on the wait for the next upstream chunk once a finish_reason has
+    /// arrived. Unbounded before that.
+    finish_grace: Duration,
+    /// When the grace period ends. Fixed the first time the stream is seen
+    /// finished, so keepalive comments cannot renew it; only the final usage
+    /// chunk is expected inside the window.
+    finish_deadline: Option<tokio::time::Instant>,
 }
 
 impl SseState {
@@ -350,7 +374,24 @@ impl SseState {
             self.done = true;
             return;
         }
-        match self.upstream.next().await {
+        let next = if self.translator.has_finish_reason() {
+            let deadline = *self
+                .finish_deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + self.finish_grace);
+            match tokio::time::timeout_at(deadline, self.upstream.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    // The answer is complete; the upstream just never closed. Drop the
+                    // connection and finish the response normally.
+                    self.upstream = stream::empty().boxed();
+                    self.finish_upstream();
+                    return;
+                }
+            }
+        } else {
+            self.upstream.next().await
+        };
+        match next {
             None => self.finish_upstream(),
             Some(Err(_)) => {
                 self.fail("the upstream stream ended with a transport error");
@@ -525,6 +566,9 @@ fn extract_error_message(value: &Value) -> Option<&str> {
     (!message.trim().is_empty()).then_some(message)
 }
 
+/// Replace each configured secret in `text`. Secrets shorter than 4 bytes are left alone on
+/// purpose: a 1-3 byte "secret" would mangle ordinary text (every "a" or "42"), and real API
+/// keys and tokens are far longer (provider keys are 20+ bytes), so nothing real is skipped.
 pub(crate) fn redact<'a>(text: &'a str, secrets: &[String]) -> Cow<'a, str> {
     let mut output = Cow::Borrowed(text);
     for secret in secrets {
@@ -652,6 +696,15 @@ fn forward_retry_after(
 mod tests {
     use super::*;
 
+    #[test]
+    fn configured_keys_of_real_length_are_redacted_and_tiny_ones_do_not_mangle_text() {
+        let secrets = vec!["sk-12345678".to_owned(), "ab".to_owned()];
+        assert_eq!(
+            redact("key sk-12345678 and abc", &secrets),
+            "key [redacted] and abc"
+        );
+    }
+
     #[tokio::test]
     async fn oversized_translated_stream_fails_before_consuming_the_next_chunk() {
         let mut state = SseState {
@@ -667,6 +720,8 @@ mod tests {
             done: false,
             terminal_sent: false,
             failed: false,
+            finish_grace: FINISH_GRACE,
+            finish_deadline: None,
         };
         state.pump().await;
         assert!(state.failed && state.done);
@@ -675,6 +730,123 @@ mod tests {
         assert!(event.starts_with("event: response.failed\n"));
         assert!(event.contains("translated response limit"));
         assert!(state.queue.is_empty());
+    }
+
+    fn chat_state(
+        upstream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    ) -> SseState {
+        SseState {
+            upstream,
+            framer: SseFramer::new(MAX_EVENT_BYTES),
+            translator: Translator::Chat(chat_completions::ResponseTranslator::new(
+                "resp_test",
+                "fixture/model",
+                0,
+            )),
+            rewriter: EventRewriter::new(ToolMap::default()),
+            secrets: Arc::new(Vec::new()),
+            requested_model: "fixture/model".to_owned(),
+            queue: VecDeque::new(),
+            remaining_bytes: MAX_TRANSLATED_STREAM_BYTES,
+            done: false,
+            terminal_sent: false,
+            failed: false,
+            finish_grace: Duration::from_millis(20),
+            finish_deadline: None,
+        }
+    }
+
+    const FINISH_CHUNK: &[u8] =
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n";
+
+    #[tokio::test]
+    async fn chat_stream_without_done_completes_after_finish_reason_grace() {
+        // The finish chunk arrives, then the upstream never sends [DONE] or closes.
+        let upstream = stream::iter([Ok(Bytes::from_static(FINISH_CHUNK))])
+            .chain(stream::pending())
+            .boxed();
+        let mut state = chat_state(upstream);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !state.done {
+                state.pump().await;
+            }
+        })
+        .await
+        .expect("the response must finish once the grace period lapses");
+        assert!(state.terminal_sent && !state.failed);
+        let mut text = String::new();
+        while let Some(chunk) = state.queue.pop_front() {
+            text.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        assert!(text.contains("event: response.completed\n"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn heartbeats_after_finish_reason_do_not_renew_the_grace_deadline() {
+        let heartbeats = stream::unfold((), |()| async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Some((Ok(Bytes::from_static(b": keep-alive\n\n")), ()))
+        });
+        let upstream = stream::iter([Ok(Bytes::from_static(FINISH_CHUNK))])
+            .chain(heartbeats)
+            .boxed();
+        let mut state = chat_state(upstream);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !state.done {
+                state.pump().await;
+            }
+        })
+        .await
+        .expect("heartbeats must not keep a finished response open");
+        assert!(state.terminal_sent && !state.failed);
+    }
+
+    #[tokio::test]
+    async fn the_final_usage_chunk_still_lands_inside_the_grace_window() {
+        let usage = Bytes::from_static(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+        );
+        let late_usage = stream::once(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok::<_, reqwest::Error>(usage)
+        });
+        let upstream = stream::iter([Ok(Bytes::from_static(FINISH_CHUNK))])
+            .chain(late_usage)
+            .chain(stream::pending())
+            .boxed();
+        let mut state = chat_state(upstream);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !state.done {
+                state.pump().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut text = String::new();
+        while let Some(chunk) = state.queue.pop_front() {
+            text.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        assert!(text.contains("\"total_tokens\":5"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn chat_stream_waits_unbounded_before_finish_reason() {
+        // No finish_reason yet: the grace timer must not apply, so a silent
+        // upstream is still being awaited after well over the grace period.
+        let upstream = stream::iter([Ok(Bytes::from_static(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        ))])
+        .chain(stream::pending())
+        .boxed();
+        let mut state = chat_state(upstream);
+        state.pump().await;
+        assert!(!state.done && !state.terminal_sent);
+        let waited = tokio::time::timeout(Duration::from_millis(200), state.pump()).await;
+        assert!(
+            waited.is_err(),
+            "pump must keep waiting before a finish_reason"
+        );
+        assert!(!state.terminal_sent && !state.failed);
     }
 
     #[tokio::test]

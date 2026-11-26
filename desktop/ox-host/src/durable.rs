@@ -70,6 +70,25 @@ pub(crate) fn handoff_window(
 pub(crate) struct Grant {
     pub(crate) scope: Scope,
     pub(crate) session: String,
+    /// Unix seconds when the grant was given. Grants saved before this field existed read
+    /// as 0 and are therefore expired.
+    #[serde(default)]
+    pub(crate) granted_at: i64,
+}
+/// How long a session's YOLO grant lasts.
+pub(crate) const GRANT_SECS: i64 = 12 * 60 * 60;
+impl Grant {
+    pub(crate) fn expires_at(&self) -> i64 {
+        self.granted_at.saturating_add(GRANT_SECS)
+    }
+    pub(crate) fn live(&self, now: i64) -> bool {
+        now < self.expires_at()
+    }
+}
+pub(crate) fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct Outcome {
@@ -110,6 +129,10 @@ pub(crate) struct SavedSession {
     origin: Option<ox_desk_core::origin::Origin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     marks: Option<crate::workers::Marks>,
+    /// The access mode a Claude session had, so the send that resumes it after a reap
+    /// starts it the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access: Option<ox_desk_core::runtime::Access>,
 }
 impl SavedScope {
     pub(crate) fn from_state(s: &ScopeState) -> Self {
@@ -119,17 +142,27 @@ impl SavedScope {
             .filter(|r| {
                 r.detail["owned"] == true || r.parent.is_some() || !r.detail["origin"].is_null()
             })
-            .map(|r| SavedSession {
-                id: r.id.clone(),
-                title: r.title.chars().take(192).collect(),
-                parent: r.parent.clone(),
-                updated_at: r.updated_at,
-                active: matches!(
-                    r.status.as_str(),
-                    "running" | "needs_input" | "interrupted" | "Last seen running"
-                ),
-                origin: serde_json::from_value(r.detail["origin"].clone()).ok(),
-                marks: serde_json::from_value(r.detail["worker_marks"].clone()).ok(),
+            .map(|r| {
+                let access = |key: &str| {
+                    serde_json::from_value::<Option<ox_desk_core::runtime::Access>>(
+                        r.detail[key].clone(),
+                    )
+                    .ok()
+                    .flatten()
+                };
+                SavedSession {
+                    id: r.id.clone(),
+                    title: r.title.chars().take(192).collect(),
+                    parent: r.parent.clone(),
+                    updated_at: r.updated_at,
+                    active: matches!(
+                        r.status.as_str(),
+                        "running" | "needs_input" | "interrupted" | "Last seen running"
+                    ),
+                    origin: serde_json::from_value(r.detail["origin"].clone()).ok(),
+                    marks: serde_json::from_value(r.detail["worker_marks"].clone()).ok(),
+                    access: access("access").or_else(|| access("resume_access")),
+                }
             })
             .collect();
         sessions.sort_by(|a, b| a.id.cmp(&b.id));
@@ -169,9 +202,17 @@ impl SavedScope {
                     parent: s.parent.clone(),
                     updated_at: s.updated_at,
                     status: if s.active { "interrupted" } else { "idle" }.into(),
-                    capabilities: vec![],
+                    // No process is open, so the thread shows Ended and a send reopens it.
+                    capabilities: {
+                        let mut caps = vec!["open".into(), "send".into(), "ended".into()];
+                        // Images stay attachable to a thread a send reopens.
+                        if self.scope.route.runtime == ox_desk_core::runtime::Runtime::Codex {
+                            caps.push("attach_image".into());
+                        }
+                        caps
+                    },
                     detail: serde_json::json!({"owned":true,"recovered":true,"worker":s.origin.is_some(),
-                        "origin":s.origin,"worker_marks":s.marks}),
+                        "origin":s.origin,"worker_marks":s.marks,"resume_access":s.access}),
                 })
                 .collect(),
         }
@@ -492,7 +533,12 @@ mod tests {
         let restored = db.data.scopes[0].recover();
         assert_eq!(restored.sessions[0].status, "interrupted");
         assert_eq!(restored.sessions[0].parent.as_deref(), Some("parent"));
-        assert!(restored.sessions[0].capabilities.is_empty());
+        // A recovered row has no process: it shows Ended and a send reopens it, and a Codex
+        // thread keeps accepting image attachments for that send.
+        assert_eq!(
+            restored.sessions[0].capabilities,
+            ["open", "send", "ended", "attach_image"]
+        );
         assert!(restored.asks.is_empty());
         assert!(restored.transcripts.is_empty());
         assert_eq!(restored.detail["retired_approvals"], 1);

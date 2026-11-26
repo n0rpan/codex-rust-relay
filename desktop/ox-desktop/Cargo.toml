@@ -16,6 +16,8 @@ gpui.workspace = true
 gpui_platform.workspace = true
 ox-desk-core = { path = "../ox-desk-core" }
 gpui-component.workspace = true
+# The default icon bundle gpui-component draws (lucide subset); no new crate in the tree.
+gpui-kit-assets = "=0.10.0"
 flume = { version = "0.12", default-features = false, features = ["async"] }
 futures-lite = "2"
 markdown = "1"

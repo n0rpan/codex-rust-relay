@@ -709,13 +709,19 @@ Approve the tool call when your client prompts.
 
 `start_ox_worker` returns a job ID. Ask for status or the result with
 `ox_worker_status`, or ask to stop it with `cancel_ox_worker`. Jobs run between
-tool calls and have no ox wall-clock limit. Without a running OX session host
+tool calls. Workers have no time or count limit by default; set `OX_WORKER_MAX_MINUTES` or
+`OX_WORKER_MAX_PER_PARENT` (positive; unset or 0 means no limit) to add one. Without a running OX session host
 they stop when the parent ox launch exits. When the session host is running
 (OX Desktop or `ox host install`), it owns the worker as an ordinary session:
 the worker keeps running after you close the terminal, its approvals reach
 your desktop and paired phone, and a resumed parent can still read its status.
 The status includes the stock client's session ID when available.
 Work already written to the project stays there if you cancel.
+To keep a finished worker's status and final answer available after its
+process has been reaped or the host restarts, the session host keeps a small
+copy of that final answer (at most 24 KiB, never the transcript) in its
+ledger under the host state directory. The full history stays in the stock
+client's own session files.
 
 `ox claude` gives each new session an ID before the first turn by passing
 `--session-id` to Claude Code, unless you chose a session yourself with
@@ -760,11 +766,21 @@ The main agent can lower it with `start_ox_worker`'s `permission_mode`
 that would start in YOLO or bypass waits until you accept it in OX Desktop or
 on a paired phone, unless you granted YOLO for that session's workers and
 handoffs. Without a host, workers start with read access, and write access
-when you tell the main agent a worker may edit files. Client permissions still
-apply, including to shell commands. Give concurrent writers separate working
-directories by starting their parent sessions there. The main session and
-its built-in subagents use your subscription. The worker bills the API provider
-you picked or the Claude subscription you requested.
+when you tell the main agent a worker may edit files. Claude read workers use
+Plan mode with the host and `dontAsk` with only read tools in a standalone
+launch. Classifier and YOLO require the session host.
+
+Write workers can edit files and run shell commands. Codex uses its Workspace
+sandbox. For Claude Code, OX pre-approves Bash and enables Claude Code’s own
+sandbox. The sandbox can restrict filesystem and network access. It is built
+in on macOS and needs `bwrap` and `socat` on Linux. If those dependencies are
+missing, OX shows a warning and Claude Code can run Bash unsandboxed with the
+worker’s OS permissions. Codex read workers use the Read only sandbox.
+
+Give concurrent writers separate working directories by starting their parent
+sessions there. The main session and its built-in subagents use your subscription.
+The worker bills the API provider you picked or the Claude subscription you
+requested.
 
 For a second opinion on a piece of text, ask for `delegate_to_ox_model`.
 That tool makes one model request with a 90-second timeout. For development,

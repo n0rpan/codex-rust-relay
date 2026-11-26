@@ -27,7 +27,7 @@
 //! | `disable_parallel_tool_use` | `parallel_tool_calls: false` |
 //! | `max_tokens` | `max_output_tokens` |
 //! | `temperature`, `top_p` | forwarded unchanged |
-//! | `stop_sequences` | `stop` |
+//! | `stop_sequences` | dropped (no Responses equivalent) |
 //! | `metadata.user_id` | `metadata.user_id` |
 //! | `output_config.effort` | `reasoning.effort` |
 //! | `output_config.format` | `text.format` (`json_schema`) |
@@ -79,14 +79,15 @@
 //!   representable in the subset shared by both destinations.
 //! * A tool result containing an image becomes a `function_call_output` whose
 //!   `output` is an array of `input_text`/`input_image` parts. Responses
-//!   accepts that shape, but the existing Chat Completions adapter rejects
-//!   image parts in tool output.
+//!   accepts that shape, and the Chat Completions adapter forwards the images
+//!   as a follow-up user message.
 //! * A `tool_result`'s `is_error` flag has no Responses field; its text
 //!   content is forwarded unchanged.
 //! * `top_k` has no Responses field and is ignored.
-//! * Chat Completions cannot represent non-streaming requests or `stop`, so a
-//!   conversion produced from `stream: false` or with `stop_sequences` is only
-//!   usable against a Responses upstream.
+//! * `stop_sequences` has no Responses field, so it is dropped. Generation is
+//!   not cut at the sequence and a stop never reports `stop_sequence`.
+//! * Chat Completions cannot represent non-streaming requests, so a conversion
+//!   produced from `stream: false` is only usable against a Responses upstream.
 //! * `mcp_servers`/`container` declare provider-side tool containers and are
 //!   rejected rather than dropped. Server-side `web_search` is expected to be
 //!   normalized by the separate web-search worker into a normal function tool;
@@ -97,6 +98,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::adapters::chat_completions::CHAT_REASONING_PREFIX;
 use serde_json::{Map, Value, json};
 
 /// Longest tool name accepted by the converter. This matches the translated
@@ -186,9 +188,8 @@ fn convert(input: &Value, upstream_model: &str, count_only: bool) -> Result<Valu
     body.insert("max_output_tokens".to_owned(), json!(max_tokens));
     insert_sampling(request, "temperature", &mut body)?;
     insert_sampling(request, "top_p", &mut body)?;
-    if let Some(stop) = translate_stop_sequences(request.get("stop_sequences"))? {
-        body.insert("stop".to_owned(), stop);
-    }
+    // `stop_sequences` is deliberately not forwarded: the Responses API has no
+    // `stop` parameter, so the field would be rejected upstream. See the gaps list.
     if let Some(metadata) = translate_metadata(request.get("metadata"))? {
         if let Some(key) = prompt_cache_key(&metadata) {
             body.insert("prompt_cache_key".to_owned(), json!(key));
@@ -285,32 +286,6 @@ fn insert_sampling(
         body.insert(field.to_owned(), value.clone());
     }
     Ok(())
-}
-
-fn translate_stop_sequences(value: Option<&Value>) -> Result<Option<Value>, String> {
-    let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Ok(None);
-    };
-    let sequences = match value {
-        Value::String(sequence) => vec![json!(sequence)],
-        Value::Array(sequences) => {
-            let mut translated = Vec::with_capacity(sequences.len());
-            for (index, sequence) in sequences.iter().enumerate() {
-                let sequence = sequence
-                    .as_str()
-                    .filter(|sequence| !sequence.is_empty())
-                    .ok_or_else(|| format!("stop_sequences[{index}] must be a non-empty string"))?;
-                translated.push(json!(sequence));
-            }
-            translated
-        }
-        _ => return Err("stop_sequences must be a string or an array of strings".to_owned()),
-    };
-    if sequences.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(Value::Array(sequences)))
-    }
 }
 
 /// A stable per-session key for the provider's prompt cache.
@@ -648,6 +623,8 @@ impl Builder {
                 Ok(())
             }
             Value::Array(blocks) => {
+                let turn_start = self.items.len();
+                let mut restored: Vec<Value> = Vec::new();
                 for (index, block) in blocks.iter().enumerate() {
                     let block_path = format!("{path}.content[{index}]");
                     let block = block
@@ -657,8 +634,27 @@ impl Builder {
                         "text" => {
                             self.push_text("assistant", field_str(block, "text", &block_path)?)
                         }
-                        // Provider-bound opaque state. Visible text stays.
-                        "thinking" | "redacted_thinking" => {}
+                        // Provider-bound opaque state is dropped, visible text
+                        // stays. The one exception is a thinking block this
+                        // gateway emitted for a Chat Completions provider: its
+                        // signature is the ox-owned reasoning envelope, which
+                        // is restored as a reasoning item so the provider gets
+                        // its `reasoning_content` back. Anthropic signatures
+                        // never match the prefix.
+                        "thinking" => {
+                            if let Some(marker) = block
+                                .get("signature")
+                                .and_then(Value::as_str)
+                                .filter(|sig| sig.starts_with(CHAT_REASONING_PREFIX))
+                            {
+                                restored.push(json!({
+                                    "type": "reasoning",
+                                    "summary": [],
+                                    "encrypted_content": marker,
+                                }));
+                            }
+                        }
+                        "redacted_thinking" => {}
                         "tool_use" => self.push_tool_use(block, &block_path)?,
                         "server_tool_use" => {
                             return Err(format!(
@@ -677,6 +673,9 @@ impl Builder {
                         }
                     }
                 }
+                // The chat adapter streams reasoning first; restore it ahead
+                // of the turn's text and calls wherever the block arrived.
+                self.items.splice(turn_start..turn_start, restored);
                 Ok(())
             }
             Value::Null => Err(format!("{path}.content must not be null")),
@@ -1241,7 +1240,84 @@ fn short(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
+
+    /// Claude Messages frontend -> reasoning-capable Chat Completions
+    /// provider -> tool -> next provider request (probe frontends.rs).
+    fn chat_turn_content() -> Value {
+        let mut upstream =
+            crate::adapters::chat_completions::ResponseTranslator::new("id", "model", 0);
+        let mut stream = crate::claude_response::MessagesStream::new("model");
+        for chunk in [
+            json!({"choices":[{"index":0,"delta":{"reasoning_content":"fixture thought"}}]}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call1","function":{"name":"read","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+        ] {
+            for e in upstream.push_event("message", &chunk.to_string()).unwrap() {
+                stream
+                    .push(e["type"].as_str().unwrap(), &e.to_string())
+                    .unwrap();
+            }
+        }
+        for e in upstream.finish().unwrap() {
+            stream
+                .push(e["type"].as_str().unwrap(), &e.to_string())
+                .unwrap();
+        }
+        stream.message().unwrap()["content"].clone()
+    }
+
+    fn follow_up(content: Value) -> Value {
+        json!({"model":"m","max_tokens":32,
+            "tools":[{"name":"read","description":"Read","input_schema":{"type":"object"}}],
+            "messages":[{"role":"user","content":"go"},
+                {"role":"assistant","content":content},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"call1","content":"ok"}]}]})
+    }
+
+    fn upstream_assistant(content: Value) -> Value {
+        let canonical = into_responses(&follow_up(content), "model").unwrap();
+        let sent =
+            crate::adapters::chat_completions::translate_request(&canonical, "model").unwrap();
+        sent["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn chat_reasoning_round_trips_through_the_claude_frontend() {
+        let content = chat_turn_content();
+        let blocks = content.as_array().unwrap();
+        let thinking = blocks.iter().find(|b| b["type"] == "thinking").unwrap();
+        assert_eq!(thinking["thinking"], "fixture thought");
+        // The signature is the ox-owned marker, never an Anthropic signature.
+        assert_eq!(
+            thinking["signature"],
+            format!("{CHAT_REASONING_PREFIX}fixture thought")
+        );
+        let assistant = upstream_assistant(content);
+        assert_eq!(assistant["reasoning_content"], "fixture thought");
+        assert_eq!(assistant["tool_calls"][0]["id"], "call1");
+    }
+
+    #[test]
+    fn thinking_after_the_tool_call_is_still_restored_and_foreign_thinking_is_dropped() {
+        let content = json!([
+            {"type":"thinking","thinking":"anthropic","signature":"EqQBabc"},
+            {"type":"tool_use","id":"call1","name":"read","input":{}},
+            {"type":"thinking","thinking":"t","signature":format!("{CHAT_REASONING_PREFIX}t")},
+        ]);
+        let assistant = upstream_assistant(content);
+        assert_eq!(assistant["reasoning_content"], "t");
+        let none = upstream_assistant(json!([
+            {"type":"thinking","thinking":"x","signature":"EqQBabc"},
+            {"type":"tool_use","id":"call1","name":"read","input":{}},
+        ]));
+        assert!(none.get("reasoning_content").is_none());
+    }
 
     fn stock_request() -> Value {
         json!({
@@ -1623,7 +1699,8 @@ mod tests {
         assert_eq!(converted["temperature"], 0.5);
         assert_eq!(converted["top_p"], 0.9);
         assert!(converted.get("top_k").is_none());
-        assert_eq!(converted["stop"], json!(["STOP", "END"]));
+        // Responses has no `stop` field; the sequences are dropped, not forwarded.
+        assert!(converted.get("stop").is_none());
         assert_eq!(converted["service_tier"], "default");
         assert_eq!(converted["metadata"], json!({"user_id": "u"}));
         // A user ID without a session names no cache.

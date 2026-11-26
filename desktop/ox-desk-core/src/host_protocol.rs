@@ -41,6 +41,10 @@ pub enum Client {
     Subscribe {
         scope: Option<Scope>,
         after: Option<Cursor>,
+        /// The client is a desktop window that can take a terminal handoff held for its
+        /// scope. Phones and other gateways never set it, and the web bridge refuses it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        terminal: bool,
     },
     Act {
         id: String,
@@ -53,6 +57,11 @@ pub enum Client {
         id: String,
         caller: crate::origin::ExternalCaller,
         start: crate::origin::WorkerStart,
+    },
+    /// Ask for the live processes the host runs. Answered by `Server::Processes`.
+    /// Only clients that send this receive that frame, so older clients are unaffected.
+    ListProcesses {
+        id: String,
     },
     /// The parent-agent tools of such a gateway.
     WorkerCall {
@@ -139,10 +148,43 @@ pub enum Server {
         result: Option<Value>,
         error: Option<String>,
     },
+    /// The live processes of this host, newest first by start. Answers `Client::ListProcesses`.
+    Processes {
+        id: String,
+        processes: Vec<ProcessView>,
+    },
     Error {
         id: Option<String>,
         message: String,
     },
+}
+/// One live process the host runs for a project and billing route.
+///
+/// A Claude process serves one thread. A Codex app-server serves a scope and lists
+/// every thread subscribed on it. To end a process, send `Action::EndSession(thread)`
+/// for each id in `threads` (scoped to `scope`). The host refuses `EndSession` on a busy
+/// thread; `Action::ForceEndSession(thread)` ends it anyway, after the user confirmed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProcessView {
+    /// `claude`, `codex` or `worker` (every thread of the process is a host-owned worker).
+    pub kind: String,
+    pub scope: Scope,
+    pub project: PathBuf,
+    pub threads: Vec<String>,
+    /// The scope's billing route label, such as the model alias.
+    pub route: String,
+    pub model: Option<String>,
+    /// Unix seconds when the host started or first saw the process.
+    pub started_at: i64,
+    /// Unix seconds of the last event or action on any of its threads.
+    pub last_activity: i64,
+    /// A turn is in progress or an approval is pending, so ending would lose work.
+    pub running: bool,
+    /// The blank process kept warm for new sessions (the sign-in and version probe), not a
+    /// conversation. `kind` stays `claude`. End all idle skips it, since it respawns.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub draft: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

@@ -1,4 +1,5 @@
 use super::Workbench;
+use crate::appearance::Step;
 use crate::{
     appearance::Palette,
     kit::{button, col, row, small},
@@ -32,7 +33,12 @@ fn metric(p: Palette, label: impl Into<SharedString>, value: impl Into<SharedStr
         .gap_3()
         .justify_between()
         .child(small(p, label))
-        .child(div().font_family("monospace").text_sm().child(value.into()))
+        .child(
+            div()
+                .font_family("monospace")
+                .text_size(p.text(Step::Ui))
+                .child(value.into()),
+        )
 }
 
 impl Workbench {
@@ -43,10 +49,26 @@ impl Workbench {
             .selected()
             .and_then(|id| store.transcript(id))
             .and_then(|t| t.usage.as_ref());
-        let mut label = tokens.map_or_else(
-            || "Session usage".to_string(),
-            |u| format!("{} tokens", compact(u.total.total_tokens)),
-        );
+        // With no thread selected, or no usage data yet, only a limit warning shows.
+        if store.selected().is_none() || tokens.is_none() {
+            let limit = store.usage.closest_limit(Utc::now().timestamp())?;
+            return Some(
+                small(
+                    p,
+                    format!(
+                        "{} · {} limit {}% used",
+                        limit.0,
+                        duration(limit.1.window_duration_mins),
+                        limit.1.used_percent
+                    ),
+                )
+                .text_color(rgb(p.warning))
+                .into_any_element(),
+            );
+        }
+        let mut label = tokens.map_or_else(String::new, |u| {
+            format!("{} tokens", compact(u.total.total_tokens))
+        });
         if let Some(percent) = tokens.and_then(|u| u.context_percent()) {
             label.push_str(&format!(" · {percent:.0}% context"));
         }
@@ -56,7 +78,7 @@ impl Workbench {
             .trigger(
                 crate::kit::toolbar_button(p, "show-usage", label, true, |_, _, _| {})
                     .compact()
-                    .text_size(px(12.)),
+                    .text_size(p.text(Step::Meta)),
             )
             .content(move |_, window, cx| {
                 view.read_with(cx, |s, _| s.usage_details(p, window, &view))
@@ -87,7 +109,12 @@ impl Workbench {
         )
     }
 
-    fn usage_details(&self, p: Palette, window: &Window, view: &WeakEntity<Self>) -> AnyElement {
+    pub(in crate::views) fn usage_details(
+        &self,
+        p: Palette,
+        window: &Window,
+        view: &WeakEntity<Self>,
+    ) -> AnyElement {
         let Some(store) = self.store.as_ref() else {
             return div().into_any_element();
         };
@@ -107,7 +134,12 @@ impl Workbench {
             .when_some(
                 store.selected().and_then(|id| store.catalog_row(id)),
                 |panel, thread| {
-                    panel.child(div().text_sm().truncate().child(thread.title().to_owned()))
+                    panel.child(
+                        div()
+                            .text_size(p.text(Step::Ui))
+                            .truncate()
+                            .child(thread.title().to_owned()),
+                    )
                 },
             )
             .child(small(p, store.profile().route.label()).truncate());
@@ -167,7 +199,7 @@ impl Workbench {
                     .pt_2()
                     .child(
                         div()
-                            .text_sm()
+                            .text_size(p.text(Step::Ui))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Account limits"),
                     )

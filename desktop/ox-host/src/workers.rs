@@ -30,6 +30,46 @@ pub(crate) struct Marks {
     /// by the launch that started the worker. Never changed afterwards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session: Option<String>,
+    /// Unix seconds when the worker session was stamped. 0 for workers saved before limits.
+    #[serde(default)]
+    pub started_at: i64,
+    /// The wall-clock limit this worker runs under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_minutes: Option<u32>,
+    /// The host stopped the worker because it ran past `max_minutes`.
+    #[serde(default)]
+    pub expired: bool,
+    /// A caution recorded at launch, such as another write worker in the same project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    /// How the worker's latest run ended, kept so a parent can still read its answer once
+    /// the route's process is gone or the host restarted. Only the final answer, never the
+    /// transcript, which stays in the runtime's own history. Cleared when a new turn starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<Last>,
+    /// Unix seconds when the current run began: the launch, or the operator's latest
+    /// continuation. Expiry measures this, not the original launch.
+    #[serde(default)]
+    pub run_started_at: i64,
+}
+/// The recorded end of a worker's latest run.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Last {
+    /// `completed` or `failed`.
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// A worker limit from an environment variable. Unset, zero or unparsable means no
+/// limit: workers may run for days, and a limit is opt-in.
+pub(crate) fn env_limit(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
 }
 
 #[derive(Clone, Debug)]
@@ -77,7 +117,11 @@ impl Registry {
             key,
             Entry {
                 origin,
-                marks: Marks::default(),
+                marks: Marks {
+                    started_at: crate::durable::unix_now(),
+                    run_started_at: crate::durable::unix_now(),
+                    ..Marks::default()
+                },
             },
         );
         true
@@ -314,6 +358,20 @@ pub(crate) struct Operators {
     pub connected: usize,
 }
 
+/// True for a finished Workflow-mode Claude worker whose transcript has no Workflow tool call.
+fn workflow_unrun(mode: ox_desk_core::origin::WorkerMode, timeline: Option<&Timeline>) -> bool {
+    let Some(t) = timeline.filter(|_| mode == ox_desk_core::origin::WorkerMode::Workflow) else {
+        return false;
+    };
+    let used = t
+        .items
+        .iter()
+        .any(|i| i.role == "tool" && i.text == "Workflow");
+    ox_desk_core::claude_worker_contract::Contract::with_support(false, true, false)
+        .check_workflow(used)
+        .is_err()
+}
+
 pub(crate) fn status(
     entry: &Entry,
     id: &str,
@@ -326,7 +384,8 @@ pub(crate) fn status(
     let o = &entry.origin;
     let row = view.map_or("interrupted", |v| v.status.as_str());
     let finished = timeline.is_some_and(|t| !t.detail["last_finished"].is_null());
-    let status = if entry.marks.cancelled {
+    let stopped = timeline.is_some_and(|t| t.detail["interrupted"] == true);
+    let mut status = if entry.marks.cancelled {
         "cancelled"
     } else {
         match row {
@@ -337,28 +396,75 @@ pub(crate) fn status(
             "failed" => "failed",
             "interrupted" | "Last seen running" => "interrupted",
             _ if !live => "interrupted",
+            // A stopped Workflow can exit before calling its tool.
+            _ if finished && stopped => "interrupted",
+            _ if finished && workflow_unrun(o.mode, timeline) => "failed",
             _ if finished || timeline.is_none() => "completed",
             _ => "running",
         }
     };
+    // The route closed or the host restarted after the run ended: answer from the
+    // recorded end instead of reporting the finished worker as interrupted.
+    let recorded = entry
+        .marks
+        .last
+        .as_ref()
+        .filter(|_| !entry.marks.cancelled && !matches!(row, "running" | "needs_input"));
+    // Only a worker with no transcript to read, or one the route's close left
+    // interrupted, answers from the record: a reopened route that lists the session
+    // without its history (an unrelated sibling opened it) must not turn a recorded
+    // failure into a success.
+    if (status == "interrupted" && !stopped || timeline.is_none() && status == "completed")
+        && let Some(last) = recorded
+    {
+        status = match last.status.as_str() {
+            "failed" => "failed",
+            "interrupted" => "interrupted",
+            _ => "completed",
+        };
+    }
     let progress = match row {
         "needs_input" => "Waiting for the operator to answer a request",
         "running" => "Working",
+        _ if status == "interrupted" && stopped => {
+            "The worker was stopped before it finished. Its output is partial. Open the worker to continue it."
+        }
         _ if status == "interrupted" => {
             "The session host restarted or the runtime closed. Open the worker to continue it."
         }
         _ => "",
     };
-    let result = timeline.and_then(|t| {
-        t.items
-            .iter()
-            .rev()
-            .find(|i| i.role == "assistant")
-            .map(|i| i.text[..i.text.floor_char_boundary(24 * 1024)].to_owned())
-    });
-    let error = timeline
-        .and_then(|t| t.detail["error"].as_str())
-        .map(str::to_owned);
+    let stopped_turn = timeline
+        .filter(|_| stopped && status == "interrupted")
+        .and_then(|t| t.detail["last_finished"].as_str());
+    let result = timeline
+        .and_then(|t| {
+            t.items
+                .iter()
+                .rev()
+                .find(|i| i.role == "assistant" && stopped_turn.is_none_or(|turn| i.turn == turn))
+                .map(|i| i.text[..i.text.floor_char_boundary(24 * 1024)].to_owned())
+        })
+        .or_else(|| {
+            recorded
+                .filter(|_| stopped_turn.is_none())
+                .and_then(|last| last.result.clone())
+        });
+    let error = if entry.marks.expired {
+        Some(format!(
+            "Worker stopped after {} minutes (time limit).",
+            entry.marks.max_minutes.unwrap_or_default()
+        ))
+    } else if status == "failed" && workflow_unrun(o.mode, timeline) {
+        Some(ox_desk_core::claude_worker_contract::WORKFLOW_NOT_RUN.to_owned())
+    } else {
+        timeline
+            .and_then(|t| t.detail["error"].as_str())
+            .map(str::to_owned)
+            .or_else(|| recorded.and_then(|l| l.error.clone()))
+    };
+    let elapsed = (entry.marks.started_at > 0)
+        .then(|| (crate::durable::unix_now() - entry.marks.started_at).max(0));
     let operator = (entry.marks.steered > 0 || entry.marks.continued > 0 || entry.marks.access.is_some())
         .then(|| {
             json!({
@@ -407,7 +513,11 @@ pub(crate) fn status(
         "started_mode": o.started,
         "mode_decided": o.decided,
         "progress": progress,
+        "elapsed_seconds": elapsed,
+        "max_minutes": entry.marks.max_minutes,
+        "warning": entry.marks.warning,
         "result": result,
+        "partial": status == "interrupted" && result.is_some(),
         "error": error,
         "operator": operator,
         "messages": [],
@@ -677,6 +787,207 @@ mod tests {
         assert!(owns(&terminal(Some("s1"), "l2"), &t));
         assert!(!owns(&terminal(Some("s2"), "l2"), &t));
         assert!(!owns(&terminal(None, "l2"), &t));
+    }
+
+    #[test]
+    fn workflow_worker_completes_only_after_the_workflow_tool_ran() {
+        use ox_desk_core::host_protocol::TimelineItem;
+        let mut origin = worker(Level::Write, Runtime::Claude);
+        origin.mode = WorkerMode::Workflow;
+        let entry = Entry {
+            origin,
+            marks: Marks::default(),
+        };
+        let view = SessionView {
+            id: "w".into(),
+            title: String::new(),
+            parent: None,
+            status: "idle".into(),
+            updated_at: 0,
+            capabilities: vec![],
+            detail: Value::Null,
+        };
+        let item = |role: &str, text: &str| TimelineItem {
+            turn: "t".into(),
+            id: text.into(),
+            role: role.into(),
+            text: text.into(),
+            revision: 1,
+            detail: Value::Null,
+        };
+        let run = |items| {
+            let t = Timeline {
+                items,
+                detail: json!({"last_finished":"t"}),
+            };
+            status(
+                &entry,
+                "w",
+                "w",
+                Some(&view),
+                Some(&t),
+                true,
+                Operators::default(),
+            )
+        };
+        let text_only = run(vec![item("assistant", "done")]);
+        assert_eq!(text_only["status"], "failed");
+        assert!(
+            text_only["error"]
+                .as_str()
+                .unwrap()
+                .contains("Workflow tool")
+        );
+        let used = run(vec![item("tool", "Workflow"), item("assistant", "done")]);
+        assert_eq!(used["status"], "completed");
+    }
+
+    #[test]
+    fn a_stopped_worker_reports_interrupted_with_its_partial_output() {
+        let mut entry = Entry {
+            origin: worker(Level::Read, Runtime::Codex),
+            marks: Marks::default(),
+        };
+        let view = SessionView {
+            id: "w".into(),
+            title: String::new(),
+            parent: None,
+            status: "idle".into(),
+            updated_at: 0,
+            capabilities: vec![],
+            detail: Value::Null,
+        };
+        let partial = Timeline {
+            items: vec![ox_desk_core::host_protocol::TimelineItem {
+                turn: "t".into(),
+                id: "i".into(),
+                role: "assistant".into(),
+                text: "half an answ".into(),
+                revision: 1,
+                detail: Value::Null,
+            }],
+            detail: json!({"last_finished":"t","interrupted":true}),
+        };
+        let stopped = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view),
+            Some(&partial),
+            true,
+            Operators::default(),
+        );
+        assert_eq!(stopped["status"], "interrupted");
+        assert_eq!(stopped["partial"], true);
+        assert_eq!(stopped["result"], "half an answ");
+        // The same turn finishing normally is complete.
+        let mut done = partial.clone();
+        done.detail = json!({"last_finished":"t"});
+        let finished = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view),
+            Some(&done),
+            true,
+            Operators::default(),
+        );
+        assert_eq!(finished["status"], "completed");
+        assert_eq!(finished["partial"], false);
+        // A recorded stop survives the route closing: no transcript, still interrupted and partial.
+        entry.marks.last = Some(Last {
+            status: "interrupted".into(),
+            result: Some("half an answ".into()),
+            error: None,
+        });
+        let reopened = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view),
+            None,
+            true,
+            Operators::default(),
+        );
+        assert_eq!(reopened["status"], "interrupted");
+        assert_eq!(reopened["result"], "half an answ");
+        assert_eq!(reopened["partial"], true);
+    }
+
+    #[test]
+    fn interrupted_second_turn_does_not_publish_the_previous_turn_as_partial() {
+        let entry = Entry {
+            origin: worker(Level::Read, Runtime::Codex),
+            marks: Marks::default(),
+        };
+        let view = SessionView {
+            id: "w".into(),
+            title: String::new(),
+            parent: None,
+            status: "idle".into(),
+            updated_at: 0,
+            capabilities: vec![],
+            detail: Value::Null,
+        };
+        let timeline = Timeline {
+            items: vec![ox_desk_core::host_protocol::TimelineItem {
+                turn: "earlier".into(),
+                id: "i".into(),
+                role: "assistant".into(),
+                text: "original answer".into(),
+                revision: 1,
+                detail: Value::Null,
+            }],
+            detail: json!({"last_finished":"second","interrupted":true}),
+        };
+        let state = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view),
+            Some(&timeline),
+            true,
+            Operators::default(),
+        );
+        assert_eq!(state["status"], "interrupted");
+        assert!(
+            state["result"].is_null(),
+            "second turn had no output: {state}"
+        );
+        assert_eq!(state["partial"], false);
+    }
+
+    #[test]
+    fn a_failed_worker_stays_failed_when_a_sibling_reopens_its_route() {
+        let mut entry = Entry {
+            origin: worker(Level::Read, Runtime::Codex),
+            marks: Marks::default(),
+        };
+        entry.marks.last = Some(Last {
+            status: "failed".into(),
+            result: None,
+            error: Some("bad".into()),
+        });
+        let view = SessionView {
+            id: "w".into(),
+            title: String::new(),
+            parent: None,
+            status: "idle".into(),
+            updated_at: 0,
+            capabilities: vec![],
+            detail: Value::Null,
+        };
+        let s = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view),
+            None,
+            true,
+            Operators::default(),
+        );
+        assert_eq!(s["status"], "failed");
+        assert_eq!(s["error"], "bad");
     }
 
     #[test]

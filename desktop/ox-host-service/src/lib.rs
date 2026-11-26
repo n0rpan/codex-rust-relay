@@ -43,6 +43,45 @@ pub struct Paths {
     pub state_dir: PathBuf,
 }
 
+type FileIdentity = (u64, u64, u64, i64, i64, i64, i64);
+pub type RouteInputs = [Option<FileIdentity>; 4];
+
+/// File identities behind the settings snapshot's provider aliases and favorites.
+/// An unreadable input produces no stamp so callers bypass their cache.
+pub fn route_inputs() -> Option<RouteInputs> {
+    let home = env::var_os("CODEX_HOME")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|p| PathBuf::from(p).join(".codex")))?;
+    let mut ids = [None; 4];
+    for (i, name) in [
+        "codeox.toml",
+        "config.toml",
+        "ox-api-keys.json",
+        "ox-favorites.json",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        match fs::metadata(home.join(name)) {
+            Ok(m) => {
+                ids[i] = Some((
+                    m.dev(),
+                    m.ino(),
+                    m.len(),
+                    m.mtime(),
+                    m.mtime_nsec(),
+                    m.ctime(),
+                    m.ctime_nsec(),
+                ))
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => (),
+            Err(_) => return None,
+        }
+    }
+    Some(ids)
+}
+
 fn absolute_env(name: &str) -> Option<PathBuf> {
     env::var_os(name)
         .map(PathBuf::from)
@@ -101,19 +140,57 @@ impl Paths {
     }
 }
 
+/// The start of the error for an OX state folder that other accounts could read. The
+/// desktop recognises it to offer a one-click fix, so keep it stable.
+pub const UNSAFE_FOLDER: &str = "OX state folder has unsafe permissions";
+
 fn private_directory(path: &Path) -> io::Result<()> {
     DirBuilder::new().recursive(true).mode(0o700).create(path)?;
     let m = fs::symlink_metadata(path)?;
-    if !m.is_dir() || m.uid() != uid() || m.mode() & 0o077 != 0 {
+    if m.is_dir() && m.uid() == uid() && m.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!("{UNSAFE_FOLDER}: {}", path.display()),
+        ));
+    }
+    if !m.is_dir() || m.uid() != uid() {
         return Err(io::Error::new(
             ErrorKind::PermissionDenied,
             format!(
-                "{} must be a private directory owned by the current account",
+                "OX can't use {} because it is not a folder that only you own. Move or delete it, then reconnect.",
                 path.display()
             ),
         ));
     }
     Ok(())
+}
+
+/// The folder named by an [`UNSAFE_FOLDER`] error message, if `message` is one.
+pub fn unsafe_folder(message: &str) -> Option<PathBuf> {
+    let path = message.strip_prefix(UNSAFE_FOLDER)?.strip_prefix(": ")?;
+    let path = PathBuf::from(path.lines().next()?);
+    path.is_absolute().then_some(path)
+}
+
+/// The shell command that fixes an unsafe folder by hand.
+pub fn fix_command(path: &Path) -> String {
+    format!(
+        "chmod 700 '{}'",
+        path.display().to_string().replace('\'', "'\\''")
+    )
+}
+
+/// Make a folder OX created private again (mode 700). Only a real folder owned by the
+/// current account is changed; anything else is refused.
+pub fn fix_folder_permissions(path: &Path) -> io::Result<()> {
+    let m = fs::symlink_metadata(path)?;
+    if !m.is_dir() || m.uid() != uid() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!("{} is not a folder you own", path.display()),
+        ));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
 fn lock_file(path: &Path) -> io::Result<File> {

@@ -1,0 +1,269 @@
+{
+ "confirmed": [
+  {
+   "title": "Web push notifications stop for scope-less subscribers",
+   "file": "desktop/ox-host/src/engine.rs",
+   "line": 2220,
+   "severity": "high",
+   "scenario": "ox-host-web push.rs subscribes with Subscribe{scope: None} (push.rs ~L243) and filters deltas for kind \"notification\" (push.rs:293). Before this PR a scope-less subscriber (subscription Some(None)) was retained for every scope packet, so it received Change::Notification (Approval/Question/Finished/Failed, produced by projection.rs:420-428 note()). This PR changes broadcast(): the per-scope send at L2220 only matches Some(Some(s)), and the `_ => true` arm keeps scope-less clients without sending. catalog_only() (L2228) includes Some(None), but the catalog packet only carries Session/Sessions/State. Result: a phone or web client gets no approval or finished alerts after this PR. The new test scope_less_subscribers_get_catalog_deltas_and_never_transcripts encodes this by asserting that scope-less clients receive only [Change::Sessions].",
+   "evidence": "engine.rs:2170-2224 (broadcast), engine.rs:2228-2230 (catalog_only), push.rs:288-296 (notices keeps only kind==notification), projection.rs:420-428 (note), test around engine.rs:2512-2600.",
+   "fix": "Forward Change::Notification (and any other non-transcript change needed by push) to catalog_only clients in the catalog packet, and keep transcripts/items out. Then update the test to assert Notification delivery and still no Transcript.",
+   "area": "end-session-host",
+   "upheld": 3,
+   "refutations": []
+  },
+  {
+   "title": "Failed end_session after end_children leaves workers cancelled while the parent stays live",
+   "file": "desktop/ox-host/src/engine.rs",
+   "line": 2039,
+   "severity": "medium",
+   "scenario": "end_thread calls self.end_children(scope, thread)? at L2039 before live.store.end_session(thread)? at L2042. For a Codex parent, end_session returns Err(\"Reconnect to end this session\") when the connection is not Ready (compose.rs end_session). A parent that is loading during a reconnect and has a running worker therefore gets its worker aborted or cancelled and ended, then the EndSession action returns an error. The parent is still live, and the user sees an error that suggests nothing happened.",
+   "evidence": "engine.rs:2031-2044; compose.rs:370-380 (end_session Err paths); reap_idle at engine.rs:2125-2150 ignores the failure after children are already ended.",
+   "fix": "Check store-side preconditions (state == Ready, in_terminal, etc.) before touching children, or end the parent first and then end its children.",
+   "area": "end-session-host",
+   "upheld": 2,
+   "refutations": [
+    "The claimed scenario is unreachable at PR head. end_thread (desktop/ox-host/src/engine.rs:2031-2034) first requires live.store.has_live_session(thread), which for a Codex thread is (t.ready || t.loading) and not terminal (desktop/ox-desk-core/src/store/compose.rs:442-450). The only path that drops the connection out of Ready for a reconnect is LinkEvent::Closed (desktop/ox-desk-core/src/store.rs:548-572), and that handler sets thread.ready = false and thread.loading = false for every transcript. So during a reconnect (state Closed) has_live_session is false and end_thread returns \"This session has no live process to end.\" before end_children runs, so no worker is cancelled. Opening a thread is also gated on Ready (desktop/ox-desk-core/src/store/history.rs:137-141), so a Codex transcript cannot start loading while not Ready. The Initialize-unsupported path sets Closed with no transcripts loading. The one residual shape I could see is LinkEvent::SignInRequired (store.rs:545-547), which sets state without clearing loading. That could leave a loading transcript with state != Ready, so end_children would run and end_session would then fail. I did not verify that a sign-in event can arrive mid-resume, and that is not the reconnect scenario the claim describes, so the claim as written is refuted. The reap_idle part of the claim is also not reachable from the cancel path: reap only includes threads with no busy workers."
+   ]
+  },
+  {
+   "title": "Held terminal handoff pins its runtime and goes to whichever client subscribes next",
+   "file": "desktop/ox-host/src/engine.rs",
+   "line": 2103,
+   "severity": "medium",
+   "scenario": "A terminal handoff is ready while the requesting desktop window is gone, so it is stored in live.held_handoff (L1282). reap_empty refuses to close the scope while held_handoff is Some (L2103), and reap_idle never clears it, so the Codex app-server or Claude process stays alive until someone subscribes to that scope. If nobody does, it lives until the host restarts. Also, deliver_held_handoff (L870) hands the Handoff frame, with its argv, to the next subscriber of the scope, which may be a phone or web client rather than the requester.",
+   "evidence": "engine.rs:1282 (held assignment), engine.rs:870-884 (deliver_held_handoff from subscribe), engine.rs:2090-2104 (reap_empty), engine.rs:2125 (reap_idle has no held-handoff expiry).",
+   "fix": "Give the held frame a deadline and drop it on expiry, which lets reap_empty run. Deliver it only to a client that can run the handoff, or only to the original requester's identity.",
+   "area": "end-session-host",
+   "upheld": 2,
+   "refutations": [
+    "Refuted as stated; the pinning and delivery are intended and tested at PR head. (1) engine.rs:1276-1283 deliberately stores the handoff in held_handoff when the requester is gone, with the comment \"Keep it for the next subscriber instead of losing it with the terminal mode set.\" (2) reap_empty (engine.rs:2103) refusing to close while held_handoff is Some is the designed pin, and the test a_handoff... / the test around engine.rs:4516 asserts \"A held handoff keeps the scope open until its subscriber takes it.\" (3) deliver_held_handoff (engine.rs:870-884) is called from subscribe (engine.rs:867) and replay (engine.rs:845), and it replies only to the subscribing client id. The plan (docs/design/threads-plan.md:45, row 9 at :84) also says a Claude process ends only on terminal handoff or host exit, and that a lost terminal handoff on reconnect is a bug to fix. The only part not spelled out is the lack of expiry, which is a judgment call rather than a demonstrated user-facing bug. The phone web assets (ox-host-web/assets) do not reference the handoff frame at all, and the desktop consumes it via desk-core host_protocol.rs:131, so the \"phone receives argv\" scenario has no shown harm. Unsure on the no-expiry point, so refuted."
+   ]
+  },
+  {
+   "title": "Worker-retention fix in catalog keep() is ineffective on real list refreshes",
+   "file": "desktop/ox-desk-core/src/store.rs",
+   "line": 658,
+   "severity": "high",
+   "scenario": "A parent thread P sits in the project root with a worker W whose cwd is a project subdirectory. The user opens the project or refreshes the list. Neither P nor W emits a notification or history read during the listing, so created_while_listing is empty. store.rs:658 calls self.catalog.keep(&self.created_while_listing), which passes an empty retained set. catalog.rs:124-135 therefore retains nothing, and W is dropped from the catalog. The page loop at store.rs:42-49 only reinserts rows with cwd == project root, so W does not come back. The sidebar shows P without its worker until discover_children runs. The PR's stated goal of keeping workers across a list refresh is not met in the common case.",
+   "evidence": "store.rs:658 passes created_while_listing, which is populated only at catalog.rs:221-223 (record_row while listing), notifications.rs:183-185 (Renamed) and history.rs:113-114. The page loop store.rs:42-49 never adds to it. The new test catalog.rs:371 hand-builds `listed = {\"parent\"}` and calls keep() directly, so it does not exercise the value production passes.",
+   "fix": "Have the first-page listing seed the retained set with the ids in page.data (for example, add each row.id where row.cwd == project inside the store.rs:42 loop before keep runs, or move keep() after that loop and pass the listed ids). Change the test to drive the real Store::list page path instead of a hand-made set.",
+   "area": "catalog-turns",
+   "upheld": 3,
+   "refutations": []
+  },
+  {
+   "title": "End all idle acts on a stale snapshot and can kill a turn that just started",
+   "file": "desktop/ox-desktop/src/views/running.rs",
+   "line": 166,
+   "severity": "high",
+   "scenario": "The RUNNING list is refreshed only every 5 s (POLL, line 16). Thread A is idle in the last snapshot, so it is in idle_rows. The user then sends a message in A from the desktop or phone, and A's turn starts. The user clicks 'End all idle' before the next poll. end_all_idle (lines 166-170) builds groups from self.processes without re-checking, so Action::EndSession(A) is sent. The host's end_thread (desktop/ox-host/src/engine.rs:2031-2048) does not refuse busy threads. It calls end_session and cancels the workers of the busy thread, so the turn in progress is killed and its output lost.",
+   "evidence": "running.rs:166-170 (end_all_idle uses idle_rows(&self.processes) from the last poll); running.rs:16 POLL = 5 s; engine.rs:2041-2045 (busy only marks workers cancelled, then end_session anyway); host_client.rs:196-245 (end_threads ends whatever scope/thread it is given, no busy check).",
+   "fix": "Make the host decide: send EndSession only for threads that are idle at the host, or have end_threads skip busy threads, or refresh the list and wait for a fresh snapshot before ending in end_all_idle.",
+   "area": "desktop-running-ui",
+   "upheld": 3,
+   "refutations": []
+  },
+  {
+   "title": "End failures are cleared by the refresh that follows, so the message never shows",
+   "file": "desktop/ox-desktop/src/views/running.rs",
+   "line": 158,
+   "severity": "medium",
+   "scenario": "The user clicks End on a row whose process has already exited. end_threads returns Err('This session has no live process to end.'). In end() (lines 156-162), s.error = failure is set, then s.refresh(cx) starts list_processes. When that call succeeds, refresh's completion (line 125) runs s.error = None. The error is wiped within milliseconds, so the red error line (render, when_some on self.error) never appears for a successful refresh. The failure is effectively silent.",
+   "evidence": "running.rs:125 (s.error = None on successful refresh), running.rs:158 (s.error = failure), running.rs:159-160 (s.refresh(cx) immediately after).",
+   "fix": "Keep the end failure in its own field (for example end_error) that refresh does not clear, or only clear it on the next successful End, and render it in the panel.",
+   "area": "desktop-running-ui",
+   "upheld": 2,
+   "refutations": [
+    "The claim is overstated, so I'm refuting it as stated. The mechanism is real: running.rs:158 sets s.error = failure, running.rs:159 calls s.refresh(cx), and the Ok branch of refresh at running.rs:125 clears s.error. But end() then calls cx.notify() at running.rs:165 before the background platform::list_processes() call (desktop/ox-desktop/src/platform/host_client.rs:191, a socket connect plus round trip to the host) has returned. The render at that point shows the red line from self.error (running.rs:285-291, which requires self.loaded), so the message does appear for the duration of that round trip. It is a brief flash, not \"never appears\", so the \"effectively silent\" conclusion is an overstatement. The message is also informational only: the source error is 'This session has no live process to end.' (desktop/ox-host/src/engine.rs:2037), and the stale row disappears on the refresh that follows, so the user still gets visible feedback. At most this is a low-severity nit about a transient message, not a user-facing bug as claimed."
+   ]
+  },
+  {
+   "title": "Polling every 5 s calls ensure_running, which restarts a host the user stopped",
+   "file": "desktop/ox-desktop/src/platform/host_client.rs",
+   "line": 195,
+   "severity": "medium",
+   "scenario": "The user stops the host with 'ox host stop', or the desktop runs without a host installed. While the sidebar is shown, the poll in running.rs:88-96 calls refresh every 5 s, then list_processes, then connect() (host_client.rs:48-53), which calls ensure_running (ox-host-service/src/lib.rs:265-290). That function starts the daemon (manager::start or start_detached) and waits up to 8 s for the socket. So the host comes back within 5 s of being stopped, and on a machine where the host cannot start, each poll spawns a new start attempt and blocks a background thread for up to 8 s. This contradicts the comment at running.rs:~228 that a missing host should be 'quiet'.",
+   "evidence": "running.rs:16 POLL, running.rs:90-93 (refresh on each tick while shown); host_client.rs:48-53 (connect -> handshake -> ensure_running); ox-host-service/src/lib.rs:265-290.",
+   "fix": "Poll with a non-starting probe (check is_running and skip the poll when the socket is absent), and only start the host from an explicit user action such as End or a session select.",
+   "area": "desktop-running-ui",
+   "upheld": 2,
+   "refutations": [
+    "Refuted as a bug introduced or left by this PR. (1) The restart path is pre-existing on main: host_client.rs:52 (handshake) calls ensure_running, and the catalog watcher at desktop/ox-desktop/src/platform/host_client/catalog.rs:34 (watch_catalog loop, lines ~25-100) calls handshake() in a reconnect loop with a 300ms pause, started at desktop launch. A host stopped with 'ox host stop' is already restarted by that loop on main, independent of running.rs. The PR's 5 s poll only adds more calls to the same path. (2) The claimed concurrent-start problem does not happen: running.rs:110-116 sets self.loading and returns early on overlapping refreshes (again flag), so at most one list_processes/ensure_running is in flight from the poll. Also startup.lock in ox-host-service/src/lib.rs:265-290 serializes start attempts across clients. (3) The 'quiet' comment at running.rs:281 concerns how the error is displayed ('Session host not running' instead of a red error), not whether start is attempted, so the claim's contradiction does not hold. Net: no new user-facing regression from this PR; at most a frequency increase on an existing, intentional auto-start behavior."
+   ]
+  },
+  {
+   "title": "End on a busy thread or one with workers has no confirmation, against the plan",
+   "file": "desktop/ox-desktop/src/views/running.rs",
+   "line": 232,
+   "severity": "medium",
+   "scenario": "A Claude worker is mid-task with a long turn, and the user clicks the End button on its RUNNING row (running.rs row End, ~line 232-246), or picks 'End session' in the thread menu (thread_menu.rs:185-188) or the palette (palette.rs:355-366). The action is sent at once. The host cancels the turn and every child worker (engine.rs:2051-2070) with no prompt. polish-plan.md:180 specifies that End shows a confirm when running workers or a pending approval exist ('End session and 2 workers?'). Nothing on the desktop checks thread_busy or the worker count before sending.",
+   "evidence": "docs/design/polish-plan.md:180 (Confirm column: 'Only with running workers or a pending approval'); running.rs End toolbar_button enabled only by !self.ending; thread_menu.rs:185-188 and palette.rs:355-366 send EndSession with no check; engine.rs:2051-2070 cancels children.",
+   "fix": "Before sending EndSession from the three entry points, check thread_busy / active workers and show the confirm sheet ('End session and N workers?'), as the plan specifies.",
+   "area": "desktop-running-ui",
+   "upheld": 3,
+   "refutations": []
+  },
+  {
+   "title": "A live YOLO grant can no longer be seen or revoked on a session that is not in YOLO, yet agent-started workers still inherit it",
+   "file": "desktop/ox-desktop/src/views/compose.rs",
+   "line": 244,
+   "severity": "high",
+   "scenario": "User allows YOLO for workers on session S (compose.rs menu 'Allow YOLO for workers and handoffs', which sends YoloGrant(S,true); the host stores it in the ledger). The user then drops S back to Default or Accept edits. compose.rs:244 computes grant_offer = key.is_some() && effective.is_some_and(bypasses_permissions), so the menu no longer offers 'Revoke' (the grant branch at compose.rs:275 is only reached when grant_offer is true). The permission chip (compose.rs:219-232) shows only the Default label, with no grant indicator. The PR also removed the banner's 'revoke-yolo-grant' button from transcript.rs handoff_banner (main had it, shown whenever yolo_grant was set; the banner now has no revoke at all, see transcript.rs:603-707). Meanwhile the host still honours the grant: engine.rs:1664 and flows.rs:23-50 (yolo_grant walks the session and its parents) auto-approve a YOLO worker started by a hosted agent call with no prompt. Result: the user cannot see or revoke a live YOLO allowance on a session that is not currently in YOLO, and an agent can still start unattended YOLO workers under it.",
+   "evidence": "compose.rs:219-224 (granted / 'YOLO + workers' only when bypass), compose.rs:244 (grant_offer gating), compose.rs:275-310 (revoke only in the grant_offer branch). transcript.rs: no 'revoke-yolo-grant' anywhere in PR head (present on origin/main, transcript.rs ~line 630). engine.rs:1664 Caller::Hosted -> self.yolo_grant(ps, session). Fix idea: show the revoke whenever granted (independent of effective access), or keep the banner revoke.",
+   "fix": "Compute the grant-menu condition from `granted` (or key.is_some()) rather than from effective bypass, so Revoke is always reachable for a session that holds a grant; restore a visible revoke (or a 'YOLO grant active' indicator) in the handoff banner when yolo_grant is true.",
+   "area": "desktop-sheets",
+   "upheld": 3,
+   "refutations": []
+  },
+  {
+   "title": "Worker and handoff sheets default to the window's route, not the selected session's route",
+   "file": "desktop/ox-desktop/src/views/worker_sheet.rs",
+   "line": 228,
+   "severity": "medium",
+   "scenario": "Host-linked desktop (Link::Host) shows each thread on its own route (Store::thread_route in store/routes_thread.rs:40 reads remote.routes per thread; views/host.rs:876 and layout.rs:275 use it). open_launch passes store.profile().route into Choice::new, which is the window-level route and not the owner's. Example: the window profile is Claude subscription and the user selects a Codex API thread, then clicks Start worker (or Continue in\u2026). The sheet opens with Runtime=Claude and 'Claude subscription' selected, although the Choice::new doc comment says it starts 'from the route the session is on, so the common case needs no edits'. A user who just presses the submit button starts a worker on the wrong runtime/billing for that session. The sheet is also seeded with the wrong model (model: Billing::Api alias from the profile route), so the Codex alias from the window is shown for the selected session.",
+   "evidence": "worker_sheet.rs:228 `Choice::new(owner, &store.profile().route)`; worker_sheet.rs:40-46 doc comment and billing mapping; store/routes_thread.rs:40-56 thread_route(Some(id)) returns remote.routes[id] when present; views/host.rs:876 uses store.thread_route(Some(&t.id)) for the per-thread route label.",
+   "fix": "Seed Choice::new from store.thread_route(Some(&owner)) (the per-session route, falling back to the profile route) so the sheet default matches the session it is launched from.",
+   "area": "desktop-sheets",
+   "upheld": 2,
+   "refutations": [
+    "Refuted as written. The code does what the claim says at worker_sheet.rs:228 (Choice::new(owner, &store.profile().route), not store.thread_route(Some(&owner))), but the claimed runtime/billing mismatch is not reachable. Host panes are keyed by project x route (Subscribe scope and Opened/Handoff frames match on profile.route; views/host.rs:871 matches panes by route), so a store's threads share that window's runtime and billing. The Codex-subscription window returns CODEX_SUBSCRIPTION for every thread (routes_thread.rs:50-52), and a Claude window's remote route is the window route, so a Claude subscription window cannot hold a Codex API thread. The example \"Claude subscription window selects a Codex API thread\" does not occur. The only real divergence is the model alias within one Codex API pane: thread_route on the host returns codex_api(authorized_models[id]) (routes_thread.rs:57-60, written by apply_options at routes_thread.rs:208 and thread_ops.rs:100), so a thread switched to model B while the window alias is A seeds the sheet with A (worker_sheet.rs:44-46 and 228). That is a narrower, same-billing, wrong-model default, not wrong runtime or billing. If reported, the finding should be reduced to that case, at worker_sheet.rs:228 with routes_thread.rs:40-60 as evidence."
+   ]
+  },
+  {
+   "title": "Opening a thread under a folded parent leaves the target row hidden",
+   "file": "desktop/ox-desktop/src/views/host/discovery.rs",
+   "line": 444,
+   "severity": "medium",
+   "scenario": "Parent P is selected and expanded. Its child C is folded, and grandchild G (a running worker) sits under C. The workers line under P ('1 worker running', workbench.rs/workbench/worker.rs workers_line) emits OpenThread(G) because TreeIndex.first_running is G (walk_tree, host/discovery.rs:431-434 picks the first running descendant at any depth). open_thread only removes the fold for the currently selected thread (P) at lines 455-467. C stays collapsed, and index_catalog's `continue` at host.rs ~line 630 hides G. activate_row then selects G, but no row for it is visible in the sidebar, so the click appears to do nothing for the sidebar even though the transcript switches.",
+   "evidence": "discovery.rs:444-470 open_thread removes only `(project, selected)` from `collapsed`; discovery.rs:431-434 first_running is taken from any depth; host.rs:~630 catalog loop skips children of collapsed parents.",
+   "fix": "In open_thread, walk the parent chain of the target id (via the same children/parent map used by index_catalog) and remove every collapsed ancestor, not just the selected one, then re-index.",
+   "area": "desktop-picker-sidebar",
+   "upheld": 3,
+   "refutations": []
+  },
+  {
+   "title": "Legacy font_size 19 makes every Appearance & input change fail as 'changed on another device'",
+   "file": "desktop/ox-desktop/src/preferences/behavior.rs",
+   "line": 33,
+   "severity": "high",
+   "scenario": "A user who picked 'Large' on main has font_size 19 on disk. appearance.rs:369-374 migrate() maps it to 18 in memory, so the Active global (read at behavior.rs:70 as `b`) holds 18. On the Appearance & input page, clicking Small, Default, Extra large, Dark, Light, System or the motion toggle calls desktop_behavior::write(&revision(current), next) (line 33). revision(current) serializes font_size 18, but write_at (desktop_behavior.rs:110-114) recomputes the snapshot from the file, which still says 19, so the revisions differ and it returns Outcome::ChangedOnDisk. The UI shows 'The preference changed on another device' on every attempt. Nothing rewrites the file, so the failure persists. Only the already-selected Large button is clickable without error.",
+   "evidence": "behavior.rs:33 expected revision built from migrated `current`; appearance.rs:369-374 migrate (applied only in memory in init and watch_behavior); desktop-core desktop_behavior.rs:95 and :110 compare against the raw on-disk value.",
+   "fix": "Compare against the raw on-disk revision, or write the migrated value back to disk when migrating.",
+   "area": "desktop-system",
+   "upheld": 3,
+   "refutations": []
+  },
+  {
+   "title": "Running view ends a session on a snapshot up to 5 s old, with no confirm for single rows",
+   "file": "desktop/ox-host-web/assets/app.js",
+   "line": 488,
+   "severity": "high",
+   "scenario": "The Running list is refreshed only every 5 s (openRunning interval, line ~509). A row shows 'Idle' from a snapshot taken at t=0. At t=2 s a turn starts on the desktop or another device. At t=3 s the user taps End on that row: endRow() (lines 487-495) takes the non-running branch and calls endProcesses([p]) immediately, with no confirm. The host's end_thread (desktop/ox-host/src/engine.rs:2031-2048) does not re-check busy before end_session, so the live turn is cancelled and its workers are marked cancelled. The same stale filter feeds the 'End idle' confirm (lines 517-525), which then ends the stale idle set.",
+   "evidence": "app.js:458 (idle computed from the cached processes), app.js:487-495 (endRow, no confirm when !p.running), app.js:517-525 (end-idle uses the same cached list), engine.rs:2031-2048 (end_thread has no busy guard). Repro: open Running, start a turn from the desktop, tap End within 5 s.",
+   "fix": "Before ending, re-query the process list (or have the host refuse EndSession when the thread is busy unless the request carries an explicit confirmed flag). Otherwise always confirm, including for idle rows, when the snapshot is older than a few seconds.",
+   "area": "phone-js",
+   "upheld": 3,
+   "refutations": []
+  },
+  {
+   "title": "Content-refused SendImages (and other content refusals) close the socket instead of returning an error frame",
+   "file": "desktop/ox-host-web/src/bridge.rs",
+   "line": 163,
+   "severity": "medium",
+   "scenario": "The phone composer textarea (desktop/ox-host-web/assets/index.html:306) has no maxlength, so a draft over 128 KiB can be sent with attachments. Access::permit rejects SendImages when text.len() > 128*1024 (bridge.rs:225). Access::invalid only builds an error frame for StartWorker/StartHandoff; every other action hits `_ => return None` (bridge.rs:163), and the session loop then breaks (bridge.rs:280, `let Some(..) = access.invalid(..) else {break}`). The socket closes, the phone shows 'Disconnected before confirmation', reconnects, and the same send is refused the same way. The draft and attachments stay, so the user cannot send until they shorten the text, and gets no reason. The invalid() doc comment says requests refused for content are answered with an error frame, so this contradicts the PR's own design. Same path applies to SendImages with invalid images, Mention query over 512, YoloGrant id over 512, and SetAccess with a mode outside the route's choices. Main has the same close-on-refusal behaviour, but this PR adds invalid() for exactly this case and leaves these actions out.",
+   "evidence": "bridge.rs:163 `_ => return None,` inside invalid(); bridge.rs:225 `text.len() <= 128 * 1024`; bridge.rs:280 session-loop break; index.html:306 `id=\"draft\"` without maxlength; app.js:1588-1590 SendImages built from the draft text without a length check.",
+   "fix": "In invalid(), add SendImages, Mention, YoloGrant and SetAccess content refusals (mirroring their permit checks, with a reason string) so they get an error frame keyed by the request id. Or have the phone enforce the 128 KiB limit before sending.",
+   "area": "phone-bridge",
+   "upheld": 3,
+   "refutations": []
+  },
+  {
+   "title": "Failed Claude session turn is reported as status \"completed\"",
+   "file": "src/workers/jobs.rs",
+   "line": 593,
+   "severity": "medium",
+   "scenario": "A Claude session worker (Mode::Session) gets a result event with is_error true, for example an overload or max-turns error, and no steer is queued. run_claude sets turn_failure and state.error at lines 560-561, decrements pending to 0, and the loop exits. Session mode skips the Err return, so run_claude returns Ok(\"completed\") at line 593, and the spawn task at line 258 sets state.status = \"completed\". Before this PR the same turn ended with status \"failed\" and the error. The code comment at about lines 574-575 says the error stays \"visible in its status\", but the status field itself now says success. A UI or agent that branches on status will treat a failed turn as completed and may build on a result that does not exist.",
+   "evidence": "PR head src/workers/jobs.rs: 258 (Ok(status) => state.status = status), 560-561 (turn_failure / state.error set on error result), 574-576 (comment), 593 (Ok(\"completed\")). Mode enum at 78-82; the Workflow-only Err path at about 580-584 does not cover Session.",
+   "fix": "When a Session ends with turn_failure set, return an error or set status to \"failed\" (keeping state.error), so the terminal status matches the error that was recorded.",
+   "area": "workers-lease",
+   "upheld": 3,
+   "refutations": []
+  },
+  {
+   "title": "Store still ends the Claude thread when a later init reports a cd'd cwd (dogfood fix is only half applied)",
+   "file": "desktop/ox-desk-core/src/store/claude/events.rs",
+   "line": 229,
+   "severity": "high",
+   "scenario": "A Claude thread opened in ~/Work/ox runs `cd desktop` in its Bash tool. Claude Code repeats system/init on the next turn with cwd=~/Work/ox/desktop. The link layer now accepts this (links/claude.rs:156-168 only checks cwd on the first init), so the frame is forwarded as Data::Stock(Frame). Store::claude_frame (events.rs:220-230) still compares init.cwd to self.profile.project on every init and returns Err(\"Claude opened a different project\"). claude_event (events.rs ~line 66) then calls claude_closed, which removes the session from claude().sessions, drops its Process (process group killed) and marks the transcript with that error. The thread dies exactly as in the dogfood symptom the PR claims to fix, with a different error text. The PR's regression test (tests/claude_link.rs:225-265) only exercises the link layer and asserts the mismatch still closes the link on the init sub/ path, so it does not cover the store path and misses this. The store check was not touched by the PR (git diff origin/main...HEAD shows events.rs changed only in the ending-session hunks).",
+   "evidence": "Relevant PR-head lines: desktop/ox-desk-core/src/store/claude/events.rs:220-230 (Init arm, unchanged cwd check with error at :229); desktop/ox-desk-core/src/links/claude.rs:156-168 (first-init-only cwd check, the PR's fix); desktop/ox-desk-core/src/store/claude/events.rs claude_closed removes the session at its start. Threads-plan.md states the rule: 'Only the first init must match the project; later ones only the session id', which the store side does not follow.",
+   "fix": "Apply the same rule in Store::claude_frame: keep the session-id check on every init and check cwd/project only for the first init of the process (e.g., a per-Process `project_checked` flag set in claude_ready or on first Init). Add a store-level test that feeds an Init with a subdirectory cwd after the first init and asserts the session stays alive.",
+   "area": "claude-link",
+   "upheld": 3,
+   "refutations": []
+  }
+ ],
+ "contested": [
+  {
+   "title": "Ending a running Codex turn leaves it marked running, and reconnect resurrects the ended thread",
+   "file": "desktop/ox-desk-core/src/store/compose.rs",
+   "line": 402,
+   "severity": "high",
+   "scenario": "A Codex thread is mid-turn (transcript.active_turn = Some(turn)). The user picks End. end_session() calls self.stop(id), which only sends a turn/interrupt and returns on Stop Acknowledged without clearing active_turn (compose.rs:~585-587: Operation::Stop => Ok(())). The code then sets t.verified=false and t.ready=false (402-403) but never clears t.active_turn, then sends Unsubscribe. The interrupted turn's TurnCompleted is never applied: notifications.rs:97-98 already documents that a TurnCompleted is dropped while the thread is unverified, so the running turn cannot clear itself. Consequences: (1) the row keeps running=true, so projection.rs:157 still pushes the 'stop' capability and the thread counts in active_turns() (store/history.rs:22) and the spinner never stops; (2) store.rs:253-257 selects every thread with active_turn().is_some() into `reopen`, so the next reconnect/rebuild re-resumes the thread the user just ended, undoing the end. The Claude path avoids this by clearing active_turn in claude_end (store/claude.rs:701-704), so the Codex path is inconsistent with it.",
+   "evidence": "compose.rs:370-408 (end_session Codex branch, no active_turn reset); compose.rs:~585-587 Operation::Stop acknowledged without clearing; notifications.rs:96-98 comment on TurnCompleted dropped while unverified; store.rs:253-257 reopen filter on active_turn; claude.rs:701-704 clears active_turn for Claude.",
+   "fix": "In the Codex branch of end_session, set t.active_turn = None (as claude_end does) before the Unsubscribe request, and add a test that ends a thread with an active turn and asserts active_turn() is None and that it is not in `reopen` after a rebuild.",
+   "area": "end-session-core",
+   "upheld": 1,
+   "refutations": [
+    "Refuted as stated, because the claimed resurrection depends on a step I could not confirm. The local mechanics match the claim at the PR head: end_session (desktop/ox-desk-core/src/store/compose.rs:370-408) calls stop(), then sets ready/verified/loading false without touching active_turn, then sends Unsubscribe. Frame::Activity (src/store.rs:711) drops TurnCompleted when !verified && !loading, so the running turn cannot clear itself. The reconnect path (src/store.rs:563-570 pushes threads with active_turn into reopen, and connected() at store.rs:764 re-reads them) would resurrect the thread. The gap is Notification::Closed (src/store/notifications.rs:161-175). It clears active_turn with no verified gate, and the Codex app-server's thread/closed notification (names.rs:39, codex/notice.rs:122) is plausibly emitted when the last subscriber unsubscribes. If it is, active_turn is cleared and the reopen and spinner consequences do not occur; the only visible effect would be a \"Codex closed this thread\" error. I cannot verify that server behaviour from the repo, and the task says to refute when unsure. Stop-acknowledged-without-clear (compose.rs:566) and the Claude contrast (claude.rs:704) are accurate, but the claim's stated consequences are not established.",
+    "Refuted as stated, or at minimum not confirmed. The core mechanics hold: end_session (compose.rs:370-408) never clears active_turn on the Codex branch, Operation::Stop is acknowledged without clearing it (compose.rs:566), and the Activity arm (store.rs:707-720) drops TurnCompleted once verified/ready are false. But the claim's premise that \"the running turn can never clear itself\" misses the Closed path. Notification::Closed (notifications.rs:161-176) clears active_turn unconditionally, with no verified/ready gate. The codebase maps thread/closed (codex/names.rs:39, notice.rs:122). The app-server emits thread/closed when a thread is unloaded, which is the expected result of the Unsubscribe that end_session sends as the last subscriber. In that case active_turn is cleared, the row stops running, and the reopen filter (store.rs:253-257) no longer picks the thread up. The claim only holds if the thread keeps another subscriber, or if the server does not emit thread/closed on unsubscribe. Neither can be confirmed from the repo, and the instructions say to refute when unsure. The reopen consequence is also weaker than claimed: a selected thread is reopened regardless of active_turn (store.rs:253-257, selected == id). Clearing active_turn in the Codex End branch, as claude_end does, would be a reasonable hardening, but it is not a confirmed user-facing bug."
+   ]
+  },
+  {
+   "title": "A second new-chat send overwrites the pending opening id, so the first session is never auto-selected",
+   "file": "desktop/ox-desk-core/src/store/replica.rs",
+   "line": 275,
+   "severity": "medium",
+   "scenario": "The user sends the first message in a blank chat. The host accepts it (engine.rs:1191 sets live.opening) and the thread starts over a few seconds. Before the first Opened arrives, the user sends a second message from the blank composer. Submit (line 272) sets await_new = Some(K2) unconditionally, overwriting K1. The host rejects K2 with 'Another session is opening on this route.' (engine.rs:1124-1127), and that Error clears the wait because its id is K2. When K1's Opened arrives (engine.rs:1418-1437, same socket), the check at line 330-333 compares K1 with await_new and fails, so the session is never selected. The user stays on the blank draft with only an error notice, and the session they started is only visible in the sidebar. The same unconditional overwrite happens at lines 205, 226 and 305 (ForkThread, InjectHandoff, palette commands).",
+   "evidence": "replica.rs:272-276 `let opens = owner.is_none(); let id = self.send_input(...)?; if opens { self.remote_mut().await_new = Some(id); }`; replica.rs:330-334 `if self.remote().unwrap().await_new.as_deref() == Some(id.as_str())`; engine.rs:1124-1127 rejects a second opening while live.opening is set. Main had the same overwrite with a bool, so the PR narrows the bug but does not remove it.",
+   "fix": "Do not overwrite a pending opening. Keep a set of opening request ids (or only assign when await_new is None), let each Opened whose id is in the set select its thread, and remove an id only on its own Opened or Error. Add a test: open K1, open K2, Opened(K1) selects K1.",
+   "area": "replica-protocol",
+   "upheld": 1,
+   "refutations": [
+    "The claim is refuted for the blank-composer Submit path it describes. Submit (replica.rs, Action::Submit arm in dispatch_remote) first returns Err(\"Wait for the thread to be ready\") when `!self.can_send(owner) || self.sending(owner)`, before send_input runs, so K2 is never sent and never overwrites await_new. sending(None) (compose.rs:120-122) is true while the host's blank draft still has `sent` set, or while the desktop's pending map still holds K1. The host keeps draft[None].sent set until the New request completes: compose.rs:601 only removes drafts[None] in first_send, which runs on Reply::Opened. The host also pushes that state as next_sending (projection.rs:134), which the desktop stores as remote.sending \"\" (replica.rs:467-468). Ack for K1 removes it from pending (replica.rs:408), but the host-state push carrying next_sending=true is what keeps the blank composer blocked until Opened. The only window is a short gap, if any, between K1's Ack and that state frame, and I found no evidence it occurs. The overwrite is real for the fork and inject arms (replica.rs ~205/226/305), which have no sending guard. Those are a different scenario (forking another thread while K1 is opening) and not the blank-chat case the claim describes, so they do not rescue it as stated.",
+    "The claimed second-send scenario cannot happen at the PR head, because the client blocks the second Submit before the await_new overwrite. In desktop/ox-desk-core/src/store/replica.rs, Action::Submit (around lines 259-277) first runs `if !self.can_send(owner) || self.sending(owner)` and returns \"Wait for the thread to be ready\". For the blank composer, sending(None) (compose.rs:120-123) is true while either (a) the first send is still in remote.pending (pending_input, replica.rs:148-150) or (b) the host reported next_sending=true, which sets remote.sending \"\" (replica.rs:467-468). On the host, the first send sets draft.sent for owner None (compose.rs:223) and it is only cleared when the New reply completes (first_send / Send ops, compose.rs:546-563), so next_sending stays true from K1's accept until the thread opens. The host also flushes the state delta before replying Ack (engine.rs:746-765: process() runs before reply(Ack)), so the client sees sending \"\" before K1's Ack removes the pending entry. The guard therefore rejects K2 with \"Wait for the thread to be ready\", so await_new is never overwritten with K2, and K1's Opened (replica.rs:330-334) still matches and selects the session. The only residual window is the instant between the host clearing next_sending and sending the Opened frame in the same batch, which is not practically reachable from the UI. Note the refutation is for the Submit path only: ForkThread and InjectHandoff (replica.rs:205, 226) set await_new without this sending guard, so that sub-pattern was not checked against the guard and is not covered by this verdict."
+   ]
+  },
+  {
+   "title": "Chat stream drops the upstream call_id when the name arrives before the id, and fallback ids collide across responses",
+   "file": "src/adapters/chat_completions.rs",
+   "line": 1235,
+   "severity": "medium",
+   "scenario": "A chat-completions provider sends the first tool_calls delta with function.name but no id, and sends the real id in a later delta. push_tool_call announces the item at line ~1235 and replaces call_id with fallback_call_id ('call_<output_index>'). The guard at lines 1213-1214 (call_id.is_empty()) then ignores the real id, so the done item, the client's function_call and any later function_call_output all use 'call_0' instead of the upstream id. fallback_call_id (lines 1148-1158) only checks self.items of the current response, and output_index restarts at 0 in every response, so a second turn whose first call also lacks an id gets 'call_0' again. Duplicate call_ids then appear in the transcript sent back upstream and in the client's call/output pairing. Before this PR the real id was kept and only the announce carried the placeholder.",
+   "evidence": "chat_completions.rs:1148-1158 (fallback_call_id scans only self.items), 1213-1216 (first non-empty id wins, but only while call_id is empty), 1235-1238 (fallback assigned and item_id fixed). The doc comment at 1229-1233 says a later real id is ignored by design.",
+   "fix": "Keep the real id when it arrives: announce with the item_id derived from output_index, and set call_id from the first non-empty upstream id even after announce, so the done item carries the real id. If an id is needed at announce time, make the fallback unique across the whole conversation (for example a random or response-scoped prefix) rather than output_index alone.",
+   "area": "adapters",
+   "upheld": 1,
+   "refutations": [
+    "Refuted as stated. The mechanics are real at the PR head: push_tool_call (chat_completions.rs:1204-1238) assigns fallback_call_id when the name arrives without an id, and the guard at 1214 then ignores a later real id. Main (origin/main, lines 1141-1162) kept the upstream id and only used a placeholder for item_id, so the PR does change this behaviour. But the drop is intentional and documented in the doc comment at 1229-1233 (\"a real ID that arrives in a later delta is ignored, so the announce, delta and done items all agree\"). The user-facing harm is not demonstrated: chat completions is stateless, so the id only has to be consistent within the resent history. The client's function_call and function_call_output both use call_0, and push_function_call / the tool message (lines 336-369, 609-632) carry that same id, so pairing stays self-consistent. The cross-response collision is real in principle, since items and next_output_index are per response (new() at 901-912, so fallback_call_id only sees the current response). Whether it breaks anything depends on whether a given upstream rejects duplicate tool_call ids across turns, and I could not establish that from the code. The task says to refute when unsure, so this is refuted. If it is kept, the strongest version is the collision across turns, not the dropped real id.",
+    "The behaviour is real but intended, and the collision scenario is not new to this PR. (1) Intended: chat_completions.rs:1229-1233 documents that the first non-empty ID wins only while call_id is empty, and that a later real ID is ignored so the announce, delta and done items agree. The announce at 1235-1238 has already sent call_0 to the client by then, so keeping the late upstream ID would make the done item disagree with the announce. The PR chose that tradeoff deliberately. (2) Not a broken round trip: push_function_call (line 611, 632) builds both the assistant tool_calls id and the tool message's tool_call_id from the same call_id, so the history sent upstream stays internally paired on call_0. (3) Cross-turn collision needs a provider that omits the id on the first call of every response. Each ToolState lives in a per-response struct (new() at line 901, items and next_output_index reset there), so fallback_call_id cannot see prior turns. That case already existed on main, where an id-less call left call_id empty in the done item, so this PR does not introduce it. It is also outside the claimed late-id regression. (4) Late-id providers are unusual, and the PR's deliberate choice is documented. Not in the deferred list, but the claim does not describe a user-facing failure that the PR newly causes."
+   ]
+  },
+  {
+   "title": "ox end cannot disambiguate sessions whose 8-char ids collide",
+   "file": "src/ps.rs",
+   "line": 214,
+   "severity": "medium",
+   "scenario": "`ox ps` shows every thread as its first 8 characters (short_id, src/ps.rs:226, used in the THREADS column at line 265). Two live sessions whose thread ids share those 8 characters print identical ids in the table. Typing that shared prefix makes resolve_prefix (lines 212-221) report 'matches 2 sessions, so it is ambiguous. Use a longer prefix:' and list the same 8-char ids again. The message tells the user to type a longer prefix, but the only ids shown are the 8-char ones, so they cannot pick one from the output. They need `ox ps --json` to find the full id. This is most likely when several Codex threads start within the same short window, if their ids are time-ordered (unverified: thread id generation is in the external codex CLI, not this repo).",
+   "evidence": "src/ps.rs:214-219 (ambiguous message uses short_id), src/ps.rs:226-228 (short_id = first 8 chars), src/ps.rs:265 (THREADS column), src/ps.rs:127-128 (ended line also uses short_id, so the user cannot confirm which thread was ended by full id).",
+   "fix": "Show the shortest prefix that is unique across the listed sessions (compute it once from all session thread ids and use it in the THREADS column, the ambiguity list and the ended line), or print full ids in the ambiguity list.",
+   "area": "cli-provider",
+   "upheld": 1,
+   "refutations": [
+    "Refuted as stated, because the bug needs an unverified precondition. The code paths match the claim at the PR head. resolve_prefix (src/ps.rs:194-224) reports ambiguity using short_id (line 219), which takes the first SHORT_ID=8 chars (lines 26, 226-227). The THREADS column (line 265) and the ended line (lines 127-128) also use short_id. So two live threads sharing their first 8 characters would print identical ids, and the \"Use a longer prefix\" message gives no way to see more characters. `ox ps --json` does exist (src/ps.rs:67-78), but the message never points to it. The failure, however, requires two live session thread ids to share an 8-character prefix. The repo does not generate thread ids (they come from the external Codex CLI), and the claim itself marks the time-ordered id format as unverified. Without that, the collision scenario is not established, and the instructions say to refute when unsure. The narrow residual point is that the ambiguity message does not mention `--json`, which is at most a minor usability nit and not a real user-facing bug on its own.",
+    "Refuted as stated, mainly on an unverified premise, with a partial mitigation.\n\n1. The trigger needs two live threads whose ids share the first 8 characters. Claude session ids are RFC 9562 v4 random UUIDs (src/clients.rs:787), so a collision is negligible. The only path is Codex thread ids being time-ordered, which the claim itself marks unverified, and the id generator is in the external codex CLI, not this repo.\n\n2. The ambiguity message is not id-only. resolve_prefix (src/ps.rs:214-219) prints `short_id(thread)` plus `s.label`, and the label (src/ps.rs:185) is `\"{kind} {project_label}\"`. Two sessions in different projects or of different kinds are distinguishable from the output. The claim's failure case is narrower: same kind and same project, with colliding 8-char ids.\n\n3. In that narrow case the user is not stuck. An exact full id always wins (src/ps.rs:208-210), and `ox ps --json` prints full ids, as the claim notes. The remaining defect is message quality (the hint does not point at --json or give full ids), not a session-killing or state-diverging bug, and it is not in the deferred list.\n\nNet: the code does show 8-char ids in the ambiguity message, but the bug depends on an unverified collision premise and is mitigated by labels and exact-id matching, so it does not hold as a real user-facing bug at this PR head."
+   ]
+  }
+ ],
+ "total": 23
+}

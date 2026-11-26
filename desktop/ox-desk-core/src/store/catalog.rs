@@ -18,12 +18,16 @@ pub(super) struct Catalog {
     positions: HashMap<String, usize>,
     // True once the excerpt is the first known prompt. Stock previews always take precedence.
     inferred_previews: HashMap<String, bool>,
+    // Child id to parent id, mirroring the store's lineage so a list refresh can keep workers
+    // whose cwd is a project subdirectory. The first page only reports project-root rows.
+    children: HashMap<String, String>,
 }
 
 impl Catalog {
     pub(super) fn clear(&mut self) {
         *self = Self {
             titles: self.titles.clone(),
+            children: std::mem::take(&mut self.children),
             ..Default::default()
         };
     }
@@ -106,6 +110,10 @@ impl Catalog {
         true
     }
 
+    pub(super) fn forget_child(&mut self, id: &str) {
+        self.children.remove(id);
+        self.remove(id);
+    }
     pub(super) fn remove(&mut self, id: &str) {
         self.inferred_previews.remove(id);
         if let Some(pos) = self.positions.remove(id) {
@@ -116,11 +124,25 @@ impl Catalog {
         }
     }
     pub(super) fn keep(&mut self, ids: &HashSet<String>) {
+        // A child whose parent survives the listing is still described by its lineage, so keep it.
+        let mut retained = ids.clone();
+        loop {
+            let before = retained.len();
+            for (child, parent) in &self.children {
+                if retained.contains(parent) && self.positions.contains_key(child) {
+                    retained.insert(child.clone());
+                }
+            }
+            if retained.len() == before {
+                break;
+            }
+        }
         let mut kept = Self {
             titles: self.titles.clone(),
+            children: self.children.clone(),
             ..Default::default()
         };
-        for id in ids {
+        for id in &retained {
             if let Some(row) = self.get(id) {
                 kept.insert(row.clone());
                 if let Some(&known_first) = self.inferred_previews.get(id) {
@@ -134,6 +156,14 @@ impl Catalog {
 
 impl super::Store {
     pub(super) fn sync_title(&mut self, source: &ThreadRow) {
+        // A row restored for an ended thread has no model until discovery lists it.
+        if let Some(model) = &source.model
+            && let Some(row) = self.catalog.get_mut(&source.id)
+            && row.model.is_none()
+        {
+            row.model = Some(model.clone());
+            self.title_changed();
+        }
         if self.catalog.merge_title(source) {
             self.title_changed();
         }
@@ -169,6 +199,7 @@ impl super::Store {
                         .or_insert(child_alias);
                 }
             }
+            self.catalog.children.insert(row.id.clone(), parent.clone());
             self.child_threads
                 .insert(row.id.clone(), (parent.clone(), row.cwd.clone()));
         }
@@ -277,8 +308,8 @@ impl super::Store {
         }
         let kind = match &activity.change {
             Change::TurnStarted => "active",
-            Change::TurnCompleted { error: Some(_) } => "systemError",
-            Change::TurnCompleted { error: None } => "idle",
+            Change::TurnCompleted { error: Some(_), .. } => "systemError",
+            Change::TurnCompleted { error: None, .. } => "idle",
             _ => return,
         };
         row.status = Some(Status {
@@ -298,3 +329,87 @@ impl super::Store {
 #[cfg(test)]
 #[path = "catalog_titles_tests.rs"]
 mod title_tests;
+
+#[cfg(test)]
+mod keep_tests {
+    use super::super::{Connection, Profile, Route, Store, ThreadRow};
+    use crate::codex::{
+        frame::{Frame, RequestId},
+        history::ThreadPage,
+        reply::Reply,
+    };
+    use crate::links::codex::{Launch, Link, LinkEvent};
+    use serde_json::json;
+
+    fn store() -> Store {
+        let project = std::env::temp_dir();
+        let link = Link::spawn(
+            Launch {
+                executable: "/bin/cat".into(),
+                arguments: vec![],
+                directory: project.clone(),
+                path: "/usr/bin:/bin".into(),
+            },
+            |_| {},
+        )
+        .unwrap();
+        let mut store = Store::open(
+            Profile {
+                project,
+                route: Route::CODEX_SUBSCRIPTION,
+                provider: "openai".into(),
+            },
+            link,
+        )
+        .unwrap();
+        store.state = Connection::Ready;
+        store
+    }
+
+    fn row(id: &str, cwd: std::path::PathBuf, parent: Option<&str>) -> ThreadRow {
+        serde_json::from_value(json!({"id":id,"cwd":cwd,"modelProvider":"openai","parentThreadId":parent,"preview":""})).unwrap()
+    }
+
+    #[test]
+    fn selecting_a_thread_while_connecting_queues_the_open() {
+        let mut s = store();
+        s.state = Connection::Connecting;
+        s.record_row(row("early", std::env::temp_dir(), None));
+        s.select("early").unwrap();
+        assert!(s.notice().is_none());
+        assert_eq!(s.selected(), Some("early"));
+        assert!(s.transcript("early").unwrap().is_loading());
+        s.connected().unwrap();
+        assert!(s.queued_open.is_none());
+        assert!(s.transcript("early").unwrap().is_loading());
+    }
+
+    #[test]
+    fn relist_keeps_a_known_worker_in_a_project_subdirectory() {
+        let mut s = store();
+        let project = std::env::temp_dir();
+        let sub = project.join("sub");
+        s.record_row(row("parent", project.clone(), None));
+        s.record_lineage(&row("worker", sub.clone(), Some("parent")));
+        s.record_row(row("worker", sub.clone(), Some("parent")));
+        s.record_row(row("unrelated", sub.clone(), Some("gone")));
+        s.record_lineage(&row("unrelated", sub.clone(), Some("gone")));
+        s.record_row(row("unrelated", sub, Some("gone")));
+
+        // A real refresh: the first page relists only the project-root parent.
+        s.list_more().unwrap();
+        let list = s.seq;
+        s.created_while_listing.clear();
+        s.apply(LinkEvent::Frame(Frame::Reply {
+            id: RequestId::Number(list),
+            result: Ok(Reply::Threads(ThreadPage {
+                data: vec![row("parent", project, None)],
+                next_cursor: None,
+            })),
+        }));
+
+        assert!(s.catalog_row("parent").is_some());
+        assert!(s.catalog_row("worker").is_some());
+        assert!(s.catalog_row("unrelated").is_none());
+    }
+}

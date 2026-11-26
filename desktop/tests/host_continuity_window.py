@@ -173,7 +173,7 @@ def live_session(window, provider, env, root):
         window.wait(lambda s:s["selected_thread"]==thread and s["selected_requests"], "baseline permission restored")
         wait(lambda: js("return !!document.querySelector('#asks .ask')"), 30)
         js("document.querySelector('#stop').click()")
-        wait(lambda: js("return !document.querySelector('#asks .ask') && document.querySelector('#stop').hidden"),30)
+        wait(lambda: js("return !document.querySelector('#asks .ask') && document.querySelector('#stop').disabled"),30)
         window.wait(lambda s:s["selected_thread"]==thread and not s["visible_turn"] and not s["selected_requests"], "phone Stop reached stock")
         assert not marker.exists(), "Stopped tool ran"
         host_state=Path(env["OX_HOST_STATE_DIR"])

@@ -387,6 +387,35 @@ fn rejects_hosted_tools_and_custom_tools() {
 }
 
 #[test]
+fn wraps_unparseable_historical_arguments_instead_of_failing_the_thread() {
+    // A truncated or non-object call from an earlier turn must not make every
+    // later request fail. Its raw text is replayed inside a valid tool_use input.
+    for raw in ["[1,2]", "{\"command\": \"ls", "not json"] {
+        let input = json!({
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": raw},
+                {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+                {"role": "user", "content": "again"}
+            ],
+            "max_output_tokens": 64,
+            "stream": true
+        });
+        let body = translate_request(&input, "m").unwrap_or_else(|error| panic!("{raw}: {error}"));
+        let tool_use = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_array())
+            .flatten()
+            .find(|block| block["type"] == "tool_use")
+            .expect("the historical call is replayed");
+        assert_eq!(tool_use["id"], "call_1");
+        assert_eq!(tool_use["input"], json!({"_raw": raw}));
+    }
+}
+
+#[test]
 fn rejects_unsupported_content_and_bad_arguments() {
     let image = json!({
         "input": [{
@@ -400,17 +429,14 @@ fn rejects_unsupported_content_and_bad_arguments() {
         "max_output_tokens": 64,
         "stream": true
     });
-    assert!(translate_request(&image, "m").is_err());
-
-    let non_object_arguments = json!({
-        "input": [
-            {"role": "user", "content": "hi"},
-            {"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "[1,2]"}
-        ],
+    assert!(translate_request(&image, "m").is_ok());
+    let file = json!({
+        "input": [{"type": "message", "role": "user",
+            "content": [{"type": "input_file", "file_id": "f"}]}],
         "max_output_tokens": 64,
         "stream": true
     });
-    assert!(translate_request(&non_object_arguments, "m").is_err());
+    assert!(translate_request(&file, "m").is_err());
 
     let bad_name = json!({
         "input": "hi",
@@ -668,6 +694,76 @@ fn maps_max_tokens_to_incomplete() {
         terminal["response"]["output"][0]["content"][0]["text"],
         "partial"
     );
+}
+
+fn tool_use_stream(partial_json: &str, stop_reason: &str) -> Vec<Result<Vec<Value>, String>> {
+    let mut translator = ResponseTranslator::with_created_at(1_700_000_000);
+    let mut results = Vec::new();
+    let steps = [
+        ("message_start", message_start("claude-x")),
+        (
+            "content_block_start",
+            json!({
+                "index": 0,
+                "content_block": {"type": "tool_use", "id": "toolu_1", "name": "apply_patch", "input": {}}
+            }),
+        ),
+        (
+            "content_block_delta",
+            json!({"index": 0, "delta": {"type": "input_json_delta", "partial_json": partial_json}}),
+        ),
+        ("content_block_stop", json!({"index": 0})),
+        (
+            "message_delta",
+            json!({"delta": {"stop_reason": stop_reason}, "usage": {"output_tokens": 8192}}),
+        ),
+        ("message_stop", json!({"type": "message_stop"})),
+    ];
+    for (event, data) in steps {
+        results.push(translator.push_event(event, &data.to_string()));
+    }
+    results
+}
+
+#[test]
+fn truncated_tool_use_at_max_tokens_is_incomplete_not_an_error() {
+    // Output cut off mid-JSON inside a tool_use block at max_tokens.
+    let results = tool_use_stream("{\"patch\": \"*** Begin Patch\\n+line", "max_tokens");
+    for result in &results {
+        assert!(
+            result.is_ok(),
+            "truncated tool must not fail the stream: {result:?}"
+        );
+    }
+    let events = results.last().unwrap().as_ref().unwrap();
+    // Nothing completed, so the terminal event is the only one at message_stop.
+    assert_eq!(types(events), vec!["response.incomplete"]);
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["response"]["status"], "incomplete");
+    assert_eq!(
+        terminal["response"]["incomplete_details"],
+        json!({"reason": "max_output_tokens"})
+    );
+    // The truncated function_call is dropped, not completed.
+    assert_eq!(terminal["response"]["output"], json!([]));
+    assert!(
+        events
+            .iter()
+            .all(|event| event["item"]["type"] != "function_call"),
+        "truncated call must not be emitted as a function_call item"
+    );
+}
+
+#[test]
+fn invalid_tool_json_with_tool_use_stop_still_errors() {
+    let results = tool_use_stream("{\"command\": ls", "tool_use");
+    let error = results
+        .last()
+        .unwrap()
+        .as_ref()
+        .expect_err("invalid tool JSON must fail the stream");
+    assert!(error.contains("apply_patch"), "{error}");
+    assert!(error.contains("invalid JSON arguments"), "{error}");
 }
 
 #[test]
@@ -1495,4 +1591,150 @@ fn still_requires_a_call_id_for_real_tool_outputs() {
     });
     let error = translate_request(&request, "claude-upstream").unwrap_err();
     assert!(error.contains("call_id"), "{error}");
+}
+
+#[test]
+fn maps_images_in_messages_and_tool_results() {
+    let request = json!({
+        "input": [
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "look"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+                {"type": "input_image", "image_url": "https://example.test/x.jpg"}
+            ]},
+            {"type": "function_call", "call_id": "c1", "name": "view_image", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": [
+                {"type": "input_image", "image_url": "data:image/jpeg;base64,BBBB"}
+            ]}
+        ],
+        "max_output_tokens": 64,
+        "stream": true
+    });
+    let out = translate_request(&request, "m").expect("translates");
+    let messages = out["messages"].as_array().unwrap();
+    let user = messages[0]["content"].as_array().unwrap();
+    assert_eq!(user[1]["type"], "image");
+    assert_eq!(user[1]["source"]["type"], "base64");
+    assert_eq!(user[1]["source"]["media_type"], "image/png");
+    assert_eq!(user[1]["source"]["data"], "AAAA");
+    assert_eq!(user[2]["source"]["type"], "url");
+    assert_eq!(user[2]["source"]["url"], "https://example.test/x.jpg");
+    let result = messages[2]["content"][0]["content"].as_array().unwrap();
+    assert_eq!(result[0]["type"], "image");
+    assert_eq!(result[0]["source"]["media_type"], "image/jpeg");
+}
+
+/// Drive a stream of `(event, data)` steps and return every emitted event.
+fn run_steps(steps: Vec<(&str, Value)>) -> Vec<Value> {
+    let mut translator = ResponseTranslator::with_created_at(1_700_000_000);
+    let mut all = Vec::new();
+    for (event, data) in steps {
+        all.extend(push(&mut translator, event, data));
+    }
+    all
+}
+
+fn tool_start(index: usize, id: &str, name: &str) -> (&'static str, Value) {
+    (
+        "content_block_start",
+        json!({"index": index, "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}}),
+    )
+}
+
+fn block_stop(index: usize) -> (&'static str, Value) {
+    ("content_block_stop", json!({"index": index}))
+}
+
+fn max_tokens_tail() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "message_delta",
+            json!({"delta": {"stop_reason": "max_tokens"}, "usage": {"output_tokens": 8192}}),
+        ),
+        ("message_stop", json!({"type": "message_stop"})),
+    ]
+}
+
+fn done_calls(events: &[Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|event| {
+            event["type"] == "response.output_item.done" && event["item"]["type"] == "function_call"
+        })
+        .map(|event| event["item"]["call_id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn empty_partial_json_then_max_tokens_is_not_an_executable_call() {
+    // Probe empty_delta: a zero-length partial_json proves nothing about the
+    // arguments, so the cut call is dropped like one with no delta at all.
+    let mut steps = vec![
+        ("message_start", message_start("claude-x")),
+        tool_start(0, "toolu_1", "list_files"),
+        (
+            "content_block_delta",
+            json!({"index": 0, "delta": {"type": "input_json_delta", "partial_json": ""}}),
+        ),
+        block_stop(0),
+    ];
+    steps.extend(max_tokens_tail());
+    let events = run_steps(steps);
+    assert!(
+        done_calls(&events).is_empty(),
+        "streamed item.done: {events:?}"
+    );
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["type"], "response.incomplete");
+    assert_eq!(terminal["response"]["output"], json!([]));
+}
+
+#[test]
+fn closed_no_arg_call_survives_a_later_truncated_call() {
+    // Probe prior_noargs: the first call was closed by the model before the
+    // second block began, so it is complete; only the cut call is dropped.
+    let mut steps = vec![
+        ("message_start", message_start("claude-x")),
+        tool_start(0, "toolu_1", "list_files"),
+        block_stop(0),
+        tool_start(1, "toolu_cut", "apply_patch"),
+        (
+            "content_block_delta",
+            json!({"index": 1, "delta": {"type": "input_json_delta", "partial_json": "{"}}),
+        ),
+        block_stop(1),
+    ];
+    steps.extend(max_tokens_tail());
+    let events = run_steps(steps);
+    assert_eq!(done_calls(&events), vec!["toolu_1"], "streamed item.done");
+    let done = events
+        .iter()
+        .find(|event| event["type"] == "response.output_item.done")
+        .unwrap();
+    assert_eq!(done["output_index"], 0);
+    assert_eq!(done["item"]["arguments"], "{}");
+    let terminal = events.last().unwrap();
+    assert_eq!(terminal["type"], "response.incomplete");
+    let output = terminal["response"]["output"].as_array().unwrap();
+    assert_eq!(output.len(), 1);
+    assert_eq!(output[0]["call_id"], "toolu_1");
+    assert_eq!(output[0]["name"], "list_files");
+    assert_eq!(output[0]["arguments"], "{}");
+}
+
+#[test]
+fn closed_no_arg_call_before_a_cut_no_arg_call_keeps_only_the_first() {
+    let mut steps = vec![
+        ("message_start", message_start("claude-x")),
+        tool_start(0, "toolu_1", "list_files"),
+        block_stop(0),
+        tool_start(1, "toolu_2", "list_files"),
+        block_stop(1),
+    ];
+    steps.extend(max_tokens_tail());
+    let events = run_steps(steps);
+    assert_eq!(done_calls(&events), vec!["toolu_1"]);
+    let output = events.last().unwrap()["response"]["output"].clone();
+    assert_eq!(output.as_array().unwrap().len(), 1);
+    assert_eq!(output[0]["call_id"], "toolu_1");
 }

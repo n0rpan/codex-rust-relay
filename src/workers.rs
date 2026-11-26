@@ -696,12 +696,27 @@ impl Service {
         let query = filters.query.trim().to_lowercase();
         let mut total = 0;
         let mut models = Vec::new();
-        for (alias, provider) in self.app().await?.launch_models() {
+        // Every listed model can run. The user's starred models come first, in
+        // star order, so agents see the preferred choices on the first page.
+        let favorites = crate::picker::read_favorites(&self.home).unwrap_or_default();
+        let rank = |alias: &str| favorites.iter().position(|f| f == alias);
+        let app = self.app().await?;
+        let contexts: std::collections::HashMap<String, u64> =
+            app.model_contexts().into_iter().collect();
+        let mut catalog = app.launch_models();
+        catalog.sort_by_key(|(alias, _)| rank(alias).unwrap_or(usize::MAX));
+        for (alias, provider) in catalog {
             if !alias.to_lowercase().contains(&query) && !provider.to_lowercase().contains(&query) {
                 continue;
             }
             if total >= filters.offset && models.len() < PAGE_SIZE {
-                models.push(json!({"model": alias, "provider": provider, "auth": "api_key"}));
+                models.push(json!({
+                    "model": alias,
+                    "provider": provider,
+                    "auth": "api_key",
+                    "starred": rank(alias).is_some(),
+                    "context_window": contexts.get(alias),
+                }));
             }
             total += 1;
         }
@@ -811,7 +826,7 @@ fn initialize(params: &Value) -> Value {
         "protocolVersion": version,
         "serverInfo": {"name": SERVER, "version": crate::VERSION},
         "capabilities": {"tools": {}},
-        "instructions": "Use start_ox_worker for long coding tasks, Codex goals or Claude workflows, then check ox_worker_status. Workers inherit your permission mode; lower it with permission_mode when a task only reads or needs less. Use delegate_to_ox_model for one short text answer. Start jobs only at the user's request. The named provider bills the delegated work. If this session continues another one (an OX handoff), read_ox_thread returns the source's omitted or cut messages by item ID.",
+        "instructions": "Use start_ox_worker for long coding tasks, Codex goals or Claude workflows, then check ox_worker_status. Pick runtime and mode by the start_ox_worker mode notes. Workers inherit your permission mode only when the OX session host runs; with no host, inherit means read, so pass permission_mode write to let a worker edit. You can lower a worker's mode, never raise it. Check list_ox_models for provider, context_window and starred before choosing a model. Use delegate_to_ox_model for one short text answer. Start jobs only at the user's request. The named provider bills the delegated work. If this session continues another one (an OX handoff), read_ox_thread returns the source's omitted or cut messages by item ID.",
     })
 }
 
@@ -820,7 +835,7 @@ fn tools() -> Value {
         "tools": [
             {
                 "name": "list_ox_models",
-                "description": "List available ox API models and detected native subscription routes, labelled by provider. Filter by model or provider. Use an API alias when delegating to an API model.",
+                "description": "List ox API models and detected subscription routes. Models: model, provider, auth (api_key), starred (the user's favourites, listed first), context_window (tokens, null when unknown). Subscriptions: runtime, account, main_client (this launch's client), worker_available (can run start_ox_worker without a model). query filters by alias, provider or runtime. Pages hold 40 rows: when next_offset is not null, pass it as offset for more. Use a model alias for delegate_to_ox_model and start_ox_worker.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -833,12 +848,12 @@ fn tools() -> Value {
             },
             {
                 "name": "delegate_to_ox_model",
-                "description": "Send an independent text task to the named API model. Include the necessary context in task. This sends that text to the chosen provider, which can bill the request. The worker has no files or shell access.",
+                "description": "Send one independent text request to the named API model, which the provider bills. Include the context it needs. Times out after 90 seconds; task up to 96 KiB. No files or shell: for multi-step work or files, use start_ox_worker.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "model": {"type": "string", "description": "Exact ox model alias returned by list_ox_models."},
-                        "task": {"type": "string", "description": "Task and only the context the chosen provider needs."}
+                        "task": {"type": "string", "description": "Task and only the context the chosen provider needs. Up to 96 KiB."}
                     },
                     "required": ["model", "task"],
                     "additionalProperties": false
@@ -847,15 +862,16 @@ fn tools() -> Value {
             },
             {
                 "name": "start_ox_worker",
-                "description": "Start a background stock-client coding session in this project. Use mode goal for Codex Goal mode or workflow for a Claude Code workflow. Returns a job ID immediately. Workers inherit your permission mode, mapped to the worker's runtime; lower it with permission_mode for tasks that only read or need less. You cannot raise it. A YOLO worker waits until a person accepts it (status waiting_for_operator) unless the operator granted YOLO for this session's workers.",
+                "description": "Start a background coding job in this project and return its job ID at once. Choose by fit: a Codex goal for one long objective with a checkable stop condition; a Claude workflow for work Claude Code splits into steps with its Workflow tool and subagents; a session for ordinary coding on either runtime. Task up to 32 KiB. There is no time or count limit by default; set max_minutes per job, or OX_WORKER_MAX_MINUTES and OX_WORKER_MAX_PER_PARENT, to add one. A write worker starting while another writes in the same project returns a warning: consider a separate git worktree. Without the OX session host they stop when this launch exits. Inherit uses your mode only with the session host; without it, inherit is read. Lower with permission_mode, never raise it. classifier and yolo need the session host, which asks a person to accept a YOLO worker (status waiting_for_operator) unless YOLO was granted.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "runtime": {"enum": ["codex", "claude"]},
-                        "mode": {"enum": ["session", "goal", "workflow"]},
+                        "mode": {"enum": ["session", "goal", "workflow"], "description": "session: background coding session on either runtime. goal: Codex only; task becomes the Codex goal objective, at most 4,000 characters. workflow: Claude Code only; the job fails if the Workflow tool is not used."},
                         "model": {"type": "string", "description": "Exact ox API model alias. Leave out only for a Claude subscription worker."},
                         "task": {"type": "string", "description": "The job objective, desired validation, and stopping condition."},
-                        "permission_mode": {"enum": ["inherit", "read", "write", "classifier", "yolo"], "default": "inherit", "description": "inherit (default) or a lower level. read: Codex Read only / Claude Plan. write: Codex Workspace / Claude Accept edits. classifier: Codex Auto-review / Claude Auto. yolo: Codex YOLO / Claude bypass. Above your own mode is refused."},
+                        "permission_mode": {"enum": ["inherit", "read", "write", "classifier", "yolo"], "default": "inherit", "description": "read: Codex Read only or Claude Plan. Standalone Claude read workers get only read tools. write: workspace edits and shell access. Codex uses its Workspace sandbox. Claude Code pre-approves Bash and uses its own sandbox when available. Without it, commands can run unsandboxed. classifier: Codex Auto-review / Claude Auto. yolo: Codex YOLO / Claude bypass. Above your mode is refused."},
+                        "max_minutes": {"type": "integer", "minimum": 1, "maximum": 10080, "description": "Optional wall-clock limit for this worker in minutes. No limit by default (OX_WORKER_MAX_MINUTES sets one)."},
                         "workspace_write": {"type": "boolean", "description": "Deprecated: false means read, true means write. Use permission_mode."},
                     },
                     "required": ["runtime", "mode", "task"],
@@ -1137,7 +1153,7 @@ mod tests {
             start_tool["description"]
                 .as_str()
                 .unwrap()
-                .contains("inherit your permission mode")
+                .contains("Inherit uses your mode only with the session host")
         );
         assert!(start_tool["inputSchema"]["properties"]["workspace_write"].is_object());
     }

@@ -1,7 +1,8 @@
 use super::Workbench;
+use crate::views::worker_sheet::LaunchKind;
 use crate::{
     appearance::Palette,
-    kit::{DropdownMenu, PopupMenuItem, button, field},
+    kit::{DropdownMenu, button, field},
     row,
 };
 use gpui::{prelude::FluentBuilder, *};
@@ -11,11 +12,13 @@ use ox_desk_core::actions::Action;
 pub(super) enum ThreadEdit {
     Name(String, Entity<InputState>),
     Archive(String),
+    /// End a busy thread (a running turn, approval or worker), after confirmation.
+    End(String),
 }
 impl ThreadEdit {
     fn owner(&self) -> &str {
         match self {
-            Self::Name(id, _) | Self::Archive(id) => id,
+            Self::Name(id, _) | Self::Archive(id) | Self::End(id) => id,
         }
     }
 }
@@ -31,15 +34,35 @@ impl Workbench {
                 Action::RenameThread(id.clone(), name.to_string())
             }
             Some(ThreadEdit::Archive(id)) => Action::ArchiveThread(id.clone()),
+            Some(ThreadEdit::End(id)) => Action::ForceEndSession(id.clone()),
             None => return,
         };
         self.thread_edit = None;
         self.action(cx, action);
     }
+    /// End a thread's live process. A busy thread (running turn, pending approval or
+    /// running worker) asks first, inline, because ending it cancels that work.
+    pub(crate) fn request_end(&mut self, id: String, cx: &mut Context<Self>) {
+        let busy = self
+            .store
+            .as_ref()
+            .is_some_and(|store| store.thread_busy(&id))
+            || self.running_workers(&id, cx) > 0;
+        if busy {
+            self.thread_edit = Some(ThreadEdit::End(id));
+            cx.notify();
+        } else {
+            self.action(cx, Action::EndSession(id));
+        }
+    }
     pub(super) fn thread_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let id = self.store.as_ref()?.selected()?.to_owned();
         let store = self.store.as_ref()?;
-        if !store.can_manage_thread(&id) {
+        let manage = store.can_manage_thread(&id);
+        let can_end = store.can_end_session(&id);
+        let can_launch =
+            store.state() == &ox_desk_core::store::Connection::Ready && !store.in_terminal(&id);
+        if !manage && !can_end && !can_launch {
             self.thread_edit = None;
             return None;
         }
@@ -55,6 +78,7 @@ impl Workbench {
             let (input, label) = match edit {
                 ThreadEdit::Name(_, state) => (Some(Input::new(state)), "Save name"),
                 ThreadEdit::Archive(_) => (None, "Archive this thread"),
+                ThreadEdit::End(_) => (None, "End running session"),
             };
             return Some(
                 row()
@@ -84,17 +108,19 @@ impl Workbench {
             );
         }
         let view = cx.weak_entity();
-        let edit_metadata = store.can_edit_thread_metadata();
-        let can_generate = store.can_generate_title(&id);
+        let edit_metadata = manage && store.can_edit_thread_metadata();
+        // Codex refuses Archive from a client that does not hold the thread.
+        let archivable = edit_metadata && !store.is_native_live(&id);
+        let can_generate = manage && store.can_generate_title(&id);
         Some(
-            crate::kit::toolbar_button(
+            crate::kit::icon(
                 p,
                 "thread-menu",
+                gpui_component::IconName::Ellipsis,
                 "Thread actions",
                 true,
                 |_, _, _| {},
             )
-            .icon(gpui_component::IconName::Ellipsis)
             .dropdown_menu(move |menu, _, _| {
                 let rename = view.clone();
                 let owner = id.clone();
@@ -105,8 +131,12 @@ impl Workbench {
                 let archived = id.clone();
                 let naming = view.clone();
                 let unnamed = id.clone();
+                let end = view.clone();
+                let ended = id.clone();
+                let worker = view.clone();
+                let handoff = view.clone();
                 menu.when(edit_metadata, |menu| menu.item(
-                    PopupMenuItem::new("Rename thread").on_click(move |_, window, cx| {
+                    crate::kit::menu_item("Rename thread").on_click(move |_, window, cx| {
                         let _ = rename.update(cx, |s, cx| {
                             let Some(store) = &s.store else { return };
                             if !store.can_manage_thread(&owner) {
@@ -127,28 +157,31 @@ impl Workbench {
                     }),
                 ))
                 .when(can_generate, |menu| menu.item(
-                    PopupMenuItem::new("Generate title").on_click(move |_, _, cx| {
+                    crate::kit::menu_item("Generate title").on_click(move |_, _, cx| {
                         let _ = naming.update(cx, |s, cx| s.action(cx, Action::GenerateTitle(unnamed.clone())));
                     }),
                 ))
-                .item(PopupMenuItem::new("Find in transcript").on_click(move |_,w,cx| {
+                .when(manage, |menu| menu.item(crate::kit::menu_item("Find in transcript").on_click(move |_,w,cx| {
                     let _ = find.update(cx,|s,cx|s.find_in_transcript(w,cx));
-                }))
+                })))
                 .map(|mut menu| {
+                    if !manage {
+                        return menu;
+                    }
                     for (title, expand) in [("Expand all details",Some(true)),("Fold all details",Some(false)),("Show / hide thinking",None)] {
                         let view = view.clone();
-                        menu = menu.item(PopupMenuItem::new(title).on_click(move |_,_,cx| {
+                        menu = menu.item(crate::kit::menu_item(title).on_click(move |_,_,cx| {
                             let _ = view.update(cx,|s,cx|s.transcript_folding(expand,cx));
                         }));
                     }
                     menu
                 })
-                .item(PopupMenuItem::new("Fork thread").on_click(move |_, _, cx| {
+                .when(manage, |menu| menu.item(crate::kit::menu_item("Fork thread").on_click(move |_, _, cx| {
                     let _ =
                         fork.update(cx, |s, cx| s.action(cx, Action::ForkThread(target.clone())));
-                }))
-                .when(edit_metadata, |menu|menu.item(
-                    PopupMenuItem::new("Archive thread…").on_click(move |_, _, cx| {
+                })))
+                .when(archivable, |menu|menu.item(
+                    crate::kit::menu_item("Archive thread…").on_click(move |_, _, cx| {
                         let _ = archive.update(cx, |s, cx| {
                             if s.store
                                 .as_ref()
@@ -158,6 +191,21 @@ impl Workbench {
                                 cx.notify();
                             }
                         });
+                    }),
+                ))
+                .when(can_launch, |menu| menu.item(
+                    crate::kit::menu_item("Start worker…").on_click(move |_, _, cx| {
+                        let _ = worker.update(cx, |s, cx| s.request_launch(LaunchKind::Worker, cx));
+                    }),
+                ))
+                .when(can_launch, |menu| menu.item(
+                    crate::kit::menu_item("Continue in…").on_click(move |_, _, cx| {
+                        let _ = handoff.update(cx, |s, cx| s.request_launch(LaunchKind::Handoff, cx));
+                    }),
+                ))
+                .when(can_end, |menu| menu.item(
+                    crate::kit::menu_item("End session").on_click(move |_, _, cx| {
+                        let _ = end.update(cx, |s, cx| s.request_end(ended.clone(), cx));
                     }),
                 ))
             })
