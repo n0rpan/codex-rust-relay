@@ -34,6 +34,19 @@ pub enum Fix {
     UseRegionalHost { provider: String, region: String },
 }
 
+impl Advice {
+    /// Keeps a hand-edited or provider-derived record bounded.
+    fn limited(mut self) -> Self {
+        self.id = self.id.chars().take(256).collect();
+        self.message = self.message.chars().take(1000).collect();
+        if let Some(model) = &mut self.model {
+            *model = model.chars().take(200).collect();
+        }
+        self.provider = self.provider.chars().take(64).collect();
+        self
+    }
+}
+
 impl Fix {
     /// One line describing the change, for the desktop Fix button.
     pub fn label(&self) -> String {
@@ -107,7 +120,7 @@ pub fn record(home: &Path, advice: Advice) -> bool {
     if records.iter().any(|existing| existing.id == advice.id) {
         return false;
     }
-    records.push(advice);
+    records.push(advice.limited());
     if records.len() > MAX_RECORDS {
         let excess = records.len() - MAX_RECORDS;
         records.drain(0..excess);
@@ -155,6 +168,9 @@ pub fn apply(home: &Path, id: &str) -> Result<Fix, RelayError> {
             effort,
             mandatory,
         } => {
+            if crate::catalog::reasoning_rank(effort).is_none() {
+                return Err(format!("{effort:?} is not a reasoning effort").into());
+            }
             let config = crate::provider::CodeoxConfig::path(home);
             let _lock = crate::setup::lock_config(home)?;
             let text = crate::setup::read_optional_text_limited(&config, "codeox.toml")?
@@ -163,6 +179,9 @@ pub fn apply(home: &Path, id: &str) -> Result<Fix, RelayError> {
             crate::setup::write_config_atomic(&config, &updated)?;
         }
         Fix::UseRegionalHost { provider, region } => {
+            if !matches!(region.as_str(), "eu" | "us") {
+                return Err(format!("{region:?} is not an OpenRouter data region").into());
+            }
             let config = crate::provider::CodeoxConfig::path(home);
             let _lock = crate::setup::lock_config(home)?;
             let text = crate::setup::read_optional_text_limited(&config, "codeox.toml")?
@@ -356,6 +375,43 @@ reasoning_efforts = ["low", "high"]
         assert!(!profile.contains("model_reasoning_effort"));
         assert!(read(&home).is_empty());
 
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_hand_edited_fix_cannot_write_an_unknown_region_or_effort() {
+        let home = temp_home("validate");
+        std::fs::write(
+            home.join("codeox.toml"),
+            "[providers.openrouter]\nbase_url = \"https://openrouter.ai/api/v1\"\n",
+        )
+        .unwrap();
+        record(
+            &home,
+            advice(
+                "region",
+                Fix::UseRegionalHost {
+                    provider: "openrouter".to_owned(),
+                    region: "evil.example".to_owned(),
+                },
+            ),
+        );
+        assert!(apply(&home, "region").is_err());
+        record(
+            &home,
+            advice(
+                "effort",
+                Fix::SetModelReasoning {
+                    provider: "openrouter".to_owned(),
+                    model: "m".to_owned(),
+                    effort: "extreme".to_owned(),
+                    mandatory: false,
+                },
+            ),
+        );
+        assert!(apply(&home, "effort").is_err());
+        let config = std::fs::read_to_string(home.join("codeox.toml")).unwrap();
+        assert!(config.contains("https://openrouter.ai/api/v1"), "{config}");
         let _ = std::fs::remove_dir_all(home);
     }
 

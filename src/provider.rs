@@ -606,7 +606,13 @@ impl Vendor {
         let Some(object) = body.as_object_mut() else {
             return false;
         };
-        let removed = object.remove("previous_response_id").is_some();
+        // A non-null reference is the only link to earlier turns. Keep it so
+        // the provider rejects the request instead of answering from partial
+        // context; the caller must resend the full history.
+        let removed = match object.get("previous_response_id") {
+            Some(serde_json::Value::Null) => object.remove("previous_response_id").is_some(),
+            _ => false,
+        };
         let corrected = match object.get("store") {
             None | Some(serde_json::Value::Bool(false)) => false,
             Some(_) => {
@@ -2177,10 +2183,17 @@ sort = "price"
         });
         assert!(vendor.prepare_openrouter_request(&mut body, Some(&session)));
         assert_eq!(body["store"], false);
-        assert!(body.get("previous_response_id").is_none());
+        // A real continuation keeps its only reference; OpenRouter rejects it
+        // rather than letting OX answer from incomplete context.
+        assert_eq!(body["previous_response_id"], "resp_1");
         assert_eq!(body["provider"]["sort"], "price");
         assert_eq!(body["session_id"], session);
         assert_eq!(body["input"], serde_json::json!([]));
+
+        // A null reference is not context and can go.
+        let mut body = serde_json::json!({"model": "gpt", "previous_response_id": null});
+        assert!(vendor.prepare_openrouter_request(&mut body, None));
+        assert!(body.get("previous_response_id").is_none());
     }
 
     #[test]
