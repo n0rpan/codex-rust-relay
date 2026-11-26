@@ -426,7 +426,55 @@ id = "openai/gpt-5.4-mini"
 # context_window = 200000                # set to the provider model's actual limit
 # input_modalities = ["text"]            # declare supported modalities
 # reasoning_efforts = ["low", "medium"]  # declare supported effort values
+# default_reasoning_effort = "medium"    # effort Codex starts from
+# reasoning_mandatory = true             # never send effort "none"
 ```
+
+### OpenRouter
+
+OpenRouter discovers models from `<base_url>/models/user` with your key. Unlike the
+public `/models` list, that endpoint applies workspace, member and API-key guardrails
+(model and provider allowlists, privacy settings, Managed Machines model lists) and,
+for a regional host, in-region eligibility. OX asks for `output_modalities=text` and
+the harness matching the client being launched (`client=codex` or `client=claude_code`),
+so Codex and Claude Code are each offered only the models they may call. A 401 means
+the key is unusable; a 403 means a guardrail or data-region policy rejected the host.
+
+`eu.openrouter.ai` and `us.openrouter.ai` keep prompts and completions in-region.
+They require a Business or Enterprise plan, routing is chosen per request by
+hostname, and it fails closed: if no in-region endpoint can serve a model, the
+request errors instead of leaving the region. Set the regional host as `base_url`
+to use it. The model picker labels the route (`global`, `EU in-region`,
+`US in-region`) and appends `· EU` or `· US` to regional model names.
+
+OX reads OpenRouter's per-model metadata: reasoning efforts and default, input
+modalities, output ceiling, tool support, and the API paths a model serves. Models
+that cannot call tools, or that do not serve the configured API (for example the
+`:batch` variants on `/responses`), are not offered. A model marked
+`reasoning.mandatory` never receives `effort: "none"`; OX uses its default effort
+or omits the reasoning block.
+
+Request extensions are available per provider:
+
+```toml
+[providers.openrouter.provider]
+sort = "throughput"      # price, throughput or latency
+allow_fallbacks = true
+data_collection = "deny" # allow or deny
+zdr = true
+require_parameters = true
+only = ["anthropic"]
+# order = ["anthropic", "openai"]
+# ignore = ["some-provider"]
+# max_price = { prompt = 1.5, completion = 8 }
+```
+
+These are the documented OpenRouter routing preferences; an unknown key or a wrong
+type stops the launch instead of being ignored. On the Responses and Chat wires OX
+also adds a top-level `cache_control` hint, a hashed `session_id` from the client
+session (openrouter sticky routing keeps each conversation on one backend), and the
+optional `HTTP-Referer`/`X-OpenRouter-Title` attribution headers. The Responses API
+is stateless, so OX sends `store: false` and never a `previous_response_id`.
 
 Use lowercase ASCII letters, digits, `_`, and `-` for provider names, starting with a
 letter or digit. Keep aliases unique. A provider-qualified alias cannot use another

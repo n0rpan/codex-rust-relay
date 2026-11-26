@@ -358,6 +358,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
                 MAX_REQUEST_BYTES,
                 env,
                 search,
+                client_kind,
             )
             .await?
         }
@@ -707,6 +708,9 @@ impl App {
         })
     }
 
+    // Every argument is a launch input assembled once; grouping them would only
+    // move the list to another type.
+    #[allow(clippy::too_many_arguments)]
     async fn codeox(
         config: CodeoxConfig,
         bundled: BundledModels,
@@ -715,6 +719,7 @@ impl App {
         max_request_bytes: usize,
         env: &Env<'_>,
         search: Option<BraveSearch>,
+        client_kind: ClientKind,
     ) -> Result<Self, RelayError> {
         Self::codeox_with(
             config,
@@ -724,6 +729,7 @@ impl App {
             max_request_bytes,
             env,
             search,
+            client_kind,
         )
         .await
     }
@@ -731,6 +737,7 @@ impl App {
     /// Like [`App::codeox`], but the bundled Codex catalog is still loading.
     /// It is awaited concurrently with provider model discovery so a launch
     /// waits for the slower of the two instead of their sum.
+    #[allow(clippy::too_many_arguments)]
     async fn codeox_with(
         config: CodeoxConfig,
         bundled: impl Future<Output = Result<BundledModels, RelayError>>,
@@ -739,6 +746,7 @@ impl App {
         max_request_bytes: usize,
         env: &Env<'_>,
         search: Option<BraveSearch>,
+        client_kind: ClientKind,
     ) -> Result<Self, RelayError> {
         let vendors = config.vendors;
         let mut secrets = Vec::new();
@@ -771,14 +779,27 @@ impl App {
                 .enumerate()
                 .filter_map(|(index, (vendor, auth))| {
                     let key = auth.as_ref().filter(|_| vendor.discovery)?;
-                    Some(async move { (index, discover(client, vendor, key, deadline).await) })
+                    Some(async move {
+                        (
+                            index,
+                            discover(client, vendor, key, deadline, client_kind).await,
+                        )
+                    })
                 })
                 .collect();
             let mut requests = futures_util::stream::iter(requests).buffer_unordered(4);
 
             while let Some((index, result)) = requests.next().await {
                 match result {
-                    Ok(models) => discovered[index] = Some(models),
+                    Ok(mut models) => {
+                        if vendors[index].is_openrouter() {
+                            // Hide models that cannot answer the configured
+                            // wire (for example OpenRouter's `:batch` rows).
+                            let wire = vendors[index].wire;
+                            models.retain_wire(wire);
+                        }
+                        discovered[index] = Some(models);
+                    }
                     Err(reason) => eprintln!(
                         "ox: provider {:?}: model discovery failed: {reason}",
                         vendors[index].key
@@ -826,10 +847,28 @@ impl App {
                     Some(alias) => alias.clone(),
                     None => provider::alias_for(&vendor.key, &spec.id, None)?,
                 };
+                let name = spec.name.clone().unwrap_or_else(|| spec.id.clone());
+                // OpenRouter picks the data boundary per hostname. Say which
+                // one this route uses, and mark regional rows in the name every
+                // client shows.
+                let (display_name, description) = match vendor.openrouter_region() {
+                    Some(region) => {
+                        let suffix = match region {
+                            provider::Region::Eu => " · EU",
+                            provider::Region::Us => " · US",
+                            provider::Region::Global => "",
+                        };
+                        (
+                            format!("{name}{suffix}"),
+                            format!("{} · {}", vendor.name, region.label()),
+                        )
+                    }
+                    None => (name, vendor.name.clone()),
+                };
                 entries.push(CatalogModel {
                     slug: alias,
-                    display_name: spec.name.clone().unwrap_or_else(|| spec.id.clone()),
-                    description: vendor.name.clone(),
+                    display_name,
+                    description,
                     context_window: spec
                         .context_window
                         .or_else(|| catalog::published_context_window(&vendor.base_url, &spec.id)),
@@ -861,7 +900,7 @@ impl App {
                 routes,
                 catalog,
             },
-            client_kind: ClientKind::Codex,
+            client_kind,
             persistent: false,
             client,
             local_auth: provider::bearer(token)?,
@@ -1199,6 +1238,24 @@ impl App {
                         state.vendor.key
                     );
                 }
+                if state.vendor.is_openrouter() && route.wire != provider::Wire::AnthropicMessages {
+                    let session =
+                        state
+                            .vendor
+                            .openrouter_session_id(auth, Some(&parts.headers), &payload);
+                    if state
+                        .vendor
+                        .prepare_openrouter_request(&mut payload, session.as_deref())
+                    {
+                        self.notice_once(
+                            format!("stateless:{}", state.vendor.key),
+                            format!(
+                                "ox: provider {:?} keeps no conversation state; OX sends the full history and omits store/previous_response_id",
+                                state.vendor.key
+                            ),
+                        );
+                    }
+                }
 
                 if route.wire.is_translated() {
                     if path != "/responses" {
@@ -1425,21 +1482,48 @@ async fn discover(
     vendor: &provider::Vendor,
     key: &SecretKey,
     deadline: tokio::time::Instant,
+    client_kind: ClientKind,
 ) -> Result<ProviderModels, String> {
     let headers = vendor
         .discovery_headers(key)
         .map_err(|_| "could not build discovery headers".to_owned())?;
+    let url = discovery_url(vendor, client_kind);
     let response = tokio::time::timeout_at(
         deadline,
-        client
-            .get(vendor.models_url.clone())
-            .headers(headers.clone())
-            .send(),
+        client.get(url.clone()).headers(headers.clone()).send(),
     )
     .await
     .map_err(|_| "startup deadline reached".to_owned())?
     .map_err(|_| "request failed".to_owned())?;
-    collect_model_pages(client, &vendor.models_url, &headers, response, deadline).await
+    collect_model_pages(client, &url, &headers, response, deadline).await
+}
+
+/// OpenRouter's keyed catalog answers with the models this account, its
+/// guardrails and the launched harness may actually use. Ask it for the right
+/// harness and for text output only; every other provider keeps its configured
+/// URL untouched.
+fn discovery_url(vendor: &provider::Vendor, client_kind: ClientKind) -> reqwest::Url {
+    let mut url = vendor.models_url.clone();
+    if !vendor.is_openrouter() || !url.path().ends_with("/models/user") {
+        return url;
+    }
+    let client = match client_kind {
+        ClientKind::Codex => "codex",
+        ClientKind::Claude => "claude_code",
+    };
+    let mut query: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    if !query.iter().any(|(key, _)| key == "output_modalities") {
+        query.push(("output_modalities".to_owned(), "text".to_owned()));
+    }
+    if !query.iter().any(|(key, _)| key == "client") {
+        query.push(("client".to_owned(), client.to_owned()));
+    }
+    url.set_query(None);
+    url.query_pairs_mut().extend_pairs(&query);
+    url
 }
 
 async fn collect_model_pages(
@@ -2086,6 +2170,7 @@ mod tests {
     #[derive(Clone, Debug)]
     struct Hit {
         path: String,
+        query: Option<String>,
         authorization: Option<String>,
         body: Option<Value>,
     }
@@ -2244,6 +2329,7 @@ mod tests {
             .map(str::to_owned);
         hits.lock().unwrap().push(Hit {
             path: path.clone(),
+            query: parts.uri.query().map(str::to_owned),
             authorization: authorization.clone(),
             body: serde_json::from_slice(&bytes).ok(),
         });
@@ -2254,7 +2340,7 @@ mod tests {
                 .insert(LOCATION, HeaderValue::from_str(target).unwrap());
             return response;
         }
-        if path == "/v1/models" {
+        if path == "/v1/models" || path == "/v1/models/user" {
             if let Some(barrier) = &behavior.catalog_barrier {
                 barrier.wait().await;
             }
@@ -2394,6 +2480,7 @@ id = "fast-coder"
             1 << 20,
             &environment,
             None,
+            ClientKind::Codex,
         )
         .await
         .unwrap();
@@ -2437,6 +2524,7 @@ id = "fast-coder"
             MAX_REQUEST_BYTES,
             &|_| None,
             None,
+            ClientKind::Codex,
         )
         .await
         .unwrap();
@@ -2489,6 +2577,7 @@ alias = "together-llama"
             MAX_REQUEST_BYTES,
             &|_| None,
             None,
+            ClientKind::Codex,
         )
         .await
         .unwrap();
@@ -2560,6 +2649,7 @@ alias = "together-llama"
             max_request_bytes,
             &environment,
             search,
+            client_kind,
         )
         .await
         .unwrap();
@@ -2786,6 +2876,7 @@ env_key = "ALPHA_KEY"
                 1 << 20,
                 &environment,
                 None,
+                ClientKind::Codex,
             ),
         )
         .await
@@ -2820,6 +2911,7 @@ env_key = "ALPHA_KEY"
                 1 << 20,
                 &environment,
                 None,
+                ClientKind::Codex,
             ),
         )
         .await
@@ -2904,6 +2996,131 @@ env_key = "ALPHA_KEY"
         assert_eq!(slugs.len(), 32);
         assert_eq!(slugs.last().unwrap(), "alpha/m31");
         assert_eq!(mock.hits_len(), 32);
+    }
+
+    fn discovery_vendor(base: &str, models_url: &str) -> provider::Vendor {
+        provider::Vendor {
+            key: "openrouter".to_owned(),
+            name: "OpenRouter".to_owned(),
+            base_url: reqwest::Url::parse(base).unwrap(),
+            models_url: reqwest::Url::parse(models_url).unwrap(),
+            env_key: None,
+            wire: provider::Wire::Responses,
+            discovery: true,
+            models: Vec::new(),
+            openrouter_provider: None,
+            max_output_tokens: None,
+            anthropic: provider::AnthropicOptions::default(),
+            chat: provider::ChatOptions::default(),
+        }
+    }
+
+    #[test]
+    fn openrouter_discovery_asks_the_keyed_endpoint_for_the_launched_client() {
+        let vendor = discovery_vendor(
+            "https://eu.openrouter.ai/api/v1",
+            "https://eu.openrouter.ai/api/v1/models/user?scope=team",
+        );
+        assert_eq!(
+            discovery_url(&vendor, ClientKind::Codex).as_str(),
+            "https://eu.openrouter.ai/api/v1/models/user?scope=team&output_modalities=text&client=codex"
+        );
+        assert_eq!(
+            discovery_url(&vendor, ClientKind::Claude).as_str(),
+            "https://eu.openrouter.ai/api/v1/models/user?scope=team&output_modalities=text&client=claude_code"
+        );
+        // Every other provider keeps exactly the URL it configured.
+        let vendor = discovery_vendor("http://127.0.0.1:9/v1", "http://127.0.0.1:9/v1/models");
+        assert_eq!(
+            discovery_url(&vendor, ClientKind::Codex).as_str(),
+            "http://127.0.0.1:9/v1/models"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_uses_the_keyed_catalog_over_the_network() {
+        let mock = spawn_mock(Ok(models_body(&["gpt-6.1-sol"])), None).await;
+        let vendor = discovery_vendor(
+            "https://openrouter.ai/api/v1",
+            &format!("{}/models/user", mock.base),
+        );
+        let key = SecretKey::new("sk-or-test".to_owned());
+        let models = discover(
+            &test_client(),
+            &vendor,
+            &key,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            ClientKind::Claude,
+        )
+        .await
+        .expect("the keyed catalog");
+        assert_eq!(crate::catalog::merge_models(Some(models), &[]).len(), 1);
+
+        let hits = mock.hits.lock().unwrap().clone();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/v1/models/user");
+        let query = hits[0].query.as_deref().unwrap_or_default();
+        assert!(query.contains("client=claude_code"), "{query}");
+        assert!(query.contains("output_modalities=text"), "{query}");
+        assert_eq!(
+            hits[0].authorization.as_deref(),
+            Some("Bearer sk-or-test"),
+            "the keyed catalog must carry the account key"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_openrouter_route_says_which_data_boundary_it_uses() {
+        for (host, suffix, label) in [
+            ("eu", " · EU", "EU in-region"),
+            ("us", " · US", "US in-region"),
+        ] {
+            let config = format!(
+                r#"
+[providers.openrouter]
+name = "OpenRouter"
+base_url = "https://{host}.openrouter.ai/api/v1"
+env_key = "OPENROUTER_API_KEY"
+discovery = false
+
+[[providers.openrouter.models]]
+id = "openai/gpt-6.1-sol"
+name = "GPT-6.1 Sol"
+"#
+            );
+            let relay =
+                start_relay(&config, &[("OPENROUTER_API_KEY", "sk-or-test")], 1 << 20).await;
+            let catalog = get_models(&relay).await;
+            let row = &catalog["models"][0];
+            assert_eq!(row["slug"], "openrouter/openai/gpt-6.1-sol");
+            assert_eq!(row["display_name"], format!("GPT-6.1 Sol{suffix}"));
+            assert!(
+                row["description"].as_str().unwrap().contains(label),
+                "{}",
+                row["description"]
+            );
+        }
+
+        let config = r#"
+[providers.openrouter]
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+env_key = "OPENROUTER_API_KEY"
+discovery = false
+
+[[providers.openrouter.models]]
+id = "openai/gpt-6.1-sol"
+name = "GPT-6.1 Sol"
+"#;
+        let relay = start_relay(config, &[("OPENROUTER_API_KEY", "sk-or-test")], 1 << 20).await;
+        let catalog = get_models(&relay).await;
+        assert_eq!(catalog["models"][0]["display_name"], "GPT-6.1 Sol");
+        assert!(
+            catalog["models"][0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("· global")
+        );
     }
 
     #[tokio::test]

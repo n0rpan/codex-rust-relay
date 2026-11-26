@@ -501,6 +501,10 @@ pub struct Vendor {
     pub wire: Wire,
     pub discovery: bool,
     pub models: Vec<ModelEntry>,
+    /// OpenRouter's per-request provider routing preferences
+    /// (`[providers.<name>.provider]`). Rejected for other providers so a typo
+    /// cannot silently do nothing on an endpoint that has no such field.
+    pub openrouter_provider: Option<serde_json::Value>,
     /// Anthropic Messages request ceiling. Codex does not send
     /// `max_output_tokens`, but Anthropic requires `max_tokens`.
     pub max_output_tokens: Option<u64>,
@@ -545,6 +549,18 @@ impl Vendor {
         };
         value.set_sensitive(true);
         headers.insert(name, value);
+        if self.is_openrouter() {
+            // Optional attribution for app leaderboards, documented in
+            // OpenRouter's quickstart.
+            headers.insert(
+                HeaderName::from_static("http-referer"),
+                HeaderValue::from_static("https://github.com/oxstack/ox"),
+            );
+            headers.insert(
+                HeaderName::from_static("x-openrouter-title"),
+                HeaderValue::from_static("OX"),
+            );
+        }
         if self.wire == Wire::AnthropicMessages {
             headers.insert(
                 HeaderName::from_static("anthropic-version"),
@@ -552,6 +568,91 @@ impl Vendor {
             );
         }
         Ok(headers)
+    }
+
+    /// Applies OpenRouter's request extensions that the stock client does not
+    /// know about: provider routing preferences and a sticky session id.
+    pub(crate) fn decorate_openrouter(&self, body: &mut serde_json::Value, session: Option<&str>) {
+        if !self.is_openrouter() {
+            return;
+        }
+        let Some(body) = body.as_object_mut() else {
+            return;
+        };
+        if let Some(preferences) = &self.openrouter_provider
+            && !body.contains_key("provider")
+        {
+            body.insert("provider".to_owned(), preferences.clone());
+        }
+        if let Some(session) = session
+            && !body.contains_key("session_id")
+        {
+            body.insert("session_id".to_owned(), serde_json::json!(session));
+        }
+    }
+
+    /// Applies every OpenRouter request rule OX knows: routing preferences, a
+    /// sticky session, and the stateless wire contract. Returns true when a
+    /// storage field had to be removed or corrected.
+    pub(crate) fn prepare_openrouter_request(
+        &self,
+        body: &mut serde_json::Value,
+        session: Option<&str>,
+    ) -> bool {
+        if !self.is_openrouter() {
+            return false;
+        }
+        self.decorate_openrouter(body, session);
+        let Some(object) = body.as_object_mut() else {
+            return false;
+        };
+        let removed = object.remove("previous_response_id").is_some();
+        let corrected = match object.get("store") {
+            None | Some(serde_json::Value::Bool(false)) => false,
+            Some(_) => {
+                object.insert("store".to_owned(), serde_json::json!(false));
+                true
+            }
+        };
+        removed || corrected
+    }
+
+    /// A stable, non-reversible session key for OpenRouter sticky routing.
+    ///
+    /// OpenRouter documents `session_id` as the strongest cache pin: every turn
+    /// of one conversation reaches the same backend endpoint. The raw client
+    /// id never leaves OX; the HMAC is scoped to the provider key, so two
+    /// workspaces with the same thread id do not share a session.
+    pub(crate) fn openrouter_session_id(
+        &self,
+        key: &SecretKey,
+        incoming: Option<&HeaderMap>,
+        payload: &serde_json::Value,
+    ) -> Option<String> {
+        if !self.is_openrouter() {
+            return None;
+        }
+        let session = incoming
+            .and_then(openrouter_session_hint)
+            .or_else(|| {
+                payload
+                    .get("prompt_cache_key")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| hint_ok(value))
+            })
+            .or_else(|| {
+                payload
+                    .pointer("/client_metadata/session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| hint_ok(value))
+            })?;
+        let hmac = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key.expose().as_bytes());
+        let mut context = ring::hmac::Context::with_key(&hmac);
+        context.update(b"ox-openrouter-session-v1\0");
+        context.update(self.key.as_bytes());
+        context.update(b"\0");
+        context.update(session.as_bytes());
+        Some(format!("ox_{}", hex::encode(context.sign().as_ref())))
     }
 
     pub(crate) fn discovery_headers(&self, key: &SecretKey) -> Result<HeaderMap, RelayError> {
@@ -570,17 +671,17 @@ impl Vendor {
     fn hosted_messages_uses_bearer(&self) -> bool {
         self.base_url.scheme() == "https"
             && self.base_url.port_or_known_default() == Some(443)
-            && matches!(
-                (
-                    self.base_url.host_str(),
-                    self.base_url.path().trim_end_matches('/')
-                ),
-                (Some("openrouter.ai"), "/api/v1")
-                    | (
+            && (is_openrouter_url(&self.base_url)
+                || matches!(
+                    (
+                        self.base_url.host_str(),
+                        self.base_url.path().trim_end_matches('/')
+                    ),
+                    (
                         Some("opencode.ai"),
                         "/inference/anthropic/v1" | "/inference/go/anthropic/v1"
                     )
-            )
+                ))
     }
 
     /// Asks the provider to cache the prompt, where it only does so on
@@ -607,10 +708,20 @@ impl Vendor {
         }
     }
 
-    fn is_openrouter(&self) -> bool {
-        self.base_url.scheme() == "https"
-            && self.base_url.port_or_known_default() == Some(443)
-            && self.base_url.host_str() == Some("openrouter.ai")
+    pub(crate) fn is_openrouter(&self) -> bool {
+        is_openrouter_url(&self.base_url)
+    }
+
+    /// The in-region host this route uses, if it is an OpenRouter one.
+    pub(crate) fn openrouter_region(&self) -> Option<Region> {
+        if !self.is_openrouter() {
+            return None;
+        }
+        match self.base_url.host_str() {
+            Some("eu.openrouter.ai") => Some(Region::Eu),
+            Some("us.openrouter.ai") => Some(Region::Us),
+            _ => Some(Region::Global),
+        }
     }
 
     pub(crate) fn is_direct_anthropic(&self) -> bool {
@@ -712,12 +823,58 @@ fn opencode_session_hint(headers: &HeaderMap) -> Option<&str> {
     ]
     .iter()
     .filter_map(|name| headers.get(*name)?.to_str().ok())
-    .find(|id| {
-        matches!(id.len(), 1..=128)
-            && id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    })
+    .find(|id| hint_ok(id))
+}
+
+fn openrouter_session_hint(headers: &HeaderMap) -> Option<&str> {
+    opencode_session_hint(headers)
+}
+
+fn hint_ok(id: &str) -> bool {
+    matches!(id.len(), 1..=128)
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// OpenRouter serves the same API on its global and in-region hosts.
+pub(crate) fn is_openrouter_url(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.port_or_known_default() == Some(443)
+        && url
+            .host_str()
+            .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
+        && url.path().trim_end_matches('/').ends_with("/api/v1")
+}
+
+/// Which OpenRouter data boundary a route uses. In-region routing is chosen
+/// per request by hostname and cannot be switched silently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Region {
+    Global,
+    Eu,
+    Us,
+}
+
+impl Region {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Eu => "EU in-region",
+            Self::Us => "US in-region",
+        }
+    }
+}
+
+/// OpenRouter's guardrail- and key-filtered catalog. The public `/models` list
+/// ignores the account, so a restricted key is shown models it cannot call.
+pub(crate) fn openrouter_models_url(base: &Url) -> Url {
+    let mut url = base.clone();
+    url.set_path(&format!(
+        "{}/models/user",
+        base.path().trim_end_matches('/')
+    ));
+    url
 }
 
 /// Default environment variable holding the Brave Search subscription token.
@@ -966,8 +1123,21 @@ fn parse_vendor(key: &str, item: &Item) -> Result<Vendor, RelayError> {
             }
             url
         }
-        None => companion_catalog.unwrap_or_else(|| default_models_url(&base_url)),
+        None => companion_catalog.unwrap_or_else(|| {
+            if is_openrouter_url(&base_url) {
+                openrouter_models_url(&base_url)
+            } else {
+                default_models_url(&base_url)
+            }
+        }),
     };
+    let openrouter_provider = parse_openrouter_provider(key, table)?;
+    if openrouter_provider.is_some() && !is_openrouter_url(&base_url) {
+        return Err(format!(
+            "providers.{key}.provider is an OpenRouter routing setting; remove it or point base_url at an openrouter.ai host"
+        )
+        .into());
+    }
     let env_key = match opt_str(table, "env_key")? {
         Some(name) => {
             if let Some(reason) = credential_env_error(&name) {
@@ -1003,6 +1173,7 @@ fn parse_vendor(key: &str, item: &Item) -> Result<Vendor, RelayError> {
         wire,
         discovery,
         models,
+        openrouter_provider,
         max_output_tokens,
         anthropic,
         chat,
@@ -1190,6 +1361,114 @@ fn parse_models(provider_key: &str, item: &Item) -> Result<Vec<ModelEntry>, Rela
         });
     }
     Ok(entries)
+}
+
+/// OpenRouter's request-level routing preferences. Only the documented keys are
+/// accepted, with their documented types, so a typo fails at launch instead of
+/// being ignored upstream.
+fn parse_openrouter_provider(
+    provider_key: &str,
+    table: &dyn TableLike,
+) -> Result<Option<serde_json::Value>, RelayError> {
+    let Some(item) = table.get("provider") else {
+        return Ok(None);
+    };
+    let path = format!("providers.{provider_key}.provider");
+    let settings = item
+        .as_table_like()
+        .ok_or_else(|| format!("{path} must be a table"))?;
+    let mut output = serde_json::Map::new();
+    for (name, value) in settings.iter() {
+        let entry = match name {
+            "allow_fallbacks" | "zdr" | "require_parameters" | "enforce_distillable_text" => {
+                serde_json::Value::Bool(
+                    value
+                        .as_bool()
+                        .ok_or_else(|| format!("{path}.{name} must be true or false"))?,
+                )
+            }
+            "sort" => {
+                let sort = value
+                    .as_str()
+                    .ok_or_else(|| format!("{path}.sort must be a string"))?;
+                if !matches!(sort, "price" | "throughput" | "latency") {
+                    return Err(format!(
+                        "{path}.sort must be \"price\", \"throughput\" or \"latency\""
+                    )
+                    .into());
+                }
+                serde_json::Value::String(sort.to_owned())
+            }
+            "data_collection" => {
+                let policy = value
+                    .as_str()
+                    .ok_or_else(|| format!("{path}.data_collection must be a string"))?;
+                if !matches!(policy, "allow" | "deny") {
+                    return Err(
+                        format!("{path}.data_collection must be \"allow\" or \"deny\"").into(),
+                    );
+                }
+                serde_json::Value::String(policy.to_owned())
+            }
+            "order" | "only" | "ignore" => {
+                let list = value
+                    .as_array()
+                    .ok_or_else(|| format!("{path}.{name} must be a list of provider slugs"))?;
+                let mut slugs = Vec::new();
+                for slug in list.iter() {
+                    let slug = slug
+                        .as_str()
+                        .filter(|slug| {
+                            !slug.is_empty()
+                                && slug.len() <= 128
+                                && slug.bytes().all(|byte| {
+                                    byte.is_ascii_alphanumeric()
+                                        || matches!(byte, b'-' | b'_' | b'.' | b'/')
+                                })
+                        })
+                        .ok_or_else(|| {
+                            format!("{path}.{name} must contain provider slugs such as \"openai\"")
+                        })?;
+                    slugs.push(serde_json::Value::String(slug.to_owned()));
+                }
+                serde_json::Value::Array(slugs)
+            }
+            "max_price" => {
+                let prices = value
+                    .as_table_like()
+                    .ok_or_else(|| format!("{path}.max_price must be a table"))?;
+                let mut limits = serde_json::Map::new();
+                for (kind, amount) in prices.iter() {
+                    if !matches!(
+                        kind,
+                        "prompt" | "completion" | "request" | "image" | "audio"
+                    ) {
+                        return Err(format!(
+                            "{path}.max_price.{kind} is not a recognized price kind"
+                        )
+                        .into());
+                    }
+                    let amount = amount
+                        .as_float()
+                        .or_else(|| amount.as_integer().map(|value| value as f64))
+                        .filter(|amount| *amount >= 0.0)
+                        .ok_or_else(|| {
+                            format!("{path}.max_price.{kind} must be a non-negative number")
+                        })?;
+                    limits.insert(kind.to_owned(), serde_json::json!(amount));
+                }
+                serde_json::Value::Object(limits)
+            }
+            other => {
+                return Err(format!(
+                    "{path}.{other} is not a recognized OpenRouter routing setting"
+                )
+                .into());
+            }
+        };
+        output.insert(name.to_owned(), entry);
+    }
+    Ok(Some(serde_json::Value::Object(output)))
 }
 
 /// Builds a stable alias. Explicit aliases win; otherwise the alias is
@@ -1722,7 +2001,196 @@ mod tests {
             reasoning_efforts: Vec::new(),
             default_reasoning_effort: None,
             reasoning_mandatory: false,
+            endpoints: Vec::new(),
+            supports_tools: None,
         }
+    }
+
+    fn openrouter_vendor(base: &str, wire: Wire) -> Vendor {
+        let url = Url::parse(base).unwrap();
+        Vendor {
+            key: "openrouter".to_owned(),
+            name: "OpenRouter".to_owned(),
+            models_url: openrouter_models_url(&url),
+            base_url: url,
+            env_key: None,
+            wire,
+            discovery: false,
+            models: Vec::new(),
+            openrouter_provider: None,
+            max_output_tokens: None,
+            anthropic: AnthropicOptions::default(),
+            chat: ChatOptions::default(),
+        }
+    }
+
+    #[test]
+    fn openrouter_hosts_include_the_in_region_domains() {
+        for (url, region) in [
+            ("https://openrouter.ai/api/v1", Region::Global),
+            ("https://eu.openrouter.ai/api/v1", Region::Eu),
+            ("https://us.openrouter.ai/api/v1", Region::Us),
+        ] {
+            assert!(is_openrouter_url(&Url::parse(url).unwrap()), "{url}");
+            let vendor = openrouter_vendor(url, Wire::Responses);
+            assert_eq!(vendor.openrouter_region(), Some(region), "{url}");
+        }
+        for url in [
+            "https://openrouter.ai.example/api/v1",
+            "https://openrouter.ai/other",
+            "http://openrouter.ai/api/v1",
+        ] {
+            assert!(!is_openrouter_url(&Url::parse(url).unwrap()), "{url}");
+        }
+        assert_eq!(Region::Global.label(), "global");
+        assert_eq!(Region::Eu.label(), "EU in-region");
+        assert_eq!(Region::Us.label(), "US in-region");
+    }
+
+    #[test]
+    fn openrouter_discovers_from_the_keyed_catalog() {
+        let config = CodeoxConfig::load_from_str(
+            r#"
+[providers.openrouter]
+base_url = "https://eu.openrouter.ai/api/v1"
+env_key = "OPENROUTER_API_KEY"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.vendors[0].models_url.as_str(),
+            "https://eu.openrouter.ai/api/v1/models/user"
+        );
+        // An explicit models_url is never rewritten.
+        let config = CodeoxConfig::load_from_str(
+            r#"
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+models_url = "https://openrouter.ai/api/v1/models?scope=public"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.vendors[0].models_url.as_str(),
+            "https://openrouter.ai/api/v1/models?scope=public"
+        );
+    }
+
+    #[test]
+    fn openrouter_provider_preferences_are_validated() {
+        let config = CodeoxConfig::load_from_str(
+            r#"
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+
+[providers.openrouter.provider]
+sort = "throughput"
+zdr = true
+data_collection = "deny"
+only = ["anthropic", "openai"]
+max_price = { prompt = 1.5, completion = 8 }
+"#,
+        )
+        .unwrap();
+        let preferences = config.vendors[0]
+            .openrouter_provider
+            .as_ref()
+            .expect("preferences");
+        assert_eq!(preferences["sort"], "throughput");
+        assert_eq!(preferences["zdr"], true);
+        assert_eq!(
+            preferences["only"],
+            serde_json::json!(["anthropic", "openai"])
+        );
+        assert_eq!(preferences["max_price"]["completion"], 8.0);
+
+        for (extra, expected) in [
+            (
+                "[providers.openrouter.provider]\nsoort = \"price\"\n",
+                "soort",
+            ),
+            (
+                "[providers.openrouter.provider]\nsort = \"fastest\"\n",
+                "sort",
+            ),
+            (
+                "[providers.openrouter.provider]\ndata_collection = \"maybe\"\n",
+                "data_collection",
+            ),
+        ] {
+            let error = CodeoxConfig::load_from_str(&format!(
+                "[providers.openrouter]\nbase_url = \"https://openrouter.ai/api/v1\"\n{extra}"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+
+        // The table is meaningless on another provider, so it is an error.
+        let error = CodeoxConfig::load_from_str(
+            r#"
+[providers.alpha]
+base_url = "https://alpha.example/v1"
+
+[providers.alpha.provider]
+sort = "price"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("OpenRouter"), "{error}");
+    }
+
+    #[test]
+    fn openrouter_requests_get_preferences_a_session_and_the_stateless_contract() {
+        let mut vendor = openrouter_vendor("https://eu.openrouter.ai/api/v1", Wire::Responses);
+        vendor.openrouter_provider = Some(serde_json::json!({"sort": "price"}));
+        let key = SecretKey::new("sk-openrouter-test".to_owned());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("thread-123"));
+        let payload = serde_json::json!({"prompt_cache_key": "thread-123"});
+        let session = vendor
+            .openrouter_session_id(&key, Some(&headers), &payload)
+            .expect("a session");
+        assert!(session.starts_with("ox_"), "{session}");
+        assert_eq!(
+            Some(session.clone()),
+            vendor.openrouter_session_id(&key, Some(&headers), &payload)
+        );
+        let other = SecretKey::new("sk-other".to_owned());
+        assert_ne!(
+            Some(session.clone()),
+            vendor.openrouter_session_id(&other, Some(&headers), &payload)
+        );
+
+        let mut body = serde_json::json!({
+            "model": "gpt",
+            "store": true,
+            "previous_response_id": "resp_1",
+            "input": [],
+        });
+        assert!(vendor.prepare_openrouter_request(&mut body, Some(&session)));
+        assert_eq!(body["store"], false);
+        assert!(body.get("previous_response_id").is_none());
+        assert_eq!(body["provider"]["sort"], "price");
+        assert_eq!(body["session_id"], session);
+        assert_eq!(body["input"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn openrouter_requests_carry_optional_attribution() {
+        let vendor = openrouter_vendor("https://openrouter.ai/api/v1", Wire::Responses);
+        let key = SecretKey::new("sk-openrouter-test".to_owned());
+        let headers = vendor.auth_headers(&key).unwrap();
+        assert_eq!(
+            headers.get("http-referer").unwrap(),
+            "https://github.com/oxstack/ox"
+        );
+        assert_eq!(headers.get("x-openrouter-title").unwrap(), "OX");
+
+        let other = openrouter_vendor("https://alpha.example/v1", Wire::Responses);
+        let headers = other.auth_headers(&key).unwrap();
+        assert!(headers.get("http-referer").is_none());
     }
 
     fn reasoning_route(supported: &[&str], default: Option<&str>, mandatory: bool) -> Route {

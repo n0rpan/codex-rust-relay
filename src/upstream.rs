@@ -240,6 +240,22 @@ fn prepare_body(
     body.as_object_mut()
         .ok_or("the translated request must be a JSON object")?;
     vendor.add_cache_hints(&mut body);
+    // The Chat Completions translator forwards a fixed field list, so the
+    // OpenRouter extensions OX added to the canonical request are copied here.
+    if vendor.is_openrouter()
+        && let Some(object) = body.as_object_mut()
+    {
+        if let Some(preferences) = &vendor.openrouter_provider {
+            object
+                .entry("provider")
+                .or_insert_with(|| preferences.clone());
+        }
+        if let Some(session) = payload.get("session_id") {
+            object
+                .entry("session_id")
+                .or_insert_with(|| session.clone());
+        }
+    }
     Ok((body, normalized.map))
 }
 
@@ -753,6 +769,56 @@ mod tests {
             redact("key sk-12345678 and abc", &secrets),
             "key [redacted] and abc"
         );
+    }
+
+    fn openrouter_vendor(wire: Wire) -> Vendor {
+        let url = reqwest::Url::parse("https://eu.openrouter.ai/api/v1").unwrap();
+        Vendor {
+            key: "openrouter".to_owned(),
+            name: "OpenRouter".to_owned(),
+            base_url: url.clone(),
+            models_url: crate::provider::openrouter_models_url(&url),
+            env_key: None,
+            wire,
+            discovery: false,
+            models: Vec::new(),
+            openrouter_provider: Some(json!({"sort": "throughput"})),
+            max_output_tokens: None,
+            anthropic: crate::provider::AnthropicOptions::default(),
+            chat: ChatOptions::default(),
+        }
+    }
+
+    #[test]
+    fn openrouter_chat_carries_preferences_and_the_session() {
+        let vendor = openrouter_vendor(Wire::ChatCompletions);
+        let mut payload = json!({
+            "model": "alias",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "hi"}
+            ]}],
+            "session_id": "ox_abc",
+            "stream": true,
+        });
+        let (body, _) = prepare_body(&vendor, &mut payload, "upstream-model").unwrap();
+        assert_eq!(body["provider"]["sort"], "throughput");
+        assert_eq!(body["session_id"], "ox_abc");
+
+        // A provider that is not OpenRouter gets neither extension.
+        let mut vendor = openrouter_vendor(Wire::ChatCompletions);
+        vendor.base_url = reqwest::Url::parse("https://alpha.example/v1").unwrap();
+        vendor.openrouter_provider = None;
+        let mut payload = json!({
+            "model": "alias",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "hi"}
+            ]}],
+            "session_id": "ox_abc",
+            "stream": true,
+        });
+        let (body, _) = prepare_body(&vendor, &mut payload, "upstream-model").unwrap();
+        assert!(body.get("provider").is_none());
+        assert!(body.get("session_id").is_none());
     }
 
     #[tokio::test]

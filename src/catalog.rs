@@ -87,6 +87,23 @@ impl ProviderModels {
         });
         dropped
     }
+
+    /// Drops models the provider does not serve on this API, keeping every
+    /// model whose endpoint list is unknown.
+    pub fn retain_wire(&mut self, wire: crate::provider::Wire) {
+        let path = match wire {
+            crate::provider::Wire::Responses => "/api/v1/responses",
+            crate::provider::Wire::ChatCompletions => "/api/v1/chat/completions",
+            crate::provider::Wire::AnthropicMessages => "/api/v1/messages",
+        };
+        self.data.retain(|model| {
+            model.endpoints.is_empty()
+                || model
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.trim_end_matches('/').ends_with(path))
+        });
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -123,6 +140,12 @@ pub struct ModelSpec {
     /// The model rejects every attempt to disable reasoning. OX must never send
     /// `effort: "none"`, `enabled: false` or `thinking: {"type":"disabled"}`.
     pub reasoning_mandatory: bool,
+    /// API paths the provider says this model serves, when it says so. Used to
+    /// hide models that cannot answer the wire this route is configured for.
+    pub endpoints: Vec<String>,
+    /// `None` when the provider does not say. `Some(false)` hides the model,
+    /// because every OX session runs a coding agent that needs tools.
+    pub supports_tools: Option<bool>,
 }
 
 /// One row of the Codex model catalog.
@@ -179,9 +202,26 @@ pub fn merge_models(
 impl ModelSpec {
     fn from_upstream(model: &Value) -> Option<Self> {
         let id = model["id"].as_str()?;
-        if id.is_empty()
-            || model.pointer("/capabilities/tools/supported") == Some(&Value::Bool(false))
-        {
+        if id.is_empty() {
+            return None;
+        }
+        if model.pointer("/capabilities/tools/supported") == Some(&Value::Bool(false)) {
+            return None;
+        }
+        // OpenRouter publishes tool support as a `supported_parameters` entry;
+        // Model Studio-style vendors publish a boolean capability.
+        let supports_tools = match model.get("supported_parameters").and_then(Value::as_array) {
+            Some(parameters) => Some(
+                parameters
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|parameter| parameter == "tools"),
+            ),
+            None => model
+                .pointer("/capabilities/tools/supported")
+                .and_then(Value::as_bool),
+        };
+        if supports_tools == Some(false) {
             return None;
         }
         let strings = |path: &str| -> Vec<&str> {
@@ -193,7 +233,8 @@ impl ModelSpec {
                 .filter_map(Value::as_str)
                 .collect()
         };
-        let output = strings("/modalities/output");
+        let mut output = strings("/modalities/output");
+        output.extend(strings("/architecture/output_modalities"));
         let non_coding = if output.is_empty() {
             matches!(
                 model["type"].as_str(),
@@ -214,11 +255,10 @@ impl ModelSpec {
                 .filter(|tokens| *tokens > 0)
                 .min()
         };
+        let mut inputs = strings("/modalities/input");
+        inputs.extend(strings("/architecture/input_modalities"));
         let mut input_modalities = vec!["text".to_owned()];
-        if strings("/modalities/input")
-            .iter()
-            .any(|input| input.starts_with("image"))
-        {
+        if inputs.iter().any(|input| input.starts_with("image")) {
             input_modalities.push("image".to_owned());
         }
         let (reasoning_efforts, default_reasoning_effort, reasoning_mandatory) =
@@ -244,11 +284,17 @@ impl ModelSpec {
                 "/max_output",
                 "/max_output_tokens",
                 "/max_tokens",
+                "/top_provider/max_completion_tokens",
             ]),
             input_modalities,
             reasoning_efforts,
             default_reasoning_effort,
             reasoning_mandatory,
+            endpoints: strings("/endpoints")
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            supports_tools,
         })
     }
 
@@ -263,6 +309,8 @@ impl ModelSpec {
             reasoning_efforts: Vec::new(),
             default_reasoning_effort: None,
             reasoning_mandatory: false,
+            endpoints: Vec::new(),
+            supports_tools: None,
         };
         spec.apply_override(entry);
         spec
@@ -672,6 +720,67 @@ mod tests {
         let spec = merge_models(Some(discovered), &[]).remove(0);
         assert_eq!(spec.reasoning_efforts, REASONING_LEVELS);
         assert_eq!(spec.default_reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn openrouter_metadata_fills_modalities_output_tools_and_endpoints() {
+        let upstream = serde_json::from_value::<ProviderModels>(json!({
+            "data": [
+                {
+                    "id": "openai/gpt-6.1-sol",
+                    "name": "GPT-6.1 Sol",
+                    "context_length": 1_050_000,
+                    "architecture": {
+                        "input_modalities": ["file", "image", "text"],
+                        "output_modalities": ["text"]
+                    },
+                    "top_provider": {"context_length": 1_050_000, "max_completion_tokens": 128_000},
+                    "supported_parameters": ["tools", "reasoning", "temperature"],
+                    "endpoints": ["/api/v1/chat/completions", "/api/v1/responses"]
+                },
+                {
+                    "id": "no-tools",
+                    "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+                    "supported_parameters": ["temperature"]
+                },
+                {
+                    "id": "chat-only",
+                    "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+                    "supported_parameters": ["tools"],
+                    "endpoints": ["/api/v1/chat/completions"]
+                }
+            ]
+        }))
+        .unwrap();
+        let specs = merge_models(Some(upstream), &[]);
+        assert_eq!(
+            specs.len(),
+            2,
+            "a model without tools is not a coding model"
+        );
+        assert_eq!(specs[0].input_modalities, ["text", "image"]);
+        assert_eq!(specs[0].max_output_tokens, Some(128_000));
+        assert_eq!(specs[0].supports_tools, Some(true));
+        assert_eq!(specs[0].endpoints.len(), 2);
+        assert_eq!(specs[1].id, "chat-only");
+    }
+
+    #[test]
+    fn models_are_hidden_from_a_wire_they_do_not_serve() {
+        let mut upstream = serde_json::from_value::<ProviderModels>(json!({
+            "data": [
+                {"id": "responses", "endpoints": ["/api/v1/responses", "/api/v1/chat/completions"]},
+                {"id": "batch", "endpoints": ["/api/v1/chat/completions"]},
+                {"id": "unknown"}
+            ]
+        }))
+        .unwrap();
+        upstream.retain_wire(crate::provider::Wire::Responses);
+        let ids: Vec<_> = merge_models(Some(upstream), &[])
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        assert_eq!(ids, ["responses", "unknown"]);
     }
 
     #[test]
