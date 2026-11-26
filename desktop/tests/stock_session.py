@@ -144,7 +144,7 @@ class Fixture(BaseHTTPRequestHandler):
                 item["content"][0]["text"] = "Fixture conversation"
             elif self.server.mode == "host-cut":
                 self.server.on_turn(json.loads(body))
-            elif self.server.mode in ("ox-workers", "worker-cwd"):
+            elif self.server.mode in ("ox-workers", "worker-cwd", "worker-inherit"):
                 payload = json.loads(body)
                 result = next(
                     (
@@ -183,6 +183,8 @@ class Fixture(BaseHTTPRequestHandler):
                         "model": "fixture/demo",
                         "task": "OX worker fixture task",
                     }
+                    if self.server.mode == "worker-inherit":
+                        args["checkout"] = str(self.server.project.with_name("worker-checkout"))
                     if self.server.mode == "worker-cwd":
                         args["workspace_write"] = True
                     item = {
@@ -238,7 +240,7 @@ class Fixture(BaseHTTPRequestHandler):
                 chunks.append({"content":"Fixture conversation"})
             elif any(m.get("role") == "user" and "model-switch-" in str(m.get("content")) for m in req["messages"]):
                 chunks.append({"content":"fixture complete"})
-            elif self.server.mode == "worker-cwd":
+            elif self.server.mode in ("worker-cwd", "worker-inherit"):
                 if has_output:
                     chunks.append({"content": "worker directory checked"})
                 else:
@@ -361,7 +363,7 @@ class Fixture(BaseHTTPRequestHandler):
 
 
 def run():
-    rust_test = Path(sys.argv[1]).resolve()
+    rust_test = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else None
     ox = Path(os.environ["OX_TEST_OX_BIN"]).resolve(strict=True)
     codex = Path(os.environ["CODEOX_TEST_CODEX_BIN"]).resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="ox-desktop-tests-") as temp:
@@ -446,6 +448,7 @@ def run():
                 "workers",
                 "ox-workers",
                 "worker-cwd",
+                "worker-inherit",
                 "allow",
                 "deny",
                 "stop",
@@ -473,7 +476,7 @@ def run():
                 if mode == "native":
                     with (home / "config.toml").open("a") as config:
                         config.write("[features]\ngoals=true\nenable_request_compression=false\n")
-                if mode in ("native", "ox-workers", "worker-cwd"):
+                if mode in ("native", "ox-workers", "worker-cwd", "worker-inherit"):
                     identity = jwt(
                         {
                             "exp": expiry,
@@ -515,7 +518,7 @@ def run():
                         f'model = "demo"\nmodel_provider = "legacy"\n[model_providers.legacy]\n'
                         f'name = "Fixture"\nbase_url = "{vendor_base}"\nenv_key = "OX_FIXTURE_KEY"\nwire_api = "responses"\n'
                     )
-                if mode in ("ox-workers", "worker-cwd"):
+                if mode in ("ox-workers", "worker-cwd", "worker-inherit"):
                     with (home / "config.toml").open("a") as config:
                         config.write(
                             "[features]\ntool_search=false\nenable_request_compression=false\n"
@@ -550,6 +553,15 @@ def run():
                     verify_worker_directories(ox, project, env)
                     print(f"PASS {mode}", flush=True)
                     continue
+                if mode == "worker-inherit":
+                    from host_fixture import session_host
+                    from stock_boundaries import verify_hosted_inheritance
+                    env["XDG_STATE_HOME"] = str(base / "state")
+                    with session_host(ox.with_name("ox-host"), base, env):
+                        verify_hosted_inheritance(project, env)
+                    print(f"PASS {mode}", flush=True)
+                    continue
+                assert rust_test, "This scenario requires the compiled desktop test binary."
                 case = {"workers": "stock_subagent", "ox-workers": "stock_ox_worker"}.get(mode, "stock_session")
                 cases = [case]
                 if mode in ("allow", "native"):

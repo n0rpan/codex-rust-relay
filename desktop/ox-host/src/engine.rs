@@ -1904,21 +1904,31 @@ impl Engine {
                 }
             }
         }
+        let launching = self.prepare_worker(&scope, origin, start)?;
+        Ok(Accepted::Launch(scope, launching))
+    }
+
+    /// Immediate launches and operator-approved launches must pin the model and
+    /// stage the granted permissions on the same process before its first turn.
+    fn prepare_worker(
+        &mut self,
+        scope: &Scope,
+        origin: Origin,
+        start: WorkerStart,
+    ) -> Result<Launching, String> {
         let contract = origin.claude_contract(start.mode);
         let pin = start.subscription_model.clone();
         let started = origin.started;
-        origin.requested_model = pin.clone();
-        let launching = self.prepare_launch(&scope, origin, Payload::Worker(start))?;
-        // A contract or a pinned model needs a process of the worker's own: a pinned
-        // one starts with `--model`, so not even its first turn runs the account default.
-        if (contract.is_some() || pin.is_some())
-            && let Some(live) = self.running.get_mut(&scope)
-        {
-            live.store
+        let launching = self.prepare_launch(scope, origin, Payload::Worker(start))?;
+        if contract.is_some() || pin.is_some() {
+            self.running
+                .get_mut(scope)
+                .expect("ensured worker scope")
+                .store
                 .stage_claude_worker(contract, pin, started)
                 .map_err(|e| e.to_string())?;
         }
-        Ok(Accepted::Launch(scope, launching))
+        Ok(launching)
     }
     /// Open the child's route and check that nothing else is opening there.
     fn prepare_launch(

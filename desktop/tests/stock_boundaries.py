@@ -92,6 +92,45 @@ def verify_worker_directories(ox, launch, env):
     assert not (launch / "worker-marker").exists()
 
 
+def verify_hosted_inheritance(project, env):
+    """The subscription parent delegates a shell write to an API worker, with zero answers."""
+    from contextlib import closing
+    from host_codex_interrupt import ready
+    from host_stock_session import Client, ask, change
+
+    checkout = project.with_name("worker-checkout")
+    checkout.mkdir()
+    (checkout / "fixture-input").write_text("inherited")
+    scope = {"project": str(project), "route": {"runtime": "codex", "billing": "subscription"}}
+    with closing(Client(env["OX_HOST_SOCKET"])) as parent, closing(Client(env["OX_HOST_SOCKET"])) as catalog:
+        ready(parent, scope)
+        parent.act(scope, "mode", {"set_next_access": "yolo"})
+        parent.until(lambda f: f["type"] == "ack" and f["id"] == "mode")
+        parent.act(scope, "delegate", {"send_text": [None, "Start the isolated writer"]})
+        thread = parent.until(lambda f: f["type"] == "opened")["thread"]
+
+        def finished(frame):
+            assert not ask(frame), "Unexpected operator approval on the YOLO parent"
+            return (n := change(frame, "notification")) and n["event"] == "finished"
+
+        parent.until(finished)
+        deadline = time.monotonic() + 20
+        marker = checkout / "worker-marker"
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(.05)
+        assert marker.read_text() == "inherited"
+        assert not (project / marker.name).exists()
+        catalog.send(type="watch_catalog")
+        states = catalog.until(lambda f: f["type"] == "snapshot")["scopes"]
+        children = [(s["scope"], r) for s in states for r in s["sessions"] if r["parent"] == thread]
+        assert len(children) == 1, children
+        child_scope, child = children[0]
+        assert child_scope == {"project": str(checkout), "route": {"runtime":"codex", "billing":{"api":"fixture/demo"}}}
+        origin = child["detail"]["origin"]
+        assert origin["parent"]["scope"] == scope and origin["parent"]["session"] == thread
+        assert origin["started"] == origin["ceiling"] == "yolo", origin
+
+
 class CatalogClient:
     """Request/reply client for finite discovery experiments in a synthetic profile."""
 

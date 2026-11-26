@@ -357,10 +357,10 @@ impl Engine {
                     origin.decided = Some(Decision::Capped);
                 }
                 let target = a.target.clone();
-                let payload = Payload::Worker(a.start.clone());
+                let start = a.start.clone();
                 // A busy route keeps the request pending so the operator can retry.
                 let mut l = self
-                    .prepare_launch(&target, origin, payload)
+                    .prepare_worker(&target, origin, start)
                     .map_err(io::Error::other)?;
                 l.detached = true;
                 self.asking.remove(&job);

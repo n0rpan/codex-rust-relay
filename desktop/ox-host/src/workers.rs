@@ -407,7 +407,7 @@ pub(crate) fn origin(
         decided: Some(resolved.decision),
         yolo: None,
         handoff: None,
-        requested_model: None,
+        requested_model: start.subscription_model.clone(),
         pinned_model: None,
     }
 }

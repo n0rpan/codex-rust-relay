@@ -68,4 +68,9 @@ Expose these distinctions to the main agent with OX's worker capability descript
 4. Repeat after compaction, resume, fork and a cross-runtime handoff. Check both supported release floors, subscription and API routes, worker prompts, old clients and a relay-only consumer. Preserve prompt and sandbox behavior when a context feature is unavailable.
 5. Ask “which app am I using?” and “where do I add a provider here?” on both interfaces. Verify the instructions against the installed UI. Exercise the natural-language examples above and check actual job counts and billing outcomes.
 
-The first shippable slice is the end-to-end review in checks 1 and 2. It eliminates the workaround observed in this session. Sender attribution and version-matched settings help can then ship against checks 3 through 5.
+## Verification on the implementation branch
+
+- Replayed the three catalog rows from the affected conversation in an isolated desktop window. The conversation rendered as one root with both DeepSeek workers indented beneath it. The phone browser suite also exercises the worker controls and parent relationship.
+- Drove stock Codex through the OX worker tool from a YOLO ChatGPT subscription parent to a fixture API worker in another checkout. The child wrote a file there, with zero operator answers. An equivalent stock Claude subscription test covers bypass mode. A separate Codex probe checks the verified ceiling for configured sessions and explicit mode changes.
+- Queried the signed-in stock Claude picker without inference and confirmed the account offers Fable 5.2. Hosted and standalone worker fixtures cover model pinning, refusal of an unavailable model before inference, and reporting the answering model. The original live Fable plan review used the launcher workaround described above.
+- Tested sender delivery against Codex 0.171.0 and 0.172.0 and Claude Code 2.1.331 and 2.1.332 using local model endpoints. The Codex test covers steering, compaction and resume. The Claude tests inspect the context that reaches the model and the visible user text.
