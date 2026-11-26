@@ -184,7 +184,6 @@ pub fn classify(status: u16, message: &str, body: &Value) -> Option<Action> {
             "unexpected",
             "not permitted",
             "does not support",
-            "invalid",
         ],
     ) {
         return named_field(&text, body).map(Action::Drop);
@@ -195,7 +194,7 @@ pub fn classify(status: u16, message: &str, body: &Value) -> Option<Action> {
 /// Picks the request field an error names, without mistaking a field name that
 /// appears inside a rejected value for the parameter itself.
 ///
-/// `Invalid include value: reasoning.encrypted_content` names `include`; the
+/// `Unsupported include value: reasoning.encrypted_content` names `include`; the
 /// `reasoning` in the value is not the offending parameter. Quoted parameter
 /// paths win (`'reasoning.summary'` means `reasoning`), then whole tokens that
 /// are not followed by a dot.
@@ -433,7 +432,7 @@ mod tests {
         assert_eq!(
             classify(
                 400,
-                "Invalid include value: reasoning.encrypted_content",
+                "Unsupported include value: reasoning.encrypted_content",
                 &body
             ),
             Some(Action::Drop("include"))
@@ -446,6 +445,15 @@ mod tests {
                 &body
             ),
             Some(Action::Drop("reasoning"))
+        );
+    }
+
+    #[test]
+    fn a_value_validation_error_does_not_remove_the_parameter() {
+        let body = json!({"model": "m", "temperature": 3});
+        assert_eq!(
+            classify(400, "Invalid temperature: must be between 0 and 2", &body),
+            None
         );
     }
 
