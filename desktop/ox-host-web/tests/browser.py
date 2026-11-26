@@ -361,6 +361,9 @@ class Host(socketserver.StreamRequestHandler):
                             }
                         )
                     f.actions.append(frame["action"])
+                    if action == {"native_command": ["parent", "/status"]}:
+                        # Its visible state delta can arrive before the action acknowledgement.
+                        assert f.allow_status_ack.wait(15), "Browser did not release the /status acknowledgement"
                     if late != "ack":
                         send({"type": "ack", "id": frame["id"]})
         except (OSError, ValueError):
@@ -729,6 +732,7 @@ def run(harness, screenshot=None):
         }
         Path(host.scope["project"]).mkdir()
         host.caps = ["start", "access", "model_options", "native_commands"]
+        host.allow_status_ack = threading.Event()
         host.confirm_mode, host.mode_requested = threading.Event(), threading.Event()
         host.detail = {
             "selected":"parent", "applied_draft_access":"default", "access_choices":["default","plan","bypass_permissions"],
@@ -945,22 +949,36 @@ def run(harness, screenshot=None):
         choose("session-effort", "high")
         wait(lambda: {"model_options":["parent", {"effort":"high"}]} in host.actions)
         wait(lambda: js("return document.getElementById('session-effort').value==='high'"))
-        js("document.getElementById('native-command-form').requestSubmit()")
+        def run_native_command():
+            # requestSubmit() bypasses the disabled Run button. Click it only when the
+            # real control can accept another action, including after a delayed Ack.
+            try:
+                wait(lambda: js("""
+                    const run = document.querySelector('#native-command-form button');
+                    if (run.disabled || !run.getClientRects().length) return false;
+                    run.click();
+                    return true;
+                """))
+            except AssertionError as error:
+                status = js("return document.getElementById('control-status').textContent")
+                raise AssertionError(f"Run command never became available; status={status!r}") from error
+        run_native_command()
         wait(lambda: js("return document.getElementById('control-status').textContent==='Native status received'"))
         # Inspecting cold Claude history provides no installed command inventory.
         # An explicitly typed command uses the native-only action; after a refusal
         # the exact text stays editable, independent of the ordinary chat draft.
-        def custom_command(text):
-            # The status delta arrives before the acknowledgement. The form
-            # accepts the next command only after the previous action completes.
-            wait(lambda: js("return !document.querySelector('#native-command-form button').disabled"))
+        def enter_custom_command(text):
             choose("native-command", "custom")
-            js("const field=document.getElementById('typed-native-command');field.value=arguments[0];field.dispatchEvent(new Event('input'));document.getElementById('native-command-form').requestSubmit()", text)
+            js("const field=document.getElementById('typed-native-command');field.value=arguments[0];field.dispatchEvent(new Event('input'))", text)
         js("const d=document.getElementById('draft');d.value='/home/user/project';d.dispatchEvent(new Event('input'))")
-        custom_command("/only-in-terminal")
+        enter_custom_command("/only-in-terminal")
+        assert js("return document.querySelector('#native-command-form button').disabled"), "/status must still await its acknowledgement"
+        host.allow_status_ack.set()
+        run_native_command()
         wait(lambda: js("return document.getElementById('control-status').textContent.includes('Command requires the terminal')"))
         assert js("return document.getElementById('typed-native-command').value==='/only-in-terminal' && document.getElementById('draft').value==='/home/user/project'")
-        custom_command("/project:lint src/mobile.rs")
+        enter_custom_command("/project:lint src/mobile.rs")
+        run_native_command()
         wait(lambda: {"native_command":["parent", "/project:lint src/mobile.rs"]} in host.actions)
         js("document.getElementById('composer').requestSubmit()")
         wait(lambda: {"send_text":["parent", "/home/user/project"]} in host.actions)
@@ -1036,7 +1054,8 @@ def run(harness, screenshot=None):
         mode("bypass_permissions")
         wait(lambda: {"set_next_access":"bypass_permissions"} in host.actions)
         wait(lambda: js("return document.getElementById('access-mode').dataset.bypass==='true'"))
-        custom_command("/project:lint src/mobile.rs")
+        enter_custom_command("/project:lint src/mobile.rs")
+        run_native_command()
         wait(lambda: {"native_command":[None, "/project:lint src/mobile.rs"]} in host.actions)
         js("document.getElementById('open-settings').click()")
         js(
