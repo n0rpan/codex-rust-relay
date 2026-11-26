@@ -168,6 +168,8 @@ with subprocess.Popen(["sleep", "30"], pass_fds=(sock.fileno(),)) as child:
                 Err(err) => panic!("schema fixture did not start: {err}"),
             }
         };
+        // BSD hands the accepted socket the listener's non-blocking flag; Linux does not.
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();

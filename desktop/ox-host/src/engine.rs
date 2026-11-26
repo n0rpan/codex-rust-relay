@@ -2795,7 +2795,7 @@ mod tests {
             route: Route::CODEX_SUBSCRIPTION,
         };
         let config = RuntimeConfig {
-            ox: "/bin/false".into(),
+            ox: "/usr/bin/false".into(),
             path: "/bin".into(),
             desktop: root.path().into(),
         };
@@ -2868,7 +2868,7 @@ mod tests {
     fn a_slow_native_read_in_one_scope_does_not_stall_the_host() {
         let root = tempfile::tempdir().unwrap();
         let config = RuntimeConfig {
-            ox: "/bin/false".into(),
+            ox: "/usr/bin/false".into(),
             path: "/bin".into(),
             desktop: root.path().into(),
         };
@@ -2963,12 +2963,13 @@ mod tests {
     #[test]
     fn a_refused_action_retried_with_the_same_key_runs_once_it_is_valid() {
         let root = tempfile::tempdir().unwrap();
+        // Actions are checked against the canonical scope (macOS temp dirs sit behind a symlink).
         let scope = Scope {
-            project: root.path().to_owned(),
+            project: root.path().canonicalize().unwrap(),
             route: Route::CODEX_SUBSCRIPTION,
         };
         let config = RuntimeConfig {
-            ox: "/bin/false".into(),
+            ox: "/usr/bin/false".into(),
             path: "/bin".into(),
             desktop: root.path().into(),
         };
@@ -3053,7 +3054,7 @@ mod tests {
             route: Route::CODEX_SUBSCRIPTION,
         };
         let config = RuntimeConfig {
-            ox: "/bin/false".into(),
+            ox: "/usr/bin/false".into(),
             path: "/bin".into(),
             desktop: root.path().into(),
         };
@@ -3164,7 +3165,7 @@ mod tests {
             route: Route::CODEX_SUBSCRIPTION,
         };
         let config = RuntimeConfig {
-            ox: "/bin/false".into(),
+            ox: "/usr/bin/false".into(),
             path: "/bin".into(),
             desktop: root.path().into(),
         };
@@ -3194,7 +3195,7 @@ mod tests {
 
         fn config(root: &Path) -> RuntimeConfig {
             RuntimeConfig {
-                ox: "/bin/false".into(),
+                ox: "/usr/bin/false".into(),
                 path: "/bin".into(),
                 desktop: root.into(),
             }
@@ -5157,6 +5158,8 @@ mod tests {
         ) {
             use ox_desk_core::store::claude::{Launcher, SUBSCRIPTION_PROVIDER};
             use std::os::unix::fs::PermissionsExt;
+            // The fixture's journal records the real cwd; macOS temp dirs sit behind /var -> /private/var.
+            let root = &root.canonicalize().unwrap();
             let helper = root.join("private-fixture");
             std::fs::write(
                 &helper,
