@@ -160,6 +160,7 @@ def worker_cases(root, stack, binary, env, log):
                 return [{"type":"tool_use", "id":"toolu_inherit_workspace",
                          "name":"mcp__ox_workers__start_ox_worker",
                          "input":{"runtime":"claude", "mode":"session", "checkout":str(checkout),
+                                  "billing":"subscription", "subscription_model":"claude-fable-5-2",
                                   "task":"APPROVAL write the fixture marker"}}]
         native.script = spawn_writer
         client.act(scope, "parent-bypass", {"set_access":[thread, "bypass_permissions"]})
@@ -179,6 +180,18 @@ def worker_cases(root, stack, binary, env, log):
             time.sleep(.05)
         assert (checkout / "approved.txt").read_text().strip() == "accepted"
         assert not (root / "Beta" / "approved.txt").exists()
+        expected = "claude-fable-5-2"
+        assert any(r["model"] == expected and "APPROVAL write the fixture marker" in str(r["messages"])
+                   for r in native.requests), "The mock provider did not receive the pinned model"
+        catalog = Client(env["OX_HOST_SOCKET"])
+        catalog.send(type="watch_catalog")
+        states = catalog.until(lambda f: f["type"] == "snapshot")["scopes"]
+        catalog.close()
+        child, = [row for s in states if s["scope"]["project"] == str(checkout)
+                  for row in s["sessions"] if row["parent"] == thread]
+        report = child["detail"]["worker_model"]
+        assert report["actual_model"] == report["pinned_model"] == report["requested_model"] == expected, report
+        assert report["billing"] == "subscription" and report["model_state"] == "confirmed", report
         client.close()
     print("Stock Claude worker: launch above the parent's mode refused, host-owned read worker started in Plan and stamped with its parent, operator escalation above the ceiling refused.")
 

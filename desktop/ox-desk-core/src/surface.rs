@@ -74,7 +74,7 @@ impl Sender {
                 )
             }
             Self::WorkerTask => format!(
-                "This message is the task from the agent that launched you as an OX worker. This worker uses {session}."
+                "This message is your assigned task as an OX worker. This worker uses {session}."
             ),
             Self::ParentAgent => format!(
                 "This message was sent by the parent agent of this OX worker, not by a person. This worker uses {session}."
