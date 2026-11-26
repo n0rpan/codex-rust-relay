@@ -37,6 +37,10 @@ pub struct Remote {
     /// the user.
     unconfirmed: Vec<Unconfirmed>,
     pub(super) origins: HashMap<String, crate::origin::Origin>,
+    /// The runtime-confirmed model each session answered with, when the host has
+    /// observed one. Kept apart from the origin stamp, which records what was
+    /// requested before the first turn.
+    pub(super) actual_models: HashMap<String, String>,
     /// Host marks on a session: handoffs from it and its YOLO grant.
     pub(super) marks: HashMap<String, Value>,
     /// The request that opens the session this client is waiting for. Only its
@@ -98,6 +102,7 @@ impl Store {
             pending: HashMap::new(),
             unconfirmed: vec![],
             origins: HashMap::new(),
+            actual_models: HashMap::new(),
             marks: HashMap::new(),
         };
         Self::with_link(profile, Link::Host(Box::new(remote)))
@@ -105,6 +110,11 @@ impl Store {
     /// The host's immutable lineage stamp for a worker session or its fork.
     pub fn origin(&self, id: &str) -> Option<&crate::origin::Origin> {
         self.remote()?.origins.get(id)
+    }
+    /// The model the runtime itself confirmed for a session, once it has answered.
+    /// The launch stamp keeps the requested choice; this is what actually ran.
+    pub fn actual_model(&self, id: &str) -> Option<&str> {
+        self.remote()?.actual_models.get(id).map(String::as_str)
     }
     /// A host mark on a session: `handed_off_to`, `handoff_attempts`,
     /// `yolo_grant` or `yolo_children`.
@@ -643,6 +653,7 @@ impl Store {
                 let r = self.remote_mut();
                 r.caps.clear();
                 r.origins.clear();
+                r.actual_models.clear();
                 r.marks.clear();
                 r.routes.clear();
                 r.commands.clear();
@@ -824,12 +835,53 @@ impl Store {
         }
         match bits(&data["origin"]) {
             Some(origin) => {
-                r.origins.insert(id, origin);
+                r.origins.insert(id.clone(), origin);
             }
             None => {
                 r.origins.remove(&id);
             }
         }
+        match confirmed_model(data) {
+            Some(model) => {
+                r.actual_models.insert(id, model.to_owned());
+            }
+            None => {
+                r.actual_models.remove(&id);
+            }
+        }
+    }
+}
+/// The runtime-confirmed model on a host session row. The host publishes it as
+/// `detail.actual_model`; worker marks and the origin are accepted as fallbacks so
+/// an older projection that carried the value beside the stamp still shows it.
+fn confirmed_model(detail: &Value) -> Option<&str> {
+    detail["actual_model"]
+        .as_str()
+        .or_else(|| detail["worker_marks"]["actual_model"].as_str())
+        .or_else(|| detail["origin"]["actual_model"].as_str())
+}
+
+#[cfg(test)]
+mod actual_model_tests {
+    use super::confirmed_model;
+    use serde_json::json;
+
+    #[test]
+    fn the_runtime_confirmed_model_survives_the_projection() {
+        assert_eq!(
+            confirmed_model(&json!({"actual_model":"claude-fable-5-2"})),
+            Some("claude-fable-5-2")
+        );
+        // Older hosts put the confirmation beside the launch record, never in it.
+        assert_eq!(
+            confirmed_model(&json!({"worker_marks":{"actual_model":"gpt-6"}})),
+            Some("gpt-6")
+        );
+        assert_eq!(
+            confirmed_model(&json!({"origin":{"actual_model":"fixture/demo"}})),
+            Some("fixture/demo")
+        );
+        assert_eq!(confirmed_model(&json!({"origin":{}})), None);
     }
 }
 fn apply_meta(t: &mut Transcript, d: Value) {
