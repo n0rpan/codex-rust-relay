@@ -3830,7 +3830,9 @@ id = "gpt"
         assert_eq!(hits.len(), 2, "one rejection and one retry");
         assert!(hits[0].body.as_ref().unwrap().get("reasoning").is_some());
         let retried = hits[1].body.as_ref().unwrap();
-        assert!(retried.get("reasoning").is_none(), "{retried}");
+        // Only the disabling value goes; the requested summary is preserved.
+        assert!(retried["reasoning"].get("effort").is_none(), "{retried}");
+        assert_eq!(retried["reasoning"]["summary"], "auto");
         assert_eq!(retried["input"], json!([]), "nothing else is removed");
     }
 
@@ -3902,12 +3904,39 @@ id = "gpt"
     }
 
     #[tokio::test]
-    async fn a_stateless_refusal_strips_both_storage_fields() {
+    async fn a_stateless_refusal_strips_store_but_keeps_a_conversation_reference() {
+        // `store` alone is a preference, so a retry without it is safe.
         let mock = spawn_mock_with_responses(
             models_body(&[]),
             vec![(
                 400,
-                json!({"error": {"message": "Requests that set store: true or a previous_response_id are rejected"}}),
+                json!({"error": {"message": "Requests that set store: true are rejected"}}),
+            )],
+        )
+        .await;
+        let relay = start_relay(
+            &static_vendor_config(&mock.base),
+            &[("ALPHA_KEY", "alpha-secret")],
+            1 << 20,
+        )
+        .await;
+        let response = post(
+            &relay,
+            json!({"model": "alpha/gpt", "input": [], "store": true}),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let hits = mock.inference_hits();
+        assert_eq!(hits.len(), 2);
+        assert!(hits[1].body.as_ref().unwrap().get("store").is_none());
+
+        // Removing a non-null `previous_response_id` would drop the only link
+        // to earlier turns, so the provider error must reach the user.
+        let mock = spawn_mock_with_responses(
+            models_body(&[]),
+            vec![(
+                400,
+                json!({"error": {"message": "a previous_response_id is rejected"}}),
             )],
         )
         .await;
@@ -3927,11 +3956,8 @@ id = "gpt"
             }),
         )
         .await;
-        assert_eq!(response.status(), 200);
-        let hits = mock.inference_hits();
-        let retried = hits[1].body.as_ref().unwrap();
-        assert!(retried.get("store").is_none(), "{retried}");
-        assert!(retried.get("previous_response_id").is_none(), "{retried}");
+        assert_eq!(response.status(), 400);
+        assert_eq!(mock.inference_hits().len(), 1, "no unsafe retry");
     }
 
     #[tokio::test]

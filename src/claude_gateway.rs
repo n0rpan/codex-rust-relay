@@ -186,8 +186,17 @@ async fn infer_native(
     if count_tokens {
         payload["model"] = json!(context.upstream_model);
     } else {
+        // The session hint has to be read from the request as received.
+        let session = context
+            .vendor
+            .openrouter_session_id(context.key, context.incoming, &payload);
         let version = headers[ANTHROPIC_VERSION].to_str().unwrap_or_default();
         payload = prepare_native_body(payload, context.vendor, context.upstream_model, version);
+        // OpenRouter's Messages schema accepts the same routing preferences and
+        // sticky session as its other wires.
+        context
+            .vendor
+            .decorate_openrouter(&mut payload, session.as_deref());
     }
     let encoded = payload.to_string();
     drop(payload);
@@ -284,6 +293,10 @@ async fn infer_translated(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let requested_model = context.requested_model.to_owned();
+    let openrouter_session =
+        context
+            .vendor
+            .openrouter_session_id(context.key, context.incoming, &payload);
 
     let canonical = match crate::claude_request::into_responses(&payload, context.upstream_model) {
         Ok(value) => value,
@@ -306,6 +319,9 @@ async fn infer_translated(
     // Both translation paths consume Responses SSE; a non-streaming Messages
     // request is answered from the stream's terminal message below.
     canonical["stream"] = json!(true);
+    context
+        .vendor
+        .prepare_openrouter_request(&mut canonical, openrouter_session.as_deref());
 
     let upstream = match context.vendor.wire {
         Wire::Responses => {

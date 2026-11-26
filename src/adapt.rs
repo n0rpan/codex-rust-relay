@@ -52,8 +52,11 @@ const DROPPABLE: &[&str] = &[
 pub enum Action {
     /// Remove one top-level field.
     Drop(&'static str),
-    /// The provider keeps no conversation state: remove `store` and
-    /// `previous_response_id` together.
+    /// Remove only the value that turns reasoning off, keeping any other
+    /// reasoning setting the caller asked for.
+    ReasoningOff,
+    /// The provider keeps no conversation state: remove `store` when there is
+    /// no `previous_response_id` to lose.
     StripStateless,
 }
 
@@ -62,14 +65,16 @@ impl Action {
     pub fn label(self) -> String {
         match self {
             Self::Drop(field) => format!("omitting {field:?}"),
-            Self::StripStateless => "omitting store/previous_response_id".to_owned(),
+            Self::ReasoningOff => "not sending a disabled reasoning setting".to_owned(),
+            Self::StripStateless => "omitting store".to_owned(),
         }
     }
 
     /// Advice the user can apply permanently, when one exists.
     pub fn advice(self) -> &'static str {
         match self {
-            Self::Drop("reasoning" | "reasoning_effort" | "thinking" | "output_config") => {
+            Self::Drop("reasoning" | "reasoning_effort" | "thinking" | "output_config")
+            | Self::ReasoningOff => {
                 "declare the model's reasoning levels in codeox.toml (reasoning_efforts, default_reasoning_effort)"
             }
             Self::Drop("cache_control") => {
@@ -90,10 +95,47 @@ pub fn apply(action: Action, body: &mut Value) -> bool {
     };
     match action {
         Action::Drop(field) => object.remove(field).is_some(),
+        Action::ReasoningOff => {
+            let mut changed = false;
+            if let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut) {
+                if reasoning.get("effort").and_then(Value::as_str) == Some("none") {
+                    reasoning.remove("effort");
+                    changed = true;
+                }
+                if reasoning.get("enabled").and_then(Value::as_bool) == Some(false) {
+                    reasoning.remove("enabled");
+                    changed = true;
+                }
+                if reasoning.is_empty() {
+                    object.remove("reasoning");
+                }
+            }
+            if object.get("reasoning_effort").and_then(Value::as_str) == Some("none") {
+                object.remove("reasoning_effort");
+                changed = true;
+            }
+            if object
+                .get("thinking")
+                .and_then(|thinking| thinking.get("type"))
+                .and_then(Value::as_str)
+                == Some("disabled")
+            {
+                object.remove("thinking");
+                changed = true;
+            }
+            changed
+        }
         Action::StripStateless => {
-            let store = object.remove("store").is_some();
-            let previous = object.remove("previous_response_id").is_some();
-            store || previous
+            // A non-null reference is the only link to earlier turns in this
+            // request. Removing it would answer from incomplete context, so the
+            // provider error is surfaced instead of a silently wrong answer.
+            if object
+                .get("previous_response_id")
+                .is_some_and(|value| !value.is_null())
+            {
+                return false;
+            }
+            object.remove("previous_response_id").is_some() | object.remove("store").is_some()
         }
     }
 }
@@ -111,15 +153,15 @@ pub fn classify(status: u16, message: &str, body: &Value) -> Option<Action> {
     if text.trim().is_empty() {
         return None;
     }
-    if mentions_reasoning_shutdown(&text) {
-        if body.get("reasoning").is_some_and(Value::is_object) {
-            return Some(Action::Drop("reasoning"));
-        }
-        for field in ["reasoning_effort", "thinking", "output_config"] {
-            if body.get(field).is_some() {
-                return Some(Action::Drop(field));
-            }
-        }
+    if mentions_reasoning_shutdown(&text)
+        && (body.get("reasoning").is_some_and(Value::is_object)
+            || body.get("reasoning_effort").is_some()
+            || body.get("thinking").is_some())
+    {
+        // Rejecting the disabling value does not say the whole parameter is
+        // unsupported, so only that value is removed and the rule stays useful
+        // when the user later picks a real effort.
+        return Some(Action::ReasoningOff);
     }
     if mentions(&text, &["store", "previous_response_id", "stateless"])
         && mentions(
@@ -228,8 +270,11 @@ mod tests {
                 "Reasoning is mandatory for this endpoint and cannot be disabled.",
                 &body
             ),
-            Some(Action::Drop("reasoning"))
+            Some(Action::ReasoningOff)
         );
+        let mut body = body;
+        assert!(apply(Action::ReasoningOff, &mut body));
+        assert!(body.get("reasoning").is_none());
     }
 
     #[test]
@@ -241,8 +286,11 @@ mod tests {
                 "This model does not support 'none' for reasoning_effort",
                 &body
             ),
-            Some(Action::Drop("reasoning_effort"))
+            Some(Action::ReasoningOff)
         );
+        let mut body = body;
+        assert!(apply(Action::ReasoningOff, &mut body));
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -250,8 +298,11 @@ mod tests {
         let body = json!({"model": "m", "thinking": {"type": "disabled"}});
         assert_eq!(
             classify(400, "thinking cannot be disabled for this model", &body),
-            Some(Action::Drop("thinking"))
+            Some(Action::ReasoningOff)
         );
+        let mut body = body;
+        assert!(apply(Action::ReasoningOff, &mut body));
+        assert!(body.get("thinking").is_none());
     }
 
     #[test]
@@ -273,8 +324,8 @@ mod tests {
     }
 
     #[test]
-    fn a_stateless_refusal_strips_both_storage_fields() {
-        let body = json!({"model": "m", "store": true, "previous_response_id": "resp_1"});
+    fn a_stateless_refusal_only_strips_when_no_context_would_be_lost() {
+        let body = json!({"model": "m", "store": true});
         assert_eq!(
             classify(
                 400,
@@ -285,7 +336,21 @@ mod tests {
         );
         let mut body = body;
         assert!(apply(Action::StripStateless, &mut body));
-        assert!(body.get("store").is_none() && body.get("previous_response_id").is_none());
+        assert!(body.get("store").is_none());
+
+        // A continuation carries its only conversation reference here; the
+        // provider error must reach the user instead of a wrong answer.
+        let mut body = json!({"model": "m", "store": true, "previous_response_id": "resp_1"});
+        assert!(!apply(Action::StripStateless, &mut body));
+        assert_eq!(body["previous_response_id"], "resp_1");
+    }
+
+    #[test]
+    fn a_learned_reasoning_rule_keeps_explicit_supported_efforts() {
+        let mut body = json!({"reasoning": {"effort": "high", "summary": "auto"}});
+        assert!(!apply(Action::ReasoningOff, &mut body));
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
     }
 
     #[test]
