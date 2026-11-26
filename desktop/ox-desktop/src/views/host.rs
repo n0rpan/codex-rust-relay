@@ -1572,6 +1572,16 @@ impl Host {
         cx: &mut Context<Self>,
     ) {
         let id = row.id.clone();
+        let mkey = ThreadMetaKey::new(project.clone(), scope.runtime, id.clone());
+        if self
+            .sidebar
+            .thread(&mkey)
+            .and_then(|m| m.unread_override)
+            .is_some()
+        {
+            self.sidebar.set_unread_override(&mkey, None);
+            self.save_sidebar(cx);
+        }
         let (route, _) = self.project_row_state(&project, &row, scope, cx);
         if let Some(route) = route {
             self.open_catalog(project, row, route, window, cx);
@@ -1636,11 +1646,13 @@ impl Host {
                     let (_, status) = self.project_row_state(&project, &row, scope, cx);
                     let currently_unread = self
                         .sidebar
-                        .thread(&key)
-                        .and_then(|m| m.unread_override)
+                        .effective_unread_override(&key, row.updated_at)
                         .unwrap_or(row.unread || status == Some("Unread"));
-                    self.sidebar
-                        .set_unread_override(&key, Some(!currently_unread));
+                    self.sidebar.set_unread_override_at(
+                        &key,
+                        Some(!currently_unread),
+                        row.updated_at,
+                    );
                     self.save_sidebar(cx);
                     cx.stop_propagation();
                     return;
@@ -2013,11 +2025,13 @@ impl Host {
             );
         let host_unread = host.clone();
         let key_unread = key.clone();
+        let row_updated_at = row.updated_at;
         let unread_label = if unread { "Mark read" } else { "Mark unread" };
         menu = menu.item(
             crate::kit::menu_item(unread_label).on_click(move |_, _, cx| {
                 let _ = host_unread.update(cx, |s, cx| {
-                    s.sidebar.set_unread_override(&key_unread, Some(!unread));
+                    s.sidebar
+                        .set_unread_override_at(&key_unread, Some(!unread), row_updated_at);
                     s.save_sidebar(cx);
                 });
             }),
@@ -2514,7 +2528,9 @@ impl Host {
             let custom_title = meta.and_then(|m| m.custom_title.clone());
             let has_custom_title = custom_title.is_some();
             let display_title = custom_title.unwrap_or_else(|| t.title().to_owned());
-            let unread_override = meta.and_then(|m| m.unread_override);
+            let unread_override = self
+                .sidebar
+                .effective_unread_override(&meta_key, t.updated_at);
             let unread = unread_override.unwrap_or(t.unread || status == Some("Unread"));
             let status = if status == Some("Unread") && unread_override == Some(false) {
                 None

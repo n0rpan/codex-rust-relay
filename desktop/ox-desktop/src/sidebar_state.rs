@@ -83,6 +83,8 @@ pub struct ThreadMeta {
     pub custom_title: Option<String>,
     /// Local unread override (`Some(true)` = marked unread, `Some(false)` = marked read).
     pub unread_override: Option<bool>,
+    /// Timestamp of the thread when `unread_override` was set, so newer activity clears `Some(false)`.
+    pub unread_override_at: Option<i64>,
     /// Removed from the OX sidebar list without touching the provider's native thread.
     pub hidden: bool,
     /// Cached snapshot so a pinned thread still renders and opens before or without discovery.
@@ -339,8 +341,29 @@ impl SidebarState {
     }
 
     pub fn set_unread_override(&mut self, key: &ThreadMetaKey, unread: Option<bool>) {
-        self.thread_mut(key).unread_override = unread;
+        self.set_unread_override_at(key, unread, 0);
+    }
+
+    pub fn set_unread_override_at(
+        &mut self,
+        key: &ThreadMetaKey,
+        unread: Option<bool>,
+        updated_at: i64,
+    ) {
+        let meta = self.thread_mut(key);
+        meta.unread_override = unread;
+        meta.unread_override_at = unread.map(|_| updated_at);
         self.compact_thread(key);
+    }
+
+    /// Returns the active unread override for `key`, expiring `Some(false)` ("Mark read")
+    /// once the thread has newer activity (`updated_at > unread_override_at`).
+    pub fn effective_unread_override(&self, key: &ThreadMetaKey, updated_at: i64) -> Option<bool> {
+        let meta = self.thread(key)?;
+        match meta.unread_override {
+            Some(false) if meta.unread_override_at.is_some_and(|at| updated_at > at) => None,
+            other => other,
+        }
     }
 
     pub fn set_hidden(&mut self, key: &ThreadMetaKey, hidden: bool) {
@@ -543,5 +566,16 @@ mod tests {
         assert_eq!(cached.title(), "Offline pinned thread");
         assert_eq!(cached.cwd, PathBuf::from("/work/oxa"));
         assert_eq!(meta.cached_api, Some(true));
+    }
+
+    #[test]
+    fn mark_read_override_expires_when_newer_activity_arrives() {
+        let mut state = SidebarState::default();
+        let key = ThreadMetaKey::new("/work/ox", Runtime::Codex, "thread-unread");
+        state.set_unread_override_at(&key, Some(false), 1000);
+        assert_eq!(state.effective_unread_override(&key, 1000), Some(false));
+        assert_eq!(state.effective_unread_override(&key, 1005), None);
+        state.set_unread_override(&key, None);
+        assert!(state.thread(&key).is_none());
     }
 }
