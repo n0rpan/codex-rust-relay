@@ -31,6 +31,10 @@ impl Socket {
         let Some(path) = env::var_os("OX_DESK_STATS_SOCKET").map(PathBuf::from) else {
             return Ok(None);
         };
+        Self::bind_at(path).map(Some)
+    }
+
+    fn bind_at(path: PathBuf) -> io::Result<(Self, flume::Receiver<Sample>)> {
         // The probe can press buttons: create a missing parent directory 0700.
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
             && !dir.exists()
@@ -40,6 +44,9 @@ impl Socket {
         }
         let socket = UnixDatagram::bind(&path)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        // Darwin defaults to 2 KiB per outgoing Unix datagram. A single
+        // window's controls can already take several KiB in a snapshot.
+        socket2::SockRef::from(&socket).set_send_buffer_size(1 << 20)?;
         socket.set_write_timeout(Some(Duration::from_millis(100)))?;
         let (send, receive) = flume::unbounded();
         std::thread::spawn(move || {
@@ -75,12 +82,17 @@ impl Socket {
                 {
                     break;
                 }
-                if let Ok(payload) = result.recv() {
-                    let _ = socket.send_to(payload.as_bytes(), client);
+                if let Ok(payload) = result.recv()
+                    && let Err(e) = socket.send_to(payload.as_bytes(), client)
+                {
+                    eprintln!(
+                        "Could not send {}-byte desk probe reply: {e}",
+                        payload.len()
+                    );
                 }
             }
         });
-        Ok(Some((Self { path }, receive)))
+        Ok((Self { path }, receive))
     }
 }
 impl Drop for Socket {
@@ -89,5 +101,31 @@ impl Drop for Socket {
             let _ = s.send_to(b"", &self.path);
         }
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replies_larger_than_darwins_default_datagram_limit_reach_the_client() {
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let server_path = dir.path().join("stats");
+        let (_server, requests) = Socket::bind_at(server_path.clone()).unwrap();
+        let client = UnixDatagram::bind(dir.path().join("client")).unwrap();
+        socket2::SockRef::from(&client)
+            .set_recv_buffer_size(1 << 20)
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.send_to(b"snapshot", server_path).unwrap();
+        let payload = "x".repeat(16 * 1024);
+        let sample = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        sample.reply.send(payload.clone()).unwrap();
+        let mut received = vec![0; payload.len()];
+        let len = client.recv(&mut received).unwrap();
+        assert_eq!(&received[..len], payload.as_bytes());
     }
 }
