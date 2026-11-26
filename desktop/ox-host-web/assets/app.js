@@ -706,8 +706,8 @@ function open(scope, id) {
   $("asks").replaceChildren();
   $("timeline").replaceChildren();
   $("draft").value = drafts.get(keyOf(scope, id)) || "";
-  syncDraftHeight();
   page("conversation");
+  syncDraftHeight();
   notice();
   detailLink = new Link(scope, new Projection());
   // Clear the prior session's actionable controls before a new frame can accept input.
