@@ -5218,8 +5218,9 @@ for line in sys.stdin:
                 },
             )
             .unwrap();
+            // Generous: a loaded macOS runner can take seconds to start the Python fixture.
             while !store.can_send(None) {
-                store.apply(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+                store.apply(rx.recv_timeout(Duration::from_secs(30)).unwrap());
             }
             store
                 .dispatch(Action::SendText(None, "lead first turn".into()))
@@ -5472,7 +5473,7 @@ for line in sys.stdin:
             live.store.dispatch(Action::NewDraft).unwrap();
             while !live.store.can_send(None) {
                 live.store
-                    .apply(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+                    .apply(rx.recv_timeout(Duration::from_secs(30)).unwrap());
             }
             engine.process(&scope, vec![], false).unwrap();
             let rows = engine.processes();

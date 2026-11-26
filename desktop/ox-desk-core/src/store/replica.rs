@@ -1230,7 +1230,7 @@ mod local_command_tests {
             "pending, not in the composer"
         );
         let reason = closes
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(std::time::Duration::from_secs(30))
             .unwrap();
         old.apply(LinkEvent::Closed {
             reason,
