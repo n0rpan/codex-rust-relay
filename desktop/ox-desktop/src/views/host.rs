@@ -2076,16 +2076,23 @@ impl Host {
                 }),
             )
         });
-        let archive_label = match native_live {
-            Some(app) => format!("Archive — {app}"),
-            None => "Archive thread…".to_owned(),
+        let archive_disabled =
+            native_live.is_some() || scope.runtime == Runtime::Claude || row.worker;
+        let archive_label = if let Some(app) = native_live {
+            format!("Archive — {app}")
+        } else if scope.runtime == Runtime::Claude {
+            "Archive — unavailable in Claude Code".to_owned()
+        } else if row.worker {
+            "Archive — worker thread".to_owned()
+        } else {
+            "Archive thread…".to_owned()
         };
         let host_arch = host.clone();
         let key_arch = key.clone();
         let row_arch = row.clone();
         menu = menu.separator().item(
             crate::kit::menu_item(archive_label)
-                .disabled(native_live.is_some())
+                .disabled(archive_disabled)
                 .on_click(move |_, window, cx| {
                     let _ = host_arch.update(cx, |s, cx| {
                         s.activate_row_with_action(

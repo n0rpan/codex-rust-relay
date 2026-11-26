@@ -581,6 +581,10 @@ impl Workbench {
         }
         match action {
             DeferredRowAction::Archive => {
+                if !store.can_edit_thread_metadata() {
+                    self.pending_row_action = None;
+                    return;
+                }
                 if !store.can_manage_thread(&id) {
                     return;
                 }

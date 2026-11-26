@@ -53,11 +53,11 @@ impl Workbench {
         self.action(cx, action);
     }
     pub(crate) fn request_archive(&mut self, id: String, cx: &mut Context<Self>) {
-        if self
-            .store
-            .as_ref()
-            .is_some_and(|store| store.can_manage_thread(&id) && !store.is_native_live(&id))
-        {
+        if self.store.as_ref().is_some_and(|store| {
+            store.can_manage_thread(&id)
+                && store.can_edit_thread_metadata()
+                && !store.is_native_live(&id)
+        }) {
             self.thread_edit = Some(ThreadEdit::Archive(id));
             cx.notify();
         }
