@@ -66,6 +66,7 @@ pub(crate) fn update_preference_at<T: serde::de::DeserializeOwned + Serialize>(
 
 enum WriteTask {
     Layout(crate::views::host::layout::Layout),
+    Sidebar(crate::sidebar_state::SidebarState),
     Save(PathBuf, Route),
     Flush(flume::Sender<()>),
 }
@@ -84,6 +85,16 @@ fn writer() -> &'static std::sync::mpsc::Sender<WriteTask> {
                             )
                         {
                             eprintln!("Could not save desktop layout: {e}")
+                        }
+                    }
+                    WriteTask::Sidebar(state) => {
+                        if let Some(path) = path()
+                            && let Err(e) = crate::sidebar_state::SidebarState::save_at(
+                                &path.with_file_name("sidebar.json"),
+                                state,
+                            )
+                        {
+                            eprintln!("Could not save sidebar metadata: {e}")
                         }
                     }
                     WriteTask::Flush(done) => {
@@ -109,6 +120,9 @@ fn writer() -> &'static std::sync::mpsc::Sender<WriteTask> {
 }
 pub fn remember_layout(layout: crate::views::host::layout::Layout) {
     let _ = writer().send(WriteTask::Layout(layout));
+}
+pub fn remember_sidebar(state: crate::sidebar_state::SidebarState) {
+    let _ = writer().send(WriteTask::Sidebar(state));
 }
 pub fn finish_writes(cx: &gpui::App) {
     cx.on_app_quit(|_| {

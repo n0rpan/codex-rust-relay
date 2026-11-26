@@ -13,7 +13,7 @@ use std::{collections::HashMap, path::PathBuf, time::Instant};
 
 pub(super) mod empty;
 mod review;
-mod thread_menu;
+pub(super) mod thread_menu;
 mod usage;
 mod worker;
 
@@ -156,10 +156,9 @@ impl Workbench {
         Self::build(
             project,
             route,
-            first_frame,
+            Some(first_frame),
             stats,
             route_models,
-            true,
             window,
             cx,
         )
@@ -175,19 +174,21 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(project, route, None, stats, route_models, false, window, cx)
+        Self::build(project, route, None, stats, route_models, window, cx)
     }
 
+    /// `active`: `Some(first_frame)` starts connected as the front pane; `None` starts lazy.
     fn build(
         project: PathBuf,
         route: Route,
-        first_frame: Option<Instant>,
+        active: Option<Option<Instant>>,
         stats: bool,
         route_models: Entity<Vec<String>>,
-        front: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let front = active.is_some();
+        let first_frame = active.flatten();
         cx.observe_window_activation(window, |s, window, cx| {
             if s.front {
                 cx.notify();

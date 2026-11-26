@@ -122,6 +122,13 @@ impl Host {
                             cx.notify();
                         }
                     }
+                } else if host.sidebar_edit.is_some()
+                    && key.key == "escape"
+                    && key.modifiers == Modifiers::default()
+                {
+                    host.sidebar_edit = None;
+                    window.focus(&host.list_focus, cx);
+                    cx.notify();
                 } else if host.drawer_open
                     && key.key == "escape"
                     && key.modifiers == Modifiers::default()
@@ -413,13 +420,29 @@ impl Host {
                         runtime: p.route.runtime,
                         api: r.saved_claude_api().unwrap_or(p.route.is_api()),
                     };
+                    let mkey = crate::sidebar_state::ThreadMetaKey::new(
+                        p.project.clone(),
+                        scope.runtime,
+                        r.id.clone(),
+                    );
+                    let meta = self.sidebar.thread(&mkey);
+                    if meta.is_some_and(|m| m.hidden) {
+                        continue;
+                    }
                     if self.archived(&p.project, scope, &r.id, cx)
                         || !threads.insert((&p.project, scope, &r.id))
                     {
                         continue;
                     }
+                    let target = Target::Thread(i, r.id.clone());
                     if let Some(score) = search::preview_rank(&query, &r.preview) {
-                        preview_matches.insert(Target::Thread(i, r.id.clone()), score);
+                        preview_matches.insert(target.clone(), score);
+                    }
+                    if let Some(score) = search::preview_rank(&query, r.title()) {
+                        preview_matches
+                            .entry(target.clone())
+                            .and_modify(|s| *s = (*s).max(score))
+                            .or_insert(score);
                     }
                     let route = self
                         .project_row_state(&p.project, r, scope, cx)
@@ -432,36 +455,55 @@ impl Host {
                                 r.model.as_deref().unwrap_or("Choose model")
                             )
                         });
+                    let title = meta
+                        .and_then(|m| m.custom_title.clone())
+                        .unwrap_or_else(|| r.title().to_owned());
                     add(
-                        r.title().into(),
+                        title,
                         format!("Thread · {} · {route}", p.project.display()),
-                        Target::Thread(i, r.id.clone()),
+                        target,
                     );
                 }
             }
         }
         for saved in self.discovery.all() {
             let r = &saved.row;
+            let mkey = crate::sidebar_state::ThreadMetaKey::new(
+                r.cwd.clone(),
+                saved.scope.runtime,
+                r.id.clone(),
+            );
+            let meta = self.sidebar.thread(&mkey);
+            if meta.is_some_and(|m| m.hidden) {
+                continue;
+            }
             if self.archived(&r.cwd, saved.scope, &r.id, cx)
                 || !threads.insert((&r.cwd, saved.scope, &r.id))
             {
                 continue;
             }
+            let target = Target::Saved(r.cwd.clone(), saved.scope, r.id.clone());
             if let Some(score) = search::preview_rank(&query, &r.preview) {
-                preview_matches.insert(
-                    Target::Saved(r.cwd.clone(), saved.scope, r.id.clone()),
-                    score,
-                );
+                preview_matches.insert(target.clone(), score);
+            }
+            if let Some(score) = search::preview_rank(&query, r.title()) {
+                preview_matches
+                    .entry(target.clone())
+                    .and_modify(|s| *s = (*s).max(score))
+                    .or_insert(score);
             }
             let route = self.project_row_state(&r.cwd, r, saved.scope, cx).0;
             let label = route
                 .as_ref()
                 .map(Route::label)
                 .unwrap_or_else(|| r.model_provider.clone());
+            let title = meta
+                .and_then(|m| m.custom_title.clone())
+                .unwrap_or_else(|| r.title().to_owned());
             add(
-                r.title().into(),
+                title,
                 format!("Thread · {} · {label}", r.cwd.display()),
-                Target::Saved(r.cwd.clone(), saved.scope, r.id.clone()),
+                target,
             );
             if let Some(route) = route
                 && projects.insert(r.cwd.clone())

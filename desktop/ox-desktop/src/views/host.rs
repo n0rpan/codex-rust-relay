@@ -1,6 +1,7 @@
 //! One workbench per canonical project and billing route. Each owns its editors,
 //! server requests and connection for the lifetime of the window.
-use crate::appearance::Step;
+use crate::appearance::{AccentColor, Step};
+use crate::sidebar_state::{GroupingMode, SidebarState, ThreadMetaKey};
 mod discovery;
 use discovery::{Discovery, Location, Scope};
 pub(super) use discovery::{ParentIndex, ParentLink, TreeIndex};
@@ -22,8 +23,34 @@ use ox_desk_core::runtime::{Billing, Runtime};
 use ox_desk_core::store::{Connection, Route, ThreadRow};
 use std::{ops::Range, path::PathBuf, time::Instant};
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum CatalogEntry {
+    /// Top `★ Pinned` section header.
+    Pinned {
+        count: usize,
+        folded: bool,
+        running: usize,
+        waiting: usize,
+    },
+    /// User-defined named section header ("Inbox", "Review queue", …).
+    Section {
+        id: String,
+        name: String,
+        color: Option<AccentColor>,
+        count: usize,
+        folded: bool,
+        running: usize,
+        waiting: usize,
+    },
+    /// Auto-grouped project folder header (`ox`, `oxa`, …).
+    Project {
+        project: PathBuf,
+        color: Option<AccentColor>,
+        count: usize,
+        folded: bool,
+        running: usize,
+        waiting: usize,
+    },
     /// A day group header: its root-thread count and whether it is folded.
     Day {
         day: Option<chrono::NaiveDate>,
@@ -35,6 +62,24 @@ enum CatalogEntry {
         timestamp: i64,
         ordinal: usize,
         depth: usize,
+    },
+}
+
+/// Inline editor state for renaming a thread row or creating/renaming a user section in the sidebar.
+enum SidebarInlineEdit {
+    RenameThread {
+        key: ThreadMetaKey,
+        scope: Scope,
+        row: ThreadRow,
+        input: Entity<gpui_component::input::InputState>,
+    },
+    NewSection {
+        move_thread: Option<(ThreadMetaKey, ThreadRow, bool)>,
+        input: Entity<gpui_component::input::InputState>,
+    },
+    RenameSection {
+        id: String,
+        input: Entity<gpui_component::input::InputState>,
     },
 }
 
@@ -107,6 +152,8 @@ pub struct Host {
     sidebar_width: u32,
     resizing_sidebar: bool,
     saved_layouts: layout::SavedLayouts,
+    sidebar: SidebarState,
+    sidebar_edit: Option<SidebarInlineEdit>,
     filter: Entity<gpui_component::input::InputState>,
     filter_task: Option<Task<()>>,
     recent: LastWorkspace,
@@ -216,6 +263,8 @@ impl Host {
             sidebar_width: layout.side_width(),
             resizing_sidebar: false,
             saved_layouts,
+            sidebar: SidebarState::load(),
+            sidebar_edit: None,
             _palette_keys: Self::palette_keys(window, cx),
             model_picker: None,
             agent_picker: false,
@@ -974,6 +1023,17 @@ impl Host {
             },
         )
         .detach();
+        cx.subscribe(
+            pane,
+            |s, owner, event: &super::workbench::thread_menu::ThreadRenamed, cx| {
+                let view = owner.read(cx);
+                let key =
+                    ThreadMetaKey::new(view.project.clone(), view.route.runtime, event.id.clone());
+                s.sidebar.set_custom_title(&key, Some(event.name.clone()));
+                s.save_sidebar(cx);
+            },
+        )
+        .detach();
     }
     fn open_providers(
         &mut self,
@@ -1099,11 +1159,12 @@ impl Host {
     /// The status filter as one quiet icon menu in the search row. Each choice sets the
     /// same `is:` token the search box accepts; "All" clears it.
     fn filter_menu(&self, p: Palette, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        const CHOICES: [(&str, &str); 4] = [
+        const CHOICES: [(&str, &str); 5] = [
             ("", "All"),
             ("is:running", "Running"),
             ("is:waiting", "Needs you"),
             ("is:finished", "Finished"),
+            ("is:pinned", "Pinned"),
         ];
         let current = self.filter.read(cx).value().to_string();
         let active = CHOICES
@@ -1116,6 +1177,8 @@ impl Host {
             None => "Filter threads".to_owned(),
         };
         let filter = self.filter.clone();
+        let grouping = self.sidebar.grouping;
+        let host = cx.weak_entity();
         crate::kit::icon(
             p,
             "thread-filter",
@@ -1141,9 +1204,209 @@ impl Host {
                     },
                 ));
             }
+            let host_folders = host.clone();
+            let host_timeline = host.clone();
+            let host_new_sec = host.clone();
+            menu = menu
+                .separator()
+                .label("Group by")
+                .item(
+                    crate::kit::menu_item("Project folders")
+                        .checked(grouping == GroupingMode::Folders)
+                        .on_click(move |_, _, cx| {
+                            let _ = host_folders.update(cx, |s, cx| {
+                                s.sidebar.grouping = GroupingMode::Folders;
+                                s.save_sidebar(cx);
+                            });
+                        }),
+                )
+                .item(
+                    crate::kit::menu_item("Timeline (by day)")
+                        .checked(grouping == GroupingMode::Timeline)
+                        .on_click(move |_, _, cx| {
+                            let _ = host_timeline.update(cx, |s, cx| {
+                                s.sidebar.grouping = GroupingMode::Timeline;
+                                s.save_sidebar(cx);
+                            });
+                        }),
+                )
+                .separator()
+                .item(
+                    crate::kit::menu_item("New section…").on_click(move |_, window, cx| {
+                        let _ = host_new_sec.update(cx, |s, cx| {
+                            s.begin_new_section(None, window, cx);
+                        });
+                    }),
+                );
             menu
         })
     }
+    pub(super) fn save_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.discovery.revision += 1;
+        crate::workspace_state::remember_sidebar(self.sidebar.clone());
+        cx.notify();
+    }
+
+    fn begin_row_rename(
+        &mut self,
+        key: ThreadMetaKey,
+        scope: Scope,
+        row: ThreadRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let initial = self
+            .sidebar
+            .thread(&key)
+            .and_then(|m| m.custom_title.as_deref())
+            .unwrap_or_else(|| row.title());
+        let input = crate::kit::field(initial, "Thread name", false, window, cx);
+        let focus = input.read(cx).focus_handle(cx);
+        window.on_next_frame(move |w, cx| focus.focus(w, cx));
+        cx.subscribe_in(
+            &input,
+            window,
+            |s, field, event: &gpui_component::input::InputEvent, window, cx| {
+                if matches!(event, gpui_component::input::InputEvent::PressEnter { .. })
+                    && matches!(
+                        &s.sidebar_edit,
+                        Some(SidebarInlineEdit::RenameThread { input, .. }) if input == field
+                    )
+                {
+                    s.commit_sidebar_edit(window, cx);
+                }
+            },
+        )
+        .detach();
+        self.sidebar_edit = Some(SidebarInlineEdit::RenameThread {
+            key,
+            scope,
+            row,
+            input,
+        });
+        cx.notify();
+    }
+
+    fn begin_new_section(
+        &mut self,
+        move_thread: Option<(ThreadMetaKey, ThreadRow, bool)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = crate::kit::field("", "New section name…", false, window, cx);
+        let focus = input.read(cx).focus_handle(cx);
+        window.on_next_frame(move |w, cx| focus.focus(w, cx));
+        cx.subscribe_in(
+            &input,
+            window,
+            |s, field, event: &gpui_component::input::InputEvent, window, cx| {
+                if matches!(event, gpui_component::input::InputEvent::PressEnter { .. })
+                    && matches!(
+                        &s.sidebar_edit,
+                        Some(SidebarInlineEdit::NewSection { input, .. }) if input == field
+                    )
+                {
+                    s.commit_sidebar_edit(window, cx);
+                }
+            },
+        )
+        .detach();
+        self.sidebar_edit = Some(SidebarInlineEdit::NewSection { move_thread, input });
+        cx.notify();
+    }
+
+    fn begin_rename_section(
+        &mut self,
+        id: String,
+        current_name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = crate::kit::field(current_name, "Section name…", false, window, cx);
+        let focus = input.read(cx).focus_handle(cx);
+        window.on_next_frame(move |w, cx| focus.focus(w, cx));
+        cx.subscribe_in(
+            &input,
+            window,
+            |s, field, event: &gpui_component::input::InputEvent, window, cx| {
+                if matches!(event, gpui_component::input::InputEvent::PressEnter { .. })
+                    && matches!(
+                        &s.sidebar_edit,
+                        Some(SidebarInlineEdit::RenameSection { input, .. }) if input == field
+                    )
+                {
+                    s.commit_sidebar_edit(window, cx);
+                }
+            },
+        )
+        .detach();
+        self.sidebar_edit = Some(SidebarInlineEdit::RenameSection { id, input });
+        cx.notify();
+    }
+
+    fn commit_sidebar_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.sidebar_edit.take() else {
+            return;
+        };
+        match edit {
+            SidebarInlineEdit::RenameThread {
+                key,
+                scope,
+                row,
+                input,
+            } => {
+                let name = input.read(cx).value().trim().to_owned();
+                if name.is_empty() {
+                    cx.notify();
+                    return;
+                }
+                self.sidebar.set_custom_title(&key, Some(name.clone()));
+                self.sidebar.thread_mut(&key).cache_from(&row, scope.api);
+                self.sidebar.set_custom_title(&key, Some(name.clone()));
+                // Also dispatch RenameThread to any connected pane owning this thread, or
+                // open & rename if this is the active project.
+                for pane in &self.panes {
+                    let matches = {
+                        let p = pane.read(cx);
+                        p.project == key.project
+                            && scope.matches(&p.route)
+                            && p.store
+                                .as_ref()
+                                .is_some_and(|s| s.can_manage_thread(&key.id))
+                    };
+                    if matches {
+                        pane.update(cx, |p, cx| {
+                            p.action(cx, DeskAction::RenameThread(key.id.clone(), name.clone()));
+                        });
+                    }
+                }
+                self.save_sidebar(cx);
+            }
+            SidebarInlineEdit::NewSection { move_thread, input } => {
+                let name = input.read(cx).value().trim().to_owned();
+                if !name.is_empty() {
+                    self.sidebar.grouping = GroupingMode::Folders;
+                    let id = self.sidebar.create_section(name, Some(AccentColor::Cobalt));
+                    if let Some((key, row, api)) = move_thread {
+                        self.sidebar.move_to_section(&key, Some(id), &row, api);
+                    }
+                    self.save_sidebar(cx);
+                } else {
+                    cx.notify();
+                }
+            }
+            SidebarInlineEdit::RenameSection { id, input } => {
+                let name = input.read(cx).value().trim().to_owned();
+                if self.sidebar.rename_section(&id, name) {
+                    self.save_sidebar(cx);
+                } else {
+                    cx.notify();
+                }
+            }
+        }
+        let _ = window;
+    }
+
     fn search(&mut self, query: String, cx: &mut Context<Self>) {
         for pane in &self.panes {
             if pane.read(cx).query != query {
@@ -1281,7 +1544,7 @@ impl Host {
             .and_then(|s| s.selected());
         let current = selected.and_then(|id| {
             self.catalog.iter().position(|entry| {
-                self.located_entry(*entry, cx)
+                self.located_entry(entry, cx)
                     .is_some_and(|(r, project, scope)| {
                         r.id == id
                             && project == self.panes[self.active].read(cx).project
@@ -1289,16 +1552,67 @@ impl Host {
                     })
             })
         });
+        if let Some(pos) = current
+            && let Some((row, project, scope)) = self
+                .catalog
+                .get(pos)
+                .and_then(|e| self.located_entry(e, cx))
+        {
+            let row = row.clone();
+            let project = project.to_path_buf();
+            let key = ThreadMetaKey::new(project.clone(), scope.runtime, row.id.clone());
+            match event.keystroke.key.as_str() {
+                "p" => {
+                    let now = chrono::Local::now().timestamp();
+                    self.sidebar.toggle_pin(&key, &row, scope.api, now);
+                    self.save_sidebar(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "u" => {
+                    let currently_unread = self
+                        .sidebar
+                        .thread(&key)
+                        .and_then(|m| m.unread_override)
+                        .unwrap_or(row.unread);
+                    self.sidebar
+                        .set_unread_override(&key, Some(!currently_unread));
+                    self.save_sidebar(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "c" => {
+                    let current_color = self.sidebar.thread(&key).and_then(|m| m.color);
+                    self.sidebar
+                        .set_thread_color(&key, AccentColor::next(current_color));
+                    self.save_sidebar(cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "r" | "f2" => {
+                    self.begin_row_rename(key, scope, row, window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "/" => {
+                    let focus = self.filter.read(cx).focus_handle(cx);
+                    window.focus(&focus, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
         let rows = self
             .catalog
             .iter()
             .enumerate()
-            .filter_map(|(i, e)| Some((i, self.located_entry(*e, cx)?)));
+            .filter_map(|(i, e)| Some((i, self.located_entry(e, cx)?)));
         let target = match event.keystroke.key.as_str() {
             "home" => rows.into_iter().next(),
             "end" => rows.into_iter().next_back(),
-            "up" => rows.rev().find(|(i, _)| current.is_none_or(|pos| *i < pos)),
-            "down" => rows
+            "up" | "k" => rows.rev().find(|(i, _)| current.is_none_or(|pos| *i < pos)),
+            "down" | "j" => rows
                 .into_iter()
                 .find(|(i, _)| current.is_none_or(|pos| *i > pos)),
             _ => return,
@@ -1311,6 +1625,417 @@ impl Host {
         cx.stop_propagation();
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn render_section_header(
+        p: Palette,
+        width: Pixels,
+        id: SharedString,
+        title: SharedString,
+        count: usize,
+        folded: bool,
+        running: usize,
+        waiting: usize,
+        accent: Option<AccentColor>,
+        is_pinned: bool,
+        menu_builder: Option<crate::kit::RowMenuBuilder>,
+        toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        use gpui_component::menu::ContextMenuExt;
+        let label = format!(
+            "{title}, {count} {}",
+            if count == 1 { "thread" } else { "threads" }
+        );
+        let dot_color = accent.map(|c| p.thread_accent(c));
+        let btn = crate::kit::nav_row(id.clone(), label, 24., true, toggle).child(
+            row()
+                .w_full()
+                .gap(px(SPACE_S))
+                .when(is_pinned, |r| {
+                    r.child(
+                        div()
+                            .font_family(crate::appearance::LABEL_FONT)
+                            .text_size(p.text(Step::Label))
+                            .text_color(rgb(p.accent))
+                            .child("★"),
+                    )
+                })
+                .when_some(dot_color, |r, c| {
+                    r.child(div().size(px(6.)).rounded_full().bg(rgb(c)))
+                })
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(p.text(Step::Meta))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(if is_pinned { p.accent } else { p.quiet() }))
+                        .child(title.clone()),
+                )
+                .child(
+                    div()
+                        .font_family(crate::appearance::LABEL_FONT)
+                        .text_size(p.text(Step::Label))
+                        .text_color(rgb(p.quiet()))
+                        .child(count.to_string()),
+                )
+                .when(waiting > 0, |r| {
+                    r.child(
+                        row()
+                            .gap(px(3.))
+                            .child(div().size(px(6.)).rounded_full().bg(rgb(p.warning)))
+                            .child(
+                                div()
+                                    .font_family(crate::appearance::LABEL_FONT)
+                                    .text_size(p.text(Step::Label) * 0.9)
+                                    .text_color(rgb(p.warning))
+                                    .child(waiting.to_string()),
+                            ),
+                    )
+                })
+                .when(running > 0, |r| {
+                    r.child(
+                        row()
+                            .gap(px(3.))
+                            .child(div().size(px(6.)).rounded_full().bg(rgb(p.success)))
+                            .child(
+                                div()
+                                    .font_family(crate::appearance::LABEL_FONT)
+                                    .text_size(p.text(Step::Label) * 0.9)
+                                    .text_color(rgb(p.success))
+                                    .child(running.to_string()),
+                            ),
+                    )
+                })
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_size(p.text(Step::Label))
+                        .text_color(rgb(p.quiet()))
+                        .child(if folded { "▸" } else { "▾" }),
+                ),
+        );
+        let inner: AnyElement = match menu_builder {
+            Some(build) => btn
+                .context_menu(move |menu, w, cx| build(menu, w, cx))
+                .into_any_element(),
+            None => btn.into_any_element(),
+        };
+        div()
+            .w(width)
+            .h(px(crate::kit::ROW_HEIGHT))
+            .px(px(crate::kit::GUTTER))
+            .flex()
+            .flex_col()
+            .justify_end()
+            .child(inner)
+            .into_any_element()
+    }
+
+    /// Keys of sibling root threads in the same sidebar group (Pinned, user section, or project folder)
+    /// as `target`, in their current rendered order.
+    fn sibling_group_keys(&self, target: &ThreadMetaKey, cx: &App) -> Vec<ThreadMetaKey> {
+        let target_meta = self.sidebar.thread(target);
+        let target_pinned = target_meta.and_then(|m| m.pinned_at).is_some();
+        let target_section = target_meta.and_then(|m| m.section.clone());
+        let mut group = Vec::new();
+        for entry in &self.catalog {
+            if let CatalogEntry::Thread { depth: 0, .. } = entry
+                && let Some((row, project, scope)) = self.located_entry(entry, cx)
+            {
+                let key = ThreadMetaKey::new(project.to_path_buf(), scope.runtime, row.id.clone());
+                let meta = self.sidebar.thread(&key);
+                let pinned = meta.and_then(|m| m.pinned_at).is_some();
+                let section = meta.and_then(|m| m.section.clone());
+                let same_group = if target_pinned {
+                    pinned
+                } else if target_section.is_some() {
+                    !pinned && section == target_section
+                } else {
+                    !pinned && section.is_none() && project == target.project
+                };
+                if same_group && !group.contains(&key) {
+                    group.push(key);
+                }
+            }
+        }
+        group
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_thread_row_menu(
+        mut menu: gpui_component::menu::PopupMenu,
+        host: WeakEntity<Self>,
+        key: ThreadMetaKey,
+        scope: Scope,
+        row: ThreadRow,
+        pinned: bool,
+        thread_color: Option<AccentColor>,
+        thread_section: Option<String>,
+        sections: Vec<(String, String)>,
+        unread: bool,
+        native_live: Option<&'static str>,
+        can_end: bool,
+        custom_title: bool,
+        window: &mut Window,
+        cx: &mut Context<gpui_component::menu::PopupMenu>,
+    ) -> gpui_component::menu::PopupMenu {
+        let host_pin = host.clone();
+        let key_pin = key.clone();
+        let row_pin = row.clone();
+        let pin_label = if pinned { "Unpin thread" } else { "Pin thread" };
+        menu = menu.item(crate::kit::menu_item(pin_label).on_click(move |_, _, cx| {
+            let _ = host_pin.update(cx, |s, cx| {
+                let now = chrono::Local::now().timestamp();
+                s.sidebar.toggle_pin(&key_pin, &row_pin, scope.api, now);
+                s.save_sidebar(cx);
+            });
+        }));
+        let host_ren = host.clone();
+        let key_ren = key.clone();
+        let row_ren = row.clone();
+        menu = menu.item(
+            crate::kit::menu_item("Rename thread…").on_click(move |_, window, cx| {
+                let _ = host_ren.update(cx, |s, cx| {
+                    s.begin_row_rename(key_ren.clone(), scope, row_ren.clone(), window, cx);
+                });
+            }),
+        );
+        let host_gen = host.clone();
+        let key_gen = key.clone();
+        let row_gen = row.clone();
+        let gen_label = if custom_title {
+            "Generate title — custom name set"
+        } else {
+            "Generate title"
+        };
+        menu = menu.item(
+            crate::kit::menu_item(gen_label)
+                .disabled(custom_title)
+                .on_click(move |_, window, cx| {
+                    let _ = host_gen.update(cx, |s, cx| {
+                        s.activate_row(key_gen.project.clone(), scope, row_gen.clone(), window, cx);
+                        let id = key_gen.id.clone();
+                        s.panes[s.active].update(cx, |p, cx| {
+                            p.action(cx, DeskAction::GenerateTitle(id));
+                        });
+                    });
+                }),
+        );
+        let host_col = host.clone();
+        let key_col = key.clone();
+        menu = menu.submenu("Colour", window, cx, move |mut sub, _, _| {
+            for choice in AccentColor::ALL {
+                let host_c = host_col.clone();
+                let key_c = key_col.clone();
+                sub = sub.item(
+                    crate::kit::menu_item(choice.label())
+                        .checked(thread_color == Some(choice))
+                        .on_click(move |_, _, cx| {
+                            let _ = host_c.update(cx, |s, cx| {
+                                s.sidebar.set_thread_color(&key_c, Some(choice));
+                                s.save_sidebar(cx);
+                            });
+                        }),
+                );
+            }
+            let host_none = host_col.clone();
+            let key_none = key_col.clone();
+            sub.separator().item(
+                crate::kit::menu_item("No colour")
+                    .checked(thread_color.is_none())
+                    .on_click(move |_, _, cx| {
+                        let _ = host_none.update(cx, |s, cx| {
+                            s.sidebar.set_thread_color(&key_none, None);
+                            s.save_sidebar(cx);
+                        });
+                    }),
+            )
+        });
+        let host_move = host.clone();
+        let key_move = key.clone();
+        let row_move = row.clone();
+        let proj_label = key
+            .project
+            .file_name()
+            .map(|n| format!("Project folder ({})", n.to_string_lossy()))
+            .unwrap_or_else(|| "Project folder".into());
+        menu = menu.submenu("Move to", window, cx, move |mut sub, _, _| {
+            for (sec_id, sec_name) in &sections {
+                let host_s = host_move.clone();
+                let key_s = key_move.clone();
+                let row_s = row_move.clone();
+                let target_id = sec_id.clone();
+                sub = sub.item(
+                    crate::kit::menu_item(sec_name.clone())
+                        .checked(thread_section.as_deref() == Some(sec_id.as_str()))
+                        .on_click(move |_, _, cx| {
+                            let _ = host_s.update(cx, |s, cx| {
+                                s.sidebar.grouping = GroupingMode::Folders;
+                                s.sidebar.move_to_section(
+                                    &key_s,
+                                    Some(target_id.clone()),
+                                    &row_s,
+                                    scope.api,
+                                );
+                                s.save_sidebar(cx);
+                            });
+                        }),
+                );
+            }
+            let host_proj = host_move.clone();
+            let key_proj = key_move.clone();
+            let row_proj = row_move.clone();
+            let host_new = host_move.clone();
+            let key_new = key_move.clone();
+            let row_new = row_move.clone();
+            sub.separator()
+                .item(
+                    crate::kit::menu_item(proj_label.clone())
+                        .checked(thread_section.is_none())
+                        .on_click(move |_, _, cx| {
+                            let _ = host_proj.update(cx, |s, cx| {
+                                s.sidebar
+                                    .move_to_section(&key_proj, None, &row_proj, scope.api);
+                                s.save_sidebar(cx);
+                            });
+                        }),
+                )
+                .item(
+                    crate::kit::menu_item("New section…").on_click(move |_, window, cx| {
+                        let _ = host_new.update(cx, |s, cx| {
+                            s.begin_new_section(
+                                Some((key_new.clone(), row_new.clone(), scope.api)),
+                                window,
+                                cx,
+                            );
+                        });
+                    }),
+                )
+        });
+        let host_up = host.clone();
+        let key_up = key.clone();
+        let host_down = host.clone();
+        let key_down = key.clone();
+        menu = menu
+            .item(
+                crate::kit::menu_item("Move up in section").on_click(move |_, _, cx| {
+                    let _ = host_up.update(cx, |s, cx| {
+                        let group = s.sibling_group_keys(&key_up, cx);
+                        s.sidebar.step_thread_order(&group, &key_up, -1);
+                        s.save_sidebar(cx);
+                    });
+                }),
+            )
+            .item(
+                crate::kit::menu_item("Move down in section").on_click(move |_, _, cx| {
+                    let _ = host_down.update(cx, |s, cx| {
+                        let group = s.sibling_group_keys(&key_down, cx);
+                        s.sidebar.step_thread_order(&group, &key_down, 1);
+                        s.save_sidebar(cx);
+                    });
+                }),
+            );
+        let host_unread = host.clone();
+        let key_unread = key.clone();
+        let unread_label = if unread { "Mark read" } else { "Mark unread" };
+        menu = menu.item(
+            crate::kit::menu_item(unread_label).on_click(move |_, _, cx| {
+                let _ = host_unread.update(cx, |s, cx| {
+                    s.sidebar.set_unread_override(&key_unread, Some(!unread));
+                    s.save_sidebar(cx);
+                });
+            }),
+        );
+        let host_find = host.clone();
+        let key_find = key.clone();
+        let row_find = row.clone();
+        menu = menu.item(crate::kit::menu_item("Find in transcript").on_click(
+            move |_, window, cx| {
+                let _ = host_find.update(cx, |s, cx| {
+                    s.activate_row(
+                        key_find.project.clone(),
+                        scope,
+                        row_find.clone(),
+                        window,
+                        cx,
+                    );
+                    s.panes[s.active].update(cx, |p, cx| p.find_in_transcript(window, cx));
+                });
+            },
+        ));
+        let copy_id = key.id.clone();
+        let copy_path = key.project.display().to_string();
+        let copy_title = row.title().to_owned();
+        menu = menu.submenu("Copy", window, cx, move |sub, _, _| {
+            let id_str = copy_id.clone();
+            let path_str = copy_path.clone();
+            let title_str = copy_title.clone();
+            sub.item(
+                crate::kit::menu_item("Thread ID").on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(id_str.clone()));
+                }),
+            )
+            .item(
+                crate::kit::menu_item("Project path").on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(path_str.clone()));
+                }),
+            )
+            .item(
+                crate::kit::menu_item("Thread title").on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(title_str.clone()));
+                }),
+            )
+        });
+        let archive_label = match native_live {
+            Some(app) => format!("Archive — {app}"),
+            None => "Archive thread…".to_owned(),
+        };
+        let host_arch = host.clone();
+        let key_arch = key.clone();
+        let row_arch = row.clone();
+        menu = menu.separator().item(
+            crate::kit::menu_item(archive_label)
+                .disabled(native_live.is_some())
+                .on_click(move |_, window, cx| {
+                    let _ = host_arch.update(cx, |s, cx| {
+                        s.activate_row(
+                            key_arch.project.clone(),
+                            scope,
+                            row_arch.clone(),
+                            window,
+                            cx,
+                        );
+                        let id = key_arch.id.clone();
+                        s.panes[s.active].update(cx, |p, cx| p.request_archive(id, cx));
+                    });
+                }),
+        );
+        if can_end {
+            let host_end = host.clone();
+            let key_end = key.clone();
+            let row_end = row.clone();
+            menu = menu.item(crate::kit::menu_item("End running session").on_click(
+                move |_, window, cx| {
+                    let _ = host_end.update(cx, |s, cx| {
+                        s.activate_row(key_end.project.clone(), scope, row_end.clone(), window, cx);
+                        let id = key_end.id.clone();
+                        s.panes[s.active].update(cx, |p, cx| p.request_end(id, cx));
+                    });
+                },
+            ));
+        }
+        let host_hide = host;
+        let key_hide = key;
+        menu.item(
+            crate::kit::menu_item("Remove from list").on_click(move |_, _, cx| {
+                let _ = host_hide.update(cx, |s, cx| {
+                    s.sidebar.set_hidden(&key_hide, true);
+                    s.save_sidebar(cx);
+                });
+            }),
+        )
+    }
+
     fn rows(
         &mut self,
         range: Range<usize>,
@@ -1319,11 +2044,20 @@ impl Host {
     ) -> Vec<AnyElement> {
         let p = Palette::get(cx);
         let active = self.panes[self.active].read(cx);
+        let active_project = active.project.clone();
+        let active_route = active.route.clone();
+        let active_selected = active
+            .store
+            .as_ref()
+            .and_then(|s| s.selected())
+            .map(str::to_owned);
         let mut measured = 0;
         let mut rows = Vec::with_capacity(range.len());
         let now = chrono::Local::now();
-        for &entry in self.catalog.get(range.clone()).unwrap_or_default() {
-            let (depth, timestamp) = match entry {
+        let entries: Vec<CatalogEntry> =
+            self.catalog.get(range.clone()).unwrap_or_default().to_vec();
+        for entry in entries {
+            let (depth, timestamp) = match &entry {
                 CatalogEntry::Thread {
                     ordinal,
                     depth,
@@ -1332,74 +2066,277 @@ impl Host {
                 } => {
                     if self.stats {
                         measured += 1;
-                        self.furthest_row = self.furthest_row.max(ordinal + 1);
+                        self.furthest_row = self.furthest_row.max(*ordinal + 1);
                     }
-                    (depth, timestamp)
+                    (*depth, *timestamp)
                 }
-                CatalogEntry::Day { day, count, folded } => {
-                    let title = day_label(day, now.date_naive());
-                    let label = format!(
-                        "{title}, {count} {}",
-                        if count == 1 { "thread" } else { "threads" }
-                    );
-                    rows.push(
-                        div()
-                            .w(width)
-                            .h(px(crate::kit::ROW_HEIGHT))
-                            .px(px(crate::kit::GUTTER))
-                            .flex()
-                            .flex_col()
-                            .justify_end()
-                            .child(
-                                crate::kit::nav_row(
-                                    SharedString::from(format!("day-{title}")),
-                                    label,
-                                    24.,
-                                    true,
-                                    cx.listener(move |s, _, _, cx| {
-                                        s.discovery.toggle_day(day);
-                                        cx.notify();
-                                    }),
-                                )
-                                .child(
-                                    row()
-                                        .w_full()
-                                        .gap(px(SPACE_S))
-                                        .child(
-                                            div()
-                                                .text_size(p.text(Step::Meta))
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .text_color(rgb(p.quiet()))
-                                                .child(title),
-                                        )
-                                        .child(
-                                            div()
-                                                .font_family(crate::appearance::LABEL_FONT)
-                                                .text_size(p.text(Step::Label))
-                                                .text_color(rgb(p.quiet()))
-                                                .child(count.to_string()),
-                                        )
-                                        .child(div().flex_1())
-                                        .child(
-                                            div()
-                                                .text_size(p.text(Step::Label))
-                                                .text_color(rgb(p.quiet()))
-                                                .child(if folded { "▸" } else { "▾" }),
-                                        ),
+                CatalogEntry::Pinned {
+                    count,
+                    folded,
+                    running,
+                    waiting,
+                } => {
+                    rows.push(Self::render_section_header(
+                        p,
+                        width,
+                        "section-pinned".into(),
+                        "Pinned".into(),
+                        *count,
+                        *folded,
+                        *running,
+                        *waiting,
+                        None,
+                        true,
+                        None,
+                        cx.listener(|s, _, _, cx| {
+                            s.sidebar.pinned_collapsed = !s.sidebar.pinned_collapsed;
+                            s.save_sidebar(cx);
+                        }),
+                    ));
+                    continue;
+                }
+                CatalogEntry::Section {
+                    id,
+                    name,
+                    color,
+                    count,
+                    folded,
+                    running,
+                    waiting,
+                } => {
+                    let sec_id = id.clone();
+                    let sec_name = name.clone();
+                    let sec_color = *color;
+                    let host = cx.weak_entity();
+                    let menu_sec_id = sec_id.clone();
+                    let menu_sec_name = sec_name.clone();
+                    let menu: crate::kit::RowMenuBuilder =
+                        std::rc::Rc::new(move |mut menu, window, cx| {
+                            let host_rename = host.clone();
+                            let id_rename = menu_sec_id.clone();
+                            let name_rename = menu_sec_name.clone();
+                            menu = menu.item(crate::kit::menu_item("Rename section…").on_click(
+                                move |_, window, cx| {
+                                    let _ = host_rename.update(cx, |s, cx| {
+                                        s.begin_rename_section(
+                                            id_rename.clone(),
+                                            &name_rename,
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                },
+                            ));
+                            let host_color = host.clone();
+                            let id_color = menu_sec_id.clone();
+                            menu =
+                                menu.submenu("Section colour", window, cx, move |mut sub, _, _| {
+                                    for choice in AccentColor::ALL {
+                                        let host_c = host_color.clone();
+                                        let id_c = id_color.clone();
+                                        sub = sub.item(
+                                            crate::kit::menu_item(choice.label())
+                                                .checked(sec_color == Some(choice))
+                                                .on_click(move |_, _, cx| {
+                                                    let _ = host_c.update(cx, |s, cx| {
+                                                        s.sidebar
+                                                            .set_section_color(&id_c, Some(choice));
+                                                        s.save_sidebar(cx);
+                                                    });
+                                                }),
+                                        );
+                                    }
+                                    let host_none = host_color.clone();
+                                    let id_none = id_color.clone();
+                                    sub.separator().item(
+                                        crate::kit::menu_item("No colour")
+                                            .checked(sec_color.is_none())
+                                            .on_click(move |_, _, cx| {
+                                                let _ = host_none.update(cx, |s, cx| {
+                                                    s.sidebar.set_section_color(&id_none, None);
+                                                    s.save_sidebar(cx);
+                                                });
+                                            }),
+                                    )
+                                });
+                            let host_up = host.clone();
+                            let id_up = menu_sec_id.clone();
+                            let host_down = host.clone();
+                            let id_down = menu_sec_id.clone();
+                            let host_del = host.clone();
+                            let id_del = menu_sec_id.clone();
+                            menu.separator()
+                                .item(crate::kit::menu_item("Move section up").on_click(
+                                    move |_, _, cx| {
+                                        let _ = host_up.update(cx, |s, cx| {
+                                            s.sidebar.move_section(&id_up, -1);
+                                            s.save_sidebar(cx);
+                                        });
+                                    },
+                                ))
+                                .item(crate::kit::menu_item("Move section down").on_click(
+                                    move |_, _, cx| {
+                                        let _ = host_down.update(cx, |s, cx| {
+                                            s.sidebar.move_section(&id_down, 1);
+                                            s.save_sidebar(cx);
+                                        });
+                                    },
+                                ))
+                                .separator()
+                                .item(crate::kit::menu_item("Delete section").on_click(
+                                    move |_, _, cx| {
+                                        let _ = host_del.update(cx, |s, cx| {
+                                            s.sidebar.delete_section(&id_del);
+                                            s.save_sidebar(cx);
+                                        });
+                                    },
+                                ))
+                        });
+                    rows.push(Self::render_section_header(
+                        p,
+                        width,
+                        SharedString::from(format!("section-{sec_id}")),
+                        SharedString::from(sec_name),
+                        *count,
+                        *folded,
+                        *running,
+                        *waiting,
+                        sec_color,
+                        false,
+                        Some(menu),
+                        cx.listener(move |s, _, _, cx| {
+                            s.sidebar.toggle_section_collapsed(&sec_id);
+                            s.save_sidebar(cx);
+                        }),
+                    ));
+                    continue;
+                }
+                CatalogEntry::Project {
+                    project,
+                    color,
+                    count,
+                    folded,
+                    running,
+                    waiting,
+                } => {
+                    let proj_path = project.clone();
+                    let proj_color = *color;
+                    let proj_name = proj_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or_else(|| proj_path.display().to_string());
+                    let host = cx.weak_entity();
+                    let menu_proj = proj_path.clone();
+                    let menu: crate::kit::RowMenuBuilder =
+                        std::rc::Rc::new(move |mut menu, window, cx| {
+                            let host_new = host.clone();
+                            let p_new = menu_proj.clone();
+                            menu = menu.item(
+                                crate::kit::menu_item("New session in project").on_click(
+                                    move |_, window, cx| {
+                                        let _ = host_new.update(cx, |s, cx| {
+                                            let route = s.recent.route(&p_new);
+                                            s.open(p_new.clone(), route, window, cx);
+                                            s.panes[s.active].update(cx, |pane, cx| {
+                                                pane.action(cx, DeskAction::NewDraft);
+                                            });
+                                        });
+                                    },
+                                ),
+                            );
+                            let host_color = host.clone();
+                            let p_color = menu_proj.clone();
+                            menu =
+                                menu.submenu("Folder colour", window, cx, move |mut sub, _, _| {
+                                    for choice in AccentColor::ALL {
+                                        let host_c = host_color.clone();
+                                        let p_c = p_color.clone();
+                                        sub = sub.item(
+                                            crate::kit::menu_item(choice.label())
+                                                .checked(proj_color == Some(choice))
+                                                .on_click(move |_, _, cx| {
+                                                    let _ = host_c.update(cx, |s, cx| {
+                                                        s.sidebar
+                                                            .set_project_color(&p_c, Some(choice));
+                                                        s.save_sidebar(cx);
+                                                    });
+                                                }),
+                                        );
+                                    }
+                                    let host_none = host_color.clone();
+                                    let p_none = p_color.clone();
+                                    sub.separator().item(
+                                        crate::kit::menu_item("No colour")
+                                            .checked(proj_color.is_none())
+                                            .on_click(move |_, _, cx| {
+                                                let _ = host_none.update(cx, |s, cx| {
+                                                    s.sidebar.set_project_color(&p_none, None);
+                                                    s.save_sidebar(cx);
+                                                });
+                                            }),
+                                    )
+                                });
+                            let p_copy = menu_proj.display().to_string();
+                            menu.separator().item(
+                                crate::kit::menu_item("Copy project path").on_click(
+                                    move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            p_copy.clone(),
+                                        ));
+                                    },
                                 ),
                             )
-                            .into_any_element(),
-                    );
+                        });
+                    rows.push(Self::render_section_header(
+                        p,
+                        width,
+                        SharedString::from(format!("project-folder-{}", proj_path.display())),
+                        SharedString::from(proj_name),
+                        *count,
+                        *folded,
+                        *running,
+                        *waiting,
+                        proj_color,
+                        false,
+                        Some(menu),
+                        cx.listener(move |s, _, _, cx| {
+                            s.sidebar.toggle_project_collapsed(&proj_path);
+                            s.save_sidebar(cx);
+                        }),
+                    ));
+                    continue;
+                }
+                CatalogEntry::Day { day, count, folded } => {
+                    let day_val = *day;
+                    let title = day_label(day_val, now.date_naive());
+                    rows.push(Self::render_section_header(
+                        p,
+                        width,
+                        SharedString::from(format!("day-{title}")),
+                        SharedString::from(title),
+                        *count,
+                        *folded,
+                        0,
+                        0,
+                        None,
+                        false,
+                        None,
+                        cx.listener(move |s, _, _, cx| {
+                            s.discovery.toggle_day(day_val);
+                            cx.notify();
+                        }),
+                    ));
                     continue;
                 }
             };
-            let Some((t, project, scope)) = self.located_entry(entry, cx) else {
+            let Some((t, project, scope)) = self.located_entry(&entry, cx) else {
                 continue;
             };
             let (route, status) = self.project_row_state(project, t, scope, cx);
             let confirmed_model = match entry {
                 CatalogEntry::Thread { loc, .. } => self.actual_model_at(loc, cx),
-                CatalogEntry::Day { .. } => None,
+                _ => None,
             };
             let api = scope.api;
             let badge = {
@@ -1450,6 +2387,54 @@ impl Host {
                 });
             let row = t.clone();
             let project = project.to_owned();
+            let meta_key = ThreadMetaKey::new(project.clone(), scope.runtime, t.id.clone());
+            if let Some(SidebarInlineEdit::RenameThread {
+                key: edit_key,
+                input,
+                ..
+            }) = &self.sidebar_edit
+                && *edit_key == meta_key
+            {
+                let input = input.clone();
+                rows.push(
+                    gpui::div()
+                        .w(width)
+                        .h(px(crate::kit::ROW_HEIGHT))
+                        .px(px(crate::kit::GUTTER))
+                        .flex()
+                        .items_center()
+                        .gap(px(SPACE_XS))
+                        .child(div().flex_1().min_w_0().child(crate::kit::input(&input)))
+                        .child(crate::kit::icon_button(
+                            p,
+                            "save-row-rename",
+                            "✓",
+                            "Save thread name",
+                            cx.listener(|s, _, w, cx| s.commit_sidebar_edit(w, cx)),
+                        ))
+                        .child(crate::kit::icon_button(
+                            p,
+                            "cancel-row-rename",
+                            "×",
+                            "Cancel rename",
+                            cx.listener(|s, _, _, cx| {
+                                s.sidebar_edit = None;
+                                cx.notify();
+                            }),
+                        ))
+                        .into_any_element(),
+                );
+                continue;
+            }
+            let meta = self.sidebar.thread(&meta_key);
+            let pinned = meta.and_then(|m| m.pinned_at).is_some();
+            let thread_color = meta.and_then(|m| m.color);
+            let effective_accent = self.sidebar.effective_color(&meta_key);
+            let thread_section = meta.and_then(|m| m.section.clone());
+            let custom_title = meta.and_then(|m| m.custom_title.clone());
+            let has_custom_title = custom_title.is_some();
+            let display_title = custom_title.unwrap_or_else(|| t.title().to_owned());
+            let unread = meta.and_then(|m| m.unread_override).unwrap_or(t.unread);
             let fold_key = (project.clone(), t.id.clone());
             let folded = tree.as_ref().is_some_and(|tree| tree.children > 0)
                 && self.discovery.collapsed.contains(&fold_key);
@@ -1468,9 +2453,17 @@ impl Host {
             } else {
                 activity::Cartridge::Codex
             };
+            let project_name = project
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let show_project_tag = pinned
+                || thread_section.is_some()
+                || self.sidebar.grouping == GroupingMode::Timeline;
             let model = crate::kit::ListRow {
                 cartridge,
-                title: t.title().into(),
+                title: display_title,
                 route: {
                     let mut route = if depth == 0
                         && let Some(hint) = parent_hint
@@ -1479,10 +2472,7 @@ impl Host {
                     } else if !t.worker && t.parent_thread_id.is_some() {
                         format!("Subagent · {badge}")
                     } else {
-                        format!(
-                            "{} · {badge}",
-                            project.file_name().unwrap_or_default().to_string_lossy()
-                        )
+                        format!("{project_name} · {badge}")
                     };
                     if let Some(tree) = tree.as_ref().filter(|tree| tree.children > 0) {
                         let noun = if tree.children == 1 {
@@ -1501,11 +2491,15 @@ impl Host {
                     route
                 },
                 age: age(now.timestamp(), timestamp),
-                status: status.or(t.unread.then_some("Unread")),
-                selected: active.project == project
-                    && scope.matches(&active.route)
-                    && active.store.as_ref().and_then(|s| s.selected()) == Some(&t.id),
+                status: status.or(unread.then_some("Unread")),
+                selected: active_project == project
+                    && scope.matches(&active_route)
+                    && active_selected.as_deref() == Some(t.id.as_str()),
                 depth,
+                pinned,
+                accent: effective_accent,
+                project_tag: (show_project_tag && depth == 0 && !project_name.is_empty())
+                    .then_some(project_name),
             };
             // The disclosure is a sibling of the row in the gutter, so it folds without
             // selecting and the row keeps the sidebar keyline.
@@ -1545,12 +2539,46 @@ impl Host {
                         cx.notify();
                     }))
             });
+            let native_live = match status {
+                Some("Live in Codex") => Some("Live in Codex"),
+                Some("Live in Claude Code") => Some("Live in Claude Code"),
+                _ => None,
+            };
+            let can_end = matches!(status, Some("Running" | "Needs you"));
+            let sections: Vec<(String, String)> = self
+                .sidebar
+                .sections
+                .iter()
+                .map(|s| (s.id.clone(), s.name.clone()))
+                .collect();
+            let host = cx.weak_entity();
+            let row_for_menu = row.clone();
+            let menu_builder: crate::kit::RowMenuBuilder =
+                std::rc::Rc::new(move |menu, window, cx| {
+                    Self::build_thread_row_menu(
+                        menu,
+                        host.clone(),
+                        meta_key.clone(),
+                        scope,
+                        row_for_menu.clone(),
+                        pinned,
+                        thread_color,
+                        thread_section.clone(),
+                        sections.clone(),
+                        unread,
+                        native_live,
+                        can_end,
+                        has_custom_title,
+                        window,
+                        cx,
+                    )
+                });
             rows.push(
                 gpui::div()
                     .w(width)
                     .relative()
                     .px(px(crate::kit::GUTTER))
-                    .child(model.render(
+                    .child(model.render_with_menu(
                         p,
                         SharedString::from(format!(
                             "thread-{}-{}-{}",
@@ -1558,6 +2586,7 @@ impl Host {
                             scope.api,
                             t.id
                         )),
+                        Some(menu_builder),
                         cx.listener(move |s, _, window, cx| {
                             window.focus(&s.list_focus, cx);
                             s.activate_row(project.clone(), scope, row.clone(), window, cx);
@@ -1776,6 +2805,11 @@ impl Host {
         } else {
             "Ctrl N"
         };
+        let section_editor = match &self.sidebar_edit {
+            Some(SidebarInlineEdit::NewSection { input, .. })
+            | Some(SidebarInlineEdit::RenameSection { input, .. }) => Some(input.clone()),
+            _ => None,
+        };
         let sidebar = col()
             .w(sidebar_width)
             .flex_shrink_0()
@@ -1868,6 +2902,32 @@ impl Host {
                     ),
                 ),
             )
+            .when_some(section_editor, |sidebar, input| {
+                sidebar.child(
+                    row()
+                        .pt(px(SPACE_S))
+                        .px(gutter)
+                        .gap(px(SPACE_XS))
+                        .child(div().flex_1().min_w_0().child(crate::kit::input(&input)))
+                        .child(crate::kit::icon_button(
+                            p,
+                            "save-section-name",
+                            "✓",
+                            "Save section",
+                            cx.listener(|s, _, w, cx| s.commit_sidebar_edit(w, cx)),
+                        ))
+                        .child(crate::kit::icon_button(
+                            p,
+                            "cancel-section-name",
+                            "×",
+                            "Cancel section edit",
+                            cx.listener(|s, _, _, cx| {
+                                s.sidebar_edit = None;
+                                cx.notify();
+                            }),
+                        )),
+                )
+            })
             .when_some(self.choose_route.clone(), |sidebar, (project, row)| {
                 let host = cx.weak_entity();
                 let aliases = self.models.read(cx).clone();
