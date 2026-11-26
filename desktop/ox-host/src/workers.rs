@@ -251,15 +251,11 @@ impl Registry {
     }
 }
 
-/// The level a hosted source grants its children: its confirmed live mode,
-/// further bounded by its own stamp when it is a worker or a fork of one. An
-/// unverified mode grants nothing.
-pub(crate) fn source_level(
-    runtime: Runtime,
-    access: Option<Access>,
-    origin: Option<&Origin>,
-) -> Option<Level> {
-    let live = Level::of(runtime, access?)?;
+/// The level a hosted source grants its children: the ceiling of its live
+/// settings (see `Store::applied_ceiling`), further bounded by its own stamp
+/// when it is a worker or a fork of one. An unverified mode grants nothing.
+pub(crate) fn source_level(live: Option<Level>, origin: Option<&Origin>) -> Option<Level> {
+    let live = live?;
     Some(match origin.and_then(Origin::limits_children) {
         Some(stamp) => live.min(stamp),
         None => live,
@@ -649,8 +645,8 @@ mod tests {
     #[test]
     fn workers_inherit_the_mapped_source_mode_and_unverified_modes_grant_nothing() {
         use ModeRequest::Inherit;
-        let codex = |a| source_level(Runtime::Codex, Some(a), None);
-        let claude = |a| source_level(Runtime::Claude, Some(a), None);
+        let codex = |a| source_level(Level::of(Runtime::Codex, a), None);
+        let claude = |a| source_level(Level::of(Runtime::Claude, a), None);
         // Workspace and Accept edits inherit across runtimes as each other.
         assert_eq!(
             level(grant(
@@ -680,7 +676,7 @@ mod tests {
             Ok((Level::Yolo, Access::BypassPermissions))
         );
         // Unverified or foreign presets grant nothing.
-        assert_eq!(source_level(Runtime::Codex, None, None), None);
+        assert_eq!(source_level(None, None), None);
         assert_eq!(codex(Access::Configured), None);
         assert_eq!(codex(Access::AcceptEdits), None);
         assert!(grant(None, false, Inherit, Runtime::Codex).is_err());
@@ -690,7 +686,7 @@ mod tests {
     #[test]
     fn requests_above_the_source_are_refused_and_lower_ones_start_there() {
         let c = Runtime::Codex;
-        let src = source_level(c, Some(Access::Workspace), None);
+        let src = source_level(Level::of(c, Access::Workspace), None);
         assert_eq!(
             level(grant(src, false, ModeRequest::Level(Level::Read), c)),
             Ok((Level::Read, Access::ReadOnly))
@@ -705,7 +701,7 @@ mod tests {
             assert!(grant(src, false, ModeRequest::Level(above), c).is_err());
         }
         // Legacy workspace_write: false is read, true is write, never above the source.
-        let read = source_level(c, Some(Access::ReadOnly), None);
+        let read = source_level(Level::of(c, Access::ReadOnly), None);
         assert!(grant(read, false, ModeRequest::legacy(Some(true)), c).is_err());
         assert_eq!(
             level(grant(read, false, ModeRequest::legacy(Some(false)), c)),
@@ -732,17 +728,17 @@ mod tests {
     fn ceilings_are_inherited_through_children_forks_and_continuation() {
         let read = worker(Level::Read, Runtime::Codex);
         // A read worker switched to YOLO by its operator still gives its children only read.
-        let src = source_level(Runtime::Codex, Some(Access::Yolo), Some(&read));
+        let src = source_level(Level::of(Runtime::Codex, Access::Yolo), Some(&read));
         assert_eq!(src, Some(Level::Read));
         assert!(grant(src, false, ModeRequest::Level(Level::Write), Runtime::Codex).is_err());
         let write = worker(Level::Write, Runtime::Codex);
-        let src = source_level(Runtime::Codex, Some(Access::Workspace), Some(&write));
+        let src = source_level(Level::of(Runtime::Codex, Access::Workspace), Some(&write));
         assert_eq!(
             level(grant(src, false, ModeRequest::Inherit, Runtime::Claude)),
             Ok((Level::Write, Access::AcceptEdits))
         );
         // A write worker lowered to read by its operator passes on read.
-        let src = source_level(Runtime::Codex, Some(Access::ReadOnly), Some(&write));
+        let src = source_level(Level::of(Runtime::Codex, Access::ReadOnly), Some(&write));
         assert_eq!(src, Some(Level::Read));
         // Forks and forks of forks keep the original stamp's ceiling and job.
         let fork = read.fork("w1");

@@ -625,6 +625,7 @@ impl Store {
                     thread.ready = false;
                     thread.loading = false;
                     thread.access = None;
+                    thread.ceiling = None;
                 }
                 return Ok(());
             }

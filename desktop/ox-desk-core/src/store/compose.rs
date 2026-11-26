@@ -878,7 +878,8 @@ impl Store {
             t.effort = o.effort.clone();
             t.tier = o.tier.clone();
         }
-        t.access = Some(reply.access);
+        t.access = Some(reply.permissions.access);
+        t.ceiling = reply.permissions.ceiling;
         t.verified = true;
         t.ready = true;
         s.owner = Some(id);

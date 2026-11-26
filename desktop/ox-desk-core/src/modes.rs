@@ -11,8 +11,10 @@
 //! | `classifier` | Auto-review | Auto                     |
 //! | `yolo`       | YOLO        | bypass permissions       |
 //!
-//! Codex `Configured`, a preset of the other runtime, or no confirmed preset is
-//! unverified and grants nothing.
+//! A preset of the other runtime, or no confirmed preset, is unverified and
+//! grants nothing. A Codex thread shown as `Configured` still has a ceiling
+//! when its effective settings verify one (`codex::access::Permissions`); a
+//! user-defined Codex profile or an unknown policy never does.
 use crate::runtime::{Access, Runtime};
 use serde::{Deserialize, Serialize};
 

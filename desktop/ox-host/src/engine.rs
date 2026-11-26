@@ -1798,19 +1798,19 @@ impl Engine {
     }
     fn accept_launch(&mut self, caller: &Caller, start: WorkerStart) -> Result<Accepted, String> {
         start.validate()?;
-        let (project, parent, access, parent_origin, external, parent_scope) = match caller {
+        let (project, parent, ceiling, parent_origin, external, parent_scope) = match caller {
             Caller::Hosted { scope, hint, .. } => {
                 let live = self
                     .running
                     .get(scope)
                     .ok_or("This OX helper's route is not open on the session host.")?;
                 let parent = crate::policy::single_parent(&live.store, hint.as_deref())?;
-                let access = live.store.applied_access(Some(&parent));
+                let ceiling = live.store.applied_ceiling(Some(&parent));
                 let origin = self.workers.get(scope, &parent).map(|e| e.origin.clone());
                 (
                     scope.project.clone(),
                     Some(parent),
-                    access,
+                    ceiling,
                     origin,
                     false,
                     Some(scope),
@@ -1826,12 +1826,12 @@ impl Engine {
                 {
                     return Err("Open the parent session before starting a worker from it.".into());
                 }
-                let access = live.store.applied_access(Some(parent));
+                let ceiling = live.store.applied_ceiling(Some(parent));
                 let origin = self.workers.get(scope, parent).map(|e| e.origin.clone());
                 (
                     scope.project.clone(),
                     Some(parent.clone()),
-                    access,
+                    ceiling,
                     origin,
                     false,
                     Some(scope),
@@ -1839,9 +1839,8 @@ impl Engine {
             }
             Caller::External(c) => (c.project.clone(), None, None, None, true, None),
         };
-        let source = parent_scope.and_then(|s| {
-            crate::workers::source_level(s.route.runtime, access, parent_origin.as_ref())
-        });
+        let source = parent_scope
+            .and_then(|_| crate::workers::source_level(ceiling, parent_origin.as_ref()));
         let resolved =
             crate::workers::grant(source, external, start.mode_request(), start.runtime)?;
         let this_parent = crate::workers::parent_ref(caller, parent.clone());

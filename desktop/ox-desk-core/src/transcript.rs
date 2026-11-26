@@ -51,6 +51,8 @@ pub struct Transcript {
     pub(crate) tier: Option<String>,
     pub(crate) command_notice: Option<String>,
     pub(crate) access: Option<crate::codex::access::Access>,
+    /// The level a Codex thread grants its children, read from the same reply as `access`.
+    pub(crate) ceiling: Option<crate::modes::Level>,
     pub(crate) error: Option<String>,
     pub(crate) active_turn: Option<String>,
     // Number of history rows inserted at the front, used to preserve the viewport.

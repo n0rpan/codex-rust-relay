@@ -557,11 +557,12 @@ impl Engine {
             .map(str::to_owned)
             .filter(|n| n != &start.source);
         let access = live.store.applied_access(Some(&start.source));
+        let ceiling = live.store.applied_ceiling(Some(&start.source));
         let src_origin = self
             .workers
             .get(&src, &start.source)
             .map(|e| e.origin.clone());
-        let level = crate::workers::source_level(src.route.runtime, access, src_origin.as_ref());
+        let level = crate::workers::source_level(ceiling, src_origin.as_ref());
         let resolved = match modes::resolve_operator(level, start.mode, start.runtime) {
             Ok(r) => r,
             Err(e) => fail!(e),

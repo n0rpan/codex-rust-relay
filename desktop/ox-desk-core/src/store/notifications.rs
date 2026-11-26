@@ -15,6 +15,20 @@ impl Store {
             self.transcript(id?).and_then(|t| t.access())
         }
     }
+    /// The level this session grants a worker or handoff target. A Codex
+    /// thread's comes from its effective settings and may exist for a
+    /// configured mode; elsewhere only a confirmed preset grants one.
+    pub fn applied_ceiling(&self, id: Option<&str>) -> Option<crate::modes::Level> {
+        let runtime = self.profile.route.runtime;
+        let preset = |access| crate::modes::Level::of(runtime, access);
+        if self.remote().is_some() || self.is_session_scoped() {
+            return self.applied_access(id).and_then(preset);
+        }
+        let t = self.transcript(id?)?;
+        // Both come from one reply; a ceiling never outlives its access.
+        t.access?;
+        t.ceiling
+    }
     pub fn next_access(&self) -> Option<crate::codex::access::Access> {
         self.next_preset
     }
@@ -87,10 +101,11 @@ impl Store {
                     t.model = Some(settings.model.clone());
                     t.tier = settings.service_tier;
                     t.effort = settings.effort;
-                    if t.access != Some(settings.access) {
+                    if t.access != Some(settings.permissions.access) {
                         self.changed.mark(Changed::THREADS);
                     }
-                    t.access = Some(settings.access);
+                    t.access = Some(settings.permissions.access);
+                    t.ceiling = settings.permissions.ceiling;
                     if settings.provider != self.profile.provider || mismatch {
                         t.verified = false;
                         t.ready = false;
@@ -297,5 +312,92 @@ mod tests {
         store.state = Connection::SignInRequired;
         store.notification(notification()).unwrap();
         assert!(pending(&store).is_empty());
+    }
+
+    /// The host reads a source's worker ceiling from the store. Configured
+    /// stock settings verify one; a user-defined profile never does.
+    #[test]
+    fn a_codex_thread_ceiling_follows_its_effective_settings() {
+        use crate::codex::{access::Permissions, notice::EffectiveSettings};
+        use crate::modes::Level;
+        use crate::runtime::Access;
+        let project = std::env::temp_dir();
+        let link = Link::spawn(
+            Launch {
+                executable: "/bin/cat".into(),
+                arguments: vec![],
+                directory: project.clone(),
+                path: "/usr/bin:/bin".into(),
+            },
+            |_| {},
+        )
+        .unwrap();
+        let mut store = Store::open(
+            Profile {
+                project,
+                route: Route::CODEX_SUBSCRIPTION,
+                provider: "openai".into(),
+            },
+            link,
+        )
+        .unwrap();
+        store.state = Connection::Ready;
+        store.edit(None, "Start".into());
+        store.submit(None).unwrap();
+        // thread/start of `sandbox_mode = "danger-full-access"` with the desktop's on-request.
+        let opened = serde_json::from_value(json!({
+            "thread":{"id":"thread","modelProvider":"openai","cwd":std::env::temp_dir()},
+            "modelProvider":"openai","model":"stock-model",
+            "sandbox":{"type":"dangerFullAccess"},"approvalPolicy":"on-request",
+            "approvalsReviewer":"user","activePermissionProfile":null
+        }))
+        .unwrap();
+        store.apply(LinkEvent::Frame(Frame::Reply {
+            id: RequestId::Number(store.seq),
+            result: Ok(Reply::Opened(opened)),
+        }));
+        let facts = |s: &Store| {
+            (
+                s.applied_access(Some("thread")),
+                s.applied_ceiling(Some("thread")),
+            )
+        };
+        assert_eq!(
+            facts(&store),
+            (Some(Access::Configured), Some(Level::Classifier))
+        );
+        let settings = |value: serde_json::Value| Notification::Settings {
+            thread: "thread".into(),
+            settings: EffectiveSettings {
+                permissions: Permissions::effective(&value),
+                model: "stock-model".into(),
+                provider: "openai".into(),
+                effort: None,
+                service_tier: None,
+            },
+        };
+        // thread/settings/updated after `permissions = "ci"`, a profile that denies /home.
+        store
+            .notification(settings(json!({
+                "sandboxPolicy":{"type":"readOnly","networkAccess":false},
+                "approvalPolicy":"on-request","approvalsReviewer":"user",
+                "activePermissionProfile":{"id":"ci","extends":null}
+            })))
+            .unwrap();
+        assert_eq!(facts(&store), (Some(Access::Configured), None));
+        // An explicit preset again.
+        store
+            .notification(settings(json!({
+                "sandboxPolicy":{"type":"workspaceWrite","writableRoots":[],"networkAccess":false,
+                                 "excludeTmpdirEnvVar":false,"excludeSlashTmp":false},
+                "approvalPolicy":"on-request","approvalsReviewer":"auto_review",
+                "activePermissionProfile":null
+            })))
+            .unwrap();
+        assert_eq!(
+            facts(&store),
+            (Some(Access::AutoReview), Some(Level::Classifier))
+        );
+        assert_eq!(store.applied_ceiling(Some("other")), None);
     }
 }

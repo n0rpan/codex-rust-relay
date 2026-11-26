@@ -104,6 +104,19 @@ fn installed_protocol() {
             "ThreadSettingsUpdateParams",
             "threadId approvalPolicy approvalsReviewer sandboxPolicy effort model serviceTier",
         ),
+        // Effective permissions, read by `codex::access::Permissions`.
+        (
+            "ThreadStartResponse",
+            "sandbox approvalPolicy approvalsReviewer",
+        ),
+        (
+            "ThreadResumeResponse",
+            "sandbox approvalPolicy approvalsReviewer",
+        ),
+        (
+            "ThreadForkResponse",
+            "sandbox approvalPolicy approvalsReviewer",
+        ),
         ("TurnStartParams", "threadId input effort serviceTier"),
         ("TurnSteerParams", "threadId input expectedTurnId"),
         ("TurnInterruptParams", "threadId turnId"),
