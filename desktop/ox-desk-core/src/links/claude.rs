@@ -28,6 +28,9 @@ pub struct Launch {
     /// A worker launch carries the shared worker contract (tools, sandbox
     /// settings); an ordinary session passes `None`.
     pub contract: Option<crate::claude_worker_contract::Contract>,
+    /// The exact subscription model a pinned worker runs, passed as `--model` so the
+    /// first inference already uses it. Ignored on an API route, whose alias is the model.
+    pub model: Option<String>,
 }
 #[derive(Clone, Debug)]
 pub enum Session {
@@ -77,6 +80,13 @@ impl Launch {
         match &self.billing {
             Billing::Subscription => {
                 cmd.arg("--subscription");
+                if let Some(model) = self
+                    .model
+                    .as_deref()
+                    .filter(|m| crate::claude_models::valid_model(m))
+                {
+                    cmd.args(["--model", model]);
+                }
             }
             Billing::Api(alias) => {
                 cmd.args(["--model", alias]);
@@ -438,6 +448,7 @@ mod tests {
             session: Session::New("id".into()),
             permission_mode: "acceptEdits".into(),
             contract,
+            model: None,
         };
         launch
             .command()
@@ -468,6 +479,31 @@ mod tests {
                 assert!(!plain.iter().any(|a| a == "--tools" || a == "--settings"));
             }
         }
+        // A pinned subscription worker runs its exact model from the first turn;
+        // an API route never takes a second model.
+        let pinned = |billing| {
+            Launch {
+                ox: "ox".into(),
+                path: "/usr/bin".into(),
+                project: "/".into(),
+                billing,
+                session: Session::New("id".into()),
+                permission_mode: "plan".into(),
+                contract: None,
+                model: Some("claude-fable-5-2".into()),
+            }
+            .command()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+        };
+        let sub = pinned(Billing::Subscription);
+        let at = sub.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(sub[at + 1], "claude-fable-5-2");
+        assert_eq!(sub[at - 1], "--subscription");
+        let api = pinned(Billing::Api("alias".into()));
+        assert_eq!(api.iter().filter(|a| *a == "--model").count(), 1);
+        assert!(!api.iter().any(|a| a == "claude-fable-5-2"));
         let mode = args(Billing::Subscription, None);
         let at = mode.iter().position(|a| a == "--permission-mode").unwrap();
         assert_eq!(mode[at + 1], "acceptEdits");

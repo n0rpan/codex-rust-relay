@@ -107,6 +107,9 @@ pub struct Store {
     /// The launch contract of each hosted Claude worker session, kept with the session so
     /// every relaunch (cold resume, resume after a host restart, fork) starts under it.
     worker_contracts: HashMap<String, crate::claude_worker_contract::Contract>,
+    /// The exact subscription model each pinned Claude worker session runs, kept like
+    /// its contract so a continuation never falls back to the account default.
+    worker_models: HashMap<String, String>,
     child_threads: HashMap<String, (String, PathBuf)>,
     next_preset: Option<crate::codex::access::Access>,
     selection: u64,
@@ -201,6 +204,7 @@ impl Store {
             resume_access: Default::default(),
             restored_drafts: Default::default(),
             worker_contracts: Default::default(),
+            worker_models: Default::default(),
             child_threads: Default::default(),
             next_preset: None,
             selection: 0,
@@ -277,6 +281,7 @@ impl Store {
         self.ended_threads = previous.ended_threads.clone();
         self.resume_access = std::mem::take(&mut previous.resume_access);
         self.worker_contracts = std::mem::take(&mut previous.worker_contracts);
+        self.worker_models = std::mem::take(&mut previous.worker_models);
         self.authorized_models = std::mem::take(&mut previous.authorized_models);
         self.next_options = previous.next_options.take();
         self.selected = previous.selected.clone();

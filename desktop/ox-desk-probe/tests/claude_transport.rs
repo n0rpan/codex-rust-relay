@@ -31,6 +31,7 @@ fn scripted_claude_permission_uses_its_captured_session() {
             billing: Billing::Subscription,
             permission_mode: "default".into(),
             contract: None,
+            model: None,
         },
         move |frame| {
             let _ = tx.send(frame);

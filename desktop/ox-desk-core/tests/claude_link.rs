@@ -54,6 +54,7 @@ fn spawn(
             session,
             permission_mode: mode.into(),
             contract: None,
+            model: None,
         },
         move |e| {
             let _ = tx.send(e);

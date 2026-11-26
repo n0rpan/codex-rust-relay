@@ -161,6 +161,22 @@ impl Engine {
         };
         let ready = live.store.state() == &Connection::Ready;
         let operators = self.operators();
+        // The models that answered, recorded as the runtime reports them, so status,
+        // the completion record and the worker view survive the process and restarts.
+        let answered: Vec<(String, Vec<String>)> = self
+            .workers
+            .in_scope(scope)
+            .filter_map(|(id, entry)| {
+                let models = live.store.claude_answering_models(id);
+                (!models.is_empty() && !entry.marks.has_models(models))
+                    .then(|| (id.to_owned(), models.to_vec()))
+            })
+            .collect();
+        for (id, models) in &answered {
+            if let Some(entry) = self.workers.get_mut(scope, id) {
+                entry.marks.record_models(models);
+            }
+        }
         let mut updates: Vec<(String, Option<crate::workers::Last>)> = Vec::new();
         for (id, entry) in self.workers.in_scope(scope) {
             if entry.origin.relation != Relation::Worker || entry.marks.cancelled {
@@ -177,6 +193,7 @@ impl Engine {
                         status: status["status"].as_str().unwrap_or("completed").to_owned(),
                         result: status["result"].as_str().map(str::to_owned),
                         error: status["error"].as_str().map(str::to_owned),
+                        model: status["actual_model"].as_str().map(str::to_owned),
                     }))
                 }
                 // A stop the runtime confirmed, with the partial text it left. A route that
@@ -188,6 +205,7 @@ impl Engine {
                         status: "interrupted".to_owned(),
                         result: status["result"].as_str().map(str::to_owned),
                         error: None,
+                        model: status["actual_model"].as_str().map(str::to_owned),
                     }))
                 }
                 Some("running" | "waiting_for_operator") => Some(None),
@@ -199,7 +217,7 @@ impl Engine {
                 updates.push((id.to_owned(), next));
             }
         }
-        let changed = !updates.is_empty();
+        let changed = !updates.is_empty() || !answered.is_empty();
         for (id, last) in updates {
             if let Some(entry) = self.workers.get_mut(scope, &id) {
                 entry.marks.last = last;
@@ -628,6 +646,8 @@ impl Engine {
             decided: Some(resolved.decision),
             yolo,
             handoff: Some(Box::new(source)),
+            requested_model: None,
+            pinned_model: None,
         };
         let record = match nonce() {
             Ok(n) => n,

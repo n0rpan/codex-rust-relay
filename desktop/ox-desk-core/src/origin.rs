@@ -82,6 +82,15 @@ pub struct Origin {
     /// For a handoff, the source session and references to what it carried.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff: Option<Box<HandoffSource>>,
+    /// The subscription model the launcher asked for, exactly as asked
+    /// (`claude-fable-5-2` or a picker value such as `fable`). The billing route
+    /// is `route`; an API alias is recorded there, never here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    /// The exact model the runtime was pinned to after the account's picker
+    /// offered it, before the first inference. Continuations keep it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_model: Option<String>,
 }
 
 impl Origin {
@@ -144,6 +153,11 @@ pub struct WorkerStart {
     /// Wall-clock limit in minutes. Absent means no limit unless the host sets `OX_WORKER_MAX_MINUTES`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_minutes: Option<u32>,
+    /// An exact Claude subscription model to pin before the first inference,
+    /// such as `claude-fable-5-2`. Needs a Claude worker without an API alias.
+    /// The host refuses the launch when the account's picker does not offer it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_model: Option<String>,
 }
 
 impl WorkerStart {
@@ -207,6 +221,7 @@ impl WorkerStart {
             checkout: None,
             yolo_confirmed: false,
             max_minutes: None,
+            subscription_model: None,
         };
         Some(start.validate().map(|()| start))
     }
@@ -236,6 +251,19 @@ impl WorkerStart {
         }) {
             return Err("Provide an ox model alias of up to 256 bytes.".into());
         }
+        if let Some(pinned) = &self.subscription_model {
+            if self.runtime != Runtime::Claude {
+                return Err("subscription_model pins a Claude subscription worker. Codex workers use an ox API model alias.".into());
+            }
+            if self.model.is_some() {
+                return Err("Choose either an ox API model alias (billed by its provider) or a subscription_model (billed to the Claude subscription), not both.".into());
+            }
+            if !crate::claude_models::valid_model(pinned) {
+                return Err(
+                    "Provide a Claude subscription model ID such as claude-fable-5-2.".into(),
+                );
+            }
+        }
         Ok(())
     }
     pub fn route(&self) -> Route {
@@ -252,6 +280,29 @@ impl WorkerStart {
             WorkerMode::Session => task.to_owned(),
         }
     }
+}
+
+/// The worker view's model line from the host's `worker_model` report: who pays, then
+/// the model that answered, or the requested model while the runtime has not answered.
+/// "Claude subscription · claude-fable-5-2" or "Claude subscription · fable (pending)".
+pub fn model_line(report: &serde_json::Value) -> Option<String> {
+    let billing = report["billing_label"].as_str()?;
+    let shown = |key: &str| report[key].as_str().filter(|s| !s.is_empty());
+    let model = match report["model_state"].as_str() {
+        Some("confirmed" | "reported") => shown("actual_model").map(str::to_owned),
+        Some("differs") => shown("actual_model").map(|a| {
+            let pinned = shown("pinned_model").unwrap_or("the pinned model");
+            format!("{a}, not {pinned}")
+        }),
+        // An API alias already names itself in the billing label.
+        _ => shown("pinned_model")
+            .or_else(|| shown("requested_model").filter(|_| report["billing"] == "subscription"))
+            .map(|m| format!("{m} (pending)")),
+    };
+    Some(match model {
+        Some(model) => format!("{billing} · {model}"),
+        None => billing.to_owned(),
+    })
 }
 
 /// The only operations a parent agent has on its workers. Approvals, questions and
@@ -355,6 +406,72 @@ mod tests {
     }
 
     #[test]
+    fn a_subscription_model_needs_a_claude_subscription_worker() {
+        let start = |v: serde_json::Value| serde_json::from_value::<WorkerStart>(v).unwrap();
+        let pinned = start(serde_json::json!({
+            "parent":"p","runtime":"claude","model":null,"mode":"session","task":"review",
+            "subscription_model":"claude-fable-5-2"
+        }));
+        assert_eq!(pinned.validate(), Ok(()));
+        assert_eq!(pinned.route(), Runtime::Claude.route(None));
+        // Who pays is never ambiguous: an API alias and a subscription model conflict.
+        let both = start(serde_json::json!({
+            "parent":"p","runtime":"claude","model":"alias","mode":"session","task":"t",
+            "subscription_model":"claude-fable-5-2"
+        }));
+        assert!(both.validate().unwrap_err().contains("not both"));
+        let codex = start(serde_json::json!({
+            "parent":"p","runtime":"codex","model":"m","mode":"session","task":"t",
+            "subscription_model":"claude-fable-5-2"
+        }));
+        assert!(codex.validate().is_err());
+        let flag = start(serde_json::json!({
+            "parent":"p","runtime":"claude","model":null,"mode":"session","task":"t",
+            "subscription_model":"--dangerously-skip-permissions"
+        }));
+        assert!(flag.validate().is_err());
+        // An unpinned start serializes exactly as before, so an older host accepts it.
+        let plain = WorkerStart::parse_command("p", "/worker claude review")
+            .unwrap()
+            .unwrap();
+        assert!(
+            serde_json::to_value(&plain)
+                .unwrap()
+                .get("subscription_model")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_worker_view_names_who_pays_and_which_model_answered() {
+        use serde_json::json;
+        let report = |state: &str, actual: Option<&str>| {
+            json!({"billing":"subscription","billing_label":"Claude subscription","requested_model":"fable",
+                "pinned_model":"claude-fable-5-2","actual_model":actual,"model_state":state})
+        };
+        assert_eq!(
+            model_line(&report("pending", None)).as_deref(),
+            Some("Claude subscription · claude-fable-5-2 (pending)")
+        );
+        assert_eq!(
+            model_line(&report("confirmed", Some("claude-fable-5-2"))).as_deref(),
+            Some("Claude subscription · claude-fable-5-2")
+        );
+        assert_eq!(
+            model_line(&report("differs", Some("claude-opus-5-5"))).as_deref(),
+            Some("Claude subscription · claude-opus-5-5, not claude-fable-5-2")
+        );
+        let api = json!({"billing":"api","billing_label":"OX API · fixture","requested_model":"fixture","model_state":"pending"});
+        assert_eq!(model_line(&api).as_deref(), Some("OX API · fixture"));
+        let unpinned = json!({"billing":"subscription","billing_label":"Claude subscription","model_state":"reported","actual_model":"claude-opus-5-5"});
+        assert_eq!(
+            model_line(&unpinned).as_deref(),
+            Some("Claude subscription · claude-opus-5-5")
+        );
+        assert_eq!(model_line(&json!({})), None);
+    }
+
+    #[test]
     fn old_worker_starts_and_stamps_still_decode() {
         let old: WorkerStart = serde_json::from_value(serde_json::json!({
             "parent":"p","runtime":"codex","model":"m","mode":"session","task":"t","write":false
@@ -380,6 +497,7 @@ mod tests {
         assert_eq!(stamp.ceiling, Ceiling::Write);
         assert_eq!(stamp.limits_children(), Some(Ceiling::Write));
         assert!(stamp.started.is_none() && stamp.handoff.is_none());
+        assert!(stamp.requested_model.is_none() && stamp.pinned_model.is_none());
     }
 }
 

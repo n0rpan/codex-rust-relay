@@ -207,6 +207,7 @@ impl Store {
             Event::Init(i) => Some(&i.session_id),
             Event::Title { session_id, .. } => Some(session_id),
             Event::Result(r) => Some(&r.session_id),
+            Event::Model { session_id, .. } => Some(session_id),
             Event::Item { scope, .. } | Event::Delta { scope, .. } => Some(&scope.session_id),
             _ => None,
         };
@@ -217,6 +218,14 @@ impl Store {
         }
         match event {
             Event::ControlReply(r) => self.claude_control(owner, r)?,
+            Event::Model { model, .. } => {
+                let p = self.claude_mut().sessions.get_mut(owner).unwrap();
+                // Each distinct model in the order it first answered, so a fallback
+                // to another model mid-run stays visible next to the first.
+                if !p.answering.contains(&model) && p.answering.len() < 8 {
+                    p.answering.push(model);
+                }
+            }
             Event::Title { name, .. } => {
                 if let Some(row) = self.claude_mut().catalog.get_mut(owner) {
                     row.name = Some(name.clone());
@@ -831,6 +840,7 @@ mod tests {
             blank: None,
             worker: None,
             worker_blank: None,
+            worker_model: None,
             serial: 2,
             native: Default::default(),
         };

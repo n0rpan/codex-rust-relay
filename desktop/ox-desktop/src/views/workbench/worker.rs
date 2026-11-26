@@ -1,5 +1,5 @@
 //! A worker session says what it is: its job number, the access ceiling it was
-//! launched under, and the session that started it. A parent says how many of its
+//! launched under, who pays and which model answered, and the session that started it. A parent says how many of its
 //! workers are still running.
 use super::{OpenThread, Workbench};
 use crate::appearance::Palette;
@@ -72,10 +72,11 @@ impl Workbench {
         let job = format!("Worker {}", origin.job_id);
         let ceiling = format!("Ceiling {}", origin.ceiling.label(origin.runtime));
         let checkout = self.project.display().to_string();
-        let model = store.actual_model(id).map_or_else(
-            || "Model pending".to_owned(),
-            |model| format!("Model {model}"),
-        );
+        // Who pays and the model that answered; "(pending)" until the runtime confirms it.
+        let model = store
+            .session_mark(id, "worker_model")
+            .and_then(ox_desk_core::origin::model_line)
+            .unwrap_or_else(|| origin.route.label());
         Some(
             row()
                 .flex_wrap()
@@ -105,7 +106,6 @@ impl Workbench {
                 )
                 .child(div().px_1().border_1().border_color(rgb(p.line)).child(job))
                 .child(crate::small(p, ceiling))
-                .child(crate::small(p, origin.route.label()))
                 .child(crate::small(p, model))
                 .child(crate::small(p, format!("Checkout {checkout}")))
                 .into_any_element(),

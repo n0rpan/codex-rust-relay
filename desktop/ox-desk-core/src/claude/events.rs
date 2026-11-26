@@ -61,6 +61,12 @@ pub enum Event {
         text: String,
     },
     Result(TurnResult),
+    /// The model that produced a top-level assistant message, as the stream reports it.
+    /// Subagent messages are excluded: they may run another model by design.
+    Model {
+        session_id: String,
+        model: String,
+    },
 }
 #[derive(Clone, Debug, Deserialize)]
 pub struct TurnResult {

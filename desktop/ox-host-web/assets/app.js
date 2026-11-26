@@ -74,9 +74,8 @@ const leaf = (path) => path.split("/").filter(Boolean).pop() || path;
 const keyOf = (scope, id) => scopeKey(scope) + " " + id;
 // The model the runtime itself answered with, published beside the launch stamp.
 const actualModel = (session) =>
-  session?.detail?.actual_model ??
+  session?.detail?.worker_model?.actual_model ??
   session?.detail?.worker_marks?.actual_model ??
-  session?.detail?.origin?.actual_model ??
   null;
 function notice(s = "") {
   $("message").hidden = !s;
@@ -1233,7 +1232,7 @@ function conversation() {
     " · " +
     routesLabel(row?.detail?.route || scope.route) +
     (worker
-      ? ` · worker ${origin.job_id} · ${ceilingLabels[origin.ceiling] ?? origin.ceiling} ceiling · model ${actualModel(row) || "pending"}`
+      ? ` · worker ${origin.job_id} · ${ceilingLabels[origin.ceiling] ?? origin.ceiling} ceiling${workerModel(row?.detail?.worker_model) || " · model pending"}`
       : origin?.relation === "handoff"
         ? " · handoff"
         : "");
@@ -1246,8 +1245,7 @@ function conversation() {
           (candidate) =>
             candidate.session.id === recorded.id &&
             candidate.scope.project === recorded.project,
-        )?.scope ??
-        all.find((candidate) => candidate.session.id === recorded.id)?.scope;
+        )?.scope;
     if (parentScope) {
       const title = all.find(
         (candidate) =>
@@ -1500,6 +1498,17 @@ $("new-form").onsubmit = async (e) => {
     notice(error.message);
   }
 };
+// The model a worker runs, after its billing route: the model that answered, or the
+// requested one marked pending until the runtime answers. Mirrors the desktop line.
+function workerModel(report) {
+  if (!report) return "";
+  const { model_state: state, actual_model: actual, pinned_model: pinned } = report;
+  if ((state === "confirmed" || state === "reported") && actual) return ` · ${actual}`;
+  if (state === "differs" && actual)
+    return ` · ${actual}, not ${pinned || "the pinned model"}`;
+  const asked = pinned || (report.billing === "subscription" && report.requested_model);
+  return asked ? ` · ${asked} (pending)` : "";
+}
 const ceilingLabels = {
   read: "read-only",
   write: "workspace write",

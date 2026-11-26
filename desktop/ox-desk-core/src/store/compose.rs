@@ -623,6 +623,14 @@ impl Store {
     ) {
         self.worker_contracts.entry(id.into()).or_insert(contract);
     }
+    /// Keep a pinned Claude worker on its exact model when it is resumed or forked.
+    /// The host's validated exact ID replaces the picker value the launch passed, so
+    /// a continuation cannot drift when that value later points at another model.
+    pub fn restore_worker_model(&mut self, id: &str, model: &str) {
+        if crate::claude_models::valid_model(model) {
+            self.worker_models.insert(id.into(), model.to_owned());
+        }
+    }
     pub fn restore_ended(
         &mut self,
         id: &str,

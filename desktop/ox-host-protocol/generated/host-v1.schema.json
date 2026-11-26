@@ -2285,6 +2285,13 @@
         "runtime": {
           "$ref": "#/$defs/Runtime"
         },
+        "subscription_model": {
+          "description": "An exact Claude subscription model to pin before the first inference,\nsuch as `claude-fable-5-2`. Needs a Claude worker without an API alias.\nThe host refuses the launch when the account's picker does not offer it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "task": {
           "type": "string"
         },

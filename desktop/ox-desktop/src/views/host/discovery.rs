@@ -87,7 +87,7 @@ impl Hosted {
             route: scope.route.clone(),
             status: view.status.clone(),
             origin: serde_json::from_value(view.detail["origin"].clone()).ok(),
-            actual_model: view.detail["actual_model"]
+            actual_model: view.detail["worker_model"]["actual_model"]
                 .as_str()
                 .or_else(|| view.detail["worker_marks"]["actual_model"].as_str())
                 .map(str::to_owned),

@@ -159,6 +159,7 @@ pub(super) fn worker_start(
         checkout: None,
         yolo_confirmed: yolo,
         max_minutes: None,
+        subscription_model: None,
     };
     start.validate()?;
     Ok(start)

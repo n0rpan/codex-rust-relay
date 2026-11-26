@@ -1906,12 +1906,17 @@ impl Engine {
             }
         }
         let contract = origin.claude_contract(start.mode);
+        let pin = start.subscription_model.clone();
+        let started = origin.started;
+        origin.requested_model = pin.clone();
         let launching = self.prepare_launch(&scope, origin, Payload::Worker(start))?;
-        if let Some(c) = contract
+        // A contract or a pinned model needs a process of the worker's own: a pinned
+        // one starts with `--model`, so not even its first turn runs the account default.
+        if (contract.is_some() || pin.is_some())
             && let Some(live) = self.running.get_mut(&scope)
         {
             live.store
-                .stage_claude_worker(c)
+                .stage_claude_worker(contract, pin, started)
                 .map_err(|e| e.to_string())?;
         }
         Ok(Accepted::Launch(scope, launching))
@@ -2596,6 +2601,7 @@ fn catalog_row(view: &wire::SessionView) -> wire::SessionView {
         "route",
         "origin",
         "worker_marks",
+        "worker_model",
     ]
     .into_iter()
     .filter_map(|k| Some((k.to_owned(), view.detail.get(k)?.clone())))
@@ -2660,6 +2666,27 @@ fn advance_launch(live: &mut Live) -> Option<String> {
         ox_desk_core::store::claude::WorkerBlank::Ready => {
             if l.stage == Stage::Sent {
                 return None;
+            }
+            // Check the pinned model against the picker of the very process that will run
+            // it, before the first inference. An unoffered model stops the launch here, so
+            // nothing runs or bills on another model or route.
+            if let Payload::Worker(start) = &l.payload
+                && let Some(requested) = &start.subscription_model
+            {
+                let pinned = live
+                    .store
+                    .claude_worker_picker()
+                    .ok_or_else(|| {
+                        "Claude Code did not report its model picker, so the model cannot be pinned. Nothing was billed.".to_owned()
+                    })
+                    .and_then(|picker| ox_desk_core::claude_models::resolve(&picker, requested));
+                match pinned {
+                    Ok(pin) => l.origin.pinned_model = Some(pin.exact),
+                    Err(e) => {
+                        live.store.drop_claude_worker();
+                        return Some(e);
+                    }
+                }
             }
             l.stage = Stage::Sent;
             let sender = l.payload.sender();
@@ -2741,6 +2768,7 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
         }
         e.1.insert("origin".into(), json!(o));
         e.1.insert("worker_marks".into(), json!(entry.marks));
+        e.1.insert("worker_model".into(), crate::workers::model_report(entry));
         e.1.insert("worker".into(), nests.into());
     }
     let mut push = |id: &str, key: &str, value: Value| {
@@ -2792,6 +2820,9 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
     for (id, entry) in workers.in_scope(scope) {
         if let Some(contract) = entry.origin.claude_contract(entry.origin.mode) {
             store.restore_worker_contract(id, contract);
+        }
+        if let Some(model) = &entry.origin.pinned_model {
+            store.restore_worker_model(id, model);
         }
     }
     for (id, (parent, detail)) in out {
@@ -3187,6 +3218,7 @@ mod tests {
     fn internal_dispatch_paths_name_their_own_sender() {
         let worker = Payload::Worker(WorkerStart {
             parent: "p".into(),
+            subscription_model: None,
             checkout: None,
             runtime: ox_desk_core::runtime::Runtime::Codex,
             model: None,
@@ -3493,6 +3525,8 @@ mod tests {
                 decided: None,
                 yolo: None,
                 handoff: None,
+                requested_model: None,
+                pinned_model: None,
             }
         }
         fn scopes(root: &Path) -> (Scope, Scope) {
@@ -3525,6 +3559,7 @@ mod tests {
                 checkout: None,
                 yolo_confirmed: false,
                 max_minutes: None,
+                subscription_model: None,
             }
         }
 
@@ -3998,6 +4033,7 @@ mod tests {
                     checkout: None,
                     yolo_confirmed: false,
                     max_minutes: None,
+                    subscription_model: None,
                 },
                 41,
                 ox_desk_core::modes::Resolved {
@@ -5378,6 +5414,8 @@ mod tests {
 import json,sys
 mode=sys.argv[sys.argv.index("--permission-mode")+1] if "--permission-mode" in sys.argv else "default"
 sid=next((sys.argv[i+1] for i,a in enumerate(sys.argv) if a in ("--session-id","--resume")),"none")
+pinned=sys.argv[sys.argv.index("--model")+1] if "--model" in sys.argv else None
+picker=[{"value":"default","resolvedModel":"claude-opus-5-5","displayName":"Default (recommended)"},{"value":"fable","resolvedModel":"claude-fable-5-2","displayName":"Fable 5.2"}] if pinned else []
 open("argv-"+sid,"a").write(json.dumps(sys.argv)+"\n")
 if "--session-id" in sys.argv:
  import os,re
@@ -5394,10 +5432,12 @@ for line in sys.stdin:
    mode=body["mode"]
    data={"mode":mode}
   else:
-   data={"claude_code_version":"2.2.0","current_permission_mode":mode,"commands":[],"models":[],"account":{"apiProvider":"firstParty","subscriptionType":"pro"}}
+   data={"claude_code_version":"2.2.0","current_permission_mode":mode,"commands":[],"models":picker,"account":{"apiProvider":"firstParty","subscriptionType":"pro"}}
   print(json.dumps({"type":"control_response","response":{"request_id":r["request_id"],"subtype":"success","response":data}}),flush=True)
  elif r.get("type")=="user":
   print(json.dumps({"type":"user","message":r["message"],"uuid":r.get("uuid"),"session_id":sid,"isReplay":True}),flush=True)
+  if pinned:
+   print(json.dumps({"type":"assistant","uuid":"a-"+sid,"session_id":sid,"parent_tool_use_id":None,"message":{"id":"m-"+sid,"role":"assistant","model":next((m["resolvedModel"] for m in picker if pinned in (m["value"],m["resolvedModel"])),pinned),"content":[{"type":"text","text":"reviewed"}]}}),flush=True)
   print(json.dumps({"type":"result","subtype":"success","is_error":False,"session_id":sid,"stop_reason":"end_turn","result":"ok"}),flush=True)
 "#,
             )
@@ -5452,6 +5492,15 @@ for line in sys.stdin:
             lead: &str,
             rx: &std::sync::mpsc::Receiver<ox_desk_core::links::LinkEvent>,
         ) -> Result<Value, String> {
+            launch_pinned_on_warm_claude(engine, scope, lead, rx, None)
+        }
+        fn launch_pinned_on_warm_claude(
+            engine: &mut Engine,
+            scope: &Scope,
+            lead: &str,
+            rx: &std::sync::mpsc::Receiver<ox_desk_core::links::LinkEvent>,
+            subscription_model: Option<&str>,
+        ) -> Result<Value, String> {
             let caller = Caller::Operator {
                 scope: scope.clone(),
                 parent: lead.to_owned(),
@@ -5462,6 +5511,7 @@ for line in sys.stdin:
             request.model = None;
             request.parent = lead.to_owned();
             request.mode = WorkerMode::Session;
+            request.subscription_model = subscription_model.map(str::to_owned);
             let (reply, answered) = std::sync::mpsc::sync_channel(1);
             engine
                 .launch(caller, request, Replier::Channel(reply))
@@ -5492,6 +5542,147 @@ for line in sys.stdin:
                     );
                 }
                 thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Drive the host until `done` holds for its state.
+        fn pump_engine(
+            engine: &mut Engine,
+            scope: &Scope,
+            rx: &std::sync::mpsc::Receiver<ox_desk_core::links::LinkEvent>,
+            done: &dyn Fn(&Engine) -> bool,
+        ) {
+            let until = Instant::now() + Duration::from_secs(20);
+            while !done(engine) {
+                assert!(Instant::now() < until, "the host never reached the state");
+                while let Ok(event) = rx.try_recv() {
+                    engine.running.get_mut(scope).unwrap().store.apply(event);
+                }
+                engine.process(scope, vec![], false).unwrap();
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        #[test]
+        fn a_pinned_subscription_worker_runs_its_exact_model_from_the_first_turn() {
+            let root = tempfile::tempdir().unwrap();
+            let (scope, lead, mut engine, rx) = warm_claude(root.path());
+            let started =
+                launch_pinned_on_warm_claude(&mut engine, &scope, &lead, &rx, Some("fable"))
+                    .expect("an offered model starts");
+            let session = started["session"].as_str().unwrap().to_owned();
+            // The launch answer already separates the request, the pin and who pays.
+            assert_eq!(started["billing"], "subscription");
+            assert_eq!(started["requested_model"], "fable");
+            assert_eq!(started["pinned_model"], "claude-fable-5-2");
+            // The process ran the pinned model from its first turn, in the granted mode.
+            let raw = session.rsplit(':').next().unwrap();
+            let argv: Vec<String> = serde_json::from_str(
+                std::fs::read_to_string(root.path().join(format!("argv-{raw}")))
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+            let at = |flag: &str| argv.iter().position(|a| a == flag).map(|i| &argv[i + 1]);
+            assert_eq!(at("--model").map(String::as_str), Some("fable"));
+            assert_eq!(at("--permission-mode").map(String::as_str), Some("plan"));
+            assert!(argv.contains(&"--subscription".to_owned()));
+            // The runtime's answer confirms the model, in status and the saved record.
+            pump_engine(&mut engine, &scope, &rx, &|e| {
+                e.workers
+                    .get(&scope, &session)
+                    .is_some_and(|w| w.marks.actual_model.is_some() && w.marks.last.is_some())
+            });
+            let entry = engine.workers.get(&scope, &session).unwrap();
+            assert_eq!(
+                entry.origin.pinned_model.as_deref(),
+                Some("claude-fable-5-2")
+            );
+            assert_eq!(entry.origin.requested_model.as_deref(), Some("fable"));
+            let job = entry.origin.job_id;
+            pump_engine(&mut engine, &scope, &rx, &|e| {
+                e.job_status(job).unwrap()["model_state"] == "confirmed"
+            });
+            let status = engine.job_status(job).unwrap();
+            assert_eq!(status["actual_model"], "claude-fable-5-2");
+            let last = engine
+                .workers
+                .get(&scope, &session)
+                .unwrap()
+                .marks
+                .last
+                .clone();
+            assert_eq!(
+                last.and_then(|l| l.model).as_deref(),
+                Some("claude-fable-5-2")
+            );
+            // A continuation after the process ended keeps the pin, never the default.
+            let live = engine.running.get_mut(&scope).unwrap();
+            live.store.end_session(&session).unwrap();
+            live.store
+                .dispatch(Action::DraftEdit(Some(session.clone()), "again".into()))
+                .unwrap();
+            live.store
+                .dispatch(Action::SendText(Some(session.clone()), "again".into()))
+                .unwrap();
+            let launches = || {
+                std::fs::read_to_string(root.path().join(format!("argv-{raw}")))
+                    .unwrap()
+                    .lines()
+                    .map(|l| serde_json::from_str::<Vec<String>>(l).unwrap())
+                    .collect::<Vec<_>>()
+            };
+            pump_engine(&mut engine, &scope, &rx, &|_| launches().len() >= 2);
+            let resumed = &launches()[1];
+            assert!(resumed.contains(&"--resume".to_owned()), "{resumed:?}");
+            let at = resumed
+                .iter()
+                .position(|a| a == "--model")
+                .expect("pinned on resume");
+            assert_eq!(
+                resumed[at + 1],
+                "claude-fable-5-2",
+                "the validated exact ID"
+            );
+        }
+
+        #[test]
+        fn an_unoffered_subscription_model_stops_the_launch_before_any_turn() {
+            let root = tempfile::tempdir().unwrap();
+            let (scope, lead, mut engine, rx) = warm_claude(root.path());
+            let error = launch_pinned_on_warm_claude(
+                &mut engine,
+                &scope,
+                &lead,
+                &rx,
+                Some("claude-fable-9"),
+            )
+            .expect_err("an unoffered model never starts");
+            assert!(error.contains("does not offer claude-fable-9"), "{error}");
+            assert!(error.contains("claude-fable-5-2"), "{error}");
+            // No session was stamped and the dedicated process was closed unused.
+            assert!(engine.workers.jobs().next().is_none());
+            let live = &engine.running[&scope];
+            assert_eq!(
+                live.store.claude_worker_state(),
+                ox_desk_core::store::claude::WorkerBlank::None
+            );
+            // Its process never received a user turn: nothing ran or billed.
+            for file in std::fs::read_dir(root.path()).unwrap().flatten() {
+                let name = file.file_name().to_string_lossy().into_owned();
+                if let Some(id) = name.strip_prefix("argv-")
+                    && std::fs::read_to_string(file.path())
+                        .unwrap()
+                        .contains("claude-fable-9")
+                {
+                    assert!(
+                        !live
+                            .store
+                            .has_live_session(&format!("claude:subscription:{id}"))
+                    );
+                }
             }
         }
 
@@ -5702,7 +5893,9 @@ for line in sys.stdin:
                 ox_desk_core::claude_worker_contract::Contract::with_support(true, false, true);
             let live = engine.running.get_mut(&scope).unwrap();
             live.store.dispatch(Action::NewDraft).unwrap();
-            live.store.stage_claude_worker(contract).unwrap();
+            live.store
+                .stage_claude_worker(Some(contract), None, None)
+                .unwrap();
             let pump = |engine: &mut Engine, until: &dyn Fn(&Store) -> bool| {
                 let end = Instant::now() + Duration::from_secs(10);
                 while !until(&engine.running[&scope].store) {
@@ -5768,7 +5961,9 @@ for line in sys.stdin:
             };
             let live = engine.running.get_mut(&scope).unwrap();
             live.store.dispatch(Action::NewDraft).unwrap();
-            live.store.stage_claude_worker(contract).unwrap();
+            live.store
+                .stage_claude_worker(Some(contract), None, None)
+                .unwrap();
             pump(&mut engine, &|s| {
                 s.can_send(None) && s.claude_worker_state() == WorkerBlank::Ready
             });
