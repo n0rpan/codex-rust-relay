@@ -27,20 +27,20 @@ use std::sync::Mutex;
 pub const MAX_ATTEMPTS: usize = 3;
 
 /// Top-level request fields OX may omit after a provider rejects them. The list
-/// is ordered: the first match wins when a message names several. `text` is not
-/// here: it carries the JSON-schema output format, and answering without the
-/// requested schema is worse than surfacing the provider error.
+/// is ordered: the first match wins when a message names several. `text` and
+/// `tool_choice` are not here: one carries the JSON-schema output format and the
+/// other an explicit tool-use constraint, so answering without either is worse
+/// than surfacing the provider error. `parallel_tool_calls` is also kept: its
+/// default differs from `false`.
 const DROPPABLE: &[&str] = &[
     "reasoning",
     "reasoning_effort",
     "thinking",
     "output_config",
     "cache_control",
-    "parallel_tool_calls",
     "include",
     "previous_response_id",
     "store",
-    "tool_choice",
     "temperature",
     "top_p",
     "top_k",
@@ -361,6 +361,22 @@ mod tests {
             classify(400, "Unsupported parameter: 'text' is not supported", &body),
             None
         );
+    }
+
+    #[test]
+    fn explicit_tool_constraints_are_never_dropped() {
+        for body in [
+            json!({"model": "m", "tool_choice": "required"}),
+            json!({"model": "m", "tool_choice": "none"}),
+            json!({"model": "m", "tool_choice": {"type": "function", "name": "f"}}),
+            json!({"model": "m", "parallel_tool_calls": false}),
+        ] {
+            assert_eq!(
+                classify(400, "Unsupported parameter: 'tool_choice'", &body),
+                None,
+                "{body}"
+            );
+        }
     }
 
     #[test]
