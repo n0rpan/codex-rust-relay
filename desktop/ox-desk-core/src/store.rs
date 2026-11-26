@@ -96,6 +96,11 @@ pub struct Store {
     /// session starts it in that mode; opening it from the list does not (see
     /// `claude_resume_send`).
     resume_access: HashMap<String, crate::runtime::Access>,
+    /// Subscription model chosen while browsing a saved Claude session.
+    resume_models: HashMap<String, String>,
+    /// OX reserved these new IDs and restored their unacknowledged input on failure.
+    /// A deliberate retry can create the same ID if stock never wrote its journal.
+    unsaved_claude_drafts: HashSet<String>,
     /// Text the host put back in a session's composer after a send it had acknowledged
     /// failed (identified by the last unsent message). Cleared by the next send.
     restored_drafts: HashMap<String, (String, String)>,
@@ -192,6 +197,8 @@ impl Store {
             ended_threads: Default::default(),
             resume_sends: Default::default(),
             resume_access: Default::default(),
+            resume_models: Default::default(),
+            unsaved_claude_drafts: Default::default(),
             restored_drafts: Default::default(),
             worker_contracts: Default::default(),
             child_threads: Default::default(),
@@ -269,6 +276,9 @@ impl Store {
         self.terminal_threads = std::mem::take(&mut previous.terminal_threads);
         self.ended_threads = previous.ended_threads.clone();
         self.resume_access = std::mem::take(&mut previous.resume_access);
+        self.resume_models = std::mem::take(&mut previous.resume_models);
+        self.unsaved_claude_drafts = std::mem::take(&mut previous.unsaved_claude_drafts);
+        self.restored_drafts = std::mem::take(&mut previous.restored_drafts);
         self.worker_contracts = std::mem::take(&mut previous.worker_contracts);
         self.authorized_models = std::mem::take(&mut previous.authorized_models);
         self.next_options = previous.next_options.take();
@@ -295,6 +305,9 @@ impl Store {
         self.front = previous.front;
         self.catalog_revision = previous.catalog_revision + 1;
         self.query = previous.query.clone();
+        if self.is_session_scoped() && self.state == Connection::Ready {
+            self.reopen_claude_history();
+        }
     }
 
     pub fn runtime_name(&self) -> &'static str {

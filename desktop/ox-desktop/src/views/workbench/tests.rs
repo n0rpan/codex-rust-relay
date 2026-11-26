@@ -899,14 +899,21 @@ fn claude_workbench_session() {
     let root = std::env::current_dir().unwrap();
     let api = (mode == "api").then_some("fixture/demo");
     let mut a = Pane::open(&root, api);
+    a.wait("cold Claude route", |s| {
+        s.state() == &Connection::Ready && s.can_send(None)
+    });
     if mode == "signin" {
+        a.act(Action::DraftEdit(
+            None,
+            "Open my subscription session".into(),
+        ));
+        a.act(Action::Submit(None));
         a.wait("native sign-in", |s| {
             s.state() == &Connection::SignInRequired
         });
         assert!(!a.store.can_send(None));
         return;
     }
-    a.wait("ready", |s| s.state() == &Connection::Ready);
     assert!(!a.store.command_caps(None).supports_goal() && !a.store.command_caps(None).speed);
     if mode == "subscription" {
         a.send("Native OX desktop subscription turn");
@@ -979,7 +986,9 @@ fn claude_workbench_session() {
     a.act(Action::AnswerQuestions(ask_id, vec!["Apple, Pear".into()]));
     a.idle(&id);
     let mut other = Pane::open(&root, Some("other/demo"));
-    other.wait("second billing alias", |s| s.state() == &Connection::Ready);
+    other.wait("second billing alias catalog", |s| {
+        s.state() == &Connection::Ready && s.threads().iter().any(|row| row.id == id)
+    });
     let original = other
         .store
         .threads()
@@ -1000,11 +1009,14 @@ fn claude_workbench_session() {
     // Reopen through the same public catalog and selection path as an app restart.
     drop(a);
     let mut a = Pane::open(&root, api);
-    a.wait("reconnected", |s| s.state() == &Connection::Ready);
-    a.act(Action::SetNextAccess(Access::BypassPermissions));
-    a.wait("Claude confirmed YOLO for the empty draft", |s| {
-        s.applied_access(None) == Some(Access::BypassPermissions)
+    a.wait("reconnected catalog", |s| {
+        s.state() == &Connection::Ready && s.threads().iter().any(|row| row.id == id)
     });
+    a.act(Action::SetNextAccess(Access::BypassPermissions));
+    a.wait("staged YOLO for the empty draft", |s| {
+        s.next_access() == Some(Access::BypassPermissions)
+    });
+    assert_eq!(a.store.applied_access(None), None);
     let row = a
         .store
         .threads()
@@ -1018,10 +1030,8 @@ fn claude_workbench_session() {
             .is_some_and(|t| t.is_ready() && t.len() >= 2)
     });
     assert_eq!(a.store.applied_access(Some(&id)), Some(Access::Default));
-    assert_eq!(
-        a.store.applied_access(None),
-        Some(Access::BypassPermissions)
-    );
+    assert_eq!(a.store.next_access(), Some(Access::BypassPermissions));
+    assert_eq!(a.store.applied_access(None), None);
     a.act(Action::ForkThread(id.clone()));
     a.wait("fork identity", |s| {
         s.selected().is_some_and(|child| child != id)
@@ -1077,15 +1087,22 @@ fn claude_workbench_session() {
             .is_some_and(|t| t.is_ready() && !t.is_empty())
     });
     a.act(Action::NewDraft);
-    assert_eq!(
-        a.store.applied_access(None),
-        Some(Access::BypassPermissions)
-    );
+    assert_eq!(a.store.next_access(), Some(Access::BypassPermissions));
+    assert_eq!(a.store.applied_access(None), None);
     a.send("Use the prepared draft");
     let consumed = a.store.selected().unwrap().to_owned();
+    a.wait("Claude confirmed the staged permission mode", |s| {
+        s.applied_access(Some(&consumed)) == Some(Access::BypassPermissions)
+    });
     a.idle(&consumed);
     a.act(Action::NewDraft);
-    a.wait("the next draft starts with its own permission mode", |s| {
-        s.applied_access(None) == Some(Access::Default)
-    });
+    assert_eq!(a.store.next_access(), None);
+    assert_eq!(a.store.applied_access(None), None);
+    a.send("Use the default draft");
+    let fresh = a.store.selected().unwrap().to_owned();
+    a.wait(
+        "the next session starts with its own permission mode",
+        |s| s.applied_access(Some(&fresh)) == Some(Access::Default),
+    );
+    a.idle(&fresh);
 }

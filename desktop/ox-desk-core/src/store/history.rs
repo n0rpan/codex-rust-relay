@@ -146,7 +146,8 @@ impl Store {
         if let Some(row) = self.catalog.get_mut(id) {
             row.unread = false;
         }
-        if entry.ready || entry.loading || self.terminal_threads.contains(id) {
+        if ((entry.ready || entry.loading) && !confirm_alias) || self.terminal_threads.contains(id)
+        {
             return Ok(());
         }
         if self.state == Connection::Connecting {

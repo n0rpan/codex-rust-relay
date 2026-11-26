@@ -1,7 +1,15 @@
 //! Contract checks at the owned stdio boundary, before any model request is sent.
 use ox_desk_core::{
-    claude::Event as Frame,
+    actions::Action,
+    claude::{Event as Frame, catalog::Profiles},
+    links::LinkEvent,
     links::claude::{Billing, Event, Launch, Link, Session, minimum},
+    runtime::{Access, Runtime},
+    store::{
+        Connection, Profile, Store,
+        claude::{Launcher, SUBSCRIPTION_PROVIDER},
+        routes_thread::Choice,
+    },
 };
 use serde_json::{Value, json};
 use std::{
@@ -37,6 +45,7 @@ fn spawn(
             billing,
             session,
             permission_mode: mode.into(),
+            subscription_model: None,
             contract: None,
         },
         move |e| {
@@ -255,4 +264,188 @@ fn later_turns_may_report_a_moved_shell_directory_but_not_another_session() {
         }
         other => panic!("expected the session mismatch to close the link, got {other:?}"),
     }
+}
+
+fn recording_store(
+    project: &Path,
+    exe: &Path,
+    profiles: &Profiles,
+) -> (Store, Receiver<LinkEvent>) {
+    let (tx, rx) = mpsc::channel();
+    let store = Store::open_claude(
+        Profile {
+            project: project.into(),
+            route: Runtime::Claude.route(None),
+            provider: SUBSCRIPTION_PROVIDER.into(),
+        },
+        Launcher {
+            ox: exe.into(),
+            path: "/usr/bin:/bin".into(),
+            profiles: profiles.clone(),
+            index: project.join("index"),
+            aliases: vec![],
+        },
+        move |e| {
+            let _ = tx.send(e);
+        },
+    )
+    .unwrap();
+    (store, rx)
+}
+
+/// Start and recover actual stores with a stock executable that records every invocation
+/// and input. A saved Claude route opens at login, and history selection is a disk read.
+#[test]
+fn browsing_and_restoring_never_run_claude_and_each_first_input_is_delivered_once() {
+    let root = TempDir::new().unwrap();
+    let project = root.path().canonicalize().unwrap();
+    let exe = fixture(
+        &project,
+        minimum(),
+        json!({"apiProvider":"firstParty","subscriptionType":"Claude Max"}),
+    );
+    let profiles = Profiles {
+        subscription: project.join("stock"),
+        api: project.join("api"),
+    };
+    let journals = profiles.subscription.join("projects").join(
+        project
+            .to_string_lossy()
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "-"),
+    );
+    fs::create_dir_all(&journals).unwrap();
+    fs::write(journals.join(format!("{FIRST}.jsonl")), format!("{}\n", json!({"uuid":SECOND, "type":"user","cwd":project,"sessionId":FIRST,"entrypoint":"sdk-cli","message":{"role":"user","content":"Earlier message"}}))).unwrap();
+    let open = || recording_store(&project, &exe, &profiles);
+    let history = format!("claude:subscription:{FIRST}");
+    let (mut store, events) = open();
+    assert_eq!(store.state(), &Connection::Ready);
+    assert!(store.can_send(None));
+    store.dispatch(Action::NewDraft).unwrap();
+    store.dispatch(Action::SetNextAccess(Access::Plan)).unwrap();
+    store.select(&history).unwrap();
+    let wait_history = |store: &mut Store, events: &Receiver<_>| {
+        while !store.transcript(&history).is_some_and(|t| t.is_ready()) {
+            store.apply(events.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+    };
+    wait_history(&mut store, &events);
+    let (mut replacement, events) = open();
+    replacement.recover_from(&mut store);
+    drop(store);
+    wait_history(&mut replacement, &events);
+    assert!(replacement.process_threads().is_empty());
+    assert!(!project.join("launches").exists());
+    replacement.dispatch(Action::NewDraft).unwrap();
+    replacement
+        .dispatch(Action::ModelOptions(None, Choice::Model("sonnet".into())))
+        .unwrap();
+    replacement
+        .dispatch(Action::SendText(None, "First new turn".into()))
+        .unwrap();
+    let fresh = replacement.take_opened().unwrap();
+    assert!(!replacement.can_send(Some(&fresh)));
+    let wait_input = |store: &mut Store, events: &Receiver<_>, key: &str, expected: &str| {
+        while !store
+            .transcript(key)
+            .is_some_and(|t| t.active_turn().is_some())
+        {
+            store.apply(events.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        let wire = wait_lines(&project.join("wire"), 2);
+        assert_eq!(wire.len(), 2);
+        assert_eq!(wire[1]["message"]["content"][0]["text"], expected);
+    };
+    wait_input(&mut replacement, &events, &fresh, "First new turn");
+    let first = fs::read_to_string(project.join("launches")).unwrap();
+    assert_eq!(first.lines().count(), 1);
+    assert!(
+        first.contains("--session-id")
+            && first.contains("--permission-mode plan")
+            && first.contains("--subscription --model sonnet"),
+        "{first}"
+    );
+    replacement
+        .dispatch(Action::SetAccess(history.clone(), Access::Auto))
+        .unwrap();
+    replacement
+        .dispatch(Action::ModelOptions(
+            Some(history.clone()),
+            Choice::Model("opus".into()),
+        ))
+        .unwrap();
+    assert_eq!(fs::read_to_string(project.join("launches")).unwrap(), first);
+    replacement
+        .dispatch(Action::SendText(
+            Some(history.clone()),
+            "First resumed turn".into(),
+        ))
+        .unwrap();
+    wait_input(&mut replacement, &events, &history, "First resumed turn");
+    let launches = fs::read_to_string(project.join("launches")).unwrap();
+    assert_eq!(launches.lines().count(), 2);
+    let resumed = launches.lines().last().unwrap();
+    assert!(
+        resumed.contains(&format!("--resume {FIRST}"))
+            && resumed.contains("--permission-mode auto")
+            && resumed.contains("--model opus"),
+        "{resumed}"
+    );
+}
+
+#[test]
+fn a_refused_first_turn_can_retry_its_reserved_id_after_sign_in() {
+    let root = TempDir::new().unwrap();
+    let project = root.path().canonicalize().unwrap();
+    let exe = fixture(&project, minimum(), json!({"apiProvider":"firstParty"}));
+    let profiles = Profiles {
+        subscription: project.join("stock"),
+        api: project.join("api"),
+    };
+    let (mut store, events) = recording_store(&project, &exe, &profiles);
+    store.dispatch(Action::SetNextAccess(Access::Plan)).unwrap();
+    store
+        .dispatch(Action::ModelOptions(None, Choice::Model("sonnet".into())))
+        .unwrap();
+    store
+        .dispatch(Action::SendText(None, "Keep my first turn".into()))
+        .unwrap();
+    let owner = store.take_opened().unwrap();
+    while store.state() != &Connection::SignInRequired {
+        store.apply(events.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    assert_eq!(store.draft(Some(&owner)), "Keep my first turn");
+    assert_eq!(wait_lines(&project.join("wire"), 1).len(), 1);
+    fixture(
+        &project,
+        minimum(),
+        json!({"apiProvider":"firstParty","subscriptionType":"Claude Max"}),
+    );
+    let (mut replacement, events) = recording_store(&project, &exe, &profiles);
+    replacement.recover_from(&mut store);
+    assert!(replacement.process_threads().is_empty());
+    assert!(replacement.can_compose(Some(&owner)));
+    replacement
+        .dispatch(Action::SetNextAccess(Access::Auto))
+        .unwrap();
+    replacement
+        .dispatch(Action::Submit(Some(owner.clone())))
+        .unwrap();
+    while !replacement
+        .transcript(&owner)
+        .is_some_and(|t| t.active_turn().is_some())
+    {
+        replacement.apply(events.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    assert_eq!(replacement.next_access(), Some(Access::Auto));
+    let launches = fs::read_to_string(project.join("launches")).unwrap();
+    let calls = launches.lines().collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        calls[0], calls[1],
+        "retry must preserve the original ID, model and mode"
+    );
+    assert_eq!(
+        wait_lines(&project.join("wire"), 2)[1]["message"]["content"][0]["text"],
+        "Keep my first turn"
+    );
 }

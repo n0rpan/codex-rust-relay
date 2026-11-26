@@ -116,35 +116,14 @@ fn signed_in(runtime: ox_desk_core::runtime::Runtime) -> bool {
         }
     }
 }
-/// Route for a fresh install: the CLI that is already usable, else the first API model.
-pub fn initial_route(
-    codex: Probe,
-    claude: Probe,
-    first_api_model: impl FnOnce() -> Option<String>,
-) -> Route {
-    use ox_desk_core::runtime::Runtime;
-    match (codex.ready(), claude.ready()) {
-        (false, true) => Runtime::Claude.route(None),
-        (true, _) => Route::CODEX_SUBSCRIPTION,
-        (false, false) => match first_api_model() {
-            Some(alias) if !codex.installed && claude.installed => {
-                Runtime::Claude.route(Some(alias))
-            }
-            Some(alias) => Route::codex_api(alias),
-            None => Route::CODEX_SUBSCRIPTION,
-        },
+/// A fresh install uses Codex until the operator selects another runtime.
+pub fn initial_route(codex: Probe, first_api_model: impl FnOnce() -> Option<String>) -> Route {
+    if !codex.ready()
+        && let Some(alias) = first_api_model()
+    {
+        return Route::codex_api(alias);
     }
-}
-/// The runtime that drives API models: Codex unless only Claude Code is installed.
-pub fn api_runtime(
-    codex_installed: bool,
-    claude_installed: bool,
-) -> ox_desk_core::runtime::Runtime {
-    if !codex_installed && claude_installed {
-        ox_desk_core::runtime::Runtime::Claude
-    } else {
-        ox_desk_core::runtime::Runtime::Codex
-    }
+    Route::CODEX_SUBSCRIPTION
 }
 /// Whether `project` is the user's home directory.
 pub fn is_home(project: &Path) -> bool {
@@ -156,7 +135,6 @@ pub fn is_home(project: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ox_desk_core::runtime::Runtime;
     const READY: Probe = Probe {
         installed: true,
         signed_in: true,
@@ -170,30 +148,15 @@ mod tests {
         signed_in: false,
     };
     #[test]
-    fn first_launch_picks_the_ready_cli() {
+    fn first_launch_keeps_codex_even_if_its_cli_is_missing() {
+        assert_eq!(initial_route(NONE, || None), Route::CODEX_SUBSCRIPTION);
         assert_eq!(
-            initial_route(NONE, READY, || None),
-            Runtime::Claude.route(None)
-        );
-        assert_eq!(
-            initial_route(READY, NONE, || None),
+            initial_route(READY, || Some("alias".into())),
             Route::CODEX_SUBSCRIPTION
         );
         assert_eq!(
-            initial_route(READY, READY, || None),
-            Route::CODEX_SUBSCRIPTION
+            initial_route(OUT, || Some("alias".into())),
+            Route::codex_api("alias".into())
         );
-        assert_eq!(initial_route(OUT, OUT, || None), Route::CODEX_SUBSCRIPTION);
-    }
-    #[test]
-    fn first_launch_falls_back_to_an_api_route() {
-        let m = || Some("gpt".to_string());
-        assert_eq!(initial_route(OUT, OUT, m), Route::codex_api("gpt".into()));
-        assert_eq!(
-            initial_route(NONE, OUT, m),
-            Runtime::Claude.route(Some("gpt".into()))
-        );
-        assert_eq!(api_runtime(true, true), Runtime::Codex);
-        assert_eq!(api_runtime(false, true), Runtime::Claude);
     }
 }

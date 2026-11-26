@@ -177,7 +177,10 @@ impl Store {
             } else if self.is_ended(id) {
                 caps.push("ended".into());
             }
-            if self.can_send(Some(id)) && self.has_command_schema() && !self.commands_loading() {
+            if (self.can_send(Some(id)) || self.can_configure_saved_claude(id))
+                && self.has_command_schema()
+                && !self.commands_loading()
+            {
                 caps.push("native_commands".into());
                 if !running
                     && !self.changing_options(id)

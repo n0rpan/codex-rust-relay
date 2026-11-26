@@ -212,8 +212,12 @@ impl Workbench {
             "Send"
         };
         let effective = store.applied_access(key);
-        let mode = if key.is_some() {
-            effective
+        let mode = if let Some(id) = key {
+            effective.or_else(|| {
+                store
+                    .session_mark(id, "resume_access")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+            })
         } else {
             effective.or_else(|| store.next_access())
         };

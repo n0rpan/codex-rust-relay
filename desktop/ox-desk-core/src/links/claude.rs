@@ -23,6 +23,7 @@ pub struct Launch {
     pub billing: Billing,
     pub session: Session,
     pub permission_mode: String,
+    pub subscription_model: Option<String>,
     /// A worker launch carries the shared worker contract (tools, sandbox
     /// settings); an ordinary session passes `None`.
     pub contract: Option<crate::claude_worker_contract::Contract>,
@@ -75,6 +76,9 @@ impl Launch {
         match &self.billing {
             Billing::Subscription => {
                 cmd.arg("--subscription");
+                if let Some(model) = &self.subscription_model {
+                    cmd.args(["--model", model]);
+                }
             }
             Billing::Api(alias) => {
                 cmd.args(["--model", alias]);
@@ -364,6 +368,7 @@ mod tests {
             billing,
             session: Session::New("id".into()),
             permission_mode: "acceptEdits".into(),
+            subscription_model: None,
             contract,
         };
         launch

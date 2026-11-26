@@ -226,7 +226,7 @@ impl Store {
         ) && (self.commands_loading() || !self.has_command_schema())
         {
             return Err(io::Error::other(
-                "Discovering commands from the installed Codex",
+                "Discovering commands from the installed runtime",
             ));
         }
         let message = match action {
@@ -361,7 +361,10 @@ impl Store {
         thread: Option<String>,
         command: String,
     ) -> io::Result<()> {
-        if !self.can_send(thread.as_deref()) {
+        let saved_claude = thread
+            .as_deref()
+            .is_some_and(|id| self.can_configure_saved_claude(id));
+        if !saved_claude && !self.can_send(thread.as_deref()) {
             return Err(io::Error::other("Wait for this thread to be ready"));
         }
         if self.handing_off_claude()
@@ -396,7 +399,10 @@ impl Store {
                 ));
             }
             self.terminal_threads.insert(id.clone());
-            if self.is_session_scoped() {
+            if saved_claude {
+                self.handoff_ready = Some(handoff);
+                Ok(())
+            } else if self.is_session_scoped() {
                 self.release_claude(&id, handoff)
             } else {
                 self.request(Call::Unsubscribe(id), Pending::LeaveForTerminal(handoff))
@@ -426,6 +432,10 @@ impl Store {
         }
         // The terminal can have appended to the rollout. Load its authoritative tail.
         self.transcripts.remove(id);
-        self.open_catalog_id(id)
+        if self.is_session_scoped() {
+            self.claude_resume(id, false)
+        } else {
+            self.open_catalog_id(id)
+        }
     }
 }

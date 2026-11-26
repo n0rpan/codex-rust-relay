@@ -1851,15 +1851,7 @@ impl Engine {
                 }
             }
         }
-        let contract = origin.claude_contract(start.mode);
         let launching = self.prepare_launch(&scope, origin, Payload::Worker(start))?;
-        if let Some(c) = contract
-            && let Some(live) = self.running.get_mut(&scope)
-        {
-            live.store
-                .stage_claude_worker(c)
-                .map_err(|e| e.to_string())?;
-        }
         Ok(Accepted::Launch(scope, launching))
     }
     /// Open the child's route and check that nothing else is opening there.
@@ -2151,7 +2143,7 @@ impl Engine {
     fn processes(&self) -> Vec<ProcessView> {
         let mut out = Vec::new();
         for (scope, live) in &self.running {
-            // The warm blank Claude process is a process the host keeps, shown as a draft.
+            // Include a worker still starting on its dedicated process.
             let threads = live.store.process_threads();
             if threads.is_empty() {
                 continue;
@@ -2591,9 +2583,24 @@ fn advance_launch(live: &mut Live) -> Option<String> {
     if live.store.state() != &Connection::Ready {
         return None;
     }
-    // A Claude worker under the shared contract has its own process, bound to this launch:
-    // it never waits on, or takes, the route's normal blank.
+    let preset = l
+        .origin
+        .started
+        .unwrap_or_else(|| l.origin.requested.preset(l.origin.runtime));
+    // Give each Claude launch its own process so it cannot consume the operator's
+    // draft or announce a worker before stock has verified its account and mode.
     match live.store.claude_worker_state() {
+        ox_desk_core::store::claude::WorkerBlank::None
+            if l.origin.runtime == ox_desk_core::runtime::Runtime::Claude
+                && l.stage == Stage::Opening =>
+        {
+            let contract = l.origin.claude_contract(l.origin.mode);
+            return live
+                .store
+                .stage_claude_worker(contract, preset)
+                .err()
+                .map(|e| e.to_string());
+        }
         ox_desk_core::store::claude::WorkerBlank::None => (),
         ox_desk_core::store::claude::WorkerBlank::Starting => return None,
         ox_desk_core::store::claude::WorkerBlank::Lost => {
@@ -2603,6 +2610,30 @@ fn advance_launch(live: &mut Live) -> Option<String> {
         ox_desk_core::store::claude::WorkerBlank::Ready => {
             if l.stage == Stage::Sent {
                 return None;
+            }
+            if live.store.claude_worker_access() != Some(preset) {
+                // Some stock versions omit the mode from initialize. Ask for the
+                // requested mode once and wait for the same confirmation a live edit uses.
+                if l.stage == Stage::Opening {
+                    l.stage = Stage::AccessRequested;
+                    return live
+                        .store
+                        .set_claude_worker_access(preset)
+                        .err()
+                        .map(|e| e.to_string());
+                }
+                return Some(
+                    live.store
+                        .notice()
+                        .unwrap_or("Claude did not confirm the requested worker permission mode.")
+                        .into(),
+                );
+            }
+            if !l.origin.ceiling.allows(l.origin.runtime, preset) {
+                return Some(
+                    "The runtime did not confirm a permission mode within the granted ceiling."
+                        .into(),
+                );
             }
             l.stage = Stage::Sent;
             let action = match &mut l.payload {
@@ -2618,15 +2649,9 @@ fn advance_launch(live: &mut Live) -> Option<String> {
                 .map(|e| e.to_string());
         }
     }
-    let preset = l
-        .origin
-        .started
-        .unwrap_or_else(|| l.origin.requested.preset(l.origin.runtime));
     let goal = matches!(&l.payload, Payload::Worker(w) if w.mode == WorkerMode::Goal);
     match l.stage {
-        // A warm Claude route has no blank once a send consumed it; choosing the access
-        // is what prepares the next one, so the launch must not wait for it first.
-        Stage::Opening if live.store.can_send(None) || live.store.claude_blank_missing() => {
+        Stage::Opening if live.store.can_send(None) => {
             l.stage = Stage::AccessRequested;
             if let Err(e) = live.store.dispatch(Action::SetNextAccess(preset)) {
                 return Some(e.to_string());
@@ -4881,12 +4906,10 @@ mod tests {
         #[test]
         fn a_same_runtime_route_change_is_a_handoff_with_a_claude_context_block() {
             let root = tempfile::tempdir().unwrap();
-            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
-            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
-            let source = claude_source(root.path());
-            let target = Scope {
+            let (target, previous, mut engine, events) = warm_claude(root.path());
+            let source = Scope {
                 route: Runtime::Claude.route(Some("fixture".into())),
-                ..source.clone()
+                ..target.clone()
             };
             let items = [("u1", "user", "first request"), ("a1", "assistant", "done")];
             engine.running.insert(
@@ -4899,8 +4922,6 @@ mod tests {
                 )
                 .0,
             );
-            let (l, log) = live(&target, vec![], &[], vec![]);
-            engine.running.insert(target.clone(), l);
             engine
                 .act(
                     1,
@@ -4909,9 +4930,9 @@ mod tests {
                     Action::StartHandoff(HandoffStart {
                         source: "s".into(),
                         runtime: Runtime::Claude,
-                        model: Some("fixture".into()),
+                        model: None,
                         mode: Default::default(),
-                        request: "continue on the API".into(),
+                        request: "continue on my subscription".into(),
                         yolo_confirmed: false,
                     }),
                     None,
@@ -4923,35 +4944,40 @@ mod tests {
             // Claude Auto is a classifier mode and is inherited without asking.
             assert_eq!(o.started, Some(Access::Auto));
             assert!(o.yolo.is_none());
-            let confirm = LinkEvent::Host(Box::new(Server::Delta {
-                cursor: Cursor {
-                    epoch: "e".into(),
-                    seq: 3,
-                },
-                scope: target.clone(),
-                changes: vec![Change::State {
-                    connection: "ready".into(),
-                    capabilities: vec!["start".into()],
-                    detail: json!({"next_access": "auto"}),
-                }],
-            }));
-            engine.process(&target, vec![confirm], false).unwrap();
-            let (text, carried) = log
-                .lock()
-                .unwrap()
-                .iter()
-                .find_map(|(a, _)| match a {
-                    Action::InjectHandoff(t, i) => Some((t.clone(), i.clone())),
-                    _ => None,
-                })
-                .expect("first turn");
+            let launch = engine.running[&target].launching.as_ref().unwrap();
+            let Payload::Handoff {
+                text,
+                items: carried,
+                ..
+            } = &launch.payload
+            else {
+                panic!("expected Claude handoff");
+            };
             assert!(carried.is_empty(), "Claude Code has no history injection");
-            let (block, request) = ox_desk_core::handoff::split_claude_turn(&text).unwrap();
-            assert_eq!(request, "continue on the API");
+            let (block, request) = ox_desk_core::handoff::split_claude_turn(text).unwrap();
+            assert_eq!(request, "continue on my subscription");
             assert!(
                 block.contains("first request")
                     && block.contains("<message role=\"assistant\" id=\"a1\">")
             );
+            let first_turn = text.clone();
+            let until = Instant::now() + Duration::from_secs(20);
+            loop {
+                engine.process(&target, vec![], false).unwrap();
+                let store = &engine.running[&target].store;
+                if let Some(id) = store.selected().filter(|id| *id != previous)
+                    && store
+                        .transcript(id)
+                        .is_some_and(|t| t.user_messages(&first_turn, &[]) == 1)
+                {
+                    assert_eq!(store.applied_access(Some(id)), Some(Access::Auto));
+                    break;
+                }
+                let event = events
+                    .recv_timeout(until.saturating_duration_since(Instant::now()))
+                    .expect("Claude fixture did not receive the carried first turn");
+                engine.running.get_mut(&target).unwrap().store.apply(event);
+            }
         }
 
         #[test]
@@ -5186,25 +5212,23 @@ mod tests {
                 },
             )
             .unwrap();
-            let deadline = Instant::now() + Duration::from_secs(20);
-            while !store.can_send(None) {
-                if let ox_desk_core::store::Connection::Closed(reason) = store.state() {
-                    panic!("Claude fixture failed initialization: {reason}");
-                }
-                let event = rx
-                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    .unwrap_or_else(|err| {
-                        panic!(
-                            "Claude fixture initialization: {err}, state {:?}",
-                            store.state()
-                        )
-                    });
-                store.apply(event);
-            }
+            assert!(store.can_send(None));
+            assert!(store.live_threads().is_empty());
             store
                 .dispatch(Action::SendText(None, "lead first turn".into()))
                 .unwrap();
             let lead = store.take_opened().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while store.applied_access(Some(&lead)).is_none() || store.thread_busy(&lead) {
+                if let ox_desk_core::store::Connection::Closed(reason) = store.state() {
+                    panic!("Claude fixture failed initialization: {reason}");
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let event = rx.recv_timeout(remaining).unwrap_or_else(|err| {
+                    panic!("Claude fixture lead turn: {err}, state {:?}", store.state())
+                });
+                store.apply(event);
+            }
             let mut live = local_live(&scope);
             live.state = store.host_snapshot(&scope);
             live.store = store;
@@ -5247,14 +5271,13 @@ mod tests {
                 if Instant::now() >= until {
                     let live = &engine.running[scope];
                     panic!(
-                        "the launch never answered: stage {:?}, can_send {}, missing {}, next {:?}, applied {:?}, notice {:?}",
+                        "the launch never answered: stage {:?}, can_send {}, next {:?}, applied {:?}, notice {:?}",
                         live.launching.as_ref().map(|l| match l.stage {
                             Stage::Opening => "opening",
                             Stage::AccessRequested => "access",
                             Stage::Sent => "sent",
                         }),
                         live.store.can_send(None),
-                        live.store.claude_blank_missing(),
                         live.store.next_access(),
                         live.store.applied_access(None),
                         live.store.notice(),
@@ -5265,15 +5288,11 @@ mod tests {
         }
 
         #[test]
-        fn a_worker_starts_on_a_warm_claude_route_whose_blank_was_consumed() {
+        fn consecutive_workers_start_on_the_leads_claude_route() {
             let root = tempfile::tempdir().unwrap();
             let (scope, lead, mut engine, rx) = warm_claude(root.path());
-            assert!(
-                !engine.running[&scope].store.can_send(None),
-                "the lead's send consumed the blank"
-            );
-            // Two consecutive workers on the lead's own route: each send consumes the
-            // blank again, and each launch prepares the next one itself.
+            assert!(engine.running[&scope].store.can_send(None));
+            assert_eq!(engine.running[&scope].store.live_threads(), [lead.clone()]);
             let mut sessions = Vec::new();
             for _ in 0..2 {
                 let done = launch_on_warm_claude(&mut engine, &scope, &lead, &rx)
@@ -5445,20 +5464,18 @@ mod tests {
         }
 
         #[test]
-        fn the_process_list_shows_the_warm_blank_as_a_draft_but_reaping_ignores_it() {
+        fn opening_an_unsent_claude_draft_adds_no_process_to_the_running_list() {
             let root = tempfile::tempdir().unwrap();
-            let (scope, lead, mut engine, rx) = warm_claude(root.path());
+            let (scope, lead, mut engine, _rx) = warm_claude(root.path());
             let live = engine.running.get_mut(&scope).unwrap();
             live.store.dispatch(Action::NewDraft).unwrap();
-            while !live.store.can_send(None) {
-                live.store
-                    .apply(rx.recv_timeout(Duration::from_secs(5)).unwrap());
-            }
+            assert!(live.store.can_send(None));
+            assert_eq!(live.store.applied_access(None), None);
             engine.process(&scope, vec![], false).unwrap();
             let rows = engine.processes();
-            assert!(rows.iter().any(|p| p.draft), "{:?}", rows.len());
-            assert!(rows.iter().any(|p| !p.draft && p.threads == [lead.clone()]));
-            // The blank alone never keeps a route open: it is not a session.
+            assert_eq!(rows.len(), 1);
+            assert!(!rows[0].draft);
+            assert_eq!(rows[0].threads, [lead.clone()]);
             assert_eq!(engine.running[&scope].store.live_threads(), [lead]);
         }
 
@@ -5470,7 +5487,9 @@ mod tests {
                 ox_desk_core::claude_worker_contract::Contract::with_support(true, false, true);
             let live = engine.running.get_mut(&scope).unwrap();
             live.store.dispatch(Action::NewDraft).unwrap();
-            live.store.stage_claude_worker(contract).unwrap();
+            live.store
+                .stage_claude_worker(Some(contract), ox_desk_core::runtime::Access::AcceptEdits)
+                .unwrap();
             let pump = |engine: &mut Engine, until: &dyn Fn(&Store) -> bool| {
                 let end = Instant::now() + Duration::from_secs(10);
                 while !until(&engine.running[&scope].store) {
@@ -5509,6 +5528,7 @@ mod tests {
                 .unwrap_or_default()
             };
             let flag = contract.args().into_iter().next().expect("contract args");
+            pump(&mut engine, &|s| s.applied_access(Some(&other)).is_some());
             let (w, o) = (argv(&worker), argv(&other));
             assert!(!w.is_empty() && !o.is_empty(), "{w} / {o}");
             assert!(w.contains(&flag), "worker lost its contract: {w}");
@@ -5533,7 +5553,9 @@ mod tests {
             };
             let live = engine.running.get_mut(&scope).unwrap();
             live.store.dispatch(Action::NewDraft).unwrap();
-            live.store.stage_claude_worker(contract).unwrap();
+            live.store
+                .stage_claude_worker(Some(contract), ox_desk_core::runtime::Access::AcceptEdits)
+                .unwrap();
             pump(&mut engine, &|s| {
                 s.can_send(None) && s.claude_worker_state() == WorkerBlank::Ready
             });

@@ -77,7 +77,11 @@ impl Store {
 
         match thread.and_then(|id| self.transcript(id)) {
             Some(t) => Options {
-                model: t.model.clone().unwrap_or(caps.model),
+                model: thread
+                    .and_then(|id| self.resume_models.get(id))
+                    .cloned()
+                    .or_else(|| t.model.clone())
+                    .unwrap_or(caps.model),
                 effort: t.effort.clone(),
                 tier: t.tier.clone(),
             },
@@ -137,7 +141,9 @@ impl Store {
                 ))
                 .map(|_| ());
         }
-        if !self.can_send(owner) || owner.is_some_and(|id| self.changing_options(id)) {
+        if !(self.can_send(owner) || owner.is_some_and(|id| self.can_configure_saved_claude(id)))
+            || owner.is_some_and(|id| self.changing_options(id))
+        {
             return Err(io::Error::other("Wait for the pending thread settings."));
         }
         if self.is_session_scoped() {

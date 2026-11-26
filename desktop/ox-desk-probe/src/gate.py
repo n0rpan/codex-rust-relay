@@ -294,9 +294,18 @@ if len(sys.argv) == 2 and "Tailscale" in sys.argv[1]:
         (self.root / "ox").chmod(0o755)
         binary = stage / "bin"
         binary.mkdir()
-        (binary / "claude").symlink_to(
-            probe.with_name("fake-claude").resolve(strict=True)
+        # Count every invocation, including short-lived auth/version checks that
+        # would be invisible to process sampling and the conversation trace.
+        self.claude_launches = stage / "claude-launches"
+        self.claude_launches.touch()
+        launcher = binary / "claude"
+        peer = probe.with_name("fake-claude").resolve(strict=True)
+        launcher.write_text(
+            "#!/bin/sh\n"
+            + "echo launch >> " + shlex.quote(str(self.claude_launches)) + "\n"
+            + "exec " + shlex.quote(str(peer)) + ' "$@"\n'
         )
+        launcher.chmod(0o755)
         self.canary = "ox_gate_secret_" + secrets.token_hex(16)
         self.env.update(
             PATH=str(binary) + ":/usr/bin:/bin",
@@ -512,8 +521,11 @@ def idle_footprint(before, after, seconds):
     previous = {(r["pid"], r["start_ticks"]): r["cpu_ticks"] for r in before["children"]}
     child_ticks = sum(r["cpu_ticks"] - previous.get((r["pid"], r["start_ticks"]), 0)
                       for r in after["children"])
+    percent_per_tick = 100 / after["clock_ticks_per_second"] / seconds
     return {
-        "child_cpu_percent": child_ticks * 100 / after["clock_ticks_per_second"] / seconds,
+        "gui_cpu_percent": (after["app"]["cpu_ticks"] - before["app"]["cpu_ticks"]) * percent_per_tick,
+        "host_cpu_percent": (after["host"]["cpu_ticks"] - before["host"]["cpu_ticks"]) * percent_per_tick,
+        "child_cpu_percent": child_ticks * percent_per_tick,
         "child_rss_kib": sum(r["rss_kib"] for r in after["children"]),
         "gui_and_host_rss_kib": after["app"]["rss_kib"] + after["host"]["rss_kib"],
         "gui_and_host_pss_kib": after["app"]["pss_kib"] + after["host"]["pss_kib"],
@@ -532,10 +544,11 @@ def idle(f):
     a, b = before["app"], after["app"]
     gui_ticks = b["cpu_ticks"] - a["cpu_ticks"]
     host_ticks = after["host"]["cpu_ticks"] - before["host"]["cpu_ticks"]
-    cpu = (gui_ticks + host_ticks) * 100 / before["clock_ticks_per_second"] / seconds
+    footprint = idle_footprint(before, after, seconds)
+    cpu = footprint["gui_cpu_percent"] + footprint["host_cpu_percent"]
     wakes = (f.stats()["voluntary_switches"] - start_switches) / seconds
     if "G2" in selected:
-        record("G2", cpu <= limits["idle_cpu_percent"], cpu_percent=cpu, seconds=seconds, app=b, host=after["host"], gui_cpu_ticks=gui_ticks, host_cpu_ticks=host_ticks, children=after["children"], **idle_footprint(before, after, seconds))
+        record("G2", cpu <= limits["idle_cpu_percent"], cpu_percent=cpu, seconds=seconds, app=b, host=after["host"], gui_cpu_ticks=gui_ticks, host_cpu_ticks=host_ticks, children=after["children"], **footprint)
     if "G3" in selected:
         record("G3", None, voluntary_switches_per_second=wakes, target=limits["visible_context_switches_per_s_target"])
 
@@ -958,15 +971,22 @@ def mac_gate(f):
 
 
 def claude_gate(f):
-    times = [f.start(4, 2, smoke=True, claude=True) for _ in range(10)]
+    def launches():
+        return len(f.claude_launches.read_text().splitlines())
+
+    times = []
+    for _ in range(10):
+        times.append(f.start(4, 2, smoke=True, claude=True))
+        if launches():
+            raise RuntimeError("Claude executed during desktop first-frame startup")
     p90 = sorted(times)[8]
     f.start(4, 2, claude=True)
     try:
-        wait(lambda: f.stats()["connected"] and f.events("claude-clean-env"))
+        wait(lambda: f.stats()["connected"])
     except TimeoutError as error:
         s = f.stats()
         raise RuntimeError(
-            f"Claude startup: ready={s['connected']}, catalog={s['catalog_len']}, native launches={len(f.events('claude-clean-env'))}"
+            f"Claude startup: ready={s['connected']}, catalog={s['catalog_len']}, native launches={launches()}"
         ) from error
     # Match the existing G2 interval after startup workers park.
     time.sleep(1)
@@ -977,13 +997,12 @@ def claude_gate(f):
     idle_end = f.sample()
     idle_frames = f.stats()["frames_drawn"] - before_idle_frame
     seconds = time.monotonic() - start_time
-    cpu = (
-        sum(idle_end[owner]["cpu_ticks"] - idle_start[owner]["cpu_ticks"] for owner in ["app", "host"])
-        * 100
-        / idle_start["clock_ticks_per_second"]
-        / seconds
-    )
-    for ident in f.claude_ids:
+    footprint = idle_footprint(idle_start, idle_end, seconds)
+    cpu = footprint["gui_cpu_percent"] + footprint["host_cpu_percent"]
+    idle_launches = launches()
+    if idle_launches:
+        raise RuntimeError(f"Claude executed {idle_launches} time(s) before the first user action")
+    for sent, ident in enumerate(f.claude_ids):
         thread = "claude:api:" + ident
         # Sending moves the previous row into today's group. Resolve the intended
         # sidebar control at click time instead of clicking old screenshot coordinates.
@@ -992,6 +1011,8 @@ def claude_gate(f):
         f.press(row)
         f.wait_for(f"Claude session {thread} to be selected", lambda: f.stats()["selected_thread"] == thread)
         f.x("key", "ctrl+l")
+        if launches() != sent:
+            raise RuntimeError(f"Opening Claude history started a process: {launches()} launches after {sent} sends")
         f.x("type", "Generate a measured Claude stream")
         f.x("key", "ctrl+Return")
         f.wait_for(
@@ -1047,7 +1068,8 @@ def claude_gate(f):
         and 0 < end["drains"] - first["drains"] <= end["frames_drawn"]
         and 0 <= elapsed <= 250
         and leaks == 0
-        and len({e["id"] for e in f.events("claude-clean-env")}) >= 4,
+        and launches() == len(f.claude_ids)
+        and len({e["id"] for e in f.events("claude-clean-env")}) == len(f.claude_ids),
         timing_ok,
         "claude",
     )
@@ -1060,9 +1082,11 @@ def claude_gate(f):
         idle_cpu_percent=cpu,
         idle_seconds=seconds,
         idle_frames=idle_frames,
+        idle_claude_launches=idle_launches,
+        total_claude_launches=launches(),
         idle_host=idle_end["host"],
         idle_children=idle_end["children"],
-        **idle_footprint(idle_start, idle_end, seconds),
+        **footprint,
         simultaneous_threads=4,
         streams_overlap=overlap,
         message_bytes=200000,

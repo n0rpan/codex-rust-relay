@@ -1,4 +1,5 @@
 #!/bin/sh
+printf '%s\n' "$*" >> launches
 printf '%s\n' "$@" > args
 IFS= read -r row || exit 1
 printf '%s\n' "$row" > wire
