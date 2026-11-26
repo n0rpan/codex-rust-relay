@@ -159,6 +159,13 @@ impl Preferences {
                 cx,
             ))
             .child(self.preference_choices(
+                "OX updates",
+                &[
+                    ("Download automatically", Behavior { background_updates: true, ..b }),
+                    ("Check manually", Behavior { background_updates: false, ..b }),
+                ], b, p, cx,
+            ))
+            .child(self.preference_choices(
                 "Live weather (MET Norway)",
                 &[
                     (

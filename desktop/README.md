@@ -11,7 +11,9 @@ ox desktop .
 
 Run the launch command from the project you want to open, or pass a directory such as `ox desktop ~/Work/my-project`. The installer verifies the archive checksum, installs `ox`, `ox-desktop` and `ox-host` under `~/.local/bin` by default, and adds **OX Desktop** to your Linux launcher or macOS **~/Applications**. Follow the installer's PATH hint if your shell cannot find `ox`.
 
-For an update, run the same installer command again. `ox update --dev` updates the standalone CLI. The desktop installer updates the whole package and keeps existing settings and native histories. If the session host is running, the installer restarts it on the new version: running turns finish first (for up to 10 minutes), new turns wait for the new host, and connected desktops and phones reconnect on their own. `ox host restart` does the same by hand. Check installed versions with `ox --version`, `ox-desktop --version` and `ox-host --version`, and the running host with `ox host doctor`.
+Once installed, OX Desktop and the headless session host check for releases in the background. Desktop offers **Restart to update** after it has verified the entire package. **Later** keeps the current release running. Open **Settings → Accounts → Restart to update** to see the prompt again. From a terminal, `ox update` applies the staged release or downloads one. Older desktop installations need one more run of the installer above to enable this behavior.
+
+The desktop, session host, phone interface and CLI switch together. A running host allows up to ten minutes for active turns to finish. Turns still running at the deadline can be interrupted. Paired phones reconnect to the updated host. Use `ox host doctor` to check the running host version.
 
 ## First run
 

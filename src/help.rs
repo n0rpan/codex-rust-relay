@@ -234,7 +234,8 @@ checksum and installs it as ~/.local/bin/ox. To install the development
 build made from every commit on main, end the command with: sh -s -- --dev
 
 Run ox update --check to look for a newer release.
-Run ox update to verify and install it over the running ox executable.
+Run ox update to install the matching desktop suite or standalone CLI.
+Run ox update --stage to download now and ox update --apply to install later.
 Run ox update --dev or ox update --stable to switch channels.
 
 Releases: https://github.com/oxstack/ox/releases

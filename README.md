@@ -71,9 +71,9 @@ ox codex      # or: ox claude
 
 ## Upgrade
 
-Rerun the install command you used. For OX Desktop it updates the app, host and CLI together. If the session host is running, the installer restarts it on the new version without cutting work short: running turns finish first (up to 10 minutes), new turns wait a moment for the new host, and the desktop and paired phones reconnect on their own. Sessions, pairings and settings are kept. `ox host restart` does the same by hand; `ox host doctor` shows which version is running.
+OX Desktop downloads and verifies a complete release in the background. Choose **Restart to update** to switch the desktop, CLI, session host and bundled phone interface together, or **Later** to keep working. You can bring the prompt back from **Settings → Accounts → Restart to update**.
 
-The terminal-only CLI updates itself with `ox update`. Add `--dev` to the install command (`sh -s -- --dev --desktop`) for the rolling development build of `main`.
+For an older desktop installation, rerun the install command with `--desktop` once to enable background updates. Run `ox update` to apply an update from the terminal, including on a headless machine. A running host gives active turns up to ten minutes to finish. Check the running version with `ox host doctor`.
 
 To remove the login service, run `ox host uninstall`. It keeps your sessions and pairings. `ox host uninstall --purge` also deletes OX's host state. Neither touches Codex or Claude Code sessions or sign-ins.
 

@@ -84,11 +84,13 @@ how `ox update --stable` returns a dev build to stable. From a stable or source
 build before the first stable release, `ox update` reports
 `no stable ox release has been published yet` and points to `ox update --dev`.
 
-`ox update` verifies the binary against the SHA-256 digest published by GitHub,
-then replaces the running executable's file. Use an install directory writable
-by your own account. Restart any running `ox serve` or ox-launched sessions to
-use the new binary. The updater leaves provider settings and credentials alone.
-Running the installer again has the same effect as `ox update`.
+On a desktop installation, both OX Desktop and the headless session host can download the full package in the background. They share a cache and check GitHub at most every six hours after an up-to-date response. Choose **Settings → Appearance & input → OX updates → Check manually**, or set `OX_NO_BACKGROUND_UPDATE=1` in the process environment, to turn off automatic checks. Manual checks still work. Older installations need one run of `install.sh --desktop` to adopt the managed layout.
+
+OX checks the release archive against GitHub's SHA-256 digest, verifies the macOS signature where applicable, and checks the versions reported by all three executables. Choose **Restart to update** in Desktop, or run `ox update` in a terminal to apply a staged update even offline. A single package switch updates the CLI, desktop, host and phone interface. A running host drains for up to ten minutes before restarting. Check its version with `ox host doctor`.
+
+Use `ox update --stage` to download without installing, `ox update --status --json` to inspect what is staged locally, and `ox update --apply` to apply it offline. An interactive `ox codex` or `ox claude` launch from an installer-managed CLI also checks in the background and announces a staged release on the next launch.
+
+On a standalone CLI installation, `ox update` replaces the executable after verifying its size and SHA-256 digest. Restart existing `ox serve` processes or ox-launched sessions to use the new executable.
 
 ### Manual download
 

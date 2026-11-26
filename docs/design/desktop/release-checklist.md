@@ -35,6 +35,7 @@ Write the result of each line as pass, fail (with what happened) or skipped (wit
 
 ### Upgrade
 
+- [ ] Stage an update and choose **Later**. Confirm the original CLI, desktop and host are still active. Disconnect from the network, open About, and choose **Restart to update**. Confirm all three versions match and the paired phone reconnects.
 - [ ] With a long turn running, rerun the installer. The installer says it is restarting the host; the turn finishes; the phone shows the turn's result without re-pairing; `ox host doctor` shows the new version.
 - [ ] Repeat with a turn that outlasts `ox host restart --timeout 30`. The turn is reported as interrupted, and the installer output says how many turns were interrupted.
 

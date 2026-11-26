@@ -557,7 +557,8 @@ jobs:
             grep -F "ox setup" "${prefix}/${round}.log"
           done
           cmp "${prefix}/bin/ox" "target/${target}/release/ox"
-          test "$(find "${prefix}/bin" -mindepth 1 | wc -l | tr -d ' ')" = "1"
+          test -d "${prefix}/bin/.ox-cli-update"
+          test "$(find "${prefix}/bin" -mindepth 1 | wc -l | tr -d ' ')" = "2"
           # A wrong checksum must install nothing.
           mkdir -p "${prefix}/tampered"
           cp "dist/ox-${target}.tar.gz" "${prefix}/tampered/"
@@ -804,7 +805,7 @@ jobs:
             echo "ox desktop ."
             echo '```'
             echo
-            echo "To update the standalone CLI, use \`ox update --dev\`."
+            echo "OX Desktop downloads updates in the background and offers to restart. To update from the terminal, use \`ox update --dev\`."
           } > "${notes}"
 
           # Stage everything in a draft first. Uploads are the slow, failure

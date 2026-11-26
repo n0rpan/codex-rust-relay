@@ -1,7 +1,9 @@
 //! Per-user host discovery and lifecycle shared by the daemon and local desktop.
 pub mod errlog;
+#[path = "../../../src/managed_install.rs"]
+pub mod managed_install;
 mod manager;
-pub use manager::manage;
+pub use manager::{manage, refresh_update_service};
 
 /// Whether the login service (launchd agent or systemd user unit) is installed.
 pub fn service_installed() -> io::Result<bool> {
@@ -291,7 +293,11 @@ fn executable(path: &Path) -> bool {
         .is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0)
 }
 fn binary() -> io::Result<PathBuf> {
-    let sibling = env::current_exe()?.with_file_name("ox-host");
+    let executable_path = env::current_exe()?;
+    if let Some(store) = managed_install::package_store(&executable_path) {
+        return Ok(managed_install::active_binary(&store, "ox-host"));
+    }
+    let sibling = executable_path.with_file_name("ox-host");
     if executable(&sibling) {
         return Ok(sibling);
     }

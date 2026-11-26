@@ -17,9 +17,11 @@ mod clients;
 mod daemon;
 mod desktop_launch;
 mod desktop_settings;
+mod desktop_state;
 mod diagnostics;
 mod help;
 mod host_lifetime;
+mod managed_install;
 mod native;
 mod picker;
 mod provider;
@@ -120,6 +122,7 @@ pub(crate) use version::VERSION;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    let _package = managed_install::hold_generation();
     match launch(std::env::args_os().skip(1)).await {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
@@ -150,6 +153,9 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
     let args: Vec<OsString> = args.collect();
     if args.first().is_some_and(|a| a == "codex" || a == "claude") {
         host_lifetime::supervise()?;
+        if std::io::stderr().is_terminal() && !host_lifetime::hosted() {
+            update::on_terminal_launch();
+        }
     }
     if args
         .first()
