@@ -233,6 +233,7 @@ impl App {
             upstream_model: &route.upstream_model,
             requested_model: &requested,
             secrets: Arc::clone(&self.secrets),
+            adapt: &self.adapt,
         };
         let beta = parts
             .uri

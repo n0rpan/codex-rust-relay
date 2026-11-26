@@ -4,6 +4,7 @@
 //! same provider registry and credential lookup. The relay lives for the
 //! lifetime of the client process.
 
+mod adapt;
 mod adapters;
 mod catalog;
 mod claude_frontend;
@@ -97,6 +98,8 @@ struct App {
     /// One line per provider/model adaptation, so a corrected default is
     /// explained once instead of on every turn.
     notices: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Request-shape rules learned from providers that rejected a field.
+    adapt: adapt::Memory,
     /// One pooled Brave client, present only when live search is opted in and
     /// its credential reference is usable.
     search: Option<BraveSearch>,
@@ -699,6 +702,7 @@ impl App {
             max_request_bytes: MAX_REQUEST_BYTES,
             secrets: Arc::new(secrets),
             notices: std::sync::Mutex::default(),
+            adapt: adapt::Memory::default(),
             search: None,
         })
     }
@@ -864,6 +868,7 @@ impl App {
             max_request_bytes,
             secrets: Arc::new(secrets),
             notices: std::sync::Mutex::default(),
+            adapt: adapt::Memory::default(),
             search,
         })
     }
@@ -1211,6 +1216,7 @@ impl App {
                             upstream_model: &route.upstream_model,
                             requested_model: &requested,
                             secrets: Arc::clone(&self.secrets),
+                            adapt: &self.adapt,
                         },
                         payload,
                     )
@@ -1220,16 +1226,26 @@ impl App {
                 if path == "/responses" {
                     state.vendor.add_cache_hints(&mut payload);
                 }
-                let body = match serde_json::to_vec(&payload) {
-                    Ok(body) => body,
-                    Err(_) => {
-                        return error_response(
-                            StatusCode::BAD_REQUEST,
-                            "Request body could not be encoded",
-                        );
-                    }
-                };
-                drop(payload);
+                for action in self.adapt.apply_known(
+                    state.vendor.key.as_str(),
+                    route.upstream_model.as_str(),
+                    &mut payload,
+                ) {
+                    self.notice_once(
+                        format!(
+                            "adapt:{}:{}:{}",
+                            state.vendor.key,
+                            route.upstream_model,
+                            action.label()
+                        ),
+                        format!(
+                            "ox: provider {:?}: model {:?}: {} (remembered from an earlier rejection)",
+                            state.vendor.key,
+                            route.upstream_model,
+                            action.label()
+                        ),
+                    );
+                }
                 let vendor_headers =
                     match state.vendor.inference_headers(auth, Some(&parts.headers)) {
                         Ok(headers) => headers,
@@ -1256,16 +1272,75 @@ impl App {
                     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
                 }
                 headers.extend(vendor_headers);
-                let upstream = self
-                    .client
-                    .post(state.vendor.responses_url(&path, query.as_deref()))
-                    .headers(headers)
-                    .body(body)
-                    .send()
-                    .await;
-                match upstream {
-                    Ok(response) => responses_response(response, &self.secrets).await,
-                    Err(_) => error_response(StatusCode::BAD_GATEWAY, "Inference request failed"),
+                let mut attempt = 0;
+                loop {
+                    attempt += 1;
+                    let body = match serde_json::to_vec(&payload) {
+                        Ok(body) => body,
+                        Err(_) => {
+                            return error_response(
+                                StatusCode::BAD_REQUEST,
+                                "Request body could not be encoded",
+                            );
+                        }
+                    };
+                    let upstream = self
+                        .client
+                        .post(state.vendor.responses_url(&path, query.as_deref()))
+                        .headers(headers.clone())
+                        .body(body)
+                        .send()
+                        .await;
+                    let upstream = match upstream {
+                        Ok(response) => response,
+                        Err(_) => {
+                            return error_response(
+                                StatusCode::BAD_GATEWAY,
+                                "Inference request failed",
+                            );
+                        }
+                    };
+                    if !upstream.status().is_client_error()
+                        || !matches!(upstream.status().as_u16(), 400 | 422)
+                    {
+                        return responses_response(upstream, &self.secrets).await;
+                    }
+                    let status = upstream.status();
+                    let retry_after = upstream
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse::<u32>().ok());
+                    let error_body = upstream::read_error_body(upstream).await;
+                    let action = error_body
+                        .as_ref()
+                        .and_then(upstream::extract_error_message)
+                        .and_then(|message| adapt::classify(status.as_u16(), message, &payload));
+                    if attempt < adapt::MAX_ATTEMPTS
+                        && let Some(action) = action
+                        && adapt::apply(action, &mut payload)
+                    {
+                        if self.adapt.learn(
+                            state.vendor.key.as_str(),
+                            route.upstream_model.as_str(),
+                            action,
+                        ) {
+                            eprintln!(
+                                "ox: provider {:?}: model {:?}: {} because the provider rejected it\n  fix: {}",
+                                state.vendor.key,
+                                route.upstream_model,
+                                action.label(),
+                                action.advice()
+                            );
+                        }
+                        continue;
+                    }
+                    return upstream::http_failure_parts(
+                        status,
+                        retry_after,
+                        error_body,
+                        &self.secrets,
+                    );
                 }
             }
         }
@@ -2026,6 +2101,21 @@ mod tests {
                 .collect()
         }
 
+        /// Every inference request, whichever wire the provider speaks.
+        fn inference_hits(&self) -> Vec<Hit> {
+            self.hits
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|hit| {
+                    hit.path.starts_with("/v1/responses")
+                        || hit.path.starts_with("/v1/chat/completions")
+                        || hit.path.starts_with("/v1/messages")
+                })
+                .cloned()
+                .collect()
+        }
+
         fn hits_len(&self) -> usize {
             self.hits.lock().unwrap().len()
         }
@@ -2045,6 +2135,24 @@ mod tests {
         /// A canned native Responses HTTP failure, with headers to prove that
         /// arbitrary vendor headers are not relayed.
         responses_error: Option<(u16, Value, Vec<(&'static str, &'static str)>)>,
+        /// Responses returned in order before the normal echo, so a test can
+        /// make the first attempt fail the way a real provider does.
+        responses_script: Vec<(u16, Value)>,
+        responses_cursor: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Default for Behavior {
+        fn default() -> Self {
+            Self {
+                catalog_pages: Default::default(),
+                models: Ok(Value::Null),
+                catalog_barrier: None,
+                redirect: None,
+                responses_error: None,
+                responses_script: Vec::new(),
+                responses_cursor: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
     }
 
     fn models_body(ids: &[&str]) -> Value {
@@ -2053,11 +2161,9 @@ mod tests {
 
     async fn spawn_mock(models: Result<Value, u16>, redirect: Option<String>) -> MockVendor {
         spawn_mock_behavior(Behavior {
-            catalog_pages: Default::default(),
             models,
-            catalog_barrier: None,
             redirect,
-            responses_error: None,
+            ..Behavior::default()
         })
         .await
     }
@@ -2068,11 +2174,19 @@ mod tests {
         headers: &[(&'static str, &'static str)],
     ) -> MockVendor {
         spawn_mock_behavior(Behavior {
-            catalog_pages: Default::default(),
-            models: Ok(Value::Null),
-            catalog_barrier: None,
-            redirect: None,
             responses_error: Some((status, body, headers.to_vec())),
+            ..Behavior::default()
+        })
+        .await
+    }
+
+    /// A mock whose successive Responses requests answer from `script`, then
+    /// fall back to the normal echo.
+    async fn spawn_mock_with_responses(models: Value, script: Vec<(u16, Value)>) -> MockVendor {
+        spawn_mock_behavior(Behavior {
+            models: Ok(models),
+            responses_script: script,
+            ..Behavior::default()
         })
         .await
     }
@@ -2157,7 +2271,25 @@ mod tests {
                 ),
             };
         }
-        if path.starts_with("/v1/responses") {
+        if path.starts_with("/v1/responses")
+            || path.starts_with("/v1/chat/completions")
+            || path.starts_with("/v1/messages")
+        {
+            let cursor = behavior
+                .responses_cursor
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some((status, body)) = behavior.responses_script.get(cursor) {
+                // A string body is an event stream, which is what the
+                // translated wires expect from a successful provider.
+                if let Value::String(stream) = body {
+                    return bytes_response(
+                        StatusCode::from_u16(*status).unwrap(),
+                        Bytes::from(stream.clone()),
+                        "text/event-stream",
+                    );
+                }
+                return json_response(StatusCode::from_u16(*status).unwrap(), body.clone());
+            }
             if let Some((status, body, headers)) = &behavior.responses_error {
                 let mut response =
                     json_response(StatusCode::from_u16(*status).unwrap(), body.clone());
@@ -2671,11 +2803,9 @@ env_key = "ALPHA_KEY"
         // The barrier needs two waiters and only one request arrives, so
         // discovery never answers on its own.
         let mock = spawn_mock_behavior(Behavior {
-            catalog_pages: Default::default(),
             models: Ok(models_body(&["discovered"])),
             catalog_barrier: Some(tokio::sync::Barrier::new(2)),
-            redirect: None,
-            responses_error: None,
+            ..Behavior::default()
         })
         .await;
         let environment = |name: &str| (name == "ALPHA_KEY").then(|| "alpha-secret".to_owned());
@@ -2717,7 +2847,7 @@ env_key = "ALPHA_KEY"
                     }))),
                     ("scope=public&after_id=loop".to_owned(), final_page)
                 ].into(),
-                catalog_barrier: None, redirect: None, responses_error: None,
+                ..Behavior::default()
             }).await;
             let config = format!(
                 "{}models_url = \"{}/models?scope=public\"\n",
@@ -2761,9 +2891,7 @@ env_key = "ALPHA_KEY"
             catalog_pages: (0..64)
                 .map(|n| (format!("after_id=m{n}"), Ok(page(n + 1))))
                 .collect(),
-            catalog_barrier: None,
-            redirect: None,
-            responses_error: None,
+            ..Behavior::default()
         })
         .await;
         let relay = start_relay(
@@ -2781,11 +2909,9 @@ env_key = "ALPHA_KEY"
     #[tokio::test]
     async fn discovery_runs_for_multiple_vendors_concurrently() {
         let mock = spawn_mock_behavior(Behavior {
-            catalog_pages: Default::default(),
             models: Ok(models_body(&["discovered"])),
             catalog_barrier: Some(tokio::sync::Barrier::new(2)),
-            redirect: None,
-            responses_error: None,
+            ..Behavior::default()
         })
         .await;
         let config = two_vendor_config(&mock.base, &mock.base);
@@ -3327,6 +3453,269 @@ env_key = "BETA_KEY"
         assert_eq!(
             hits[0].body.as_ref().unwrap()["reasoning"]["effort"],
             "none"
+        );
+    }
+
+    fn static_vendor_config(base: &str) -> String {
+        format!(
+            r#"
+[providers.alpha]
+name = "Alpha"
+base_url = "{base}"
+env_key = "ALPHA_KEY"
+discovery = false
+
+[[providers.alpha.models]]
+id = "gpt"
+"#
+        )
+    }
+
+    fn chat_vendor_config(base: &str) -> String {
+        format!(
+            r#"
+[providers.alpha]
+name = "Alpha"
+base_url = "{base}"
+env_key = "ALPHA_KEY"
+discovery = false
+wire_api = "chat_completions"
+chat_reasoning_effort = "forward"
+
+[[providers.alpha.models]]
+id = "gpt"
+"#
+        )
+    }
+
+    const CHAT_STREAM: &str = concat!(
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    #[tokio::test]
+    async fn a_rejected_field_is_dropped_and_the_request_retried_once() {
+        let mock = spawn_mock_with_responses(
+            models_body(&[]),
+            vec![(
+                400,
+                json!({"error": {"message": "Reasoning is mandatory for this endpoint and cannot be disabled."}}),
+            )],
+        )
+        .await;
+        let relay = start_relay(
+            &static_vendor_config(&mock.base),
+            &[("ALPHA_KEY", "alpha-secret")],
+            1 << 20,
+        )
+        .await;
+
+        let response = post(
+            &relay,
+            json!({
+                "model": "alpha/gpt",
+                "input": [],
+                "reasoning": {"effort": "none", "summary": "auto"},
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let hits = mock.inference_hits();
+        assert_eq!(hits.len(), 2, "one rejection and one retry");
+        assert!(hits[0].body.as_ref().unwrap().get("reasoning").is_some());
+        let retried = hits[1].body.as_ref().unwrap();
+        assert!(retried.get("reasoning").is_none(), "{retried}");
+        assert_eq!(retried["input"], json!([]), "nothing else is removed");
+    }
+
+    #[tokio::test]
+    async fn a_learned_rule_is_applied_before_the_next_request() {
+        let mock = spawn_mock_with_responses(
+            models_body(&[]),
+            vec![(
+                400,
+                json!({"error": {"message": "Reasoning is mandatory for this endpoint and cannot be disabled."}}),
+            )],
+        )
+        .await;
+        let relay = start_relay(
+            &static_vendor_config(&mock.base),
+            &[("ALPHA_KEY", "alpha-secret")],
+            1 << 20,
+        )
+        .await;
+        let body = json!({
+            "model": "alpha/gpt",
+            "input": [],
+            "reasoning": {"effort": "none"},
+        });
+        assert_eq!(post(&relay, body.clone()).await.status(), 200);
+        assert_eq!(post(&relay, body).await.status(), 200);
+
+        let hits = mock.inference_hits();
+        assert_eq!(hits.len(), 3, "the second turn must not repeat the 400");
+        assert!(hits[2].body.as_ref().unwrap().get("reasoning").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_named_unsupported_parameter_is_dropped() {
+        let mock = spawn_mock_with_responses(
+            models_body(&[]),
+            vec![(
+                400,
+                json!({"error": {"message": "Unsupported parameter: 'cache_control' is not supported with this model."}}),
+            )],
+        )
+        .await;
+        let relay = start_relay(
+            &static_vendor_config(&mock.base),
+            &[("ALPHA_KEY", "alpha-secret")],
+            1 << 20,
+        )
+        .await;
+        let response = post(
+            &relay,
+            json!({
+                "model": "alpha/gpt",
+                "input": [],
+                "cache_control": {"type": "ephemeral"},
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let hits = mock.inference_hits();
+        assert_eq!(hits.len(), 2);
+        assert!(
+            hits[1]
+                .body
+                .as_ref()
+                .unwrap()
+                .get("cache_control")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stateless_refusal_strips_both_storage_fields() {
+        let mock = spawn_mock_with_responses(
+            models_body(&[]),
+            vec![(
+                400,
+                json!({"error": {"message": "Requests that set store: true or a previous_response_id are rejected"}}),
+            )],
+        )
+        .await;
+        let relay = start_relay(
+            &static_vendor_config(&mock.base),
+            &[("ALPHA_KEY", "alpha-secret")],
+            1 << 20,
+        )
+        .await;
+        let response = post(
+            &relay,
+            json!({
+                "model": "alpha/gpt",
+                "input": [],
+                "store": true,
+                "previous_response_id": "resp_1",
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let hits = mock.inference_hits();
+        let retried = hits[1].body.as_ref().unwrap();
+        assert!(retried.get("store").is_none(), "{retried}");
+        assert!(retried.get("previous_response_id").is_none(), "{retried}");
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_or_an_unrelated_error_is_not_retried() {
+        for (status, message) in [(429, "slow down"), (400, "the prompt is invalid")] {
+            let mock = spawn_mock_with_responses(
+                models_body(&[]),
+                vec![(status, json!({"error": {"message": message}}))],
+            )
+            .await;
+            let relay = start_relay(
+                &static_vendor_config(&mock.base),
+                &[("ALPHA_KEY", "alpha-secret")],
+                1 << 20,
+            )
+            .await;
+            let response = post(
+                &relay,
+                json!({
+                    "model": "alpha/gpt",
+                    "input": [],
+                    "reasoning": {"effort": "none"},
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), status, "{message}");
+            assert_eq!(mock.inference_hits().len(), 1, "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_translated_route_recovers_and_learns_too() {
+        let mock = spawn_mock_with_responses(
+            models_body(&[]),
+            vec![
+                (
+                    400,
+                    json!({"error": {"message": "This model does not support 'none' for reasoning_effort"}}),
+                ),
+                (200, json!(CHAT_STREAM)),
+                (200, json!(CHAT_STREAM)),
+            ],
+        )
+        .await;
+        let relay = start_relay(
+            &chat_vendor_config(&mock.base),
+            &[("ALPHA_KEY", "alpha-secret")],
+            1 << 20,
+        )
+        .await;
+        let request = json!({
+            "model": "alpha/gpt",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "hi"}
+            ]}],
+            "reasoning": {"effort": "none"},
+            "stream": true,
+        });
+        let response = post(&relay, request.clone()).await;
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        assert_eq!(status, 200, "{text}");
+        assert!(text.contains("response.completed"), "{text}");
+        let hits = mock.inference_hits();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].body.as_ref().unwrap()["reasoning_effort"], "none");
+        assert!(
+            hits[1]
+                .body
+                .as_ref()
+                .unwrap()
+                .get("reasoning_effort")
+                .is_none(),
+            "{:?}",
+            hits[1].body
+        );
+
+        // The learned rule applies before the second turn is translated.
+        let response = post(&relay, request).await;
+        assert_eq!(response.status(), 200);
+        let hits = mock.inference_hits();
+        assert_eq!(hits.len(), 3);
+        assert!(
+            hits[2]
+                .body
+                .as_ref()
+                .unwrap()
+                .get("reasoning_effort")
+                .is_none()
         );
     }
 

@@ -322,6 +322,7 @@ async fn infer_translated(
                     upstream_model: context.upstream_model,
                     requested_model: context.requested_model,
                     secrets: Arc::clone(&context.secrets),
+                    adapt: context.adapt,
                 },
                 canonical,
             )
@@ -1211,6 +1212,11 @@ mod tests {
         }
     }
 
+    fn adapt() -> &'static crate::adapt::Memory {
+        static ADAPT: std::sync::OnceLock<crate::adapt::Memory> = std::sync::OnceLock::new();
+        ADAPT.get_or_init(crate::adapt::Memory::default)
+    }
+
     fn context<'a>(
         vendor: &'a Vendor,
         key: &'a SecretKey,
@@ -1223,6 +1229,7 @@ mod tests {
             upstream_model: "upstream-model",
             requested_model: "vendor/upstream-model",
             secrets: Arc::clone(secrets),
+            adapt: adapt(),
         }
     }
 
@@ -1792,6 +1799,7 @@ mod tests {
                 upstream_model: "real-model",
                 requested_model: "vendor/upstream-model",
                 secrets: Arc::clone(&secrets),
+                adapt: adapt(),
             },
             payload,
             false,
@@ -1841,6 +1849,7 @@ mod tests {
                 upstream_model: "real-model",
                 requested_model: "vendor/upstream-model",
                 secrets,
+                adapt: adapt(),
             },
             json!({
                 "model": "vendor/upstream-model",
@@ -1892,6 +1901,7 @@ mod tests {
                 upstream_model: "real-model",
                 requested_model: "vendor/upstream-model",
                 secrets: Arc::new(vec!["sk-vendor-key".to_owned()]),
+                adapt: adapt(),
             },
             json!({"model": "vendor/upstream-model", "max_tokens": 10, "messages": []}),
             false,
@@ -1933,6 +1943,7 @@ mod tests {
                 upstream_model: "real-model",
                 requested_model: "vendor/upstream-model",
                 secrets,
+                adapt: adapt(),
             },
             json!({"model": "vendor/upstream-model", "max_tokens": 10, "messages": []}),
             false,
