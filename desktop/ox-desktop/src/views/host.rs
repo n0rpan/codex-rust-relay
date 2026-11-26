@@ -987,12 +987,27 @@ impl Host {
             pane,
             window,
             |s, owner, event: &super::route_chip::NewModelRoute, window, cx| {
-                let project = owner.read(cx).project.clone();
+                let (project, carried) = {
+                    let view = owner.read(cx);
+                    let carried = view.store.as_ref().and_then(|store| {
+                        if store.selected().is_some() {
+                            return None;
+                        }
+                        let text = store.draft(None).to_owned();
+                        let images = store.draft_images(None).to_vec();
+                        (!text.is_empty() || !images.is_empty()).then_some((text, images))
+                    });
+                    (view.project.clone(), carried)
+                };
                 match new_route_gate(&event.0, s.models.read(cx), s.native_account) {
                     Ok(()) => {
                         s.open(project, event.0.clone(), window, cx);
-                        s.panes[s.active]
-                            .update(cx, |pane, cx| pane.action(cx, DeskAction::NewDraft));
+                        s.panes[s.active].update(cx, |pane, cx| {
+                            pane.action(cx, DeskAction::NewDraft);
+                            if let Some((text, images)) = carried {
+                                pane.adopt_new_draft(text, images, cx);
+                            }
+                        });
                     }
                     Err(message) => {
                         s.message = Some(message.into());

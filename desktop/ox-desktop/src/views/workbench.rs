@@ -92,6 +92,7 @@ pub struct Workbench {
     pub(super) front: bool,
     pub(super) query: String,
     pending_selection: Option<(ox_desk_core::store::ThreadRow, bool)>,
+    pending_draft: Option<(String, Vec<ox_desk_core::mentions::ImageInput>)>,
     pub(super) store: Option<Store>,
     pub(super) launch_error: Option<String>,
     pub(super) mention_index: usize,
@@ -112,6 +113,7 @@ pub struct Workbench {
         HashMap<ox_desk_core::runtime::RequestId, Vec<Entity<gpui_component::input::InputState>>>,
     pub(super) fire: Option<Entity<activity::Runner>>,
     pub(super) runner: Option<Entity<activity::Runner>>,
+    pub(super) mascot_frame: u8,
     /// The selected thread's running turn at the last render, to notice it ending.
     last_turn: Option<(String, String)>,
     /// A just-ended turn's one-shot scene, kept until it has been seen once.
@@ -237,6 +239,7 @@ impl Workbench {
             front,
             query: String::new(),
             pending_selection: None,
+            pending_draft: None,
             project,
             route,
             store: None,
@@ -260,6 +263,7 @@ impl Workbench {
             finale_watch: None,
             fire: None,
             focused_ask: None,
+            mascot_frame: 0,
             editors: HashMap::new(),
             answer_fields: HashMap::new(),
             transcript_views: HashMap::new(),
@@ -308,6 +312,14 @@ impl Workbench {
                             s.launch_error = None;
                             if let Err(e) = store.search(s.query.clone()) {
                                 s.launch_error = Some(e.to_string());
+                            }
+                            if let Some((text, images)) = s.pending_draft.take() {
+                                if !text.is_empty() && store.draft(None).is_empty() {
+                                    store.edit(None, text);
+                                }
+                                for img in images {
+                                    store.attach_image(None, img);
+                                }
                             }
                             deadline = store.next_deadline();
                             store.set_front(s.front);
@@ -568,6 +580,32 @@ impl Workbench {
     }
     pub(super) fn restore_selection(&mut self, row: ox_desk_core::store::ThreadRow) {
         self.pending_selection = Some((row, false))
+    }
+    /// Carry over an unsent first-prompt draft (text and attached images) when switching
+    /// routes/models before sending.
+    pub(super) fn adopt_new_draft(
+        &mut self,
+        text: String,
+        images: Vec<ox_desk_core::mentions::ImageInput>,
+        cx: &mut Context<Self>,
+    ) {
+        if text.is_empty() && images.is_empty() {
+            return;
+        }
+        if let Some(store) = &mut self.store {
+            let _ = store.dispatch(DeskAction::NewDraft);
+            if !text.is_empty() {
+                store.edit(None, text);
+            }
+            for img in images {
+                store.attach_image(None, img);
+            }
+            cx.notify();
+        } else {
+            self.pending_selection = None;
+            self.pending_draft = Some((text, images));
+            cx.notify();
+        }
     }
     pub(super) fn layout_selection(&self) -> Option<&ox_desk_core::store::ThreadRow> {
         self.pending_selection
@@ -1041,7 +1079,7 @@ impl Workbench {
                                 .children(usage);
                             let dock = row().w_full().justify_center().child(dock);
                             if ready {
-                                view.child(self.empty_state(p, dock))
+                                view.child(self.empty_state(p, dock, cx))
                             } else {
                                 view.child(dock.flex_shrink_0().pt(px(SPACE_S)))
                             }
