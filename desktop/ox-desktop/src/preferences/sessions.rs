@@ -52,10 +52,10 @@ pub(super) fn limits_text(minutes: Option<u64>, per_parent: Option<u64>) -> Stri
 
 pub(super) fn sandbox_text(missing: &[&str]) -> String {
     if missing.is_empty() {
-        "Ready (bwrap and socat found).".to_owned()
+        "Ready.".to_owned()
     } else {
         format!(
-            "Not available: {} not found. Write workers can only edit files, without a sandbox.",
+            "Not available: {} not found. Write workers still run commands, unsandboxed, as Claude Code does in a terminal.",
             missing.join(" and ")
         )
     }
@@ -64,7 +64,12 @@ pub(super) fn sandbox_text(missing: &[&str]) -> String {
 impl Preferences {
     pub(super) fn sessions_page(&self, p: Palette, _cx: &mut Context<Self>) -> Div {
         let minutes = idle_minutes(std::env::var("OX_HOST_IDLE_MINUTES").ok().as_deref());
-        let missing = missing_sandbox_tools(std::env::var_os("PATH").as_deref());
+        // macOS has Claude Code's sandbox built in (Seatbelt); Linux needs bwrap and socat.
+        let missing = if cfg!(target_os = "macos") {
+            vec![]
+        } else {
+            missing_sandbox_tools(std::env::var_os("PATH").as_deref())
+        };
         let fact = |label: &'static str, value: String, note: &'static str| {
             div()
                 .flex()
@@ -111,8 +116,8 @@ impl Preferences {
             .child(fact(
                 "Worker sandbox",
                 sandbox_text(&missing),
-                "Write workers use bwrap and socat to isolate their commands. This is a status \
-                 check only.",
+                "Claude write workers run commands in Claude Code's sandbox where it can run (built \
+                 in on macOS, bwrap and socat on Linux). This is a status check only.",
             ))
     }
 }

@@ -6,13 +6,14 @@
 //! It depends on `std` and `serde_json` alone.
 use serde_json::{Value, json};
 
-/// Message shown when a write worker starts without a shell.
-pub const FALLBACK_NOTICE: &str = "Starting the stock client without a shell: Claude Code's sandbox needs bwrap and socat on Linux, so this write worker can edit files but not run commands.";
+/// Warning shown when a write worker starts where Claude Code's sandbox cannot run.
+/// The worker keeps its shell, as `claude` in a terminal does; OX adds no gate.
+pub const FALLBACK_NOTICE: &str = "Starting the stock client without a sandbox: Claude Code's sandbox needs bwrap and socat on Linux, so this write worker's commands run unsandboxed, as in a terminal session.";
 
-/// Claude Code's sandbox needs bwrap and socat on Linux. It is verified only
-/// there, so other platforms fall back to edits without a shell.
+/// Whether Claude Code's sandbox can run here: built in on macOS (Seatbelt),
+/// bwrap and socat on Linux. Only decides the warning; the shell is offered either way.
 pub fn sandbox_supported(os: &str, on_path: impl Fn(&str) -> bool) -> bool {
-    os == "linux" && on_path("bwrap") && on_path("socat")
+    os == "macos" || (os == "linux" && on_path("bwrap") && on_path("socat"))
 }
 
 /// Whether an executable of this name is on PATH. A directory scan, no spawn.
@@ -22,7 +23,8 @@ pub fn on_path(name: &str) -> bool {
 }
 
 /// The settings document that makes Claude Code's own sandbox confine the
-/// shell to the workspace. Bash is auto-allowed only inside it.
+/// shell to the workspace where it can run. Where it cannot, Claude Code warns and
+/// runs commands unsandboxed, its own default.
 pub fn sandbox_document() -> Value {
     json!({"sandbox": {"enabled": true, "autoAllowBashIfSandboxed": true}})
 }
@@ -30,6 +32,8 @@ pub fn sandbox_document() -> Value {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Contract {
     pub writes: bool,
+    /// Claude Code's sandbox can run on this machine. Without it the worker still
+    /// has its shell, unsandboxed, and its status carries the warning.
     pub sandboxed: bool,
     pub workflow: bool,
 }
@@ -50,21 +54,21 @@ impl Contract {
             workflow,
         }
     }
-    /// `--tools`. Bash is offered only to a write worker whose sandbox runs.
+    /// `--tools`. Every write worker has a shell.
     pub fn tools(&self) -> &'static str {
-        match (self.writes, self.sandboxed) {
-            (true, true) => "Read,Glob,Grep,Edit,Write,Bash,Workflow",
-            (true, false) => "Read,Glob,Grep,Edit,Write,Workflow",
-            (false, _) => "Read,Glob,Grep,Workflow",
+        if self.writes {
+            "Read,Glob,Grep,Edit,Write,Bash,Workflow"
+        } else {
+            "Read,Glob,Grep,Workflow"
         }
     }
     /// `--allowedTools`: what needs no prompt.
     pub fn allowed(&self) -> &'static str {
-        match (self.writes, self.sandboxed, self.workflow) {
-            (true, true, false) => "Read,Glob,Grep,Bash",
-            (true, true, true) => "Read,Glob,Grep,Bash,Workflow",
-            (true, false, true) | (false, _, true) => "Read,Glob,Grep,Workflow",
-            (_, _, false) => "Read,Glob,Grep",
+        match (self.writes, self.workflow) {
+            (true, false) => "Read,Glob,Grep,Bash",
+            (true, true) => "Read,Glob,Grep,Bash,Workflow",
+            (false, true) => "Read,Glob,Grep,Workflow",
+            (false, false) => "Read,Glob,Grep",
         }
     }
     /// `--disallowedTools`, only for a read worker.
@@ -80,11 +84,12 @@ impl Contract {
             "dontAsk"
         }
     }
-    /// The `--settings` value, present only for a sandboxed write worker.
+    /// The `--settings` value, present for every write worker: Claude Code uses the
+    /// sandbox where it can and otherwise warns and runs unsandboxed.
     pub fn settings(&self) -> Option<String> {
-        self.sandboxed.then(|| sandbox_document().to_string())
+        self.writes.then(|| sandbox_document().to_string())
     }
-    /// Set when a write worker has no shell because the sandbox cannot run here.
+    /// Set when a write worker's commands run unsandboxed because the sandbox cannot run here.
     pub fn fallback_notice(&self) -> Option<&'static str> {
         (self.writes && !self.sandboxed).then_some(FALLBACK_NOTICE)
     }
@@ -128,10 +133,11 @@ mod tests {
         assert_eq!(w.allowed(), "Read,Glob,Grep,Bash");
         assert_eq!(w.permission_mode(), "acceptEdits");
         assert!(w.settings().is_some() && w.fallback_notice().is_none());
+        // No sandbox here: the same shell and settings as a terminal session, plus a warning.
         let fallback = Contract::with_support(true, false, false);
-        assert_eq!(fallback.tools(), "Read,Glob,Grep,Edit,Write,Workflow");
-        assert_eq!(fallback.allowed(), "Read,Glob,Grep");
-        assert!(fallback.settings().is_none() && fallback.fallback_notice().is_some());
+        assert_eq!(fallback.tools(), w.tools());
+        assert_eq!(fallback.allowed(), w.allowed());
+        assert!(fallback.settings().is_some() && fallback.fallback_notice().is_some());
         let read = Contract::with_support(false, false, true);
         assert_eq!(read.tools(), "Read,Glob,Grep,Workflow");
         assert_eq!(read.permission_mode(), "dontAsk");
@@ -160,10 +166,11 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_needs_bwrap_and_socat_on_linux() {
+    fn sandbox_needs_bwrap_and_socat_on_linux_and_nothing_on_macos() {
         let with = |names: &'static [&'static str]| move |name: &str| names.contains(&name);
         assert!(sandbox_supported("linux", with(&["bwrap", "socat"])));
         assert!(!sandbox_supported("linux", with(&["bwrap"])));
-        assert!(!sandbox_supported("macos", with(&["bwrap", "socat"])));
+        assert!(sandbox_supported("macos", with(&[])));
+        assert!(!sandbox_supported("windows", with(&["bwrap", "socat"])));
     }
 }

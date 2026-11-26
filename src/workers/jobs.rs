@@ -455,8 +455,8 @@ impl Start {
                 wrapper
             } else {
                 overlay = true;
-                let sandboxed = self.claude_contract()?.sandboxed;
-                crate::native::claude_subscription_worker_command(home, sandboxed)?
+                let sandbox = self.claude_contract()?.settings().is_some();
+                crate::native::claude_subscription_worker_command(home, sandbox)?
             }
         };
         command
@@ -943,37 +943,26 @@ mod worker_contract_tests {
     }
 
     #[test]
-    fn write_claude_workers_get_bash_only_inside_the_sandbox() {
+    fn write_claude_workers_get_bash_with_or_without_a_sandbox() {
         let request = start(json!({
             "runtime": "claude", "mode": "session", "task": "fix it",
             "model": "fixture", "permission_mode": "write"
         }));
-        let sandboxed = crate::claude_worker_contract::sandbox_supported(
-            std::env::consts::OS,
-            crate::claude_worker_contract::on_path,
-        );
         let command = request.command(Path::new("/"), Path::new("/")).unwrap();
         let args = args_of(&command);
         assert_eq!(value_after(&args, "--permission-mode"), "acceptEdits");
-        if sandboxed {
-            assert_eq!(
-                value_after(&args, "--tools"),
-                "Read,Glob,Grep,Edit,Write,Bash,Workflow"
-            );
-            assert_eq!(value_after(&args, "--allowedTools"), "Read,Glob,Grep,Bash");
-            let settings = value_after(&args, "--settings");
-            assert_eq!(
-                serde_json::from_str::<Value>(settings).unwrap(),
-                crate::clients::claude_sandbox_document()
-            );
-        } else {
-            assert_eq!(
-                value_after(&args, "--tools"),
-                "Read,Glob,Grep,Edit,Write,Workflow"
-            );
-            assert_eq!(value_after(&args, "--allowedTools"), "Read,Glob,Grep");
-            assert!(!args.iter().any(|arg| arg == "--settings"));
-        }
+        // The shell does not depend on the sandbox: Claude Code runs it sandboxed
+        // where it can and otherwise unsandboxed, as in a terminal.
+        assert_eq!(
+            value_after(&args, "--tools"),
+            "Read,Glob,Grep,Edit,Write,Bash,Workflow"
+        );
+        assert_eq!(value_after(&args, "--allowedTools"), "Read,Glob,Grep,Bash");
+        let settings = value_after(&args, "--settings");
+        assert_eq!(
+            serde_json::from_str::<Value>(settings).unwrap(),
+            crate::clients::claude_sandbox_document()
+        );
 
         let read = start(json!({
             "runtime": "claude", "mode": "session", "task": "look",

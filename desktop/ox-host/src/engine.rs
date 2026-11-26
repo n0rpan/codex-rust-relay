@@ -5708,8 +5708,8 @@ for line in sys.stdin:
                 }
             };
             // After a restart the contract is re-derived from the saved origin on
-            // this machine: sandboxed shell where bwrap and socat exist, otherwise
-            // the edits-only fallback (CI runners may lack them).
+            // this machine: the same shell either way, sandboxed where Claude Code's
+            // sandbox can run (CI runners may lack bwrap and socat).
             let here = Contract::detect(true, false).args();
             assert!(
                 restarted.windows(here.len()).any(|w| w == here.as_slice()),

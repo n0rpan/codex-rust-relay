@@ -775,8 +775,9 @@ Workspace sandbox, and Claude Code runs Bash under its own sandbox with
 `autoAllowBashIfSandboxed`, so commands inside the workspace need no prompt
 while writes outside it fail. The sandbox may restrict network access; a task
 that needs broader access should use the classifier level instead. Claude Code's
-sandbox needs `bwrap` and `socat` on Linux. Without them a Claude write worker
-gets edits only, and its progress says so. Read workers have no shell on either
+sandbox is built in on macOS and needs `bwrap` and `socat` on Linux. Without
+them a Claude write worker keeps its shell and runs commands unsandboxed, as
+`claude` in a terminal does, and its progress warns about it. Read workers have no shell on either
 runtime. Give concurrent writers separate working directories by starting their
 parent sessions there. The main session and
 its built-in subagents use your subscription. The worker bills the API provider

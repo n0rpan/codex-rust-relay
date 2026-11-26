@@ -386,9 +386,11 @@ mod tests {
                     hosted.windows(policy.len()).any(|w| w == policy.as_slice()),
                     "{hosted:?}"
                 );
-                assert_eq!(hosted.iter().any(|a| a == "--settings"), sandboxed);
+                // A write worker has its shell and the sandbox settings either way;
+                // Claude Code decides whether the sandbox runs.
+                assert!(hosted.iter().any(|a| a == "--settings"));
                 let tools = hosted.iter().position(|a| a == "--tools").unwrap();
-                assert_eq!(hosted[tools + 1].contains("Bash"), sandboxed);
+                assert!(hosted[tools + 1].contains("Bash"));
                 let plain = args(billing, None);
                 assert!(!plain.iter().any(|a| a == "--tools" || a == "--settings"));
             }

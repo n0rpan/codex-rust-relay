@@ -131,6 +131,8 @@ let cold = new Map(),
   pendingNew = null,
   // Message and images sent from a composer whose Ack has not come back, by owner.
   unacked = new Map(),
+  // The last `restored_draft.message` applied per owner, so each host restore lands once.
+  restoredSeen = new Map(),
   visibleRows = 200;
 const global = new Projection(true);
 const controls = new SessionControls();
@@ -154,6 +156,28 @@ const phoneSettings = setupSettings({
     );
   },
 });
+/** The host took a send and then lost it (a resume that failed after the Ack): its text
+ * comes back into the composer once per lost message, before anything typed since, as in
+ * the desktop replica. */
+function restoreHostDrafts(model) {
+  for (const s of model.scopes.values())
+    for (const session of s.sessions) {
+      const r = session.detail?.restored_draft;
+      if (typeof r?.message !== "string" || typeof r.text !== "string") continue;
+      const owner = keyOf(s.scope, session.id);
+      if (restoredSeen.get(owner) === r.message) continue;
+      restoredSeen.set(owner, r.message);
+      // An Ack still on its way must not clear the restored text.
+      const sent = unacked.get(owner);
+      if (sent) sent.restored = true;
+      const current = drafts.get(owner) || "";
+      const text =
+        !current || current === r.text ? r.text : `${r.text}\n${current}`;
+      drafts.set(owner, text);
+      if (selected && keyOf(selected.scope, selected.id) === owner)
+        $("draft").value = text;
+    }
+}
 const repaint = () => {
   if (!scheduled) {
     scheduled = true;
@@ -223,6 +247,7 @@ class Link {
           global.cursor = null;
           cold.clear();
           drafts.clear();
+          restoredSeen.clear();
           timelineRows.clear();
           pickedProjects.clear();
           forgetComposer();
@@ -338,6 +363,7 @@ class Link {
     }
     if (msg.type === "snapshot" || msg.type === "delta") {
       const changed = this.model.apply(msg);
+      if (changed && this.scope) restoreHostDrafts(this.model);
       if (!this.ready) this.connected();
       if (changed) repaint();
     }
@@ -1905,7 +1931,7 @@ $("composer").onsubmit = (e) => {
     !link.act(action, null, (ok) => {
       if (unacked.get(owner) === sentNow) unacked.delete(owner);
       pendingNew = null;
-      if (ok) {
+      if (ok && !sentNow.restored) {
         clearImages(owner, images);
         if (drafts.get(owner) === content) drafts.delete(owner);
         if (

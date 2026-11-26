@@ -148,7 +148,11 @@ pub(super) fn model_choice(
     let alias = model_picker::bare(id).to_owned();
     let listed = store.command_caps(owner).models.contains_key(&alias);
     let in_place = if id.starts_with(model_picker::API_PREFIX) {
-        matches!(current.billing, Billing::Api(_)) && listed && store.same_model_route(&alias)
+        // "Run with" picks the runtime for API rows: another runtime is always a new session.
+        current.runtime == runtime
+            && matches!(current.billing, Billing::Api(_))
+            && listed
+            && store.same_model_route(&alias)
     } else {
         listed && store.same_model_route(&alias)
     };
@@ -566,5 +570,18 @@ mod tests {
         assert_eq!((new, id.as_str()), (None, "fixture-model"));
         let entries = super::composer_entries(&store, None);
         assert_eq!(entries[0].id, "@api:fixture-model");
+    }
+
+    #[test]
+    fn run_with_another_runtime_opens_that_runtime_even_for_the_current_alias() {
+        let store = store(Route::codex_api("fixture-model".into()), &["fixture-model"]);
+        let (new, id) = model_choice(&store, None, "@api:fixture-model", Runtime::Claude);
+        assert_eq!(
+            (new, id.as_str()),
+            (
+                Some(Runtime::Claude.route(Some("fixture-model".into()))),
+                "fixture-model"
+            )
+        );
     }
 }
