@@ -242,13 +242,14 @@ h1 {
   color: var(--muted);
   overflow-wrap: anywhere;
 }
-.project:before {
-  content: "";
-  width: 10px;
-  height: 2px;
-  display: inline-block;
-  margin: 0 8px 0.24em 0;
-  background: var(--accent-dim);
+#sessions-heading:focus {
+  outline: none;
+}
+.worker-outcome {
+  margin-top: 0.25rem;
+  font-size: 0.82rem;
+  font-weight: 500;
+  color: var(--accent);
 }
 .session {
   display: block;
@@ -501,10 +502,33 @@ form > .primary {
   position: sticky;
   bottom: 0;
   margin: 1.2rem 0 0;
-  padding: 0.58rem 0.72rem max(0.55rem, env(safe-area-inset-bottom));
-  border-top: 2px solid var(--line-strong);
+  padding: 0.4rem 0.5rem max(0.5rem, env(safe-area-inset-bottom));
+  border: 1px solid var(--line);
+  border-radius: 12px 12px 0 0;
   background: var(--panel);
-  border-radius: 3px;
+}
+main:has(#conversation:not([hidden])) {
+  padding-bottom: 0;
+}
+#composer:has(textarea:focus-visible) {
+  border-color: var(--accent);
+}
+#composer textarea:focus-visible {
+  outline: none;
+}
+@media (forced-colors: active) {
+  #composer textarea:focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+}
+#composer .actions {
+  gap: 0.45rem;
+  margin-top: 0;
+}
+#composer .actions button {
+  border-radius: 8px;
+  box-shadow: none;
 }
 .jump-latest {
   position: absolute;
@@ -547,7 +571,10 @@ form > .primary {
 #stop {
   color: var(--ink);
   background: var(--raised);
-  box-shadow: inset 0 -2px var(--line-strong);
+}
+#stop:disabled {
+  color: var(--muted);
+  background: transparent;
 }
 #stop:before {
   content: "";
@@ -556,14 +583,6 @@ form > .primary {
   height: 8px;
   margin-right: 7px;
   background: currentColor;
-}
-#send:before {
-  content: "";
-  display: inline-block;
-  border-top: 4px solid transparent;
-  border-bottom: 4px solid transparent;
-  border-left: 6px solid currentColor;
-  margin-right: 7px;
 }
 #message {
   position: sticky;
@@ -850,7 +869,18 @@ form > .primary {
   top: 0;
   padding-block: 0.18rem;
   background: var(--bg);
+  border-bottom: 1px solid var(--line);
   justify-content: space-between;
+}
+#nav-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+  font-size: 0.9rem;
+  font-weight: 600;
 }
 .conversation-nav .back {
   color: var(--accent);
@@ -1153,6 +1183,9 @@ form > .primary {
   margin: 0;
   width: 44px;
   height: 44px;
+  margin-right: auto;
+  border-radius: 8px;
+  background: var(--raised);
   overflow: hidden;
   text-indent: -9999px;
 }

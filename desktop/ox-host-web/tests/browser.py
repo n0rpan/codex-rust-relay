@@ -716,7 +716,26 @@ def phone_report(js, port, base, keypress, capture, screenshot):
         return document.activeElement===e && e.labels.length>0 &&
                document.elementFromPoint(r.x+r.width/2,r.y+r.height/2)===e &&
                send.width>0 && send.right<=360 && document.documentElement.scrollWidth<=360;""")
-    js("document.querySelector('#home').click()")
+    viewport(360, 450)
+    js("""const draft=document.querySelector('#draft');
+        draft.value='Please check the worker result and summarize what changed.';
+        draft.dispatchEvent(new Event('input')); scrollTo(0, document.documentElement.scrollHeight);""")
+    assert js("""const box=id=>document.getElementById(id).getBoundingClientRect(),
+        attach=box('attach-label'), send=box('send'), draft=box('draft');
+        return attach.width>=44 && attach.height>=44 && attach.left<draft.left+20 &&
+               send.height>=44 && send.bottom<=innerHeight+1 && !document.querySelector('#send').disabled;""")
+    if screenshot:
+        capture(Path(screenshot).with_stem(Path(screenshot).stem + "-composer"))
+    assert js("return scrollY > 200 && document.activeElement.id === 'draft'")
+    wait(lambda: js("return document.querySelector('#nav-title').innerText==='Rust build disk usage' && !document.querySelector('#nav-title').hidden"))
+    js("document.querySelector('#conversation .back').click()")
+    wait(lambda: js("return document.activeElement.id==='sessions-heading' && scrollY===0"))
+    assert js("""const row=document.querySelector('[data-thread-id=parent] .worker-outcome');
+        return row.innerText.includes('Worker #7') && row.innerText.includes('completed') &&
+               document.documentElement.scrollHeight > innerHeight + 500;""")
+    js("scrollTo(0, 320); document.querySelector('#find-sessions').dispatchEvent(new Event('input'))")
+    assert js("""return new Promise(resolve => requestAnimationFrame(() =>
+        requestAnimationFrame(() => resolve(scrollY >= 300))));""")
     viewport(390, 844)
     print("PASS narrow phone catalog, independent disclosures for long commands, semantic Markdown report, and reachable composer", flush=True)
 
@@ -763,7 +782,12 @@ def run(harness, screenshot=None):
             },
         ]
         host.sessions.append(dict(host.sessions[0], id="disk-report", title="Rust build disk usage",
-                                  status="idle", updated_at=0, capabilities=["open", "send"], detail={"access": "default"}))
+                                  status="idle", updated_at=0, capabilities=["open", "send", "attach_image"], detail={"access": "default"}))
+        # A catalog longer than the viewport can inherit a conversation's deep scroll.
+        saved = host.sessions[-1]
+        host.sessions.extend(dict(saved, id=f"saved-{i}", title=f"Earlier session {i}",
+                                  status="saved") for i in range(32))
+        host.sessions[0]["detail"]["worker_notice"] = {"job_id": 7, "status": "completed"}
         host.report_items = build_report_items()
         # A handoff target's first user message carries the block; the same text typed later
         # in that session, or in an ordinary session, renders as typed.
@@ -809,6 +833,8 @@ def run(harness, screenshot=None):
             "return !location.hash && document.cookie==='' && !!document.querySelector('.session.nested')"
         )
 
+        from notification_browser import check_notification_links
+        check_notification_links(js, wait, host.scope)
         from operator_browser import check_terminal
         check_terminal(js,admin,wait,d,host)
         # Source silhouettes stay stable across approvals, active work, billing routes, and nesting.

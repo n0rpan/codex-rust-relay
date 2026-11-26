@@ -109,6 +109,7 @@ pub struct Store {
     /// The host's stamp on the action being dispatched now. Each submit copies it, so a
     /// queued or deferred message keeps the sender that was current when it was accepted.
     sender: Option<crate::surface::Sender>,
+    worker_notice_receipts: Vec<WorkerNoticeReceipt>,
     /// The stamp of each message waiting in `resume_sends`.
     resume_senders: HashMap<String, crate::surface::Sender>,
     /// The Claude access mode an ended session had when its process went away, whether
@@ -221,6 +222,7 @@ impl Store {
             ended_threads: Default::default(),
             resume_sends: Default::default(),
             sender: None,
+            worker_notice_receipts: Vec::new(),
             resume_senders: Default::default(),
             resume_access: Default::default(),
             resume_models: Default::default(),
@@ -908,6 +910,7 @@ impl Store {
 mod history;
 
 mod compose;
+pub use compose::WorkerNoticeReceipt;
 
 mod notifications;
 

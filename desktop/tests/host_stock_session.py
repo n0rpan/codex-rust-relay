@@ -151,6 +151,15 @@ def worker_cases(root, stack, binary, env, log):
         operator.open(worker_scope)
         operator.until(finished)
         operator.close()
+        # The read worker's completion starts a second parent turn. A permission
+        # change is valid once that turn finishes, including on a fast worker.
+        client.until(lambda f: (n := change(f, "notification")) and n["thread"] == thread
+                     and n["event"] == "finished")
+        job_update = f"OX worker #{origin['job_id']}: completed"
+        user_inputs = [message["content"] for request in native.requests for message in request["messages"]
+                       if message["role"] == "user"]
+        assert any(job_update in json.dumps(content) for content in user_inputs), [
+            content for content in user_inputs if "OX worker #" in json.dumps(content)]
         # A normal agent call inherits the operator's active bypass mode. Both
         # runtime processes are stock Claude Code using the fixture subscription.
         checkout = root / "Beta" / "isolated-review"

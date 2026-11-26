@@ -13,6 +13,9 @@ pub use crate::runtime::RequestId;
 
 #[derive(Debug, Deserialize)]
 pub struct RpcError {
+    /// OX could not decode a successful reply. The operation may have taken effect.
+    #[serde(skip)]
+    pub invalid_reply: bool,
     pub code: i64,
     pub message: String,
     #[serde(default)]
@@ -91,6 +94,7 @@ impl Frame {
         let method = lookup(&id);
         let result = match (object.remove("result"), object.remove("error")) {
             (Some(value), None) => Reply::decode(method, value).map_err(|err| RpcError {
+                invalid_reply: true,
                 code: -32603,
                 message: format!(
                     "Invalid response for {}: {err}",

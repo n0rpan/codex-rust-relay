@@ -507,6 +507,11 @@ pub struct Vendor {
 }
 
 impl Vendor {
+    /// Anthropic Messages requires an output budget even when the client omits it.
+    pub(crate) fn messages_output_default(&self) -> u64 {
+        self.max_output_tokens.unwrap_or(8192)
+    }
+
     /// Resolves this vendor's API key, or `None` when it is not configured. A
     /// vendor without credentials stays listed, but requests for it fail with a
     /// safe error instead of using another vendor's key.
@@ -1191,6 +1196,29 @@ pub struct Route {
     pub vendor: usize,
     pub upstream_model: String,
     pub wire: Wire,
+    pub max_output_tokens: Option<u64>,
+}
+
+impl Route {
+    /// Keep both explicit requests and the adapter's default within the
+    /// selected model's discovered output ceiling. Preserve smaller requests.
+    pub fn bound_output(&self, payload: &mut serde_json::Value, field: &str, vendor: &Vendor) {
+        let Some(limit) = self.max_output_tokens else {
+            return;
+        };
+        let default = match self.wire {
+            Wire::AnthropicMessages => Some(vendor.messages_output_default()),
+            Wire::ChatCompletions => vendor.max_output_tokens,
+            Wire::Responses => None,
+        };
+        let requested = match payload.get(field) {
+            None | Some(serde_json::Value::Null) => default,
+            Some(value) => value.as_u64(),
+        };
+        if requested.is_some_and(|requested| requested > limit) {
+            payload[field] = limit.into();
+        }
+    }
 }
 
 pub enum Resolution {
@@ -1219,6 +1247,7 @@ impl Routes {
                 let route = Route {
                     vendor: index,
                     upstream_model: model.id.clone(),
+                    max_output_tokens: model.max_output_tokens,
                     wire: vendor.wire,
                 };
                 if let Some(previous) = by_alias.insert(alias.clone(), route) {
@@ -1254,9 +1283,20 @@ impl Routes {
             && valid_model_id(rest)
             && let Some((vendor, wire)) = self.prefix_vendors.get(prefix)
         {
+            if let Some(route) = self
+                .by_upstream
+                .get(rest)
+                .into_iter()
+                .flatten()
+                .map(|alias| &self.by_alias[alias])
+                .find(|route| route.vendor == *vendor)
+            {
+                return Resolution::Route(route.clone());
+            }
             return Resolution::Route(Route {
                 vendor: *vendor,
                 upstream_model: rest.to_owned(),
+                max_output_tokens: None,
                 wire: *wire,
             });
         }
@@ -1549,6 +1589,7 @@ mod tests {
             alias: None,
             name: None,
             context_window: None,
+            max_output_tokens: None,
             input_modalities: vec!["text".to_owned()],
             reasoning_efforts: Vec::new(),
         }

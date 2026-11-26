@@ -128,6 +128,9 @@ impl App {
                                 model["supports_1m"] = json!(true);
                             }
                         }
+                        if let Some(limit) = entry["max_output_tokens"].as_u64() {
+                            model["max_tokens"] = json!(limit);
+                        }
                         if let Some(tier) = entry["slug"]
                             .as_str()
                             .and_then(|alias| self.claude_family_tier(alias))
@@ -196,7 +199,7 @@ impl App {
                 return messages_error(response.status(), "Unable to read the Messages request");
             }
         };
-        let payload: Value = match serde_json::from_slice(&bytes) {
+        let mut payload: Value = match serde_json::from_slice(&bytes) {
             Ok(payload) => payload,
             Err(_) => return messages_error(StatusCode::BAD_REQUEST, "Request body must be JSON"),
         };
@@ -219,6 +222,9 @@ impl App {
             let status =
                 StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             return bytes_response(status, Bytes::from(reply.body), reply.content_type);
+        }
+        if !count_tokens {
+            route.bound_output(&mut payload, "max_tokens", &state.vendor);
         }
         let context = upstream::Translation {
             vendor: &state.vendor,

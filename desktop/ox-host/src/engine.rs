@@ -310,6 +310,8 @@ pub(crate) struct Engine {
     launched: u64,
     workers: Registry,
     receipts: Receipts,
+    notice_attempts: HashMap<u64, Instant>,
+    notice_history: HashMap<u64, notices::HistoryPage>,
     /// Last project default read from the settings snapshot, kept for a failed read.
     yolo_projects: Vec<PathBuf>,
     /// Projects whose YOLO default was already announced since the host started.
@@ -328,6 +330,7 @@ pub(crate) struct Engine {
     next_reap: Instant,
 }
 mod flows;
+mod notices;
 
 impl Drop for Engine {
     fn drop(&mut self) {
@@ -348,20 +351,27 @@ impl Engine {
     ) -> io::Result<Self> {
         let mut ledger = Ledger::open(dir)?;
         let seq = ledger.data.reserved;
-        let cold = ledger
-            .data
-            .scopes
-            .iter()
-            .map(|saved| (saved.scope.clone(), saved.recover()))
-            .collect();
         let mut workers = Registry::default();
         for saved in &ledger.data.scopes {
             for (id, origin, marks) in saved.origins() {
                 workers.restore(&saved.scope, id, origin, marks);
             }
         }
-        ledger.begin(seq)?;
+        notices::recover(&mut ledger, &workers)?;
         ledger.retire(&crate::handover::take(dir))?;
+        let cold = ledger
+            .data
+            .scopes
+            .iter()
+            .map(|saved| {
+                let mut state = saved.recover();
+                ledger.data.worker_notices.apply_to(&mut state);
+                (saved.scope.clone(), state)
+            })
+            .collect();
+        // Capture retired approval counts for the recovery snapshot before the
+        // new epoch discards the previous runtime's tokens.
+        ledger.begin(seq)?;
         Ok(Self {
             config,
             ledger,
@@ -373,6 +383,8 @@ impl Engine {
             launched: 0,
             workers,
             receipts: Receipts::default(),
+            notice_attempts: HashMap::new(),
+            notice_history: HashMap::new(),
             yolo_projects: Vec::new(),
             yolo_announced: HashSet::new(),
             launch_warnings: HashMap::new(),
@@ -1385,6 +1397,7 @@ impl Engine {
         from_action: bool,
     ) -> io::Result<()> {
         self.process_scope(scope, events, from_action)?;
+        self.apply_notice_receipts(scope)?;
         self.advance_flows()
     }
     fn process_scope(
@@ -1678,6 +1691,16 @@ impl Engine {
         }) {
             self.ledger.update(SavedScope::from_state(&live.state))?;
         }
+        let worker_state_changed = changes.iter().any(|c| {
+            matches!(
+                c,
+                Change::State { .. }
+                    | Change::Session { .. }
+                    | Change::Sessions { .. }
+                    | Change::TimelineState { .. }
+                    | Change::Transcript { .. }
+            )
+        });
         self.broadcast(scope, changes)?;
         if let Some((id, frame)) = handoff {
             self.reply(id, frame)?;
@@ -1688,7 +1711,11 @@ impl Engine {
         self.finish_launch(scope, launched)?;
         // A worker's run just ended (or restarted): carry its final answer in the saved
         // rows so it outlives the process and the host.
-        if self.capture_finals(scope) {
+        let finals_changed = self.capture_finals(scope);
+        if worker_state_changed || finals_changed {
+            self.observe_worker_notices(scope)?;
+        }
+        if finals_changed {
             self.process(scope, vec![], true)?;
         }
         Ok(())
@@ -1763,7 +1790,7 @@ impl Engine {
             let origin = f.origin.clone();
             let message = e.clone();
             self.ledger.change(|d| {
-                d.outcomes.push(crate::durable::Outcome {
+                d.record_outcome(crate::durable::Outcome {
                     origin,
                     status: "failed".into(),
                     message,
@@ -1824,6 +1851,12 @@ impl Engine {
             let candidate = getrandom::u64().map_err(|e| e.to_string())? & ((1u64 << 52) - 1);
             if candidate > 0
                 && !self.workers.job_ids().any(|j| j == candidate)
+                && !self
+                    .ledger
+                    .data
+                    .worker_notices
+                    .observed
+                    .contains_key(&candidate)
                 && !self.asking.contains_key(&candidate)
                 && !self
                     .ledger
@@ -2222,12 +2255,16 @@ impl Engine {
         if l.detached {
             let origin = l.origin.clone();
             self.ledger.change(|d| {
-                d.outcomes.push(crate::durable::Outcome {
+                d.record_outcome(crate::durable::Outcome {
                     origin,
                     status: "cancelled".into(),
                     message: MESSAGE.into(),
                 })
             })?;
+        }
+        if !l.detached {
+            self.ledger
+                .change(|d| d.worker_notices.observe(&l.origin, "cancelled", MESSAGE))?;
         }
         self.answer(l.reply, Err(MESSAGE.into()))?;
         self.process(&scope, vec![], false)?;
@@ -2473,7 +2510,8 @@ impl Engine {
         // Keep each worker's final answer: the process is about to close.
         self.capture_finals(scope);
         let live = self.running.remove(scope).expect("checked above");
-        let recovered = SavedScope::from_state(&live.state).recover();
+        let mut recovered = SavedScope::from_state(&live.state).recover();
+        self.ledger.data.worker_notices.apply_to(&mut recovered);
         drop(live);
         let changes = vec![
             Change::State {
@@ -2627,6 +2665,7 @@ fn catalog_row(view: &wire::SessionView) -> wire::SessionView {
         "origin",
         "worker_marks",
         "worker_model",
+        "worker_notice",
     ]
     .into_iter()
     .filter_map(|k| Some((k.to_owned(), view.detail.get(k)?.clone())))
@@ -2833,6 +2872,17 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
         e.1.insert("worker_model".into(), crate::workers::model_report(entry));
         e.1.insert("worker".into(), nests.into());
     }
+    for summary in data
+        .worker_notices
+        .latest
+        .iter()
+        .filter(|s| &s.scope == scope)
+    {
+        out.entry(summary.session.clone())
+            .or_default()
+            .1
+            .insert("worker_notice".into(), summary.detail());
+    }
     let mut push = |id: &str, key: &str, value: Value| {
         let e = out.entry(id.to_owned()).or_default();
         let list = e.1.entry(key.to_owned()).or_insert_with(|| json!([]));
@@ -2929,7 +2979,7 @@ fn restore_row(row: &mut wire::SessionView, saved: &wire::SessionView) {
     }
     row.detail["owned"] = true.into();
     row.detail["recovered"] = true.into();
-    for key in ["resume_access", "worker_marks", "origin"] {
+    for key in ["resume_access", "worker_marks", "origin", "worker_notice"] {
         if row.detail[key].is_null() && !saved.detail[key].is_null() {
             row.detail[key] = saved.detail[key].clone();
         }
@@ -4878,6 +4928,16 @@ mod tests {
                 .unwrap();
             assert_eq!(status["status"], "declined");
             assert!(status["error"].as_str().unwrap().contains("restarted"));
+            let queued: Vec<_> = engine
+                .ledger
+                .data
+                .worker_notices
+                .pending
+                .iter()
+                .filter(|n| n.job == job)
+                .map(|n| n.status.as_str())
+                .collect();
+            assert_eq!(queued, ["waiting_for_operator", "declined"]);
             assert!(
                 !engine.running.contains_key(&worker),
                 "nothing is relaunched"
@@ -5597,6 +5657,292 @@ mod tests {
                 engine.process(scope, vec![], false).unwrap();
                 thread::sleep(Duration::from_millis(20));
             }
+        }
+
+        #[test]
+        fn a_hosted_worker_wakes_its_claude_parent_with_its_result_once() {
+            let root = tempfile::tempdir().unwrap();
+            let (scope, lead, mut engine, rx) = warm_claude(root.path());
+            engine
+                .running
+                .get_mut(&scope)
+                .unwrap()
+                .store
+                .dispatch(Action::SendText(
+                    Some(lead.clone()),
+                    "delegate a review".into(),
+                ))
+                .unwrap();
+            let mut request = start(false);
+            request.runtime = Runtime::Claude;
+            request.model = None;
+            request.subscription_model = Some("fable".into());
+            request.mode = WorkerMode::Session;
+            let (reply, answer) = std::sync::mpsc::sync_channel(1);
+            engine
+                .launch(thread(&scope, &lead), request, Replier::Channel(reply))
+                .unwrap();
+            pump_engine(&mut engine, &scope, &rx, &|e| {
+                !e.ledger.data.worker_notices.latest.is_empty()
+                    && e.ledger.data.worker_notices.pending.is_empty()
+            });
+            let job = answer.recv().unwrap().unwrap()["job_id"].as_u64().unwrap();
+            let text = format!("OX worker #{job}: completed (update 1).\nreviewed");
+            let live = &engine.running[&scope];
+            assert_eq!(
+                live.store
+                    .transcript(&lead)
+                    .unwrap()
+                    .user_messages(&text, &[]),
+                1
+            );
+            let row = live.state.sessions.iter().find(|s| s.id == lead).unwrap();
+            assert_eq!(
+                catalog_row(row).detail["worker_notice"],
+                json!({"job_id": job, "status":"completed"})
+            );
+            engine.process(&scope, vec![], true).unwrap();
+            let (tx, _) = std::sync::mpsc::sync_channel(1);
+            let engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            assert!(engine.ledger.data.worker_notices.pending.is_empty());
+            let row = engine.cold[&scope]
+                .sessions
+                .iter()
+                .find(|s| s.id == lead)
+                .unwrap();
+            assert_eq!(row.detail["worker_notice"]["job_id"], job);
+        }
+
+        #[test]
+        fn worker_notices_wait_for_a_busy_parent_and_confirm_native_acceptance() {
+            let root = tempfile::tempdir().unwrap();
+            let (scope, lead, mut engine, rx) = warm_claude(root.path());
+            let origin = origin(workers_parent(&scope, &lead), Ceiling::Read);
+            engine
+                .running
+                .get_mut(&scope)
+                .unwrap()
+                .store
+                .dispatch(Action::SendText(Some(lead.clone()), "work first".into()))
+                .unwrap();
+            engine
+                .ledger
+                .change(|d| {
+                    d.worker_notices
+                        .observe(&origin, "waiting_for_operator", "Please answer.");
+                    d.worker_notices
+                        .observe(&origin, "waiting_for_operator", "Same open request.");
+                    d.record_outcome(crate::durable::Outcome {
+                        origin,
+                        status: "declined".into(),
+                        message: "The operator declined.".into(),
+                    });
+                })
+                .unwrap();
+            engine.advance_flows().unwrap();
+            let pending = &engine.ledger.data.worker_notices.pending;
+            assert_eq!(pending.len(), 2);
+            assert!(pending.iter().all(|n| !n.submitted));
+            let messages: Vec<_> = pending.iter().map(|n| n.text.clone()).collect();
+            // Only drive the prior native turn to its boundary. The automatic input
+            // is now in Claude's stdin but its echo is still in the fixture's inbox.
+            while !engine.ledger.data.worker_notices.pending[0].submitted {
+                let event = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                engine.process(&scope, vec![event], false).unwrap();
+            }
+            assert_eq!(
+                engine.ledger.data.worker_notices.pending.len(),
+                2,
+                "stdin write awaits Claude's echo"
+            );
+            assert!(!engine.ledger.data.worker_notices.pending[1].submitted);
+            pump_engine(&mut engine, &scope, &rx, &|e| {
+                e.ledger.data.worker_notices.pending.is_empty()
+            });
+            let t = engine.running[&scope].store.transcript(&lead).unwrap();
+            for text in &messages {
+                assert_eq!(t.user_messages(text, &[]), 1);
+            }
+        }
+
+        #[test]
+        fn restarted_host_reconciles_an_unconfirmed_worker_notice_before_resending() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _) = std::sync::mpsc::sync_channel(8);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx.clone()).unwrap();
+            let (scope, _) = scopes(root.path());
+            let mut saved_parent = live(&scope, vec![], &[], vec![]).0.state;
+            saved_parent.sessions = vec![view(&scope, "parent", "idle", "read_only")];
+            engine
+                .ledger
+                .update(SavedScope::from_state(&saved_parent))
+                .unwrap();
+            let origin = origin(workers_parent(&scope, "parent"), Ceiling::Read);
+            engine
+                .ledger
+                .change(|d| {
+                    d.worker_notices
+                        .observe(&origin, "failed", "The runtime refused the turn.");
+                    // The host stopped after writing to the runtime but before its receipt.
+                    // The best-effort live alert was already reserved at the time of the crash.
+                    d.worker_notices.pending[0].announced = true;
+                    d.worker_notices.pending[0].submitted = true;
+                })
+                .unwrap();
+            let text = engine.ledger.data.worker_notices.pending[0].text.clone();
+            drop(engine);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            assert_eq!(
+                engine.cold[&scope].sessions[0].detail["worker_notice"],
+                json!({"job_id":41, "status":"failed"})
+            );
+            engine.advance_flows().unwrap();
+            assert!(
+                engine.running.is_empty(),
+                "explicitly closed parents stay closed"
+            );
+            assert_eq!(engine.ledger.data.worker_notices.pending.len(), 1);
+            let (parent, log) = live_with(
+                &scope,
+                vec![view(&scope, "parent", "idle", "read_only")],
+                vec![(
+                    "parent",
+                    timeline(&[("persisted-input", "user", &text)], false),
+                )],
+                vec![],
+            );
+            engine.running.insert(scope, parent);
+            engine.advance_flows().unwrap();
+            assert!(engine.ledger.data.worker_notices.pending.is_empty());
+            assert!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(action, _)| !matches!(action, Action::SendText(..)))
+            );
+        }
+
+        #[test]
+        fn reopening_an_ended_claude_parent_delivers_its_saved_notice() {
+            let root = tempfile::tempdir().unwrap();
+            let (scope, lead, mut engine, rx) = warm_claude(root.path());
+            engine.end_thread(&scope, &lead, false).unwrap();
+            let origin = origin(workers_parent(&scope, &lead), Ceiling::Read);
+            engine
+                .ledger
+                .change(|d| {
+                    d.worker_notices
+                        .observe(&origin, "interrupted", "Partial result")
+                })
+                .unwrap();
+            engine.process(&scope, vec![], true).unwrap();
+            let n = &engine.ledger.data.worker_notices.pending[0];
+            assert!(!n.submitted);
+            let text = n.text.clone();
+            let live = engine.running.get_mut(&scope).unwrap();
+            assert!(live.store.is_ended(&lead));
+            live.store.select(&lead).unwrap();
+            pump_engine(&mut engine, &scope, &rx, &|e| {
+                e.ledger.data.worker_notices.pending.is_empty()
+            });
+            assert_eq!(
+                engine.running[&scope]
+                    .store
+                    .transcript(&lead)
+                    .unwrap()
+                    .user_messages(&text, &[]),
+                1
+            );
+        }
+
+        #[test]
+        fn a_refused_history_page_holds_the_uncertain_notice_without_repeated_reads() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _) = std::sync::mpsc::sync_channel(8);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (scope, _) = scopes(root.path());
+            let origin = origin(workers_parent(&scope, "parent"), Ceiling::Read);
+            engine
+                .ledger
+                .change(|d| {
+                    d.worker_notices.observe(&origin, "completed", "Result");
+                    d.worker_notices.pending[0].submitted = true;
+                    d.worker_notices.pending[0].announced = true;
+                })
+                .unwrap();
+            let mut page = timeline(&[], false);
+            page.detail["older"] = true.into();
+            page.detail["error"] = "Earlier turns unavailable".into();
+            let (parent, log) = live_with(
+                &scope,
+                vec![view(&scope, "parent", "idle", "read_only")],
+                vec![("parent", page)],
+                vec![],
+            );
+            engine.running.insert(scope, parent);
+            for _ in 0..10 {
+                engine.advance_flows().unwrap();
+            }
+            let actions = log.lock().unwrap();
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|(a, _)| matches!(a, Action::LoadOlder(_)))
+                    .count(),
+                1
+            );
+            assert!(
+                actions
+                    .iter()
+                    .all(|(a, _)| !matches!(a, Action::SendText(..)))
+            );
+            assert!(engine.ledger.data.worker_notices.pending[0].submitted);
+        }
+
+        #[test]
+        fn clearing_a_persons_draft_after_a_refusal_releases_the_queued_notice() {
+            let root = tempfile::tempdir().unwrap();
+            let (scope, lead, mut engine, rx) = warm_claude(root.path());
+            let origin = origin(workers_parent(&scope, &lead), Ceiling::Read);
+            engine
+                .ledger
+                .change(|d| {
+                    d.worker_notices.observe(&origin, "failed", "Worker failed");
+                    d.worker_notices.pending[0].submitted = true;
+                })
+                .unwrap();
+            let n = engine.ledger.data.worker_notices.pending[0].clone();
+            engine
+                .notice_attempts
+                .insert(n.id, Instant::now() - Duration::from_secs(31));
+            engine
+                .running
+                .get_mut(&scope)
+                .unwrap()
+                .store
+                .edit(Some(&lead), "My own message".into());
+            engine
+                .record_notice_receipts(vec![ox_desk_core::store::WorkerNoticeReceipt::Rejected(
+                    n.id,
+                )])
+                .unwrap();
+            engine.advance_flows().unwrap();
+            assert!(!engine.ledger.data.worker_notices.pending[0].submitted);
+            let store = &mut engine.running.get_mut(&scope).unwrap().store;
+            assert_eq!(store.draft(Some(&lead)), "My own message");
+            store.edit(Some(&lead), String::new());
+            engine.advance_flows().unwrap();
+            pump_engine(&mut engine, &scope, &rx, &|e| {
+                e.ledger.data.worker_notices.pending.is_empty()
+            });
+            assert_eq!(
+                engine.running[&scope]
+                    .store
+                    .transcript(&lead)
+                    .unwrap()
+                    .user_messages(&n.text, &[]),
+                1
+            );
         }
 
         #[test]

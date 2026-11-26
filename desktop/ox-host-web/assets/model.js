@@ -13,6 +13,60 @@ export const emptyScope = (scope) => ({
   detail: {},
 });
 const sessionKey = (scope, id) => scopeKey(scope) + " " + id;
+// A Web Push reference includes the SHA-256 digest of the same four fields as
+// push.rs. Older notifications carry only the native session id.
+async function notificationMatch(ref, rows, complete) {
+  const cut = ref.lastIndexOf("~");
+  const id = cut < 0 ? ref : ref.slice(0, cut);
+  const candidates = rows.filter(({ session }) => session.id === id);
+  if (cut < 0) {
+    if (candidates.length > 1) return "ambiguous";
+    if (!complete) return "incomplete";
+    return candidates[0] ?? "missing";
+  }
+  const signature = ref.slice(cut + 1);
+  if (!id || !/^[a-zA-Z0-9_-]{43}$/.test(signature)) return "missing";
+  for (const row of candidates) {
+    const { project, route } = row.scope;
+    const alias = typeof route.billing === "string" ? null : route.billing.api;
+    const bytes = new TextEncoder().encode(JSON.stringify([project, route.runtime, alias, id]));
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+    const hash = btoa(String.fromCharCode(...digest))
+      .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+    if (hash === signature) return row;
+  }
+  return complete ? "missing" : "incomplete";
+}
+
+export class NotificationTarget {
+  pending = null;
+
+  request(ref) {
+    this.pending = ref ? { ref, discovery: null } : null;
+  }
+
+  // A reconnect invalidates an in-flight digest but keeps the link for the
+  // next catalog. User navigation or a newer tap replaces the request itself.
+  reconnect() {
+    if (this.pending) this.pending.discovery = null;
+  }
+
+  async resolve(rows, discovery, show) {
+    const request = this.pending;
+    if (!request || !discovery || request.discovery === discovery) return;
+    request.discovery = discovery;
+    let match;
+    try {
+      match = await notificationMatch(request.ref, rows, discovery.complete);
+    } catch {
+      match = "incomplete";
+    }
+    if (request !== this.pending || request.discovery !== discovery) return;
+    this.pending = null;
+    show(match);
+  }
+}
+
 /**
  * The recorded parent of a session, from the immutable launch stamp when there
  * is one. The stamp carries the parent's full scope, so a worker in another

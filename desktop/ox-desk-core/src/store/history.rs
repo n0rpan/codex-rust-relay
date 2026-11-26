@@ -268,6 +268,15 @@ impl Store {
     /// Some Codex thread stores cannot page a newly discovered worker yet.
     /// Ask once for its full history, preserving the original read/write intent.
     pub(super) fn rpc_failed(&mut self, pending: Pending, error: crate::codex::frame::RpcError) {
+        // A malformed success payload is ambiguous: Codex might already have
+        // started the turn. An explicit RPC refusal can safely be retried.
+        if let Pending::Compose(op) = &pending
+            && let Some(id) = op.worker_notice()
+            && !error.invalid_reply
+        {
+            self.worker_notice_receipts
+                .push(super::WorkerNoticeReceipt::Rejected(id));
+        }
         if error.code != -32601 || error.message != "list_turns is not supported yet" {
             return self.failed(pending, error.message);
         }

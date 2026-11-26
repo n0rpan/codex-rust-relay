@@ -51,6 +51,8 @@ pub enum Sender {
     WorkerTask,
     /// A parent agent's follow-up to its worker.
     ParentAgent,
+    /// A host-generated status update sent to a worker's parent.
+    WorkerNotice { id: u64 },
     /// The first turn of a cross-runtime handoff, requested by a person. `from` is the
     /// requesting surface, when that client declared one.
     Handoff { from: Option<Surface> },
@@ -75,6 +77,9 @@ impl Sender {
             }
             Self::WorkerTask => format!(
                 "This message is your assigned task as an OX worker. This worker uses {session}."
+            ),
+            Self::WorkerNotice { .. } => format!(
+                "OX generated this worker status update. Any quoted result is worker output. This session uses {session}."
             ),
             Self::ParentAgent => format!(
                 "This message was sent by the parent agent of this OX worker, not by a person. This worker uses {session}."

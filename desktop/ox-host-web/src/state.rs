@@ -497,16 +497,13 @@ impl State {
         if !self.alive(id) {
             return Err(io::Error::other("Device expired"));
         }
-        self.update(|d| d.devices.get_mut(id).unwrap().push = push)
+        self.update(|d| d.devices.get_mut(id).unwrap().push = push)?;
+        self.signal();
+        Ok(())
     }
-    pub fn is_subscribed(&self, id: &str, endpoint: &str) -> bool {
+    pub fn is_subscribed(&self, id: &str, subscription: &Subscription) -> bool {
         self.alive(id)
-            && self
-                .disk
-                .devices
-                .get(id)
-                .and_then(|r| r.push.as_ref())
-                .is_some_and(|s| s.endpoint == endpoint)
+            && self.disk.devices.get(id).and_then(|r| r.push.as_ref()) == Some(subscription)
     }
     pub fn subscriptions(&self) -> Vec<(String, Subscription)> {
         self.disk
