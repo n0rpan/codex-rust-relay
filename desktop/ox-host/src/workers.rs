@@ -1,8 +1,10 @@
 //! Host-owned OX workers. A worker is an ordinary native session in its own
 //! project and billing route. This module keeps the immutable origin stamp of
 //! each worker and fork, decides access ceilings, and answers the parent agent's
-//! four MCP tools from host session state. It never resolves approvals: those
-//! go to the human clients through the normal ask path.
+//! four MCP tools from host session state. Approvals go to the human clients
+//! through the normal ask path. The one exception is a read worker's request to
+//! leave Plan mode: its ceiling could never grant it, so the host declines it
+//! and asks for the report instead ([`declines_plan_exit`]).
 use ox_desk_core::{
     host_protocol::{Scope, SessionView, Timeline},
     modes::{self, Level, ModeRequest},
@@ -298,6 +300,112 @@ pub(crate) fn operator_access(origin: &Origin, access: Access) -> Result<(), Str
             origin.ceiling.label(origin.runtime)
         ))
     }
+}
+
+/// The tool result a read worker receives when it asks to leave Plan mode.
+pub(crate) const PLAN_REPORT: &str = "OX: This worker has read access only and stays in Plan mode, so nothing will be implemented and no approval is coming. Do not call ExitPlanMode again. Reply now with your complete findings or plan as your final message: OX delivers that reply to the agent that started you.";
+
+/// Whether a request to leave Plan mode from this session is answered by the
+/// host instead of a person: the session is a worker whose ceiling is read, so
+/// leaving Plan mode could never be granted and its plan is its report.
+pub(crate) fn declines_plan_exit(origin: &Origin) -> bool {
+    origin.runtime == Runtime::Claude && origin.bounds_operator() && origin.ceiling == Level::Read
+}
+
+/// Whether the parent agent may answer this worker request in place of the
+/// operator. Questions are answers, not grants, so a parent fills them in unless
+/// one is secret. An approval decides whether an action runs, so the parent may
+/// approve only when its own verified mode already runs actions without a person
+/// (Auto, Auto-review or YOLO): it then stands in as the reviewer, the way a
+/// classifier would. A read worker's approvals always wait for a person: any of
+/// them would let it go beyond reading. So do YOLO acceptances, which this
+/// policy never sees because they are raised on the parent itself.
+pub(crate) fn parent_may_answer(
+    worker: &Origin,
+    parent_level: Option<Level>,
+    ask: &ox_desk_core::asks::Ask,
+    setting: ox_desk_core::desktop_behavior::WorkerApprovals,
+) -> Result<(), &'static str> {
+    if setting == ox_desk_core::desktop_behavior::WorkerApprovals::Operator {
+        return Err(
+            "The operator answers worker requests (Settings › Accounts › Worker requests).",
+        );
+    }
+    if ask.waits_for_yolo() {
+        return Err("Accepting YOLO always needs the operator.");
+    }
+    if !ask.questions.is_empty() {
+        return if ask.questions.iter().any(|q| q.is_secret) {
+            Err("A secret answer must come from the operator.")
+        } else {
+            Ok(())
+        };
+    }
+    if ask.detail.chars().count() > REQUEST_DETAIL_LIMIT {
+        return Err("This request is too long to show you in full, so the operator decides.");
+    }
+    if worker.ceiling == Level::Read {
+        return Err(
+            "This is a read worker: approving its request would let it do more than read, so the operator decides.",
+        );
+    }
+    match parent_level {
+        Some(level) if level >= Level::Classifier => Ok(()),
+        _ => Err(
+            "Your own mode asks a person before acting, so this worker's approvals go to the operator too.",
+        ),
+    }
+}
+
+/// Whether a parent may pick this choice of a request it may answer. A choice
+/// that sets a lasting rule (Codex "Always allow this prefix", a host rule or
+/// any other policy amendment, which carry their scope as the choice detail)
+/// outlives the task, so it stays with the operator.
+pub(crate) fn parent_may_choose(
+    ask: &ox_desk_core::asks::Ask,
+    choice: usize,
+) -> Result<(), &'static str> {
+    match ask.decisions().get(choice) {
+        None => Err("That choice is not one of the request's choices."),
+        Some(d) if d.detail.is_some() => Err(
+            "This choice sets a lasting rule, so the operator decides. Pick a one-time choice or leave the request to the operator.",
+        ),
+        Some(_) => Ok(()),
+    }
+}
+
+/// The longest request detail a parent sees. An approval whose action does not
+/// fit is never the parent's to answer, so a parent never approves arguments it
+/// could not read.
+pub(crate) const REQUEST_DETAIL_LIMIT: usize = 16_000;
+
+/// One open worker request as its parent agent sees it.
+pub(crate) fn request_view(ask: &ox_desk_core::asks::Ask, may: Result<(), &str>) -> Value {
+    let mut detail: String = ask.detail.chars().take(REQUEST_DETAIL_LIMIT).collect();
+    if detail.len() < ask.detail.len() {
+        detail.push_str("\n[… detail cut: the operator answers this request]");
+    }
+    let mut view = json!({
+        "request_id": ask.id,
+        "title": ask.title(),
+        "detail": detail,
+        "choices": ask.decisions().iter().map(|d| &d.label).collect::<Vec<_>>(),
+        // The scope of a rule-setting choice, such as the command prefix or host.
+        "choice_details": ask.decisions().iter().map(|d| &d.detail).collect::<Vec<_>>(),
+        "parent_choices": (0..ask.decisions().len())
+            .filter(|&i| parent_may_choose(ask, i).is_ok())
+            .collect::<Vec<_>>(),
+        "questions": ask.questions.iter().map(|q| json!({
+            "question": q.question,
+            "options": q.options.as_ref().map(|o| o.iter().map(|c| &c.label).collect::<Vec<_>>()),
+            "multi_select": q.multi_select,
+        })).collect::<Vec<_>>(),
+        "parent_may_answer": may.is_ok(),
+    });
+    if let Err(why) = may {
+        view["operator_needed"] = json!(why);
+    }
+    view
 }
 
 /// A parent-agent caller after identity resolution. Every parent operation,

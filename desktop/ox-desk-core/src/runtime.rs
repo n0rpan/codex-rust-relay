@@ -177,11 +177,8 @@ pub fn terminal_args(route: &Route, provider: &str, thread: Option<&str>) -> Vec
     if route.runtime == Runtime::Claude {
         let mut args = vec!["claude".into()];
         match &route.billing {
-            Billing::Subscription => args.extend([
-                "--subscription".into(),
-                "--permission-mode".into(),
-                "default".into(),
-            ]),
+            // No `--permission-mode`: the terminal starts in Claude Code's own default.
+            Billing::Subscription => args.push("--subscription".into()),
             Billing::Api(alias) => args.extend(["--model".into(), alias.clone()]),
         }
         if let Some(id) = thread {

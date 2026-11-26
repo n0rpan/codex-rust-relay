@@ -44,7 +44,8 @@ fn spawn(
             project: project.into(),
             billing,
             session,
-            permission_mode: mode.into(),
+            // An empty mode passes no flag, as a session nobody chose a mode for.
+            permission_mode: Some(mode.to_owned()).filter(|m| !m.is_empty()),
             contract: None,
             model: None,
         },
@@ -153,7 +154,7 @@ fn each_session_owns_its_launch_and_control_frames() {
         api,
         Billing::Api("fixture/demo".into()),
         Session::New(FIRST.into()),
-        "default",
+        "",
     );
     let (two, other_events) = spawn(
         b.path(),
@@ -170,7 +171,9 @@ fn each_session_owns_its_launch_and_control_frames() {
     }
     let args = fs::read_to_string(a.path().join("args")).unwrap();
     assert!(args.contains("claude\n--model\nfixture/demo\n-p\n"));
-    assert!(args.contains("--permission-mode\ndefault\n--allow-dangerously-skip-permissions\n"));
+    // No chosen mode: Claude Code starts in its own default, as in a terminal.
+    assert!(!args.contains("--permission-mode"));
+    assert!(args.contains("stdio\n--allow-dangerously-skip-permissions\n"));
     let args = fs::read_to_string(b.path().join("args")).unwrap();
     assert!(args.contains("claude\n--subscription\n-p\n"));
     assert!(args.contains("--dangerously-skip-permissions\n"));

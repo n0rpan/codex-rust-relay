@@ -505,6 +505,33 @@ impl Service {
                     .await;
                     tool_result(result)
                 }
+                Some("answer_ox_worker") => {
+                    let result = async {
+                        let request: jobs::Answer =
+                            serde_json::from_value(params["arguments"].clone()).map_err(|_| {
+                                "Provide job_id, request_id and either choice or answers."
+                                    .to_string()
+                            })?;
+                        if self.jobs.lock().unwrap().has(request.job_id) {
+                            return Err("This worker runs without the OX session host and has no requests to answer: it declines approvals itself.".to_string());
+                        }
+                        let app = self.app().await.map_err(|e| e.to_string())?;
+                        let answers = request.answers.map(|answers| {
+                            answers
+                                .iter()
+                                .map(|a| crate::upstream::redact(a, &app.secrets).into_owned())
+                                .collect::<Vec<_>>()
+                        });
+                        self.host_call(
+                            json!({"op":"answer","job_id":request.job_id,"request":request.request_id,
+                                "choice":request.choice,"answers":answers}),
+                            thread,
+                        )
+                        .await
+                    }
+                    .await;
+                    tool_result(result)
+                }
                 Some(tool @ ("ox_worker_status" | "cancel_ox_worker")) => {
                     match serde_json::from_value(params["arguments"].clone()) {
                         Ok(job) => {
@@ -579,7 +606,7 @@ impl Service {
             }
             let mut reply = redact_value(reply, &app.secrets);
             reply["approvals"] = json!(
-                "This worker is owned by the OX session host. Its approvals and questions go to OX Desktop and paired phones, not to you. If ox_worker_status reports waiting_for_operator, tell the user where to answer."
+                "This worker is owned by the OX session host. Its approvals and questions appear in OX Desktop and on paired phones. When ox_worker_status lists requests with parent_may_answer, you may answer them with answer_ox_worker; otherwise tell the user where to answer."
             );
             return Ok(reply);
         }
@@ -885,7 +912,7 @@ fn initialize(params: &Value) -> Value {
         "protocolVersion": version,
         "serverInfo": {"name": SERVER, "version": crate::VERSION},
         "capabilities": {"tools": {}},
-        "instructions": "For an ordinary implementation worker, omit permission_mode to inherit the verified hosted parent mode and pass checkout for a separate workspace. Without a host, inherit is read; request write for edits. Answer requests for your own assessment directly. Suggest a second reviewer when it would resolve a concrete uncertainty. A request for a second opinion authorizes one read-only review. Use the established model and billing preference or clarify if the choice changes who pays. Consult list_ox_models, pass subscription_model for a named Claude subscription model or model for an API alias, and report unavailability before choosing another. A how-to question calls for an explanation. Hosted parent sessions receive worker outcomes and requests for operator attention at a turn boundary. Use ox_worker_status for full results or to check a job from a terminal session. Summarize the results. Use delegate_to_ox_model for a short text-only API request. For handoffs use read_ox_thread to recover omitted source messages.",
+        "instructions": "For an ordinary implementation worker, omit permission_mode to inherit the verified hosted parent mode and pass checkout for a separate workspace. Without a host, inherit is read; request write for edits. Answer requests for your own assessment directly. Suggest a second reviewer when it would resolve a concrete uncertainty. A request for a second opinion authorizes one read-only review. Use the established model and billing preference or clarify if the choice changes who pays. Consult list_ox_models, pass subscription_model for a named Claude subscription model or model for an API alias, and report unavailability before choosing another. A how-to question calls for an explanation. Hosted parent sessions receive worker outcomes and open worker requests at a turn boundary. Answer a request marked parent_may_answer with answer_ox_worker when it serves the task; leave the rest to the user. Use ox_worker_status for full results or to check a job from a terminal session. Summarize the results. Use delegate_to_ox_model for a short text-only API request. For handoffs use read_ox_thread to recover omitted source messages.",
     })
 }
 
@@ -966,9 +993,20 @@ fn tools() -> Value {
             },
             {
                 "name": "ox_worker_status",
-                "description": "Get a worker's running or terminal status, native session ID, progress, and result. Jobs keep running between tool calls. Status waiting_for_operator means a person must answer an approval or question in OX Desktop or on a paired phone; tell the user where, using waiting_for_operator.message.",
+                "description": "Get a worker's running or terminal status, native session ID, progress, and result. Jobs keep running between tool calls. Status waiting_for_operator means the worker waits on an approval or question, listed in requests. Answer those marked parent_may_answer with answer_ox_worker; for the rest tell the user where to answer, using waiting_for_operator.message.",
                 "inputSchema": {"type":"object","properties":{"job_id":{"type":"integer","minimum":1}},"required":["job_id"],"additionalProperties":false},
                 "annotations": {"readOnlyHint":true,"openWorldHint":false},
+            },
+            {
+                "name": "answer_ox_worker",
+                "description": "Answer an approval or question of a host-owned worker you started, in place of the user. Only requests that ox_worker_status lists with parent_may_answer true are accepted: questions, and approvals when your own mode already runs actions without a person (Auto, Auto-review or YOLO) and the worker is not read-only. Pick only an index listed in the request's parent_choices: choices that set a lasting rule stay with the user. Approve only what serves the task you gave the worker and that you would run yourself; deny anything else. Raising a worker's mode always stays with the user.",
+                "inputSchema": {"type":"object","properties":{
+                    "job_id":{"type":"integer","minimum":1},
+                    "request_id":{"type":["integer","string"],"description":"request_id from the worker's requests."},
+                    "choice":{"type":"integer","minimum":0,"description":"Index into the request's choices, for an approval."},
+                    "answers":{"type":"array","items":{"type":"string"},"description":"One answer per question, in order, for a question form."}
+                },"required":["job_id","request_id"],"additionalProperties":false},
+                "annotations": {"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true},
             },
             {
                 "name": "cancel_ox_worker",

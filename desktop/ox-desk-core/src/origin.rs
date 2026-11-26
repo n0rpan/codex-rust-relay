@@ -305,8 +305,10 @@ pub fn model_line(report: &serde_json::Value) -> Option<String> {
     })
 }
 
-/// The only operations a parent agent has on its workers. Approvals, questions and
-/// permission changes belong to the human operator and have no variant here.
+/// The only operations a parent agent has on its workers. Permission changes
+/// belong to the human operator and have no variant here. A parent answers a
+/// worker's approval or question only where the host's policy lets it stand in
+/// for the operator.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -321,6 +323,16 @@ pub enum ParentCall {
     },
     Cancel {
         job_id: u64,
+    },
+    /// Answer one open request of the worker: `choice` picks one of its listed
+    /// choices, `answers` fills its questions in order.
+    Answer {
+        job_id: u64,
+        request: crate::runtime::RequestId,
+        #[serde(default)]
+        choice: Option<usize>,
+        #[serde(default)]
+        answers: Option<Vec<String>>,
     },
     /// Read this session's own handoff sources, read-only. `session` names a
     /// source in the caller's chain; absent means the nearest one. Pages by item
