@@ -702,9 +702,7 @@ fn prepare_native_body(
     payload["model"] = json!(upstream_model);
     strip_ox_thinking(&mut payload);
     if payload.get("max_tokens").is_none_or(Value::is_null) {
-        let tokens = vendor
-            .max_output_tokens
-            .unwrap_or(upstream::DEFAULT_MAX_OUTPUT_TOKENS);
+        let tokens = vendor.messages_output_default();
         payload["max_tokens"] = json!(tokens);
     }
     if let Some(object) = payload.as_object_mut()

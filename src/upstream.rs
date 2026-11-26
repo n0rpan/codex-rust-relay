@@ -28,9 +28,6 @@ use crate::provider::{ChatOptions, RelayError, SecretKey, ThinkingMode, Vendor, 
 use crate::sse::SseFramer;
 use crate::translate::{EventRewriter, ToolMap, normalize_request};
 
-/// Codex does not send `max_output_tokens`, but Anthropic requires
-/// `max_tokens`. Vendors can override this in `codeox.toml`.
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 8192;
 /// Largest upstream error body read for its message.
 const MAX_ERROR_BODY: usize = 64 * 1024;
 /// Largest single upstream SSE event.
@@ -184,9 +181,7 @@ fn prepare_body(
         match vendor.wire {
             Wire::AnthropicMessages => {
                 // Anthropic requires max_tokens, and Codex does not send it.
-                let tokens = vendor
-                    .max_output_tokens
-                    .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+                let tokens = vendor.messages_output_default();
                 payload["max_output_tokens"] = json!(tokens);
             }
             Wire::ChatCompletions => {

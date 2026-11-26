@@ -384,6 +384,7 @@ pub(super) async fn test_provider(
     let key = vendor
         .api_key(&|n| keys.get(n))
         .ok_or("This provider needs a configured API key.")?;
-    let list = crate::discover(&upstream_client()?, vendor, &key).await?;
+    let deadline = tokio::time::Instant::now() + crate::CATALOG_TIMEOUT;
+    let list = crate::discover(&upstream_client()?, vendor, &key, deadline).await?;
     Ok(crate::catalog::merge_models(Some(list), &[]).len())
 }

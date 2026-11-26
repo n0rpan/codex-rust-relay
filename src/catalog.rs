@@ -15,10 +15,27 @@ use crate::provider::ModelEntry;
 
 #[derive(Deserialize)]
 pub struct ProviderModels {
-    data: Vec<ProviderModel>,
+    #[serde(deserialize_with = "parse_model_rows")]
+    data: Vec<ModelSpec>,
+    #[serde(default)]
+    has_more: Value,
+    #[serde(default)]
+    last_id: Value,
 }
 
 impl ProviderModels {
+    pub fn next_cursor(&self) -> Option<&str> {
+        self.last_id.as_str().filter(|cursor| {
+            self.has_more.as_bool() == Some(true) && !cursor.is_empty() && cursor.len() <= 1024
+        })
+    }
+
+    pub fn append_page(&mut self, page: Self) {
+        self.data.extend(page.data);
+        self.has_more = page.has_more;
+        self.last_id = page.last_id;
+    }
+
     /// Removes discovered models whose IDs `keep` rejects, returning the
     /// rejected IDs in upstream order.
     pub fn retain_ids(&mut self, mut keep: impl FnMut(&str) -> bool) -> Vec<String> {
@@ -39,55 +56,14 @@ pub struct BundledModels {
     models: Vec<Value>,
 }
 
-#[derive(Deserialize)]
-struct ProviderModel {
-    id: String,
-    name: Option<String>,
-    #[serde(rename = "type")]
-    kind: Option<String>,
-    #[serde(default)]
-    modalities: Modalities,
-    #[serde(default)]
-    capabilities: Capabilities,
-    #[serde(default)]
-    limit: Limits,
-    #[serde(default)]
-    context_length: Value,
-    #[serde(default)]
-    max_input_tokens: Value,
-}
-
-#[derive(Default, Deserialize)]
-struct Modalities {
-    #[serde(default)]
-    input: Vec<String>,
-    #[serde(default)]
-    output: Vec<String>,
-}
-
-#[derive(Default, Deserialize)]
-struct Capabilities {
-    #[serde(default)]
-    tools: ToolCapabilities,
-    #[serde(default)]
-    reasoning: ReasoningCapabilities,
-}
-
-#[derive(Default, Deserialize)]
-struct ToolCapabilities {
-    supported: Option<bool>,
-}
-
-#[derive(Default, Deserialize)]
-struct ReasoningCapabilities {
-    #[serde(default)]
-    effort: Vec<String>,
-}
-
-#[derive(Default, Deserialize)]
-struct Limits {
-    context: Option<u64>,
-    input: Option<u64>,
+/// Providers disagree on optional field types. A bad field is unknown for
+/// this model, and a row without a usable ID does not affect its neighbors.
+fn parse_model_rows<'de, D>(deserializer: D) -> Result<Vec<ModelSpec>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let rows = Vec::<Value>::deserialize(deserializer)?;
+    Ok(rows.iter().filter_map(ModelSpec::from_upstream).collect())
 }
 
 /// A model after discovery and static overrides, still identified by its
@@ -99,6 +75,7 @@ pub struct ModelSpec {
     pub alias: Option<String>,
     pub name: Option<String>,
     pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
     pub input_modalities: Vec<String>,
     pub reasoning_efforts: Vec<String>,
 }
@@ -109,6 +86,7 @@ pub struct CatalogModel {
     pub display_name: String,
     pub description: String,
     pub context_window: Option<u64>,
+    pub max_output_tokens: Option<u64>,
     pub input_modalities: Vec<String>,
     pub reasoning_efforts: Vec<String>,
     /// Offer Codex's freeform `apply_patch` tool. Enabled for translated
@@ -131,11 +109,10 @@ pub fn merge_models(
     let mut used = vec![false; overrides.len()];
     if let Some(models) = discovered {
         let mut seen = HashSet::new();
-        for model in models.data {
-            if !model.supports_coding() || !seen.insert(model.id.clone()) {
+        for mut spec in models.data {
+            if !seen.insert(spec.id.clone()) {
                 continue;
             }
-            let mut spec = ModelSpec::from_upstream(model);
             if let Some(index) = overrides.iter().position(|entry| entry.id == spec.id) {
                 spec.apply_override(&overrides[index]);
                 used[index] = true;
@@ -153,33 +130,78 @@ pub fn merge_models(
 }
 
 impl ModelSpec {
-    fn from_upstream(model: ProviderModel) -> Self {
-        let context_window = model
-            .limit
-            .context
-            .into_iter()
-            .chain(model.limit.input)
-            .chain(model.context_length.as_u64())
-            .chain(model.max_input_tokens.as_u64())
-            .filter(|limit| *limit > 0)
-            .min();
+    fn from_upstream(model: &Value) -> Option<Self> {
+        let id = model["id"].as_str()?;
+        if id.is_empty()
+            || model.pointer("/capabilities/tools/supported") == Some(&Value::Bool(false))
+        {
+            return None;
+        }
+        let strings = |path: &str| -> Vec<&str> {
+            model
+                .pointer(path)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect()
+        };
+        let output = strings("/modalities/output");
+        let non_coding = if output.is_empty() {
+            matches!(
+                model["type"].as_str(),
+                Some(
+                    "embedding" | "embeddings" | "image" | "audio" | "video" | "speech" | "rerank"
+                )
+            )
+        } else {
+            !output.contains(&"text")
+        };
+        if non_coding {
+            return None;
+        }
+        let limit = |paths: &[&str]| {
+            paths
+                .iter()
+                .filter_map(|path| model.pointer(path)?.as_u64())
+                .filter(|tokens| *tokens > 0)
+                .min()
+        };
         let mut input_modalities = vec!["text".to_owned()];
-        if model
-            .modalities
-            .input
+        if strings("/modalities/input")
             .iter()
             .any(|input| input.starts_with("image"))
         {
             input_modalities.push("image".to_owned());
         }
-        Self {
-            id: model.id,
+        Some(Self {
+            id: id.to_owned(),
             alias: None,
-            name: model.name,
-            context_window,
+            name: model["name"]
+                .as_str()
+                .or_else(|| model["display_name"].as_str())
+                .map(str::to_owned),
+            context_window: limit(&[
+                "/limit/context",
+                "/limit/input",
+                "/context_length",
+                "/max_input_tokens",
+                "/context_window",
+                "/max_model_len",
+                "/n_ctx",
+            ]),
+            max_output_tokens: limit(&[
+                "/limit/output",
+                "/max_output",
+                "/max_output_tokens",
+                "/max_tokens",
+            ]),
             input_modalities,
-            reasoning_efforts: model.capabilities.reasoning.effort,
-        }
+            reasoning_efforts: strings("/capabilities/reasoning/effort")
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        })
     }
 
     fn from_entry(entry: &ModelEntry) -> Self {
@@ -188,6 +210,7 @@ impl ModelSpec {
             alias: None,
             name: None,
             context_window: None,
+            max_output_tokens: None,
             input_modalities: vec!["text".to_owned()],
             reasoning_efforts: Vec::new(),
         };
@@ -253,28 +276,13 @@ impl ProviderModels {
                 display_name: spec.name.clone().unwrap_or_else(|| spec.id.clone()),
                 description: provider_name.to_owned(),
                 context_window: spec.context_window,
+                max_output_tokens: spec.max_output_tokens,
                 input_modalities: spec.input_modalities,
                 reasoning_efforts: spec.reasoning_efforts,
                 apply_patch: false,
             })
             .collect::<Vec<_>>();
         Some(catalog_json(&models, bundled))
-    }
-}
-
-impl ProviderModel {
-    fn supports_coding(&self) -> bool {
-        if self.id.is_empty() || self.capabilities.tools.supported == Some(false) {
-            return false;
-        }
-        if !self.modalities.output.is_empty() {
-            return self.modalities.output.iter().any(|output| output == "text");
-        }
-
-        !matches!(
-            self.kind.as_deref(),
-            Some("embedding" | "embeddings" | "image" | "audio" | "video" | "speech" | "rerank")
-        )
     }
 }
 
@@ -369,6 +377,9 @@ impl CatalogModel {
             "input_modalities": self.input_modalities,
             "context_window": self.context_window
         });
+        if let Some(tokens) = self.max_output_tokens {
+            entry["max_output_tokens"] = json!(tokens);
+        }
         if self.apply_patch {
             // The translated adapters normalize this freeform tool to a
             // function tool and map calls back to custom_tool_call items.
@@ -544,6 +555,7 @@ mod tests {
             display_name: "Coder".to_owned(),
             description: "Alpha".to_owned(),
             context_window: Some(128_000),
+            max_output_tokens: Some(16384),
             input_modalities: vec!["text".to_owned()],
             reasoning_efforts: vec!["medium".to_owned()],
             apply_patch: true,

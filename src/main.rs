@@ -756,32 +756,25 @@ impl App {
             .collect();
         let discovery = async {
             let client = &client;
+            let deadline = tokio::time::Instant::now() + CATALOG_TIMEOUT;
             let requests: Vec<_> = vendors
                 .iter()
                 .zip(&auths)
                 .enumerate()
                 .filter_map(|(index, (vendor, auth))| {
                     let key = auth.as_ref().filter(|_| vendor.discovery)?;
-                    Some(async move { (index, discover(client, vendor, key).await) })
+                    Some(async move { (index, discover(client, vendor, key, deadline).await) })
                 })
                 .collect();
             let mut requests = futures_util::stream::iter(requests).buffer_unordered(4);
 
-            let deadline = tokio::time::Instant::now() + CATALOG_TIMEOUT;
-            loop {
-                match tokio::time::timeout_at(deadline, requests.next()).await {
-                    Ok(Some((index, Ok(models)))) => discovered[index] = Some(models),
-                    Ok(Some((index, Err(reason)))) => eprintln!(
+            while let Some((index, result)) = requests.next().await {
+                match result {
+                    Ok(models) => discovered[index] = Some(models),
+                    Err(reason) => eprintln!(
                         "ox: provider {:?}: model discovery failed: {reason}",
                         vendors[index].key
                     ),
-                    Ok(None) => break,
-                    Err(_) => {
-                        eprintln!(
-                            "ox: model discovery reached the startup deadline. Using configured models for remaining providers."
-                        );
-                        break;
-                    }
                 }
             }
             Ok::<(), RelayError>(())
@@ -832,6 +825,7 @@ impl App {
                     context_window: spec
                         .context_window
                         .or_else(|| catalog::published_context_window(&vendor.base_url, &spec.id)),
+                    max_output_tokens: spec.max_output_tokens,
                     input_modalities: spec.input_modalities.clone(),
                     reasoning_efforts: spec.reasoning_efforts.clone(),
                     apply_patch: vendor.wire.is_translated(),
@@ -1063,21 +1057,28 @@ impl App {
         match &self.mode {
             Mode::Codeox { catalog, .. } => json_response(StatusCode::OK, catalog.clone()),
             Mode::Legacy { provider, bundled } => {
+                let deadline = tokio::time::Instant::now() + CATALOG_TIMEOUT;
+                let mut headers = forward_headers(headers);
+                headers.insert(AUTHORIZATION, provider.upstream_auth.clone());
                 let upstream = self
                     .client
                     .get(provider.models_url.clone())
-                    .headers(forward_headers(headers))
-                    .header(AUTHORIZATION, provider.upstream_auth.clone())
+                    .headers(headers.clone())
                     .timeout(CATALOG_TIMEOUT)
                     .send()
                     .await;
                 match upstream {
                     Ok(response) if response.status().is_success() => {
-                        let catalog = read_upstream(response, MAX_CATALOG_BYTES)
-                            .await
-                            .ok()
-                            .and_then(|bytes| serde_json::from_slice::<ProviderModels>(&bytes).ok())
-                            .and_then(|models| models.legacy_catalog(&provider.name, bundled));
+                        let catalog = collect_model_pages(
+                            &self.client,
+                            &provider.models_url,
+                            &headers,
+                            response,
+                            deadline,
+                        )
+                        .await
+                        .ok()
+                        .and_then(|models| models.legacy_catalog(&provider.name, bundled));
                         match catalog {
                             Some(catalog) => json_response(StatusCode::OK, catalog),
                             None => error_response(
@@ -1155,6 +1156,9 @@ impl App {
                     Ok(target) => target,
                     Err((status, message)) => return error_response(status, &message),
                 };
+                if path == "/responses" {
+                    route.bound_output(&mut payload, "max_output_tokens", &state.vendor);
+                }
                 if translate::sanitize_replayed_history(&mut payload, route.wire) {
                     eprintln!(
                         "ox: sending this thread's history to provider {:?}",
@@ -1316,23 +1320,93 @@ async fn discover(
     client: &Client,
     vendor: &provider::Vendor,
     key: &SecretKey,
+    deadline: tokio::time::Instant,
 ) -> Result<ProviderModels, String> {
     let headers = vendor
         .discovery_headers(key)
         .map_err(|_| "could not build discovery headers".to_owned())?;
-    let response = client
-        .get(vendor.models_url.clone())
-        .headers(headers)
-        .timeout(CATALOG_TIMEOUT)
-        .send()
-        .await
-        .map_err(|_| "request failed".to_owned())?;
-    let status = response.status();
-    let bytes = read_upstream(response, MAX_CATALOG_BYTES).await?;
-    if !status.is_success() {
-        return Err(format!("upstream returned HTTP {}", status.as_u16()));
+    let response = tokio::time::timeout_at(
+        deadline,
+        client
+            .get(vendor.models_url.clone())
+            .headers(headers.clone())
+            .send(),
+    )
+    .await
+    .map_err(|_| "startup deadline reached".to_owned())?
+    .map_err(|_| "request failed".to_owned())?;
+    collect_model_pages(client, &vendor.models_url, &headers, response, deadline).await
+}
+
+async fn collect_model_pages(
+    client: &Client,
+    endpoint: &reqwest::Url,
+    headers: &HeaderMap,
+    first: reqwest::Response,
+    deadline: tokio::time::Instant,
+) -> Result<ProviderModels, String> {
+    async fn parse(
+        response: reqwest::Response,
+        remaining: &mut usize,
+    ) -> Result<ProviderModels, String> {
+        if !response.status().is_success() {
+            return Err(format!(
+                "upstream returned HTTP {}",
+                response.status().as_u16()
+            ));
+        }
+        let bytes = read_upstream(response, *remaining).await?;
+        *remaining -= bytes.len();
+        serde_json::from_slice(&bytes).map_err(|_| "invalid model catalog".to_owned())
     }
-    serde_json::from_slice(&bytes).map_err(|_| "invalid model catalog".to_owned())
+
+    const MAX_PAGES: usize = 32;
+    let mut remaining = MAX_CATALOG_BYTES;
+    let mut models = tokio::time::timeout_at(deadline, parse(first, &mut remaining))
+        .await
+        .map_err(|_| "catalog deadline reached".to_owned())??;
+    let mut seen: BTreeSet<_> = endpoint
+        .query_pairs()
+        .filter(|(key, _)| key == "after_id")
+        .map(|(_, value)| value.into_owned())
+        .collect();
+    // Only the opaque cursor comes from the provider. Every request targets
+    // the configured endpoint with its original non-pagination parameters.
+    let query: Vec<_> = endpoint
+        .query_pairs()
+        .filter(|(key, _)| key != "after_id")
+        .collect();
+    for _ in 1..MAX_PAGES {
+        let Some(cursor) = models.next_cursor() else {
+            break;
+        };
+        if remaining == 0 || !seen.insert(cursor.to_owned()) {
+            break;
+        }
+        let mut url = endpoint.clone();
+        url.query_pairs_mut()
+            .clear()
+            .extend_pairs(&query)
+            .append_pair("after_id", cursor);
+        let next = async {
+            let response = client
+                .get(url)
+                .headers(headers.clone())
+                .send()
+                .await
+                .map_err(|_| "request failed".to_owned())?;
+            parse(response, &mut remaining).await
+        };
+        match tokio::time::timeout_at(deadline, next).await {
+            Ok(Ok(page)) => models.append_page(page),
+            Ok(Err(reason)) => {
+                eprintln!("ox: additional model catalog page unavailable: {reason}");
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(models)
 }
 
 async fn read_upstream(response: reqwest::Response, limit: usize) -> Result<Bytes, String> {
@@ -1808,6 +1882,7 @@ mod tests {
     }
 
     struct Behavior {
+        catalog_pages: std::collections::BTreeMap<String, Result<Value, u16>>,
         models: Result<Value, u16>,
         catalog_barrier: Option<tokio::sync::Barrier>,
         redirect: Option<String>,
@@ -1822,6 +1897,7 @@ mod tests {
 
     async fn spawn_mock(models: Result<Value, u16>, redirect: Option<String>) -> MockVendor {
         spawn_mock_behavior(Behavior {
+            catalog_pages: Default::default(),
             models,
             catalog_barrier: None,
             redirect,
@@ -1836,6 +1912,7 @@ mod tests {
         headers: &[(&'static str, &'static str)],
     ) -> MockVendor {
         spawn_mock_behavior(Behavior {
+            catalog_pages: Default::default(),
             models: Ok(Value::Null),
             catalog_barrier: None,
             redirect: None,
@@ -1911,7 +1988,12 @@ mod tests {
             if let Some(barrier) = &behavior.catalog_barrier {
                 barrier.wait().await;
             }
-            return match &behavior.models {
+            let page = parts
+                .uri
+                .query()
+                .and_then(|query| behavior.catalog_pages.get(query))
+                .unwrap_or(&behavior.models);
+            return match page {
                 Ok(body) => json_response(StatusCode::OK, body.clone()),
                 Err(status) => error_response(
                     StatusCode::from_u16(*status).unwrap(),
@@ -2433,6 +2515,7 @@ env_key = "ALPHA_KEY"
         // The barrier needs two waiters and only one request arrives, so
         // discovery never answers on its own.
         let mock = spawn_mock_behavior(Behavior {
+            catalog_pages: Default::default(),
             models: Ok(models_body(&["discovered"])),
             catalog_barrier: Some(tokio::sync::Barrier::new(2)),
             redirect: None,
@@ -2462,8 +2545,87 @@ env_key = "ALPHA_KEY"
     }
 
     #[tokio::test]
+    async fn discovery_keeps_valid_neighbors_and_each_page_before_a_bad_or_repeated_cursor() {
+        for final_page in [
+            Err(503),
+            Ok(json!({"has_more": true, "last_id":"loop", "data":[]})),
+        ] {
+            let mock = spawn_mock_behavior(Behavior {
+                models: Ok(json!({"has_more":true, "last_id":"a&next=https://other.invalid", "data":[
+                    null, {"id":3}, {"id":"first","context_window":131072,"max_output":16384, "capabilities":null}
+                ]})),
+                catalog_pages: [
+                    ("scope=public&after_id=a%26next%3Dhttps%3A%2F%2Fother.invalid".to_owned(), Ok(json!({
+                        "data":[{"id":"first","context_window":2}, {"id":"second","limit":{"input":"unknown"}, "n_ctx":8192}],
+                        "has_more":true, "last_id":"loop"
+                    }))),
+                    ("scope=public&after_id=loop".to_owned(), final_page)
+                ].into(),
+                catalog_barrier: None, redirect: None, responses_error: None,
+            }).await;
+            let config = format!(
+                "{}models_url = \"{}/models?scope=public\"\n",
+                one_vendor_config(&mock.base),
+                mock.base
+            );
+            let relay = start_relay(&config, &[("ALPHA_KEY", "alpha-secret")], 1 << 20).await;
+            let catalog = get_models(&relay).await;
+            assert_eq!(listed_slugs(&catalog), ["alpha/first", "alpha/second"]);
+            assert_eq!(catalog["models"][0]["context_window"], 131072);
+            assert_eq!(catalog["models"][0]["max_output_tokens"], 16384);
+            assert_eq!(catalog["models"][1]["context_window"], 8192);
+            assert_eq!(mock.hits_len(), 3);
+            assert!(
+                mock.hits
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|hit| hit.authorization.as_deref() == Some("Bearer alpha-secret"))
+            );
+            let _ = post(
+                &relay,
+                json!({"model":"alpha/first","input":"hello","max_output_tokens":32768}),
+            )
+            .await;
+            assert_eq!(
+                mock.responses_hits()[0].body.as_ref().unwrap()["max_output_tokens"],
+                16384
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_caps_the_number_of_distinct_pages() {
+        let page = |n: usize| {
+            let id = format!("m{n}");
+            json!({"data":[{"id":id}], "has_more":true, "last_id":id})
+        };
+        let mock = spawn_mock_behavior(Behavior {
+            models: Ok(page(0)),
+            catalog_pages: (0..64)
+                .map(|n| (format!("after_id=m{n}"), Ok(page(n + 1))))
+                .collect(),
+            catalog_barrier: None,
+            redirect: None,
+            responses_error: None,
+        })
+        .await;
+        let relay = start_relay(
+            &one_vendor_config(&mock.base),
+            &[("ALPHA_KEY", "alpha-secret")],
+            1 << 20,
+        )
+        .await;
+        let slugs = listed_slugs(&get_models(&relay).await);
+        assert_eq!(slugs.len(), 32);
+        assert_eq!(slugs.last().unwrap(), "alpha/m31");
+        assert_eq!(mock.hits_len(), 32);
+    }
+
+    #[tokio::test]
     async fn discovery_runs_for_multiple_vendors_concurrently() {
         let mock = spawn_mock_behavior(Behavior {
+            catalog_pages: Default::default(),
             models: Ok(models_body(&["discovered"])),
             catalog_barrier: Some(tokio::sync::Barrier::new(2)),
             redirect: None,
@@ -2750,7 +2912,11 @@ env_key = "BETA_KEY"
 
     #[tokio::test]
     async fn claude_launch_authenticates_and_serves_its_model_catalog() {
-        let alpha = spawn_mock(Ok(models_body(&["fixture-model"])), None).await;
+        let alpha = spawn_mock(
+            Ok(json!({"data":[{"id":"fixture-model","max_model_len":131072,"max_output":16384}]})),
+            None,
+        )
+        .await;
         let relay = start_relay_with_client(
             &two_vendor_config(&alpha.base, &alpha.base),
             &[("ALPHA_KEY", "alpha-secret"), ("BETA_KEY", "beta-secret")],
@@ -2780,11 +2946,12 @@ env_key = "BETA_KEY"
             .await
             .unwrap();
         let models = catalog["data"].as_array().unwrap();
-        assert!(
-            models
-                .iter()
-                .any(|model| model["id"] == "alpha/fixture-model")
-        );
+        let fixture = models
+            .iter()
+            .find(|model| model["id"] == "alpha/fixture-model")
+            .unwrap();
+        assert_eq!(fixture["max_input_tokens"], 131072);
+        assert_eq!(fixture["max_tokens"], 16384);
         assert!(models.iter().all(|model| model["type"] == "model"));
         assert!(!models.iter().any(|model| model["id"] == "bundled-default"));
         assert_eq!(catalog["has_more"], false);

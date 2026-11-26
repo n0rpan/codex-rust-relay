@@ -293,7 +293,7 @@ class Catalog(http.server.BaseHTTPRequestHandler):
         self.send_response(200 if ok else 401)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(b'{"data":[{"id":"fixture","limit":{"context":123456}}]}')
+        self.wfile.write(b'{"data":[{"id":"fixture","context_window":123456,"max_output":16384}]}')
 
     def log_message(self, *args):
         pass
