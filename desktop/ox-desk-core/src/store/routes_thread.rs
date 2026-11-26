@@ -73,7 +73,14 @@ impl Store {
                 .cloned()
                 .unwrap_or_default();
         }
-        let caps = self.command_caps(thread);
+        let mut caps = self.command_caps(thread);
+        if caps.model.is_empty()
+            && self.is_session_scoped()
+            && let Billing::Api(alias) = &self.profile.route.billing
+        {
+            // The billing route already identifies the model before stock sends its schema.
+            caps.model.clone_from(alias);
+        }
 
         match thread.and_then(|id| self.transcript(id)) {
             Some(t) => Options {
