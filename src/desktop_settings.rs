@@ -114,6 +114,10 @@ async fn handle(home: &Path, request: Request) -> Result<Value, RelayError> {
             crate::advice::apply(home, &id)?;
             Ok(json!(true))
         }
+        Request::DismissAdvice { id } => {
+            crate::advice::dismiss(home, &id)?;
+            Ok(json!(true))
+        }
         Request::Models => {
             if !home.join(REGISTRY).try_exists()? {
                 return legacy::models(home).await;

@@ -4,23 +4,29 @@
 //! has its own idea of which request fields exist. When a provider rejects a
 //! field the stock client always sends, a pure relay ends the turn with a raw
 //! provider message. Instead OX names the offending field, removes only that
-//! field, retries once, and remembers the rule for that provider and model for
-//! the rest of the process.
+//! field, and retries (at most [`MAX_ATTEMPTS`] sends in total). The rule is
+//! remembered for that provider and model for the rest of the process.
 //!
 //! The rule table is deliberately small and auditable:
 //!
-//! * a provider that refuses to disable reasoning loses its reasoning block;
-//! * a stateless provider loses `store` and `previous_response_id`;
+//! * a provider that refuses to disable reasoning loses only the disabling
+//!   value (`effort: "none"`, `enabled: false`, `thinking.type: "disabled"`);
+//! * a stateless provider loses `store`, and a null `previous_response_id`;
+//!   a non-null reference is never dropped, because it is the only link to
+//!   earlier turns;
+//! * a rejected `reasoning.<field>` loses only that sub-field;
 //! * an unknown/unsupported parameter loses exactly the field it names.
 //!
 //! Fields that carry user intent (`model`, `input`, `messages`, `tools`,
-//! `instructions`) and anything that controls credentials, the sandbox or
-//! search are never dropped. Authentication, payment, permission and rate-limit
-//! failures are never retried, and a response is never retried after any byte
-//! of it has reached the client.
+//! `instructions`, `text`, `tool_choice`, `parallel_tool_calls`) and anything
+//! that controls credentials, the sandbox or search are never dropped.
+//! Authentication, payment, permission and rate-limit failures are never
+//! retried, and a response is never retried after any byte of it has reached
+//! the client.
 
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// How many times one request may be sent: the original plus two adaptations.
@@ -48,11 +54,18 @@ const DROPPABLE: &[&str] = &[
     "stream_options",
 ];
 
+/// `reasoning` sub-fields OX may omit on their own. A rejection that names
+/// `reasoning.summary` says nothing about the effort the user picked, so only
+/// the named sub-field goes and the rest of the block is still sent.
+const REASONING_FIELDS: &[&str] = &["summary", "generate_summary", "effort"];
+
 /// What to change in a rejected request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Action {
     /// Remove one top-level field.
     Drop(&'static str),
+    /// Remove one field inside the `reasoning` object, keeping the others.
+    DropReasoningField(&'static str),
     /// Remove only the value that turns reasoning off, keeping any other
     /// reasoning setting the caller asked for.
     ReasoningOff,
@@ -66,6 +79,7 @@ impl Action {
     pub fn label(self) -> String {
         match self {
             Self::Drop(field) => format!("omitting {field:?}"),
+            Self::DropReasoningField(field) => format!("omitting \"reasoning.{field}\""),
             Self::ReasoningOff => "not sending a disabled reasoning setting".to_owned(),
             Self::StripStateless => "omitting store".to_owned(),
         }
@@ -75,6 +89,7 @@ impl Action {
     pub fn advice(self) -> &'static str {
         match self {
             Self::Drop("reasoning" | "reasoning_effort" | "thinking" | "output_config")
+            | Self::DropReasoningField(_)
             | Self::ReasoningOff => {
                 "declare the model's reasoning levels in codeox.toml (reasoning_efforts, default_reasoning_effort)"
             }
@@ -96,6 +111,18 @@ pub fn apply(action: Action, body: &mut Value) -> bool {
     };
     match action {
         Action::Drop(field) => object.remove(field).is_some(),
+        Action::DropReasoningField(field) => {
+            let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut) else {
+                return false;
+            };
+            if reasoning.remove(field).is_none() {
+                return false;
+            }
+            if reasoning.is_empty() {
+                object.remove("reasoning");
+            }
+            true
+        }
         Action::ReasoningOff => {
             let mut changed = false;
             if let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut) {
@@ -186,9 +213,24 @@ pub fn classify(status: u16, message: &str, body: &Value) -> Option<Action> {
             "does not support",
         ],
     ) {
+        if let Some(field) = named_reasoning_field(&text, body) {
+            return Some(Action::DropReasoningField(field));
+        }
         return named_field(&text, body).map(Action::Drop);
     }
     None
+}
+
+/// A quoted `reasoning.<field>` path whose sub-field the request carries.
+fn named_reasoning_field(text: &str, body: &Value) -> Option<&'static str> {
+    let reasoning = body.get("reasoning").and_then(Value::as_object)?;
+    let quoted = quoted_tokens(text);
+    REASONING_FIELDS.iter().copied().find(|field| {
+        reasoning.contains_key(*field)
+            && quoted
+                .iter()
+                .any(|token| token.strip_prefix("reasoning.") == Some(*field))
+    })
 }
 
 /// Picks the request field an error names, without mistaking a field name that
@@ -284,20 +326,55 @@ fn mentions_reasoning_shutdown(text: &str) -> bool {
 #[derive(Default)]
 pub struct Memory {
     rules: Mutex<BTreeMap<(String, String), BTreeSet<Action>>>,
+    /// Where a lasting fix is recorded for `ox doctor` and OX Desktop.
+    advice_home: Option<PathBuf>,
 }
 
 impl Memory {
+    /// A memory that also records a configuration fix the first time a
+    /// provider proves a model's reasoning is mandatory.
+    pub fn with_advice(home: Option<PathBuf>) -> Self {
+        Self {
+            rules: Mutex::default(),
+            advice_home: home,
+        }
+    }
+
     /// Records a rule. Returns true only the first time this provider/model
     /// needs it, which is when the caller should explain the change.
     pub fn learn(&self, vendor: &str, model: &str, action: Action) -> bool {
-        let mut rules = self
+        let new = self
             .rules
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        rules
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry((vendor.to_owned(), model.to_owned()))
             .or_default()
-            .insert(action)
+            .insert(action);
+        // A rejected "reasoning off" means the catalog did not know the model
+        // is reasoning-mandatory. Writing that into codeox.toml lets the
+        // catalog hide `none`, so the next process never pays this 400. This
+        // runs once per provider/model, never per request.
+        if new
+            && action == Action::ReasoningOff
+            && let Some(home) = &self.advice_home
+        {
+            crate::advice::record(
+                home,
+                crate::advice::Advice {
+                    id: format!("model-mandatory:{vendor}:{model}"),
+                    provider: vendor.to_owned(),
+                    model: Some(model.to_owned()),
+                    message: "the provider refused to turn reasoning off for this model".to_owned(),
+                    fix: crate::advice::Fix::SetModelReasoning {
+                        provider: vendor.to_owned(),
+                        model: model.to_owned(),
+                        effort: None,
+                        mandatory: true,
+                    },
+                },
+            );
+        }
+        new
     }
 
     /// Applies every rule learned for this provider/model so far.
@@ -444,8 +521,59 @@ mod tests {
                 "Unsupported parameter: 'reasoning.summary' is not supported with this model.",
                 &body
             ),
-            Some(Action::Drop("reasoning"))
+            Some(Action::DropReasoningField("summary"))
         );
+    }
+
+    #[test]
+    fn a_rejected_reasoning_sub_field_keeps_the_explicit_effort() {
+        let body = json!({"model": "m", "reasoning": {"effort": "high", "summary": "auto"}});
+        let action = classify(
+            400,
+            "Unsupported parameter: 'reasoning.summary' is not supported with this model.",
+            &body,
+        );
+        assert_eq!(action, Some(Action::DropReasoningField("summary")));
+
+        // Learned once, the rule still leaves a later explicit effort alone.
+        let memory = Memory::default();
+        memory.learn("openrouter", "m", action.unwrap());
+        let mut later = json!({"reasoning": {"effort": "xhigh", "summary": "detailed"}});
+        memory.apply_known("openrouter", "m", &mut later);
+        assert_eq!(later, json!({"reasoning": {"effort": "xhigh"}}));
+
+        // A block left empty is removed instead of sent as `{}`.
+        let mut only_summary = json!({"reasoning": {"summary": "auto"}});
+        assert!(apply(
+            Action::DropReasoningField("summary"),
+            &mut only_summary
+        ));
+        assert!(only_summary.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn a_refused_reasoning_shutdown_is_recorded_as_a_fix_once() {
+        let mut bytes = [0u8; 8];
+        getrandom::fill(&mut bytes).unwrap();
+        let home = std::env::temp_dir().join(format!("ox-adapt-{}", hex::encode(bytes)));
+        std::fs::create_dir_all(&home).unwrap();
+        let memory = Memory::with_advice(Some(home.clone()));
+        assert!(memory.learn("openrouter", "gpt", Action::ReasoningOff));
+        assert!(!memory.learn("openrouter", "gpt", Action::ReasoningOff));
+        // Other rules are process-local workarounds, not configuration fixes.
+        memory.learn("openrouter", "gpt", Action::Drop("cache_control"));
+        let advice = crate::advice::read(&home);
+        assert_eq!(advice.len(), 1, "{advice:?}");
+        assert_eq!(
+            advice[0].fix,
+            crate::advice::Fix::SetModelReasoning {
+                provider: "openrouter".to_owned(),
+                model: "gpt".to_owned(),
+                effort: None,
+                mandatory: true,
+            }
+        );
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

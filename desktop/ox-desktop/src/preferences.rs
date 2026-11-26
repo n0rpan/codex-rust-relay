@@ -514,6 +514,15 @@ impl Preferences {
         .detach();
     }
     fn apply_advice(&mut self, id: String, w: &mut Window, cx: &mut Context<Self>) {
+        self.resolve_advice(id, true, w, cx);
+    }
+    fn dismiss_advice(&mut self, id: String, w: &mut Window, cx: &mut Context<Self>) {
+        self.resolve_advice(id, false, w, cx);
+    }
+    /// Applies or dismisses one advice record. The list is reloaded either way:
+    /// the helper discards advice that can no longer apply, so a failed Fix
+    /// must not leave a stale row behind.
+    fn resolve_advice(&mut self, id: String, apply: bool, w: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
@@ -522,17 +531,23 @@ impl Preferences {
         cx.spawn_in(w, async move |view, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { settings::apply_advice(&id) })
+                .spawn(async move {
+                    if apply {
+                        settings::apply_advice(&id)
+                    } else {
+                        settings::dismiss_advice(&id)
+                    }
+                })
                 .await;
             let _ = view.update_in(cx, |s, w, cx| {
                 s.busy = false;
-                match result {
-                    Ok(()) => {
-                        s.report(Ok(()), "Provider fix applied.", cx);
-                        s.reload(w, cx);
-                    }
-                    Err(e) => s.report(Err(e), "", cx),
-                }
+                let done = if apply {
+                    "Provider fix applied."
+                } else {
+                    "Advice dismissed."
+                };
+                s.report(result, done, cx);
+                s.reload(w, cx);
             });
         })
         .detach();
@@ -721,6 +736,7 @@ impl Preferences {
                 .collect::<Vec<_>>()
             {
                 let id = record.id.clone();
+                let dismiss_id = record.id.clone();
                 advice_rows = advice_rows.child(
                     div()
                         .flex()
@@ -739,6 +755,16 @@ impl Preferences {
                             true,
                             true,
                             cx.listener(move |s, _, w, cx| s.apply_advice(id.clone(), w, cx)),
+                        ))
+                        .child(crate::kit::button(
+                            p,
+                            format!("dismiss-advice-{}", record.id),
+                            "Dismiss",
+                            false,
+                            true,
+                            cx.listener(move |s, _, w, cx| {
+                                s.dismiss_advice(dismiss_id.clone(), w, cx)
+                            }),
                         )),
                 );
             }

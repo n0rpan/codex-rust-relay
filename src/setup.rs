@@ -3358,12 +3358,15 @@ pub(crate) fn run_doctor_styled(
     }
     if fix {
         let mut repairs = repair(codex_home)?;
+        // A fix that was refused is not a repair; it is listed separately so
+        // the output never shows a green "fixed" next to a failure.
+        let mut refused = Vec::new();
         // Advice is applied after the repair lock is released: both paths
         // rewrite the same files and must not nest the lock.
         for record in crate::advice::read(codex_home) {
             match crate::advice::apply(codex_home, &record.id) {
                 Ok(_) => repairs.push(format!("applied: {}", record.message)),
-                Err(error) => repairs.push(format!(
+                Err(error) => refused.push(format!(
                     "could not apply the fix for {}: {error}",
                     record.provider
                 )),
@@ -3374,7 +3377,7 @@ pub(crate) fn run_doctor_styled(
             "{}",
             crate::ui::paint("repairs", crate::ui::BOLD, color)
         )?;
-        if repairs.is_empty() {
+        if repairs.is_empty() && refused.is_empty() {
             writeln!(output, "  · nothing needed repair")?;
         }
         for line in &repairs {
@@ -3382,6 +3385,13 @@ pub(crate) fn run_doctor_styled(
                 output,
                 "  {} fixed: {line}",
                 crate::ui::paint("✓", crate::ui::GREEN, color)
+            )?;
+        }
+        for line in &refused {
+            writeln!(
+                output,
+                "  {} {line}",
+                crate::ui::paint("!", crate::ui::YELLOW, color)
             )?;
         }
         writeln!(output)?;

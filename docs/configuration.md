@@ -346,7 +346,7 @@ under `repairs`, then runs the check:
 | `ox-api-keys.json` cannot be parsed | Moves it to `ox-api-keys.json.broken-<time>`. Paste your keys again in `ox setup`. |
 | `ox-favorites.json` cannot be parsed | Moves it to `ox-favorites.json.broken-<time>`. Star your models again in the picker. |
 | Temporary files left by an interrupted save | Removes them once they are at least 10 minutes old. |
-| A provider workaround was recorded | Applies the safe fix (for example clearing a stale global reasoning effort, or recording a model's reasoning default). |
+| A provider workaround was recorded | Applies the safe fix (for example clearing a stale global reasoning effort, or marking a model reasoning-mandatory after the provider refused to turn reasoning off). A fix that is refused is listed with `!` and kept; advice whose provider entry is gone or was repointed is discarded. |
 
 `<time>` is the Unix time of the repair. Unreadable files are renamed, never
 deleted, so every repair can be undone by renaming the file back. Running
@@ -475,11 +475,16 @@ These are the documented OpenRouter routing preferences; an unknown key or a wro
 type stops the launch instead of being ignored. If the relay has to work around a
 provider quirk, it records the safe fix. `ox doctor` lists it under `advice` and
 `ox doctor --fix` applies it; OX Desktop shows the same entry on the provider page
-with a **Fix** button, so the terminal is optional. On the Responses and Chat wires OX
+with **Fix** and **Dismiss** buttons, so the terminal is optional. The EU/US host
+probe only runs after a 403 from the global host; an in-region route is never told
+to move to the other region. On the Responses and Chat wires OX
 also adds a top-level `cache_control` hint, a hashed `session_id` from the client
 session (openrouter sticky routing keeps each conversation on one backend), and the
 optional `HTTP-Referer`/`X-OpenRouter-Title` attribution headers. The Responses API
-is stateless, so OX sends `store: false` and never a `previous_response_id`.
+is stateless, so OX sends `store: false` and drops a null `previous_response_id`. A
+non-null `previous_response_id` is kept: it is the only link to earlier turns, so
+OpenRouter's rejection reaches the client, which then resends the full history,
+instead of OX answering from incomplete context.
 
 Use lowercase ASCII letters, digits, `_`, and `-` for provider names, starting with a
 letter or digit. Keep aliases unique. A provider-qualified alias cannot use another

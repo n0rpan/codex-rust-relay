@@ -68,6 +68,9 @@ pub fn advice() -> Vec<protocol::ProviderAdvice> {
 pub fn apply_advice(id: &str) -> Result<(), String> {
     request::<bool>(Request::ApplyAdvice { id: id.to_owned() }).map(|_| ())
 }
+pub fn dismiss_advice(id: &str) -> Result<(), String> {
+    request::<bool>(Request::DismissAdvice { id: id.to_owned() }).map(|_| ())
+}
 pub fn previous_workspace() -> Result<Option<protocol::ProjectRoute>, String> {
     request(Request::LegacyWorkspace)
 }

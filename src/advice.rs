@@ -22,12 +22,14 @@ pub enum Fix {
     /// Remove the relay Codex profile's global `model_reasoning_effort`, so a
     /// choice made for one model cannot follow the user to another.
     ClearRelayReasoningEffort,
-    /// Record a model's reasoning default (and whether reasoning is mandatory)
-    /// in `codeox.toml`, so the catalog never has to guess again.
+    /// Record a model's reasoning default and/or that reasoning is mandatory
+    /// in `codeox.toml`, so the catalog never has to guess again. `effort` is
+    /// absent when the provider only proved reasoning cannot be turned off.
     SetModelReasoning {
         provider: String,
         model: String,
-        effort: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
         mandatory: bool,
     },
     /// Point an OpenRouter provider at the in-region host its key may use.
@@ -59,14 +61,13 @@ impl Fix {
                 model,
                 effort,
                 mandatory,
-            } => format!(
-                "record {model} on {provider} as {effort}{}",
-                if *mandatory {
-                    " with mandatory reasoning"
-                } else {
-                    ""
+            } => match (effort, mandatory) {
+                (Some(effort), true) => {
+                    format!("record {model} on {provider} as {effort} with mandatory reasoning")
                 }
-            ),
+                (Some(effort), false) => format!("record {model} on {provider} as {effort}"),
+                (None, _) => format!("record {model} on {provider} as reasoning-mandatory"),
+            },
             Self::UseRegionalHost { provider, region } => {
                 format!("use {region}.openrouter.ai for {provider}")
             }
@@ -145,6 +146,20 @@ pub fn remove(home: &Path, id: &str) -> Result<(), RelayError> {
     crate::setup::write_config_atomic(&path(home), &text)
 }
 
+/// Whether a fix still applies to the configuration on disk.
+enum Applied {
+    Done,
+    /// The condition the advice was recorded for no longer exists (the
+    /// provider entry is gone or was repointed). The record is discarded so the
+    /// desktop does not keep offering a Fix that can never succeed.
+    Stale(String),
+}
+
+/// Forgets one advice record without changing any configuration.
+pub fn dismiss(home: &Path, id: &str) -> Result<(), RelayError> {
+    remove(home, id)
+}
+
 /// Applies one advice record and forgets it. Only the documented safe changes
 /// are performed; nothing else in the file is reformatted.
 pub fn apply(home: &Path, id: &str) -> Result<Fix, RelayError> {
@@ -152,7 +167,20 @@ pub fn apply(home: &Path, id: &str) -> Result<Fix, RelayError> {
         .into_iter()
         .find(|advice| advice.id == id)
         .ok_or("that advice is no longer recorded; reload the provider page")?;
-    match &advice.fix {
+    match apply_fix(home, &advice.fix)? {
+        Applied::Done => {
+            remove(home, id)?;
+            Ok(advice.fix)
+        }
+        Applied::Stale(reason) => {
+            remove(home, id)?;
+            Err(format!("{reason}; the advice was discarded").into())
+        }
+    }
+}
+
+fn apply_fix(home: &Path, fix: &Fix) -> Result<Applied, RelayError> {
+    match fix {
         Fix::ClearRelayReasoningEffort => {
             let config = home.join("ox-clients/codex/config.toml");
             let _lock = crate::setup::lock_config(home)?;
@@ -161,6 +189,7 @@ pub fn apply(home: &Path, id: &str) -> Result<Fix, RelayError> {
             {
                 crate::setup::write_config_atomic(&config, &updated)?;
             }
+            Ok(Applied::Done)
         }
         Fix::SetModelReasoning {
             provider,
@@ -168,15 +197,24 @@ pub fn apply(home: &Path, id: &str) -> Result<Fix, RelayError> {
             effort,
             mandatory,
         } => {
-            if crate::catalog::reasoning_rank(effort).is_none() {
+            if let Some(effort) = effort
+                && crate::catalog::reasoning_rank(effort).is_none()
+            {
                 return Err(format!("{effort:?} is not a reasoning effort").into());
             }
             let config = crate::provider::CodeoxConfig::path(home);
             let _lock = crate::setup::lock_config(home)?;
             let text = crate::setup::read_optional_text_limited(&config, "codeox.toml")?
                 .ok_or("codeox.toml is missing; run `ox setup`")?;
-            let updated = set_model_reasoning(&text, provider, model, effort, *mandatory)?;
+            if !has_provider(&text, provider)? {
+                return Ok(Applied::Stale(format!(
+                    "codeox.toml has no providers.{provider} table"
+                )));
+            }
+            let updated =
+                set_model_reasoning(&text, provider, model, effort.as_deref(), *mandatory)?;
             crate::setup::write_config_atomic(&config, &updated)?;
+            Ok(Applied::Done)
         }
         Fix::UseRegionalHost { provider, region } => {
             if !matches!(region.as_str(), "eu" | "us") {
@@ -189,21 +227,20 @@ pub fn apply(home: &Path, id: &str) -> Result<Fix, RelayError> {
             // Saved keys are scoped to their destination, so the move has to
             // take the credential with it or the route looks keyless.
             let before = crate::provider::CodeoxConfig::load_from_str(&text)?;
-            let vendor = before
-                .vendors
-                .iter()
-                .find(|vendor| vendor.key == *provider)
-                .ok_or_else(|| format!("codeox.toml has no providers.{provider} table"))?;
+            let Some(vendor) = before.vendors.iter().find(|vendor| vendor.key == *provider) else {
+                return Ok(Applied::Stale(format!(
+                    "codeox.toml has no providers.{provider} table"
+                )));
+            };
             // Advice can outlive the provider entry it was recorded for. Moving
             // a credential to OpenRouter after the entry was repointed would
             // send the wrong service's key there.
             if vendor.base_url.host_str() != Some("openrouter.ai")
                 || !crate::provider::is_openrouter_url(&vendor.base_url)
             {
-                return Err(format!(
-                    "providers.{provider} no longer points at the global OpenRouter route; discard this advice"
-                )
-                .into());
+                return Ok(Applied::Stale(format!(
+                    "providers.{provider} no longer points at the global OpenRouter route"
+                )));
             }
             let old_base = vendor.base_url.as_str().to_owned();
             let env_key = vendor.env_key.clone();
@@ -221,21 +258,46 @@ pub fn apply(home: &Path, id: &str) -> Result<Fix, RelayError> {
                 .into());
             }
             let base = format!("https://{region}.openrouter.ai/api/v1");
+            // Both files are prepared before either is written, and a failed
+            // key write puts codeox.toml back, so a partial move can never
+            // leave the provider pointing at a host its key is not scoped to.
             let updated = set_provider_base(&text, provider, &base)?;
-            crate::setup::write_config_atomic(&config, &updated)?;
-            if let Some(env_key) = env_key {
-                let mut keys = crate::provider::SavedKeys::load(home)?;
-                if let Some(text) = keys.rescope(&env_key, &old_base, &base)? {
-                    crate::setup::write_config_atomic(
-                        &crate::provider::SavedKeys::path(home),
-                        &text,
-                    )?;
+            let keys = match &env_key {
+                Some(env_key) => {
+                    crate::provider::SavedKeys::load(home)?.rescope(env_key, &old_base, &base)?
                 }
+                None => None,
+            };
+            crate::setup::write_config_atomic(&config, &updated)?;
+            if let Some(keys) = keys
+                && let Err(error) = crate::setup::write_config_atomic(
+                    &crate::provider::SavedKeys::path(home),
+                    &keys,
+                )
+            {
+                return match crate::setup::write_config_atomic(&config, &text) {
+                    Ok(()) => Err(format!(
+                        "could not move the saved key, so codeox.toml was left unchanged: {error}"
+                    )
+                    .into()),
+                    Err(restore) => Err(format!(
+                        "could not move the saved key ({error}) or restore codeox.toml ({restore}); set providers.{provider}.base_url back to {old_base}"
+                    )
+                    .into()),
+                };
             }
+            Ok(Applied::Done)
         }
     }
-    remove(home, id)?;
-    Ok(advice.fix)
+}
+
+fn has_provider(text: &str, provider: &str) -> Result<bool, RelayError> {
+    let document: DocumentMut = text.parse().map_err(|_| "could not parse codeox.toml")?;
+    Ok(document
+        .get("providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(provider))
+        .is_some_and(Item::is_table))
 }
 
 /// Removes one top-level key from a TOML document, keeping everything else
@@ -254,7 +316,7 @@ fn set_model_reasoning(
     text: &str,
     provider: &str,
     model: &str,
-    effort: &str,
+    effort: Option<&str>,
     mandatory: bool,
 ) -> Result<String, RelayError> {
     let mut document: DocumentMut = text.parse().map_err(|_| "could not parse codeox.toml")?;
@@ -288,7 +350,9 @@ fn set_model_reasoning(
         }
     };
     let entry = models.get_mut(index).expect("the entry exists");
-    entry["default_reasoning_effort"] = toml_edit::value(effort);
+    if let Some(effort) = effort {
+        entry["default_reasoning_effort"] = toml_edit::value(effort);
+    }
     entry["reasoning_mandatory"] = toml_edit::value(mandatory);
     Ok(document.to_string())
 }
@@ -368,15 +432,27 @@ id = "openai/gpt-6.1-sol"
 reasoning_efforts = ["low", "high"]
 "#;
         let updated =
-            set_model_reasoning(text, "openrouter", "openai/gpt-6.1-sol", "high", true).unwrap();
+            set_model_reasoning(text, "openrouter", "openai/gpt-6.1-sol", Some("high"), true)
+                .unwrap();
         assert!(updated.contains("default_reasoning_effort = \"high\""));
         assert!(updated.contains("reasoning_mandatory = true"));
 
-        let updated =
-            set_model_reasoning(text, "openrouter", "openai/gpt-6.2-astra", "medium", false)
-                .unwrap();
+        let updated = set_model_reasoning(
+            text,
+            "openrouter",
+            "openai/gpt-6.2-astra",
+            Some("medium"),
+            false,
+        )
+        .unwrap();
         assert!(updated.contains("id = \"openai/gpt-6.2-astra\""));
         assert!(updated.contains("default_reasoning_effort = \"medium\""));
+
+        // A provider that only proved reasoning is mandatory records no default.
+        let updated =
+            set_model_reasoning(text, "openrouter", "openai/gpt-6.1-sol", None, true).unwrap();
+        assert!(updated.contains("reasoning_mandatory = true"));
+        assert!(!updated.contains("default_reasoning_effort"));
     }
 
     #[test]
@@ -399,7 +475,7 @@ reasoning_efforts = ["low", "high"]
                 Fix::SetModelReasoning {
                     provider: "openrouter".to_owned(),
                     model: "openai/gpt-6.1-sol".to_owned(),
-                    effort: "high".to_owned(),
+                    effort: Some("high".to_owned()),
                     mandatory: true,
                 },
             ),
@@ -447,7 +523,7 @@ reasoning_efforts = ["low", "high"]
                 Fix::SetModelReasoning {
                     provider: "openrouter".to_owned(),
                     model: "m".to_owned(),
-                    effort: "extreme".to_owned(),
+                    effort: Some("extreme".to_owned()),
                     mandatory: false,
                 },
             ),
@@ -511,11 +587,16 @@ reasoning_efforts = ["low", "high"]
                 },
             ),
         );
-        assert!(apply(&home, "region").is_err());
+        let error = apply(&home, "region").unwrap_err().to_string();
+        assert!(error.contains("discarded"), "{error}");
         let config = std::fs::read_to_string(home.join("codeox.toml")).unwrap();
         assert!(config.contains("https://other.example/v1"), "{config}");
         let keys = std::fs::read_to_string(home.join("ox-api-keys.json")).unwrap();
         assert!(keys.contains("https://other.example/v1"), "{keys}");
+        assert!(
+            read(&home).is_empty(),
+            "a fix that can never apply is not offered again"
+        );
         let _ = std::fs::remove_dir_all(home);
     }
 
@@ -565,5 +646,81 @@ models_url = "https://openrouter.ai/api/v1/models/user"
             set_provider_base(text, "openrouter", "https://eu.openrouter.ai/api/v1").unwrap();
         assert!(updated.contains("https://eu.openrouter.ai/api/v1"));
         assert!(!updated.contains("models_url"));
+    }
+
+    #[test]
+    fn a_refused_regional_fix_is_kept_and_a_dismissed_one_is_gone() {
+        let home = temp_home("dismiss");
+        std::fs::write(
+            home.join("codeox.toml"),
+            "[providers.openrouter]\nbase_url = \"https://openrouter.ai/api/v1\"\nenv_key = \"OPENROUTER_API_KEY\"\n\n[providers.openrouter-chat]\nbase_url = \"https://openrouter.ai/api/v1\"\nenv_key = \"OPENROUTER_API_KEY\"\n",
+        )
+        .unwrap();
+        let entry = advice(
+            "region",
+            Fix::UseRegionalHost {
+                provider: "openrouter".to_owned(),
+                region: "eu".to_owned(),
+            },
+        );
+        record(&home, entry.clone());
+        assert!(apply(&home, "region").is_err());
+        assert_eq!(read(&home), vec![entry], "the user can still act on it");
+        dismiss(&home, "region").unwrap();
+        assert!(read(&home).is_empty());
+        let config = std::fs::read_to_string(home.join("codeox.toml")).unwrap();
+        assert!(!config.contains("eu.openrouter.ai"), "{config}");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_regional_fix_leaves_codeox_toml_alone_when_the_key_cannot_move() {
+        let home = temp_home("rollback");
+        let original = "[providers.openrouter]\nbase_url = \"https://openrouter.ai/api/v1\"\nenv_key = \"OPENROUTER_API_KEY\"\n";
+        std::fs::write(home.join("codeox.toml"), original).unwrap();
+        // An unreadable key store fails before anything is written.
+        std::fs::write(home.join("ox-api-keys.json"), "not json").unwrap();
+        record(
+            &home,
+            advice(
+                "region",
+                Fix::UseRegionalHost {
+                    provider: "openrouter".to_owned(),
+                    region: "eu".to_owned(),
+                },
+            ),
+        );
+        assert!(apply(&home, "region").is_err());
+        assert_eq!(
+            std::fs::read_to_string(home.join("codeox.toml")).unwrap(),
+            original
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_mandatory_only_fix_round_trips_through_the_record_file() {
+        let home = temp_home("mandatory-only");
+        std::fs::write(
+            home.join("codeox.toml"),
+            "[providers.openrouter]\nbase_url = \"https://openrouter.ai/api/v1\"\n",
+        )
+        .unwrap();
+        record(
+            &home,
+            advice(
+                "mandatory",
+                Fix::SetModelReasoning {
+                    provider: "openrouter".to_owned(),
+                    model: "openai/gpt-6.1-sol".to_owned(),
+                    effort: None,
+                    mandatory: true,
+                },
+            ),
+        );
+        apply(&home, "mandatory").unwrap();
+        let config = crate::provider::CodeoxConfig::load(&home.join("codeox.toml")).unwrap();
+        assert!(config.vendors[0].models[0].reasoning_mandatory == Some(true));
+        let _ = std::fs::remove_dir_all(home);
     }
 }

@@ -86,6 +86,10 @@ pub enum Request {
     ApplyAdvice {
         id: String,
     },
+    /// Forget one recorded advice without changing any configuration.
+    DismissAdvice {
+        id: String,
+    },
 }
 
 /// One recorded provider workaround, as shown by OX Desktop.

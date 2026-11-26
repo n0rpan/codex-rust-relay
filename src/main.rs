@@ -816,7 +816,10 @@ impl App {
                             "ox: provider {:?}: model discovery failed: {reason}",
                             vendors[index].key
                         );
-                        if vendors[index].is_openrouter()
+                        // Only a 403 from the global host can mean "this key is
+                        // regional". An in-region route never gets a suggestion
+                        // to move its data to the other region.
+                        if vendors[index].openrouter_region() == Some(provider::Region::Global)
                             && reason.contains("403")
                             && let Some(key) = auths[index].as_ref()
                         {
@@ -954,7 +957,7 @@ impl App {
             secrets: Arc::new(secrets),
             notices: std::sync::Mutex::default(),
             advice_home: advice_home.map(std::path::Path::to_path_buf),
-            adapt: adapt::Memory::default(),
+            adapt: adapt::Memory::with_advice(advice_home.map(std::path::Path::to_path_buf)),
             search,
         })
     }
@@ -963,18 +966,29 @@ impl App {
     /// process. The condition it explains is a configuration default, not a
     /// per-turn event, so repeating it in the log would only add noise.
     fn notice_once(&self, key: impl std::fmt::Display, message: impl std::fmt::Display) {
-        let mut notices = self
-            .notices
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if notices.insert(key.to_string()) {
+        if self.first_time(key) {
             eprintln!("{message}");
         }
     }
 
+    /// True the first time `key` is seen in this process.
+    fn first_time(&self, key: impl std::fmt::Display) -> bool {
+        self.notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.to_string())
+    }
+
     /// Records a fixable provider condition for `ox doctor` and OX Desktop.
+    ///
+    /// Recording takes the config file lock and reads the advice file, which
+    /// is blocking I/O on the request path. The condition is a configuration
+    /// default, so it is written once per process instead of on every turn
+    /// (and every parallel worker turn) that hits it.
     fn record_advice(&self, advice: crate::advice::Advice) {
-        if let Some(home) = &self.advice_home {
+        if let Some(home) = &self.advice_home
+            && self.first_time(format!("advice:{}", advice.id))
+        {
             crate::advice::record(home, advice);
         }
     }
