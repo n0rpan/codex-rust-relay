@@ -4844,6 +4844,8 @@ name = "ox-host-service"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rustix",
+ "sha2 0.10.9",
  "tempfile",
 ]
 

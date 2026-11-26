@@ -105,7 +105,7 @@ impl HostLink {
 }
 pub(crate) enum IdleReservation {
     Running(UnixStream),
-    Stopped(std::fs::File),
+    Stopped(ox_host_service::HostLock),
 }
 
 /// Probe the package lock first so normal agent requests continue throughout a

@@ -6,6 +6,6 @@ publish = false
 
 [dependencies]
 libc = "0.2"
-
-[dev-dependencies]
+sha2 = "0.10"
+rustix = { version = "1", features = ["fs"] }
 tempfile = "3"
