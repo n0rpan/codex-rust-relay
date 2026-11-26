@@ -1675,32 +1675,55 @@ impl ReasoningPolicy {
                 );
             }
         }
-        let replacement = object
+        let requested = object
             .get("output_config")
             .and_then(|config| config.get("effort"))
             .and_then(serde_json::Value::as_str)
-            .and_then(|effort| {
-                if self.supported.is_empty() {
-                    return None;
+            .map(str::to_owned);
+        if let Some(requested) = requested {
+            let wants_off = requested == "none";
+            let supports_none = self.supported.iter().any(|level| level == "none");
+            let unsupported = !self.supported.is_empty() && !supports_none;
+            if (wants_off && self.mandatory) || unsupported {
+                let replacement = self
+                    .default
+                    .clone()
+                    .filter(|default| self.supported.is_empty() || self.supported.contains(default))
+                    .or_else(|| {
+                        if self.supported.is_empty() {
+                            return None;
+                        }
+                        crate::catalog::clamp_reasoning_effort(&requested, &self.supported, None)
+                    });
+                if let Some(output) = object
+                    .get_mut("output_config")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    match replacement {
+                        Some(replacement) => {
+                            output.insert(
+                                "effort".to_owned(),
+                                serde_json::Value::String(replacement.clone()),
+                            );
+                            notice = Some(format!(
+                                "reasoning effort is not supported; using {replacement:?}"
+                            ));
+                        }
+                        None => {
+                            // No known level to use: drop only the disabling
+                            // effort and let the provider apply its default.
+                            output.remove("effort");
+                            if output.is_empty() {
+                                object.remove("output_config");
+                            }
+                            notice = Some(
+                                "reasoning cannot be disabled on this model; using its default"
+                                    .to_owned(),
+                            );
+                        }
+                    }
                 }
-                crate::catalog::clamp_reasoning_effort(
-                    effort,
-                    &self.supported,
-                    self.default.as_deref(),
-                )
-            });
-        if let Some(replacement) = replacement
-            && let Some(output) = object
-                .get_mut("output_config")
-                .and_then(serde_json::Value::as_object_mut)
-        {
-            output.insert(
-                "effort".to_owned(),
-                serde_json::Value::String(replacement.clone()),
-            );
-            notice = Some(format!(
-                "reasoning effort is not supported; using {replacement:?}"
-            ));
+            }
         }
         notice
     }
@@ -2354,6 +2377,17 @@ sort = "price"
         });
         assert!(route.reasoning.normalize_anthropic(&mut payload).is_some());
         assert_eq!(payload["output_config"]["effort"], "high");
+
+        // A mandatory policy with no list still corrects a disabling effort.
+        let route = reasoning_route(&[], Some("high"), true);
+        let mut payload = serde_json::json!({"output_config": {"effort": "none"}});
+        assert!(route.reasoning.normalize_anthropic(&mut payload).is_some());
+        assert_eq!(payload["output_config"]["effort"], "high");
+
+        let route = reasoning_route(&[], None, true);
+        let mut payload = serde_json::json!({"output_config": {"effort": "none"}});
+        assert!(route.reasoning.normalize_anthropic(&mut payload).is_some());
+        assert!(payload.get("output_config").is_none(), "no level to use");
 
         // An unknown list and no policy leaves the caller's choice alone.
         let route = reasoning_route(&[], None, false);
