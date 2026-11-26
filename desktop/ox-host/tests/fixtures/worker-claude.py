@@ -30,9 +30,25 @@ if "--session-id" in args:
                    "message": {"role": kind, "id": uuid, "content": content}}
             journal.write(json.dumps(row) + "\n")
 
+def finish(text):
+    answer = {"type": "assistant", "uuid": f"a-{session}", "session_id": session, "parent_tool_use_id": None,
+              "message": {"id": f"m-{session}", "role": "assistant", "model": "claude-opus-5-5",
+                          "content": [{"type": "text", "text": text}]}}
+    print(json.dumps(answer), flush=True)
+    result = {"type": "result", "subtype": "success", "is_error": False, "session_id": session,
+              "stop_reason": "end_turn", "result": text}
+    print(json.dumps(result), flush=True)
+
+
 for line in sys.stdin:
     frame = json.loads(line)
-    if frame["type"] == "control_request":
+    if frame["type"] == "control_response":
+        # Plan mode's exit request was answered: log the answer and report.
+        response = frame["response"]
+        with Path(f"plan-exit-{session}").open("w") as log:
+            log.write(json.dumps(response))
+        finish("Findings: the plan is the report.")
+    elif frame["type"] == "control_request":
         request = frame["request"]
         if request["subtype"] == "set_permission_mode":
             mode = request["mode"]
@@ -47,6 +63,14 @@ for line in sys.stdin:
         echo = {"type": "user", "message": frame["message"], "uuid": frame.get("uuid"),
                 "session_id": session, "isReplay": True}
         print(json.dumps(echo), flush=True)
+        text = json.dumps(frame["message"])
+        if mode == "plan" and "PLAN-EXIT" in text:
+            # Like stock Plan mode, finish the plan by asking to leave Plan mode.
+            ask = {"type": "control_request", "request_id": "plan-exit", "request": {
+                "subtype": "can_use_tool", "tool_name": "ExitPlanMode", "tool_use_id": "tool-plan",
+                "input": {"plan": "1. Review the diff."}}}
+            print(json.dumps(ask), flush=True)
+            continue
         if pinned:
             model = next((row["resolvedModel"] for row in picker if pinned in (row["value"], row["resolvedModel"])), pinned)
             answer = {"type": "assistant", "uuid": f"a-{session}", "session_id": session, "parent_tool_use_id": None,

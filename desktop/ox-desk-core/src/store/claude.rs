@@ -1288,6 +1288,30 @@ impl Store {
         self.claude_mut().asks.remove(id);
         Ok(())
     }
+    /// The session that owns an open Claude tool request and the tool it asks
+    /// for. `None` for another runtime or an unknown request.
+    pub fn claude_ask_tool(&self, id: &RequestId) -> Option<(&str, &str)> {
+        let links::Link::Claude(project) = &self.link else {
+            return None;
+        };
+        project
+            .asks
+            .get(id)
+            .map(|(owner, ask)| (owner.as_str(), ask.tool.as_str()))
+    }
+    /// Turn down an open Claude tool request. Claude Code receives `message` as
+    /// the tool's error result and the turn continues.
+    pub fn deny_claude_ask(&mut self, id: &RequestId, message: &str) -> io::Result<()> {
+        let answer = match &self.link {
+            links::Link::Claude(project) => project.asks.get(id).map(|(_, ask)| ask.deny(message)),
+            _ => None,
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Request already resolved"))?;
+        self.claude_response(id, answer)?;
+        self.asks.retain(|a| &a.id != id);
+        self.changed.mark(Changed::ASK);
+        Ok(())
+    }
     pub(super) fn claude_questions(&mut self, id: &RequestId, values: &[String]) -> io::Result<()> {
         let (_, ask) = self
             .claude()

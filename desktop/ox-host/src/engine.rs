@@ -1417,6 +1417,32 @@ impl Engine {
                     .retain(|id, _| live.store.asks().iter().any(|a| &a.id == id));
             }
         }
+        // A read worker asking to leave Plan mode has finished its plan, and no
+        // person could grant the exit within its ceiling. Answer it here so the
+        // worker reports instead of waiting for an operator.
+        let plan_exits: Vec<_> = live
+            .store
+            .asks()
+            .iter()
+            .filter(|ask| {
+                live.store
+                    .claude_ask_tool(&ask.id)
+                    .is_some_and(|(owner, tool)| {
+                        tool == "ExitPlanMode"
+                            && self
+                                .workers
+                                .get(scope, owner)
+                                .is_some_and(|e| crate::workers::declines_plan_exit(&e.origin))
+                    })
+            })
+            .map(|ask| ask.id.clone())
+            .collect();
+        for id in plan_exits {
+            live.tokens.remove(&id);
+            if let Err(e) = live.store.deny_claude_ask(&id, crate::workers::PLAN_REPORT) {
+                eprintln!("ox host: could not answer a read worker's plan exit: {e}");
+            }
+        }
         let reported = live.store.take_context_windows();
         if !reported.is_empty() {
             let route = scope.route.clone();
@@ -5598,12 +5624,23 @@ mod tests {
             rx: &std::sync::mpsc::Receiver<ox_desk_core::links::LinkEvent>,
             subscription_model: Option<&str>,
         ) -> Result<Value, String> {
+            launch_task_on_warm_claude(engine, scope, lead, rx, subscription_model, "check")
+        }
+        fn launch_task_on_warm_claude(
+            engine: &mut Engine,
+            scope: &Scope,
+            lead: &str,
+            rx: &std::sync::mpsc::Receiver<ox_desk_core::links::LinkEvent>,
+            subscription_model: Option<&str>,
+            task: &str,
+        ) -> Result<Value, String> {
             let caller = Caller::Operator {
                 scope: scope.clone(),
                 parent: lead.to_owned(),
                 device: "probe".into(),
             };
             let mut request = start(false);
+            request.task = task.into();
             request.runtime = Runtime::Claude;
             request.model = None;
             request.parent = lead.to_owned();
@@ -5942,6 +5979,46 @@ mod tests {
                     .unwrap()
                     .user_messages(&n.text, &[]),
                 1
+            );
+        }
+
+        #[test]
+        fn a_read_worker_finishing_its_plan_reports_without_an_operator() {
+            let root = tempfile::tempdir().unwrap();
+            let (scope, lead, mut engine, rx) = warm_claude(root.path());
+            let started = launch_task_on_warm_claude(
+                &mut engine,
+                &scope,
+                &lead,
+                &rx,
+                None,
+                "PLAN-EXIT review",
+            )
+            .expect("a read worker starts");
+            let session = started["session"].as_str().unwrap().to_owned();
+            let raw = session.rsplit(':').next().unwrap().to_owned();
+            let job = engine.workers.get(&scope, &session).unwrap().origin.job_id;
+            pump_engine(&mut engine, &scope, &rx, &|e| {
+                e.job_status(job).unwrap()["status"] == "completed"
+            });
+            // The host turned the exit down itself with the report instruction; no
+            // request ever waited for a person.
+            let answer: Value = serde_json::from_str(
+                &std::fs::read_to_string(root.path().join(format!("plan-exit-{raw}"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(answer["response"]["behavior"], "deny");
+            assert_eq!(answer["response"]["message"], crate::workers::PLAN_REPORT);
+            assert!(engine.running[&scope].store.asks().is_empty());
+            let status = engine.job_status(job).unwrap();
+            assert!(status["waiting_for_operator"].is_null());
+            assert_eq!(status["access_ceiling"], "read");
+            assert_eq!(status["started_mode"], "plan");
+            assert!(
+                status["result"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("the plan is the report")),
+                "{status}"
             );
         }
 

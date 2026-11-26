@@ -1,8 +1,10 @@
 //! Host-owned OX workers. A worker is an ordinary native session in its own
 //! project and billing route. This module keeps the immutable origin stamp of
 //! each worker and fork, decides access ceilings, and answers the parent agent's
-//! four MCP tools from host session state. It never resolves approvals: those
-//! go to the human clients through the normal ask path.
+//! four MCP tools from host session state. Approvals go to the human clients
+//! through the normal ask path. The one exception is a read worker's request to
+//! leave Plan mode: its ceiling could never grant it, so the host declines it
+//! and asks for the report instead ([`declines_plan_exit`]).
 use ox_desk_core::{
     host_protocol::{Scope, SessionView, Timeline},
     modes::{self, Level, ModeRequest},
@@ -298,6 +300,16 @@ pub(crate) fn operator_access(origin: &Origin, access: Access) -> Result<(), Str
             origin.ceiling.label(origin.runtime)
         ))
     }
+}
+
+/// The tool result a read worker receives when it asks to leave Plan mode.
+pub(crate) const PLAN_REPORT: &str = "OX: This worker has read access only and stays in Plan mode, so nothing will be implemented and no approval is coming. Do not call ExitPlanMode again. Reply now with your complete findings or plan as your final message: OX delivers that reply to the agent that started you.";
+
+/// Whether a request to leave Plan mode from this session is answered by the
+/// host instead of a person: the session is a worker whose ceiling is read, so
+/// leaving Plan mode could never be granted and its plan is its report.
+pub(crate) fn declines_plan_exit(origin: &Origin) -> bool {
+    origin.runtime == Runtime::Claude && origin.bounds_operator() && origin.ceiling == Level::Read
 }
 
 /// A parent-agent caller after identity resolution. Every parent operation,
