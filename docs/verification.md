@@ -125,7 +125,7 @@ ox launches the `codex` or `claude` executable on `PATH` with its launch-scoped
 provider settings and relay credential. Updating either client takes effect on
 the next launch.
 
-The [CI workflow](https://github.com/n0rpan/ox/actions/workflows/ci.yml)
+The [CI workflow](https://github.com/oxstack/ox/actions/workflows/ci.yml)
 runs the same coding, tool, search, resume and auth scenarios against two inputs:
 
 - **Baseline** uses checksum-pinned Codex 0.171.0 and Claude Code 2.1.330 on PRs and

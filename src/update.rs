@@ -16,7 +16,7 @@ use serde::Deserialize;
 
 use crate::provider::RelayError;
 
-const REPOSITORY: &str = "n0rpan/ox";
+const REPOSITORY: &str = "oxstack/ox";
 const CURRENT: &str = crate::VERSION;
 const DEV_TAG: &str = "dev";
 const MAX_RELEASE_BYTES: usize = 512 * 1024;
@@ -729,11 +729,11 @@ mod tests {
 
         assert_eq!(
             Channel::Stable.metadata_url(),
-            "https://api.github.com/repos/n0rpan/ox/releases/latest"
+            "https://api.github.com/repos/oxstack/ox/releases/latest"
         );
         assert_eq!(
             Channel::Dev.metadata_url(),
-            "https://api.github.com/repos/n0rpan/ox/releases/tags/dev"
+            "https://api.github.com/repos/oxstack/ox/releases/tags/dev"
         );
         let update = Update {
             version: "0.2.1-dev.7".to_owned(),
@@ -743,7 +743,7 @@ mod tests {
         };
         assert_eq!(
             Channel::Dev.download_url(&update),
-            format!("https://github.com/n0rpan/ox/releases/download/dev/ox-0.2.1-dev.7-{TARGET}")
+            format!("https://github.com/oxstack/ox/releases/download/dev/ox-0.2.1-dev.7-{TARGET}")
         );
         let update = Update {
             version: "0.2.0".to_owned(),
@@ -754,7 +754,7 @@ mod tests {
         let url = Channel::Stable.download_url(&update);
         assert_eq!(
             url,
-            format!("https://github.com/n0rpan/ox/releases/download/v0.2.0/ox-0.2.0-{TARGET}")
+            format!("https://github.com/oxstack/ox/releases/download/v0.2.0/ox-0.2.0-{TARGET}")
         );
         assert!(release_host(&Url::parse(&url).unwrap()));
         assert!(release_host(

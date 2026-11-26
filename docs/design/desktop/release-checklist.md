@@ -29,7 +29,7 @@ Write the result of each line as pass, fail (with what happened) or skipped (wit
 
 ### Fresh install (macOS and Linux)
 
-- [ ] On an account that has never run OX: `curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh -s -- --desktop`, then `ox desktop .`. The app opens and the host starts.
+- [ ] On an account that has never run OX: `curl -fsSL https://raw.githubusercontent.com/oxstack/ox/main/install.sh | sh -s -- --desktop`, then `ox desktop .`. The app opens and the host starts.
 - [ ] `ox host install`. Log out and in: `ox host status` says running and installed.
 - [ ] Pair the phone (README, "Pair a phone"). Run one Claude and one Codex session from the phone and from the desktop.
 

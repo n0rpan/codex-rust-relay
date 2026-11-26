@@ -2,10 +2,10 @@
 
 ## Install or update the dev release
 
-The rolling dev release is published after a successful build of `main`. Once its assets include `ox-desktop-linux-*` and `ox-desktop-macos-*`, the installer can choose the right package for Linux x86-64 or ARM64, Intel macOS or Apple Silicon. [Dev release and assets](https://github.com/n0rpan/ox/releases/tag/dev)
+The rolling dev release is published after a successful build of `main`. Once its assets include `ox-desktop-linux-*` and `ox-desktop-macos-*`, the installer can choose the right package for Linux x86-64 or ARM64, Intel macOS or Apple Silicon. [Dev release and assets](https://github.com/oxstack/ox/releases/tag/dev)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh -s -- --dev --desktop
+curl -fsSL https://raw.githubusercontent.com/oxstack/ox/main/install.sh | sh -s -- --dev --desktop
 ox desktop .
 ```
 
@@ -94,7 +94,7 @@ OX stores its desktop state under `$XDG_STATE_HOME/ox/desktop` when that variabl
 
 ## Run a packaged build
 
-Download the artifact for your OS and architecture from the [OX Desktop workflow](https://github.com/n0rpan/ox/actions/workflows/desktop.yml). Each archive includes the matching desktop app, session host and CLI. Use the artifact from the branch and commit you intend to test.
+Download the artifact for your OS and architecture from the [OX Desktop workflow](https://github.com/oxstack/ox/actions/workflows/desktop.yml). Each archive includes the matching desktop app, session host and CLI. Use the artifact from the branch and commit you intend to test.
 
 - On macOS, extract the ZIP and open **OX Desktop.app**. These builds are ad-hoc signed. If Gatekeeper requests confirmation, use System Settings → Privacy & Security → Open Anyway for the downloaded app. Terminal may request Automation permission for native sign-in or a terminal handoff.
 - On Linux, extract the tarball and run `./ox-desktop/ox-desktop`. Keep all three executables in the extracted directory. Linux builds target glibc 2.39 or later and use Wayland or X11 with a Vulkan-capable driver. The tarball contains its shared library requirements in `shared-libraries.txt`.

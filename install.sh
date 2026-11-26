@@ -1,8 +1,8 @@
 #!/bin/sh
 # Install ox, the local model gateway for stock Codex and Claude Code.
 #
-#   curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh
-#   curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh -s -- --dev
+#   curl -fsSL https://raw.githubusercontent.com/oxstack/ox/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/oxstack/ox/main/install.sh | sh -s -- --dev
 #
 # Options (flags win over environment variables):
 #   --stable                 Install the latest stable release (default)
@@ -18,7 +18,7 @@
 
 set -eu
 
-REPOSITORY="n0rpan/ox"
+REPOSITORY="oxstack/ox"
 MIN_GLIBC_MINOR=39
 
 bold=""

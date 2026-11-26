@@ -198,5 +198,5 @@
   "probe_sha256": "3bb6dc21b33362cbe72629cbec933ca2856992a91aa9672cb342078a049b5f90",
   "companion_sha256": "bb3fe1326d33973b43e1adc0fcb9e83baa17d205fd119e7d5cd29f2578dec8a0",
   "commit": "50d60e64d14ef15ed4c4dee39e34cd5a77e6e4ba",
-  "workflow": "https://github.com/n0rpan/ox/actions/runs/45430986035"
+  "workflow": "https://github.com/oxstack/ox/actions/runs/45430986035"
 }

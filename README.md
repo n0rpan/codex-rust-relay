@@ -9,7 +9,7 @@ OX does not replace either client. It starts the official `codex` and `claude` C
 You need macOS 11 or later, or Linux with glibc 2.39 or later (x86-64 or ARM64). One command on both:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh -s -- --desktop
+curl -fsSL https://raw.githubusercontent.com/oxstack/ox/main/install.sh | sh -s -- --desktop
 cd ~/Work/my-project && ox desktop .
 ```
 
@@ -62,7 +62,7 @@ The same installer adds **OX Desktop** to your application launcher. It runs on 
 If you only want the relay in your terminal, leave out `--desktop`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/oxstack/ox/main/install.sh | sh
 ox setup
 ox codex      # or: ox claude
 ```

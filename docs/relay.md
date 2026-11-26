@@ -134,7 +134,7 @@ The table covers the standalone CLI. For desktop updates, rerun the installer wi
   switch channels.
 - **Manual download.** Every release has `ox-<target>.tar.gz` and a matching
   `.sha256` for four platforms on the
-  [Releases page](https://github.com/n0rpan/ox/releases).
+  [Releases page](https://github.com/oxstack/ox/releases).
   [Manual steps, platform names and source builds](configuration.md#install-options)
 ## Common tasks
 

@@ -5,7 +5,7 @@
 ## Install options
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/oxstack/ox/main/install.sh | sh
 ```
 
 The installer works on macOS and Linux. It picks the build for your machine,
@@ -40,8 +40,8 @@ and prints the [source build](#build-from-source) command.
 
 | Channel | Source | Version | Fixed download URL |
 | --- | --- | --- | --- |
-| stable | A pushed tag `vX.Y.Z` | `X.Y.Z` | `https://github.com/n0rpan/ox/releases/latest/download/ox-<target>.tar.gz` |
-| dev | Every commit on `main` | `X.Y.(Z+1)-dev.N` | `https://github.com/n0rpan/ox/releases/download/dev/ox-<target>.tar.gz` |
+| stable | A pushed tag `vX.Y.Z` | `X.Y.Z` | `https://github.com/oxstack/ox/releases/latest/download/ox-<target>.tar.gz` |
+| dev | Every commit on `main` | `X.Y.(Z+1)-dev.N` | `https://github.com/oxstack/ox/releases/download/dev/ox-<target>.tar.gz` |
 
 **No stable release has been tagged yet.** Until one is, the dev pre-release is
 the only download. Run without a channel, the installer says
@@ -92,7 +92,7 @@ Running the installer again has the same effect as `ox update`.
 
 ### Manual download
 
-Every release on the [Releases page](https://github.com/n0rpan/ox/releases)
+Every release on the [Releases page](https://github.com/oxstack/ox/releases)
 carries these files for each platform, each with a matching `.sha256` file:
 
 | File | Contents |
@@ -106,8 +106,8 @@ to the channel you want:
 
 ```sh
 target='x86_64-unknown-linux-gnu'
-base='https://github.com/n0rpan/ox/releases/download/dev'
-# For stable: base='https://github.com/n0rpan/ox/releases/latest/download'
+base='https://github.com/oxstack/ox/releases/download/dev'
+# For stable: base='https://github.com/oxstack/ox/releases/latest/download'
 curl -fsSLO "$base/ox-$target.tar.gz"
 curl -fsSLO "$base/ox-$target.tar.gz.sha256"
 sha256sum -c "ox-$target.tar.gz.sha256" &&
@@ -123,7 +123,7 @@ add the same line to `~/.bashrc` or `~/.zshrc` for future terminals. Run
 
 Each CI run on a pull request also keeps its four `ox-<target>` builds as
 workflow artifacts. Sign in to GitHub to download one from the run page.
-[GitHub Actions builds](https://github.com/n0rpan/ox/actions/workflows/ci.yml)
+[GitHub Actions builds](https://github.com/oxstack/ox/actions/workflows/ci.yml)
 
 ### Build from source
 
@@ -132,7 +132,7 @@ Gatekeeper blocks a downloaded binary. CI uses Rust 1.100.0.
 [Apple’s Gatekeeper guidance](https://support.apple.com/en-us/102445)
 
 ```sh
-cargo install --locked --git https://github.com/n0rpan/ox
+cargo install --locked --git https://github.com/oxstack/ox
 ox --version
 ```
 

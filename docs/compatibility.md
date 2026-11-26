@@ -19,7 +19,7 @@ Stock Codex and Claude Code fixtures compare the native profile trees before
 and after API-backed launches. They verify that relay sessions use separate
 settings and history. The clients execute tools locally. [Client profiles](configuration.md#sessions-and-sign-in)
 ox launches the client found on `PATH`. For the current verified versions, see the
-`Stock clients (latest)` job in the [latest CI run](https://github.com/n0rpan/ox/actions/workflows/ci.yml).
+`Stock clients (latest)` job in the [latest CI run](https://github.com/oxstack/ox/actions/workflows/ci.yml).
 
 Subscription sessions started through ox can delegate to API workers through
 MCP. The local fixtures cover a stock Codex goal, a stock Claude Code workflow,
