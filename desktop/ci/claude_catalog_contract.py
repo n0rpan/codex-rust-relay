@@ -6,13 +6,13 @@ from pathlib import Path
 
 def check(desktop: Path):
     allowed = tomllib.loads((desktop / "ci/migration.toml").read_text())["stock_read_only"]
-    reader = "claude/catalog.rs"
-    if set(allowed) != {reader}:
+    readers = {"claude/catalog.rs", "claude/catalog/history.rs", "claude/catalog/sidecars.rs"}
+    if set(allowed) != readers:
         raise SystemExit("The Claude catalog is the sole stock history filesystem exception")
     for source in (desktop / "ox-desk-core/src").rglob("*.rs"):
         relative = source.relative_to(desktop / "ox-desk-core/src").as_posix()
         code = source.read_text().split("#[cfg(test)]", 1)[0]
-        if relative == reader:
+        if relative in readers:
             writes = r"(?:\.(?:write|append|create|truncate)\(true\)|(?:fs|File)::(?:write|create\w*|remove\w*|rename|copy)|write_all\()"
             if re.search(writes, code):
                 raise SystemExit("Stock Claude catalog must stay read-only")

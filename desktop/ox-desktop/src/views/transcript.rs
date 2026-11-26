@@ -59,6 +59,9 @@ pub(super) struct TranscriptView {
 }
 
 impl TranscriptView {
+    pub(super) fn invalidate_messages(&mut self) {
+        self.markdown.clear();
+    }
     fn message(
         &mut self,
         key: &ItemKey,
@@ -252,6 +255,8 @@ impl Workbench {
         let previous = view.list.item_count();
         if count > previous {
             view.list.splice(previous..previous, count - previous);
+        } else if count < previous {
+            view.list.splice(count..previous, 0);
         }
         for row in changed_rows {
             view.list.remeasure_items(row..row + 1);

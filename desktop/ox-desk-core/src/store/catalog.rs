@@ -110,6 +110,10 @@ impl Catalog {
         true
     }
 
+    pub(super) fn forget_child(&mut self, id: &str) {
+        self.children.remove(id);
+        self.remove(id);
+    }
     pub(super) fn remove(&mut self, id: &str) {
         self.inferred_previews.remove(id);
         if let Some(pos) = self.positions.remove(id) {

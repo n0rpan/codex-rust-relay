@@ -568,6 +568,9 @@ impl Store {
     }
     fn apply_scope(&mut self, s: ScopeState) -> io::Result<()> {
         let before = self.threads().len();
+        for id in self.transcripts.keys() {
+            self.changed.replace_transcript(id);
+        }
         self.transcripts.clear();
         self.apply_change(Change::State {
             connection: s.connection,
@@ -695,7 +698,11 @@ impl Store {
                 }
                 t.host_history_replaced(old_len);
                 apply_meta(t, timeline.detail);
-                self.changed.transcript(&thread);
+                if old_len > 0 {
+                    self.changed.replace_transcript(&thread);
+                } else {
+                    self.changed.transcript(&thread);
+                }
             }
             Change::TimelineState { thread, detail } => {
                 apply_meta(self.transcripts.entry(thread.clone()).or_default(), detail);
@@ -726,7 +733,7 @@ impl Store {
             }
             Change::Retired { thread } => {
                 self.transcripts.remove(&thread);
-                self.changed.transcript(&thread);
+                self.changed.replace_transcript(&thread);
             }
             Change::Notification { .. } => (),
         }

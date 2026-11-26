@@ -162,6 +162,7 @@ impl Projection {
 type Retired = (Transcript, Option<HashMap<String, String>>);
 pub(super) struct Batch {
     snapshots: Arc<Mutex<Vec<Snapshot>>>,
+    removed: Vec<String>,
     applied: mpsc::Sender<Vec<Retired>>,
 }
 impl Batch {
@@ -194,13 +195,40 @@ impl Batch {
                 .events
                 .pending
                 .insert(id.clone(), pending);
-            store.changed.transcript(&id);
+            if viewing && store.transcripts.get(&id).is_some_and(|t| !t.is_empty()) {
+                store.changed.replace_transcript(&id);
+            } else {
+                store.changed.transcript(&id);
+            }
             match store.transcripts.entry(id) {
                 Entry::Occupied(mut e) => retired.push((e.insert(transcript), old_pending)),
                 Entry::Vacant(e) => {
                     e.insert(transcript);
                 }
             }
+        }
+        for id in self.removed {
+            let p = store.claude_mut();
+            p.catalog.remove(&id);
+            let pending = p
+                .sessions
+                .get_mut(owner)
+                .unwrap()
+                .events
+                .pending
+                .remove(&id);
+            store.catalog.forget_child(&id);
+            store.child_threads.remove(&id);
+            store.authorized_models.remove(&id);
+            if let Some(transcript) = store.transcripts.remove(&id) {
+                retired.push((transcript, pending));
+            }
+            if store.selected() == Some(&id) {
+                let _ = store.open_catalog_id(owner);
+            }
+            store.catalog_revision += 1;
+            store.changed.transcript(&id);
+            store.changed.mark(Changed::THREADS);
         }
         let _ = self.applied.send(retired);
     }
@@ -224,7 +252,12 @@ pub(super) fn load(
         }
         Ok(())
     })?;
-    publish(projection.threads.into_values(), alive, emit)
+    publish(
+        projection.threads.into_values(),
+        std::iter::empty(),
+        alive,
+        emit,
+    )
 }
 
 /// What a read-only viewer keeps between ticks so only appended journal bytes are parsed:
@@ -233,9 +266,7 @@ pub(super) struct Follower {
     saved: wire::catalog::Session,
     decoder: wire::Decoder,
     projection: Projection,
-    visited: std::collections::HashSet<String>,
-    offset: u64,
-    identity: Option<u64>,
+    cursor: wire::catalog::HistoryCursor,
 }
 /// The items one tick appended, for the UI thread to apply in place.
 pub(super) struct Tail {
@@ -262,35 +293,54 @@ impl Tail {
     }
 }
 impl Follower {
+    pub(super) fn last_child_write(&self) -> Option<std::time::SystemTime> {
+        self.cursor.last_child_write()
+    }
+    pub(super) fn watches_children(&self) -> bool {
+        self.cursor.watches_children()
+    }
+
     /// Read the whole journal, publish it, and keep what following needs.
     pub(super) fn load(
         profile: &Profile,
         owner: &str,
         saved: wire::catalog::Session,
+        previous: Option<&Follower>,
         alive: &Weak<()>,
         emit: impl FnMut(Batch),
     ) -> io::Result<Self> {
         let mut projection = Projection::new(owner, profile, saved.updated_at);
         let mut decoder = wire::Decoder::default();
-        let mut visited = std::collections::HashSet::new();
-        let (offset, identity) = saved
-            .history_from(0, None, &mut visited, |record| {
-                if alive.strong_count() == 0 {
-                    return Err(io::Error::other("Claude history was closed"));
-                }
-                for e in decoder.decode_value(record)? {
-                    projection.observe(e);
-                }
-                Ok(())
-            })?
-            .expect("a read from the start never goes stale");
+        let mut cursor = wire::catalog::HistoryCursor::default();
+        saved.history_from(&mut cursor, |record| {
+            if alive.strong_count() == 0 {
+                return Err(io::Error::other("Claude history was closed"));
+            }
+            for e in decoder.decode_value(record)? {
+                projection.observe(e);
+            }
+            Ok(())
+        })?;
         // The snapshots are consumed by the UI; a follower keeps copies of their state.
         let kept: Vec<(String, String, HashMap<String, String>)> = projection
             .threads
             .values()
             .map(|s| (s.id.clone(), s.turn.clone(), s.pending.clone()))
             .collect();
-        publish(projection.threads.into_values(), alive, emit)?;
+        // A replacement can drop an entire nested tool call. Retire just the child
+        // threads that vanished from this viewer, including their remote projections.
+        let removed: Vec<_> = previous
+            .into_iter()
+            .flat_map(|f| f.projection.threads.keys())
+            .filter(|id| !projection.threads.contains_key(*id))
+            .cloned()
+            .collect();
+        publish(
+            projection.threads.into_values(),
+            removed.into_iter(),
+            alive,
+            emit,
+        )?;
         let mut follow = Projection::new(owner, profile, saved.updated_at);
         follow.threads = kept
             .into_iter()
@@ -305,9 +355,7 @@ impl Follower {
             saved,
             decoder,
             projection: follow.follow(),
-            visited,
-            offset,
-            identity: Some(identity),
+            cursor,
         })
     }
 
@@ -322,11 +370,9 @@ impl Follower {
             saved,
             decoder,
             projection,
-            visited,
-            offset,
-            identity,
+            cursor,
         } = self;
-        let Some((next, ino)) = saved.history_from(*offset, *identity, visited, |record| {
+        let current = saved.history_from(cursor, |record| {
             if alive.strong_count() == 0 {
                 return Err(io::Error::other("Claude history was closed"));
             }
@@ -334,12 +380,10 @@ impl Follower {
                 projection.observe(e);
             }
             Ok(())
-        })?
-        else {
+        })?;
+        if !current {
             return Ok(false);
-        };
-        *offset = next;
-        *identity = Some(ino);
+        }
         let ops: Vec<_> = projection
             .threads
             .values_mut()
@@ -357,18 +401,24 @@ impl Follower {
 }
 fn publish(
     mut snapshots: impl Iterator<Item = Snapshot>,
+    mut removed: impl Iterator<Item = String>,
     alive: &Weak<()>,
     mut emit: impl FnMut(Batch),
 ) -> io::Result<()> {
     loop {
         let contents: Vec<_> = snapshots.by_ref().take(THREADS_PER_BATCH).collect();
-        if contents.is_empty() {
+        let removed: Vec<_> = removed
+            .by_ref()
+            .take(THREADS_PER_BATCH - contents.len())
+            .collect();
+        if contents.is_empty() && removed.is_empty() {
             return Ok(());
         }
         let contents = Arc::new(Mutex::new(contents));
         let (tx, rx) = mpsc::channel();
         emit(Batch {
             snapshots: contents.clone(),
+            removed,
             applied: tx,
         });
         loop {
@@ -395,6 +445,7 @@ pub(super) fn fixture(profile: &Profile, owner: &str, events: Vec<wire::Event>) 
     Batch {
         snapshots: Arc::new(Mutex::new(projection.threads.into_values().collect())),
         applied,
+        removed: Vec::new(),
     }
 }
 
@@ -408,7 +459,9 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let reader = std::thread::spawn(move || {
             let snapshots = (0..(THREADS_PER_BATCH * 3)).map(|i| Snapshot::new(&i.to_string()));
-            publish(snapshots, &alive, |batch| tx.send(batch).unwrap())
+            publish(snapshots, std::iter::empty(), &alive, |batch| {
+                tx.send(batch).unwrap()
+            })
         });
         let first = rx.recv().unwrap();
         assert_eq!(first.snapshots.lock().unwrap().len(), THREADS_PER_BATCH);

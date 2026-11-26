@@ -6,3 +6,5 @@
 # only to list or replay conversations; resume and fork must use stock Claude.
 [stock_read_only]
 "claude/catalog.rs" = "selected Claude profiles: projects/<project>/<session UUID>.jsonl"
+"claude/catalog/history.rs" = "selected session and its linked subagent journals"
+"claude/catalog/sidecars.rs" = "subagent metadata linking journal files to agent tool calls"

@@ -353,6 +353,18 @@ impl Store {
                 });
                 continue;
             };
+            if changed.replaced_threads().contains(id) {
+                // A reread can correct text with the same message ID and revision.
+                let current = timeline(t);
+                if *previous != current {
+                    *previous = current.clone();
+                    out.push(Change::Transcript {
+                        thread: id.clone(),
+                        timeline: current,
+                    });
+                }
+                continue;
+            }
             let detail = timeline_detail(t);
             if previous.detail["last_finished"] != detail["last_finished"]
                 && !detail["last_finished"].is_null()

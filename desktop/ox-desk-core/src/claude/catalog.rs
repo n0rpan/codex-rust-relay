@@ -212,12 +212,12 @@ fn records(mut reader: impl BufRead, mut f: impl FnMut(Value) -> io::Result<()>)
     }
 }
 
-/// Like `records`, but only complete lines count (a writer may be mid-line), and the
-/// offset just past the last one is returned (`whole`: a finished file whose last line has no newline counts too) so a later read can resume there.
+/// Return the offset after the last complete record. Stock child files may end with a
+/// complete JSON object and no newline; keep a partial object for the next read.
 fn records_at(
     mut reader: impl BufRead,
     start: u64,
-    whole: bool,
+    child: bool,
     mut f: impl FnMut(Value) -> io::Result<()>,
 ) -> io::Result<u64> {
     let mut line = Vec::new();
@@ -238,13 +238,16 @@ fn records_at(
                 "Claude transcript record exceeds 64 MiB",
             ));
         }
-        if line.last() != Some(&b'\n') && !whole {
+        let terminated = line.last() == Some(&b'\n');
+        if !terminated && !child {
             return Ok(at);
         }
-        at += line.len() as u64;
-        if let Ok(value) = serde_json::from_slice(&line) {
-            f(value)?;
+        match serde_json::from_slice(&line) {
+            Ok(value) => f(value)?,
+            Err(_) if !terminated => return Ok(at),
+            Err(_) => (),
         }
+        at += line.len() as u64;
     }
 }
 
@@ -530,133 +533,9 @@ impl Profiles {
     }
 }
 
-impl Session {
-    /// Replay only user/assistant records; attachments and CLI metadata are private
-    /// implementation details. Normalize the session key used in stream-json.
-    pub fn history(&self, mut consume: impl FnMut(Value) -> io::Result<()>) -> io::Result<()> {
-        if self.origin == Origin::Ambiguous {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Choose the original Claude profile before opening history",
-            ));
-        }
-        let children = self.path.with_extension("").join("subagents");
-        let mut visited = std::collections::HashSet::new();
-        self.replay(&self.path, None, &children, &mut visited, 0, &mut consume)
-            .map(drop)
-    }
-
-    /// Replay the main journal from `start` (a line boundary this method returned before),
-    /// consuming only complete lines. `None` when the file shrank or was replaced since
-    /// (the caller starts over); otherwise the next offset and the file's identity.
-    pub fn history_from(
-        &self,
-        start: u64,
-        identity: Option<u64>,
-        visited: &mut std::collections::HashSet<String>,
-        mut consume: impl FnMut(Value) -> io::Result<()>,
-    ) -> io::Result<Option<(u64, u64)>> {
-        use std::os::unix::fs::MetadataExt;
-        let meta = open_transcript(&self.path)?.metadata()?;
-        if meta.len() < start || identity.is_some_and(|i| i != meta.ino()) {
-            return Ok(None);
-        }
-        let children = self.path.with_extension("").join("subagents");
-        let end = self.replay(&self.path, None, &children, visited, start, &mut consume)?;
-        Ok(Some((end, meta.ino())))
-    }
-
-    fn replay(
-        &self,
-        path: &Path,
-        child: Option<(&str, &str)>,
-        children: &Path,
-        visited: &mut std::collections::HashSet<String>,
-        start: u64,
-        consume: &mut dyn FnMut(Value) -> io::Result<()>,
-    ) -> io::Result<u64> {
-        // A resumed read has seen the first row already.
-        let mut confirmed = start > 0;
-        let mut file = open_transcript(path)?;
-        if start > 0 {
-            file.seek(SeekFrom::Start(start))?;
-        }
-        records_at(BufReader::new(file), start, child.is_some(), |mut row| {
-            if !matches!(row["type"].as_str(), Some("user" | "assistant"))
-                || row["sessionId"] != self.id
-            {
-                return Ok(());
-            }
-            let sidechain = row["isSidechain"] == true;
-            if sidechain != child.is_some() {
-                return Ok(());
-            }
-            if let Some((agent, parent_tool)) = child {
-                if row["agentId"] != agent {
-                    return Ok(());
-                }
-                row["parent_tool_use_id"] = Value::String(parent_tool.to_owned());
-                row["agent_id"] = Value::String(agent.to_owned());
-            }
-            // The project is the cwd of the first conversation row of the main
-            // journal (where Claude Code started), the same rule `Header` uses.
-            // Later rows follow `cd`, and subagents run in their own directories.
-            if !confirmed
-                && child.is_none()
-                && let Some(cwd) = row["cwd"].as_str()
-            {
-                if Path::new(cwd) != self.project {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Claude session project changed",
-                    ));
-                }
-                confirmed = true;
-            }
-            row["session_id"] = Value::String(self.id.clone());
-            if let Some(result) = row.as_object_mut().and_then(|r| r.remove("toolUseResult")) {
-                row["tool_use_result"] = result;
-            }
-            // Follow only the named child of this tool result. The outputFile
-            // field may point outside the profile and must never be opened.
-            let spawned = row["tool_use_result"]["agentId"]
-                .as_str()
-                .filter(|id| {
-                    !id.is_empty()
-                        && id.len() <= 96
-                        && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
-                })
-                .zip(
-                    row["message"]["content"]
-                        .as_array()
-                        .and_then(|blocks| blocks.iter().find_map(|b| b["tool_use_id"].as_str())),
-                )
-                .map(|(agent, tool)| {
-                    (
-                        agent.to_owned(),
-                        tool.to_owned(),
-                        row["tool_use_result"]["description"].clone(),
-                    )
-                });
-            consume(row)?;
-            if let Some((agent, tool, description)) = spawned
-                && visited.insert(agent.clone())
-                && directory_is_plain(children.parent().unwrap())?
-                && directory_is_plain(children)?
-            {
-                let path = children.join(format!("agent-{agent}.jsonl"));
-                if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
-                    consume(
-                        serde_json::json!({"type":"system","subtype":"task_started","task_type":"local_agent","task_id":agent,
-                        "session_id":self.id,"tool_use_id":tool,"description":description,"parent_tool_use_id":child.map(|(_,tool)|tool)}),
-                    )?;
-                    self.replay(&path, Some((&agent, &tool)), children, visited, 0, consume)?;
-                }
-            }
-            Ok(())
-        })
-    }
-}
+mod history;
+pub(crate) use history::HistoryCursor;
+mod sidecars;
 
 mod bindings;
 pub use bindings::Bindings;

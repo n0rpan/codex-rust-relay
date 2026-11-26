@@ -23,6 +23,9 @@ pub(super) struct Native {
 #[derive(Default)]
 pub(super) struct Viewer {
     loaded: Option<SystemTime>,
+    /// Drain child-only appends once after the native owner disappears.
+    checked_after_exit: bool,
+    last_child_write: Option<SystemTime>,
     pub(super) loading: bool,
     /// Where the last read stopped; `None` until the first full read finishes (or after
     /// a failure), so the next tick reads from the start.
@@ -121,9 +124,17 @@ impl Store {
                 Some(Some(baseline)) => modified.is_some_and(|m| m > *baseline),
                 Some(None) | None => true,
             };
+            // Older clients have no process registry. While viewing their journal, use
+            // the same freshness window for independent child writes as for the parent.
+            let child_write = p
+                .sessions
+                .get(key)
+                .and_then(|s| s.viewer.as_ref())
+                .and_then(|v| v.last_child_write);
             let fresh = !registry
                 && moved_since_ox
-                && modified.is_some_and(|m| live::is_fresh(m, now))
+                && (modified.is_some_and(|m| live::is_fresh(m, now))
+                    || child_write.is_some_and(|m| live::is_fresh(m, now)))
                 && profiles
                     .last_entrypoint(&self.profile.project, raw, origin)
                     .as_deref()
@@ -201,6 +212,11 @@ impl Store {
         }
         let moved = modified != viewer.loaded;
         let live = self.claude().native.live.contains(id);
+        let check_children = viewer
+            .follower
+            .as_ref()
+            .is_some_and(|f| f.watches_children())
+            && (live || !viewer.checked_after_exit);
         if moved {
             // The row's age follows the journal.
             if let Some(secs) = modified
@@ -216,6 +232,8 @@ impl Store {
                 self.catalog_revision += 1;
                 self.changed.mark(Changed::THREADS);
             }
+        }
+        if moved || check_children {
             self.start_view_load(id);
         } else if !live {
             self.leave_native(id);
@@ -267,6 +285,7 @@ impl Store {
         let Some(viewer) = process.viewer.as_mut() else {
             return;
         };
+        viewer.checked_after_exit = !p.native.live.contains(id);
         let mut follower = viewer.follower.take();
         viewer.loading = true;
         viewer.loaded = launcher
@@ -293,9 +312,14 @@ impl Store {
                     .profiles
                     .session(&profile.project, &raw, origin)
                     .and_then(|saved| {
-                        history::Follower::load(&profile, &key, saved, &alive, |batch| {
-                            emit(Data::History(batch))
-                        })
+                        history::Follower::load(
+                            &profile,
+                            &key,
+                            saved,
+                            follower.as_deref(),
+                            &alive,
+                            |batch| emit(Data::History(batch)),
+                        )
                     })
                     .map(|f| Some(Box::new(f))),
                 Err(e) => Err(e),
@@ -328,6 +352,7 @@ impl Store {
             .and_then(|s| s.viewer.as_mut())
         {
             v.loading = false;
+            v.last_child_write = follower.as_ref().and_then(|f| f.last_child_write());
             v.follower = follower;
         }
     }
@@ -475,7 +500,6 @@ mod tests {
         store.refresh_native(Instant::now(), true);
         assert!(!store.is_native_live(&key));
         pump(&mut store, &rx);
-        let mut row = row;
         row["entrypoint"] = "cli".into();
         row["uuid"] = "00000000-0000-4000-8000-000000000999".into();
         std::io::Write::write_all(&mut f, format!("{row}\n").as_bytes()).unwrap();
@@ -641,6 +665,270 @@ mod tests {
         assert_eq!(r.store.transcript(&r.key).unwrap().len(), 1);
     }
 
+    fn append_parent_row(r: &Rig, value: Value) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&r.journal)
+            .unwrap();
+        writeln!(f, "{value}").unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(1))
+            .unwrap();
+    }
+
+    fn append_agent_call(r: &Rig, background: bool) {
+        let mut call: Value =
+            serde_json::from_str(&row_json("assistant", &r.project, "launch")).unwrap();
+        call["message"]["content"] = json!([{"type":"tool_use","name":"Agent","id":"call-child",
+            "input":{"description":"Review","run_in_background":background}}]);
+        append_parent_row(r, call);
+    }
+
+    fn append_agent_result(r: &Rig, status: &str) {
+        let mut result: Value =
+            serde_json::from_str(&row_json("user", &r.project, "result")).unwrap();
+        result["message"]["content"] =
+            json!([{"type":"tool_result","tool_use_id":"call-child","content":"Agent result."}]);
+        result["toolUseResult"] = json!({"agentId":"a0","description":"Review","status":status});
+        append_parent_row(r, result);
+    }
+
+    fn append_child_link(r: &Rig) {
+        append_agent_call(r, true);
+        append_agent_result(r, "async_launched");
+    }
+
+    fn child_row(r: &Rig, text: &str) -> String {
+        let mut row: Value =
+            serde_json::from_str(&row_json("assistant", &r.project, text)).unwrap();
+        row["agentId"] = "a0".into();
+        row["isSidechain"] = true.into();
+        format!("{row}\n")
+    }
+
+    fn poll_view(r: &mut Rig) -> (bool, bool) {
+        r.store.refresh_native(Instant::now(), true);
+        if r.store.claude().sessions[&r.key]
+            .viewer
+            .as_ref()
+            .unwrap()
+            .loading
+        {
+            pump_kinds(&mut r.store, &r.rx)
+        } else {
+            (false, false)
+        }
+    }
+
+    fn child_messages(r: &Rig) -> Vec<&str> {
+        let child = child_key(&r.key, "call-child");
+        let t = r.store.transcript(&child).unwrap();
+        (0..t.len())
+            .map(|i| {
+                let Some(crate::transcript::Row::Message(key)) = t.row(i) else {
+                    panic!("expected a child message")
+                };
+                let item = t.entry(key).unwrap();
+                assert_eq!(item.revision, 0, "replayed child message");
+                let Item::AgentMessage { text, .. } = &item.item else {
+                    panic!("expected assistant output")
+                };
+                text.as_str()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn quiet_parent_follows_child_appends_once_across_partial_writes() {
+        use std::io::Write;
+        let mut r = rig(2);
+        pump(&mut r.store, &r.rx);
+        let dir = r.journal.with_extension("").join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut file = std::fs::File::create(dir.join("agent-a0.jsonl")).unwrap();
+        file.write_all(child_row(&r, "started").as_bytes()).unwrap();
+        append_child_link(&r);
+        assert_eq!(poll_view(&mut r), (false, true));
+        assert_eq!(child_messages(&r), ["started"]);
+        let parent_rows = r.store.transcript(&r.key).unwrap().len();
+
+        let pending = child_row(&r, "still working");
+        let (a, b) = pending.split_at(pending.len() / 2);
+        file.write_all(a.as_bytes()).unwrap();
+        assert_eq!(poll_view(&mut r), (false, false));
+        file.write_all(b.as_bytes()).unwrap();
+        assert_eq!(poll_view(&mut r), (false, true));
+        assert_eq!(poll_view(&mut r), (false, false));
+        assert_eq!(child_messages(&r), ["started", "still working"]);
+        assert_eq!(r.store.transcript(&r.key).unwrap().len(), parent_rows);
+
+        append(&r, "assistant", "parent resumed", 0);
+        assert_eq!(poll_view(&mut r), (false, true));
+        assert_eq!(child_messages(&r), ["started", "still working"]);
+        assert_eq!(r.store.transcript(&r.key).unwrap().len(), parent_rows + 1);
+    }
+
+    #[test]
+    fn linked_child_journal_can_appear_after_its_parent_goes_quiet() {
+        let mut r = rig(2);
+        pump(&mut r.store, &r.rx);
+        append_child_link(&r);
+        assert_eq!(poll_view(&mut r), (false, true));
+
+        let dir = r.journal.with_extension("").join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent-a0.jsonl"), child_row(&r, "created later")).unwrap();
+        assert_eq!(poll_view(&mut r), (false, true));
+        assert_eq!(child_messages(&r), ["created later"]);
+    }
+
+    #[test]
+    fn replacing_a_live_child_journal_resets_only_what_is_shown_from_that_file() {
+        let mut r = rig(2);
+        pump(&mut r.store, &r.rx);
+        let dir = r.journal.with_extension("").join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent-a0.jsonl");
+        std::fs::write(&path, child_row(&r, "before")).unwrap();
+        append_child_link(&r);
+        assert_eq!(poll_view(&mut r), (false, true));
+        assert_eq!(child_messages(&r), ["before"]);
+        let scope = crate::host_protocol::Scope {
+            project: r.project.clone(),
+            route: r.store.profile.route.clone(),
+        };
+        let child = child_key(&r.key, "call-child");
+        let mut host = r.store.host_snapshot(&scope);
+        let original = host.transcripts[&child].items[0].clone();
+        r.store.changed = Default::default();
+
+        // A rotated file can already be larger than the cursor and have the same timestamp.
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let replacement = dir.join("replacement");
+        let mut corrected: Value = serde_json::from_str(&child_row(&r, "before")).unwrap();
+        corrected["message"]["content"][0]["text"] = "after the replacement".into();
+        std::fs::write(&replacement, format!("{corrected}\n")).unwrap();
+        std::fs::File::open(&replacement)
+            .unwrap()
+            .set_modified(before)
+            .unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+        poll_view(&mut r);
+        assert_eq!(child_messages(&r), ["after the replacement"]);
+        let dirty = std::mem::take(&mut r.store.changed);
+        let changes = r.store.host_project(&scope, &dirty, &mut host);
+        assert!(changes.iter().any(
+            |c| matches!(c, crate::host_protocol::Change::Transcript { thread, timeline }
+            if thread == &child && timeline.items[0].text == "after the replacement")
+        ));
+        let current = &host.transcripts[&child].items[0];
+        assert_eq!(current.id, original.id);
+        assert_eq!(current.revision, original.revision);
+        assert_eq!(current.text, "after the replacement");
+        assert_eq!(
+            r.store
+                .transcript(&r.key)
+                .unwrap()
+                .user_messages("message number 0", &[]),
+            1
+        );
+        assert_eq!(poll_view(&mut r), (false, false));
+    }
+
+    #[test]
+    fn foreground_child_output_arrives_before_the_parent_records_its_result() {
+        let mut r = rig(2);
+        pump(&mut r.store, &r.rx);
+        append_agent_call(&r, false);
+        assert_eq!(poll_view(&mut r), (false, true));
+        assert!(child_messages(&r).is_empty());
+
+        let dir = r.journal.with_extension("").join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent-a0.jsonl"), child_row(&r, "looking")).unwrap();
+        std::fs::write(
+            dir.join("agent-a0.meta.json"),
+            r#"{"toolUseId":"call-child"}"#,
+        )
+        .unwrap();
+        assert_eq!(poll_view(&mut r), (false, true));
+        assert_eq!(child_messages(&r), ["looking"]);
+        append_agent_result(&r, "completed");
+        assert_eq!(poll_view(&mut r), (false, true));
+        assert_eq!(child_messages(&r), ["looking"]);
+        assert_eq!(poll_view(&mut r), (false, false));
+    }
+
+    #[test]
+    fn legacy_client_stays_live_while_only_its_child_writes() {
+        let mut r = rig(2);
+        pump(&mut r.store, &r.rx);
+        append_child_link(&r);
+        let dir = r.journal.with_extension("").join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent-a0.jsonl");
+        std::fs::write(&path, child_row(&r, "busy")).unwrap();
+        poll_view(&mut r);
+
+        let old = SystemTime::now() - Duration::from_secs(600);
+        std::fs::File::open(&r.journal)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        poll_view(&mut r);
+        poll_view(&mut r);
+        assert!(r.store.is_native_live(&r.key));
+        assert!(r.store.is_viewer(&r.key));
+
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        poll_view(&mut r); // The reader sees the changed child timestamp.
+        poll_view(&mut r); // No live owner: drain one last time.
+        r.store.refresh_native(Instant::now(), true);
+        assert!(!r.store.is_viewer(&r.key));
+        assert!(!r.store.is_native_live(&r.key));
+    }
+
+    #[test]
+    fn registered_client_exit_drains_child_once_then_releases_even_a_fresh_journal() {
+        use std::io::Write;
+        let mut r = rig(2);
+        pump(&mut r.store, &r.rx);
+        let registry = r
+            .store
+            .claude()
+            .launcher
+            .profiles
+            .subscription
+            .join("sessions");
+        std::fs::create_dir_all(&registry).unwrap();
+        let pid = std::process::id();
+        let registration = registry.join(format!("{pid}.json"));
+        std::fs::write(
+            &registration,
+            json!({"pid":pid,"sessionId":ID,"entrypoint":"cli"}).to_string(),
+        )
+        .unwrap();
+
+        append_child_link(&r);
+        let dir = r.journal.with_extension("").join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut file = std::fs::File::create(dir.join("agent-a0.jsonl")).unwrap();
+        file.write_all(child_row(&r, "started").as_bytes()).unwrap();
+        poll_view(&mut r);
+        assert!(r.store.is_native_live(&r.key));
+        file.write_all(child_row(&r, "finished").as_bytes())
+            .unwrap();
+        std::fs::remove_file(registration).unwrap();
+        assert_eq!(poll_view(&mut r), (false, true));
+        assert_eq!(child_messages(&r), ["started", "finished"]);
+        r.store.refresh_native(Instant::now(), true);
+        assert!(!r.store.is_viewer(&r.key));
+        assert!(!r.store.is_native_live(&r.key));
+    }
+
     #[test]
     fn a_large_journal_follows_within_one_tick() {
         let mut r = rig(20_000);
@@ -721,6 +1009,32 @@ mod tests {
             r.store.claude_resume_send(&r.key).is_err(),
             "no second writer"
         );
+    }
+
+    #[test]
+    fn a_replaced_child_retires_nested_tools_that_its_new_journal_no_longer_names() {
+        let mut r = rig(2);
+        pump(&mut r.store, &r.rx);
+        let dir = r.journal.with_extension("").join("subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let child = dir.join("agent-a0.jsonl");
+        let mut launch: Value = serde_json::from_str(&child_row(&r, "research")).unwrap();
+        launch["message"]["content"] = json!([{"type":"tool_use","name":"Agent","id":"nested-tool","input":{"description":"Investigate"}}]);
+        std::fs::write(&child, format!("{launch}\n")).unwrap();
+        append_child_link(&r);
+        assert_eq!(poll_view(&mut r), (false, true));
+        let nested = child_key(&r.key, "nested-tool");
+        assert!(r.store.transcript(&nested).is_some());
+        r.store.select(&nested).unwrap();
+
+        let fresh = dir.join("replacement");
+        std::fs::write(&fresh, child_row(&r, "rewritten without a nested call")).unwrap();
+        std::fs::rename(fresh, child).unwrap();
+        assert!(poll_view(&mut r).0);
+        assert!(r.store.transcript(&nested).is_none());
+        assert!(r.store.catalog_row(&nested).is_none());
+        assert_eq!(r.store.selected(), Some(r.key.as_str()));
+        assert_eq!(child_messages(&r), ["rewritten without a nested call"]);
     }
 
     #[test]

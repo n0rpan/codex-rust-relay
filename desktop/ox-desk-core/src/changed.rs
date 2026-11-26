@@ -3,6 +3,7 @@
 pub struct Changed {
     bits: u32,
     transcripts: Vec<String>,
+    replaced: Vec<String>,
 }
 impl Changed {
     pub const THREADS: u32 = 1;
@@ -17,8 +18,21 @@ impl Changed {
             self.transcripts.push(id.to_owned());
         }
     }
+    /// All item revisions restart when a reader replaces an existing history.
+    pub(crate) fn replace_transcript(&mut self, id: &str) {
+        self.transcript(id);
+        if !self.replaced.iter().any(|t| t == id) {
+            self.replaced.push(id.to_owned());
+        }
+    }
+    pub fn replaced_threads(&self) -> &[String] {
+        &self.replaced
+    }
     pub fn merge(&mut self, other: Changed) {
         self.bits |= other.bits;
+        for id in other.replaced {
+            self.replace_transcript(&id);
+        }
         for id in other.transcripts {
             self.transcript(&id);
         }

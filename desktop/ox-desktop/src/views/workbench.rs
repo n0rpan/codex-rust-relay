@@ -363,6 +363,11 @@ impl Workbench {
                                 stats.drains += 1;
                             }
                             let changed = store.drain(batch, Instant::now());
+                            for id in changed.replaced_threads() {
+                                if let Some(view) = s.transcript_views.get_mut(id) {
+                                    view.invalidate_messages();
+                                }
+                            }
                             if store.profile().route == Route::CODEX_SUBSCRIPTION
                                 && store.state() == &Connection::Ready
                             {
