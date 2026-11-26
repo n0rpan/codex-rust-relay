@@ -121,6 +121,17 @@ pub(super) struct Steer {
     pub text: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Answer {
+    pub job_id: u64,
+    pub request_id: Value,
+    #[serde(default)]
+    pub choice: Option<usize>,
+    #[serde(default)]
+    pub answers: Option<Vec<String>>,
+}
+
 struct Instruction {
     text: String,
     reply: oneshot::Sender<Result<Value, String>>,

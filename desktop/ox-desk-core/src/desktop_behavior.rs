@@ -16,6 +16,17 @@ pub enum ThemeSource {
     Light,
     Dark,
 }
+/// Who answers the approvals and questions of a worker an agent started.
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerApprovals {
+    /// The parent agent answers what the host's policy lets it; the rest waits
+    /// for a person.
+    #[default]
+    Parent,
+    /// Every request waits for a person.
+    Operator,
+}
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct Behavior {
@@ -26,6 +37,7 @@ pub struct Behavior {
     /// Show the weather from MET Norway on the header horizon.
     pub live_weather: bool,
     pub background_updates: bool,
+    pub worker_approvals: WorkerApprovals,
 }
 impl Default for Behavior {
     fn default() -> Self {
@@ -36,6 +48,7 @@ impl Default for Behavior {
             reduce_motion: false,
             live_weather: true,
             background_updates: true,
+            worker_approvals: WorkerApprovals::Parent,
         }
     }
 }

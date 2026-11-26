@@ -85,6 +85,12 @@ def exercise(js, wait):
     wait(lambda: js("return [...document.querySelectorAll('#settings button')].some(b=>b.disabled && b.textContent==='Sign in with ChatGPT')"))
     js("window.fixtureAccountButton=document.querySelector('#settings button'); window.dispatchEvent(new CustomEvent('ox-native-login-finished'))")
     wait(lambda: js("return !fixtureAccountButton.isConnected && [...document.querySelectorAll('#settings button')].some(b=>b.textContent==='Sign in with Claude')"))
+    wait(lambda: js("return !!document.querySelector('#settings [name=worker_approvals]')"))
+    fill("worker_approvals", "operator")
+    go("Save agent settings")
+    saved()
+    agents = settings({"action": "read_behavior"})["behavior"]
+    assert agents["worker_approvals"] == "operator" and agents["font_size"] == 18, agents
     go("← Settings")
     go("Remote access")
     go("Pair another device")
@@ -97,4 +103,4 @@ def exercise(js, wait):
     go("Install & notifications")
     go("Set up notifications")
     wait(lambda: js("return document.querySelector('#notification-setup').open && !document.querySelector('#catalog').hidden"))
-    print("PASS authenticated phone Settings forms, scoped key, provider/static model, favorites/search, phone/desktop appearance, device grant, new QR and notification navigation", flush=True)
+    print("PASS authenticated phone Settings forms, scoped key, provider/static model, favorites/search, phone/desktop appearance, agent settings, device grant, new QR and notification navigation", flush=True)

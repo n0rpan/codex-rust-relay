@@ -3,7 +3,7 @@ use super::Preferences;
 use crate::appearance::Palette;
 use crate::appearance::Step;
 use gpui::{prelude::*, *};
-pub use ox_desk_core::desktop_behavior::{Behavior, ThemeSource};
+pub use ox_desk_core::desktop_behavior::{Behavior, ThemeSource, WorkerApprovals};
 pub struct Active(pub Behavior);
 impl Global for Active {}
 impl std::ops::Deref for Active {
@@ -66,6 +66,48 @@ impl Preferences {
                     .child(label),
             )
             .child(controls)
+    }
+    /// How agents start and who answers their workers, on the Accounts page.
+    pub(super) fn agents_card(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let b = cx.global::<Active>().0;
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .border_1()
+            .border_color(rgb(p.line))
+            .rounded_lg()
+            .bg(rgb(p.panel))
+            .child(div().text_size(p.text(Step::Title)).child("Agents"))
+            .child(self.preference_choices(
+                "Worker requests",
+                &[
+                    (
+                        "Parent agent answers",
+                        Behavior {
+                            worker_approvals: WorkerApprovals::Parent,
+                            ..b
+                        },
+                    ),
+                    (
+                        "I answer",
+                        Behavior {
+                            worker_approvals: WorkerApprovals::Operator,
+                            ..b
+                        },
+                    ),
+                ],
+                b,
+                p,
+                cx,
+            ))
+            .child(
+                div()
+                    .text_size(p.text(Step::Meta))
+                    .text_color(rgb(p.muted))
+                    .child("A parent agent answers its workers' questions, and approves their actions when its own mode runs without asking you (Auto, Auto-review or YOLO). Read-only workers and mode changes always ask you. You can still answer any request yourself."),
+            )
     }
     pub(super) fn behavior_page(&self, p: Palette, cx: &mut Context<Self>) -> Div {
         let b = cx.global::<Active>().0;

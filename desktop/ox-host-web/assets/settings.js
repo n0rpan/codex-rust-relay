@@ -459,10 +459,63 @@ export function setupSettings({ request, open, close, notifications, login }) {
       );
       body.append(detail);
     }
+    await agentsCard(id);
+    if (id !== pageId || panel.hidden) return;
     body.append(
       action("Refresh accounts", () => load(accounts)),
       button("Configure API provider", providers),
     );
+  }
+  // How agents start and who answers their workers: host preferences shared with OX Desktop.
+  async function agentsCard(id) {
+    const record = await readPage(id, { action: "read_behavior" });
+    if (!record) return;
+    const card = node("div", undefined, "phone-settings-card");
+    card.append(node("h2", "Agents"));
+    const form = node("form");
+    const fields = [];
+    const choice = (label, name, options) => {
+      const wrap = node("label", label),
+        select = node("select");
+      select.name = name;
+      for (const [text, value] of options) select.append(new Option(text, value));
+      select.value = record.behavior[name];
+      wrap.append(select);
+      form.append(wrap);
+      fields.push(select);
+    };
+    choice("Worker requests", "worker_approvals", [
+      ["Parent agent answers", "parent"],
+      ["I answer", "operator"],
+    ]);
+    form.append(
+      node(
+        "p",
+        "A parent agent answers its workers' questions, and approves their actions when its own mode runs without asking you (Auto, Auto-review or YOLO). Read-only workers and mode changes always ask you.",
+      ),
+    );
+    submit(form, "Save agent settings", async () => {
+      const behavior = { ...record.behavior };
+      for (const select of fields) behavior[select.name] = select.value;
+      const result = await request({
+        action: "save_behavior",
+        revision: record.revision,
+        behavior,
+      });
+      if (id !== pageId || panel.hidden) return;
+      status.textContent =
+        result.status === "applied"
+          ? "Saved on the host."
+          : "Settings changed on the host. Refresh accounts and try again.";
+      if (result.status === "applied") record.revision = await reread();
+    });
+    async function reread() {
+      const fresh = await request({ action: "read_behavior" });
+      record.behavior = fresh.behavior;
+      return fresh.revision;
+    }
+    card.append(form);
+    body.append(card);
   }
   function providers() {
     screen("Providers");
@@ -938,7 +991,9 @@ export function setupSettings({ request, open, close, notifications, login }) {
       form,
       onPhone ? "Save phone preferences" : "Save desktop preferences",
       async () => {
+        // Keep the host preferences this form does not show, such as agent settings.
         const behavior = {
+          ...(onPhone ? {} : prefs),
           theme: theme.value,
           font_size: Number(font.value),
           enter_sends: enter.value === "send",

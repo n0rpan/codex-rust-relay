@@ -312,6 +312,69 @@ pub(crate) fn declines_plan_exit(origin: &Origin) -> bool {
     origin.runtime == Runtime::Claude && origin.bounds_operator() && origin.ceiling == Level::Read
 }
 
+/// Whether the parent agent may answer this worker request in place of the
+/// operator. Questions are answers, not grants, so a parent fills them in unless
+/// one is secret. An approval decides whether an action runs, so the parent may
+/// approve only when its own verified mode already runs actions without a person
+/// (Auto, Auto-review or YOLO): it then stands in as the reviewer, the way a
+/// classifier would. A read worker's approvals always wait for a person: any of
+/// them would let it go beyond reading. So do YOLO acceptances, which this
+/// policy never sees because they are raised on the parent itself.
+pub(crate) fn parent_may_answer(
+    worker: &Origin,
+    parent_level: Option<Level>,
+    ask: &ox_desk_core::asks::Ask,
+    setting: ox_desk_core::desktop_behavior::WorkerApprovals,
+) -> Result<(), &'static str> {
+    if setting == ox_desk_core::desktop_behavior::WorkerApprovals::Operator {
+        return Err(
+            "The operator answers worker requests (Settings › Accounts › Worker requests).",
+        );
+    }
+    if ask.waits_for_yolo() {
+        return Err("Accepting YOLO always needs the operator.");
+    }
+    if !ask.questions.is_empty() {
+        return if ask.questions.iter().any(|q| q.is_secret) {
+            Err("A secret answer must come from the operator.")
+        } else {
+            Ok(())
+        };
+    }
+    if worker.ceiling == Level::Read {
+        return Err(
+            "This is a read worker: approving its request would let it do more than read, so the operator decides.",
+        );
+    }
+    match parent_level {
+        Some(level) if level >= Level::Classifier => Ok(()),
+        _ => Err(
+            "Your own mode asks a person before acting, so this worker's approvals go to the operator too.",
+        ),
+    }
+}
+
+/// One open worker request as its parent agent sees it.
+pub(crate) fn request_view(ask: &ox_desk_core::asks::Ask, may: Result<(), &str>) -> Value {
+    let detail: String = ask.detail.chars().take(4000).collect();
+    let mut view = json!({
+        "request_id": ask.id,
+        "title": ask.title(),
+        "detail": detail,
+        "choices": ask.decisions().iter().map(|d| &d.label).collect::<Vec<_>>(),
+        "questions": ask.questions.iter().map(|q| json!({
+            "question": q.question,
+            "options": q.options.as_ref().map(|o| o.iter().map(|c| &c.label).collect::<Vec<_>>()),
+            "multi_select": q.multi_select,
+        })).collect::<Vec<_>>(),
+        "parent_may_answer": may.is_ok(),
+    });
+    if let Err(why) = may {
+        view["operator_needed"] = json!(why);
+    }
+    view
+}
+
 /// A parent-agent caller after identity resolution. Every parent operation,
 /// listing included, filters jobs through [`owns`] with this one value, so no
 /// operation is looser than another.

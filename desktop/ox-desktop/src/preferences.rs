@@ -614,6 +614,7 @@ impl Preferences {
                     }),
                 ))),
             )
+            .child(self.agents_card(p, cx))
             .child(self.about.clone())
     }
     fn providers_view(&self, p: Palette, cx: &mut Context<Self>) -> Div {
