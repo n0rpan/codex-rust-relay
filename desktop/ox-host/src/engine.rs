@@ -358,7 +358,6 @@ impl Engine {
             }
         }
         notices::recover(&mut ledger, &workers)?;
-        ledger.begin(seq)?;
         ledger.retire(&crate::handover::take(dir))?;
         let cold = ledger
             .data
@@ -370,6 +369,9 @@ impl Engine {
                 (saved.scope.clone(), state)
             })
             .collect();
+        // Capture retired approval counts for the recovery snapshot before the
+        // new epoch discards the previous runtime's tokens.
+        ledger.begin(seq)?;
         Ok(Self {
             config,
             ledger,
