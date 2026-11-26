@@ -2,11 +2,11 @@ name: OX Desktop
 
 # Full lane: packaged desktop builds, window tests and stock sessions in the
 # packaged app. The fast lane (fmt, clippy, unit tests, the Linux workbench
-# check and stock-client protocol fixtures) is fast.yml and runs on every push.
+# check and stock-client protocol fixtures) is fast.yml and runs before merge.
 #
 # When this workflow runs, once per change:
-#   - pull request labelled `full-ci`: ubuntu-24.04 only. Adding the label
-#     starts it; each later push to the labelled PR runs it again.
+#   - pull request: ci.yml requests packaged tests for packaging and window-test
+#     changes or the full-ci label. Changes to macOS packaging also run on macOS.
 #   - push to main and v* tags: called by ci.yml (job desktop-release) with the
 #     release version, all four legs. That call is the only main/tag run, so the
 #     packages are built once and published from the same run.
@@ -24,9 +24,6 @@ name: OX Desktop
 # and close the issue. Entries expire after at most 30 days, and the fast lane
 # rejects an entry without an issue or past its date.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
-    paths: ['desktop/**', 'src/**', 'Cargo.*', 'install.sh', '.github/workflows/desktop.yml']
   schedule:
     - cron: '41 2 * * *'
   workflow_dispatch:
@@ -37,6 +34,10 @@ on:
         default: false
   workflow_call:
     inputs:
+      pr_macos:
+        description: Also exercise macOS packaging on this pull request
+        type: boolean
+        default: false
       build_version:
         required: true
         type: string
@@ -44,9 +45,8 @@ on:
 permissions:
   contents: read
 concurrency:
-  # Adding an unrelated label must not cancel a running full lane, and the
-  # nightly run must not cancel the release build ci.yml calls on main.
-  group: desktop-${{ github.ref }}-${{ github.event_name == 'schedule' && 'nightly' || 'change' }}${{ github.event.action == 'labeled' && github.event.label.name != 'full-ci' && format('-{0}', github.run_id) || '' }}
+  # A nightly run must not cancel the release build ci.yml calls on main.
+  group: desktop-${{ github.ref }}-${{ github.event_name == 'schedule' && 'nightly' || 'change' }}
   cancel-in-progress: true
 env:
   OX_BUILD_SHA: ${{ github.sha }}
@@ -57,15 +57,11 @@ env:
   CARGO_PROFILE_RELEASE_STRIP: symbols
 jobs:
   package:
-    if: >-
-      github.event_name != 'pull_request' ||
-      (contains(github.event.pull_request.labels.*.name, 'full-ci') &&
-       (github.event.action != 'labeled' || github.event.label.name == 'full-ci'))
     strategy:
       fail-fast: false
       matrix:
         runner: >-
-          ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' ||
+          ${{ fromJSON(github.event_name == 'pull_request' && (inputs.pr_macos && '["ubuntu-24.04","macos-26"]' || '["ubuntu-24.04"]') ||
           (inputs.build_version || inputs.intel) && '["ubuntu-24.04","ubuntu-24.04-arm","macos-26","macos-26-intel"]' ||
           '["ubuntu-24.04","ubuntu-24.04-arm","macos-26"]') }}
     runs-on: ${{ matrix.runner }}
@@ -281,26 +277,22 @@ jobs:
 
   clean-account:
     needs: package
-    if: >-
-      !cancelled() &&
-      (github.event_name != 'pull_request' ||
-       (contains(github.event.pull_request.labels.*.name, 'full-ci') &&
-        (github.event.action != 'labeled' || github.event.label.name == 'full-ci')))
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["ubuntu-24.04","macos-26"]') }}
+        runner: ${{ fromJSON(github.event_name == 'pull_request' && (inputs.pr_macos && '["ubuntu-24.04","macos-26"]' || '["ubuntu-24.04"]') || '["ubuntu-24.04","macos-26"]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # This leg's package job may have failed or never got a runner; that job
-      # already reports it. Say so here instead of failing on the download.
+      # A successful package matrix owes this leg a real install. When a package
+      # already failed, still exercise the platforms whose artifacts are available.
       - id: package
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        continue-on-error: true
+        continue-on-error: ${{ needs.package.result != 'success' }}
         with:
           name: ox-desktop-${{ matrix.runner }}
           path: ${{ runner.temp }}/dist

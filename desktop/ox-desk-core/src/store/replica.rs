@@ -1182,25 +1182,12 @@ mod local_command_tests {
             scopes: vec![scope_state(sessions)],
         }
     }
-    /// A store over a real unix socket whose peer (the host) is gone: the writer thread
-    /// fails like `open_store`'s and reports the close. The store had paged in 150 rows
-    /// and sent a message with an image that never reached the host.
+    /// The outbound action was queued, then the client discovered the host had gone
+    /// away. A closed peer can be observed by either half of the duplex transport.
     fn store_whose_host_closed_the_socket() -> Store {
-        use std::io::Write;
-        let (client, host) = std::os::unix::net::UnixStream::pair().unwrap();
+        use std::io::{Read, Write};
+        let (mut client, host) = std::os::unix::net::UnixStream::pair().unwrap();
         let (tx, rx) = std::sync::mpsc::sync_channel::<(String, Action)>(16);
-        let (closed, closes) = std::sync::mpsc::channel::<String>();
-        let writer = std::thread::spawn(move || {
-            let mut out = client;
-            for (id, action) in rx {
-                let mut frame = serde_json::to_vec(&(id, &action)).unwrap();
-                frame.push(b'\n');
-                if let Err(e) = out.write_all(&frame).and_then(|_| out.flush()) {
-                    let _ = closed.send(e.to_string());
-                    return;
-                }
-            }
-        });
         let seq = std::sync::atomic::AtomicU64::new(0);
         let mut old = Store::remote_client(profile(), move |action, _| {
             let n = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1229,14 +1216,26 @@ mod local_command_tests {
             "",
             "pending, not in the composer"
         );
-        let reason = closes
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
+        let (id, action) = rx.try_recv().expect("send was queued on the transport");
+        assert!(matches!(action, Action::SendImages(..)));
+        let mut frame = serde_json::to_vec(&(id, action)).unwrap();
+        frame.push(b'\n');
+        // A write can enter a socket buffer even after the peer shuts down. The real
+        // host client also reports EOF on its independent reader in that case.
+        let reason = match client.write_all(&frame) {
+            Err(error) => error.to_string(),
+            Ok(()) => {
+                client
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                assert_eq!(client.read(&mut [0]).expect("read after peer shutdown"), 0);
+                "Session host disconnected".into()
+            }
+        };
         old.apply(LinkEvent::Closed {
             reason,
             stderr_tail: vec![],
         });
-        writer.join().unwrap();
         old
     }
     fn counting_replica() -> (Store, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
