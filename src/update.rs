@@ -194,14 +194,40 @@ fn automatic_enabled() -> bool {
     }
 }
 
-fn recent_check(store: &Path) -> bool {
-    let stamp = store.join("last-check");
-    std::fs::metadata(&stamp)
+fn fresh_stamp(path: &Path, age_limit: Duration) -> bool {
+    std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|time| time.elapsed().ok())
-        .is_some_and(|age| age < Duration::from_secs(6 * 3600))
-        && std::fs::read_to_string(stamp).ok().as_deref() == Some(CURRENT)
+        .is_some_and(|age| age < age_limit)
+        && std::fs::read_to_string(path).ok().as_deref() == Some(CURRENT)
+}
+
+fn recent_check(store: &Path) -> bool {
+    fresh_stamp(&store.join("last-check"), Duration::from_secs(6 * 3600))
+}
+fn retry_later(store: &Path) -> bool {
+    fresh_stamp(&store.join("failed-check"), Duration::from_secs(3600))
+}
+
+fn record_check<T>(
+    store: &Path,
+    result: Result<Option<T>, RelayError>,
+) -> Result<Option<T>, RelayError> {
+    let failed = store.join("failed-check");
+    match &result {
+        Ok(candidate) => {
+            let _ = std::fs::remove_file(failed);
+            if candidate.is_none() {
+                std::fs::write(store.join("last-check"), CURRENT)?;
+            }
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(store.join("last-check"));
+            let _ = std::fs::write(failed, CURRENT);
+        }
+    }
+    result
 }
 
 fn write_error(store: &Path, error: std::io::Error) -> String {
@@ -217,7 +243,7 @@ fn write_error(store: &Path, error: std::io::Error) -> String {
         format!("Could not stage the update in {}: {error}", store.display())
     }
 }
-fn store_lock(store: &Path) -> Result<File, RelayError> {
+fn store_lock(store: &Path, background: bool) -> Result<File, RelayError> {
     let file = File::options()
         .create(true)
         .truncate(false)
@@ -225,8 +251,29 @@ fn store_lock(store: &Path) -> Result<File, RelayError> {
         .write(true)
         .open(store.join("update.lock"))
         .map_err(|e| write_error(store, e))?;
-    file.try_lock()
-        .map_err(|_| "Another OX update is in progress. Try again shortly.")?;
+    // Manual operations wait for the download (15 minutes) and bounded host
+    // drain (10 minutes). Background pollers leave the current owner alone.
+    let until = std::time::Instant::now() + Duration::from_secs(30 * 60);
+    let mut announced = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+            Err(std::fs::TryLockError::WouldBlock) if background => {
+                return Err("An OX update is already running.".into());
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= until {
+                    return Err("Timed out waiting for the other OX update to finish.".into());
+                }
+                if !announced {
+                    eprintln!("Waiting for the current OX update to finish…");
+                    announced = true;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
     Ok(file)
 }
 
@@ -243,7 +290,7 @@ pub(crate) fn on_terminal_launch() {
     }
     if let Some(version) = staged_version(&store) {
         eprintln!("OX {version} is downloaded. Run ox update to install it.");
-    } else if !recent_check(&store) {
+    } else if !recent_check(&store) && !retry_later(&store) {
         // The interactive client starts immediately, even on a slow or offline connection.
         if let Ok(mut child) = Command::new(exe)
             .args(["update", "--background"])
@@ -295,7 +342,7 @@ pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
             let staged = staged_version(&store);
             println!(
                 "{}",
-                serde_json::json!({"installed": CURRENT, "available": staged, "staged": staged})
+                serde_json::json!({"installed": CURRENT, "staged": staged})
             );
             return Ok(0);
         }
@@ -756,6 +803,43 @@ mod tests {
     ) -> Result<Option<Update>, RelayError> {
         let release: Release = serde_json::from_value(release).unwrap();
         select_update(release, channel, switching, current, TARGET, None)
+    }
+
+    #[test]
+    fn failed_checks_back_off_and_recover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        record_check::<()>(dir, Ok(None)).unwrap();
+        assert!(recent_check(dir));
+        assert!(record_check::<()>(dir, Err("offline".into())).is_err());
+        assert!(!recent_check(dir));
+        assert!(retry_later(dir));
+        let stamp = File::open(dir.join("failed-check")).unwrap();
+        stamp
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(3601))
+            .unwrap();
+        assert!(!retry_later(dir));
+        record_check(dir, Ok(Some(()))).unwrap();
+        assert!(!dir.join("failed-check").exists());
+    }
+
+    #[test]
+    fn manual_update_waits_while_background_checks_yield() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let owner = store_lock(dir, true).unwrap();
+        assert!(store_lock(dir, true).is_err());
+        std::thread::scope(|scope| {
+            let (sent, received) = std::sync::mpsc::channel();
+            let waiting = scope.spawn(move || {
+                sent.send(()).unwrap();
+                store_lock(dir, false).unwrap()
+            });
+            received.recv().unwrap();
+            assert!(!waiting.is_finished());
+            drop(owner);
+            let _lock = waiting.join().unwrap();
+        });
     }
 
     #[test]

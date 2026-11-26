@@ -263,7 +263,7 @@ fn optional_desktop_installs_launches_and_preserves_existing_profile() {
     let config = home.join(".codex/config.toml");
     fs::create_dir_all(config.parent().unwrap()).unwrap();
     fs::write(&config, "# existing user settings\n").unwrap();
-    assert!(run().status.success());
+    assert!(install(&release, &bin, &home, &[]).status.success());
     assert_eq!(
         fs::read_link(bin.join("ox-desktop")).unwrap(),
         installed_gui
@@ -369,6 +369,40 @@ fn optional_desktop_installs_launches_and_preserves_existing_profile() {
     for name in ["ox", "ox-host", "ox-desktop"] {
         assert_eq!(bin.join(name).canonicalize().unwrap(), next_bin.join(name));
     }
+    // An existing window uses its pinned CLI when another installer switches versions.
+    let pinned = current.join("ox-desktop/ox");
+    let running = Command::new(&pinned)
+        .arg("--version")
+        .output()
+        .unwrap()
+        .stdout;
+    for version in [std::str::from_utf8(&running).unwrap().trim(), "ox 0.0.0"] {
+        fs::write(
+            next_bin.join("ox"),
+            format!("#!/bin/sh\necho '{version}'\n"),
+        )
+        .unwrap();
+        let check = Command::new(&pinned)
+            .args(["update", "--stage-desktop"])
+            .output()
+            .unwrap();
+        assert!(check.status.success());
+        assert_eq!(check.stdout, b"null\n");
+    }
+
+    // Forced installation of a pre-updater release keeps its self-replacing CLI writable.
+    fs::write(source.join("ox"), FAKE_OX).unwrap();
+    fs::write(&gui, "#!/bin/sh\necho 'ox-desktop 9.9.9-dev.1'\n").unwrap();
+    pack();
+    let legacy = install(&release, &bin, &home, &[]);
+    assert!(
+        legacy.status.success(),
+        "{}",
+        String::from_utf8_lossy(&legacy.stderr)
+    );
+    assert!(!bin.join("ox").is_symlink());
+    assert_eq!(fs::read(bin.join("ox")).unwrap(), FAKE_OX.as_bytes());
+    assert!(bin.join("ox-host").is_symlink());
 }
 
 #[test]
@@ -397,6 +431,14 @@ fn standalone_applies_a_staged_binary_offline_and_rejects_cache_corruption() {
             .unwrap()
     };
     stage();
+    let status = Command::new(&cli)
+        .args(["update", "--status", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&status.stdout).unwrap(),
+        serde_json::json!({"installed": installed, "staged": "9.9.9-dev.1"})
+    );
     fs::write(cache.join("download"), "x".repeat(FAKE_OX.len())).unwrap();
     assert!(!apply().status.success());
     assert_eq!(

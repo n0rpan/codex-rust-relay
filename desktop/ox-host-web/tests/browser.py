@@ -951,6 +951,9 @@ def run(harness, screenshot=None):
         # An explicitly typed command uses the native-only action; after a refusal
         # the exact text stays editable, independent of the ordinary chat draft.
         def custom_command(text):
+            # The status delta arrives before the acknowledgement. The form
+            # accepts the next command only after the previous action completes.
+            wait(lambda: js("return !document.querySelector('#native-command-form button').disabled"))
             choose("native-command", "custom")
             js("const field=document.getElementById('typed-native-command');field.value=arguments[0];field.dispatchEvent(new Event('input'));document.getElementById('native-command-form').requestSubmit()", text)
         js("const d=document.getElementById('draft');d.value='/home/user/project';d.dispatchEvent(new Event('input'))")

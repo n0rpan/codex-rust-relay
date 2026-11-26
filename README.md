@@ -73,7 +73,7 @@ ox codex      # or: ox claude
 
 OX Desktop downloads and verifies a complete release in the background. Choose **Restart to update** to switch the desktop, CLI, session host and bundled phone interface together, or **Later** to keep working. You can bring the prompt back from **Settings → Accounts → Restart to update**.
 
-For an older desktop installation, rerun the install command with `--desktop` once to enable background updates. Run `ox update` to apply an update from the terminal, including on a headless machine. A running host gives active turns up to ten minutes to finish. Check the running version with `ox host doctor`.
+For an older installation, rerun the install command once to enable background updates. Include `--desktop` for the full suite or omit it for the standalone CLI. Run `ox update` to apply an update from the terminal, including on a headless machine. A running host gives active turns up to ten minutes to finish. Check the running version with `ox host doctor`.
 
 To remove the login service, run `ox host uninstall`. It keeps your sessions and pairings. `ox host uninstall --purge` also deletes OX's host state. Neither touches Codex or Claude Code sessions or sign-ins.
 

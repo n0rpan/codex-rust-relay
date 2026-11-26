@@ -188,6 +188,21 @@ pub(crate) fn stop(paths: &Paths) -> io::Result<()> {
     Ok(())
 }
 
+/// A service migration failure must not skip bringing a drained host back up.
+fn resume_host(paths: &Paths) -> io::Result<()> {
+    let refresh = ox_host_service::refresh_update_service();
+    let start = ensure_running(paths);
+    match (refresh, start) {
+        (Err(refresh), Err(start)) => Err(io::Error::other(format!(
+            "Could not refresh the OX login service ({refresh}) or start the host ({start})."
+        ))),
+        (Err(refresh), Ok(())) => Err(io::Error::other(format!(
+            "OX host is running. Retry to refresh its login service: {refresh}"
+        ))),
+        (Ok(()), start) => start,
+    }
+}
+
 pub(crate) fn restart_if_updated(paths: &Paths) -> io::Result<()> {
     let marker = paths.state_dir.join("pending-update-restart");
     let expected = handover::version();
@@ -202,10 +217,10 @@ pub(crate) fn restart_if_updated(paths: &Paths) -> io::Result<()> {
             restart(paths, DEFAULT_BOUND)?;
         }
         None if fs::read_to_string(&marker).ok().as_deref() == Some(expected) => {
-            ox_host_service::refresh_update_service()?;
-            ensure_running(paths)?;
+            resume_host(paths)?;
         }
-        None => return Ok(()),
+        None => return ox_host_service::refresh_update_service(),
+        Some(_) if marker.exists() => resume_host(paths)?,
         Some(_) => {}
     }
     if probe(paths)?
@@ -266,8 +281,7 @@ pub(crate) fn restart(paths: &Paths, bound: Duration) -> io::Result<()> {
             }
         }
     }
-    ox_host_service::refresh_update_service()?;
-    ensure_running(paths)?;
+    resume_host(paths)?;
     let version = probe(paths)?
         .and_then(|p| p.host)
         .map_or_else(|| "?".into(), |h| h.version);

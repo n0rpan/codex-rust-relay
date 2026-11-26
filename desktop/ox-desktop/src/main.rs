@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use workspace_state::LastWorkspace;
 
 fn main() {
+    platform::init_companion();
     let _package = ox_host_service::managed_install::hold_generation();
     ox_host_service::configure_allocator();
     app::install_panic_hook();

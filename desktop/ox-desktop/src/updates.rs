@@ -2,18 +2,8 @@
 use crate::{appearance::Palette, kit, platform, version::VERSION};
 use gpui::{prelude::*, *};
 use ox_host_service::managed_install::package_store;
-use serde::Deserialize;
-use std::{
-    path::PathBuf,
-    process::{Command, Stdio},
-    time::Duration,
-};
-
-#[derive(Clone, Debug, Deserialize)]
-struct Candidate {
-    version: String,
-    digest: String,
-}
+use platform::versions::{self, Candidate};
+use std::{path::PathBuf, time::Duration};
 
 #[derive(Default)]
 enum State {
@@ -58,20 +48,6 @@ pub fn start(smoke: bool, cx: &mut App) {
     }
 }
 
-fn helper(args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = Command::new(platform::ox())
-        .arg("update")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| e.to_string())?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
-    }
-}
-
 pub fn managed(cx: &App) -> bool {
     cx.try_global::<Updates>()
         .is_some_and(|u| u.store.is_some())
@@ -98,15 +74,7 @@ fn check(manual: bool, cx: &mut App) {
     u.state = State::Checking;
     cx.spawn(async move |cx| {
         let result = cx
-            .background_spawn(async move {
-                let args: &[&str] = if manual {
-                    &["--stage-desktop"]
-                } else {
-                    &["--stage-desktop", "--background"]
-                };
-                serde_json::from_slice::<Option<Candidate>>(&helper(args)?)
-                    .map_err(|e| e.to_string())
-            })
+            .background_spawn(async move { versions::stage(!manual) })
             .await;
         cx.update(|cx| {
             cx.global_mut::<Updates>().state = match result {
@@ -130,9 +98,7 @@ fn apply(candidate: Candidate, cx: &mut App) {
     cx.spawn(async move |cx| {
         let request = candidate.clone();
         let result = cx
-            .background_spawn(async move {
-                helper(&["--apply-desktop", &request.version, &request.digest])
-            })
+            .background_spawn(async move { versions::apply(&request) })
             .await;
         cx.update(|cx| match result {
             Ok(_) => {
@@ -180,8 +146,8 @@ pub fn perform_action(cx: &mut App) {
 pub fn about(cx: &App) -> String {
     match &cx.global::<Updates>().state {
         State::Idle => String::new(),
-        State::Checking => "Checking for updates and downloading any available release…".into(),
-        State::Current => format!("OX {VERSION} is up to date."),
+        State::Checking => "Waiting for any earlier update, then checking for a release…".into(),
+        State::Current => format!("No newer release is available for OX {VERSION}."),
         State::Ready(c) if c.digest == "current" => format!(
             "OX {} is installed. Reopen this window on the new version.",
             c.version
@@ -191,7 +157,7 @@ pub fn about(cx: &App) -> String {
             c.version
         ),
         State::Applying(version) => format!(
-            "Updating to OX {version}. Running turns have up to 10 minutes to finish before OX reopens."
+            "Updating to OX {version}. Any earlier update finishes first. Active turns have up to 10 minutes to finish before OX reopens."
         ),
         State::RestartFailed(_, e) | State::Failed(e) => e.clone(),
     }

@@ -49,7 +49,6 @@ async fn prepare(cache: &Path) -> Result<Option<Staged>, RelayError> {
     )
     .await?
     else {
-        fs::write(cache.join("last-check"), CURRENT)?;
         return Ok(None);
     };
     let mut binary = tempfile::NamedTempFile::new_in(cache).map_err(|e| write_error(cache, e))?;
@@ -100,14 +99,14 @@ pub(super) async fn command(
     executable: &Path,
     action: &str,
 ) -> Result<u8, RelayError> {
-    let _lock = store_lock(cache)?;
-    if action == "--background" && recent_check(cache) {
+    let _lock = store_lock(cache, action == "--background")?;
+    if action == "--background" && (recent_check(cache) || retry_later(cache)) {
         return Ok(0);
     }
     let staged = if action == "--apply" {
         Some(pending(cache).ok_or("No staged CLI update. Run ox update --stage first.")?)
     } else {
-        prepare(cache).await?
+        record_check(cache, prepare(cache).await)?
     };
     match staged {
         Some(s) if action == "--apply" || action == "update" => {
