@@ -1426,3 +1426,175 @@ fn saved_key_file_is_repaired_or_reported_but_never_fatal() {
     assert!(!home.exists("ox-api-keys.json"));
     assert!(!output.contains("fixture-saved-value") && !output.contains("fixture-value"));
 }
+
+// Codex bundled catalog diagnostics
+
+#[test]
+fn catalog_failure_keeps_its_first_line_and_explains_the_cause() {
+    let home = TempHome::new();
+    let message = setup::codex_catalog_failure(
+        "`codex debug models --bundled` exited with status 2",
+        b"\x1b[31merror:\x1b[0m unrecognized subcommand 'models'\n\nUsage: codex debug <COMMAND>\n",
+        Some(Path::new("/usr/local/bin/codex")),
+        home.path(),
+        Some("codex-cli 0.172.0"),
+    );
+    assert!(
+        message.starts_with("could not read the bundled Codex model catalog\n  why: "),
+        "{message}"
+    );
+    assert!(message.contains("exited with status 2"), "{message}");
+    assert!(message.contains("codex: /usr/local/bin/codex"), "{message}");
+    assert!(
+        message.contains("unrecognized subcommand 'models'"),
+        "{message}"
+    );
+    assert!(
+        !message.contains('\x1b'),
+        "control characters must be dropped: {message:?}"
+    );
+    assert!(message.contains("\n  fix: "), "{message}");
+    assert!(message.contains(setup::min_codex()), "{message}");
+    assert!(message.contains("config.toml"), "{message}");
+    // render_error must not add a second, generic fix line.
+    let rendered = ui::render_error("ox", &message, false);
+    assert_eq!(rendered.matches("fix:").count(), 1, "{rendered}");
+}
+
+#[test]
+fn stderr_tail_keeps_the_last_lines_and_caps_the_size() {
+    let many = (1..=20).map(|n| format!("line {n}\n")).collect::<String>();
+    let tail = setup::stderr_tail(many.as_bytes()).unwrap();
+    assert!(
+        tail.starts_with("line 16") && tail.ends_with("line 20"),
+        "{tail}"
+    );
+    assert!(!tail.contains("line 15"), "{tail}");
+
+    let long = format!("{}\n", "é".repeat(2000));
+    let tail = setup::stderr_tail(long.as_bytes()).unwrap();
+    assert!(tail.starts_with('…') && tail.len() <= 504, "{}", tail.len());
+
+    assert_eq!(setup::stderr_tail(b" \n\t\n"), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_probe_reports_a_codex_without_the_bundled_catalog() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = TempHome::new();
+    let fake = |name: &str, body: &str| {
+        let path = home.path().join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+
+    let old = fake(
+        "codex-old",
+        "[ \"$1\" = --version ] && { echo 'codex-cli 0.98.0'; exit 0; }\necho \"error: unrecognized subcommand 'models'\" >&2; exit 2",
+    );
+    let error = setup::probe_codex_catalog(&old, home.path()).unwrap_err();
+    assert!(
+        error.starts_with("Codex 0.98.0 is older than the required"),
+        "{error}"
+    );
+    assert!(error.contains("exited with status 2"), "{error}");
+    assert!(
+        error.contains("unrecognized subcommand 'models'"),
+        "{error}"
+    );
+
+    let garbled = fake("codex-garbled", "echo not-json");
+    let error = setup::probe_codex_catalog(&garbled, home.path()).unwrap_err();
+    assert!(error.contains("could not parse"), "{error}");
+
+    // Larger than a pipe buffer, so a probe that waits before reading would hang.
+    let good = fake(
+        "codex-good",
+        "printf '{\"models\":['; i=0; while [ $i -lt 4000 ]; do printf '{\"slug\":\"m%s\",\"pad\":\"xxxxxxxxxxxxxxxxxxxx\"},' $i; i=$((i+1)); done; printf '{\"slug\":\"last\"}]}'",
+    );
+    assert_eq!(setup::probe_codex_catalog(&good, home.path()), Ok(()));
+}
+
+#[cfg(unix)]
+#[test]
+fn find_all_on_path_lists_each_binary_once_in_order() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = TempHome::new();
+    let first = home.path().join("first");
+    let second = home.path().join("second");
+    let alias = home.path().join("alias");
+    for dir in [&first, &second] {
+        fs::create_dir_all(dir).unwrap();
+        let bin = dir.join("codex");
+        fs::write(&bin, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::os::unix::fs::symlink(&first, &alias).unwrap();
+    let path = std::env::join_paths([&first, &alias, &second]).unwrap();
+    let found = setup::find_all_on_path("codex", Some(&path));
+    assert_eq!(found, vec![first.join("codex"), second.join("codex")]);
+    assert_eq!(
+        setup::find_on_path("codex", Some(&path)),
+        Some(first.join("codex"))
+    );
+}
+
+#[test]
+fn upgrade_command_matches_how_codex_was_installed() {
+    let brew = Path::new("/opt/homebrew/Caskroom/codex/0.170.0/codex");
+    assert_eq!(
+        setup::codex_upgrade_command(Some(brew)),
+        "brew upgrade --cask codex"
+    );
+    let mise = Path::new("/Users/eli/.local/share/mise/installs/codex/0.170.0/codex");
+    assert_eq!(
+        setup::codex_upgrade_command(Some(mise)),
+        "mise use --global codex@latest"
+    );
+    let npm = Path::new("/usr/local/lib/node_modules/@openai/codex/bin/codex.js");
+    assert_eq!(
+        setup::codex_upgrade_command(Some(npm)),
+        "npm install -g @openai/codex@latest"
+    );
+}
+
+#[test]
+fn an_old_codex_gets_the_desktop_wording_and_the_gate_floor() {
+    let gate = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("desktop/gate.toml"))
+        .unwrap();
+    assert!(
+        gate.contains(&format!("minimum_version = \"{}\"", setup::min_codex())),
+        "the CLI floor must be the desktop [codex] floor"
+    );
+    assert_eq!(setup::codex_too_old("codex-cli 0.171.0"), None);
+    assert_eq!(setup::codex_too_old("codex-cli 1.0.0"), None);
+    assert_eq!(setup::codex_too_old("not a version"), None);
+    let old = setup::codex_too_old("codex-cli 0.98.2").unwrap();
+    assert_eq!(
+        old,
+        format!(
+            "Codex 0.98.2 is older than the required {}.",
+            setup::min_codex()
+        )
+    );
+
+    let home = TempHome::new();
+    let message = setup::codex_catalog_failure(
+        "`codex debug models --bundled` exited with status 2",
+        b"error: unrecognized subcommand 'models'",
+        Some(Path::new("/opt/homebrew/Caskroom/codex/0.98.2/codex")),
+        home.path(),
+        Some("codex-cli 0.98.2"),
+    );
+    // OX Desktop matches this first line to offer its Update button.
+    assert!(message.starts_with(&old), "{message}");
+    assert!(message.contains("unrecognized subcommand"), "{message}");
+    assert!(
+        message.contains("\n  fix: brew upgrade --cask codex"),
+        "{message}"
+    );
+}

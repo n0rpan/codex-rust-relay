@@ -102,9 +102,11 @@ impl Link {
             }
         });
         let diagnostics = thread::spawn(move || {
-            let mut tail = VecDeque::with_capacity(4);
+            // Enough for a whole `ox` launch error (first line, why and fix).
+            const LINES: usize = 12;
+            let mut tail = VecDeque::with_capacity(LINES);
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if tail.len() == 4 {
+                if tail.len() == LINES {
                     tail.pop_front();
                 }
                 tail.push_back(line.chars().take(512).collect());

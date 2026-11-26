@@ -1698,22 +1698,141 @@ async fn bundled_catalog(
     codex_home: &Path,
     strip: &BTreeSet<String>,
 ) -> Result<BundledModels, RelayError> {
+    let mut offered = false;
+    loop {
+        let codex = setup::find_on_path("codex", std::env::var_os("PATH").as_deref());
+        let (why, stderr) = match read_bundled_catalog(codex_home, strip).await? {
+            Ok(models) => return Ok(models),
+            Err(failure) => failure,
+        };
+        let version = codex_version(strip).await;
+        if !offered
+            && let Some(old) = version.as_deref().and_then(setup::codex_too_old)
+            && let Some(codex) = codex.as_deref()
+        {
+            offered = true;
+            if offer_codex_update(&old, codex).await {
+                continue;
+            }
+        }
+        return Err(setup::codex_catalog_failure(
+            &why,
+            &stderr,
+            codex.as_deref(),
+            codex_home,
+            version.as_deref(),
+        )
+        .into());
+    }
+}
+
+/// Runs `codex debug models --bundled`. The inner error is why it failed and
+/// the child's stderr, for the caller to explain.
+async fn read_bundled_catalog(
+    codex_home: &Path,
+    strip: &BTreeSet<String>,
+) -> Result<Result<BundledModels, (String, Vec<u8>)>, RelayError> {
     let mut command = Command::new("codex");
     command
         .env("CODEX_HOME", codex_home)
         .env_remove("CODEX_SQLITE_HOME")
-        .args(["debug", "models", "--bundled"]);
+        .args(["debug", "models", "--bundled"])
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
     for name in strip {
         command.env_remove(name);
     }
-    let output = command
-        .output()
-        .await
-        .map_err(|error| client_launch_error("codex", error))?;
+    let output = match tokio::time::timeout(CATALOG_TIMEOUT, command.output()).await {
+        Ok(output) => output.map_err(|error| client_launch_error("codex", error))?,
+        Err(_) => {
+            let why = format!(
+                "`codex debug models --bundled` did not finish within {}s",
+                CATALOG_TIMEOUT.as_secs()
+            );
+            return Ok(Err((why, Vec::new())));
+        }
+    };
     if !output.status.success() {
-        return Err("could not read the bundled Codex model catalog".into());
+        return Ok(Err((setup::exit_description(output.status), output.stderr)));
     }
-    Ok(serde_json::from_slice(&output.stdout)?)
+    Ok(serde_json::from_slice(&output.stdout).map_err(|error| {
+        (
+            format!("Codex printed a model catalog ox could not parse ({error})"),
+            output.stderr,
+        )
+    }))
+}
+
+/// In a terminal, offer to update an old Codex through the package manager
+/// that installed it. True when the update ran and the launch should retry.
+/// Never runs without a yes, and never when ox has no terminal (OX Desktop
+/// shows its own Update button instead).
+async fn offer_codex_update(old: &str, codex: &Path) -> bool {
+    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        return false;
+    }
+    let Some((tool, args, display)) =
+        setup::codex_update_argv(codex, std::env::var_os("PATH").as_deref())
+    else {
+        return false;
+    };
+    let prompt = format!("ox: {old}\nUpdate it now with `{display}`? [Y/n] ");
+    let yes = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        eprint!("{prompt}");
+        let _ = std::io::stderr().flush();
+        read_codex_update_confirmation(std::io::stdin().lock())
+    })
+    .await
+    .unwrap_or(false);
+    if !yes {
+        return false;
+    }
+    let status = Command::new(tool).args(args).status().await;
+    match status {
+        Ok(status) if status.success() => {
+            eprintln!("ox: Codex updated; continuing the launch");
+            true
+        }
+        Ok(status) => {
+            eprintln!("ox: `{display}` failed ({status})");
+            false
+        }
+        Err(error) => {
+            eprintln!("ox: could not run `{display}` ({error})");
+            false
+        }
+    }
+}
+
+fn read_codex_update_confirmation(mut input: impl std::io::BufRead) -> bool {
+    let mut answer = String::new();
+    matches!(input.read_line(&mut answer), Ok(1..))
+        && matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "" | "y" | "yes"
+        )
+}
+
+/// `codex --version` output, used only to explain a failed launch.
+async fn codex_version(strip: &BTreeSet<String>) -> Option<String> {
+    let mut command = Command::new("codex");
+    command
+        .arg("--version")
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    for name in strip {
+        command.env_remove(name);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn codex_relay_command(home: &Path) -> Result<Command, RelayError> {
@@ -1845,6 +1964,14 @@ mod tests {
     use tokio::task::JoinHandle;
 
     const RELAY_TOKEN: &str = "relay-test-token";
+
+    #[test]
+    fn codex_update_prompt_distinguishes_eof_from_enter() {
+        assert!(!read_codex_update_confirmation("".as_bytes()));
+        assert!(read_codex_update_confirmation("\n".as_bytes()));
+        assert!(read_codex_update_confirmation("YES\n".as_bytes()));
+        assert!(!read_codex_update_confirmation("n\n".as_bytes()));
+    }
 
     struct MockVendor {
         base: String,

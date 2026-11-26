@@ -1199,6 +1199,10 @@ mod local_command_tests {
     fn store_whose_host_closed_the_socket() -> Store {
         use std::io::{Read, Write};
         let (mut client, host) = std::os::unix::net::UnixStream::pair().unwrap();
+        // macOS can reject socket options once the peer has disconnected.
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
         let (tx, rx) = std::sync::mpsc::sync_channel::<(String, Action)>(16);
         let seq = std::sync::atomic::AtomicU64::new(0);
         let mut old = Store::remote_client(profile(), move |action, _| {
@@ -1237,9 +1241,6 @@ mod local_command_tests {
         let reason = match client.write_all(&frame) {
             Err(error) => error.to_string(),
             Ok(()) => {
-                client
-                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                    .unwrap();
                 assert_eq!(client.read(&mut [0]).expect("read after peer shutdown"), 0);
                 "Session host disconnected".into()
             }

@@ -639,7 +639,11 @@ impl Store {
                 self.changed.mark(Changed::CONNECTION);
                 return Ok(());
             }
-            LinkEvent::Closed { reason, .. } => {
+            LinkEvent::Closed {
+                reason,
+                stderr_tail,
+            } => {
+                let reason = crate::links::close_reason(&reason, &stderr_tail);
                 let sign_in = self.state == Connection::SignInRequired;
                 self.changed.mark(Changed::CONNECTION | Changed::ASK);
                 for (_, (_, pending)) in std::mem::take(&mut self.pending) {

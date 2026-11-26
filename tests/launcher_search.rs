@@ -680,3 +680,45 @@ fn is_uuid_v4(id: &str) -> bool {
         && parts[2].starts_with('4')
         && parts[3].starts_with(['8', '9', 'a', 'b'])
 }
+
+#[test]
+fn an_old_codex_fails_the_launch_with_the_floor_and_its_own_error() {
+    let home = TempDir::new("launcher-old-codex-home");
+    let capture = TempDir::new("launcher-old-codex-capture");
+    let fake_bin = TempDir::new("launcher-old-codex-bin");
+    let script = fake_bin.0.join("codex");
+    fs::write(
+        &script,
+        "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'codex-cli 0.98.0'; exit 0; }\necho \"error: unrecognized subcommand 'models'\" >&2\nexit 2\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    write_codeox_config(&home.0, false);
+
+    let output = run_launcher(
+        &home.0,
+        &capture.0,
+        &fake_bin.0,
+        &[("ALPHA_KEY", "alpha-secret")],
+        &["exec", "hello"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    // OX Desktop reads this first line to offer its Update button.
+    assert!(
+        stderr.starts_with("ox: Codex 0.98.0 is older than the required 0.171.0."),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("unrecognized subcommand 'models'"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.matches("fix:").count(), 1, "{stderr}");
+    // Without a terminal ox never asks to update.
+    assert!(!stderr.contains("[Y/n]"), "{stderr}");
+    assert!(!stderr.contains("alpha-secret"), "{stderr}");
+}
