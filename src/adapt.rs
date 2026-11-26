@@ -210,12 +210,10 @@ fn named_field(text: &str, body: &Value) -> Option<&'static str> {
             return Some(field);
         }
     }
-    for field in DROPPABLE {
-        if body.get(*field).is_some() && names_token(text, field) {
-            return Some(field);
-        }
-    }
-    None
+    DROPPABLE
+        .iter()
+        .copied()
+        .find(|field| body.get(*field).is_some() && names_token(text, field))
 }
 
 fn quoted_tokens(text: &str) -> Vec<&str> {
