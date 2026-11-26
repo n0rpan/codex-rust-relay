@@ -407,16 +407,19 @@ fn optional_desktop_installs_launches_and_preserves_existing_profile() {
 
 #[test]
 fn standalone_applies_a_staged_binary_offline_and_rejects_cache_corruption() {
-    let dir = TempDir::new("cli-staged");
-    let cli = dir.0.join("ox");
-    fs::copy(env!("CARGO_BIN_EXE_ox"), &cli).unwrap();
+    // No writable descriptor may survive a concurrent fork when this fixture
+    // launches. Apply replaces the directory entry, so the original stays intact.
+    let built = Path::new(env!("CARGO_BIN_EXE_ox"));
+    let dir = tempfile::tempdir_in(built.parent().unwrap()).unwrap();
+    let cli = dir.path().join("ox");
+    fs::hard_link(built, &cli).unwrap();
     let version_line = Command::new(&cli).arg("--version").output().unwrap().stdout;
     let installed = std::str::from_utf8(&version_line)
         .unwrap()
         .trim()
         .strip_prefix("ox ")
         .unwrap();
-    let cache = dir.0.join(".ox-cli-update");
+    let cache = dir.path().join(".ox-cli-update");
     fs::create_dir(&cache).unwrap();
     let stage = || {
         fs::write(cache.join("download"), FAKE_OX).unwrap();
