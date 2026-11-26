@@ -96,6 +96,8 @@ pub struct PairedClient {
     key: DeviceKey,
     cookie: header::HeaderValue,
     http: Client,
+    #[cfg(test)]
+    fixture: Option<(std::net::SocketAddr, tokio_tungstenite::Connector)>,
     settings_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
 fn http() -> io::Result<Client> {
@@ -159,9 +161,12 @@ impl DeviceKey {
                 return Ok((Self::Enclave(key), SavedKey::Enclave(B64.encode(id))));
             }
         }
+        Ok(Self::software())
+    }
+    fn software() -> (Self, SavedKey) {
         let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
         let saved = SavedKey::Software(B64.encode(key.to_bytes()));
-        Ok((Self::Software(key), saved))
+        (Self::Software(key), saved)
     }
     fn load(saved: &SavedKey) -> io::Result<Self> {
         match saved {
@@ -183,20 +188,37 @@ impl DeviceKey {
                     .ignore_legacy_keychains()
                     .load_refs(true)
                     .search()
-                    .map_err(io::Error::other)?
+                    .map_err(|err| {
+                        if err.code() == -25300 {
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                "The paired Secure Enclave key is missing",
+                            )
+                        } else {
+                            io::Error::other(err)
+                        }
+                    })?
                     .into_iter()
                     .find_map(|result| match result {
                         SearchResult::Ref(Reference::Key(key)) => Some(Self::Enclave(key)),
                         _ => None,
                     })
-                    .ok_or_else(|| io::Error::other("The paired Secure Enclave key is missing"))
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "The paired Secure Enclave key is missing",
+                        )
+                    })
             }
         }
     }
     fn discard(&self) -> io::Result<()> {
         #[cfg(target_os = "macos")]
         if let Self::Enclave(key) = self {
-            return key.delete().map_err(io::Error::other);
+            return match key.delete() {
+                Err(err) if err.code() == -25300 => Ok(()),
+                result => result.map_err(io::Error::other),
+            };
         }
         Ok(())
     }
@@ -231,12 +253,19 @@ impl DeviceKey {
     }
 }
 pub async fn register(invite: Invitation, label: &str) -> io::Result<Credential> {
-    let (key, saved) = DeviceKey::generate()?;
+    register_via(invite, label, http()?, DeviceKey::generate()?).await
+}
+async fn register_via(
+    invite: Invitation,
+    label: &str,
+    http: Client,
+    (key, saved): (DeviceKey, SavedKey),
+) -> io::Result<Credential> {
     let result: io::Result<String> = async {
         let payload = json!({"code":invite.code, "signature":key.sign(&invite.code)?,
             "key":key.public()?, "class":"desktop","label":label});
         let response = checked(
-            http()?.post(format!("{}/api/pair", invite.origin))
+            http.post(format!("{}/api/pair", invite.origin))
                 .header(header::ORIGIN, &invite.origin).json(&payload).send().await,
             "Pairing was refused. Check your Tailscale login and get a fresh invitation with ox host pair.",
         ).await?;
@@ -257,7 +286,10 @@ pub async fn register(invite: Invitation, label: &str) -> io::Result<Credential>
 }
 impl Credential {
     pub fn discard_key(&self) -> io::Result<()> {
-        DeviceKey::load(&self.key)?.discard()
+        match DeviceKey::load(&self.key) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result?.discard(),
+        }
     }
 }
 impl PairedClient {
@@ -287,6 +319,8 @@ impl PairedClient {
             key,
             cookie,
             http: http()?,
+            #[cfg(test)]
+            fixture: None,
             settings_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
         })
     }
@@ -373,13 +407,24 @@ impl PairedClient {
         );
         req.headers_mut()
             .insert(header::COOKIE, self.cookie.clone());
-        let (mut socket, _) = tokio::time::timeout(
-            Duration::from_secs(12),
-            tokio_tungstenite::connect_async(req),
-        )
-        .await
-        .map_err(io::Error::other)?
-        .map_err(io::Error::other)?;
+        let connect = async {
+            #[cfg(test)]
+            if let Some((addr, tls)) = &self.fixture {
+                let stream = tokio::net::TcpStream::connect(addr).await?;
+                return tokio_tungstenite::client_async_tls_with_config(
+                    req,
+                    stream,
+                    None,
+                    Some(tls.clone()),
+                )
+                .await;
+            }
+            tokio_tungstenite::connect_async(req).await
+        };
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(12), connect)
+            .await
+            .map_err(io::Error::other)?
+            .map_err(io::Error::other)?;
         socket
             .send(Message::text(first.to_string()))
             .await
@@ -515,3 +560,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod fixture;

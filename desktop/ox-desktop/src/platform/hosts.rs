@@ -149,20 +149,41 @@ pub(crate) fn pair(address: &str, code: &str, label: &str) -> io::Result<SavedHo
     let client = PairedClient::new(&origin, &credential).inspect_err(|_| {
         let _ = credential.discard_key();
     })?;
-    let result = save_pairing(origin, &credential, &client);
-    if result.is_err() {
+    let host = prepare_pairing(origin, &credential, &client).inspect_err(|_| {
         let _ = rt.block_on(client.revoke_self());
         let _ = credential.discard_key();
+    })?;
+    let mut old = Vec::new();
+    if let Err(e) = edit(|mut rows| {
+        rows.retain(|r| {
+            if r.id == host.id || r.origin == host.origin {
+                old.push(r.clone());
+                false
+            } else {
+                true
+            }
+        });
+        rows.push(host.clone());
+        rows
+    }) {
+        let _ = rt.block_on(client.revoke_self());
+        let _ = keys::remove(&host.key_id, host.storage);
+        return Err(e);
     }
-    result
+    for previous in old {
+        if let Ok(client) = previous.client() {
+            let _ = rt.block_on(client.revoke_self());
+        }
+        let _ = previous.forget();
+    }
+    Ok(host)
 }
-fn save_pairing(
+fn prepare_pairing(
     origin: String,
     credential: &client::Credential,
     client: &PairedClient,
 ) -> io::Result<SavedHost> {
-    let rt = client::runtime()?;
-    let mut socket = rt.block_on(client.session())?;
+    let mut socket = client::runtime()?.block_on(client.session())?;
     socket.set_read_timeout(Some(Duration::from_secs(15)))?;
     super::host_client::write_frame(&mut socket, &Client::Hello { version: VERSION })?;
     let frame = super::host_client::read_frame(&mut BufReader::new(socket))?;
@@ -182,37 +203,14 @@ fn save_pairing(
     getrandom::fill(&mut nonce).map_err(io::Error::other)?;
     let key_id = format!("{:032x}", u128::from_be_bytes(nonce));
     let storage = keys::save(&key_id, credential)?;
-    let host = SavedHost {
+    Ok(SavedHost {
         id,
         name: info.name.unwrap_or_else(|| origin.clone()),
         origin,
         key_id,
         storage,
         client: Arc::new(OnceLock::from(client.clone())),
-    };
-    let mut old = Vec::new();
-    if let Err(e) = edit(|mut rows| {
-        rows.retain(|r| {
-            if r.id == host.id || r.origin == host.origin {
-                old.push(r.clone());
-                false
-            } else {
-                true
-            }
-        });
-        rows.push(host.clone());
-        rows
-    }) {
-        let _ = keys::remove(&host.key_id, storage);
-        return Err(e);
-    }
-    for previous in old {
-        if let Ok(client) = previous.client() {
-            let _ = rt.block_on(client.revoke_self());
-        }
-        let _ = previous.forget();
-    }
-    Ok(host)
+    })
 }
 
 #[derive(Deserialize)]

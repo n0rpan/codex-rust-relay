@@ -17,7 +17,7 @@ Worktree `/home/oscar/Work/ox-multi-host`, branch `feat/multi-host`, based on `f
 
 | Milestone | Evidence still needed |
 | --- | --- |
-| 1. Identity and first remote host | Real native tailnet pairing, macOS credential storage, terminal and Codex/Claude turns through reconnect. Linux first-frame, signed gateway, attachment bytes and adjacent hello fixtures pass. |
+| 1. Identity and first remote host | Real tailnet pairing and macOS credential storage on two physical machines. Linux native TLS fixtures cover remote PTYs and stock Codex/Claude turns through reconnect. Linux first-frame, signed gateway, attachment bytes and adjacent hello fixtures pass. |
 | 2. Multiple hosts | Live multi-machine acceptance, sidebar and palette integration, host labels, repository matching. Host-keyed inbox, offline catalog, stored project and client-only window implemented. |
 | 3. Host policy | Host enforcement on session opens, changes, workers and handoffs, signed settings and CLI, asks on all clients, stamps and ceiling tests |
 | 4. Resources | Host metrics and live subscription, UI, agent listing, placement evidence |
@@ -27,7 +27,7 @@ Worktree `/home/oscar/Work/ox-multi-host`, branch `feat/multi-host`, based on `f
 
 ## Verification
 
-Verification entries below refer to the worktree above. Real-machine macOS/Linux and authenticated runtime scenarios are pending.
+Verification entries below refer to the worktree above. Physical macOS/Linux and subscription sign-in scenarios are pending.
 
 - The CLI settings integration test sent a synthetic provider and Brave Search key between two isolated homes. It covers the active environment credential, atomic batch rejection, a changed destination revision, scope mismatch, and 0600 file permissions.
 - The Linux update smoke started the real host and CLI in a temporary managed package with a synthetic staged release. It verified the headless Automatic default, Dev/Stable selection, idle reservation, cancellation, and an in-place exec on the same PID with the old generation available for recovery. No production account, package, or service was used.
@@ -42,3 +42,5 @@ Verification entries below refer to the worktree above. Real-machine macOS/Linux
 - Remote projects and worker navigation indexes belong to each host view. On reopening a project the desktop re-registers its path with the host, including after a restart. Desktop pairing can open a folder on a fresh host before the first runtime sign-in.
 - Wave 3 was reviewed by Claude Opus 5.5 on the subscription (OX job 3784552356265470). It returned its findings directly. Remote slash commands now use the host-validated native command path. An offline or revoked host can be forgotten locally, and failed enrollment attempts try to revoke the new registration. Terminal status preserves the host's reason for refusal.
 - Plain pairing keeps shell access off. I think that distinction is worth keeping because a terminal can operate outside a project. On a headless host, the owner can use `ox host pair --terminal` to include shell access and subscription sign-in in the initial invitation. This saves a second trip to the server. Invitations minted remotely still carry the ordinary device grant.
+
+- Wave 4 was reviewed directly by Claude Opus 5.5 on the subscription (OX job 3569146683615105). The native acceptance fixture pairs over TLS, transfers a synthetic Brave key, checks stable host identity, previews and runs a remote PTY, and revokes the desktop. Stock Claude and Codex each request permission in a temporary project, survive a desktop disconnect, and complete only after the reconnected desktop answers the pending ask. Both run against local fixture providers. Five consecutive stock runs passed on Linux. CI uses the packaged host when available. Review fixes isolate the test CA and home, correlate completion to the approved thread, and keep the desktop continuity job independent. Production DNS, publicly trusted Tailscale certificates and macOS Keychain still need physical acceptance.

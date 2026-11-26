@@ -180,13 +180,20 @@ jobs:
         if: runner.os == 'Linux' && !cancelled() && steps.window-tests.outcome == 'success'
         id: browser
         run: desktop/ci/browser-runtime.sh
-      - name: Exercise mobile PWA and desktop continuity through the packaged host
+      - name: Exercise the mobile PWA and signed native desktop client
         if: runner.os == 'Linux' && !cancelled() && steps.browser.outcome == 'success'
         env:
           FIXTURE: ${{ steps.window-tests.outputs.dir }}
           OX_TEST_CARGO_PROFILE: release
         run: |
+          export OX_TEST_OX_BIN="$FIXTURE/ox-desktop/ox" OX_TEST_HOST_BIN="$FIXTURE/ox-desktop/ox-host"
+          export CODEOX_TEST_CODEX_BIN="$FIXTURE/node_modules/.bin/codex" OX_TEST_CLAUDE_BIN="$FIXTURE/node_modules/.bin/claude"
           desktop/ox-host-web/tests/check.sh
+      - name: Exercise desktop continuity through the packaged host
+        if: runner.os == 'Linux' && !cancelled() && steps.window-tests.outcome == 'success'
+        env:
+          FIXTURE: ${{ steps.window-tests.outputs.dir }}
+        run: |
           python3 desktop/ci/quarantine.py host_continuity_window -- xvfb-run -a -s '-screen 0 1280x900x24' python3 desktop/tests/host_continuity_window.py \
             "$FIXTURE/ox-desktop/ox-desktop" "$FIXTURE/node_modules/.bin/claude"
       - name: Exercise concurrent stock sessions in the packaged Linux window

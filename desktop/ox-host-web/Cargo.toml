@@ -33,6 +33,7 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"], 
 web-push-native = { version = "0.5", default-features = false, optional = true }
 
 [dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1", features = ["test-util"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
