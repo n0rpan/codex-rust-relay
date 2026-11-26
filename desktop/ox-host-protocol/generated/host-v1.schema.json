@@ -966,6 +966,24 @@
         },
         {
           "additionalProperties": false,
+          "description": "The interface this connection's person uses. Send it once, after a host hello that\nlists `surface::CAPABILITY`; an older host rejects the frame. The phone bridge\ndeclares the phone itself and never forwards a phone's own declaration. A\nconnection that declares nothing is stamped as an unknown OX client.",
+          "properties": {
+            "surface": {
+              "$ref": "#/$defs/Surface"
+            },
+            "type": {
+              "const": "surface",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "surface"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "properties": {
             "type": {
               "const": "watch_catalog",
@@ -2095,6 +2113,14 @@
         "type"
       ],
       "type": "object"
+    },
+    "Surface": {
+      "description": "The interface a person is using. Declared by the desktop for itself, and by the\nauthenticated phone bridge on behalf of the phone.",
+      "enum": [
+        "desktop",
+        "phone"
+      ],
+      "type": "string"
     },
     "ThreadRow": {
       "properties": {

@@ -17,6 +17,7 @@ use ox_desk_core::{
     origin::{Origin, ParentCall, WorkerMode, WorkerStart},
     runtime::RequestId,
     store::{Connection, Store},
+    surface::Sender,
 };
 use serde_json::{Value, json};
 use std::{
@@ -126,7 +127,19 @@ pub(crate) enum Payload {
         text: String,
         items: Vec<Value>,
         record: String,
+        /// The surface of the client that requested the handoff, if it declared one.
+        from: Option<ox_desk_core::surface::Surface>,
     },
+}
+impl Payload {
+    /// Who the first turn comes from: the launching agent's task for a worker, or the
+    /// person who requested a handoff.
+    fn sender(&self) -> Sender {
+        match self {
+            Self::Worker(_) => Sender::WorkerTask,
+            Self::Handoff { from, .. } => Sender::Handoff { from: *from },
+        }
+    }
 }
 /// A worker launch or handoff accepted by policy, waiting for its runtime to create the session.
 pub(crate) struct Launching {
@@ -155,6 +168,8 @@ struct Preparing {
     start: HandoffStart,
     reply: Replier,
     device: String,
+    /// The requesting client's declared surface.
+    surface: Option<ox_desk_core::surface::Surface>,
     deadline: Instant,
     /// The target's context window, looked up off the engine thread. The outer
     /// None means the lookup is still running.
@@ -185,6 +200,9 @@ struct ClientState {
     catalog: bool,
     /// A desktop window that may take a terminal handoff held for its scope.
     terminal: bool,
+    /// The interface this connection declared after its hello. None for an older
+    /// client or a relay-only consumer: their sends are stamped `Sender::Unknown`.
+    surface: Option<ox_desk_core::surface::Surface>,
 }
 struct Live {
     launching: Option<Launching>,
@@ -508,6 +526,7 @@ impl Engine {
                             subscription: None,
                             catalog: false,
                             terminal: false,
+                            surface: None,
                         },
                     );
                 }
@@ -556,6 +575,11 @@ impl Engine {
         }
         self.running.clear();
         Ok(())
+    }
+    /// The stamp for a person's send on connection `id`: its declared surface, or an
+    /// unknown OX client when it declared none.
+    fn sender(&self, id: u64) -> Sender {
+        Sender::from_client(self.clients.get(&id).and_then(|c| c.surface))
     }
     fn reply(&mut self, id: u64, frame: Server) -> io::Result<()> {
         if let Some(client) = self.clients.get(&id)
@@ -615,6 +639,7 @@ impl Engine {
                             "live_catalog",
                             "end",
                             "processes",
+                            ox_desk_core::surface::CAPABILITY,
                         ]
                         .map(str::to_owned)
                         .into(),
@@ -658,6 +683,19 @@ impl Engine {
                             message: e.to_string(),
                         },
                     ),
+                }
+            }
+            Client::Surface { surface } => {
+                let client = self.clients.get_mut(&id).expect("connected");
+                match client.surface {
+                    None => {
+                        client.surface = Some(surface);
+                        Ok(())
+                    }
+                    Some(declared) if declared == surface => Ok(()),
+                    Some(_) => Err(io::Error::other(
+                        "This connection already declared a different surface",
+                    )),
                 }
             }
             Client::ListProcesses { id: key } => {
@@ -1270,7 +1308,11 @@ impl Engine {
         {
             live.store.adopt_catalog_row(row)?;
         }
-        live.store.dispatch(action)?;
+        // The stamp describes who sent this message. It is fixed here, at acceptance, and
+        // travels with the message; it never enters the digest or an authorization check.
+        let sender = self.sender(id);
+        let live = self.running.get_mut(scope).expect("validated live scope");
+        live.store.dispatch_as(action, sender)?;
         if fork && let (Some(origin), Some(source)) = (&origin, &target) {
             live.fork_origin = Some(origin.fork(source));
         }
@@ -2091,7 +2133,10 @@ impl Engine {
                     return Err("This worker is not accepting input.".into());
                 }
                 live.store
-                    .dispatch(Action::SendText(Some(id), text.to_owned()))
+                    .dispatch_as(
+                        Action::SendText(Some(id), text.to_owned()),
+                        Sender::ParentAgent,
+                    )
                     .map_err(|e| e.to_string())?;
                 self.process(&scope, vec![], true)
                     .map_err(|e| e.to_string())?;
@@ -2617,6 +2662,7 @@ fn advance_launch(live: &mut Live) -> Option<String> {
                 return None;
             }
             l.stage = Stage::Sent;
+            let sender = l.payload.sender();
             let action = match &mut l.payload {
                 Payload::Worker(start) => Action::SendText(None, start.prompt()),
                 Payload::Handoff { text, items, .. } => {
@@ -2625,7 +2671,7 @@ fn advance_launch(live: &mut Live) -> Option<String> {
             };
             return live
                 .store
-                .send_on_worker_blank(action)
+                .send_on_worker_blank(action, sender)
                 .err()
                 .map(|e| e.to_string());
         }
@@ -2659,6 +2705,7 @@ fn advance_launch(live: &mut Live) -> Option<String> {
                     || live.store.applied_access(None) == Some(preset)) =>
         {
             l.stage = Stage::Sent;
+            let sender = l.payload.sender();
             let action = match &mut l.payload {
                 Payload::Worker(start) if start.mode == WorkerMode::Goal => {
                     Action::NativeCommand(None, start.prompt())
@@ -2668,7 +2715,10 @@ fn advance_launch(live: &mut Live) -> Option<String> {
                     Action::InjectHandoff(std::mem::take(text), std::mem::take(items))
                 }
             };
-            live.store.dispatch(action).err().map(|e| e.to_string())
+            live.store
+                .dispatch_as(action, sender)
+                .err()
+                .map(|e| e.to_string())
         }
         _ => None,
     }
@@ -2941,6 +2991,7 @@ mod tests {
                 subscription: None,
                 catalog: false,
                 terminal: false,
+                surface: None,
             },
         );
         let (mailbox, rx) = std::sync::mpsc::sync_channel(64);
@@ -3036,6 +3087,7 @@ mod tests {
                 subscription: Some(Some(scope.clone())),
                 catalog: false,
                 terminal: false,
+                surface: None,
             },
         );
         let act = |approval: Option<String>| Client::Act {
@@ -3055,6 +3107,107 @@ mod tests {
         assert!(
             matches!(sent.as_slice(), [Server::Error { .. }, Server::Ack { .. }]),
             "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_connection_declares_its_surface_once_after_a_hello_that_offers_it() {
+        use ox_desk_core::surface::{CAPABILITY, Surface};
+        let root = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig {
+            ox: "/usr/bin/false".into(),
+            path: "/bin".into(),
+            desktop: root.path().into(),
+        };
+        let (tx, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut engine = Engine::open(config, root.path(), tx).unwrap();
+        let mut frames = vec![];
+        for id in [1, 2] {
+            let (peer, rx) = crate::transport::test_peer();
+            engine.clients.insert(
+                id,
+                ClientState {
+                    peer,
+                    hello: false,
+                    prepared: None,
+                    subscription: None,
+                    catalog: false,
+                    terminal: false,
+                    surface: None,
+                },
+            );
+            frames.push(rx);
+        }
+        let declare = |surface| Client::Surface { surface };
+        // Nothing is accepted before the hello.
+        assert!(engine.request(1, declare(Surface::Phone)).is_err());
+        engine
+            .request(
+                1,
+                Client::Hello {
+                    version: wire::VERSION,
+                },
+            )
+            .unwrap();
+        let hello: Server = serde_json::from_slice(&frames[0].try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(&hello, Server::Hello { capabilities, .. } if capabilities.iter().any(|c| c == CAPABILITY)),
+            "{hello:?}"
+        );
+        engine.request(1, declare(Surface::Phone)).unwrap();
+        engine.request(1, declare(Surface::Phone)).unwrap();
+        assert!(
+            engine.request(1, declare(Surface::Desktop)).is_err(),
+            "a connection cannot change who it speaks for"
+        );
+        assert_eq!(
+            engine.sender(1),
+            Sender::Person {
+                surface: Surface::Phone
+            }
+        );
+        // An older client never declares: generic OX guidance, no surface claim.
+        engine
+            .request(
+                2,
+                Client::Hello {
+                    version: wire::VERSION,
+                },
+            )
+            .unwrap();
+        assert_eq!(engine.sender(2), Sender::Unknown);
+        assert!(
+            serde_json::from_str::<Client>(r#"{"type":"surface","surface":"desktop","x":1}"#)
+                .is_err(),
+            "the wire still rejects unknown fields"
+        );
+    }
+
+    #[test]
+    fn internal_dispatch_paths_name_their_own_sender() {
+        let worker = Payload::Worker(WorkerStart {
+            parent: "p".into(),
+            runtime: ox_desk_core::runtime::Runtime::Codex,
+            model: None,
+            mode: WorkerMode::Session,
+            task: "review".into(),
+            write: None,
+            permission: None,
+            yolo_confirmed: false,
+            max_minutes: None,
+        });
+        assert_eq!(worker.sender(), Sender::WorkerTask);
+        let handoff = Payload::Handoff {
+            text: String::new(),
+            items: vec![],
+            record: "r".into(),
+            from: Some(ox_desk_core::surface::Surface::Desktop),
+        };
+        assert_eq!(
+            handoff.sender(),
+            Sender::Handoff {
+                from: Some(ox_desk_core::surface::Surface::Desktop)
+            }
         );
     }
 
@@ -3083,6 +3236,7 @@ mod tests {
                     subscription,
                     catalog,
                     terminal: false,
+                    surface: None,
                 },
             );
             frames
@@ -3620,6 +3774,7 @@ mod tests {
                         subscription: Some(Some(worker.clone())),
                         catalog: false,
                         terminal: false,
+                        surface: None,
                     },
                 );
             }
@@ -5375,6 +5530,7 @@ for line in sys.stdin:
                     text: "carry on".into(),
                     items: vec![],
                     record: "h1".into(),
+                    from: None,
                 },
                 reply: Replier::Channel(reply),
                 stage: Stage::Opening,
@@ -5571,7 +5727,10 @@ for line in sys.stdin:
                 "kept for its launch"
             );
             live.store
-                .send_on_worker_blank(Action::SendText(None, "worker task".into()))
+                .send_on_worker_blank(
+                    Action::SendText(None, "worker task".into()),
+                    Sender::WorkerTask,
+                )
                 .unwrap();
             let worker = live.store.take_opened().unwrap();
             assert_ne!(worker, other);
@@ -5614,7 +5773,10 @@ for line in sys.stdin:
             });
             let live = engine.running.get_mut(&scope).unwrap();
             live.store
-                .send_on_worker_blank(Action::SendText(None, "worker task".into()))
+                .send_on_worker_blank(
+                    Action::SendText(None, "worker task".into()),
+                    Sender::WorkerTask,
+                )
                 .unwrap();
             let worker = live.store.take_opened().unwrap();
             let raw = worker.rsplit(':').next().unwrap().to_owned();
@@ -5804,6 +5966,7 @@ for line in sys.stdin:
                     subscription: Some(Some(scope.clone())),
                     catalog: false,
                     terminal: false,
+                    surface: None,
                 },
             );
             for (key, action) in [
@@ -6081,6 +6244,7 @@ for line in sys.stdin:
                         subscription: None,
                         catalog: false,
                         terminal,
+                        surface: None,
                     },
                     frames,
                 )
@@ -6140,6 +6304,7 @@ for line in sys.stdin:
                     subscription: None,
                     catalog: false,
                     terminal: false,
+                    surface: None,
                 },
             );
             engine.subscribe(9, None, None).unwrap();

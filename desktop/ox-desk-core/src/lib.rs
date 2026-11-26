@@ -19,6 +19,7 @@ pub mod perf;
 pub mod ports;
 pub mod slash;
 pub mod store;
+pub mod surface;
 pub mod transcript;
 
 pub mod keys;

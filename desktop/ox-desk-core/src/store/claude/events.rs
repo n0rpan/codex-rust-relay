@@ -951,6 +951,35 @@ mod tests {
         assert_eq!(s.draft(Some(&a)), "back again");
         assert!(!s.claude().sessions.contains_key(&a));
     }
+    #[test]
+    fn a_resumed_claude_send_waits_with_its_sender_statement() {
+        let (mut s, a, _b) = fixture();
+        s.claude_mut().deliver = Arc::new(|_| ());
+        s.state = Connection::Ready;
+        s.end_session(&a).unwrap();
+        s.edit(Some(&a), "from the phone".into());
+        s.dispatch_as(
+            crate::actions::Action::Submit(Some(a.clone())),
+            crate::surface::Sender::Person {
+                surface: crate::surface::Surface::Phone,
+            },
+        )
+        .unwrap();
+        let process = &s.claude().sessions[&a];
+        assert_eq!(
+            process.first.as_ref().map(|f| f.1.as_str()),
+            Some("from the phone"),
+            "the user text is unchanged"
+        );
+        assert!(
+            process
+                .first_context
+                .as_deref()
+                .is_some_and(|c| c.contains("OX phone app")),
+            "{:?}",
+            process.first_context
+        );
+    }
     /// A host reaps an idle route and reopens it for the next send: the new store is still
     /// connecting, its catalog holds the saved row and no process exists for it yet.
     #[test]

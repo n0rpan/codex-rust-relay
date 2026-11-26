@@ -91,7 +91,21 @@ fn open_handshake(paths: &Paths) -> io::Result<(BufReader<UnixStream>, UnixStrea
         }
     };
     socket.set_read_timeout(None)?;
+    declare_surface(&mut socket, &caps)?;
     Ok((input, socket, caps))
+}
+/// Tell a host that negotiates it that a person on OX Desktop uses this connection. An
+/// older host rejects the frame, so it is sent only when the hello lists the capability.
+fn declare_surface(out: &mut impl Write, caps: &[String]) -> io::Result<()> {
+    if caps.iter().any(|c| c == ox_desk_core::surface::CAPABILITY) {
+        write_frame(
+            out,
+            &Client::Surface {
+                surface: ox_desk_core::surface::Surface::Desktop,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn open_store(
@@ -314,6 +328,18 @@ pub(crate) use catalog::{CatalogEvent, CatalogWatch, watch_catalog};
 mod process_monitor_tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn the_desktop_declares_itself_only_to_a_host_that_negotiates_it() {
+        let mut out = Vec::new();
+        declare_surface(&mut out, &["snapshot".into()]).unwrap();
+        assert!(out.is_empty(), "an older host would reject the frame");
+        declare_surface(&mut out, &[ox_desk_core::surface::CAPABILITY.into()]).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"type\":\"surface\",\"surface\":\"desktop\"}\n"
+        );
+    }
 
     #[test]
     fn polls_reuse_the_handshake_and_reconnect_after_host_exit() {

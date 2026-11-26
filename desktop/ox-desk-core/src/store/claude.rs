@@ -70,6 +70,9 @@ struct Process {
     mode: Option<Access>,
     controls: HashMap<String, Control>,
     first: Option<(String, String)>,
+    /// The sender statement of `first`, fixed when the host accepted that message. It
+    /// waits with the message while the process starts, and goes out with it.
+    first_context: Option<String>,
     /// The permission mode this process was launched with.
     #[cfg_attr(not(test), allow(dead_code))]
     launch_mode: String,
@@ -348,12 +351,16 @@ impl Store {
         }
     }
     /// Send a launch's first turn on its dedicated process and nowhere else.
-    pub fn send_on_worker_blank(&mut self, action: crate::actions::Action) -> io::Result<()> {
+    pub fn send_on_worker_blank(
+        &mut self,
+        action: crate::actions::Action,
+        sender: crate::surface::Sender,
+    ) -> io::Result<()> {
         let Some(owner) = self.claude_mut().worker_blank.take() else {
             return Err(io::Error::other("The worker's runtime is not prepared"));
         };
         let normal = self.claude_mut().blank.replace(owner);
-        let result = self.dispatch(action);
+        let result = self.dispatch_as(action, sender);
         // The send consumed the dedicated process; the normal draft stays as it was.
         let p = self.claude_mut();
         p.blank = normal;
@@ -580,6 +587,7 @@ impl Store {
         }
         .or_else(|| contract.map(|c| c.permission_mode().to_owned()))
         .unwrap_or_else(|| "default".to_owned());
+        let first_context = first.as_ref().and_then(|_| self.sender_context());
         let p = self.claude_mut();
         p.serial += 1;
         let generation = p.serial;
@@ -591,6 +599,7 @@ impl Store {
             Process {
                 generation,
                 first,
+                first_context,
                 launch_mode: mode.clone(),
                 ..Default::default()
             },
@@ -772,11 +781,14 @@ impl Store {
         }
         self.selected = Some(owner.clone());
         self.selection += 1;
-        self.claude_mut()
+        let context = self.sender_context();
+        let process = self
+            .claude_mut()
             .sessions
             .get_mut(&owner)
-            .ok_or_else(|| io::Error::other("Reconnect the session before sending"))?
-            .first = Some((message, text));
+            .ok_or_else(|| io::Error::other("Reconnect the session before sending"))?;
+        process.first = Some((message, text));
+        process.first_context = context;
         self.flush_claude(&owner)?;
         if id.is_none() {
             self.host_opened = Some(owner.clone());
@@ -801,12 +813,13 @@ impl Store {
         let Some((id, text)) = process.first.as_ref() else {
             return Ok(());
         };
-        process
-            .link
-            .as_ref()
-            .unwrap()
-            .send_user(id, vec![json!({"type":"text","text":text})])?;
+        process.link.as_ref().unwrap().send_user_with_context(
+            id,
+            vec![json!({"type":"text","text":text})],
+            process.first_context.as_deref(),
+        )?;
         let (id, text) = process.first.take().unwrap();
+        process.first_context = None;
         process.events.sent(&id, &text);
         let transcript = self.transcripts.get_mut(owner).unwrap();
         let turn = transcript

@@ -494,6 +494,7 @@ impl Engine {
             start,
             reply: Replier::Client(client, key.to_owned()),
             device: format!("client-{client}"),
+            surface: self.clients.get(&client).and_then(|c| c.surface),
             deadline: Instant::now() + LOAD_WAIT,
             window,
             window_deadline: Instant::now() + WINDOW_WAIT,
@@ -508,6 +509,7 @@ impl Engine {
             start,
             reply,
             device,
+            surface,
             window,
             ..
         } = prep;
@@ -635,6 +637,7 @@ impl Engine {
             text,
             items: carried,
             record: record.clone(),
+            from: surface,
         };
         let mut l = match self.prepare_launch(&target, origin.clone(), payload) {
             Ok(l) => l,

@@ -91,6 +91,11 @@ pub struct Store {
     ended_threads: HashSet<String>,
     /// Ended threads a message is waiting on: reopened, and the draft is sent once ready.
     resume_sends: HashSet<String>,
+    /// The host's stamp on the action being dispatched now. Each submit copies it, so a
+    /// queued or deferred message keeps the sender that was current when it was accepted.
+    sender: Option<crate::surface::Sender>,
+    /// The stamp of each message waiting in `resume_sends`.
+    resume_senders: HashMap<String, crate::surface::Sender>,
     /// The Claude access mode an ended session had when its process went away, whether
     /// this client ended it or the host reaped the idle route. A send that reopens the
     /// session starts it in that mode; opening it from the list does not (see
@@ -191,6 +196,8 @@ impl Store {
             terminal_threads: Default::default(),
             ended_threads: Default::default(),
             resume_sends: Default::default(),
+            sender: None,
+            resume_senders: Default::default(),
             resume_access: Default::default(),
             restored_drafts: Default::default(),
             worker_contracts: Default::default(),
