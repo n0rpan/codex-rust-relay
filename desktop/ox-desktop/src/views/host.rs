@@ -2,8 +2,8 @@
 //! server requests and connection for the lifetime of the window.
 use crate::appearance::Step;
 mod discovery;
-pub(super) use discovery::TreeIndex;
 use discovery::{Discovery, Location, Scope};
+pub(super) use discovery::{ParentIndex, ParentLink, TreeIndex};
 pub(crate) mod layout;
 mod palette;
 mod shortcuts;
@@ -1366,6 +1366,10 @@ impl Host {
                 continue;
             };
             let (route, status) = self.project_row_state(project, t, scope, cx);
+            let confirmed_model = match entry {
+                CatalogEntry::Thread { loc, .. } => self.actual_model_at(loc, cx),
+                CatalogEntry::Day { .. } => None,
+            };
             let api = scope.api;
             let badge = {
                 route.as_ref().map_or_else(
@@ -1388,10 +1392,28 @@ impl Host {
                     },
                 )
             };
+            let badge = match confirmed_model {
+                Some(model) => format!("{badge} · {model}"),
+                None => badge,
+            };
             let tree = cx
                 .try_global::<TreeIndex>()
                 .and_then(|index| index.0.get(&(project.to_path_buf(), t.id.clone())))
                 .cloned();
+            // A worker whose parent is hidden by the current filter keeps a
+            // readable return reference; opening it shows the full parent link.
+            let parent_hint = cx
+                .try_global::<ParentIndex>()
+                .and_then(|index| index.0.get(&(project.to_path_buf(), t.id.clone())))
+                .map(|link| {
+                    link.title.clone().unwrap_or_else(|| {
+                        link.project
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                });
             let row = t.clone();
             let project = project.to_owned();
             let fold_key = (project.clone(), t.id.clone());
@@ -1416,7 +1438,11 @@ impl Host {
                 cartridge,
                 title: t.title().into(),
                 route: {
-                    let mut route = if !t.worker && t.parent_thread_id.is_some() {
+                    let mut route = if depth == 0
+                        && let Some(hint) = parent_hint
+                    {
+                        format!("↳ {hint} · {badge}")
+                    } else if !t.worker && t.parent_thread_id.is_some() {
                         format!("Subagent · {badge}")
                     } else {
                         format!(

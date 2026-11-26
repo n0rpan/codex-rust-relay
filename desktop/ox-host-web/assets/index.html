@@ -220,6 +220,12 @@
               <label for="native-command">Native command</label>
               <select id="native-command"></select>
               <input
+                id="typed-native-command"
+                aria-label="Claude slash command and arguments"
+                placeholder="/command [arguments]"
+                hidden
+              />
+              <input
                 id="command-args"
                 aria-label="Command arguments"
                 placeholder="Arguments (optional)"

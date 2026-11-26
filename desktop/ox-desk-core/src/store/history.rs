@@ -290,7 +290,8 @@ impl Store {
             t.model = Some(reply.model);
             t.tier = reply.service_tier;
             t.effort = reply.reasoning_effort;
-            t.access = Some(reply.access);
+            t.access = Some(reply.permissions.access);
+            t.ceiling = reply.permissions.ceiling;
             t.verified = true;
             if let Some(page) = initial {
                 t.add_history(page)?;

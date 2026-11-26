@@ -51,6 +51,34 @@ pub(crate) struct Marks {
     /// continuation. Expiry measures this, not the original launch.
     #[serde(default)]
     pub run_started_at: i64,
+    /// The model that answered the worker's first top-level turn, as the runtime
+    /// reported it. Absent (pending) until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_model: Option<String>,
+    /// Other models that answered later top-level turns, such as a runtime fallback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub also_answered: Vec<String>,
+}
+impl Marks {
+    /// Whether every one of these answering models is already recorded.
+    pub fn has_models(&self, models: &[String]) -> bool {
+        models
+            .iter()
+            .all(|m| self.actual_model.as_ref() == Some(m) || self.also_answered.contains(m))
+    }
+    /// Record answering models in first-answer order. The first one stays the actual model.
+    pub fn record_models(&mut self, models: &[String]) {
+        for m in models {
+            if self.actual_model.is_none() {
+                self.actual_model = Some(m.clone());
+            } else if self.actual_model.as_ref() != Some(m)
+                && !self.also_answered.contains(m)
+                && self.also_answered.len() < 8
+            {
+                self.also_answered.push(m.clone());
+            }
+        }
+    }
 }
 /// The recorded end of a worker's latest run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -61,6 +89,49 @@ pub(crate) struct Last {
     pub result: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The model that actually answered, as recorded when the run ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// Who pays for a worker and which model it was asked for, pinned to and answered
+/// with. The requested choice, billing route and actual model are separate facts:
+/// `actual_model` stays null and `model_state` `pending` until the runtime answers.
+pub(crate) fn model_report(entry: &Entry) -> Value {
+    use ox_desk_core::{claude_models, runtime::Billing};
+    let o = &entry.origin;
+    let m = &entry.marks;
+    let (billing, requested) = match &o.route.billing {
+        Billing::Api(alias) => ("api", Some(alias.as_str())),
+        Billing::Subscription => ("subscription", o.requested_model.as_deref()),
+    };
+    let pinned = o.pinned_model.as_deref();
+    let actual = m.actual_model.as_deref();
+    let mut state = claude_models::model_state(pinned, actual);
+    let mut warning = pinned
+        .zip(actual)
+        .filter(|_| state == "differs")
+        .map(|(p, a)| claude_models::differs_warning(p, a));
+    if let Some(p) = pinned
+        && state == "confirmed"
+        && let Some(other) = m
+            .also_answered
+            .iter()
+            .find(|a| !claude_models::same_model(p, a))
+    {
+        state = "differs";
+        warning = Some(claude_models::differs_warning(p, other));
+    }
+    json!({
+        "billing": billing,
+        "billing_label": o.route.label(),
+        "requested_model": requested,
+        "pinned_model": pinned,
+        "actual_model": actual,
+        "also_answered": m.also_answered,
+        "model_state": state,
+        "model_warning": warning,
+    })
 }
 
 /// A worker limit from an environment variable. Unset, zero or unparsable means no
@@ -180,15 +251,11 @@ impl Registry {
     }
 }
 
-/// The level a hosted source grants its children: its confirmed live mode,
-/// further bounded by its own stamp when it is a worker or a fork of one. An
-/// unverified mode grants nothing.
-pub(crate) fn source_level(
-    runtime: Runtime,
-    access: Option<Access>,
-    origin: Option<&Origin>,
-) -> Option<Level> {
-    let live = Level::of(runtime, access?)?;
+/// The level a hosted source grants its children: the ceiling of its live
+/// settings (see `Store::applied_ceiling`), further bounded by its own stamp
+/// when it is a worker or a fork of one. An unverified mode grants nothing.
+pub(crate) fn source_level(live: Option<Level>, origin: Option<&Origin>) -> Option<Level> {
+    let live = live?;
     Some(match origin.and_then(Origin::limits_children) {
         Some(stamp) => live.min(stamp),
         None => live,
@@ -340,6 +407,8 @@ pub(crate) fn origin(
         decided: Some(resolved.decision),
         yolo: None,
         handoff: None,
+        requested_model: start.subscription_model.clone(),
+        pinned_model: None,
     }
 }
 
@@ -399,7 +468,7 @@ pub(crate) fn status(
             // A stopped Workflow can exit before calling its tool.
             _ if finished && stopped => "interrupted",
             _ if finished && workflow_unrun(o.mode, timeline) => "failed",
-            _ if finished || timeline.is_none() => "completed",
+            _ if finished => "completed",
             _ => "running",
         }
     };
@@ -414,7 +483,8 @@ pub(crate) fn status(
     // interrupted, answers from the record: a reopened route that lists the session
     // without its history (an unrelated sibling opened it) must not turn a recorded
     // failure into a success.
-    if (status == "interrupted" && !stopped || timeline.is_none() && status == "completed")
+    if (status == "interrupted" && !stopped
+        || timeline.is_none() && row != "running" && row != "needs_input" && status == "running")
         && let Some(last) = recorded
     {
         status = match last.status.as_str() {
@@ -424,6 +494,8 @@ pub(crate) fn status(
         };
     }
     let progress = match row {
+        _ if status == "cancelled" => "",
+        _ if status == "running" && timeline.is_none() && row != "running" => "Starting worker",
         "needs_input" => "Waiting for the operator to answer a request",
         "running" => "Working",
         _ if status == "interrupted" && stopped => {
@@ -494,7 +566,7 @@ pub(crate) fn status(
             "message": message,
         })
     });
-    json!({
+    let mut report = json!({
         "waiting_for_operator": waiting,
         "job_id": o.job_id,
         "mode": o.mode,
@@ -521,7 +593,11 @@ pub(crate) fn status(
         "error": error,
         "operator": operator,
         "messages": [],
-    })
+    });
+    if let (Some(out), Value::Object(model)) = (report.as_object_mut(), model_report(entry)) {
+        out.extend(model);
+    }
+    report
 }
 
 #[cfg(test)]
@@ -557,6 +633,8 @@ mod tests {
             decided: None,
             yolo: None,
             handoff: None,
+            requested_model: None,
+            pinned_model: None,
         }
     }
 
@@ -567,8 +645,8 @@ mod tests {
     #[test]
     fn workers_inherit_the_mapped_source_mode_and_unverified_modes_grant_nothing() {
         use ModeRequest::Inherit;
-        let codex = |a| source_level(Runtime::Codex, Some(a), None);
-        let claude = |a| source_level(Runtime::Claude, Some(a), None);
+        let codex = |a| source_level(Level::of(Runtime::Codex, a), None);
+        let claude = |a| source_level(Level::of(Runtime::Claude, a), None);
         // Workspace and Accept edits inherit across runtimes as each other.
         assert_eq!(
             level(grant(
@@ -598,7 +676,7 @@ mod tests {
             Ok((Level::Yolo, Access::BypassPermissions))
         );
         // Unverified or foreign presets grant nothing.
-        assert_eq!(source_level(Runtime::Codex, None, None), None);
+        assert_eq!(source_level(None, None), None);
         assert_eq!(codex(Access::Configured), None);
         assert_eq!(codex(Access::AcceptEdits), None);
         assert!(grant(None, false, Inherit, Runtime::Codex).is_err());
@@ -608,7 +686,7 @@ mod tests {
     #[test]
     fn requests_above_the_source_are_refused_and_lower_ones_start_there() {
         let c = Runtime::Codex;
-        let src = source_level(c, Some(Access::Workspace), None);
+        let src = source_level(Level::of(c, Access::Workspace), None);
         assert_eq!(
             level(grant(src, false, ModeRequest::Level(Level::Read), c)),
             Ok((Level::Read, Access::ReadOnly))
@@ -623,7 +701,7 @@ mod tests {
             assert!(grant(src, false, ModeRequest::Level(above), c).is_err());
         }
         // Legacy workspace_write: false is read, true is write, never above the source.
-        let read = source_level(c, Some(Access::ReadOnly), None);
+        let read = source_level(Level::of(c, Access::ReadOnly), None);
         assert!(grant(read, false, ModeRequest::legacy(Some(true)), c).is_err());
         assert_eq!(
             level(grant(read, false, ModeRequest::legacy(Some(false)), c)),
@@ -650,17 +728,17 @@ mod tests {
     fn ceilings_are_inherited_through_children_forks_and_continuation() {
         let read = worker(Level::Read, Runtime::Codex);
         // A read worker switched to YOLO by its operator still gives its children only read.
-        let src = source_level(Runtime::Codex, Some(Access::Yolo), Some(&read));
+        let src = source_level(Level::of(Runtime::Codex, Access::Yolo), Some(&read));
         assert_eq!(src, Some(Level::Read));
         assert!(grant(src, false, ModeRequest::Level(Level::Write), Runtime::Codex).is_err());
         let write = worker(Level::Write, Runtime::Codex);
-        let src = source_level(Runtime::Codex, Some(Access::Workspace), Some(&write));
+        let src = source_level(Level::of(Runtime::Codex, Access::Workspace), Some(&write));
         assert_eq!(
             level(grant(src, false, ModeRequest::Inherit, Runtime::Claude)),
             Ok((Level::Write, Access::AcceptEdits))
         );
         // A write worker lowered to read by its operator passes on read.
-        let src = source_level(Runtime::Codex, Some(Access::ReadOnly), Some(&write));
+        let src = source_level(Level::of(Runtime::Codex, Access::ReadOnly), Some(&write));
         assert_eq!(src, Some(Level::Read));
         // Forks and forks of forks keep the original stamp's ceiling and job.
         let fork = read.fork("w1");
@@ -790,6 +868,63 @@ mod tests {
     }
 
     #[test]
+    fn status_keeps_requested_pinned_and_actual_models_apart() {
+        let mut origin = worker(Level::Read, Runtime::Claude);
+        origin.route = Runtime::Claude.route(None);
+        origin.requested_model = Some("fable".into());
+        let mut entry = Entry {
+            origin,
+            marks: Marks::default(),
+        };
+        let s = |e: &Entry| status(e, "w", "w", None, None, true, Operators::default());
+        // Before validation and before any answer: pending, nothing claimed.
+        let before = s(&entry);
+        assert_eq!(before["billing"], "subscription");
+        assert_eq!(before["billing_label"], "Claude subscription");
+        assert_eq!(before["requested_model"], "fable");
+        assert!(before["pinned_model"].is_null() && before["actual_model"].is_null());
+        assert_eq!(before["model_state"], "pending");
+        // The legacy field is unchanged for older parents.
+        assert_eq!(before["model"], "Claude subscription");
+        entry.origin.pinned_model = Some("claude-fable-5-2".into());
+        entry.marks.record_models(&["claude-fable-5-2".into()]);
+        let confirmed = s(&entry);
+        assert_eq!(confirmed["actual_model"], "claude-fable-5-2");
+        assert_eq!(confirmed["model_state"], "confirmed");
+        assert!(confirmed["model_warning"].is_null());
+        // A later fallback to another model is never silent.
+        entry
+            .marks
+            .record_models(&["claude-fable-5-2".into(), "claude-opus-5-5".into()]);
+        assert!(entry.marks.has_models(&["claude-opus-5-5".into()]));
+        let fell_back = s(&entry);
+        assert_eq!(fell_back["actual_model"], "claude-fable-5-2");
+        assert_eq!(fell_back["also_answered"], json!(["claude-opus-5-5"]));
+        assert_eq!(fell_back["model_state"], "differs");
+        assert!(
+            fell_back["model_warning"]
+                .as_str()
+                .unwrap()
+                .contains("claude-opus-5-5 answered")
+        );
+        // An API worker reports its alias as the request; who pays is the provider.
+        let api = Entry {
+            origin: worker(Level::Read, Runtime::Codex),
+            marks: Marks::default(),
+        };
+        let api = s(&api);
+        assert_eq!(
+            (api["billing"].as_str(), api["requested_model"].as_str()),
+            (Some("api"), Some("fixture"))
+        );
+        // Marks saved before models existed still load, and the record round-trips.
+        let old: Marks = serde_json::from_value(json!({"cancelled":false})).unwrap();
+        assert!(old.actual_model.is_none() && old.also_answered.is_empty());
+        let saved = serde_json::to_value(&entry.marks).unwrap();
+        assert_eq!(serde_json::from_value::<Marks>(saved).unwrap(), entry.marks);
+    }
+
+    #[test]
     fn workflow_worker_completes_only_after_the_workflow_tool_ran() {
         use ox_desk_core::host_protocol::TimelineItem;
         let mut origin = worker(Level::Write, Runtime::Claude);
@@ -899,6 +1034,7 @@ mod tests {
             status: "interrupted".into(),
             result: Some("half an answ".into()),
             error: None,
+            model: None,
         });
         let reopened = status(
             &entry,
@@ -967,6 +1103,7 @@ mod tests {
             status: "failed".into(),
             result: None,
             error: Some("bad".into()),
+            model: None,
         });
         let view = SessionView {
             id: "w".into(),
@@ -1005,6 +1142,19 @@ mod tests {
             capabilities: vec!["steer".into()],
             detail: Value::Null,
         };
+        let starting = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view("idle")),
+            None,
+            true,
+            Operators::default(),
+        );
+        assert_eq!(
+            starting["status"], "running",
+            "the worker has no completed turn yet"
+        );
         let done = Timeline {
             items: vec![ox_desk_core::host_protocol::TimelineItem {
                 turn: "t".into(),

@@ -62,6 +62,8 @@ pub(super) struct Submit {
     command: Option<ThreadCommand>,
     /// Handoff items injected after thread/start and before the first turn.
     inject: Vec<serde_json::Value>,
+    /// The sender statement for this message, fixed when the host accepted it.
+    context: Option<String>,
 }
 #[derive(Debug)]
 pub(super) enum Operation {
@@ -80,6 +82,24 @@ impl Operation {
     }
 }
 impl Store {
+    /// Dispatch an action the host accepted from `sender`. A message this submits, now or
+    /// later from a queue or a deferred resume, carries that sender's statement.
+    pub fn dispatch_as(
+        &mut self,
+        action: crate::actions::Action,
+        sender: crate::surface::Sender,
+    ) -> io::Result<crate::actions::Effect> {
+        let previous = self.sender.replace(sender);
+        let result = self.dispatch(action);
+        self.sender = previous;
+        result
+    }
+    /// The statement for a message submitted now, from the host's current stamp.
+    pub(super) fn sender_context(&self) -> Option<String> {
+        self.sender
+            .as_ref()
+            .map(|sender| sender.context(&self.profile.route))
+    }
     pub fn new_session(&mut self) {
         if self.remote().is_some() {
             if let Err(e) = self.dispatch_remote(crate::actions::Action::NewDraft) {
@@ -199,6 +219,9 @@ impl Store {
         }
         self.ended_threads.remove(id);
         self.resume_sends.insert(id.into());
+        if let Some(sender) = self.sender.clone() {
+            self.resume_senders.insert(id.into(), sender);
+        }
         let opened = if self.state == Connection::Ready {
             self.open_catalog_id(id)
         } else {
@@ -211,6 +234,7 @@ impl Store {
         };
         if let Err(error) = opened {
             self.resume_sends.remove(id);
+            self.resume_senders.remove(id);
             self.ended_threads.insert(id.into());
             return Err(error);
         }
@@ -228,7 +252,12 @@ impl Store {
         for id in waiting {
             self.resume_sends.remove(&id);
             if self.can_send(Some(&id)) {
-                if let Err(error) = self.submit(Some(&id)) {
+                // The message goes out with the stamp it was accepted with, not with
+                // whatever the host is dispatching when the thread becomes ready.
+                let previous = std::mem::replace(&mut self.sender, self.resume_senders.remove(&id));
+                let submitted = self.submit(Some(&id));
+                self.sender = previous;
+                if let Err(error) = submitted {
                     self.notice = Some(error.to_string());
                     self.changed.mark(Changed::NOTICE);
                 }
@@ -240,6 +269,7 @@ impl Store {
             if opening && t.is_none_or(|t| t.error.is_none()) {
                 self.resume_sends.insert(id);
             } else {
+                self.resume_senders.remove(&id);
                 self.ended_threads.insert(id.clone());
                 self.notice = Some(
                     "The thread did not resume. Your message is still in the composer.".into(),
@@ -359,6 +389,7 @@ impl Store {
             } else {
                 vec![]
             },
+            context: self.sender_context(),
         };
         if id.is_none() {
             let model = submit
@@ -441,12 +472,14 @@ impl Store {
                 thread: id.into(),
                 turn: turn.clone(),
                 text,
+                context: submit.context.clone(),
             },
             None => Call::Start {
                 options: submit.options.clone(),
                 images,
                 thread: id.into(),
                 text,
+                context: submit.context.clone(),
             },
         };
         self.request(call, Pending::Compose(Operation::Send(submit)))
@@ -584,6 +617,14 @@ impl Store {
         contract: crate::claude_worker_contract::Contract,
     ) {
         self.worker_contracts.entry(id.into()).or_insert(contract);
+    }
+    /// Keep a pinned Claude worker on its exact model when it is resumed or forked.
+    /// The host's validated exact ID replaces the picker value the launch passed, so
+    /// a continuation cannot drift when that value later points at another model.
+    pub fn restore_worker_model(&mut self, id: &str, model: &str) {
+        if crate::claude_models::valid_model(model) {
+            self.worker_models.insert(id.into(), model.to_owned());
+        }
     }
     pub fn restore_ended(
         &mut self,
@@ -832,7 +873,8 @@ impl Store {
             t.effort = o.effort.clone();
             t.tier = o.tier.clone();
         }
-        t.access = Some(reply.access);
+        t.access = Some(reply.permissions.access);
+        t.ceiling = reply.permissions.ceiling;
         t.verified = true;
         t.ready = true;
         s.owner = Some(id);
@@ -928,6 +970,7 @@ mod tests {
             selection: store.selection,
             command: None,
             inject: vec![],
+            context: None,
         };
         // While the thread opens, the new-chat composer gets text and an image; the operator
         // then selects another thread, so the opened thread must not take either.
@@ -1032,6 +1075,120 @@ mod tests {
             "the draft is submitted"
         );
         assert_eq!(store.draft(Some(&id)), "");
+    }
+
+    fn phone() -> crate::surface::Sender {
+        crate::surface::Sender::Person {
+            surface: crate::surface::Surface::Phone,
+        }
+    }
+    fn submitted_context(store: &Store, id: Option<&str>) -> Option<Option<String>> {
+        store.pending.values().find_map(|(_, p)| match p {
+            Pending::Compose(Operation::Account(s) | Operation::Send(s) | Operation::New(s))
+                if s.owner.as_deref() == id =>
+            {
+                Some(s.context.clone())
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_send_and_a_steer_carry_the_stamp_they_were_accepted_with() {
+        let mut store = ready();
+        let id = "thread-live".to_owned();
+        let t = store.transcripts.entry(id.clone()).or_default();
+        t.ready = true;
+        t.verified = true;
+        store
+            .dispatch_as(
+                crate::actions::Action::SendText(Some(id.clone()), "where are settings?".into()),
+                phone(),
+            )
+            .unwrap();
+        let context = submitted_context(&store, Some(&id)).unwrap().unwrap();
+        assert!(context.starts_with("This message was sent from the OX phone app."));
+        assert!(store.sender.is_none(), "the stamp is per action");
+        // The same stamp reaches the wire as one application entry; the user text is intact.
+        let Some(Pending::Compose(Operation::Account(submit))) = store
+            .pending
+            .drain()
+            .map(|(_, (_, p))| p)
+            .find(|p| matches!(p, Pending::Compose(Operation::Account(_))))
+        else {
+            panic!("account check");
+        };
+        store.transmit(submit).unwrap();
+        let Some(Pending::Compose(Operation::Send(submit))) =
+            store.pending.drain().map(|(_, (_, p))| p).next()
+        else {
+            panic!("turn/start");
+        };
+        assert_eq!(submit.context.as_deref(), Some(context.as_str()));
+
+        // A steer from the desktop while the turn runs keeps the desktop's own stamp.
+        store.drafts.remove(&Some(id.clone()));
+        let t = store.transcripts.get_mut(&id).unwrap();
+        t.active_turn = Some("turn-1".into());
+        store
+            .dispatch_as(
+                crate::actions::Action::SendText(Some(id.clone()), "also check phone".into()),
+                crate::surface::Sender::Person {
+                    surface: crate::surface::Surface::Desktop,
+                },
+            )
+            .unwrap();
+        let steer = store
+            .pending
+            .values()
+            .find_map(|(_, p)| match p {
+                Pending::Compose(Operation::Account(s)) => Some(s),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(steer.expected_turn.as_deref(), Some("turn-1"));
+        assert!(steer.context.as_deref().unwrap().contains("OX Desktop"));
+    }
+
+    #[test]
+    fn an_unstamped_send_attaches_no_context() {
+        let mut store = ready();
+        store.edit(None, "hello".into());
+        store.submit(None).unwrap();
+        assert_eq!(submitted_context(&store, None), Some(None));
+    }
+
+    #[test]
+    fn a_deferred_resume_send_keeps_its_own_stamp() {
+        let mut store = ready();
+        let id = "thread-ended".to_owned();
+        let row: crate::codex::history::ThreadRow = serde_json::from_value(serde_json::json!({
+            "id": id, "cwd": store.profile.project, "modelProvider": "openai", "preview": "hi"
+        }))
+        .unwrap();
+        store.catalog.insert(row);
+        let t = store.transcripts.entry(id.clone()).or_default();
+        t.ready = true;
+        t.verified = true;
+        store.end_session(&id).unwrap();
+        store.edit(Some(&id), "from the phone".into());
+        store
+            .dispatch_as(crate::actions::Action::Submit(Some(id.clone())), phone())
+            .unwrap();
+        assert!(store.resume_senders.contains_key(&id));
+        let t = store.transcripts.get_mut(&id).unwrap();
+        t.loading = false;
+        t.ready = true;
+        t.verified = true;
+        // The thread becomes ready while the host dispatches something from the desktop.
+        store.sender = Some(crate::surface::Sender::Person {
+            surface: crate::surface::Surface::Desktop,
+        });
+        store.drain(vec![], std::time::Instant::now());
+        store.sender = None;
+        let context = submitted_context(&store, Some(&id)).unwrap().unwrap();
+        assert!(context.contains("OX phone app"), "{context}");
+        assert!(store.resume_senders.is_empty());
     }
 
     /// The host reaped the route and reopened it for a send: the replacement store is

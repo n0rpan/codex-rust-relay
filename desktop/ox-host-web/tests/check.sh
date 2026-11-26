@@ -6,6 +6,7 @@ cd "$root"
 cargo test --profile "${OX_TEST_CARGO_PROFILE:-dev}" --manifest-path desktop/Cargo.toml --locked -p ox-host-web --features server --lib
 npx --yes --package typescript@5.9.3 tsc --noEmit --allowJs --checkJs --target es2023 \
     --module esnext --moduleResolution bundler desktop/ox-host-web/assets/{wire,model}.js
+node --test desktop/ox-host-web/tests/catalog_tree.test.mjs
 harness=$(cargo test --profile "${OX_TEST_CARGO_PROFILE:-dev}" --manifest-path desktop/Cargo.toml --locked -p ox-host-web --features server --lib \
     --no-run --message-format=json | jq -r 'select(.profile.test and .target.name=="ox_host_web" and .executable!=null) | .executable')
 profile=${OX_TEST_CARGO_PROFILE:-dev}

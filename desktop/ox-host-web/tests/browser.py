@@ -270,8 +270,13 @@ class Host(socketserver.StreamRequestHandler):
                         target["detail"]["options"].update(choice)
                         changes.append({"kind":"session", "session":target})
                     elif "native_command" in action:
-                        assert action["native_command"] == ["parent", "/status"]
-                        f.detail["notice"] = "Native status received"
+                        owner, command = action["native_command"]
+                        assert owner in ("parent", None)
+                        if command == "/only-in-terminal":
+                            send({"type":"error", "id":frame["id"], "message":"Command requires the terminal."})
+                            continue
+                        assert command in ("/status", "/project:lint src/mobile.rs")
+                        f.detail["notice"] = "Native status received" if command == "/status" else "Native lint received"
                         changes.append({"kind":"state","connection":"ready","capabilities":f.caps,"detail":f.detail})
                     if changes:
                         sequence += 1
@@ -750,7 +755,7 @@ def run(harness, screenshot=None):
                     "requested": "read", "runtime": "claude", "mode": "session", "by_operator": False,
                     "launch": "helper:fixture", "source": None,
                     "route": {"runtime": "claude", "billing": "subscription"},
-                    "parent": {"project": "/fixture", "scope": None, "session": "parent", "runtime": "claude"}}},
+                    "parent": {"project": host.scope["project"], "scope": host.scope, "session": "parent", "runtime": "claude"}}},
             },
         ]
         host.sessions.append(dict(host.sessions[0], id="disk-report", title="Rust build disk usage",
@@ -768,7 +773,7 @@ def run(harness, screenshot=None):
         handoff_origin = {"relation": "handoff", "job_id": 0, "ceiling": "write", "requested": "write",
             "runtime": "claude", "mode": "session", "by_operator": True, "launch": "operator:fixture",
             "source": None, "route": route, "started": "accept_edits", "decided": "inherited",
-            "parent": {"project": "/fixture", "scope": None, "session": "parent", "runtime": "claude"},
+            "parent": {"project": host.scope["project"], "scope": host.scope, "session": "parent", "runtime": "claude"},
             "handoff": {"scope": host.scope, "session": "parent", "native": None, "title": "Database connection timeouts",
                 "runtime": "claude", "route": route, "source_access": "accept_edits", "source_level": "write",
                 "decision": "inherited", "selection": {"total": 4, "carried": 3, "omitted": 1, "items": [], "cut": [],
@@ -942,6 +947,21 @@ def run(harness, screenshot=None):
         wait(lambda: js("return document.getElementById('session-effort').value==='high'"))
         js("document.getElementById('native-command-form').requestSubmit()")
         wait(lambda: js("return document.getElementById('control-status').textContent==='Native status received'"))
+        # Inspecting cold Claude history provides no installed command inventory.
+        # An explicitly typed command uses the native-only action; after a refusal
+        # the exact text stays editable, independent of the ordinary chat draft.
+        def custom_command(text):
+            choose("native-command", "custom")
+            js("const field=document.getElementById('typed-native-command');field.value=arguments[0];field.dispatchEvent(new Event('input'));document.getElementById('native-command-form').requestSubmit()", text)
+        js("const d=document.getElementById('draft');d.value='/home/user/project';d.dispatchEvent(new Event('input'))")
+        custom_command("/only-in-terminal")
+        wait(lambda: js("return document.getElementById('control-status').textContent.includes('Command requires the terminal')"))
+        assert js("return document.getElementById('typed-native-command').value==='/only-in-terminal' && document.getElementById('draft').value==='/home/user/project'")
+        custom_command("/project:lint src/mobile.rs")
+        wait(lambda: {"native_command":["parent", "/project:lint src/mobile.rs"]} in host.actions)
+        js("document.getElementById('composer').requestSubmit()")
+        wait(lambda: {"send_text":["parent", "/home/user/project"]} in host.actions)
+        choose("native-command", "/status")
         if screenshot:
             capture(s.with_name(s.stem+"-settings"+s.suffix))
         js("document.getElementById('home').click()")
@@ -1013,6 +1033,8 @@ def run(harness, screenshot=None):
         mode("bypass_permissions")
         wait(lambda: {"set_next_access":"bypass_permissions"} in host.actions)
         wait(lambda: js("return document.getElementById('access-mode').dataset.bypass==='true'"))
+        custom_command("/project:lint src/mobile.rs")
+        wait(lambda: {"native_command":[None, "/project:lint src/mobile.rs"]} in host.actions)
         js("document.getElementById('open-settings').click()")
         js(
             "const d=document.getElementById('draft');d.value='New session';d.dispatchEvent(new Event('input'));document.getElementById('composer').requestSubmit()"

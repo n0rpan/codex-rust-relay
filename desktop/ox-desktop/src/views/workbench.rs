@@ -125,8 +125,9 @@ pub(super) struct FocusSearch;
 impl EventEmitter<FocusSearch> for Workbench {}
 pub(super) struct CatalogChanged;
 impl EventEmitter<CatalogChanged> for Workbench {}
-/// Ask the host to open the session with this thread id: a worker's parent, or a running worker.
-pub(super) struct OpenThread(pub String);
+/// Ask the host to open a recorded parent session: the full scope travels with
+/// the id so the target is reachable across checkouts and billing routes.
+pub(super) struct OpenThread(pub super::host::ParentLink);
 impl EventEmitter<OpenThread> for Workbench {}
 
 #[derive(Default)]

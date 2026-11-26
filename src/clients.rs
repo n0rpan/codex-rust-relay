@@ -814,7 +814,9 @@ pub(crate) fn take_subscription_sandbox(
     args: &[OsString],
 ) -> Result<(Vec<OsString>, bool), RelayError> {
     const REJECT: &str = "subscription launches own their authentication settings";
-    let sandbox = claude_sandbox_document().to_string();
+    let sandbox = claude_sandbox_document();
+    let matches_sandbox =
+        |value: &str| serde_json::from_str::<Value>(value).ok().as_ref() == Some(&sandbox);
     let mut kept = Vec::with_capacity(args.len());
     let mut found = false;
     let mut index = 0;
@@ -822,7 +824,7 @@ pub(crate) fn take_subscription_sandbox(
         let text = args[index].to_string_lossy();
         if text == "--settings" {
             let value = args.get(index + 1).map(|value| value.to_string_lossy());
-            if value.as_deref() != Some(sandbox.as_str()) {
+            if !value.as_deref().is_some_and(matches_sandbox) {
                 return Err(REJECT.into());
             }
             found = true;
@@ -830,7 +832,7 @@ pub(crate) fn take_subscription_sandbox(
             continue;
         }
         if let Some(value) = text.strip_prefix("--settings=") {
-            if value != sandbox {
+            if !matches_sandbox(value) {
                 return Err(REJECT.into());
             }
             found = true;
@@ -1292,6 +1294,13 @@ mod tests {
         assert!(found && kept.is_empty());
         let (kept, found) = take_subscription_sandbox(&strings(&["--print"])).unwrap();
         assert!(!found && kept == strings(&["--print"]));
+        // The desktop and relay can build serde_json with different map ordering.
+        let reordered = r#"{ "sandbox": { "enabled":true, "autoAllowBashIfSandboxed": true } }"#;
+        assert!(
+            take_subscription_sandbox(&strings(&["--settings", reordered]))
+                .unwrap()
+                .1
+        );
         // Anything else could replace the account settings, so it is refused.
         assert!(take_subscription_sandbox(&strings(&["--settings", "{\"env\":{}}"])).is_err());
         assert!(take_subscription_sandbox(&strings(&["--settings"])).is_err());

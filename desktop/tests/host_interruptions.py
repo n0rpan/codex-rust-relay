@@ -156,7 +156,7 @@ class Fixture:
 
     # -- the lead speaks Anthropic Messages through the subscription fixture ----
     def lead_script(self, body, prompt):
-        messages = body["messages"]
+        messages = conversation(body)
         names, results = {}, []
         for m in messages:
             for block in m["content"] if isinstance(m["content"], list) else []:
@@ -548,7 +548,7 @@ class Run:
         for body in self.ctx.native.requests:
             if "Name a conversation" in str(body.get("system")):
                 continue
-            last = body["messages"][-1]
+            last = conversation(body)[-1]
             blocks = last["content"] if isinstance(last["content"], list) else [{"type": "text", "text": last["content"]}]
             if last["role"] == "user" and any(text in b.get("text", "") for b in blocks):
                 return True
@@ -717,10 +717,16 @@ def blocks(m):
     return m["content"] if isinstance(m["content"], list) else [{"type": "text", "text": m["content"]}]
 
 
+def conversation(body):
+    # Stock Claude can append per-submit system context after the user's message.
+    # These checks follow the conversation and its paired tool results.
+    return [m for m in body["messages"] if m["role"] != "system"]
+
+
 def lead_view(body):
     """The lead's request messages as (role, [what it carries]) with tool results parsed."""
     out = []
-    for m in body["messages"]:
+    for m in conversation(body):
         row = []
         for b in blocks(m):
             if b["type"] == "text":
@@ -842,8 +848,9 @@ def case_0(ctx):
 
 def delivered_once(ctx, prompt):
     """The prompt reached the model as a fresh user message exactly once, ever."""
-    fresh = [b for b in lead_requests(ctx)
-             if b["messages"][-1]["role"] == "user" and prompt in "".join(x.get("text", "") for x in blocks(b["messages"][-1]))]
+    last_messages = (conversation(b)[-1] for b in lead_requests(ctx))
+    fresh = [m for m in last_messages if m["role"] == "user"
+             and prompt in "".join(x.get("text", "") for x in blocks(m))]
     assert len(fresh) == 1, (prompt, "delivered", len(fresh))
     assert count_prompt(lead_requests(ctx)[-1], prompt) == 1, "the prompt is in the history more than once"
 
@@ -922,9 +929,10 @@ def after_continue(run, n=1, timeout=90):
     """Wait for the lead's two requests after "continue": the user turn and the status result."""
     ctx = run.ctx
     def done():
-        return any(b["messages"][-1]["role"] == "user" and any(
-            x["type"] == "tool_result" and x["tool_use_id"] == f"toolu_lead_status_c{n}" for x in blocks(b["messages"][-1]))
-            for b in lead_requests(ctx))
+        last_messages = (conversation(b)[-1] for b in lead_requests(ctx))
+        return any(m["role"] == "user" and any(
+            x["type"] == "tool_result" and x["tool_use_id"] == f"toolu_lead_status_c{n}"
+            for x in blocks(m)) for m in last_messages)
     run.wait_until(done, "the lead to read the worker's status after continue", timeout)
     time.sleep(1.5)
     leads = lead_requests(ctx)

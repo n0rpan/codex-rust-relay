@@ -17,6 +17,7 @@ use ox_desk_core::{
     origin::{Origin, ParentCall, WorkerMode, WorkerStart},
     runtime::RequestId,
     store::{Connection, Store},
+    surface::Sender,
 };
 use serde_json::{Value, json};
 use std::{
@@ -37,7 +38,7 @@ pub(crate) enum Message {
     Discovered(u64, Box<Server>),
     Gateway {
         caller: Caller,
-        request: Gateway,
+        request: Box<Gateway>,
         reply: Replier,
     },
     Stop,
@@ -126,7 +127,19 @@ pub(crate) enum Payload {
         text: String,
         items: Vec<Value>,
         record: String,
+        /// The surface of the client that requested the handoff, if it declared one.
+        from: Option<ox_desk_core::surface::Surface>,
     },
+}
+impl Payload {
+    /// Who the first turn comes from: the launching agent's task for a worker, or the
+    /// person who requested a handoff.
+    fn sender(&self) -> Sender {
+        match self {
+            Self::Worker(_) => Sender::WorkerTask,
+            Self::Handoff { from, .. } => Sender::Handoff { from: *from },
+        }
+    }
 }
 /// A worker launch or handoff accepted by policy, waiting for its runtime to create the session.
 pub(crate) struct Launching {
@@ -155,6 +168,8 @@ struct Preparing {
     start: HandoffStart,
     reply: Replier,
     device: String,
+    /// The requesting client's declared surface.
+    surface: Option<ox_desk_core::surface::Surface>,
     deadline: Instant,
     /// The target's context window, looked up off the engine thread. The outer
     /// None means the lookup is still running.
@@ -185,6 +200,9 @@ struct ClientState {
     catalog: bool,
     /// A desktop window that may take a terminal handoff held for its scope.
     terminal: bool,
+    /// The interface this connection declared after its hello. None for an older
+    /// client or a relay-only consumer: their sends are stamped `Sender::Unknown`.
+    surface: Option<ox_desk_core::surface::Surface>,
 }
 struct Live {
     launching: Option<Launching>,
@@ -485,7 +503,7 @@ impl Engine {
                     caller,
                     request,
                     reply,
-                }) => match request {
+                }) => match *request {
                     Gateway::Launch(_) if self.draining.is_some() => {
                         self.answer(reply, Err(crate::handover::REFUSAL.into()))?
                     }
@@ -508,6 +526,7 @@ impl Engine {
                             subscription: None,
                             catalog: false,
                             terminal: false,
+                            surface: None,
                         },
                     );
                 }
@@ -556,6 +575,11 @@ impl Engine {
         }
         self.running.clear();
         Ok(())
+    }
+    /// The stamp for a person's send on connection `id`: its declared surface, or an
+    /// unknown OX client when it declared none.
+    fn sender(&self, id: u64) -> Sender {
+        Sender::from_client(self.clients.get(&id).and_then(|c| c.surface))
     }
     fn reply(&mut self, id: u64, frame: Server) -> io::Result<()> {
         if let Some(client) = self.clients.get(&id)
@@ -615,6 +639,7 @@ impl Engine {
                             "live_catalog",
                             "end",
                             "processes",
+                            ox_desk_core::surface::CAPABILITY,
                         ]
                         .map(str::to_owned)
                         .into(),
@@ -658,6 +683,19 @@ impl Engine {
                             message: e.to_string(),
                         },
                     ),
+                }
+            }
+            Client::Surface { surface } => {
+                let client = self.clients.get_mut(&id).expect("connected");
+                match client.surface {
+                    None => {
+                        client.surface = Some(surface);
+                        Ok(())
+                    }
+                    Some(declared) if declared == surface => Ok(()),
+                    Some(_) => Err(io::Error::other(
+                        "This connection already declared a different surface",
+                    )),
                 }
             }
             Client::ListProcesses { id: key } => {
@@ -1278,7 +1316,11 @@ impl Engine {
         {
             live.store.adopt_catalog_row(row)?;
         }
-        live.store.dispatch(action)?;
+        // The stamp describes who sent this message. It is fixed here, at acceptance, and
+        // travels with the message; it never enters the digest or an authorization check.
+        let sender = self.sender(id);
+        let live = self.running.get_mut(scope).expect("validated live scope");
+        live.store.dispatch_as(action, sender)?;
         if fork && let (Some(origin), Some(source)) = (&origin, &target) {
             live.fork_origin = Some(origin.fork(source));
         }
@@ -1764,19 +1806,19 @@ impl Engine {
     }
     fn accept_launch(&mut self, caller: &Caller, start: WorkerStart) -> Result<Accepted, String> {
         start.validate()?;
-        let (project, parent, access, parent_origin, external, parent_scope) = match caller {
+        let (project, parent, ceiling, parent_origin, external, parent_scope) = match caller {
             Caller::Hosted { scope, hint, .. } => {
                 let live = self
                     .running
                     .get(scope)
                     .ok_or("This OX helper's route is not open on the session host.")?;
                 let parent = crate::policy::single_parent(&live.store, hint.as_deref())?;
-                let access = live.store.applied_access(Some(&parent));
+                let ceiling = live.store.applied_ceiling(Some(&parent));
                 let origin = self.workers.get(scope, &parent).map(|e| e.origin.clone());
                 (
                     scope.project.clone(),
                     Some(parent),
-                    access,
+                    ceiling,
                     origin,
                     false,
                     Some(scope),
@@ -1792,12 +1834,12 @@ impl Engine {
                 {
                     return Err("Open the parent session before starting a worker from it.".into());
                 }
-                let access = live.store.applied_access(Some(parent));
+                let ceiling = live.store.applied_ceiling(Some(parent));
                 let origin = self.workers.get(scope, parent).map(|e| e.origin.clone());
                 (
                     scope.project.clone(),
                     Some(parent.clone()),
-                    access,
+                    ceiling,
                     origin,
                     false,
                     Some(scope),
@@ -1805,13 +1847,17 @@ impl Engine {
             }
             Caller::External(c) => (c.project.clone(), None, None, None, true, None),
         };
-        let source = parent_scope.and_then(|s| {
-            crate::workers::source_level(s.route.runtime, access, parent_origin.as_ref())
-        });
+        let source = parent_scope
+            .and_then(|_| crate::workers::source_level(ceiling, parent_origin.as_ref()));
         let resolved =
             crate::workers::grant(source, external, start.mode_request(), start.runtime)?;
         let this_parent = crate::workers::parent_ref(caller, parent.clone());
         self.check_worker_cap(&this_parent)?;
+        let project = ox_desk_core::worker_checkout::resolve(
+            &project,
+            start.checkout.as_deref(),
+            source == Some(ox_desk_core::modes::Level::Yolo),
+        )?;
         let scope = canonical_scope(Scope {
             project,
             route: start.route(),
@@ -1839,6 +1885,13 @@ impl Engine {
                     let session = parent.as_deref().expect("hosted parent");
                     match self.yolo_grant(ps, session) {
                         Some(grant) => origin.yolo = Some(grant),
+                        None if start.mode_request()
+                            == ox_desk_core::modes::ModeRequest::Inherit =>
+                        {
+                            origin.yolo = Some(YoloAllowance::Inherited {
+                                session: session.to_owned(),
+                            });
+                        }
                         None => {
                             let parent_title = self.running[ps]
                                 .store
@@ -1897,15 +1950,11 @@ impl Engine {
             .and_then(|l| l.store.terminal_session_id(id).ok())
             .unwrap_or_else(|| id.rsplit(':').next().unwrap_or(id));
         let ready = live.is_some_and(|l| l.store.state() == &Connection::Ready);
-        Ok(crate::workers::status(
-            entry,
-            id,
-            native,
-            view,
-            timeline,
-            ready,
-            self.operators(),
-        ))
+        let mut status =
+            crate::workers::status(entry, id, native, view, timeline, ready, self.operators());
+        status["checkout"] = json!(scope.project);
+        status["parent"] = json!(entry.origin.parent);
+        Ok(status)
     }
     /// Resolve the caller to exactly one parent identity, or refuse. Every
     /// parent operation uses this one result.
@@ -2079,7 +2128,10 @@ impl Engine {
                     return Err("This worker is not accepting input.".into());
                 }
                 live.store
-                    .dispatch(Action::SendText(Some(id), text.to_owned()))
+                    .dispatch_as(
+                        Action::SendText(Some(id), text.to_owned()),
+                        Sender::ParentAgent,
+                    )
                     .map_err(|e| e.to_string())?;
                 self.process(&scope, vec![], true)
                     .map_err(|e| e.to_string())?;
@@ -2539,6 +2591,7 @@ fn catalog_row(view: &wire::SessionView) -> wire::SessionView {
         "route",
         "origin",
         "worker_marks",
+        "worker_model",
     ]
     .into_iter()
     .filter_map(|k| Some((k.to_owned(), view.detail.get(k)?.clone())))
@@ -2603,9 +2656,13 @@ fn advance_launch(live: &mut Live) -> Option<String> {
                 && l.stage == Stage::Opening =>
         {
             let contract = l.origin.claude_contract(l.origin.mode);
+            let model = match &l.payload {
+                Payload::Worker(start) => start.subscription_model.clone(),
+                Payload::Handoff { .. } => None,
+            };
             return live
                 .store
-                .stage_claude_worker(contract, preset)
+                .stage_claude_worker(contract, model, preset)
                 .err()
                 .map(|e| e.to_string());
         }
@@ -2643,7 +2700,29 @@ fn advance_launch(live: &mut Live) -> Option<String> {
                         .into(),
                 );
             }
+            // Check the pinned model against the picker of the very process that will run
+            // it, before the first inference. An unoffered model stops the launch here, so
+            // nothing runs or bills on another model or route.
+            if let Payload::Worker(start) = &l.payload
+                && let Some(requested) = &start.subscription_model
+            {
+                let pinned = live
+                    .store
+                    .claude_worker_picker()
+                    .ok_or_else(|| {
+                        "Claude Code did not report its model picker, so the model cannot be pinned. Nothing was billed.".to_owned()
+                    })
+                    .and_then(|picker| ox_desk_core::claude_models::resolve(&picker, requested));
+                match pinned {
+                    Ok(pin) => l.origin.pinned_model = Some(pin.exact),
+                    Err(e) => {
+                        live.store.drop_claude_worker();
+                        return Some(e);
+                    }
+                }
+            }
             l.stage = Stage::Sent;
+            let sender = l.payload.sender();
             let action = match &mut l.payload {
                 Payload::Worker(start) => Action::SendText(None, start.prompt()),
                 Payload::Handoff { text, items, .. } => {
@@ -2652,7 +2731,7 @@ fn advance_launch(live: &mut Live) -> Option<String> {
             };
             return live
                 .store
-                .send_on_worker_blank(action)
+                .send_on_worker_blank(action, sender)
                 .err()
                 .map(|e| e.to_string());
         }
@@ -2680,6 +2759,7 @@ fn advance_launch(live: &mut Live) -> Option<String> {
                     || live.store.applied_access(None) == Some(preset)) =>
         {
             l.stage = Stage::Sent;
+            let sender = l.payload.sender();
             let action = match &mut l.payload {
                 Payload::Worker(start) if start.mode == WorkerMode::Goal => {
                     Action::NativeCommand(None, start.prompt())
@@ -2689,7 +2769,10 @@ fn advance_launch(live: &mut Live) -> Option<String> {
                     Action::InjectHandoff(std::mem::take(text), std::mem::take(items))
                 }
             };
-            live.store.dispatch(action).err().map(|e| e.to_string())
+            live.store
+                .dispatch_as(action, sender)
+                .err()
+                .map(|e| e.to_string())
         }
         _ => None,
     }
@@ -2712,6 +2795,7 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
         }
         e.1.insert("origin".into(), json!(o));
         e.1.insert("worker_marks".into(), json!(entry.marks));
+        e.1.insert("worker_model".into(), crate::workers::model_report(entry));
         e.1.insert("worker".into(), nests.into());
     }
     let mut push = |id: &str, key: &str, value: Value| {
@@ -2763,6 +2847,9 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
     for (id, entry) in workers.in_scope(scope) {
         if let Some(contract) = entry.origin.claude_contract(entry.origin.mode) {
             store.restore_worker_contract(id, contract);
+        }
+        if let Some(model) = &entry.origin.pinned_model {
+            store.restore_worker_model(id, model);
         }
     }
     for (id, (parent, detail)) in out {
@@ -2962,6 +3049,7 @@ mod tests {
                 subscription: None,
                 catalog: false,
                 terminal: false,
+                surface: None,
             },
         );
         let (mailbox, rx) = std::sync::mpsc::sync_channel(64);
@@ -3057,6 +3145,7 @@ mod tests {
                 subscription: Some(Some(scope.clone())),
                 catalog: false,
                 terminal: false,
+                surface: None,
             },
         );
         let act = |approval: Option<String>| Client::Act {
@@ -3076,6 +3165,109 @@ mod tests {
         assert!(
             matches!(sent.as_slice(), [Server::Error { .. }, Server::Ack { .. }]),
             "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_connection_declares_its_surface_once_after_a_hello_that_offers_it() {
+        use ox_desk_core::surface::{CAPABILITY, Surface};
+        let root = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig {
+            ox: "/usr/bin/false".into(),
+            path: "/bin".into(),
+            desktop: root.path().into(),
+        };
+        let (tx, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut engine = Engine::open(config, root.path(), tx).unwrap();
+        let mut frames = vec![];
+        for id in [1, 2] {
+            let (peer, rx) = crate::transport::test_peer();
+            engine.clients.insert(
+                id,
+                ClientState {
+                    peer,
+                    hello: false,
+                    prepared: None,
+                    subscription: None,
+                    catalog: false,
+                    terminal: false,
+                    surface: None,
+                },
+            );
+            frames.push(rx);
+        }
+        let declare = |surface| Client::Surface { surface };
+        // Nothing is accepted before the hello.
+        assert!(engine.request(1, declare(Surface::Phone)).is_err());
+        engine
+            .request(
+                1,
+                Client::Hello {
+                    version: wire::VERSION,
+                },
+            )
+            .unwrap();
+        let hello: Server = serde_json::from_slice(&frames[0].try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(&hello, Server::Hello { capabilities, .. } if capabilities.iter().any(|c| c == CAPABILITY)),
+            "{hello:?}"
+        );
+        engine.request(1, declare(Surface::Phone)).unwrap();
+        engine.request(1, declare(Surface::Phone)).unwrap();
+        assert!(
+            engine.request(1, declare(Surface::Desktop)).is_err(),
+            "a connection cannot change who it speaks for"
+        );
+        assert_eq!(
+            engine.sender(1),
+            Sender::Person {
+                surface: Surface::Phone
+            }
+        );
+        // An older client never declares: generic OX guidance, no surface claim.
+        engine
+            .request(
+                2,
+                Client::Hello {
+                    version: wire::VERSION,
+                },
+            )
+            .unwrap();
+        assert_eq!(engine.sender(2), Sender::Unknown);
+        assert!(
+            serde_json::from_str::<Client>(r#"{"type":"surface","surface":"desktop","x":1}"#)
+                .is_err(),
+            "the wire still rejects unknown fields"
+        );
+    }
+
+    #[test]
+    fn internal_dispatch_paths_name_their_own_sender() {
+        let worker = Payload::Worker(WorkerStart {
+            parent: "p".into(),
+            subscription_model: None,
+            checkout: None,
+            runtime: ox_desk_core::runtime::Runtime::Codex,
+            model: None,
+            mode: WorkerMode::Session,
+            task: "review".into(),
+            write: None,
+            permission: None,
+            yolo_confirmed: false,
+            max_minutes: None,
+        });
+        assert_eq!(worker.sender(), Sender::WorkerTask);
+        let handoff = Payload::Handoff {
+            text: String::new(),
+            items: vec![],
+            record: "r".into(),
+            from: Some(ox_desk_core::surface::Surface::Desktop),
+        };
+        assert_eq!(
+            handoff.sender(),
+            Sender::Handoff {
+                from: Some(ox_desk_core::surface::Surface::Desktop)
+            }
         );
     }
 
@@ -3104,6 +3296,7 @@ mod tests {
                     subscription,
                     catalog,
                     terminal: false,
+                    surface: None,
                 },
             );
             frames
@@ -3359,6 +3552,8 @@ mod tests {
                 decided: None,
                 yolo: None,
                 handoff: None,
+                requested_model: None,
+                pinned_model: None,
             }
         }
         fn scopes(root: &Path) -> (Scope, Scope) {
@@ -3388,8 +3583,10 @@ mod tests {
                 task: "check".into(),
                 write: Some(write),
                 permission: None,
+                checkout: None,
                 yolo_confirmed: false,
                 max_minutes: None,
+                subscription_model: None,
             }
         }
 
@@ -3640,6 +3837,7 @@ mod tests {
                         subscription: Some(Some(worker.clone())),
                         catalog: false,
                         terminal: false,
+                        surface: None,
                     },
                 );
             }
@@ -3859,8 +4057,10 @@ mod tests {
                     task: "fix".into(),
                     write: Some(true),
                     permission: None,
+                    checkout: None,
                     yolo_confirmed: false,
                     max_minutes: None,
+                    subscription_model: None,
                 },
                 41,
                 ox_desk_core::modes::Resolved {
@@ -4181,6 +4381,48 @@ mod tests {
             );
         }
 
+        fn explicit_yolo(runtime: Runtime) -> WorkerStart {
+            WorkerStart {
+                permission: Some(ox_desk_core::modes::ModeRequest::Level(Ceiling::Yolo)),
+                ..inherit(runtime)
+            }
+        }
+
+        #[test]
+        fn inherited_yolo_runs_in_the_requested_checkout_and_keeps_its_visible_parent() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker, _) = routes(root.path());
+            let checkout = root.path().join("isolated");
+            std::fs::create_dir(&checkout).unwrap();
+            let child = Scope {
+                project: checkout.canonicalize().unwrap(),
+                ..worker
+            };
+            with_parent(&mut engine, &parent, "yolo");
+            engine
+                .running
+                .insert(child.clone(), live(&child, vec![], &[], vec![]).0);
+            let request = WorkerStart {
+                checkout: Some(checkout),
+                ..inherit(Runtime::Codex)
+            };
+            let result = engine
+                .accept_launch(&thread(&parent, "a"), request)
+                .unwrap();
+            let Accepted::Launch(scope, launch) = result else {
+                panic!("unexpected approval request")
+            };
+            assert_eq!(scope, child);
+            assert_eq!(launch.origin.parent.scope.as_ref(), Some(&parent));
+            assert_eq!(launch.origin.parent.session.as_deref(), Some("a"));
+            assert_eq!(launch.origin.started, Some(Access::Yolo));
+            assert!(
+                matches!(launch.origin.yolo, Some(YoloAllowance::Inherited { session }) if session == "a")
+            );
+        }
+
         #[test]
         fn a_yolo_child_waits_for_the_operator_who_accepts_one_and_declines_another() {
             let root = tempfile::tempdir().unwrap();
@@ -4193,7 +4435,7 @@ mod tests {
                 .insert(worker.clone(), live(&worker, vec![], &[], vec![]).0);
             let request = |engine: &mut Engine, confirmed: bool| {
                 let (done, result) = std::sync::mpsc::sync_channel(1);
-                let mut s = inherit(Runtime::Codex);
+                let mut s = explicit_yolo(Runtime::Codex);
                 // An agent cannot confirm YOLO for itself.
                 s.yolo_confirmed = confirmed;
                 engine
@@ -4512,11 +4754,11 @@ mod tests {
                 .act(1, "g2", &parent, Action::YoloGrant("a".into(), false), None)
                 .unwrap();
             assert!(matches!(
-                engine.accept_launch(&thread(&parent, "a"), inherit(Runtime::Codex)),
+                engine.accept_launch(&thread(&parent, "a"), explicit_yolo(Runtime::Codex)),
                 Ok(Accepted::Ask(_))
             ));
             assert!(matches!(
-                engine.accept_launch(&thread(&worker, "w"), inherit(Runtime::Codex)),
+                engine.accept_launch(&thread(&worker, "w"), explicit_yolo(Runtime::Codex)),
                 Ok(Accepted::Ask(_))
             ));
             assert_eq!(
@@ -4574,8 +4816,7 @@ mod tests {
                     .insert(worker.clone(), live(&worker, vec![], &[], vec![]).0);
                 let (done, result) = std::sync::mpsc::sync_channel(1);
                 // A Claude parent in bypass: the parent scope here is Codex, so use the table directly.
-                let mut s = inherit(Runtime::Codex);
-                s.permission = None;
+                let s = explicit_yolo(Runtime::Codex);
                 engine.running.insert(
                     parent.clone(),
                     live(
@@ -4615,7 +4856,7 @@ mod tests {
                 .running
                 .insert(worker.clone(), live(worker, vec![], &[], vec![]).0);
             let (done, result) = std::sync::mpsc::sync_channel(1);
-            let mut s = inherit(Runtime::Codex);
+            let mut s = explicit_yolo(Runtime::Codex);
             s.yolo_confirmed = true;
             engine
                 .launch(thread(parent, "a"), s, Replier::Channel(done))
@@ -5253,6 +5494,15 @@ mod tests {
             lead: &str,
             rx: &std::sync::mpsc::Receiver<ox_desk_core::links::LinkEvent>,
         ) -> Result<Value, String> {
+            launch_pinned_on_warm_claude(engine, scope, lead, rx, None)
+        }
+        fn launch_pinned_on_warm_claude(
+            engine: &mut Engine,
+            scope: &Scope,
+            lead: &str,
+            rx: &std::sync::mpsc::Receiver<ox_desk_core::links::LinkEvent>,
+            subscription_model: Option<&str>,
+        ) -> Result<Value, String> {
             let caller = Caller::Operator {
                 scope: scope.clone(),
                 parent: lead.to_owned(),
@@ -5263,6 +5513,7 @@ mod tests {
             request.model = None;
             request.parent = lead.to_owned();
             request.mode = WorkerMode::Session;
+            request.subscription_model = subscription_model.map(str::to_owned);
             let (reply, answered) = std::sync::mpsc::sync_channel(1);
             engine
                 .launch(caller, request, Replier::Channel(reply))
@@ -5292,6 +5543,147 @@ mod tests {
                     );
                 }
                 thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Drive the host until `done` holds for its state.
+        fn pump_engine(
+            engine: &mut Engine,
+            scope: &Scope,
+            rx: &std::sync::mpsc::Receiver<ox_desk_core::links::LinkEvent>,
+            done: &dyn Fn(&Engine) -> bool,
+        ) {
+            let until = Instant::now() + Duration::from_secs(20);
+            while !done(engine) {
+                assert!(Instant::now() < until, "the host never reached the state");
+                while let Ok(event) = rx.try_recv() {
+                    engine.running.get_mut(scope).unwrap().store.apply(event);
+                }
+                engine.process(scope, vec![], false).unwrap();
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        #[test]
+        fn a_pinned_subscription_worker_runs_its_exact_model_from_the_first_turn() {
+            let root = tempfile::tempdir().unwrap();
+            let (scope, lead, mut engine, rx) = warm_claude(root.path());
+            let started =
+                launch_pinned_on_warm_claude(&mut engine, &scope, &lead, &rx, Some("fable"))
+                    .expect("an offered model starts");
+            let session = started["session"].as_str().unwrap().to_owned();
+            // The launch answer already separates the request, the pin and who pays.
+            assert_eq!(started["billing"], "subscription");
+            assert_eq!(started["requested_model"], "fable");
+            assert_eq!(started["pinned_model"], "claude-fable-5-2");
+            // The process ran the pinned model from its first turn, in the granted mode.
+            let raw = session.rsplit(':').next().unwrap();
+            let argv: Vec<String> = serde_json::from_str(
+                std::fs::read_to_string(root.path().join(format!("argv-{raw}")))
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+            let at = |flag: &str| argv.iter().position(|a| a == flag).map(|i| &argv[i + 1]);
+            assert_eq!(at("--model").map(String::as_str), Some("fable"));
+            assert_eq!(at("--permission-mode").map(String::as_str), Some("plan"));
+            assert!(argv.contains(&"--subscription".to_owned()));
+            // The runtime's answer confirms the model, in status and the saved record.
+            pump_engine(&mut engine, &scope, &rx, &|e| {
+                e.workers
+                    .get(&scope, &session)
+                    .is_some_and(|w| w.marks.actual_model.is_some() && w.marks.last.is_some())
+            });
+            let entry = engine.workers.get(&scope, &session).unwrap();
+            assert_eq!(
+                entry.origin.pinned_model.as_deref(),
+                Some("claude-fable-5-2")
+            );
+            assert_eq!(entry.origin.requested_model.as_deref(), Some("fable"));
+            let job = entry.origin.job_id;
+            pump_engine(&mut engine, &scope, &rx, &|e| {
+                e.job_status(job).unwrap()["model_state"] == "confirmed"
+            });
+            let status = engine.job_status(job).unwrap();
+            assert_eq!(status["actual_model"], "claude-fable-5-2");
+            let last = engine
+                .workers
+                .get(&scope, &session)
+                .unwrap()
+                .marks
+                .last
+                .clone();
+            assert_eq!(
+                last.and_then(|l| l.model).as_deref(),
+                Some("claude-fable-5-2")
+            );
+            // A continuation after the process ended keeps the pin, never the default.
+            let live = engine.running.get_mut(&scope).unwrap();
+            live.store.end_session(&session).unwrap();
+            live.store
+                .dispatch(Action::DraftEdit(Some(session.clone()), "again".into()))
+                .unwrap();
+            live.store
+                .dispatch(Action::SendText(Some(session.clone()), "again".into()))
+                .unwrap();
+            let launches = || {
+                std::fs::read_to_string(root.path().join(format!("argv-{raw}")))
+                    .unwrap()
+                    .lines()
+                    .map(|l| serde_json::from_str::<Vec<String>>(l).unwrap())
+                    .collect::<Vec<_>>()
+            };
+            pump_engine(&mut engine, &scope, &rx, &|_| launches().len() >= 2);
+            let resumed = &launches()[1];
+            assert!(resumed.contains(&"--resume".to_owned()), "{resumed:?}");
+            let at = resumed
+                .iter()
+                .position(|a| a == "--model")
+                .expect("pinned on resume");
+            assert_eq!(
+                resumed[at + 1],
+                "claude-fable-5-2",
+                "the validated exact ID"
+            );
+        }
+
+        #[test]
+        fn an_unoffered_subscription_model_stops_the_launch_before_any_turn() {
+            let root = tempfile::tempdir().unwrap();
+            let (scope, lead, mut engine, rx) = warm_claude(root.path());
+            let error = launch_pinned_on_warm_claude(
+                &mut engine,
+                &scope,
+                &lead,
+                &rx,
+                Some("claude-fable-9"),
+            )
+            .expect_err("an unoffered model never starts");
+            assert!(error.contains("does not offer claude-fable-9"), "{error}");
+            assert!(error.contains("claude-fable-5-2"), "{error}");
+            // No session was stamped and the dedicated process was closed unused.
+            assert!(engine.workers.jobs().next().is_none());
+            let live = &engine.running[&scope];
+            assert_eq!(
+                live.store.claude_worker_state(),
+                ox_desk_core::store::claude::WorkerBlank::None
+            );
+            // Its process never received a user turn: nothing ran or billed.
+            for file in std::fs::read_dir(root.path()).unwrap().flatten() {
+                let name = file.file_name().to_string_lossy().into_owned();
+                if let Some(id) = name.strip_prefix("argv-")
+                    && std::fs::read_to_string(file.path())
+                        .unwrap()
+                        .contains("claude-fable-9")
+                {
+                    assert!(
+                        !live
+                            .store
+                            .has_live_session(&format!("claude:subscription:{id}"))
+                    );
+                }
             }
         }
 
@@ -5330,6 +5722,7 @@ mod tests {
                     text: "carry on".into(),
                     items: vec![],
                     record: "h1".into(),
+                    from: None,
                 },
                 reply: Replier::Channel(reply),
                 stage: Stage::Opening,
@@ -5499,7 +5892,11 @@ mod tests {
             let live = engine.running.get_mut(&scope).unwrap();
             live.store.dispatch(Action::NewDraft).unwrap();
             live.store
-                .stage_claude_worker(Some(contract), ox_desk_core::runtime::Access::AcceptEdits)
+                .stage_claude_worker(
+                    Some(contract),
+                    None,
+                    ox_desk_core::runtime::Access::AcceptEdits,
+                )
                 .unwrap();
             let pump = |engine: &mut Engine, until: &dyn Fn(&Store) -> bool| {
                 let end = Instant::now() + Duration::from_secs(10);
@@ -5526,7 +5923,10 @@ mod tests {
                 "kept for its launch"
             );
             live.store
-                .send_on_worker_blank(Action::SendText(None, "worker task".into()))
+                .send_on_worker_blank(
+                    Action::SendText(None, "worker task".into()),
+                    Sender::WorkerTask,
+                )
                 .unwrap();
             let worker = live.store.take_opened().unwrap();
             assert_ne!(worker, other);
@@ -5565,14 +5965,21 @@ mod tests {
             let live = engine.running.get_mut(&scope).unwrap();
             live.store.dispatch(Action::NewDraft).unwrap();
             live.store
-                .stage_claude_worker(Some(contract), ox_desk_core::runtime::Access::AcceptEdits)
+                .stage_claude_worker(
+                    Some(contract),
+                    None,
+                    ox_desk_core::runtime::Access::AcceptEdits,
+                )
                 .unwrap();
             pump(&mut engine, &|s| {
                 s.can_send(None) && s.claude_worker_state() == WorkerBlank::Ready
             });
             let live = engine.running.get_mut(&scope).unwrap();
             live.store
-                .send_on_worker_blank(Action::SendText(None, "worker task".into()))
+                .send_on_worker_blank(
+                    Action::SendText(None, "worker task".into()),
+                    Sender::WorkerTask,
+                )
                 .unwrap();
             let worker = live.store.take_opened().unwrap();
             let raw = worker.rsplit(':').next().unwrap().to_owned();
@@ -5763,6 +6170,7 @@ mod tests {
                     subscription: Some(Some(scope.clone())),
                     catalog: false,
                     terminal: false,
+                    surface: None,
                 },
             );
             for (key, action) in [
@@ -6040,6 +6448,7 @@ mod tests {
                         subscription: None,
                         catalog: false,
                         terminal,
+                        surface: None,
                     },
                     frames,
                 )
@@ -6099,6 +6508,7 @@ mod tests {
                     subscription: None,
                     catalog: false,
                     terminal: false,
+                    surface: None,
                 },
             );
             engine.subscribe(9, None, None).unwrap();

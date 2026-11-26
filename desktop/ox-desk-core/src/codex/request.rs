@@ -66,12 +66,15 @@ pub enum Call {
         options: Option<crate::store::routes_thread::Options>,
         thread: String,
         text: String,
+        /// OX's sender statement, sent as an `additionalContext` application entry.
+        context: Option<String>,
     },
     Steer {
         images: Vec<crate::mentions::ImageInput>,
         thread: String,
         turn: String,
         text: String,
+        context: Option<String>,
     },
     Stop {
         thread: String,
@@ -241,6 +244,7 @@ impl Call {
                 text,
                 images,
                 options,
+                context,
             } => {
                 let mut params =
                     json!({"threadId":thread,"input":crate::mentions::turn_input(text,images)});
@@ -249,6 +253,9 @@ impl Call {
                     params["effort"] = json!(settings.effort);
                     params["serviceTier"] = json!(settings.tier);
                 }
+                if let Some(context) = context {
+                    params["additionalContext"] = crate::surface::codex_context(&context);
+                }
                 params
             }
             Self::Steer {
@@ -256,8 +263,13 @@ impl Call {
                 turn,
                 text,
                 images,
+                context,
             } => {
-                json!({"threadId":thread,"expectedTurnId":turn,"input":crate::mentions::turn_input(text,images)})
+                let mut params = json!({"threadId":thread,"expectedTurnId":turn,"input":crate::mentions::turn_input(text,images)});
+                if let Some(context) = context {
+                    params["additionalContext"] = crate::surface::codex_context(&context);
+                }
+                params
             }
             Self::Stop { thread, turn } => json!({"threadId":thread,"turnId":turn}),
             Self::Inject { thread, items } => json!({"threadId":thread,"items":items}),
@@ -283,5 +295,49 @@ impl Outgoing {
                 json!({"id":id,"error":{"code":code,"message":message}})
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_and_steer_send_the_sender_as_one_application_entry() {
+        let start = Call::Start {
+            images: vec![],
+            options: None,
+            thread: "t".into(),
+            text: "exact text".into(),
+            context: Some("from OX Desktop".into()),
+        }
+        .params();
+        assert_eq!(
+            start["additionalContext"],
+            json!({"ox.sender":{"kind":"application","value":"from OX Desktop"}})
+        );
+        assert_eq!(start["input"][0]["text"], "exact text");
+        let steer = Call::Steer {
+            images: vec![],
+            thread: "t".into(),
+            turn: "u".into(),
+            text: "more".into(),
+            context: Some("from the OX phone app".into()),
+        }
+        .params();
+        assert_eq!(
+            steer["additionalContext"]["ox.sender"]["value"],
+            "from the OX phone app"
+        );
+        assert_eq!(steer["expectedTurnId"], "u");
+        let plain = Call::Steer {
+            images: vec![],
+            thread: "t".into(),
+            turn: "u".into(),
+            text: "more".into(),
+            context: None,
+        }
+        .params();
+        assert!(plain.get("additionalContext").is_none());
     }
 }

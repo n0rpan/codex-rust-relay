@@ -8,11 +8,13 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
     },
 };
 
+pub mod context;
 mod process;
 pub const INIT_ID: &str = "ox-init";
 
@@ -23,10 +25,12 @@ pub struct Launch {
     pub billing: Billing,
     pub session: Session,
     pub permission_mode: String,
-    pub subscription_model: Option<String>,
     /// A worker launch carries the shared worker contract (tools, sandbox
     /// settings); an ordinary session passes `None`.
     pub contract: Option<crate::claude_worker_contract::Contract>,
+    /// The selected subscription model or exact worker pin, passed as `--model` so the
+    /// first inference already uses it. Ignored on an API route, whose alias is the model.
+    pub model: Option<String>,
 }
 #[derive(Clone, Debug)]
 pub enum Session {
@@ -76,7 +80,11 @@ impl Launch {
         match &self.billing {
             Billing::Subscription => {
                 cmd.arg("--subscription");
-                if let Some(model) = &self.subscription_model {
+                if let Some(model) = self
+                    .model
+                    .as_deref()
+                    .filter(|m| crate::claude_models::valid_model(m))
+                {
                     cmd.args(["--model", model]);
                 }
             }
@@ -127,6 +135,8 @@ pub struct Link {
     session_id: String,
     billing: Billing,
     seq: AtomicU64,
+    /// Accepted submits awaiting their `UserPromptSubmit` callback, in stdin order.
+    ledger: Arc<Mutex<context::Ledger>>,
 }
 
 impl Link {
@@ -143,10 +153,36 @@ impl Link {
         let output = receive.clone();
         let mut decoder = Decoder::default();
         let mut project_checked = false;
+        let ledger = Arc::new(Mutex::new(context::Ledger::default()));
+        let answers = ledger.clone();
+        let writer = Arc::new(OnceLock::<mpsc::Sender<Value>>::new());
+        let hook_writer = writer.clone();
         let process = process::Process::spawn(
             launch.command(),
             move |line| {
-                for frame in decoder.decode(line)? {
+                let row: Value = serde_json::from_slice(line).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "Invalid Claude stream JSON")
+                })?;
+                if let Some((id, prompt)) = context_request(&row) {
+                    // Answer on receipt: stock Claude drops the prompt if this times out.
+                    let answer = answers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .answer(prompt);
+                    let sent = hook_writer.get().is_some_and(|w| {
+                        w.send(
+                            json!({"type":"control_response","response":{"subtype":"success",
+                            "request_id":id,"response":context::reply(&answer)}}),
+                        )
+                        .is_ok()
+                    });
+                    return if sent {
+                        Ok(())
+                    } else {
+                        Err(io::Error::other("Claude Code writer closed"))
+                    };
+                }
+                for frame in decoder.decode_value(row)? {
                     if let Frame::ControlReply(reply) = &frame
                         && reply.request_id == INIT_ID
                     {
@@ -189,27 +225,54 @@ impl Link {
                 receive(Event::Closed { reason });
             },
         )?;
-        process.send(
-            json!({"type":"control_request","request_id":INIT_ID,"request":{
-                "subtype":"initialize","forwardSubagentText":true
-            }}),
-        )?;
+        let _ = writer.set(process.writer());
+        let mut request = json!({"subtype":"initialize","forwardSubagentText":true});
+        let fields = context::initialize_fields(&launch.billing, launch.contract.is_some());
+        request
+            .as_object_mut()
+            .expect("initialize object")
+            .extend(fields.as_object().expect("context fields").clone());
+        process.send(json!({"type":"control_request","request_id":INIT_ID,"request":request}))?;
         Ok(Self {
             process,
             ready,
             session_id: launch.session.id().to_owned(),
             billing: launch.billing,
             seq: AtomicU64::new(1),
+            ledger,
         })
     }
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
+    /// Sends a user message without a known submitting interface; the model is
+    /// told the interface is unknown.
     pub fn send_user(&self, uuid: &str, content: Vec<Value>) -> io::Result<()> {
-        self.send(
+        self.submit(uuid, content, None)
+    }
+    /// Sends a user message and delivers `context` (for example which OX
+    /// interface sent it) to the model alongside that message only. The user's
+    /// content is sent unchanged; the context never enters it or its replay.
+    pub fn send_user_with_context(
+        &self,
+        uuid: &str,
+        content: Vec<Value>,
+        context: &str,
+    ) -> io::Result<()> {
+        self.submit(uuid, content, Some(context))
+    }
+    fn submit(&self, uuid: &str, content: Vec<Value>, context: Option<&str>) -> io::Result<()> {
+        // Record and write under one lock so the ledger order is the stdin order.
+        let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        let seq = ledger.submit(&content, context);
+        let sent = self.send(
             json!({"type":"user","uuid":uuid,"session_id":self.session_id,
             "parent_tool_use_id":Value::Null,"message":{"role":"user","content":content}}),
-        )
+        );
+        if sent.is_err() {
+            ledger.withdraw(seq);
+        }
+        sent
     }
     pub fn interrupt(&self) -> io::Result<String> {
         self.control(json!({"subtype":"interrupt"}))
@@ -248,6 +311,22 @@ impl Link {
         }
         self.process.send(value)
     }
+}
+
+/// The request ID and prompt of an OX context callback.
+fn context_request(row: &Value) -> Option<(&str, &str)> {
+    let request = &row["request"];
+    if row["type"] != "control_request"
+        || request["subtype"] != "hook_callback"
+        || request["callback_id"] != context::CALLBACK_ID
+        || request["input"]["hook_event_name"] != "UserPromptSubmit"
+    {
+        return None;
+    }
+    Some((
+        row["request_id"].as_str()?,
+        request["input"]["prompt"].as_str().unwrap_or(""),
+    ))
 }
 
 pub fn minimum() -> &'static str {
@@ -368,8 +447,8 @@ mod tests {
             billing,
             session: Session::New("id".into()),
             permission_mode: "acceptEdits".into(),
-            subscription_model: None,
             contract,
+            model: None,
         };
         launch
             .command()
@@ -400,6 +479,31 @@ mod tests {
                 assert!(!plain.iter().any(|a| a == "--tools" || a == "--settings"));
             }
         }
+        // A pinned subscription worker runs its exact model from the first turn;
+        // an API route never takes a second model.
+        let pinned = |billing| {
+            Launch {
+                ox: "ox".into(),
+                path: "/usr/bin".into(),
+                project: "/".into(),
+                billing,
+                session: Session::New("id".into()),
+                permission_mode: "plan".into(),
+                contract: None,
+                model: Some("claude-fable-5-2".into()),
+            }
+            .command()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+        };
+        let sub = pinned(Billing::Subscription);
+        let at = sub.iter().position(|a| a == "--model").unwrap();
+        assert_eq!(sub[at + 1], "claude-fable-5-2");
+        assert_eq!(sub[at - 1], "--subscription");
+        let api = pinned(Billing::Api("alias".into()));
+        assert_eq!(api.iter().filter(|a| *a == "--model").count(), 1);
+        assert!(!api.iter().any(|a| a == "claude-fable-5-2"));
         let mode = args(Billing::Subscription, None);
         let at = mode.iter().position(|a| a == "--permission-mode").unwrap();
         assert_eq!(mode[at + 1], "acceptEdits");

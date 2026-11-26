@@ -1,5 +1,5 @@
 //! Project and account notifications decoded on the reader.
-use super::{access::Access, frame::RequestId, history::ThreadRow, names::Notice};
+use super::{access::Permissions, frame::RequestId, history::ThreadRow, names::Notice};
 use crate::transcript::item::FileChange;
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -38,7 +38,7 @@ pub struct PlanStep {
 pub use crate::usage::{Limits, TokenUsage};
 #[derive(Debug)]
 pub struct EffectiveSettings {
-    pub access: Access,
+    pub permissions: Permissions,
     pub model: String,
     pub provider: String,
     pub effort: Option<String>,
@@ -48,7 +48,7 @@ impl EffectiveSettings {
     pub(super) fn decode(p: &Value) -> Self {
         let string = |key: &str| p[key].as_str().map(str::to_owned);
         Self {
-            access: Access::effective(p),
+            permissions: Permissions::effective(p),
             model: string("model").unwrap_or_default(),
             provider: string("modelProvider").unwrap_or_default(),
             effort: string("effort"),

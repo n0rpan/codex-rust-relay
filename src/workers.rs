@@ -2,6 +2,7 @@
 //! subscription session. The stock client retains its own inference and tools.
 
 mod jobs;
+mod picker;
 
 use std::ffi::OsString;
 use std::net::Ipv4Addr;
@@ -544,6 +545,9 @@ impl Service {
 
     async fn start_job(&self, request: jobs::Start, thread: Option<&str>) -> Result<Value, String> {
         request.validate()?;
+        if let Some(model) = &request.subscription_model {
+            self.check_subscription_model(model).await?;
+        }
         let app = self.app().await?;
         if let Some(model) = &request.model
             && let Mode::Codeox {
@@ -583,6 +587,28 @@ impl Service {
             .lock()
             .unwrap()
             .start(request, &self.home, &self.cwd, Arc::clone(&app.secrets))
+    }
+
+    /// Refuse a subscription model the account's picker does not offer, before
+    /// anything starts. A stale cache is refreshed once before refusing. When the
+    /// picker cannot be read here, the worker's own process still checks the pin
+    /// before its first turn, so nothing runs on another model either way.
+    async fn check_subscription_model(&self, model: &str) -> Result<(), String> {
+        if !crate::native::has_saved_account(ClientKind::Claude, &self.home) {
+            return Err("Run ox login claude on this host to use a Claude subscription worker. Nothing was started.".into());
+        }
+        for refresh in [false, true] {
+            match picker::picker(&self.home, refresh).await {
+                Ok(models) => match crate::claude_models::resolve(&models, model) {
+                    Ok(_) => return Ok(()),
+                    Err(error) if refresh => return Err(error),
+                    Err(_) => {}
+                },
+                Err(_) if !refresh => {}
+                Err(_) => return Ok(()),
+            }
+        }
+        Ok(())
     }
 
     /// The session this launch names for a call. Codex reports the exact calling
@@ -714,6 +740,7 @@ impl Service {
                     "model": alias,
                     "provider": provider,
                     "auth": "api_key",
+                    "billing": format!("API key · {provider}"),
                     "starred": rank(alias).is_some(),
                     "context_window": contexts.get(alias),
                 }));
@@ -743,8 +770,40 @@ impl Service {
             }))
         })
         .collect();
+        // The account's exact subscription models, from its own picker (cached; probed
+        // without a turn when missing), next to the API aliases a search matched.
+        let (subscription_models, picker_error) = if crate::native::has_saved_account(
+            ClientKind::Claude,
+            &self.home,
+        ) {
+            match picker::picker(&self.home, false).await {
+                    Ok(picker) => (
+                        crate::claude_models::search(&picker, &query)
+                            .into_iter()
+                            .map(|m| {
+                                json!({
+                                    "model": m.exact(),
+                                    "display_name": m.display,
+                                    "picker_value": m.value,
+                                    "description": m.description,
+                                    "runtime": "claude",
+                                    "auth": "subscription",
+                                    "billing": "Claude subscription",
+                                    "start_with": {"runtime": "claude", "subscription_model": m.exact()},
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                        None,
+                    ),
+                    Err(error) => (Vec::new(), Some(error)),
+                }
+        } else {
+            (Vec::new(), None)
+        };
         Ok(json!({
             "models": models,
+            "subscription_models": subscription_models,
+            "subscription_models_error": picker_error,
             "subscriptions": subscriptions,
             "total": total,
             "next_offset": (next < total).then_some(next),
@@ -826,7 +885,7 @@ fn initialize(params: &Value) -> Value {
         "protocolVersion": version,
         "serverInfo": {"name": SERVER, "version": crate::VERSION},
         "capabilities": {"tools": {}},
-        "instructions": "Use start_ox_worker for long coding tasks, Codex goals or Claude workflows, then check ox_worker_status. Pick runtime and mode by the start_ox_worker mode notes. Workers inherit your permission mode only when the OX session host runs; with no host, inherit means read, so pass permission_mode write to let a worker edit. You can lower a worker's mode, never raise it. Check list_ox_models for provider, context_window and starred before choosing a model. Use delegate_to_ox_model for one short text answer. Start jobs only at the user's request. The named provider bills the delegated work. If this session continues another one (an OX handoff), read_ox_thread returns the source's omitted or cut messages by item ID.",
+        "instructions": "For an ordinary implementation worker, omit permission_mode to inherit the verified hosted parent mode and pass checkout for a separate workspace. Without a host, inherit is read; request write for edits. Answer requests for your own assessment directly. Suggest a second reviewer when it would resolve a concrete uncertainty. A request for a second opinion authorizes one read-only review. Use the established model and billing preference or clarify if the choice changes who pays. Consult list_ox_models, pass subscription_model for a named Claude subscription model or model for an API alias, and report unavailability before choosing another. A how-to question calls for an explanation. Follow started jobs through ox_worker_status and summarize their results. Use delegate_to_ox_model for a short text-only API request. For handoffs use read_ox_thread to recover omitted source messages.",
     })
 }
 
@@ -835,7 +894,7 @@ fn tools() -> Value {
         "tools": [
             {
                 "name": "list_ox_models",
-                "description": "List ox API models and detected subscription routes. Models: model, provider, auth (api_key), starred (the user's favourites, listed first), context_window (tokens, null when unknown). Subscriptions: runtime, account, main_client (this launch's client), worker_available (can run start_ox_worker without a model). query filters by alias, provider or runtime. Pages hold 40 rows: when next_offset is not null, pass it as offset for more. Use a model alias for delegate_to_ox_model and start_ox_worker.",
+                "description": "List ox API models, the signed-in Claude subscription's exact models, and detected subscription routes. models: API aliases with model, provider, auth (api_key), billing, starred (the user's favourites, listed first), context_window (tokens, null when unknown). subscription_models: exact Claude subscription models (model such as claude-fable-5-2, display_name, billing Claude subscription), read from the account's own model picker without running a turn; start one with start_ox_worker runtime claude and subscription_model, no model. subscriptions: runtime, account, main_client (this launch's client), worker_available (can run start_ox_worker without a model). query filters by alias, provider, runtime or model name, such as fable. Pages of API models hold 40 rows: when next_offset is not null, pass it as offset for more. Use a model alias for delegate_to_ox_model.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -862,16 +921,19 @@ fn tools() -> Value {
             },
             {
                 "name": "start_ox_worker",
-                "description": "Start a background coding job in this project and return its job ID at once. Choose by fit: a Codex goal for one long objective with a checkable stop condition; a Claude workflow for work Claude Code splits into steps with its Workflow tool and subagents; a session for ordinary coding on either runtime. Task up to 32 KiB. There is no time or count limit by default; set max_minutes per job, or OX_WORKER_MAX_MINUTES and OX_WORKER_MAX_PER_PARENT, to add one. A write worker starting while another writes in the same project returns a warning: consider a separate git worktree. Without the OX session host they stop when this launch exits. Inherit uses your mode only with the session host; without it, inherit is read. Lower with permission_mode, never raise it. classifier and yolo need the session host, which asks a person to accept a YOLO worker (status waiting_for_operator) unless YOLO was granted.",
+                "description": "Start a background coding job in this project and return its job ID at once. Choose by fit: a Codex goal for one long objective with a checkable stop condition; a Claude workflow for work Claude Code splits into steps with its Workflow tool and subagents; a session for ordinary coding on either runtime. Task up to 32 KiB. There is no time or count limit by default; set max_minutes per job, or OX_WORKER_MAX_MINUTES and OX_WORKER_MAX_PER_PARENT, to add one. A write worker starting while another writes in the same project returns a warning: consider a separate git worktree. Without the OX session host they stop when this launch exits. Inherit uses your mode only with the session host; without it, inherit is read. Lower with permission_mode, never raise it. For ordinary work, omit permission_mode to inherit the hosted parent’s verified mode, including YOLO. Request read for a read-only review. Explicit YOLO requests can require operator acceptance. Pin a subscription model with subscription_model. Status reports the actual_model that answered.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "runtime": {"enum": ["codex", "claude"]},
                         "mode": {"enum": ["session", "goal", "workflow"], "description": "session: background coding session on either runtime. goal: Codex only; task becomes the Codex goal objective, at most 4,000 characters. workflow: Claude Code only; the job fails if the Workflow tool is not used."},
-                        "model": {"type": "string", "description": "Exact ox API model alias. Leave out only for a Claude subscription worker."},
+                        "model": {"type": "string", "description": "Exact ox API model alias, billed by its provider. Leave out for a Claude subscription worker."},
+                        "billing": {"enum": ["api", "subscription"], "description": "Who pays. api: the provider of model. subscription: the user's Claude subscription. Optional: a model means api, none means subscription. A conflicting model is refused."},
+                        "subscription_model": {"type": "string", "description": "Exact Claude subscription model to pin, such as claude-fable-5-2, from list_ox_models subscription_models. Claude runtime only, without model. Checked against the account's model picker before the first turn: an unoffered model is refused and nothing runs or bills. Leave out for the subscription's default model."},
                         "task": {"type": "string", "description": "The job objective, desired validation, and stopping condition."},
                         "permission_mode": {"enum": ["inherit", "read", "write", "classifier", "yolo"], "default": "inherit", "description": "read: Codex Read only or Claude Plan. Standalone Claude read workers get only read tools. write: workspace edits and shell access. Codex uses its Workspace sandbox. Claude Code pre-approves Bash and uses its own sandbox when available. Without it, commands can run unsandboxed. classifier: Codex Auto-review / Claude Auto. yolo: Codex YOLO / Claude bypass. Above your mode is refused."},
                         "max_minutes": {"type": "integer", "minimum": 1, "maximum": 10080, "description": "Optional wall-clock limit for this worker in minutes. No limit by default (OX_WORKER_MAX_MINUTES sets one)."},
+                        "checkout": {"type":"string","description":"Existing execution directory, absolute or relative to the parent workspace. The current thread remains the worker’s parent."},
                         "workspace_write": {"type": "boolean", "description": "Deprecated: false means read, true means write. Use permission_mode."},
                     },
                     "required": ["runtime", "mode", "task"],
@@ -1156,6 +1218,48 @@ mod tests {
                 .contains("Inherit uses your mode only with the session host")
         );
         assert!(start_tool["inputSchema"]["properties"]["workspace_write"].is_object());
+    }
+
+    #[test]
+    fn subscription_models_and_billing_are_explicit_and_never_conflict() {
+        let start = |v: Value| serde_json::from_value::<jobs::Start>(v).unwrap();
+        let pinned = start(json!({"runtime":"claude","mode":"session","task":"review",
+            "permission_mode":"read","subscription_model":"claude-fable-5-2"}));
+        assert_eq!(pinned.validate(), Ok(()));
+        assert_eq!(
+            pinned.host_start(&[])["subscription_model"],
+            "claude-fable-5-2"
+        );
+        assert!(pinned.host_start(&[])["model"].is_null());
+        // Explicit billing that agrees is accepted; a conflicting alias is refused.
+        let explicit = start(json!({"runtime":"claude","mode":"session","task":"t",
+            "billing":"subscription","subscription_model":"claude-fable-5-2"}));
+        assert_eq!(explicit.validate(), Ok(()));
+        for refused in [
+            json!({"runtime":"claude","mode":"session","task":"t","model":"alias","subscription_model":"claude-fable-5-2"}),
+            json!({"runtime":"claude","mode":"session","task":"t","model":"alias","billing":"subscription"}),
+            json!({"runtime":"claude","mode":"session","task":"t","billing":"api"}),
+            json!({"runtime":"codex","mode":"session","task":"t","model":"m","subscription_model":"claude-fable-5-2"}),
+            json!({"runtime":"claude","mode":"session","task":"t","subscription_model":"--settings"}),
+        ] {
+            assert!(start(refused.clone()).validate().is_err(), "{refused}");
+        }
+        // Old calls keep working and reach an older host unchanged.
+        let old = start(json!({"runtime":"claude","mode":"session","task":"t"}));
+        assert_eq!(old.validate(), Ok(()));
+        assert!(old.host_start(&[]).get("subscription_model").is_none());
+        let api = start(json!({"runtime":"claude","mode":"session","task":"t","model":"alias"}));
+        assert_eq!(api.validate(), Ok(()));
+        // The tool tells the agent how to name the exact model and who pays.
+        let tools = tools();
+        let schema = &tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "start_ox_worker")
+            .unwrap()["inputSchema"]["properties"];
+        assert!(schema["subscription_model"].is_object());
+        assert_eq!(schema["billing"]["enum"], json!(["api", "subscription"]));
     }
 
     #[test]

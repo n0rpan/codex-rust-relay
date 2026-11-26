@@ -45,8 +45,8 @@ fn spawn(
             billing,
             session,
             permission_mode: mode.into(),
-            subscription_model: None,
             contract: None,
+            model: None,
         },
         move |e| {
             let _ = tx.send(e);

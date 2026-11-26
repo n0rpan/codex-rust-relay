@@ -11,8 +11,11 @@ pub struct ReadThread {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResumedThread {
-    #[serde(flatten, deserialize_with = "super::access::Access::from_settings")]
-    pub access: super::access::Access,
+    #[serde(
+        flatten,
+        deserialize_with = "super::access::Permissions::from_settings"
+    )]
+    pub permissions: super::access::Permissions,
     pub thread: ThreadRow,
     pub model_provider: String,
     pub model: String,

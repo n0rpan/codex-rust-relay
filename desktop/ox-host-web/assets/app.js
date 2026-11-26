@@ -16,7 +16,13 @@ import { ActivityLine } from "./activity.js";
 import * as wire from "./wire.js";
 import { SessionControls } from "./controls.js";
 import { setupSettings } from "./settings.js";
-import { scopeKey, Projection, emptyScope } from "./model.js";
+import {
+  scopeKey,
+  Projection,
+  emptyScope,
+  catalogTree,
+  catalogParentResolver,
+} from "./model.js";
 import {
   deviceKey,
   pair,
@@ -66,6 +72,11 @@ const statusText = (session, needsInput) =>
           })[session.status] ?? "";
 const leaf = (path) => path.split("/").filter(Boolean).pop() || path;
 const keyOf = (scope, id) => scopeKey(scope) + " " + id;
+// The model the runtime itself answered with, published beside the launch stamp.
+const actualModel = (session) =>
+  session?.detail?.worker_model?.actual_model ??
+  session?.detail?.worker_marks?.actual_model ??
+  null;
 function notice(s = "") {
   $("message").hidden = !s;
   $("message").textContent = s;
@@ -723,7 +734,7 @@ function catalog() {
     }
   }
   const needle = $("find-sessions").value.trim().toLocaleLowerCase();
-  const byProject = new Map();
+  const visible = [];
   for (const row of rows) {
     const { scope, session } = row,
       s = global.scopes.get(scopeKey(scope)),
@@ -750,33 +761,32 @@ function catalog() {
         (needsInput || ["running", "needs_input"].includes(session.status)))
     )
       continue;
-    const list = byProject.get(scope.project) ?? [];
-    list.push({ ...row, needsInput });
-    byProject.set(scope.project, list);
+    visible.push({ ...row, needsInput });
+  }
+  // Nest by the recorded parent scope, not the child's project: a worker may run
+  // in a review checkout on another route. A filtered-out parent still leaves a
+  // navigable reference on the child.
+  const tree = catalogTree(visible, rows);
+  const byProject = new Map();
+  for (const entry of tree.roots) {
+    const list = byProject.get(entry.scope.project) ?? [];
+    list.push(entry);
+    byProject.set(entry.scope.project, list);
   }
   const frag = document.createDocumentFragment();
   for (const [project, list] of [...byProject].sort((a, b) =>
     a[0].localeCompare(b[0]),
   )) {
     frag.append(el("h2", "project", project));
-    const done = new Set(),
-      children = new Map();
-    for (const entry of list)
-      if (entry.session.parent) {
-        // A host-owned worker runs on its own route; its origin names the parent's scope.
-        const k = keyOf(
-            entry.session.detail?.origin?.parent?.scope ?? entry.scope,
-            entry.session.parent,
-          ),
-          group = children.get(k) ?? [];
-        group.push(entry);
-        children.set(k, group);
-      }
+    const done = new Set();
     const add = (entry, depth) => {
       const { scope, session, needsInput } = entry,
         key = keyOf(scope, session.id);
       if (done.has(key)) return;
       done.add(key);
+      const recorded = tree.links.get(key),
+        elsewhere = recorded && recorded.project !== scope.project,
+        model = actualModel(session);
       const b = button("", () => open(scope, session.id));
       b.dataset.source =
         session.parent || session.detail?.worker || session.detail?.origin
@@ -795,16 +805,21 @@ function catalog() {
         el("span", "session-name", session.title || "Untitled session"),
         el("span", "status", statusText(session, needsInput)),
       );
+      let meta = depth ? "↳ " : "";
+      if (depth && elsewhere) meta += leaf(scope.project) + " · ";
+      else if (!depth && recorded)
+        meta += `↳ ${recorded.title || leaf(recorded.project)} · `;
+      meta += routesLabel(scope.route);
+      if (model) meta += ` · ${model}`;
       b.append(
         head,
-        el("div", "meta", (depth ? "↳ " : "") + routesLabel(scope.route)),
+        el("div", "meta", meta),
       );
       frag.append(b);
-      for (const child of children.get(key) || []) add(child, depth + 1);
+      for (const child of tree.children.get(key) || []) add(child, depth + 1);
     };
     list.sort((a, b) => b.session.updated_at - a.session.updated_at);
-    for (const entry of list) if (!entry.session.parent) add(entry, 0);
-    for (const entry of list) add(entry, entry.session.parent ? 1 : 0);
+    for (const entry of list) add(entry, 0);
   }
   if (!frag.childNodes.length)
     frag.append(
@@ -1208,15 +1223,31 @@ function conversation() {
     routesLabel,
   });
   $("title").textContent = row?.title || (id ? "Session" : "New session");
+  // A worker says what it runs as: its billing route, the model the runtime
+  // confirmed (pending until then), the access ceiling and its checkout.
+  const worker = origin && origin.relation !== "handoff";
   $("context").textContent =
-    leaf(scope.project) +
+    (worker ? "checkout " + leaf(scope.project) : leaf(scope.project)) +
     " · " +
     routesLabel(row?.detail?.route || scope.route) +
-    (origin
-      ? origin.relation === "handoff"
+    (worker
+      ? ` · worker ${origin.job_id} · ${ceilingLabels[origin.ceiling] ?? origin.ceiling} ceiling${workerModel(row?.detail?.worker_model) || " · model pending"}`
+      : origin?.relation === "handoff"
         ? " · handoff"
-        : ` · worker ${origin.job_id} · ${ceilingLabels[origin.ceiling] ?? origin.ceiling} ceiling`
-      : "");
+        : "");
+  $("context").title = worker ? scope.project : "";
+  if (worker) {
+    const parentOf = catalogParentResolver(entries());
+    const parent = parentOf({ scope, session: row });
+    if (parent) {
+      const link = button(`↳ ${parent.title || "Parent session"}`, () =>
+        open(parent.scope, parent.id),
+      );
+      link.className = "context-link";
+      link.title = parent.project;
+      $("context").append(document.createTextNode(" · "), link);
+    }
+  }
   handoffMarks(row);
   if (
     pendingGrant?.id === id &&
@@ -1455,6 +1486,17 @@ $("new-form").onsubmit = async (e) => {
     notice(error.message);
   }
 };
+// The model a worker runs, after its billing route: the model that answered, or the
+// requested one marked pending until the runtime answers. Mirrors the desktop line.
+function workerModel(report) {
+  if (!report) return "";
+  const { model_state: state, actual_model: actual, pinned_model: pinned } = report;
+  if ((state === "confirmed" || state === "reported") && actual) return ` · ${actual}`;
+  if (state === "differs" && actual)
+    return ` · ${actual}, not ${pinned || "the pinned model"}`;
+  const asked = pinned || (report.billing === "subscription" && report.requested_model);
+  return asked ? ` · ${asked} (pending)` : "";
+}
 const ceilingLabels = {
   read: "read-only",
   write: "workspace write",

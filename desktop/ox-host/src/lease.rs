@@ -149,7 +149,7 @@ fn answer(
     let (done, result) = mpsc::sync_channel(1);
     tx.send(Message::Gateway {
         caller,
-        request,
+        request: Box::new(request),
         reply: Replier::Channel(done),
     })
     .map_err(io::Error::other)?;

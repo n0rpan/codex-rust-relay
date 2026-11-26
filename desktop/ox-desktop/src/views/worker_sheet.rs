@@ -156,8 +156,10 @@ pub(super) fn worker_start(
         task: task.to_owned(),
         write: None,
         permission: permission_field(permission),
+        checkout: None,
         yolo_confirmed: yolo,
         max_minutes: None,
+        subscription_model: None,
     };
     start.validate()?;
     Ok(start)

@@ -324,6 +324,15 @@ h1 {
   font-size: 0.77rem;
   color: var(--muted);
 }
+.context-link {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  min-height: 0;
+}
 #context:before {
   content: "";
   width: 5px;

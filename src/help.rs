@@ -16,6 +16,7 @@ If something is off
   ox doctor          Check everything. The last line is the next command to run
   ox doctor --fix    Repair what ox can repair itself (files are backed up first)
   ox setup           Add a provider, paste a key, sign in, or enable web search
+  ox help settings   Find providers, accounts and remote access in the apps
   ox ps              List the live sessions and workers the OX host runs
   ox end <id>        End a session (or --idle, --all); ox ps shows the ids
   ox weather [--json]  Weather for your timezone's city (MET Norway; OX_WEATHER=0 turns it off)
@@ -27,7 +28,7 @@ More
   ox login chatgpt|claude              Sign in with a ChatGPT or Claude plan
   ox serve [--port PORT]               Share one gateway with desktop apps and devices
   ox update [--check]                  Install or check for the newest ox release
-  ox help [install|setup|desktop|share|t3|subscriptions]
+  ox help [install|setup|settings|desktop|share|t3|subscriptions]
   ox --version
 
 Providers live in codeox.toml in your Codex home; ox doctor prints the path.
@@ -174,6 +175,55 @@ For API vendors, desktop gateways, and sharing, add provider API keys with
 ox setup and run ox serve on the host. For included API credits, use an API
 key from the OpenAI or Claude organization where you claimed those credits.";
 
+const SETTINGS: &str = "\
+Settings in OX Desktop and on the phone
+
+Both screens edit the same provider file and saved keys as ox setup. Use
+whichever is at hand.
+
+OX Desktop
+  Open Settings with Ctrl+, (Cmd+, on macOS) or the sidebar footer.
+  Accounts                Sign in with ChatGPT or Claude; Configure provider.
+  Providers & models      Add, edit or remove a provider and its models.
+  API keys                Save, replace or remove a provider key.
+  Web search              Brave Search for both clients.
+  Starred models          Order the model lists; any model still runs.
+  Appearance & input      Theme, text size and the Enter key.
+  Remote access           Enable Tailscale Serve, Pair a device, and allow
+                          terminal access for a paired phone.
+  Advanced configuration  Edit the provider registry and favorites as text.
+
+Phone (the paired web app)
+  Sessions → ••• → Settings
+  Accounts                Sign in; Configure API provider.
+  Providers & models      The same provider editor.
+  Credentials             Provider keys.
+  Favorites               Order the model lists.
+  Web search              Brave Search for both clients.
+  Remote access           Pair another device and review paired devices.
+  Install & notifications Home Screen and alert setup.
+  Phone appearance & input
+                          Theme, text size and the Enter key on this phone.
+  Sign-in buttons need terminal access for that device: OX Desktop →
+  Settings → Remote access → Allow terminal access.
+
+Where the files are
+  Providers: $CODEX_HOME/codeox.toml (default ~/.codex/codeox.toml).
+  Saved keys: $CODEX_HOME/ox-api-keys.json, or the environment variable named
+  in the provider entry. An exported variable overrides a saved key.
+
+Checks and next steps
+  ox setup                Add a provider, save a key, sign in, enable Brave.
+  ox doctor               Check files, providers and saved accounts. It prints
+                          home: and a next: line with the command to run.
+  ox doctor --fix         Repair what ox can repair; files are backed up first.
+  ox host doctor          Check the host, Tailscale Serve and paired devices.
+  ox help share           Serve one gateway to another device.
+  ox help subscriptions   Sign in with a ChatGPT or Claude plan.
+
+These screens are OX Desktop and the phone. Stock Codex, Codex Desktop and
+Claude Code keep their own settings; use ox help desktop for those fields.";
+
 const INSTALL: &str = "\
 Install or update ox on macOS and Linux
 
@@ -193,6 +243,7 @@ Manual download steps and platform filenames are in docs/configuration.md.";
 const HELP_TOPICS: &[&str] = &[
     "install",
     "setup",
+    "settings",
     "desktop",
     "share",
     "t3",
@@ -217,7 +268,7 @@ End sessions on the OX host. A thread stays resumable after it ends.
   --all               end every session. Asks y/N unless --yes is given.
 A running session loses its current turn when it ends. ox ps lists the ids.";
 
-const TOPICS: &str = "Usage: ox help [install|setup|desktop|share|t3|subscriptions]";
+const TOPICS: &str = "Usage: ox help [install|setup|settings|desktop|share|t3|subscriptions]";
 
 pub(crate) fn overview() {
     println!("{OVERVIEW}");
@@ -231,6 +282,7 @@ pub(crate) fn dispatch(args: &[OsString]) -> Option<Result<u8, RelayError>> {
         [command, topic] if command == "help" => match topic.to_str() {
             Some("install") => println!("{INSTALL}"),
             Some("setup") => return Some(crate::setup::print_setup_help()),
+            Some("settings") => println!("{SETTINGS}"),
             Some("desktop") => println!(
                 "{DESKTOP}\n\nCodex manual configuration\n\
                  Replace the example URL and model alias before merging:\n\n{}",

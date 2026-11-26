@@ -91,6 +91,11 @@ pub struct Store {
     ended_threads: HashSet<String>,
     /// Ended threads a message is waiting on: reopened, and the draft is sent once ready.
     resume_sends: HashSet<String>,
+    /// The host's stamp on the action being dispatched now. Each submit copies it, so a
+    /// queued or deferred message keeps the sender that was current when it was accepted.
+    sender: Option<crate::surface::Sender>,
+    /// The stamp of each message waiting in `resume_sends`.
+    resume_senders: HashMap<String, crate::surface::Sender>,
     /// The Claude access mode an ended session had when its process went away, whether
     /// this client ended it or the host reaped the idle route. A send that reopens the
     /// session starts it in that mode; opening it from the list does not (see
@@ -107,6 +112,9 @@ pub struct Store {
     /// The launch contract of each hosted Claude worker session, kept with the session so
     /// every relaunch (cold resume, resume after a host restart, fork) starts under it.
     worker_contracts: HashMap<String, crate::claude_worker_contract::Contract>,
+    /// The exact subscription model each pinned Claude worker session runs, kept like
+    /// its contract so a continuation never falls back to the account default.
+    worker_models: HashMap<String, String>,
     child_threads: HashMap<String, (String, PathBuf)>,
     next_preset: Option<crate::codex::access::Access>,
     selection: u64,
@@ -197,11 +205,14 @@ impl Store {
             terminal_threads: Default::default(),
             ended_threads: Default::default(),
             resume_sends: Default::default(),
+            sender: None,
+            resume_senders: Default::default(),
             resume_access: Default::default(),
             resume_models: Default::default(),
             unsaved_claude_drafts: Default::default(),
             restored_drafts: Default::default(),
             worker_contracts: Default::default(),
+            worker_models: Default::default(),
             child_threads: Default::default(),
             next_preset: None,
             selection: 0,
@@ -281,6 +292,7 @@ impl Store {
         self.unsaved_claude_drafts = std::mem::take(&mut previous.unsaved_claude_drafts);
         self.restored_drafts = std::mem::take(&mut previous.restored_drafts);
         self.worker_contracts = std::mem::take(&mut previous.worker_contracts);
+        self.worker_models = std::mem::take(&mut previous.worker_models);
         self.authorized_models = std::mem::take(&mut previous.authorized_models);
         self.next_options = previous.next_options.take();
         self.selected = previous.selected.clone();
@@ -627,6 +639,7 @@ impl Store {
                     thread.ready = false;
                     thread.loading = false;
                     thread.access = None;
+                    thread.ceiling = None;
                 }
                 return Ok(());
             }
