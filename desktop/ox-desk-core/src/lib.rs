@@ -3,6 +3,8 @@
 pub mod claude_worker_contract;
 #[path = "../../../src/settings_protocol.rs"]
 pub mod settings_protocol;
+#[path = "../../../src/worker_checkout.rs"]
+pub mod worker_checkout;
 
 pub mod actions;
 pub mod asks;

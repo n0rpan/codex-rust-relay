@@ -39,6 +39,8 @@ pub(super) struct Start {
     mode: Mode,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    checkout: Option<std::path::PathBuf>,
     task: String,
     /// Legacy: false means read, true means write. Capped by the parent's mode.
     #[serde(default)]
@@ -109,6 +111,7 @@ struct Instruction {
 }
 
 struct Job {
+    checkout: std::path::PathBuf,
     sender: mpsc::Sender<Instruction>,
     state: Arc<Mutex<State>>,
     task: AbortHandle,
@@ -220,7 +223,8 @@ impl Jobs {
             return Err("All background worker slots are in use. Wait for one to finish or cancel one. The limit is OX_WORKER_MAX_PER_PARENT.".into());
         }
         let writes = request.writes()?;
-        let warning = self.write_overlap(writes);
+        let cwd = crate::worker_checkout::resolve(cwd, request.checkout.as_deref(), false)?;
+        let warning = self.write_overlap(writes, &cwd);
         let max_minutes = request
             .max_minutes
             .map(u64::from)
@@ -235,7 +239,7 @@ impl Jobs {
             self.entries.remove(&id);
         }
         let command = request
-            .command(home, cwd)
+            .command(home, &cwd)
             .map_err(|error| error.to_string())?;
         // Worker IDs appear in archived transcripts. Never recycle a small counter on reconnect.
         let id = loop {
@@ -312,6 +316,7 @@ impl Jobs {
         self.entries.insert(
             id,
             Job {
+                checkout: cwd,
                 sender,
                 state,
                 task: handle.abort_handle(),
@@ -322,12 +327,12 @@ impl Jobs {
     }
 
     /// A caution when this write worker starts beside another running write worker.
-    fn write_overlap(&self, writes: bool) -> Option<String> {
+    fn write_overlap(&self, writes: bool, checkout: &Path) -> Option<String> {
         (writes
             && self
                 .entries
                 .values()
-                .any(|job| job.writes && !job.task.is_finished()))
+                .any(|job| job.writes && job.checkout == checkout && !job.task.is_finished()))
         .then(|| {
             "Another write worker is editing this project. Consider a separate git worktree."
                 .to_owned()
@@ -370,7 +375,7 @@ impl Drop for Jobs {
 impl Start {
     /// The launch the session host receives. Secrets are removed from the task first.
     pub(super) fn host_start(&self, secrets: &[String]) -> Value {
-        json!({
+        let mut start = json!({
             "parent": "",
             "runtime": self.runtime,
             "model": self.model,
@@ -379,7 +384,11 @@ impl Start {
             "write": self.workspace_write,
             "max_minutes": self.max_minutes,
             "permission": self.permission_mode.as_deref().map(|m| permission_level(m).ok().flatten().unwrap_or("inherit")),
-        })
+        });
+        if let Some(path) = &self.checkout {
+            start["checkout"] = json!(path);
+        }
+        start
     }
     /// Without a session host the gateway cannot verify the parent's mode: it
     /// starts read workers by default and write workers on request, as before.
@@ -1080,6 +1089,7 @@ printf '%s\n' '{"type":"result","is_error":true,"result":"overloaded right now"}
         let (sender, _) = mpsc::channel(1);
         let task = tokio::spawn(std::future::pending::<()>());
         Job {
+            checkout: ".".into(),
             sender,
             state: Arc::new(Mutex::new(State {
                 runtime: Runtime::Codex,
@@ -1115,10 +1125,14 @@ printf '%s\n' '{"type":"result","is_error":true,"result":"overloaded right now"}
     #[tokio::test]
     async fn a_second_write_worker_gets_a_warning_and_a_read_worker_does_not() {
         let mut jobs = Jobs::default();
-        assert!(jobs.write_overlap(true).is_none());
+        assert!(jobs.write_overlap(true, Path::new(".")).is_none());
         jobs.entries.insert(1, pending_job(true));
-        assert!(jobs.write_overlap(true).unwrap().contains("git worktree"));
-        assert!(jobs.write_overlap(false).is_none());
+        assert!(
+            jobs.write_overlap(true, Path::new("."))
+                .unwrap()
+                .contains("git worktree")
+        );
+        assert!(jobs.write_overlap(false, Path::new(".")).is_none());
     }
 
     #[test]

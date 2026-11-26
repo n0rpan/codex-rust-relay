@@ -762,10 +762,7 @@ With the session host running, workers start in the main session's own
 permission mode, mapped to the worker's runtime (Codex Read only ↔ Claude Plan,
 Workspace ↔ Accept edits, Auto-review ↔ Auto, YOLO ↔ bypass permissions).
 The main agent can lower it with `start_ox_worker`'s `permission_mode`
-(`read`, `write`, `classifier` or `yolo`) and can never raise it. A worker
-that would start in YOLO or bypass waits until you accept it in OX Desktop or
-on a paired phone, unless you granted YOLO for that session's workers and
-handoffs. Without a host, workers start with read access, and write access
+(`read`, `write`, `classifier` or `yolo`) and can never raise it. A worker that inherits an active YOLO or bypass parent starts without a second confirmation. Explicit YOLO requests use a stored grant or ask on OX Desktop or a paired phone. Without a host, workers start with read access, and write access
 when you tell the main agent a worker may edit files. Claude read workers use
 Plan mode with the host and `dontAsk` with only read tools in a standalone
 launch. Classifier and YOLO require the session host.

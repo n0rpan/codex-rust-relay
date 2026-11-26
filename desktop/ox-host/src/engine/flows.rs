@@ -140,8 +140,8 @@ impl Engine {
         }
         self.workers
             .jobs()
-            .any(|(_, _, e)| {
-                e.origin.parent.project == scope.project
+            .any(|(worker_scope, _, e)| {
+                worker_scope.project == scope.project
                     && e.origin.ceiling >= ox_desk_core::origin::Ceiling::Write
                     && self.worker_active(e.origin.job_id)
             })

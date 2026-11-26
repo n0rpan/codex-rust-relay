@@ -2217,6 +2217,13 @@
       "additionalProperties": false,
       "description": "An operator's request to start a worker attached to a session in the subscribed scope.",
       "properties": {
+        "checkout": {
+          "description": "Execution directory, independent of the parent session identity.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "max_minutes": {
           "description": "Wall-clock limit in minutes. Absent means no limit unless the host sets `OX_WORKER_MAX_MINUTES`.",
           "format": "uint32",

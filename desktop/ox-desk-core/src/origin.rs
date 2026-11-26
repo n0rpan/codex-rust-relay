@@ -127,6 +127,9 @@ pub struct WorkerStart {
     pub parent: String,
     pub runtime: Runtime,
     pub model: Option<String>,
+    /// Execution directory, independent of the parent session identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<PathBuf>,
     pub mode: WorkerMode,
     pub task: String,
     /// Legacy access request: false is read, true is write. Absent means inherit.
@@ -201,6 +204,7 @@ impl WorkerStart {
             task: task.to_owned(),
             write,
             permission,
+            checkout: None,
             yolo_confirmed: false,
             max_minutes: None,
         };
@@ -376,5 +380,28 @@ mod tests {
         assert_eq!(stamp.ceiling, Ceiling::Write);
         assert_eq!(stamp.limits_children(), Some(Ceiling::Write));
         assert!(stamp.started.is_none() && stamp.handoff.is_none());
+    }
+}
+
+#[cfg(test)]
+mod checkout_tests {
+    use crate::worker_checkout::resolve;
+    use std::path::Path;
+    #[test]
+    fn canonical_checkout_respects_workspace_and_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        std::os::unix::fs::symlink(temp.path(), root.join("outside")).unwrap();
+        assert_eq!(
+            resolve(&root, Some(Path::new("child")), false).unwrap(),
+            root.join("child").canonicalize().unwrap()
+        );
+        assert!(resolve(&root, Some(Path::new("outside")), false).is_err());
+        assert!(resolve(&root, Some(Path::new("../missing")), true).is_err());
+        assert_eq!(
+            resolve(&root, Some(Path::new("outside")), true).unwrap(),
+            temp.path().canonicalize().unwrap()
+        );
     }
 }

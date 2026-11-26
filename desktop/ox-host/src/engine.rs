@@ -1804,6 +1804,11 @@ impl Engine {
             crate::workers::grant(source, external, start.mode_request(), start.runtime)?;
         let this_parent = crate::workers::parent_ref(caller, parent.clone());
         self.check_worker_cap(&this_parent)?;
+        let project = ox_desk_core::worker_checkout::resolve(
+            &project,
+            start.checkout.as_deref(),
+            source == Some(ox_desk_core::modes::Level::Yolo),
+        )?;
         let scope = canonical_scope(Scope {
             project,
             route: start.route(),
@@ -1831,6 +1836,13 @@ impl Engine {
                     let session = parent.as_deref().expect("hosted parent");
                     match self.yolo_grant(ps, session) {
                         Some(grant) => origin.yolo = Some(grant),
+                        None if start.mode_request()
+                            == ox_desk_core::modes::ModeRequest::Inherit =>
+                        {
+                            origin.yolo = Some(YoloAllowance::Inherited {
+                                session: session.to_owned(),
+                            });
+                        }
                         None => {
                             let parent_title = self.running[ps]
                                 .store
@@ -3355,6 +3367,7 @@ mod tests {
                 task: "check".into(),
                 write: Some(write),
                 permission: None,
+                checkout: None,
                 yolo_confirmed: false,
                 max_minutes: None,
             }
@@ -3826,6 +3839,7 @@ mod tests {
                     task: "fix".into(),
                     write: Some(true),
                     permission: None,
+                    checkout: None,
                     yolo_confirmed: false,
                     max_minutes: None,
                 },
@@ -4148,6 +4162,48 @@ mod tests {
             );
         }
 
+        fn explicit_yolo(runtime: Runtime) -> WorkerStart {
+            WorkerStart {
+                permission: Some(ox_desk_core::modes::ModeRequest::Level(Ceiling::Yolo)),
+                ..inherit(runtime)
+            }
+        }
+
+        #[test]
+        fn inherited_yolo_runs_in_the_requested_checkout_and_keeps_its_visible_parent() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker, _) = routes(root.path());
+            let checkout = root.path().join("isolated");
+            std::fs::create_dir(&checkout).unwrap();
+            let child = Scope {
+                project: checkout.canonicalize().unwrap(),
+                ..worker
+            };
+            with_parent(&mut engine, &parent, "yolo");
+            engine
+                .running
+                .insert(child.clone(), live(&child, vec![], &[], vec![]).0);
+            let request = WorkerStart {
+                checkout: Some(checkout),
+                ..inherit(Runtime::Codex)
+            };
+            let result = engine
+                .accept_launch(&thread(&parent, "a"), request)
+                .unwrap();
+            let Accepted::Launch(scope, launch) = result else {
+                panic!("unexpected approval request")
+            };
+            assert_eq!(scope, child);
+            assert_eq!(launch.origin.parent.scope.as_ref(), Some(&parent));
+            assert_eq!(launch.origin.parent.session.as_deref(), Some("a"));
+            assert_eq!(launch.origin.started, Some(Access::Yolo));
+            assert!(
+                matches!(launch.origin.yolo, Some(YoloAllowance::Inherited { session }) if session == "a")
+            );
+        }
+
         #[test]
         fn a_yolo_child_waits_for_the_operator_who_accepts_one_and_declines_another() {
             let root = tempfile::tempdir().unwrap();
@@ -4160,7 +4216,7 @@ mod tests {
                 .insert(worker.clone(), live(&worker, vec![], &[], vec![]).0);
             let request = |engine: &mut Engine, confirmed: bool| {
                 let (done, result) = std::sync::mpsc::sync_channel(1);
-                let mut s = inherit(Runtime::Codex);
+                let mut s = explicit_yolo(Runtime::Codex);
                 // An agent cannot confirm YOLO for itself.
                 s.yolo_confirmed = confirmed;
                 engine
@@ -4479,11 +4535,11 @@ mod tests {
                 .act(1, "g2", &parent, Action::YoloGrant("a".into(), false), None)
                 .unwrap();
             assert!(matches!(
-                engine.accept_launch(&thread(&parent, "a"), inherit(Runtime::Codex)),
+                engine.accept_launch(&thread(&parent, "a"), explicit_yolo(Runtime::Codex)),
                 Ok(Accepted::Ask(_))
             ));
             assert!(matches!(
-                engine.accept_launch(&thread(&worker, "w"), inherit(Runtime::Codex)),
+                engine.accept_launch(&thread(&worker, "w"), explicit_yolo(Runtime::Codex)),
                 Ok(Accepted::Ask(_))
             ));
             assert_eq!(
@@ -4541,8 +4597,7 @@ mod tests {
                     .insert(worker.clone(), live(&worker, vec![], &[], vec![]).0);
                 let (done, result) = std::sync::mpsc::sync_channel(1);
                 // A Claude parent in bypass: the parent scope here is Codex, so use the table directly.
-                let mut s = inherit(Runtime::Codex);
-                s.permission = None;
+                let s = explicit_yolo(Runtime::Codex);
                 engine.running.insert(
                     parent.clone(),
                     live(
@@ -4582,7 +4637,7 @@ mod tests {
                 .running
                 .insert(worker.clone(), live(worker, vec![], &[], vec![]).0);
             let (done, result) = std::sync::mpsc::sync_channel(1);
-            let mut s = inherit(Runtime::Codex);
+            let mut s = explicit_yolo(Runtime::Codex);
             s.yolo_confirmed = true;
             engine
                 .launch(thread(parent, "a"), s, Replier::Channel(done))

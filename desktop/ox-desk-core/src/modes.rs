@@ -161,6 +161,8 @@ pub enum Decision {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "by", rename_all = "snake_case")]
 pub enum YoloAllowance {
+    /// The worker inherited the verified active parent’s existing bypass mode.
+    Inherited { session: String },
     /// The operator accepted this child's YOLO request on a device.
     Accepted { request: String, device: String },
     /// A grant stored with an ancestor session (or the project default) covered it.

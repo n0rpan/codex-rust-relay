@@ -399,7 +399,7 @@ pub(crate) fn status(
             // A stopped Workflow can exit before calling its tool.
             _ if finished && stopped => "interrupted",
             _ if finished && workflow_unrun(o.mode, timeline) => "failed",
-            _ if finished || timeline.is_none() => "completed",
+            _ if finished => "completed",
             _ => "running",
         }
     };
@@ -414,7 +414,8 @@ pub(crate) fn status(
     // interrupted, answers from the record: a reopened route that lists the session
     // without its history (an unrelated sibling opened it) must not turn a recorded
     // failure into a success.
-    if (status == "interrupted" && !stopped || timeline.is_none() && status == "completed")
+    if (status == "interrupted" && !stopped
+        || timeline.is_none() && row != "running" && row != "needs_input" && status == "running")
         && let Some(last) = recorded
     {
         status = match last.status.as_str() {
@@ -424,6 +425,8 @@ pub(crate) fn status(
         };
     }
     let progress = match row {
+        _ if status == "cancelled" => "",
+        _ if status == "running" && timeline.is_none() && row != "running" => "Starting worker",
         "needs_input" => "Waiting for the operator to answer a request",
         "running" => "Working",
         _ if status == "interrupted" && stopped => {
@@ -1005,6 +1008,19 @@ mod tests {
             capabilities: vec!["steer".into()],
             detail: Value::Null,
         };
+        let starting = status(
+            &entry,
+            "w",
+            "w",
+            Some(&view("idle")),
+            None,
+            true,
+            Operators::default(),
+        );
+        assert_eq!(
+            starting["status"], "running",
+            "the worker has no completed turn yet"
+        );
         let done = Timeline {
             items: vec![ox_desk_core::host_protocol::TimelineItem {
                 turn: "t".into(),
