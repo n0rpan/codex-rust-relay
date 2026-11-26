@@ -1682,8 +1682,7 @@ impl ReasoningPolicy {
             .map(str::to_owned);
         if let Some(requested) = requested {
             let wants_off = requested == "none";
-            let supports_none = self.supported.iter().any(|level| level == "none");
-            let unsupported = !self.supported.is_empty() && !supports_none;
+            let unsupported = !self.supported.is_empty() && !self.supported.contains(&requested);
             if (wants_off && self.mandatory) || unsupported {
                 let replacement = self
                     .default
@@ -2377,6 +2376,10 @@ sort = "price"
         });
         assert!(route.reasoning.normalize_anthropic(&mut payload).is_some());
         assert_eq!(payload["output_config"]["effort"], "high");
+
+        let mut payload = serde_json::json!({"output_config": {"effort": "low"}});
+        assert!(route.reasoning.normalize_anthropic(&mut payload).is_none());
+        assert_eq!(payload["output_config"]["effort"], "low");
 
         // A mandatory policy with no list still corrects a disabling effort.
         let route = reasoning_route(&[], Some("high"), true);
