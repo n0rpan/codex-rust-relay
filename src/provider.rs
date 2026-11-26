@@ -1572,11 +1572,17 @@ impl Route {
         if wants_off && supports_none && !mandatory {
             return None;
         }
-        if !wants_off
-            && let Some(effort) = requested.as_deref()
-            && supported.iter().any(|level| level == effort)
-        {
-            return None;
+        if !wants_off {
+            // An unknown list does not mean every explicit effort is invalid,
+            // and a mandatory policy only forbids turning reasoning off.
+            if supported.is_empty() {
+                return None;
+            }
+            if let Some(effort) = requested.as_deref()
+                && supported.iter().any(|level| level == effort)
+            {
+                return None;
+            }
         }
         let replacement = self
             .reasoning

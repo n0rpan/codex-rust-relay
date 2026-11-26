@@ -27,7 +27,9 @@ use std::sync::Mutex;
 pub const MAX_ATTEMPTS: usize = 3;
 
 /// Top-level request fields OX may omit after a provider rejects them. The list
-/// is ordered: the first match wins when a message names several.
+/// is ordered: the first match wins when a message names several. `text` is not
+/// here: it carries the JSON-schema output format, and answering without the
+/// requested schema is worse than surfacing the provider error.
 const DROPPABLE: &[&str] = &[
     "reasoning",
     "reasoning_effort",
@@ -42,7 +44,6 @@ const DROPPABLE: &[&str] = &[
     "temperature",
     "top_p",
     "top_k",
-    "text",
     "service_tier",
     "stream_options",
 ];
@@ -351,6 +352,15 @@ mod tests {
         assert!(!apply(Action::ReasoningOff, &mut body));
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn a_structured_output_constraint_is_never_dropped() {
+        let body = json!({"model": "m", "text": {"format": {"type": "json_schema"}}});
+        assert_eq!(
+            classify(400, "Unsupported parameter: 'text' is not supported", &body),
+            None
+        );
     }
 
     #[test]
