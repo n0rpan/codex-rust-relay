@@ -4,6 +4,7 @@ use crate::appearance::Palette;
 use crate::appearance::Step;
 use gpui::{prelude::*, *};
 pub use ox_desk_core::desktop_behavior::{Behavior, ThemeSource, WorkerApprovals};
+use ox_desk_core::runtime::{Access, Runtime};
 pub struct Active(pub Behavior);
 impl Global for Active {}
 impl std::ops::Deref for Active {
@@ -11,6 +12,28 @@ impl std::ops::Deref for Active {
     fn deref(&self) -> &Behavior {
         &self.0
     }
+}
+/// "Same as terminal" plus every native preset of `runtime`, as start-mode choices.
+fn start_choices(runtime: Runtime, b: Behavior) -> Vec<(&'static str, Behavior)> {
+    let with = |start: Option<Access>| match runtime {
+        Runtime::Claude => Behavior {
+            claude_start: start,
+            ..b
+        },
+        Runtime::Codex => Behavior {
+            codex_start: start,
+            ..b
+        },
+    };
+    std::iter::once(("Same as terminal", with(None)))
+        .chain(Access::choices(runtime).iter().map(|&mode| {
+            let label = match mode {
+                Access::Default => "Ask before edits",
+                other => other.label(),
+            };
+            (label, with(Some(mode)))
+        }))
+        .collect()
 }
 impl Preferences {
     fn preference_choices(
@@ -23,7 +46,7 @@ impl Preferences {
     ) -> Div {
         let mut controls = div().flex().gap_1().flex_wrap();
         for &(caption, next) in options {
-            controls = controls.child(crate::kit::button(p, caption, caption, next == current, true, cx.listener(move |s, _, _, cx| {
+            controls = controls.child(crate::kit::button(p, SharedString::from(format!("{label}:{caption}")), caption, next == current, true, cx.listener(move |s, _, _, cx| {
                     if current == next || s.busy {
                         return;
                     }
@@ -80,6 +103,26 @@ impl Preferences {
             .rounded_lg()
             .bg(rgb(p.panel))
             .child(div().text_size(p.text(Step::Title)).child("Agents"))
+            .child(self.preference_choices(
+                "New Claude sessions",
+                &start_choices(Runtime::Claude, b),
+                b,
+                p,
+                cx,
+            ))
+            .child(self.preference_choices(
+                "New Codex sessions",
+                &start_choices(Runtime::Codex, b),
+                b,
+                p,
+                cx,
+            ))
+            .child(
+                div()
+                    .text_size(p.text(Step::Meta))
+                    .text_color(rgb(p.muted))
+                    .child("Same as terminal starts a new session the way `claude` or `codex` starts in your terminal, using your own Claude Code and Codex settings. A mode you pick in the composer still applies to that one session."),
+            )
             .child(self.preference_choices(
                 "Worker requests",
                 &[

@@ -629,6 +629,12 @@ setup or run `ox claude` to open a Claude session. With no API provider, `ox doc
 saved accounts without launching either client. Each client validates its own
 credentials when you open a subscription session. If Codex uses its keyring,
 ox reports the configured store and leaves the account check to Codex.
+New sessions in OX Desktop and on the phone start the way the stock client
+starts in your terminal: Claude Code in its own default mode (Auto when your
+account uses it) and Codex with the access settings in your Codex
+configuration. To start every new session in a fixed mode instead, choose one
+under Settings › Accounts › Agents › **New Claude sessions** or **New Codex
+sessions**. A mode you pick in the composer still applies to that session.
 `ox help subscriptions` lists the sign-in commands. `ox help settings` maps
 providers, accounts and remote access to their labels in OX Desktop and on the
 phone, and names the files and checks behind them.

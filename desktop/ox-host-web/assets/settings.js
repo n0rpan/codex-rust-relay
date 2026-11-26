@@ -479,11 +479,33 @@ export function setupSettings({ request, open, close, notifications, login }) {
         select = node("select");
       select.name = name;
       for (const [text, value] of options) select.append(new Option(text, value));
-      select.value = record.behavior[name];
+      select.value = record.behavior[name] ?? "";
       wrap.append(select);
       form.append(wrap);
       fields.push(select);
     };
+    const terminal = ["Same as terminal", ""];
+    choice("New Claude sessions", "claude_start", [
+      terminal,
+      ["Ask before edits", "default"],
+      ["Auto", "auto"],
+      ["Accept edits", "accept_edits"],
+      ["Plan mode", "plan"],
+      ["YOLO · bypass permissions", "bypass_permissions"],
+    ]);
+    choice("New Codex sessions", "codex_start", [
+      terminal,
+      ["Read only", "read_only"],
+      ["Workspace", "workspace"],
+      ["Auto-review", "auto_review"],
+      ["YOLO", "yolo"],
+    ]);
+    form.append(
+      node(
+        "p",
+        "Same as terminal starts a new session the way claude or codex starts in your terminal, with your own Claude Code and Codex settings.",
+      ),
+    );
     choice("Worker requests", "worker_approvals", [
       ["Parent agent answers", "parent"],
       ["I answer", "operator"],
@@ -496,7 +518,11 @@ export function setupSettings({ request, open, close, notifications, login }) {
     );
     submit(form, "Save agent settings", async () => {
       const behavior = { ...record.behavior };
-      for (const select of fields) behavior[select.name] = select.value;
+      for (const select of fields)
+        behavior[select.name] =
+          select.value === "" && select.name.endsWith("_start")
+            ? null
+            : select.value;
       const result = await request({
         action: "save_behavior",
         revision: record.revision,

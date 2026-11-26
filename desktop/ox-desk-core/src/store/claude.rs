@@ -79,7 +79,7 @@ struct Process {
     /// Native message UUID and durable host notice id until the CLI echoes it.
     worker_notice: Option<(String, u64)>,
     /// The permission mode this process was launched with.
-    launch_mode: String,
+    launch_mode: Option<String>,
     /// The explicit subscription model to reuse if a turn needs to be retried.
     selected_model: Option<String>,
     started_new: bool,
@@ -657,7 +657,7 @@ impl Store {
         let profile = self.profile.clone();
         // A draft preset belongs only to the new session it was chosen for.
         let preset = match &session {
-            Session::New(_) => self.next_preset.take(),
+            Session::New(_) => self.next_preset.take().or_else(|| self.start_mode()),
             Session::Resume(_) => resume_mode,
             Session::Fork { .. } => None,
         };
@@ -693,8 +693,9 @@ impl Store {
             (Session::New(_), Some(c)) => Some(c.permission_mode().to_owned()),
             _ => preset.and_then(Access::mode).map(str::to_owned),
         }
-        .or_else(|| contract.map(|c| c.permission_mode().to_owned()))
-        .unwrap_or_else(|| "default".to_owned());
+        .or_else(|| contract.map(|c| c.permission_mode().to_owned()));
+        // With no chosen mode, Claude Code starts in its own configured default,
+        // as `claude` does in a terminal, and reports that mode on connect.
         let model = model.or_else(|| match &session {
             Session::New(_) if contract.is_none() && !profile.route.is_api() => {
                 self.next_options.take().map(|options| options.model)

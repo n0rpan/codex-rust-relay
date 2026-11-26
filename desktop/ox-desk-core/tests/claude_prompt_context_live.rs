@@ -181,7 +181,7 @@ fn stock_claude_receives_stable_facts_and_each_submit_label() {
                 billing: Billing::Api(MODEL.into()),
                 session: Session::New("6f1c2b55-2f43-4d0e-9a51-3e7c1d0a9b21".into()),
                 model: None,
-                permission_mode: "default".into(),
+                permission_mode: Some("default".into()),
                 contract: None,
             },
             move |e| {

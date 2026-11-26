@@ -29,6 +29,17 @@ impl Store {
         t.access?;
         t.ceiling
     }
+    /// Replace where new sessions read their start mode, for tests and embedders.
+    pub fn set_start_mode(
+        &mut self,
+        source: fn(crate::runtime::Runtime) -> Option<crate::runtime::Access>,
+    ) {
+        self.start_mode = source;
+    }
+    /// The start mode for a new session nobody chose a mode for.
+    pub(crate) fn start_mode(&self) -> Option<crate::runtime::Access> {
+        (self.start_mode)(self.profile.route.runtime)
+    }
     pub fn next_access(&self) -> Option<crate::codex::access::Access> {
         self.next_preset
     }

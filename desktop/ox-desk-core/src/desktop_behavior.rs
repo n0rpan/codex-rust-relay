@@ -1,4 +1,5 @@
 //! User-owned Desktop appearance and input settings shared by native and paired settings clients.
+use crate::runtime::{Access, Runtime};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -38,6 +39,12 @@ pub struct Behavior {
     pub live_weather: bool,
     pub background_updates: bool,
     pub worker_approvals: WorkerApprovals,
+    /// The mode a new Claude Code session starts in. `None` starts it the way
+    /// `claude` starts in a terminal: Claude Code's own configured default.
+    pub claude_start: Option<Access>,
+    /// The preset a new Codex session starts in. `None` uses the Codex config,
+    /// as `codex` does in a terminal.
+    pub codex_start: Option<Access>,
 }
 impl Default for Behavior {
     fn default() -> Self {
@@ -49,6 +56,8 @@ impl Default for Behavior {
             live_weather: true,
             background_updates: true,
             worker_approvals: WorkerApprovals::Parent,
+            claude_start: None,
+            codex_start: None,
         }
     }
 }
@@ -87,6 +96,17 @@ fn snapshot(value: Value) -> io::Result<Snapshot> {
         behavior,
     })
 }
+/// The mode a new session of `runtime` starts in when nobody chose one for it:
+/// the saved setting when it names a preset of that runtime, else `None`
+/// (the runtime's own configured default).
+pub fn start_mode(runtime: Runtime) -> Option<Access> {
+    let behavior = read().ok()?.behavior;
+    let chosen = match runtime {
+        Runtime::Claude => behavior.claude_start,
+        Runtime::Codex => behavior.codex_start,
+    }?;
+    Access::choices(runtime).contains(&chosen).then_some(chosen)
+}
 pub fn revision(value: Behavior) -> String {
     serde_json::to_string(&value).expect("Scalar desktop preferences are serializable")
 }
@@ -99,6 +119,17 @@ pub fn write(expected: &str, next: Behavior) -> io::Result<Outcome> {
 fn write_at(path: &Path, expected: &str, next: Behavior) -> io::Result<Outcome> {
     if !(12..=24).contains(&next.font_size) {
         return Err(io::Error::other("Font size must be between 12 and 24"));
+    }
+    for (runtime, start) in [
+        (Runtime::Claude, next.claude_start),
+        (Runtime::Codex, next.codex_start),
+    ] {
+        if start.is_some_and(|a| !Access::choices(runtime).contains(&a)) {
+            return Err(io::Error::other(format!(
+                "That start mode is not a {} mode",
+                runtime.name()
+            )));
+        }
     }
     let dir = path
         .parent()
@@ -154,5 +185,38 @@ mod tests {
             Outcome::ChangedOnDisk { .. }
         ));
         assert_eq!(document(&path).unwrap()["future"]["tint"], "amber");
+    }
+    #[test]
+    fn start_modes_default_to_the_terminal_and_stay_within_their_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("preferences.json");
+        // A file saved before these settings existed starts both runtimes as a terminal does.
+        fs::write(&path, r#"{"font_size":18}"#).unwrap();
+        let before = snapshot(document(&path).unwrap()).unwrap().behavior;
+        assert_eq!((before.claude_start, before.codex_start), (None, None));
+        assert_eq!(before.worker_approvals, WorkerApprovals::Parent);
+        let auto = Behavior {
+            claude_start: Some(Access::Auto),
+            codex_start: Some(Access::Yolo),
+            ..before
+        };
+        assert!(matches!(
+            write_at(&path, &revision(before), auto).unwrap(),
+            Outcome::Applied
+        ));
+        let saved = document(&path).unwrap();
+        assert_eq!(
+            (
+                saved["claude_start"].as_str(),
+                saved["codex_start"].as_str()
+            ),
+            (Some("auto"), Some("yolo"))
+        );
+        // A preset of the other runtime is refused.
+        let crossed = Behavior {
+            codex_start: Some(Access::Plan),
+            ..auto
+        };
+        assert!(write_at(&path, &revision(auto), crossed).is_err());
     }
 }
