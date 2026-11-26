@@ -151,6 +151,34 @@ def worker_cases(root, stack, binary, env, log):
         operator.open(worker_scope)
         operator.until(finished)
         operator.close()
+        # A normal agent call inherits the operator's active bypass mode. Both
+        # runtime processes are stock Claude Code using the fixture subscription.
+        checkout = root / "Beta" / "isolated-review"
+        checkout.mkdir()
+        def spawn_writer(body, prompt):
+            if prompt == "Start the isolated writer":
+                return [{"type":"tool_use", "id":"toolu_inherit_workspace",
+                         "name":"mcp__ox_workers__start_ox_worker",
+                         "input":{"runtime":"claude", "mode":"session", "checkout":str(checkout),
+                                  "task":"APPROVAL write the fixture marker"}}]
+        native.script = spawn_writer
+        client.act(scope, "parent-bypass", {"set_access":[thread, "bypass_permissions"]})
+        def applied(frame):
+            return any(d["kind"] == "session" and d["session"]["id"] == thread
+                       and d["session"]["detail"].get("access") == "bypass_permissions"
+                       for d in frame.get("changes", []))
+        client.until(applied)
+        client.act(scope, "inherit-workspace", {"send_text":[thread, "Start the isolated writer"]})
+        def parent_finished(frame):
+            assert not ask(frame), "parent or worker requested human approval for inherited access"
+            return (notice := change(frame, "notification")) and notice["event"] == "finished"
+        client.until(parent_finished)
+        assert any(r.get("started_mode") == "bypass_permissions" for r in launch_results()), list(launch_results())
+        deadline = time.monotonic() + 20
+        while not (checkout / "approved.txt").exists() and time.monotonic() < deadline:
+            time.sleep(.05)
+        assert (checkout / "approved.txt").read_text().strip() == "accepted"
+        assert not (root / "Beta" / "approved.txt").exists()
         client.close()
     print("Stock Claude worker: launch above the parent's mode refused, host-owned read worker started in Plan and stamped with its parent, operator escalation above the ceiling refused.")
 
