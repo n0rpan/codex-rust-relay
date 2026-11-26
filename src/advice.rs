@@ -186,9 +186,35 @@ pub fn apply(home: &Path, id: &str) -> Result<Fix, RelayError> {
             let _lock = crate::setup::lock_config(home)?;
             let text = crate::setup::read_optional_text_limited(&config, "codeox.toml")?
                 .ok_or("codeox.toml is missing; run `ox setup`")?;
+            // Saved keys are scoped to their destination, so the move has to
+            // take the credential with it or the route looks keyless.
+            let before = crate::provider::CodeoxConfig::load_from_str(&text)?;
+            let vendor = before
+                .vendors
+                .iter()
+                .find(|vendor| vendor.key == *provider)
+                .ok_or_else(|| format!("codeox.toml has no providers.{provider} table"))?;
+            let old_base = vendor.base_url.as_str().to_owned();
+            let env_key = vendor.env_key.clone();
+            let shared = before.vendors.iter().any(|vendor| {
+                vendor.key != *provider
+                    && vendor.env_key == env_key
+                    && vendor.base_url.as_str() != old_base
+            });
             let base = format!("https://{region}.openrouter.ai/api/v1");
             let updated = set_provider_base(&text, provider, &base)?;
             crate::setup::write_config_atomic(&config, &updated)?;
+            if let Some(env_key) = env_key
+                && !shared
+            {
+                let mut keys = crate::provider::SavedKeys::load(home)?;
+                if let Some(text) = keys.rescope(&env_key, &old_base, &base)? {
+                    crate::setup::write_config_atomic(
+                        &crate::provider::SavedKeys::path(home),
+                        &text,
+                    )?;
+                }
+            }
         }
     }
     remove(home, id)?;
@@ -412,6 +438,41 @@ reasoning_efforts = ["low", "high"]
         assert!(apply(&home, "effort").is_err());
         let config = std::fs::read_to_string(home.join("codeox.toml")).unwrap();
         assert!(config.contains("https://openrouter.ai/api/v1"), "{config}");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_regional_fix_moves_a_saved_key_to_the_new_destination() {
+        let home = temp_home("rescope");
+        std::fs::write(
+            home.join("codeox.toml"),
+            "[providers.openrouter]\nbase_url = \"https://openrouter.ai/api/v1\"\nenv_key = \"OPENROUTER_API_KEY\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("ox-api-keys.json"),
+            r#"{"OPENROUTER_API_KEY":{"scope":"https://openrouter.ai/api/v1","value":"sk-test"}}"#,
+        )
+        .unwrap();
+        record(
+            &home,
+            advice(
+                "region",
+                Fix::UseRegionalHost {
+                    provider: "openrouter".to_owned(),
+                    region: "eu".to_owned(),
+                },
+            ),
+        );
+        apply(&home, "region").unwrap();
+        let keys = std::fs::read_to_string(home.join("ox-api-keys.json")).unwrap();
+        assert!(keys.contains("https://eu.openrouter.ai/api/v1"), "{keys}");
+        let config = crate::provider::CodeoxConfig::load(&home.join("codeox.toml")).unwrap();
+        let saved = crate::provider::SavedKeys::for_config(&home, &config).unwrap();
+        assert!(
+            saved.scopes().any(|(name, _)| name == "OPENROUTER_API_KEY"),
+            "the key must still resolve after the move"
+        );
         let _ = std::fs::remove_dir_all(home);
     }
 
