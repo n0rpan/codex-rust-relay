@@ -245,11 +245,6 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         if let Some(code) = native::launch_if_signed_in(client_kind, &codex_home).await? {
             return Ok(code);
         }
-        if bare
-            && let Some(code) = native::launch_if_signed_in(ClientKind::Claude, &codex_home).await?
-        {
-            return Ok(code);
-        }
         if !interactive {
             if bare {
                 help::overview();

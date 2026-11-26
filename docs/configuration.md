@@ -622,8 +622,8 @@ sign-in. The menu returns after each action. Select **Done** when finished. Plai
 and `ox claude` show that client's subscription at the top of the picker
 when signed in, alongside the API models. Choosing the subscription opens a native session
 with its own `/model` list. With no API providers, ox can start the signed-in
-stock client directly. Bare `ox` prefers Codex and uses Claude Code
-if only Claude has a saved account. With no API provider, `ox doctor` checks for
+stock client directly. Bare `ox` defaults to Codex. Choose Claude Code in
+setup or run `ox claude` to open a Claude session. With no API provider, `ox doctor` checks for
 saved accounts without launching either client. Each client validates its own
 credentials when you open a subscription session. If Codex uses its keyring,
 ox reports the configured store and leaves the account check to Codex.
