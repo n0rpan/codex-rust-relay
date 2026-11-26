@@ -12,6 +12,73 @@ export const emptyScope = (scope) => ({
   transcripts: Object.create(null),
   detail: {},
 });
+const sessionKey = (scope, id) => scopeKey(scope) + " " + id;
+/**
+ * The recorded parent of a session, from the immutable launch stamp when there
+ * is one. The stamp carries the parent's full scope, so a worker in another
+ * checkout or billing route still points at the conversation that started it.
+ * @param {{scope: Scope, session: any}} entry
+ * @returns {{project: string, scope: Scope|null, id: string}|null}
+ */
+export function sessionParent(entry) {
+  const origin = entry?.session?.detail?.origin;
+  if (origin && origin.relation === "handoff") return null;
+  const parent = origin?.parent;
+  if (parent?.session)
+    return {
+      project: parent.project ?? entry.scope.project,
+      scope: parent.scope ?? null,
+      id: parent.session,
+    };
+  if (entry?.session?.parent)
+    return { project: entry.scope.project, scope: entry.scope, id: entry.session.parent };
+  return null;
+}
+/**
+ * Group catalog entries into a worker tree. A parent may live in another
+ * project or route; a filter that hides it keeps the child as a root with a
+ * navigable recorded parent instead of dropping the relationship.
+ * @param {Array<{scope: Scope, session: any}>} entries
+ */
+export function catalogTree(entries) {
+  const byKey = new Map(entries.map((entry) => [sessionKey(entry.scope, entry.session.id), entry]));
+  const byProject = new Map(entries.map(({ scope, session }) => [JSON.stringify([scope.project, session.id]), scope]));
+  const links = new Map();
+  const children = new Map();
+  const roots = [];
+  for (const entry of entries) {
+    const own = sessionKey(entry.scope, entry.session.id);
+    const recorded = sessionParent(entry);
+    let target = null;
+    if (recorded) {
+      let scope = recorded.scope;
+      if (!scope) {
+        // A terminal parent has no host scope. Its native id still matches a
+        // catalog row in the recorded project.
+        scope = byProject.get(JSON.stringify([recorded.project, recorded.id])) ?? null;
+      }
+      if (scope) {
+        const key = sessionKey(scope, recorded.id);
+        target = {
+          key,
+          scope,
+          project: scope.project,
+          id: recorded.id,
+          title: byKey.get(key)?.session.title ?? null,
+        };
+        links.set(own, target);
+      }
+    }
+    if (target && target.key !== own && byKey.has(target.key)) {
+      const group = children.get(target.key) ?? [];
+      group.push(entry);
+      children.set(target.key, group);
+    } else {
+      roots.push(entry);
+    }
+  }
+  return { roots, children, links, byKey };
+}
 const itemKey = (i) => JSON.stringify([i.turn, i.id]);
 const safeMap = (entries) => Object.assign(Object.create(null), entries);
 export class Projection {

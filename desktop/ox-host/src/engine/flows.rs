@@ -140,13 +140,13 @@ impl Engine {
         }
         self.workers
             .jobs()
-            .any(|(_, _, e)| {
-                e.origin.parent.project == scope.project
+            .any(|(worker_scope, _, e)| {
+                worker_scope.project == scope.project
                     && e.origin.ceiling >= ox_desk_core::origin::Ceiling::Write
                     && self.worker_active(e.origin.job_id)
             })
             .then(|| {
-                "Another write worker is editing this project. Consider a separate git worktree."
+                "Another worker had write access to this checkout when this job started. Use a separate git worktree for independent edits."
                     .to_owned()
             })
     }
@@ -161,6 +161,22 @@ impl Engine {
         };
         let ready = live.store.state() == &Connection::Ready;
         let operators = self.operators();
+        // The models that answered, recorded as the runtime reports them, so status,
+        // the completion record and the worker view survive the process and restarts.
+        let answered: Vec<(String, Vec<String>)> = self
+            .workers
+            .in_scope(scope)
+            .filter_map(|(id, entry)| {
+                let models = live.store.claude_answering_models(id);
+                (!models.is_empty() && !entry.marks.has_models(models))
+                    .then(|| (id.to_owned(), models.to_vec()))
+            })
+            .collect();
+        for (id, models) in &answered {
+            if let Some(entry) = self.workers.get_mut(scope, id) {
+                entry.marks.record_models(models);
+            }
+        }
         let mut updates: Vec<(String, Option<crate::workers::Last>)> = Vec::new();
         for (id, entry) in self.workers.in_scope(scope) {
             if entry.origin.relation != Relation::Worker || entry.marks.cancelled {
@@ -177,6 +193,7 @@ impl Engine {
                         status: status["status"].as_str().unwrap_or("completed").to_owned(),
                         result: status["result"].as_str().map(str::to_owned),
                         error: status["error"].as_str().map(str::to_owned),
+                        model: status["actual_model"].as_str().map(str::to_owned),
                     }))
                 }
                 // A stop the runtime confirmed, with the partial text it left. A route that
@@ -188,6 +205,7 @@ impl Engine {
                         status: "interrupted".to_owned(),
                         result: status["result"].as_str().map(str::to_owned),
                         error: None,
+                        model: status["actual_model"].as_str().map(str::to_owned),
                     }))
                 }
                 Some("running" | "waiting_for_operator") => Some(None),
@@ -199,7 +217,7 @@ impl Engine {
                 updates.push((id.to_owned(), next));
             }
         }
-        let changed = !updates.is_empty();
+        let changed = !updates.is_empty() || !answered.is_empty();
         for (id, last) in updates {
             if let Some(entry) = self.workers.get_mut(scope, &id) {
                 entry.marks.last = last;
@@ -339,10 +357,10 @@ impl Engine {
                     origin.decided = Some(Decision::Capped);
                 }
                 let target = a.target.clone();
-                let payload = Payload::Worker(a.start.clone());
+                let start = a.start.clone();
                 // A busy route keeps the request pending so the operator can retry.
                 let mut l = self
-                    .prepare_launch(&target, origin, payload)
+                    .prepare_worker(&target, origin, start)
                     .map_err(io::Error::other)?;
                 l.detached = true;
                 self.asking.remove(&job);
@@ -494,6 +512,7 @@ impl Engine {
             start,
             reply: Replier::Client(client, key.to_owned()),
             device: format!("client-{client}"),
+            surface: self.clients.get(&client).and_then(|c| c.surface),
             deadline: Instant::now() + LOAD_WAIT,
             window,
             window_deadline: Instant::now() + WINDOW_WAIT,
@@ -508,6 +527,7 @@ impl Engine {
             start,
             reply,
             device,
+            surface,
             window,
             ..
         } = prep;
@@ -537,11 +557,12 @@ impl Engine {
             .map(str::to_owned)
             .filter(|n| n != &start.source);
         let access = live.store.applied_access(Some(&start.source));
+        let ceiling = live.store.applied_ceiling(Some(&start.source));
         let src_origin = self
             .workers
             .get(&src, &start.source)
             .map(|e| e.origin.clone());
-        let level = crate::workers::source_level(src.route.runtime, access, src_origin.as_ref());
+        let level = crate::workers::source_level(ceiling, src_origin.as_ref());
         let resolved = match modes::resolve_operator(level, start.mode, start.runtime) {
             Ok(r) => r,
             Err(e) => fail!(e),
@@ -626,6 +647,8 @@ impl Engine {
             decided: Some(resolved.decision),
             yolo,
             handoff: Some(Box::new(source)),
+            requested_model: None,
+            pinned_model: None,
         };
         let record = match nonce() {
             Ok(n) => n,
@@ -635,6 +658,7 @@ impl Engine {
             text,
             items: carried,
             record: record.clone(),
+            from: surface,
         };
         let mut l = match self.prepare_launch(&target, origin.clone(), payload) {
             Ok(l) => l,

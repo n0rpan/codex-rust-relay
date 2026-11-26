@@ -53,6 +53,8 @@ pub struct Project {
     /// The process started under that contract for one worker launch. It is kept apart
     /// from `blank`, so no other send can take it, and no worker can take a normal blank.
     worker_blank: Option<String>,
+    /// The exact subscription model the next worker process is pinned to with `--model`.
+    worker_model: Option<String>,
     serial: u64,
     native: native::Native,
 }
@@ -70,11 +72,16 @@ struct Process {
     mode: Option<Access>,
     controls: HashMap<String, Control>,
     first: Option<(String, String)>,
+    /// The sender statement of `first`, fixed when the host accepted that message. It
+    /// waits with the message while the process starts, and goes out with it.
+    first_context: Option<String>,
     /// The permission mode this process was launched with.
     #[cfg_attr(not(test), allow(dead_code))]
     launch_mode: String,
     /// Read-only view of a journal a stock client is writing right now: no process.
     viewer: Option<native::Viewer>,
+    /// Models that answered top-level turns in this process, in first-answer order.
+    answering: Vec<String>,
 }
 enum Control {
     Mode(Access),
@@ -313,24 +320,69 @@ impl Store {
             && matches!(self.link, links::Link::Claude(_))
             && self.claude().blank.is_none()
     }
-    /// Start a dedicated process under the shared worker contract for one launch.
+    /// Start a dedicated process for one worker launch: under the shared worker
+    /// contract, pinned to an exact subscription model, or both. A process without
+    /// a contract starts in `access`, the mode the launch was granted.
     /// The warm blank is left alone: only `send_on_worker_blank` ever uses this process,
     /// so a send from any other session keeps getting a normal draft.
     pub fn stage_claude_worker(
         &mut self,
-        contract: crate::claude_worker_contract::Contract,
+        contract: Option<crate::claude_worker_contract::Contract>,
+        model: Option<String>,
+        access: Option<Access>,
     ) -> io::Result<()> {
         if !matches!(self.link, links::Link::Claude(_)) {
             return Ok(());
         }
+        if model.is_some() && self.profile.route.is_api() {
+            return Err(io::Error::other(
+                "A subscription model cannot be pinned on an API billing route.",
+            ));
+        }
         self.drop_claude_worker();
-        let preset = self.next_preset.take();
-        self.claude_mut().worker = Some(contract);
+        let preset = std::mem::replace(&mut self.next_preset, access);
+        self.claude_mut().worker = contract;
+        self.claude_mut().worker_model = model;
         let spawned = self.spawn_claude(Session::New(new_id()?), None, false);
         self.next_preset = preset;
+        let p = self.claude_mut();
+        p.worker = None;
+        p.worker_model = None;
         let owner = spawned?;
         self.claude_mut().worker_blank = Some(owner);
         Ok(())
+    }
+    /// The account's picker as the worker's own process reported it at initialization,
+    /// in the runtime's order. None until that process has initialized.
+    pub fn claude_worker_picker(&self) -> Option<Vec<crate::claude_models::PickerModel>> {
+        if !matches!(self.link, links::Link::Claude(_)) {
+            return None;
+        }
+        let p = self.claude();
+        let s = p.sessions.get(p.worker_blank.as_deref()?)?;
+        let caps = s.capabilities.as_ref().filter(|_| s.initialized)?;
+        let mut rows: Vec<_> = caps.models.iter().collect();
+        rows.sort_by_key(|(value, info)| (info.rank.unwrap_or(u32::MAX), value.as_str()));
+        Some(
+            rows.into_iter()
+                .map(|(value, info)| crate::claude_models::PickerModel {
+                    value: value.clone(),
+                    resolved: info.resolved.clone(),
+                    display: info.label.clone(),
+                    description: String::new(),
+                })
+                .collect(),
+        )
+    }
+    /// The models that answered top-level turns of a live Claude session, first one first.
+    pub fn claude_answering_models(&self, id: &str) -> &[String] {
+        if !matches!(self.link, links::Link::Claude(_)) {
+            return &[];
+        }
+        self.claude()
+            .sessions
+            .get(id)
+            .map_or(&[], |s| s.answering.as_slice())
     }
     /// Where the worker's dedicated process stands.
     pub fn claude_worker_state(&self) -> WorkerBlank {
@@ -348,12 +400,16 @@ impl Store {
         }
     }
     /// Send a launch's first turn on its dedicated process and nowhere else.
-    pub fn send_on_worker_blank(&mut self, action: crate::actions::Action) -> io::Result<()> {
+    pub fn send_on_worker_blank(
+        &mut self,
+        action: crate::actions::Action,
+        sender: crate::surface::Sender,
+    ) -> io::Result<()> {
         let Some(owner) = self.claude_mut().worker_blank.take() else {
             return Err(io::Error::other("The worker's runtime is not prepared"));
         };
         let normal = self.claude_mut().blank.replace(owner);
-        let result = self.dispatch(action);
+        let result = self.dispatch_as(action, sender);
         // The send consumed the dedicated process; the normal draft stays as it was.
         let p = self.claude_mut();
         p.blank = normal;
@@ -471,6 +527,7 @@ impl Store {
             blank: None,
             worker: None,
             worker_blank: None,
+            worker_model: None,
             serial: 0,
             native: Default::default(),
         };
@@ -572,6 +629,19 @@ impl Store {
         if let Some(c) = contract {
             self.worker_contracts.insert(owner.clone(), c);
         }
+        // A pinned worker keeps its exact model the same way: never the account default.
+        let model = match &session {
+            Session::New(_) => self.claude_mut().worker_model.take(),
+            Session::Resume(_) => self.worker_models.get(&owner).cloned(),
+            Session::Fork { source, .. } => self
+                .worker_models
+                .get(&session_key(&self.profile.route.billing, source))
+                .cloned(),
+        }
+        .filter(|_| !self.profile.route.is_api());
+        if let Some(m) = &model {
+            self.worker_models.insert(owner.clone(), m.clone());
+        }
         // A new worker starts in the contract's mode. A resumed one keeps the access the
         // user chose since; without a recorded choice it starts in the contract's mode.
         let mode = match (&session, contract) {
@@ -580,6 +650,7 @@ impl Store {
         }
         .or_else(|| contract.map(|c| c.permission_mode().to_owned()))
         .unwrap_or_else(|| "default".to_owned());
+        let first_context = first.as_ref().and_then(|_| self.sender_context());
         let p = self.claude_mut();
         p.serial += 1;
         let generation = p.serial;
@@ -591,6 +662,7 @@ impl Store {
             Process {
                 generation,
                 first,
+                first_context,
                 launch_mode: mode.clone(),
                 ..Default::default()
             },
@@ -654,6 +726,7 @@ impl Store {
                         session,
                         permission_mode: mode,
                         contract,
+                        model,
                     },
                     move |event| output(Data::Stock(event)),
                 )?;
@@ -772,11 +845,14 @@ impl Store {
         }
         self.selected = Some(owner.clone());
         self.selection += 1;
-        self.claude_mut()
+        let context = self.sender_context();
+        let process = self
+            .claude_mut()
             .sessions
             .get_mut(&owner)
-            .ok_or_else(|| io::Error::other("Reconnect the session before sending"))?
-            .first = Some((message, text));
+            .ok_or_else(|| io::Error::other("Reconnect the session before sending"))?;
+        process.first = Some((message, text));
+        process.first_context = context;
         self.flush_claude(&owner)?;
         if id.is_none() {
             self.host_opened = Some(owner.clone());
@@ -801,12 +877,14 @@ impl Store {
         let Some((id, text)) = process.first.as_ref() else {
             return Ok(());
         };
-        process
-            .link
-            .as_ref()
-            .unwrap()
-            .send_user(id, vec![json!({"type":"text","text":text})])?;
+        let link = process.link.as_ref().unwrap();
+        let content = vec![json!({"type":"text","text":text})];
+        match process.first_context.as_deref() {
+            Some(context) => link.send_user_with_context(id, content, context),
+            None => link.send_user(id, content),
+        }?;
         let (id, text) = process.first.take().unwrap();
+        process.first_context = None;
         process.events.sent(&id, &text);
         let transcript = self.transcripts.get_mut(owner).unwrap();
         let turn = transcript

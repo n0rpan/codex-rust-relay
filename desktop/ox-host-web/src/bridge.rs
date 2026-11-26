@@ -86,18 +86,31 @@ struct Access {
     discovery: Option<String>,
 }
 impl Access {
-    fn host(&mut self, app: &App, bytes: &[u8]) -> io::Result<()> {
+    /// Track a host frame. Returns the frame the bridge itself must send the host next:
+    /// the phone's surface, once a host hello lists that it negotiates one.
+    fn host(&mut self, app: &App, bytes: &[u8]) -> io::Result<Option<Client>> {
         if !self.ready {
             match serde_json::from_slice::<Server>(bytes)? {
                 Server::Hello {
                     version,
                     projects,
                     routes,
+                    capabilities,
                     ..
                 } if self.hello && version == VERSION => {
                     self.ready = true;
                     self.projects = projects.into_iter().collect();
                     self.routes = routes.into_iter().collect();
+                    // The bridge authenticated the device, so it states the surface. A
+                    // phone's own declaration is never forwarded (see `permit`).
+                    if capabilities
+                        .iter()
+                        .any(|c| c == ox_desk_core::surface::CAPABILITY)
+                    {
+                        return Ok(Some(Client::Surface {
+                            surface: ox_desk_core::surface::Surface::Phone,
+                        }));
+                    }
                 }
                 Server::Error { .. } => {}
                 _ => return Err(io::Error::other("Incompatible session host")),
@@ -116,7 +129,7 @@ impl Access {
                 _ => {}
             }
         }
-        Ok(())
+        Ok(None)
     }
     /// Whether a scope may be subscribed: listed in the hello, or discovered on this host.
     fn reachable(&self, app: &App, scope: &Scope) -> bool {
@@ -322,7 +335,10 @@ pub(crate) async fn session(app: App, id: String, mut ws: WebSocket) {
             },
             frame=line(&mut r,&mut buf)=>{
                 let Ok(bytes)=frame else{break};
-                if access.host(&app,&bytes).is_err() || !app.state.lock().unwrap().alive(&id){break}
+                let Ok(declare)=access.host(&app,&bytes) else{break};
+                if !app.state.lock().unwrap().alive(&id){break}
+                if let Some(declare)=declare
+                    && !matches!(timeout(Duration::from_secs(5),write(&mut w,&declare)).await,Ok(Ok(()))){break}
                 let Ok(s)=String::from_utf8(bytes) else{break};
                 if !matches!(timeout(Duration::from_secs(8),ws.send(Message::Text(s.into()))).await,Ok(Ok(()))){break}
             },
@@ -335,6 +351,58 @@ pub(crate) async fn session(app: App, id: String, mut ws: WebSocket) {
 mod tests {
     use super::*;
     use ox_desk_core::runtime::Runtime;
+    #[test]
+    fn the_bridge_declares_the_phone_itself_and_never_forwards_a_declaration() {
+        use ox_desk_core::surface::{CAPABILITY, Surface};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let app = App {
+            state: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::state::State::load(dir.path()).unwrap(),
+            )),
+            host: Default::default(),
+            slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            discovered: Default::default(),
+        };
+        let hello = |capabilities: Vec<String>| {
+            serde_json::to_vec(&Server::Hello {
+                version: VERSION,
+                projects: vec![],
+                routes: vec![],
+                capabilities,
+                host: None,
+            })
+            .unwrap()
+        };
+        // An older host: nothing to declare, so the phone gets generic guidance.
+        let mut old = Access::default();
+        assert!(old.permit(&app, &Client::Hello { version: VERSION }));
+        assert!(old.host(&app, &hello(vec![])).unwrap().is_none());
+        // A host that negotiates surfaces gets the phone's from the bridge.
+        let mut a = Access::default();
+        let declare = Client::Surface {
+            surface: Surface::Desktop,
+        };
+        assert!(!a.permit(&app, &declare), "not before the hello either");
+        assert!(a.permit(&app, &Client::Hello { version: VERSION }));
+        let frame = a.host(&app, &hello(vec![CAPABILITY.into()])).unwrap();
+        assert!(matches!(
+            frame,
+            Some(Client::Surface {
+                surface: Surface::Phone
+            })
+        ));
+        assert!(
+            !a.permit(&app, &declare),
+            "a browser cannot claim to be the desktop"
+        );
+        assert!(a.invalid(&app, &declare).is_none(), "it closes the socket");
+    }
+
     #[test]
     fn browser_actions_use_subscribed_route_and_native_permission_modes() {
         let dir = tempfile::tempdir().unwrap();

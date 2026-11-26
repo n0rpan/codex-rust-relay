@@ -37,6 +37,9 @@ pub struct Remote {
     /// the user.
     unconfirmed: Vec<Unconfirmed>,
     pub(super) origins: HashMap<String, crate::origin::Origin>,
+    /// The runtime-confirmed model each session answered with, when the host has
+    /// observed one. Kept apart from the origin stamp, which records what was
+    /// requested before the first turn.
     /// Host marks on a session: handoffs from it and its YOLO grant.
     pub(super) marks: HashMap<String, Value>,
     /// The request that opens the session this client is waiting for. Only its
@@ -64,6 +67,7 @@ fn bits<T: DeserializeOwned>(value: &Value) -> Option<T> {
 }
 pub fn row(view: &SessionView) -> Option<ThreadRow> {
     let mut row: ThreadRow = bits(&view.detail["row"])?;
+    row.parent_thread_id = view.parent.clone().or(row.parent_thread_id);
     row.worker = view.detail["worker"] == true;
     row.generated_title = bits(&view.detail["generated"]);
     row.unread = view.detail["unread"] == true;
@@ -106,8 +110,13 @@ impl Store {
     pub fn origin(&self, id: &str) -> Option<&crate::origin::Origin> {
         self.remote()?.origins.get(id)
     }
+    /// The model the runtime itself confirmed for a session, once it has answered.
+    /// The launch stamp keeps the requested choice; this is what actually ran.
+    pub fn actual_model(&self, id: &str) -> Option<&str> {
+        self.session_mark(id, "worker_model")?["actual_model"].as_str()
+    }
     /// A host mark on a session: `handed_off_to`, `handoff_attempts`,
-    /// `yolo_grant` or `yolo_children`.
+    /// `yolo_grant`, `yolo_children` or `worker_model`.
     pub fn session_mark(&self, id: &str, key: &str) -> Option<&Value> {
         self.remote()?
             .marks
@@ -813,6 +822,7 @@ impl Store {
             "yolo_grant",
             "yolo_grant_expires",
             "yolo_children",
+            "worker_model",
         ]
         .into_iter()
         .filter_map(|k| Some((k.to_owned(), data.get(k)?.clone())))
@@ -824,7 +834,7 @@ impl Store {
         }
         match bits(&data["origin"]) {
             Some(origin) => {
-                r.origins.insert(id, origin);
+                r.origins.insert(id.clone(), origin);
             }
             None => {
                 r.origins.remove(&id);

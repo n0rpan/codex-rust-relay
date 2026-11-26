@@ -429,15 +429,21 @@ fn print_chatgpt_status(home: &Path) -> bool {
 }
 
 fn has_saved_claude_account() -> bool {
-    // Even `claude auth status` writes its global config. Use the account
-    // marker as a hint for the picker, leaving OAuth and expiry to Claude.
+    claude_account_id().is_some()
+}
+
+/// The saved Claude account's ID, read from its marker without running Claude.
+/// Even `claude auth status` writes its global config. Use the account
+/// marker as a hint for the picker, leaving OAuth and expiry to Claude.
+pub(crate) fn claude_account_id() -> Option<String> {
     crate::clients::claude_config_override()
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
         .and_then(|dir| read_account_json(&dir.join(".claude.json"), ".claude.json"))
-        .is_some_and(|config| {
+        .and_then(|config| {
             config["oauthAccount"]["accountUuid"]
                 .as_str()
-                .is_some_and(|id| !id.is_empty())
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
         })
 }
 

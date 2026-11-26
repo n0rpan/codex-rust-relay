@@ -166,11 +166,14 @@ jobs:
       - name: App-server protocol contract
         env:
           CODEOX_TEST_CODEX_BIN: ${{ runner.temp }}/stock/node_modules/.bin/codex
+          OX_CLAUDE_PROBE_BINS: ${{ runner.temp }}/stock/node_modules/.bin/claude
         run: |
           until [ -s "$RUNNER_TEMP/build.status" ]; do sleep 1; done
           [ "$(cat "$RUNNER_TEMP/build.status")" = 0 ] || { cat "$RUNNER_TEMP/build.log"; exit 1; }
           cargo test --locked --manifest-path desktop/Cargo.toml -p ox-desk-core --test contract_protocol \
             -- --ignored --exact installed_protocol
+          cargo test --locked --manifest-path desktop/Cargo.toml -p ox-desk-core \
+            --test sender_context_codex --test codex_permissions --test claude_prompt_context_live -- --ignored
       - name: Report a latest-client break without blocking
         if: failure() && matrix.track == 'latest'
         run: echo "::warning title=Latest stock client::A protocol fixture fails against the latest Codex or Claude Code release. It does not block this push; the nightly CI run does."
@@ -222,6 +225,12 @@ jobs:
           [ "$(cat "$RUNNER_TEMP/build.status")" = 0 ] || { cat "$RUNNER_TEMP/build.log"; exit 1; }
       - name: Recover an interrupted stock Codex turn without replaying it
         run: python3 desktop/tests/host_codex_interrupt.py desktop/target/debug/ox-host desktop/target/debug/ox "$RUNNER_TEMP/stock/node_modules/.bin/codex"
+      - name: A YOLO Codex parent delegates to an API worker without operator prompts
+        env:
+          OX_DESKTOP_TEST_CASE: worker-inherit
+          OX_TEST_OX_BIN: desktop/target/debug/ox
+          CODEOX_TEST_CODEX_BIN: ${{ runner.temp }}/stock/node_modules/.bin/codex
+        run: python3 desktop/tests/stock_session.py
       - name: Two clients, approvals and SIGKILL recovery
         run: python3 desktop/tests/host_stock_session.py desktop/target/debug/ox-host desktop/target/debug/ox "$RUNNER_TEMP/stock/node_modules/.bin/claude"
       - name: Worker turns across dropped connections, Stop and host restarts

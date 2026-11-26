@@ -966,6 +966,24 @@
         },
         {
           "additionalProperties": false,
+          "description": "The interface this connection's person uses. Send it once, after a host hello that\nlists `surface::CAPABILITY`; an older host rejects the frame. The phone bridge\ndeclares the phone itself and never forwards a phone's own declaration. A\nconnection that declares nothing is stamped as an unknown OX client.",
+          "properties": {
+            "surface": {
+              "$ref": "#/$defs/Surface"
+            },
+            "type": {
+              "const": "surface",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "surface"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "properties": {
             "type": {
               "const": "watch_catalog",
@@ -2096,6 +2114,14 @@
       ],
       "type": "object"
     },
+    "Surface": {
+      "description": "The interface a person is using. Declared by the desktop for itself, and by the\nauthenticated phone bridge on behalf of the phone.",
+      "enum": [
+        "desktop",
+        "phone"
+      ],
+      "type": "string"
+    },
     "ThreadRow": {
       "properties": {
         "agentNickname": {
@@ -2217,6 +2243,13 @@
       "additionalProperties": false,
       "description": "An operator's request to start a worker attached to a session in the subscribed scope.",
       "properties": {
+        "checkout": {
+          "description": "Execution directory, independent of the parent session identity.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "max_minutes": {
           "description": "Wall-clock limit in minutes. Absent means no limit unless the host sets `OX_WORKER_MAX_MINUTES`.",
           "format": "uint32",
@@ -2251,6 +2284,13 @@
         },
         "runtime": {
           "$ref": "#/$defs/Runtime"
+        },
+        "subscription_model": {
+          "description": "An exact Claude subscription model to pin before the first inference,\nsuch as `claude-fable-5-2`. Needs a Claude worker without an API alias.\nThe host refuses the launch when the account's picker does not offer it.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "task": {
           "type": "string"

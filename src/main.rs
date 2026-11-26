@@ -8,6 +8,7 @@ mod adapters;
 mod catalog;
 mod claude_frontend;
 mod claude_gateway;
+mod claude_models;
 mod claude_request;
 mod claude_response;
 mod claude_search;
@@ -34,6 +35,7 @@ mod update;
 mod upstream;
 mod version;
 mod weather;
+mod worker_checkout;
 mod workers;
 
 use std::collections::BTreeSet;

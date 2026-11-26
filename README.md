@@ -33,7 +33,7 @@ The same installer adds **OX Desktop** to your application launcher. It runs on 
 
 ### First session
 
-1. **Connect.** The first-run card has a Codex, Claude Code and API key switch. It checks again by itself while you install or sign in. Later, choose the runtime and billing route in the header. To add an API model, open **Settings → Accounts → Configure provider**, or run `ox setup`. A saved provider becomes the active route.
+1. **Connect.** The first-run card has a Codex, Claude Code and API key switch. It checks again by itself while you install or sign in. Later, choose the runtime and billing route in the header. To add an API model, open **Settings → Accounts → Configure provider**, or run `ox setup`. A saved provider becomes the active route. Run `ox help settings` for the desktop and phone screens, file paths and checks.
 2. **Send a prompt.** Choose **New session**, type, press Enter. Existing Codex and Claude Code sessions from your terminal appear in the sidebar.
 3. **Keep it running.** Run `ox host install` so the session host starts at login. Close the window during a turn; reopen it and the turn is still there.
 4. **Check the setup.** `ox host doctor` checks the host, Tailscale Serve, paired devices and the stock client versions, and names the fix for anything that blocks.
@@ -46,7 +46,7 @@ The same installer adds **OX Desktop** to your application launcher. It runs on 
 - **The phone.** A web app served by the host over your private Tailscale network. Pair it with a QR code, then follow turns, answer approvals and questions, start sessions and get notifications. Nothing is exposed to the internet: OX refuses Tailscale Funnel.
 - **Workers.** A session can start a background Codex goal, Claude Code workflow or plain session as a separate job, on an API model or a subscription. Workers appear under their parent on both screens. Without the session host, workers start read-only unless the main agent asks for write, and classifier or YOLO workers are refused.
 - **Handoffs.** Continue a conversation in another runtime, billing route or model (`/handoff claude:<alias> …` or **Continue in…**). The new session receives the real recent messages, not a summary, and can read the rest of the source.
-- **One mode model.** Every permission preset maps to one of four levels: read (Codex Read only, Claude Plan), write (Workspace, Accept edits), classifier (Auto-review, Auto) and YOLO (YOLO, bypass permissions). Workers and handoffs start at their source's level or lower. Agents can lower a child's mode but never raise it. A YOLO child waits for you to accept it on a paired device, unless you stored a grant. [Mode model](docs/design/desktop/host-notes.md#permission-modes-for-workers-and-handoffs)
+- **One mode model.** Every permission preset maps to one of four levels: read (Codex Read only, Claude Plan), write (Workspace, Accept edits), classifier (Auto-review, Auto) and YOLO (YOLO, bypass permissions). Workers and handoffs start at their source's level or lower. Agents can lower a child's mode but never raise it. An agent-launched worker inherits a verified YOLO parent without another prompt. Explicit YOLO requests and handoffs use the operator confirmation or a stored grant. [Mode model](docs/design/desktop/host-notes.md#permission-modes-for-workers-and-handoffs)
 
 ### Pair a phone
 

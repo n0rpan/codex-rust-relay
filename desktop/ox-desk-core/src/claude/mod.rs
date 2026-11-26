@@ -194,6 +194,15 @@ impl Decoder {
             return Ok(());
         }
         cursor.last_uuid = uuid.map(str::to_owned);
+        if scope.parent_tool_use_id.is_none()
+            && let Some(model) = crate::claude_models::answering_model(msg)
+        {
+            out.push(Event::Model {
+                session_id: scope.session_id.clone(),
+                model: model.to_owned(),
+            });
+        }
+        let cursor = self.message(&scope, id);
         let start = cursor.next_index;
         cursor.next_index = cursor.next_index.saturating_add(blocks.len() as u64);
         for (index, b) in blocks.iter().enumerate() {

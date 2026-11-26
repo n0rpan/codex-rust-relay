@@ -1,6 +1,7 @@
 //! Paged native metadata and the merged navigation index. Opening a row is the only
 //! operation here that creates a project workbench.
 use super::*;
+use ox_desk_core::origin::{Origin, Relation};
 use ox_desk_core::runtime::Runtime;
 use std::{
     collections::{HashMap, HashSet},
@@ -57,6 +58,11 @@ struct Hosted {
     saved: Saved,
     route: Route,
     status: String,
+    /// The immutable launch stamp. Its parent reference is the authority for
+    /// nesting, even when the parent runs in another checkout or billing route.
+    origin: Option<Origin>,
+    /// The model the runtime confirmed, once it has answered.
+    actual_model: Option<String>,
 }
 impl Hosted {
     fn from_view(
@@ -66,11 +72,10 @@ impl Hosted {
         if view.detail["owned"] != true {
             return None;
         }
-        let mut row = ox_desk_core::store::replica::row(view)?;
+        let row = ox_desk_core::store::replica::row(view)?;
         if row.cwd != scope.project {
             return None;
         }
-        row.parent_thread_id = view.parent.clone().or(row.parent_thread_id);
         Some(Self {
             saved: Saved {
                 row,
@@ -81,6 +86,11 @@ impl Hosted {
             },
             route: scope.route.clone(),
             status: view.status.clone(),
+            origin: serde_json::from_value(view.detail["origin"].clone()).ok(),
+            actual_model: view.detail["worker_model"]["actual_model"]
+                .as_str()
+                .or_else(|| view.detail["worker_marks"]["actual_model"].as_str())
+                .map(str::to_owned),
         })
     }
 }
@@ -121,6 +131,75 @@ pub(crate) struct Tree {
 pub(crate) struct TreeIndex(pub HashMap<(PathBuf, String), Tree>);
 impl gpui::Global for TreeIndex {}
 
+/// Where a worker's recorded parent lives. The origin stamp carries the parent's
+/// full host scope and session key, so navigation works across projects, routes
+/// and filtered views without looking the parent up in the child's project.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ParentLink {
+    pub project: PathBuf,
+    /// The exact parent route when the host recorded a hosted parent scope.
+    pub route: Option<Route>,
+    pub id: String,
+    /// The parent's title when it is visible in the current index.
+    pub title: Option<String>,
+}
+impl ParentLink {
+    /// A launch stamp names its parent. Handoffs record a source rather than a
+    /// worker parent and keep their existing presentation.
+    fn from_origin(origin: &Origin) -> Option<Self> {
+        if origin.relation == Relation::Handoff {
+            return None;
+        }
+        let id = origin.parent.session.clone()?;
+        let (project, route) = match &origin.parent.scope {
+            Some(scope) => (scope.project.clone(), Some(scope.route.clone())),
+            // A terminal parent has no host scope. Its project and native ID still
+            // let a same-project catalog row resolve it.
+            None => (origin.parent.project.clone(), None),
+        };
+        Some(Self {
+            project,
+            route,
+            id,
+            title: None,
+        })
+    }
+}
+/// Recorded parent links for every indexed worker, visible or filtered away.
+#[derive(Default)]
+pub(crate) struct ParentIndex(pub HashMap<(PathBuf, String), ParentLink>);
+impl gpui::Global for ParentIndex {}
+
+/// Resolve a recorded parent against the entries in the current index. Exact
+/// scope first, then the same project, so a filtered or differently routed view
+/// still groups a worker under its recorded parent when that parent is present.
+fn resolve_parent_key<'a, K: ?Sized>(
+    parent: &ParentLink,
+    by_scope: &HashMap<(PathBuf, Scope, String), &'a K>,
+    by_project: &HashMap<(PathBuf, String), &'a K>,
+) -> Option<&'a K> {
+    parent
+        .route
+        .as_ref()
+        .and_then(|route| {
+            by_scope
+                .get(&(
+                    parent.project.clone(),
+                    Scope {
+                        runtime: route.runtime,
+                        api: route.is_api(),
+                    },
+                    parent.id.clone(),
+                ))
+                .copied()
+        })
+        .or_else(|| {
+            by_project
+                .get(&(parent.project.clone(), parent.id.clone()))
+                .copied()
+        })
+}
+
 /// Unfolds every collapsed ancestor of `start`. Returns whether any fold was removed.
 /// Bounded by the parent map's size, so a malformed parent cycle cannot spin.
 fn unfold_ancestors(
@@ -140,13 +219,31 @@ fn unfold_ancestors(
     unfolded
 }
 
-/// A child's parent link survives a merge with a richer row that has none.
-fn keep_parent(known: Option<String>, incoming: Option<String>) -> Option<String> {
-    incoming.or(known)
-}
-
 /// The identity of one catalog row: project, scope, thread id and provider.
 type Key = (PathBuf, Scope, String, String);
+
+/// One deduplicated sidebar row before parent links are resolved.
+struct Indexed {
+    order: (i64, u128),
+    loc: Location,
+    parent: Option<String>,
+    quality: (bool, bool, bool, bool, bool, i64),
+    origin: Option<Origin>,
+}
+
+impl Indexed {
+    fn merge(&mut self, mut incoming: Self) {
+        // Display quality and activity can differ across catalogs. Preserve
+        // the host stamp even when a native row has a better title.
+        let order = self.order.max(incoming.order);
+        if incoming.quality > self.quality {
+            std::mem::swap(self, &mut incoming);
+        }
+        self.order = order;
+        self.parent = self.parent.take().or(incoming.parent);
+        self.origin = self.origin.take().or(incoming.origin);
+    }
+}
 
 impl Discovery {
     pub(super) fn all(&self) -> impl Iterator<Item = &Saved> {
@@ -455,6 +552,84 @@ impl Host {
         self.located(loc, cx)
     }
 
+    /// The launch stamp for an indexed row. Only host-owned sessions carry one.
+    fn origin_at(&self, loc: Location, cx: &App) -> Option<Origin> {
+        match loc {
+            Location::Live(pane, index) => {
+                let pane = self.panes.get(pane)?.read(cx);
+                let store = pane.store.as_ref()?;
+                let row = store.threads().get(index)?;
+                store.origin(&row.id).cloned()
+            }
+            Location::Hosted(index) => self.discovery.hosted.get(index)?.origin.clone(),
+            Location::Saved(_) => None,
+        }
+    }
+
+    /// The model the runtime confirmed for an indexed row, when the host saw it.
+    pub(super) fn actual_model_at(&self, loc: Location, cx: &App) -> Option<String> {
+        match loc {
+            Location::Live(pane, index) => {
+                let pane = self.panes.get(pane)?.read(cx);
+                let store = pane.store.as_ref()?;
+                let row = store.threads().get(index)?;
+                store.actual_model(&row.id).map(str::to_owned)
+            }
+            Location::Hosted(index) => self.discovery.hosted.get(index)?.actual_model.clone(),
+            Location::Saved(_) => None,
+        }
+    }
+
+    /// Find a session by its recorded identity, even when a search or status
+    /// filter keeps it out of the rendered catalog. Discovery rows cover every
+    /// project; open workbenches cover rows a scope has already loaded.
+    fn find_row(
+        &self,
+        project: &Path,
+        id: &str,
+        route: Option<&Route>,
+        cx: &App,
+    ) -> Option<(ThreadRow, Scope)> {
+        for hosted in &self.discovery.hosted {
+            if hosted.saved.row.cwd == project
+                && hosted.saved.row.id == id
+                && route.is_none_or(|route| hosted.route == *route)
+            {
+                return Some((hosted.saved.row.clone(), hosted.saved.scope));
+            }
+        }
+        for saved in &self.discovery.rows {
+            if saved.row.cwd == project
+                && saved.row.id == id
+                && route.is_none_or(|route| saved.scope.matches(route))
+            {
+                return Some((saved.row.clone(), saved.scope));
+            }
+        }
+        for pane in &self.panes {
+            let pane = pane.read(cx);
+            if pane.project != project {
+                continue;
+            }
+            let Some(store) = &pane.store else {
+                continue;
+            };
+            let Some(row) = store.catalog_row(id) else {
+                continue;
+            };
+            let scope = Scope {
+                runtime: pane.route.runtime,
+                api: row
+                    .saved_claude_api()
+                    .unwrap_or_else(|| pane.route.is_api()),
+            };
+            if route.is_none_or(|route| scope.matches(route)) {
+                return Some((row.clone(), scope));
+            }
+        }
+        None
+    }
+
     fn status_at(&self, loc: Location, cx: &App) -> Option<&'static str> {
         let (row, project, scope) = self.located(loc, cx)?;
         self.project_row_state(project, row, scope, cx).1
@@ -489,31 +664,22 @@ impl Host {
         total
     }
 
-    fn catalog_row(&self, id: &str, project: &Path, cx: &App) -> Option<(ThreadRow, Scope)> {
-        self.catalog.iter().find_map(|entry| {
-            let (row, path, scope) = self.located_entry(*entry, cx)?;
-            (row.id == id && path == project).then(|| (row.clone(), scope))
-        })
-    }
-
     /// Open a session from the sidebar index, unfolding its parent if needed.
     pub(super) fn open_thread(
         &mut self,
         owner: &Entity<Workbench>,
-        id: String,
+        link: ParentLink,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (project, selected) = {
-            let pane = owner.read(cx);
-            (
-                pane.project.clone(),
-                pane.store
-                    .as_ref()
-                    .and_then(|s| s.selected())
-                    .map(str::to_owned),
-            )
-        };
+        let project = link.project.clone();
+        let id = link.id.clone();
+        let selected = owner
+            .read(cx)
+            .store
+            .as_ref()
+            .and_then(|s| s.selected())
+            .map(str::to_owned);
         // The target may be a worker folded under the session being viewed, or under
         // any other folded ancestor. Unfold the whole chain so its row shows.
         let mut unfolded = selected.is_some_and(|selected| {
@@ -530,16 +696,36 @@ impl Host {
             self.discovery.revision += 1;
             self.index_catalog(cx);
         }
-        let mut found = self.catalog_row(&id, &project, cx);
+        let mut found = self.find_row(&project, &id, link.route.as_ref(), cx);
         // The target may sit in a folded day group: open the groups and look again.
         if found.is_none() && !self.discovery.folded_days.is_empty() {
             self.discovery.folded_days.clear();
             self.discovery.revision += 1;
             self.index_catalog(cx);
-            found = self.catalog_row(&id, &project, cx);
+            found = self.find_row(&project, &id, link.route.as_ref(), cx);
         }
         if let Some((row, scope)) = found {
             self.activate_row(project, scope, row, window, cx);
+        } else if let Some(route) = link.route {
+            // Discovery has not listed the parent yet. Its recorded scope is
+            // enough to open the right workbench and select the session there.
+            let row = ThreadRow {
+                worker: true,
+                parent_thread_id: None,
+                agent_nickname: None,
+                id,
+                cwd: project.clone(),
+                model_provider: String::new(),
+                model: None,
+                name: link.title,
+                preview: String::new(),
+                generated_title: None,
+                updated_at: 0,
+                status: None,
+                unread: false,
+                activity_order: 0,
+            };
+            self.open_catalog(project, row, route, window, cx);
         }
     }
 
@@ -574,7 +760,7 @@ impl Host {
             })
             .chain((0..self.discovery.hosted.len()).map(Location::Hosted))
             .chain((0..self.discovery.rows.len()).map(Location::Saved));
-        let mut entries = HashMap::new();
+        let mut entries: HashMap<Key, Indexed> = HashMap::new();
         for loc in locations {
             let Some((r, project, scope)) = self.located(loc, cx) else {
                 continue;
@@ -610,12 +796,6 @@ impl Host {
                 r.model_provider.clone(),
             );
             let order = (r.updated_at, r.activity_order);
-            let entry = entries.entry(key).or_insert((
-                order,
-                loc,
-                r.parent_thread_id.clone(),
-                (false, false, false, false, false, 0),
-            ));
             // Prefer authoritative, richer identity for rendering. Keep the newest
             // positive activity date independently when two catalogs describe the same row.
             let quality = (
@@ -626,18 +806,27 @@ impl Host {
                 matches!(loc, Location::Live(..) | Location::Hosted(..)),
                 r.updated_at,
             );
-            entry.0 = entry.0.max(order);
-            if quality > entry.3 {
-                entry.1 = loc;
-                entry.2 = keep_parent(entry.2.take(), r.parent_thread_id.clone());
-                entry.3 = quality;
+            let candidate = Indexed {
+                order,
+                loc,
+                parent: r.parent_thread_id.clone(),
+                quality,
+                origin: self.origin_at(loc, cx),
+            };
+            match entries.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    slot.get_mut().merge(candidate)
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(candidate);
+                }
             }
         }
         let mut ordered: Vec<_> = entries.keys().collect();
         ordered.sort_unstable_by(|a, b| {
             entries[b]
-                .0
-                .cmp(&entries[a].0)
+                .order
+                .cmp(&entries[a].order)
                 .then_with(|| a.2.cmp(&b.2))
                 .then_with(|| a.0.cmp(&b.0))
                 .then_with(|| a.1.runtime.name().cmp(b.1.runtime.name()))
@@ -647,33 +836,53 @@ impl Host {
         let mut roots = Vec::new();
         let mut children = HashMap::new();
         let mut parents: HashMap<(PathBuf, String), (PathBuf, String)> = HashMap::new();
-        // A host-owned worker runs on its own route. Its origin names a parent
-        // session on another route of the same project.
-        let by_id: HashMap<_, _> = entries
+        let mut links: HashMap<(PathBuf, String), ParentLink> = HashMap::new();
+        // A host-owned worker runs on its own route and may run in another
+        // checkout. Its origin names the exact parent scope and session.
+        let by_scope: HashMap<_, _> = entries
             .keys()
-            .map(|k| ((k.0.as_path(), k.2.as_str()), k))
+            .map(|k| ((k.0.clone(), k.1, k.2.clone()), k))
             .collect();
-        for key in ordered {
-            let ((time, _), loc, parent, _) = &entries[key];
-            let node = (key, *time, *loc);
-            if let Some(parent) = parent
-                && let Some((key, _)) =
-                    entries.get_key_value(&(key.0.clone(), key.1, parent.clone(), key.3.clone()))
+        let by_project: HashMap<_, _> = entries
+            .keys()
+            .map(|k| ((k.0.clone(), k.2.clone()), k))
+            .collect();
+        for key in &ordered {
+            let entry = &entries[*key];
+            let node = (*key, entry.order.0, entry.loc);
+            let recorded = entry.origin.as_ref().and_then(ParentLink::from_origin);
+            let mut resolved = recorded
+                .as_ref()
+                .and_then(|parent| resolve_parent_key(parent, &by_scope, &by_project));
+            // Native subagent rows carry only a parent thread id in the same project.
+            if recorded.is_none()
+                && let Some(parent) = &entry.parent
             {
+                resolved = by_scope
+                    .get(&(key.0.clone(), key.1, parent.clone()))
+                    .or_else(|| by_project.get(&(key.0.clone(), parent.clone())))
+                    .copied();
+            }
+            if let Some(mut link) = recorded {
+                if let Some((row, project, scope)) =
+                    resolved.and_then(|k| self.located(entries[k].loc, cx))
+                {
+                    link.title = Some(row.title().to_owned());
+                    if link.route.is_none() {
+                        link.route = self.project_row_state(project, row, scope, cx).0;
+                    }
+                }
+                links.insert((key.0.clone(), key.2.clone()), link);
+            }
+            if let Some(parent_key) = resolved.filter(|parent| *parent != *key) {
                 parents.insert(
                     (node.0.0.clone(), node.0.2.clone()),
-                    (key.0.clone(), key.2.clone()),
+                    (parent_key.0.clone(), parent_key.2.clone()),
                 );
-                children.entry(key).or_insert_with(Vec::new).push(node);
-            } else if let Some(parent) = parent
-                && let Some(owner) = by_id.get(&(key.0.as_path(), parent.as_str()))
-                && *owner != key
-            {
-                parents.insert(
-                    (node.0.0.clone(), node.0.2.clone()),
-                    (owner.0.clone(), owner.2.clone()),
-                );
-                children.entry(*owner).or_insert_with(Vec::new).push(node);
+                children
+                    .entry(parent_key)
+                    .or_insert_with(Vec::new)
+                    .push(node);
             } else {
                 roots.push(node);
             }
@@ -685,6 +894,7 @@ impl Host {
             self.walk_tree(key, &children, cx, &mut tree);
         }
         cx.set_global(TreeIndex(tree));
+        cx.set_global(ParentIndex(links));
         self.discovery.parents = parents;
         let mut catalog = Vec::new();
         let mut previous = None;
@@ -925,14 +1135,158 @@ mod status_filter_tests {
 }
 
 #[cfg(test)]
-mod parent_merge_tests {
-    use super::keep_parent;
+mod parent_link_tests {
+    use super::{ParentLink, Scope, resolve_parent_key};
+    use ox_desk_core::origin::{Origin, Relation};
+    use ox_desk_core::runtime::{Route, Runtime};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn origin(
+        relation: Relation,
+        project: &str,
+        scope: Option<ox_desk_core::host_protocol::Scope>,
+        session: Option<&str>,
+    ) -> Origin {
+        serde_json::from_value(serde_json::json!({
+            "relation": relation,
+            "parent": {"project": project, "scope": scope, "session": session, "runtime": "codex"},
+            "launch": "helper:fixture",
+            "by_operator": false,
+            "runtime": "codex",
+            "route": {"runtime": "codex", "billing": {"api": "fixture/demo"}},
+            "mode": "session",
+            "job_id": 4,
+            "requested": "read",
+            "ceiling": "read",
+            "source": null
+        }))
+        .unwrap()
+    }
+
+    fn hosted_parent() -> ox_desk_core::host_protocol::Scope {
+        ox_desk_core::host_protocol::Scope {
+            project: PathBuf::from("/work/parent"),
+            route: Route::CODEX_SUBSCRIPTION,
+        }
+    }
+
     #[test]
-    fn a_richer_row_without_a_parent_keeps_the_known_parent() {
-        let p = |s: &str| Some(s.to_owned());
-        assert_eq!(keep_parent(p("parent"), None), p("parent"));
-        assert_eq!(keep_parent(None, p("parent")), p("parent"));
-        assert_eq!(keep_parent(p("old"), p("new")), p("new"));
-        assert_eq!(keep_parent(None, None), None);
+    fn worker_lineage_survives_richer_native_rows_in_either_catalog_order() {
+        use super::{Indexed, Location};
+        for host_first in [true, false] {
+            let candidate = |host: bool| Indexed {
+                order: (if host { 2 } else { 1 }, 0),
+                loc: if host {
+                    Location::Hosted(0)
+                } else {
+                    Location::Saved(0)
+                },
+                parent: host.then(|| "p".to_owned()),
+                quality: (!host, false, false, false, false, 0),
+                origin: host.then(|| {
+                    origin(
+                        Relation::Worker,
+                        "/work/parent",
+                        Some(hosted_parent()),
+                        Some("p"),
+                    )
+                }),
+            };
+            let mut row = candidate(host_first);
+            row.merge(candidate(!host_first));
+            assert!(matches!(row.loc, Location::Saved(0)));
+            assert_eq!(row.order.0, 2);
+            assert_eq!(row.parent.as_deref(), Some("p"));
+            let parent = ParentLink::from_origin(row.origin.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                (parent.id.as_str(), parent.route),
+                ("p", Some(Route::CODEX_SUBSCRIPTION))
+            );
+        }
+    }
+
+    #[test]
+    fn a_worker_takes_its_project_and_route_from_the_recorded_parent_scope() {
+        let link = ParentLink::from_origin(&origin(
+            Relation::Worker,
+            "/elsewhere",
+            Some(hosted_parent()),
+            Some("p"),
+        ))
+        .unwrap();
+        assert_eq!(link.project, PathBuf::from("/work/parent"));
+        assert_eq!(link.route, Some(Route::CODEX_SUBSCRIPTION));
+        assert_eq!(link.id, "p");
+    }
+
+    #[test]
+    fn a_recorded_parent_resolves_across_projects_before_the_same_project_fallback() {
+        let parent = ParentLink::from_origin(&origin(
+            Relation::Worker,
+            "/work/parent",
+            Some(hosted_parent()),
+            Some("p"),
+        ))
+        .unwrap();
+        let by_scope = HashMap::from([(
+            (
+                PathBuf::from("/work/parent"),
+                Scope {
+                    runtime: Runtime::Codex,
+                    api: false,
+                },
+                "p".to_owned(),
+            ),
+            "parent-in-other-checkout",
+        )]);
+        let by_project = HashMap::new();
+        assert_eq!(
+            resolve_parent_key(&parent, &by_scope, &by_project),
+            Some("parent-in-other-checkout")
+        );
+    }
+
+    #[test]
+    fn a_parent_whose_route_is_filtered_away_still_resolves_in_its_project() {
+        let parent = ParentLink::from_origin(&origin(
+            Relation::Worker,
+            "/work/parent",
+            Some(hosted_parent()),
+            Some("p"),
+        ))
+        .unwrap();
+        let by_scope = HashMap::new();
+        let by_project = HashMap::from([(
+            (PathBuf::from("/work/parent"), "p".to_owned()),
+            "parent-in-this-project",
+        )]);
+        assert_eq!(
+            resolve_parent_key(&parent, &by_scope, &by_project),
+            Some("parent-in-this-project")
+        );
+    }
+
+    #[test]
+    fn a_terminal_parent_keeps_its_project_and_handoffs_are_not_worker_parents() {
+        let terminal = ParentLink::from_origin(&origin(
+            Relation::Worker,
+            "/work/parent",
+            None,
+            Some("native-7"),
+        ))
+        .unwrap();
+        assert_eq!(terminal.project, PathBuf::from("/work/parent"));
+        assert_eq!(terminal.route, None);
+        assert_eq!(terminal.id, "native-7");
+        assert!(
+            ParentLink::from_origin(&origin(
+                Relation::Handoff,
+                "/source",
+                Some(hosted_parent()),
+                Some("p")
+            ))
+            .is_none()
+        );
     }
 }

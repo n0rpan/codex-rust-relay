@@ -39,6 +39,8 @@ pub(super) struct Start {
     mode: Mode,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    checkout: Option<std::path::PathBuf>,
     task: String,
     /// Legacy: false means read, true means write. Capped by the parent's mode.
     #[serde(default)]
@@ -50,6 +52,22 @@ pub(super) struct Start {
     /// Wall-clock limit in minutes. Falls back to OX_WORKER_MAX_MINUTES when set.
     #[serde(default)]
     max_minutes: Option<u32>,
+    /// Who pays, stated explicitly: `api` (the provider of the alias in `model`) or
+    /// `subscription`. Absent keeps the old inference: an alias is API, none is the
+    /// Claude subscription.
+    #[serde(default)]
+    billing: Option<Billing>,
+    /// The exact Claude subscription model to pin before the first inference, such as
+    /// `claude-fable-5-2`. Refused with an API alias; never falls back to another model.
+    #[serde(default)]
+    pub subscription_model: Option<String>,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Billing {
+    Api,
+    Subscription,
 }
 
 /// The canonical level name of a permission mode, or None for inherit.
@@ -116,6 +134,7 @@ struct Job {
 }
 
 struct State {
+    checkout: std::path::PathBuf,
     runtime: Runtime,
     mode: Mode,
     can_steer: bool,
@@ -129,6 +148,60 @@ struct State {
     started: std::time::Instant,
     max_minutes: Option<u64>,
     warning: Option<String>,
+    models: Models,
+}
+
+/// A worker's billing route and its requested, pinned and answering models.
+#[derive(Default)]
+struct Models {
+    subscription: bool,
+    requested: Option<String>,
+    /// The exact model the worker's own picker resolved the request to.
+    pinned: Option<String>,
+    /// Models that answered top-level turns, first one first.
+    answering: Vec<String>,
+}
+
+impl Models {
+    fn of(request: &Start) -> Self {
+        Self {
+            subscription: request.model.is_none(),
+            requested: request
+                .subscription_model
+                .clone()
+                .or_else(|| request.model.clone()),
+            ..Self::default()
+        }
+    }
+    fn answered(&mut self, model: &str) {
+        if !self.answering.iter().any(|m| m == model) && self.answering.len() < 8 {
+            self.answering.push(model.to_owned());
+        }
+    }
+    fn report(&self, runtime: Runtime) -> Value {
+        use crate::claude_models::{differs_warning, model_state, same_model};
+        let pinned = self.pinned.as_deref();
+        let actual = self.answering.first().map(String::as_str);
+        let other = pinned.and_then(|p| self.answering.iter().find(|a| !same_model(p, a)));
+        let state = match other {
+            Some(_) => "differs",
+            None => model_state(pinned, actual),
+        };
+        json!({
+            "billing": if self.subscription { "subscription" } else { "api" },
+            "billing_label": match (self.subscription, runtime) {
+                (true, Runtime::Claude) => "Claude subscription".to_owned(),
+                (true, Runtime::Codex) => "ChatGPT subscription".to_owned(),
+                (false, _) => format!("OX API · {}", self.requested.as_deref().unwrap_or("")),
+            },
+            "requested_model": self.requested,
+            "pinned_model": pinned,
+            "actual_model": actual,
+            "also_answered": self.answering.get(1..).unwrap_or_default(),
+            "model_state": state,
+            "model_warning": pinned.zip(other).map(|(p, o)| differs_warning(p, o)),
+        })
+    }
 }
 
 impl State {
@@ -144,10 +217,11 @@ impl State {
     }
 
     fn summary(&self, job_id: u64) -> Value {
-        json!({
+        let mut summary = json!({
             "job_id": job_id, "mode":self.mode, "runtime":self.runtime,
             "can_steer": self.can_steer && self.status == "running",
             "status": self.status,
+            "checkout": self.checkout,
             "model": self.model,
             "native_session": self.native_session,
             "progress": self.progress,
@@ -156,7 +230,13 @@ impl State {
             "elapsed_seconds": self.started.elapsed().as_secs(),
             "max_minutes": self.max_minutes,
             "warning": self.warning,
-        })
+        });
+        if let (Some(out), Value::Object(models)) =
+            (summary.as_object_mut(), self.models.report(self.runtime))
+        {
+            out.extend(models);
+        }
+        summary
     }
     fn snapshot(&self, job_id: u64) -> Value {
         let mut result = self.summary(job_id);
@@ -220,7 +300,8 @@ impl Jobs {
             return Err("All background worker slots are in use. Wait for one to finish or cancel one. The limit is OX_WORKER_MAX_PER_PARENT.".into());
         }
         let writes = request.writes()?;
-        let warning = self.write_overlap(writes);
+        let cwd = crate::worker_checkout::resolve(cwd, request.checkout.as_deref(), false)?;
+        let warning = self.write_overlap(writes, &cwd);
         let max_minutes = request
             .max_minutes
             .map(u64::from)
@@ -235,7 +316,7 @@ impl Jobs {
             self.entries.remove(&id);
         }
         let command = request
-            .command(home, cwd)
+            .command(home, &cwd)
             .map_err(|error| error.to_string())?;
         // Worker IDs appear in archived transcripts. Never recycle a small counter on reconnect.
         let id = loop {
@@ -246,6 +327,7 @@ impl Jobs {
         };
         let (sender, instructions) = mpsc::channel(4);
         let state = Arc::new(Mutex::new(State {
+            checkout: cwd.clone(),
             status: "running",
             can_steer: false,
             runtime: request.runtime,
@@ -265,12 +347,14 @@ impl Jobs {
             started: std::time::Instant::now(),
             max_minutes,
             warning,
+            models: Models::of(&request),
         }));
         state
             .lock()
             .unwrap()
             .record("user", &clean(&request.task, &secrets));
         let initial = state.lock().unwrap().snapshot(id);
+        let home = home.to_owned();
         let handle = tokio::spawn({
             let state = Arc::clone(&state);
             async move {
@@ -280,7 +364,15 @@ impl Jobs {
                             run_codex(command, &request, &state, &secrets, instructions).await
                         }
                         Runtime::Claude => {
-                            run_claude(command, &request, &state, &secrets, instructions).await
+                            run_claude(
+                                command,
+                                &request,
+                                &state,
+                                &secrets,
+                                instructions,
+                                Some(&home),
+                            )
+                            .await
                         }
                     }
                 };
@@ -322,14 +414,14 @@ impl Jobs {
     }
 
     /// A caution when this write worker starts beside another running write worker.
-    fn write_overlap(&self, writes: bool) -> Option<String> {
+    fn write_overlap(&self, writes: bool, checkout: &Path) -> Option<String> {
         (writes
             && self
                 .entries
                 .values()
-                .any(|job| job.writes && !job.task.is_finished()))
+                .any(|job| job.writes && !job.task.is_finished() && job.state.lock().unwrap().checkout == checkout))
         .then(|| {
-            "Another write worker is editing this project. Consider a separate git worktree."
+            "Another worker had write access to this checkout when this job started. Use a separate git worktree for independent edits."
                 .to_owned()
         })
     }
@@ -370,7 +462,7 @@ impl Drop for Jobs {
 impl Start {
     /// The launch the session host receives. Secrets are removed from the task first.
     pub(super) fn host_start(&self, secrets: &[String]) -> Value {
-        json!({
+        let mut start = json!({
             "parent": "",
             "runtime": self.runtime,
             "model": self.model,
@@ -379,7 +471,16 @@ impl Start {
             "write": self.workspace_write,
             "max_minutes": self.max_minutes,
             "permission": self.permission_mode.as_deref().map(|m| permission_level(m).ok().flatten().unwrap_or("inherit")),
-        })
+        });
+        if let Some(path) = &self.checkout {
+            start["checkout"] = json!(path);
+        }
+        // Sent only when pinned, so an unpinned launch still reaches an older host, and
+        // a pinned one is refused there instead of running the account default.
+        if let Some(model) = &self.subscription_model {
+            start["subscription_model"] = json!(model);
+        }
+        start
     }
     /// Without a session host the gateway cannot verify the parent's mode: it
     /// starts read workers by default and write workers on request, as before.
@@ -425,6 +526,25 @@ impl Start {
         }) {
             return Err("Provide an ox model alias of up to 256 bytes.".into());
         }
+        match (self.billing, &self.model, &self.subscription_model) {
+            (_, Some(_), Some(_)) | (Some(Billing::Subscription), Some(_), None) => {
+                return Err("model is an ox API alias, billed by its provider. For the Claude subscription, leave model out and pass subscription_model. Nothing was started.".into());
+            }
+            (Some(Billing::Api), None, _) => {
+                return Err("billing api needs an ox API model alias in model. Check list_ox_models. Nothing was started.".into());
+            }
+            _ => {}
+        }
+        if let Some(pinned) = &self.subscription_model {
+            if self.runtime != Runtime::Claude {
+                return Err("subscription_model pins a Claude subscription worker. Codex workers use an ox API model alias.".into());
+            }
+            if !crate::claude_models::valid_model(pinned) {
+                return Err(
+                    "Provide a Claude subscription model ID such as claude-fable-5-2.".into(),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -449,7 +569,7 @@ impl Start {
                     "Run ox login claude on this host to use a Claude subscription worker.".into(),
                 );
             }
-            if crate::host_lifetime::hosted() {
+            let mut command = if crate::host_lifetime::hosted() {
                 let mut wrapper = Command::new(std::env::current_exe()?);
                 wrapper.args(["claude", "--subscription"]);
                 wrapper
@@ -457,7 +577,13 @@ impl Start {
                 overlay = true;
                 let sandbox = self.claude_contract()?.settings().is_some();
                 crate::native::claude_subscription_worker_command(home, sandbox)?
+            };
+            // The pinned model runs from the first turn. run_claude checks it against
+            // this process's own picker before sending the task.
+            if let Some(model) = &self.subscription_model {
+                command.args(["--model", model]);
             }
+            command
         };
         command
             .current_dir(cwd)
@@ -530,13 +656,13 @@ impl Start {
 
 // Kill the process group on cancellation so a relay and its stock child stop
 // together. The group is created for this job and never comes from MCP input.
-struct WorkerProcess {
-    child: Child,
+pub(super) struct WorkerProcess {
+    pub(super) child: Child,
     group: Option<u32>,
 }
 
 impl WorkerProcess {
-    fn spawn(mut command: Command) -> Result<Self, RelayError> {
+    pub(super) fn spawn(mut command: Command) -> Result<Self, RelayError> {
         let child = command
             .spawn()
             .map_err(|error| format!("Could not start the installed worker client: {error}"))?;
@@ -561,16 +687,66 @@ impl Drop for WorkerProcess {
     }
 }
 
+/// Ask the worker's own Claude Code for its picker and resolve the pinned model,
+/// before any user message: an unoffered model ends the job with nothing inferred.
+async fn pin_claude_model(
+    input: &mut ChildStdin,
+    lines: &mut Lines<BufReader<ChildStdout>>,
+    requested: &str,
+    state: &Mutex<State>,
+    home: Option<&Path>,
+) -> Result<(), RelayError> {
+    const ID: &str = "ox-pin-model";
+    write_rpc(input, crate::claude_models::initialize_request(ID)).await?;
+    let reply = tokio::time::timeout(RPC_TIMEOUT, async {
+        while let Some(line) = lines.next_line().await? {
+            let Ok(event) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let r = &event["response"];
+            if event["type"] == "control_response" && r["request_id"] == ID {
+                return if r["subtype"] == "success" {
+                    Ok(r["response"].clone())
+                } else {
+                    Err(
+                        "Claude Code refused to report its model picker. Nothing was billed."
+                            .into(),
+                    )
+                };
+            }
+        }
+        Err::<Value, RelayError>(
+            "Claude Code exited before reporting its model picker. Nothing was billed.".into(),
+        )
+    })
+    .await
+    .map_err(|_| "Claude Code did not report its model picker in time. Nothing was billed.")??;
+    let (version, picker) = super::picker::picker_reply(&reply)?;
+    // The worker's own report is the freshest picker: it also refreshes model search.
+    if let Some(home) = home {
+        super::picker::remember(home, version.as_deref(), &picker);
+    }
+    let pin = crate::claude_models::resolve(&picker, requested)?;
+    let mut state = state.lock().unwrap();
+    state.models.pinned = Some(pin.exact);
+    state.progress = format!("Pinned to {} on the Claude subscription", pin.display);
+    Ok(())
+}
+
 async fn run_claude(
     command: Command,
     request: &Start,
     state: &Mutex<State>,
     secrets: &[String],
     mut instructions: mpsc::Receiver<Instruction>,
+    home: Option<&Path>,
 ) -> Result<&'static str, RelayError> {
     let mut process = WorkerProcess::spawn(command)?;
     let mut lines = process.output();
     let mut input = process.child.stdin.take().expect("worker stdin is piped");
+    if let Some(requested) = &request.subscription_model {
+        pin_claude_model(&mut input, &mut lines, requested, state, home).await?;
+    }
     let user_message = |text: &str| json!({"type":"user","message":{"role":"user","content":text},"parent_tool_use_id":null,"session_id":""});
     let task = clean(request.task.trim(), secrets);
     let task = if request.mode == Mode::Workflow {
@@ -610,6 +786,12 @@ async fn run_claude(
         }
         match event["type"].as_str() {
             Some("assistant") => {
+                // Subagents may run other models by design; the worker's own turns may not.
+                if event["parent_tool_use_id"].is_null()
+                    && let Some(model) = crate::claude_models::answering_model(&event["message"])
+                {
+                    state.models.answered(&clean(model, secrets));
+                }
                 for block in event["message"]["content"].as_array().into_iter().flatten() {
                     if block["type"] == "tool_use" {
                         used_workflow |= block["name"] == "Workflow";
@@ -692,6 +874,14 @@ async fn run_codex(
         .as_str()
         .ok_or("Codex returned no worker session ID.")?;
     state.lock().unwrap().native_session = Some(clean(thread, secrets));
+    // Codex reports the model the thread runs; nothing is pinned to compare it with.
+    if let Some(model) = session["model"].as_str().filter(|m| !m.is_empty()) {
+        state
+            .lock()
+            .unwrap()
+            .models
+            .answered(&clean(model, secrets));
+    }
     let task = clean(request.task.trim(), secrets);
     let (method, params) = if request.mode == Mode::Goal {
         (
@@ -1008,6 +1198,7 @@ printf flushed > "$MARKER"
             "runtime": "codex", "mode": "session", "task": "say hi", "model": "fixture"
         }));
         let state = Mutex::new(State {
+            checkout: ".".into(),
             runtime: Runtime::Codex,
             mode: Mode::Session,
             can_steer: false,
@@ -1021,6 +1212,7 @@ printf flushed > "$MARKER"
             started: std::time::Instant::now(),
             max_minutes: None,
             warning: None,
+            models: Models::default(),
         });
         let (_instructions, receiver) = mpsc::channel::<Instruction>(1);
         let status = run_codex(command, &request, &state, &[], receiver)
@@ -1055,6 +1247,7 @@ printf '%s\n' '{"type":"result","is_error":true,"result":"overloaded right now"}
             "runtime": "claude", "mode": "session", "task": "say hi", "model": "fixture"
         }));
         let state = Mutex::new(State {
+            checkout: ".".into(),
             runtime: Runtime::Claude,
             mode: Mode::Session,
             can_steer: false,
@@ -1068,12 +1261,154 @@ printf '%s\n' '{"type":"result","is_error":true,"result":"overloaded right now"}
             started: std::time::Instant::now(),
             max_minutes: None,
             warning: None,
+            models: Models::default(),
         });
         let (_instructions, receiver) = mpsc::channel::<Instruction>(1);
-        let error = run_claude(command, &request, &state, &[], receiver)
+        let error = run_claude(command, &request, &state, &[], receiver, None)
             .await
             .expect_err("an errored last turn fails the session");
         assert!(error.to_string().contains("overloaded right now"));
+    }
+
+    /// A scripted stock Claude Code: it reports a subscription picker at initialization,
+    /// marks any user message it receives, and answers as `$ANSWER`.
+    #[cfg(unix)]
+    fn scripted_claude(marker: &Path, answer: &str) -> Command {
+        const SCRIPT: &str = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"subtype":"initialize"'*)
+      printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"ox-pin-model","response":{"claude_code_version":"2.1.332","account":{"apiProvider":"firstParty","subscriptionType":"pro"},"models":[{"value":"default","resolvedModel":"claude-opus-5-5","displayName":"Default"},{"value":"fable","resolvedModel":"claude-fable-5-2","displayName":"Fable 5.2"}]}}}' ;;
+    *'"type":"user"'*)
+      printf user > "$MARKER"
+      printf '%s\n' "{\"type\":\"assistant\",\"session_id\":\"s\",\"parent_tool_use_id\":null,\"message\":{\"model\":\"$ANSWER\",\"content\":[{\"type\":\"text\",\"text\":\"reviewed\"}]}}"
+      printf '%s\n' '{"type":"assistant","session_id":"s","parent_tool_use_id":"tool-1","message":{"model":"claude-haiku-5-5","content":[]}}'
+      printf '%s\n' '{"type":"result","is_error":false,"session_id":"s","result":"reviewed"}' ;;
+  esac
+done
+"#;
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", SCRIPT])
+            .env("MARKER", marker)
+            .env("ANSWER", answer)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0);
+        command
+    }
+
+    #[cfg(unix)]
+    fn pinned_state(request: &Start) -> Mutex<State> {
+        Mutex::new(State {
+            checkout: ".".into(),
+            runtime: Runtime::Claude,
+            mode: Mode::Session,
+            can_steer: false,
+            messages: VecDeque::new(),
+            status: "running",
+            native_session: None,
+            progress: String::new(),
+            result: None,
+            error: None,
+            model: "Claude subscription".into(),
+            started: std::time::Instant::now(),
+            max_minutes: None,
+            warning: None,
+            models: Models::of(request),
+        })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_standalone_worker_is_pinned_before_its_first_turn_and_confirmed_after() {
+        let dir = tempfile_dir("pinned");
+        let marker = dir.join("user");
+        let request = start(json!({
+            "runtime":"claude","mode":"session","task":"review","subscription_model":"fable"
+        }));
+        let state = pinned_state(&request);
+        let (_instructions, receiver) = mpsc::channel::<Instruction>(1);
+        let status = run_claude(
+            scripted_claude(&marker, "claude-fable-5-2"),
+            &request,
+            &state,
+            &[],
+            receiver,
+            None,
+        )
+        .await
+        .expect("an offered model runs");
+        assert_eq!(status, "completed");
+        let report = state.lock().unwrap().summary(1);
+        assert_eq!(report["billing"], "subscription");
+        assert_eq!(report["requested_model"], "fable");
+        assert_eq!(report["pinned_model"], "claude-fable-5-2");
+        // The subagent's model is not the worker's.
+        assert_eq!(report["actual_model"], "claude-fable-5-2");
+        assert_eq!(report["also_answered"], json!([]));
+        assert_eq!(report["model_state"], "confirmed");
+        assert_eq!(report["model"], "Claude subscription", "legacy field kept");
+
+        // Another model answering is reported, never silent.
+        let state = pinned_state(&request);
+        let (_instructions, receiver) = mpsc::channel::<Instruction>(1);
+        run_claude(
+            scripted_claude(&marker, "claude-opus-5-5"),
+            &request,
+            &state,
+            &[],
+            receiver,
+            None,
+        )
+        .await
+        .unwrap();
+        let report = state.lock().unwrap().summary(1);
+        assert_eq!(report["model_state"], "differs");
+        assert!(
+            report["model_warning"]
+                .as_str()
+                .unwrap()
+                .contains("claude-opus-5-5 answered")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unoffered_model_ends_a_standalone_worker_before_any_user_message() {
+        let dir = tempfile_dir("unoffered");
+        let marker = dir.join("user");
+        let request = start(json!({
+            "runtime":"claude","mode":"session","task":"review","subscription_model":"claude-fable-9"
+        }));
+        let state = pinned_state(&request);
+        let (_instructions, receiver) = mpsc::channel::<Instruction>(1);
+        let error = run_claude(
+            scripted_claude(&marker, "claude-fable-9"),
+            &request,
+            &state,
+            &[],
+            receiver,
+            None,
+        )
+        .await
+        .expect_err("an unoffered model is refused");
+        let error = error.to_string();
+        assert!(error.contains("does not offer claude-fable-9"), "{error}");
+        assert!(error.contains("Nothing was started or billed"), "{error}");
+        assert!(!marker.exists(), "the task never reached the stock client");
+        assert_eq!(state.lock().unwrap().summary(1)["model_state"], "pending");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn tempfile_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ox-pin-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     fn pending_job(writes: bool) -> Job {
@@ -1082,6 +1417,7 @@ printf '%s\n' '{"type":"result","is_error":true,"result":"overloaded right now"}
         Job {
             sender,
             state: Arc::new(Mutex::new(State {
+                checkout: ".".into(),
                 runtime: Runtime::Codex,
                 mode: Mode::Session,
                 can_steer: false,
@@ -1095,6 +1431,7 @@ printf '%s\n' '{"type":"result","is_error":true,"result":"overloaded right now"}
                 started: std::time::Instant::now(),
                 max_minutes: None,
                 warning: None,
+                models: Models::default(),
             })),
             task: task.abort_handle(),
             writes,
@@ -1115,10 +1452,14 @@ printf '%s\n' '{"type":"result","is_error":true,"result":"overloaded right now"}
     #[tokio::test]
     async fn a_second_write_worker_gets_a_warning_and_a_read_worker_does_not() {
         let mut jobs = Jobs::default();
-        assert!(jobs.write_overlap(true).is_none());
+        assert!(jobs.write_overlap(true, Path::new(".")).is_none());
         jobs.entries.insert(1, pending_job(true));
-        assert!(jobs.write_overlap(true).unwrap().contains("git worktree"));
-        assert!(jobs.write_overlap(false).is_none());
+        assert!(
+            jobs.write_overlap(true, Path::new("."))
+                .unwrap()
+                .contains("git worktree")
+        );
+        assert!(jobs.write_overlap(false, Path::new(".")).is_none());
     }
 
     #[test]

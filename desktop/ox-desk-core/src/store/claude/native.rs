@@ -454,6 +454,7 @@ mod tests {
             blank: None,
             worker: None,
             worker_blank: None,
+            worker_model: None,
             serial: 0,
             native: Default::default(),
         };
@@ -579,6 +580,7 @@ mod tests {
             blank: None,
             worker: None,
             worker_blank: None,
+            worker_model: None,
             serial: 0,
             native: Default::default(),
         };

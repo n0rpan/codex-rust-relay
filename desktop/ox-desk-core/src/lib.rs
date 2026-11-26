@@ -1,8 +1,12 @@
 //! Data shared by the OX desktop workbench and its native services.
+#[path = "../../../src/claude_models.rs"]
+pub mod claude_models;
 #[path = "../../../src/claude_worker_contract.rs"]
 pub mod claude_worker_contract;
 #[path = "../../../src/settings_protocol.rs"]
 pub mod settings_protocol;
+#[path = "../../../src/worker_checkout.rs"]
+pub mod worker_checkout;
 
 pub mod actions;
 pub mod asks;
@@ -17,6 +21,7 @@ pub mod perf;
 pub mod ports;
 pub mod slash;
 pub mod store;
+pub mod surface;
 pub mod transcript;
 
 pub mod keys;

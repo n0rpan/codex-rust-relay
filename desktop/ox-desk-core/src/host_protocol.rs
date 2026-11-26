@@ -29,6 +29,13 @@ pub enum Client {
     Hello {
         version: u32,
     },
+    /// The interface this connection's person uses. Send it once, after a host hello that
+    /// lists `surface::CAPABILITY`; an older host rejects the frame. The phone bridge
+    /// declares the phone itself and never forwards a phone's own declaration. A
+    /// connection that declares nothing is stamped as an unknown OX client.
+    Surface {
+        surface: crate::surface::Surface,
+    },
     WatchCatalog,
     TerminalPreview {
         id: String,

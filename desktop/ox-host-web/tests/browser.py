@@ -750,7 +750,7 @@ def run(harness, screenshot=None):
                     "requested": "read", "runtime": "claude", "mode": "session", "by_operator": False,
                     "launch": "helper:fixture", "source": None,
                     "route": {"runtime": "claude", "billing": "subscription"},
-                    "parent": {"project": "/fixture", "scope": None, "session": "parent", "runtime": "claude"}}},
+                    "parent": {"project": host.scope["project"], "scope": host.scope, "session": "parent", "runtime": "claude"}}},
             },
         ]
         host.sessions.append(dict(host.sessions[0], id="disk-report", title="Rust build disk usage",
@@ -768,7 +768,7 @@ def run(harness, screenshot=None):
         handoff_origin = {"relation": "handoff", "job_id": 0, "ceiling": "write", "requested": "write",
             "runtime": "claude", "mode": "session", "by_operator": True, "launch": "operator:fixture",
             "source": None, "route": route, "started": "accept_edits", "decided": "inherited",
-            "parent": {"project": "/fixture", "scope": None, "session": "parent", "runtime": "claude"},
+            "parent": {"project": host.scope["project"], "scope": host.scope, "session": "parent", "runtime": "claude"},
             "handoff": {"scope": host.scope, "session": "parent", "native": None, "title": "Database connection timeouts",
                 "runtime": "claude", "route": route, "source_access": "accept_edits", "source_level": "write",
                 "decision": "inherited", "selection": {"total": 4, "carried": 3, "omitted": 1, "items": [], "cut": [],

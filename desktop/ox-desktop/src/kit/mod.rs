@@ -396,11 +396,26 @@ impl ListRow {
             Some("Unread") => Some(p.accent),
             _ => None,
         };
+        let indent = self.depth.min(4) as f32 * SPACE_M;
         let track = row()
+            .relative()
             .w_full()
             .h(px(ROW_HEIGHT))
             .gap(px(SPACE_S))
-            .pl(px(self.depth.min(4) as f32 * SPACE_M))
+            .pl(px(indent))
+            .when(self.depth > 0, |track| {
+                track.child(
+                    gpui::div()
+                        .absolute()
+                        .left(px(indent - SPACE_S))
+                        .top_0()
+                        .h(px(ROW_HEIGHT / 2.0))
+                        .w(px(SPACE_S - 2.0))
+                        .border_l_1()
+                        .border_b_1()
+                        .border_color(rgb(p.line)),
+                )
+            })
             .child(crate::activity::cartridge(
                 p,
                 self.cartridge,
