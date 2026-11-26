@@ -207,17 +207,23 @@ pub fn apply(home: &Path, id: &str) -> Result<Fix, RelayError> {
             }
             let old_base = vendor.base_url.as_str().to_owned();
             let env_key = vendor.env_key.clone();
-            let shared = before.vendors.iter().any(|vendor| {
-                vendor.key != *provider
-                    && vendor.env_key == env_key
-                    && vendor.base_url.as_str() != old_base
-            });
+            // A saved key is valid only while every provider that references it
+            // shares one destination. Moving one of two providers would leave
+            // the others unreachable, so refuse and let the user split them.
+            if let Some(env_key) = &env_key
+                && before.vendors.iter().any(|vendor| {
+                    vendor.key != *provider && vendor.env_key.as_deref() == Some(env_key.as_str())
+                })
+            {
+                return Err(format!(
+                    "providers.{provider} shares {env_key} with another provider; give each route its own env_key (or update both by hand) before moving to {region}.openrouter.ai"
+                )
+                .into());
+            }
             let base = format!("https://{region}.openrouter.ai/api/v1");
             let updated = set_provider_base(&text, provider, &base)?;
             crate::setup::write_config_atomic(&config, &updated)?;
-            if let Some(env_key) = env_key
-                && !shared
-            {
+            if let Some(env_key) = env_key {
                 let mut keys = crate::provider::SavedKeys::load(home)?;
                 if let Some(text) = keys.rescope(&env_key, &old_base, &base)? {
                     crate::setup::write_config_atomic(
@@ -449,6 +455,36 @@ reasoning_efforts = ["low", "high"]
         assert!(apply(&home, "effort").is_err());
         let config = std::fs::read_to_string(home.join("codeox.toml")).unwrap();
         assert!(config.contains("https://openrouter.ai/api/v1"), "{config}");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_regional_fix_is_refused_when_another_route_shares_the_key() {
+        let home = temp_home("shared-key");
+        std::fs::write(
+            home.join("codeox.toml"),
+            "[providers.openrouter]\nbase_url = \"https://openrouter.ai/api/v1\"\nenv_key = \"OPENROUTER_API_KEY\"\n\n[providers.openrouter-chat]\nbase_url = \"https://openrouter.ai/api/v1\"\nenv_key = \"OPENROUTER_API_KEY\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("ox-api-keys.json"),
+            r#"{"OPENROUTER_API_KEY":{"scope":"https://openrouter.ai/api/v1","value":"sk-test"}}"#,
+        )
+        .unwrap();
+        record(
+            &home,
+            advice(
+                "region",
+                Fix::UseRegionalHost {
+                    provider: "openrouter".to_owned(),
+                    region: "eu".to_owned(),
+                },
+            ),
+        );
+        let error = apply(&home, "region").unwrap_err().to_string();
+        assert!(error.contains("shares OPENROUTER_API_KEY"), "{error}");
+        let config = std::fs::read_to_string(home.join("codeox.toml")).unwrap();
+        assert!(!config.contains("eu.openrouter.ai"), "{config}");
         let _ = std::fs::remove_dir_all(home);
     }
 
