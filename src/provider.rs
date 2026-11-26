@@ -1270,9 +1270,7 @@ impl Route {
     /// Returns a short description of the change for the one-line notice.
     pub fn normalize_reasoning(&self, payload: &mut serde_json::Value) -> Option<String> {
         let supported = self.reasoning.supported.clone();
-        if supported.is_empty() {
-            return None;
-        }
+        let mandatory = self.reasoning.mandatory;
         let reasoning = payload.get_mut("reasoning")?.as_object_mut()?;
         let requested = reasoning
             .get("effort")
@@ -1287,7 +1285,12 @@ impl Route {
         }
         let supports_none = supported.iter().any(|level| level == "none");
         let wants_off = requested.as_deref() == Some("none") || disabled;
-        if wants_off && supports_none && !self.reasoning.mandatory {
+        // Without a published effort list there is nothing to clamp, but an
+        // explicit mandatory policy still forbids disabling reasoning.
+        if !mandatory && supported.is_empty() {
+            return None;
+        }
+        if wants_off && supports_none && !mandatory {
             return None;
         }
         if !wants_off
@@ -1300,32 +1303,43 @@ impl Route {
             .reasoning
             .default
             .clone()
-            .filter(|default| supported.contains(default))
+            .filter(|default| supported.is_empty() || supported.contains(default))
             .or_else(|| {
+                if supported.is_empty() {
+                    return None;
+                }
                 crate::catalog::clamp_reasoning_effort(
                     requested.as_deref().unwrap_or("none"),
                     &supported,
                     None,
                 )
             });
-        let replacement = replacement?;
-        if requested.as_deref() == Some(replacement.as_str()) && !disabled {
+        if let Some(replacement) = replacement {
+            if requested.as_deref() == Some(replacement.as_str()) && !disabled {
+                return None;
+            }
+            reasoning.remove("enabled");
+            reasoning.insert(
+                "effort".to_owned(),
+                serde_json::Value::String(replacement.clone()),
+            );
+            let notice = match requested.as_deref() {
+                Some("none") | None => {
+                    format!("reasoning cannot be disabled on this model; using {replacement:?}")
+                }
+                Some(previous) => {
+                    format!("reasoning effort {previous:?} is not supported; using {replacement:?}")
+                }
+            };
+            return Some(notice);
+        }
+        // A mandatory model with no effort list and no default: drop the block
+        // and let the provider apply its own reasoning level.
+        if !mandatory {
             return None;
         }
-        reasoning.remove("enabled");
-        reasoning.insert(
-            "effort".to_owned(),
-            serde_json::Value::String(replacement.clone()),
-        );
-        let notice = match requested.as_deref() {
-            Some("none") | None => {
-                format!("reasoning cannot be disabled on this model; using {replacement:?}")
-            }
-            Some(previous) => {
-                format!("reasoning effort {previous:?} is not supported; using {replacement:?}")
-            }
-        };
-        Some(notice)
+        payload.as_object_mut()?.remove("reasoning");
+        Some("reasoning cannot be disabled on this model; using its default".to_owned())
     }
 }
 
@@ -1751,6 +1765,30 @@ mod tests {
         assert!(route.normalize_reasoning(&mut payload).is_some());
         // The closest supported level to "none" is the lowest one.
         assert_eq!(payload["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn a_mandatory_policy_without_an_effort_list_still_enforces_it() {
+        // A static entry can declare `reasoning_mandatory` without listing the
+        // efforts; the policy, not the list, is what forbids disabling.
+        let route = reasoning_route(&[], Some("high"), true);
+        let mut payload = serde_json::json!({"reasoning": {"effort": "none"}});
+        assert!(route.normalize_reasoning(&mut payload).is_some());
+        assert_eq!(payload["reasoning"]["effort"], "high");
+
+        let route = reasoning_route(&[], None, true);
+        let mut payload = serde_json::json!({"reasoning": {"enabled": false}});
+        assert!(route.normalize_reasoning(&mut payload).is_some());
+        assert!(
+            payload.get("reasoning").is_none(),
+            "no level to use, so drop it"
+        );
+
+        // Without the policy an unknown model keeps the caller's value.
+        let route = reasoning_route(&[], Some("high"), false);
+        let mut payload = serde_json::json!({"reasoning": {"effort": "none"}});
+        assert!(route.normalize_reasoning(&mut payload).is_none());
+        assert_eq!(payload["reasoning"]["effort"], "none");
     }
 
     #[test]
