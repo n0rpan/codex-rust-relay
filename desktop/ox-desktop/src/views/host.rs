@@ -177,9 +177,16 @@ impl Host {
         let route_refresh = Self::refresh_routes(window, cx);
         cx.observe_window_visibility(window, |s, _, w, cx| {
             if w.is_visible() {
+                crate::sky::wake(cx);
                 cx.notify()
             } else {
                 s.running.update(cx, |r, cx| r.set_shown(false, cx));
+            }
+        })
+        .detach();
+        cx.observe_window_activation(window, |_, w, cx| {
+            if w.is_window_active() {
+                crate::sky::wake(cx);
             }
         })
         .detach();

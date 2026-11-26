@@ -269,9 +269,12 @@ struct Live {
 struct Frame(u32);
 
 struct Current(Sky);
+#[derive(Clone)]
+struct Wake(flume::Sender<()>);
 impl Global for Current {}
 impl Global for Live {}
 impl Global for Frame {}
+impl Global for Wake {}
 
 /// The sky the header should draw now. Time-only defaults before the provider has run.
 pub fn now(cx: &App) -> Sky {
@@ -358,17 +361,32 @@ fn tick(cx: &mut App) -> bool {
     animating
 }
 
+/// Wake the sky clock immediately so refocusing a window resumes weather animation
+/// without waiting for the remainder of the 60 s unfocused sleep.
+pub fn wake(cx: &App) {
+    if let Some(wake) = cx.try_global::<Wake>() {
+        let _ = wake.0.try_send(());
+    }
+}
+
 /// Start the clock and weather refreshers. The clock part wakes once a minute (every 400 ms
 /// only while weather particles are moving in an active, focused window); when unfocused it
 /// drops to the 60 s minute tick, and it does nothing while hidden.
 pub fn start(cx: &mut App) {
+    let (tx, rx) = flume::bounded(1);
+    cx.set_global(Wake(tx));
     cx.spawn(async move |cx| {
         loop {
             let animating = cx.update(tick);
             let wait = if animating { 400 } else { 60_000 };
-            cx.background_executor()
-                .timer(Duration::from_millis(wait))
-                .await;
+            let timer = cx.background_executor().timer(Duration::from_millis(wait));
+            futures_lite::future::or(
+                async {
+                    let _ = rx.recv_async().await;
+                },
+                timer,
+            )
+            .await;
         }
     })
     .detach();
@@ -387,6 +405,7 @@ pub fn reload(cx: &mut App) {
         fetch(cx).await;
         cx.update(|cx| {
             tick(cx);
+            wake(cx);
         });
     })
     .detach();
@@ -446,6 +465,7 @@ async fn fetch(cx: &AsyncApp) -> Duration {
             weather: answer.weather,
         });
         tick(cx);
+        wake(cx);
     });
     wait
 }
