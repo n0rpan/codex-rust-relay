@@ -987,6 +987,14 @@ impl Host {
             pane,
             window,
             |s, owner, event: &super::route_chip::NewModelRoute, window, cx| {
+                if owner.read(cx).image_work.contains_key(&None) {
+                    s.message = Some(
+                        "Wait for image attachment preparation to finish before switching models."
+                            .into(),
+                    );
+                    cx.notify();
+                    return;
+                }
                 let (project, same_route, carried) = owner.update(cx, |view, _| {
                     let same_route = view.route == event.0;
                     let carried = view.store.as_mut().and_then(|store| {
@@ -1859,14 +1867,23 @@ impl Host {
         let host_gen = host.clone();
         let key_gen = key.clone();
         let row_gen = row.clone();
-        let gen_label = if custom_title {
+        let has_native_name = row.name.as_deref().is_some_and(|n| !n.trim().is_empty());
+        let is_worker =
+            row.worker || row.parent_thread_id.is_some() || row.agent_nickname.is_some();
+        let has_generated = row.generated_title.is_some();
+        let gen_disabled = custom_title || has_native_name || is_worker || has_generated;
+        let gen_label = if custom_title || has_native_name {
             "Generate title — custom name set"
+        } else if is_worker {
+            "Generate title — worker thread"
+        } else if has_generated {
+            "Generate title — already titled"
         } else {
             "Generate title"
         };
         menu = menu.item(
             crate::kit::menu_item(gen_label)
-                .disabled(custom_title)
+                .disabled(gen_disabled)
                 .on_click(move |_, window, cx| {
                     let _ = host_gen.update(cx, |s, cx| {
                         s.activate_row_with_action(

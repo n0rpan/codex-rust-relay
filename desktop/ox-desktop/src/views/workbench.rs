@@ -592,10 +592,16 @@ impl Workbench {
                 self.request_end(id, cx);
             }
             DeferredRowAction::GenerateTitle => {
-                if !store.can_generate_title(&id) {
+                if !store
+                    .transcript(&id)
+                    .is_some_and(|t| t.is_ready() || t.active_turn().is_some())
+                {
                     return;
                 }
                 self.pending_row_action = None;
+                if !store.can_generate_title(&id) {
+                    return;
+                }
                 self.action(cx, DeskAction::GenerateTitle(id));
             }
             DeferredRowAction::FindInTranscript => {
