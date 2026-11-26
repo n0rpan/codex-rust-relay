@@ -1,9 +1,57 @@
 use crate::preferences::behavior::{Active, Behavior, ThemeSource};
 use gpui::{App, Global, Pixels, px, rgb};
 use gpui_component::{Theme, ThemeMode};
+use serde::{Deserialize, Serialize};
 use std::env;
 #[cfg(any(target_os = "linux", test))]
 use toml_edit::DocumentMut;
+
+/// The six named OX Arcade accent colours for threads, project groups and user sections.
+/// Every colour resolves against the active theme and passes the contrast guard against `nav`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccentColor {
+    Cobalt,
+    Amber,
+    Emerald,
+    Coral,
+    Violet,
+    Cyan,
+}
+
+impl AccentColor {
+    pub const ALL: [Self; 6] = [
+        Self::Cobalt,
+        Self::Amber,
+        Self::Emerald,
+        Self::Coral,
+        Self::Violet,
+        Self::Cyan,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cobalt => "Cobalt",
+            Self::Amber => "Amber",
+            Self::Emerald => "Emerald",
+            Self::Coral => "Coral",
+            Self::Violet => "Violet",
+            Self::Cyan => "Cyan",
+        }
+    }
+
+    pub const fn next(current: Option<Self>) -> Option<Self> {
+        match current {
+            None => Some(Self::Cobalt),
+            Some(Self::Cobalt) => Some(Self::Amber),
+            Some(Self::Amber) => Some(Self::Emerald),
+            Some(Self::Emerald) => Some(Self::Coral),
+            Some(Self::Coral) => Some(Self::Violet),
+            Some(Self::Violet) => Some(Self::Cyan),
+            Some(Self::Cyan) => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Palette {
@@ -138,7 +186,6 @@ impl Palette {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
 fn lightness(color: u32) -> f32 {
     let linear = |shift| {
         let v = ((color >> shift) & 255u32) as f32 / 255.;
@@ -152,14 +199,12 @@ fn lightness(color: u32) -> f32 {
 }
 
 /// WCAG contrast ratio between two colours.
-#[cfg(any(target_os = "linux", test))]
 fn contrast(a: u32, b: u32) -> f32 {
     let (x, y) = (lightness(a), lightness(b));
     (x.max(y) + 0.05) / (x.min(y) + 0.05)
 }
 
 /// Moves `color` toward `fg` until it reaches 4.5:1 against `bg`. None if it never does.
-#[cfg(any(target_os = "linux", test))]
 fn nudge_to_contrast(color: u32, bg: u32, fg: u32) -> Option<u32> {
     let mut current = color;
     for _ in 0..12 {
@@ -209,6 +254,26 @@ fn parse_color(value: &str) -> Option<u32> {
 impl Palette {
     pub fn get(cx: &App) -> Self {
         *cx.global::<Self>()
+    }
+
+    /// Resolves a named arcade accent colour against this palette, ensuring at least 4.5:1
+    /// contrast against `nav` in both dark, light and Omarchy themes.
+    pub fn thread_accent(self, color: AccentColor) -> u32 {
+        let base = match color {
+            AccentColor::Cobalt => self.accent,
+            AccentColor::Amber => self.warning,
+            AccentColor::Emerald => self.success,
+            AccentColor::Coral => self.error,
+            AccentColor::Violet => {
+                let raw = if self.light { 0x6b3fa0 } else { 0xd4a5ff };
+                mix(raw, self.accent, 25)
+            }
+            AccentColor::Cyan => {
+                let raw = if self.light { 0x156585 } else { 0x7ee8fa };
+                mix(raw, self.success, 25)
+            }
+        };
+        nudge_to_contrast(base, self.nav, self.fg).unwrap_or(self.fg)
     }
 
     /// Pixel size of a type step at the user's text-size preference.

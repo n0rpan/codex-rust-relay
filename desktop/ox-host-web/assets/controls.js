@@ -382,18 +382,32 @@ export class SessionControls {
     $("control-status").textContent = typeof status === "string" ? status : "";
   }
   threadActions() {
-    const { id, ready, archived } = this.ctx;
+    const { id, ready, archived, pinned, color, togglePin, cycleColor } =
+      this.ctx;
     const stamp = JSON.stringify([
       id,
       ready,
       this.caps,
       this.pending.has("thread"),
+      pinned,
+      color,
     ]);
     if (this.actionStamp === stamp) return;
     this.actionStamp = stamp;
     const container = $("thread-actions");
     container.replaceChildren();
     if (!id) return;
+    if (togglePin) {
+      container.append(
+        button(pinned ? "Unpin thread" : "Pin thread", togglePin),
+      );
+    }
+    if (cycleColor) {
+      const colorName = color
+        ? color.charAt(0).toUpperCase() + color.slice(1)
+        : "None";
+      container.append(button(`Colour · ${colorName}`, cycleColor));
+    }
     for (const [cap, label] of [
       ["end", "End session"],
       ["rename", "Rename"],

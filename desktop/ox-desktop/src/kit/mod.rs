@@ -1,14 +1,16 @@
 //! Shared keyboard-accessible controls for the workspace and preferences.
-use crate::appearance::{LABEL_FONT, Palette, Step};
+use crate::appearance::{AccentColor, LABEL_FONT, Palette, Step};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, ClickEvent, ElementId, InteractiveElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Window, px, rgb,
+    AnyElement, App, AppContext, ClickEvent, Context, ElementId, InteractiveElement, IntoElement,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, px, rgb,
 };
 use gpui_component::{
     Disableable,
     button::{Button, ButtonVariant, ButtonVariants},
+    menu::{ContextMenuExt, PopupMenu},
 };
+use std::rc::Rc;
 
 /// Three control heights on the 4 px grid: inline pills 24, secondary and icon
 /// controls 28, primary buttons and inputs 32. List rows share the primary height.
@@ -352,6 +354,8 @@ pub fn field(
     })
 }
 
+pub type RowMenuBuilder = Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>;
+
 pub struct ListRow {
     pub cartridge: crate::activity::Cartridge,
     pub title: String,
@@ -361,6 +365,28 @@ pub struct ListRow {
     pub selected: bool,
     /// Nesting under a parent session; indents the content by one step per level.
     pub depth: usize,
+    /// Whether this row is in the Pinned section.
+    pub pinned: bool,
+    /// Optional custom arcade colour stripe on the left edge.
+    pub accent: Option<AccentColor>,
+    /// Short project tag shown when a row lives in Pinned or a cross-project user section.
+    pub project_tag: Option<String>,
+}
+impl Default for ListRow {
+    fn default() -> Self {
+        Self {
+            cartridge: crate::activity::Cartridge::Codex,
+            title: String::new(),
+            route: String::new(),
+            age: String::new(),
+            status: None,
+            selected: false,
+            depth: 0,
+            pinned: false,
+            accent: None,
+            project_tag: None,
+        }
+    }
 }
 impl ListRow {
     fn secondary(&self) -> String {
@@ -379,10 +405,13 @@ impl ListRow {
     /// A 32 px row: muted pixel glyph, title, an exception marker and a quiet age. Only
     /// exceptions (running, needs you, error, unread) get a marker; the rest of the
     /// status (such as "Ended") lives in the tooltip.
-    pub fn render(
+    /// Renders the row with an optional context menu (available on right-click and via an
+    /// explicit `⋯` action button on the trailing edge).
+    pub fn render_with_menu(
         self,
         p: Palette,
         id: impl Into<ElementId>,
+        menu_builder: Option<RowMenuBuilder>,
         click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> gpui::Div {
         use gpui::prelude::FluentBuilder;
@@ -396,6 +425,7 @@ impl ListRow {
             Some("Unread") => Some(p.accent),
             _ => None,
         };
+        let stripe_color = self.accent.map(|c| p.thread_accent(c));
         let indent = self.depth.min(4) as f32 * SPACE_M;
         let track = row()
             .relative()
@@ -403,6 +433,19 @@ impl ListRow {
             .h(px(ROW_HEIGHT))
             .gap(px(SPACE_S))
             .pl(px(indent))
+            .when(menu_builder.is_some(), |track| track.pr(px(20.)))
+            .when_some(stripe_color, |track, color| {
+                track.child(
+                    gpui::div()
+                        .absolute()
+                        .left(px(0.))
+                        .top(px(6.))
+                        .bottom(px(6.))
+                        .w(px(2.))
+                        .rounded(px(1.))
+                        .bg(rgb(color)),
+                )
+            })
             .when(self.depth > 0, |track| {
                 track.child(
                     gpui::div()
@@ -431,6 +474,32 @@ impl ListRow {
                     .when(self.selected, |d| d.font_weight(gpui::FontWeight::MEDIUM))
                     .child(self.title),
             )
+            .when(self.pinned, |d| {
+                d.child(
+                    gpui::div()
+                        .flex_shrink_0()
+                        .font_family(LABEL_FONT)
+                        .text_size(p.text(Step::Label) * 0.9)
+                        .text_color(rgb(p.accent))
+                        .child("★"),
+                )
+            })
+            .when_some(self.project_tag, |d, tag| {
+                d.child(
+                    gpui::div()
+                        .flex_shrink_0()
+                        .max_w(px(64.))
+                        .truncate()
+                        .px(px(4.))
+                        .py(px(1.))
+                        .rounded(px(2.))
+                        .bg(rgb(p.surface()))
+                        .font_family(LABEL_FONT)
+                        .text_size(p.text(Step::Label) * 0.85)
+                        .text_color(rgb(p.quiet()))
+                        .child(tag),
+                )
+            })
             .when_some(marker, |d, color| {
                 d.child(
                     gpui::div()
@@ -466,7 +535,37 @@ impl ListRow {
             .tooltip(hint)
             .on_click(click);
         let button = crate::platform::layout_probe::mark(button, &id, &name, true);
-        col().h(px(ROW_HEIGHT)).justify_center().child(button)
+        let action_button: Option<AnyElement> = menu_builder.as_ref().map(|build| {
+            let build = build.clone();
+            let menu_id = ElementId::Name(format!("row-menu-{id}").into());
+            let menu_btn = icon_button(
+                p,
+                menu_id,
+                "⋯",
+                format!("Thread actions for {name}"),
+                |_, _, _| {},
+            )
+            .size(px(20.))
+            .dropdown_menu(move |menu, window, cx| build(menu, window, cx));
+            gpui::div()
+                .absolute()
+                .right(px(4.))
+                .top(px((ROW_HEIGHT - 20.) / 2.))
+                .child(menu_btn)
+                .into_any_element()
+        });
+        let row_element: AnyElement = match menu_builder {
+            Some(build) => button
+                .context_menu(move |menu, window, cx| build(menu, window, cx))
+                .into_any_element(),
+            None => button.into_any_element(),
+        };
+        col()
+            .relative()
+            .h(px(ROW_HEIGHT))
+            .justify_center()
+            .child(row_element)
+            .children(action_button)
     }
 }
 
@@ -492,6 +591,7 @@ mod test {
             status: None,
             selected: true,
             depth: 0,
+            ..Default::default()
         };
         assert_eq!(
             text_tree(&row),

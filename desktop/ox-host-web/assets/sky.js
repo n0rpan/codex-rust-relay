@@ -220,8 +220,9 @@ function start() {
     clearTimeout(timer);
     if (document.hidden) return;
     const moving = draw();
-    if (moving) frame = (frame + 1) % 1000000;
-    timer = setTimeout(loop, moving ? 400 : 60000);
+    const focused = typeof document.hasFocus !== "function" || document.hasFocus();
+    if (moving && focused) frame = (frame + 1) % 1000000;
+    timer = setTimeout(loop, moving && focused ? 400 : 60000);
   };
   const weather = async () => {
     if (document.hidden || Date.now() - fetchedAt < WEATHER_EVERY) return;
@@ -239,6 +240,8 @@ function start() {
     loop();
     weather();
   });
+  globalThis.addEventListener?.("focus", loop);
+  globalThis.addEventListener?.("blur", loop);
   new MutationObserver(loop).observe(document.documentElement, {
     attributes: true,
     attributeFilter: ["data-phone-theme", "data-phone-reduced-motion"],

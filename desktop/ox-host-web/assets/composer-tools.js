@@ -270,6 +270,11 @@ function readFile(file) {
     reader.readAsDataURL(file);
   });
 }
+function formatBytes(bytes) {
+  if (!bytes || bytes < 1024) return (bytes || 0) + " B";
+  if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
 $("attach-image").onchange = async (event) => {
   const key = owner,
     files = Array.from(event.target.files);
@@ -311,7 +316,10 @@ export function updateExtras(state, caps, link, id) {
     itemsShown = images;
     $("attached-images").replaceChildren(
       ...(images ?? []).map((file, i) => {
-        const b = element("button", "Remove " + file.file);
+        const b = element(
+          "button",
+          `Remove ${file.file} (${formatBytes(file.bytes)})`,
+        );
         b.className = "attached-chip";
         const src = file.image?.clipboard?.[1];
         if (typeof src === "string" && src.startsWith("data:image/")) {
@@ -321,6 +329,7 @@ export function updateExtras(state, caps, link, id) {
           b.prepend(img);
         }
         b.type = "button";
+        b.setAttribute("aria-label", "Remove " + file.file);
         b.onclick = () => {
           drafts.set(
             owner,
