@@ -398,6 +398,9 @@ impl Store {
                     "Finish the current turn and its workers before opening the parent session in the terminal",
                 ));
             }
+            if saved_claude && self.native_live_now(&id) {
+                return Err(io::Error::other(self.native_live_hint()));
+            }
             self.terminal_threads.insert(id.clone());
             if saved_claude {
                 self.handoff_ready = Some(handoff);

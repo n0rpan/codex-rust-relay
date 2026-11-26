@@ -80,7 +80,7 @@ impl Store {
             .any(|s| s.viewer.is_some())
             .then(|| p.native.next.unwrap_or_else(Instant::now))
     }
-    pub(super) fn native_live_now(&mut self, id: &str) -> bool {
+    pub(in crate::store) fn native_live_now(&mut self, id: &str) -> bool {
         self.refresh_native(Instant::now(), true);
         self.claude().native.live.contains(id)
     }
@@ -1087,6 +1087,44 @@ mod tests {
         let mut old = rig(2);
         append_as(&old, "cli", "fresh");
         assert!(old.store.native_live_now(&old.key));
+    }
+
+    #[test]
+    fn a_terminal_handoff_rechecks_the_owner_of_a_browsed_journal() {
+        let mut r = rig(2);
+        pump(&mut r.store, &r.rx);
+        let registry = r
+            .store
+            .claude()
+            .launcher
+            .profiles
+            .subscription
+            .join("sessions");
+        std::fs::create_dir_all(&registry).unwrap();
+        assert!(!r.store.native_live_now(&r.key));
+        assert!(r.store.can_configure_saved_claude(&r.key));
+
+        let pid = std::process::id();
+        std::fs::write(
+            registry.join(format!("{pid}.json")),
+            json!({"pid":pid,"sessionId":ID,"entrypoint":"cli"}).to_string(),
+        )
+        .unwrap();
+        assert!(!r.store.is_native_live(&r.key));
+        let result = r.store.dispatch(crate::actions::Action::TerminalText(
+            Some(r.key.clone()),
+            "/terminal".into(),
+        ));
+        assert_eq!(
+            result
+                .err()
+                .expect("terminal accepted another writer")
+                .to_string(),
+            HINT
+        );
+        assert!(r.store.is_native_live(&r.key));
+        assert!(!r.store.in_terminal(&r.key));
+        assert!(r.store.take_handoff().is_none());
     }
 
     #[test]
