@@ -452,7 +452,7 @@ print("flag-driven ox provider add in a terminal: applied defaults without promp
 for args, sign_in, expected in (
     (["codex"], {"signed_in": True}, ["codex", "-c", 'model_provider="openai"']),
     (["claude"], {"claude_signed_in": True}, ["claude"]),
-    ([], {"claude_signed_in": True}, ["claude"]),
+    ([], {"signed_in": True}, ["codex", "-c", 'model_provider="openai"']),
 ):
     text, argv, registry = run(args, **sign_in)
     session = drop_session(argv)
@@ -470,6 +470,12 @@ for args, sign_in, expected in (
     assert argv == expected and registry is None, (text, argv)
     assert "What would you like to use?" not in text
 print("plain commands: launch signed-in stock clients without reopening setup")
+
+text, argv, registry = run([], b"5\n", claude_signed_in=True)
+assert argv == [] and registry is None, (text, argv)
+text, argv, registry = run([], b"2\n", claude_signed_in=True)
+assert argv[0] == "claude" and registry is None, (text, argv)
+print("bare ox with only a Claude account starts Claude only after selection")
 
 text, argv, registry = run(["setup"], b"1\n2\n5\n", signed_in=True, claude_signed_in=True)
 assert "has a saved Claude account" in text and "has a saved ChatGPT sign-in" in text

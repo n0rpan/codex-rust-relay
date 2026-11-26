@@ -139,6 +139,11 @@ export class SessionControls {
       );
     };
     $("permission").onchange = () => this.render();
+    $("typed-native-command").oninput = () => $("typed-native-command").setCustomValidity("");
+    $("native-command").onchange = () => {
+      this.render();
+      if (!$("typed-native-command").hidden) $("typed-native-command").focus();
+    };
     $("native-command-form").onsubmit = (e) => {
       e.preventDefault();
       const cmd = $("native-command").value;
@@ -148,10 +153,14 @@ export class SessionControls {
       )
         return;
       const args = $("command-args").value.trim();
-      this.apply(
-        { native_command: [this.ctx.id, args ? cmd + " " + args : cmd] },
-        "command",
-      );
+      const text = cmd === "custom" ? $("typed-native-command").value.trim() :
+        (args ? cmd + " " + args : cmd);
+      if (!/^\/[^\s/]/.test(text)) {
+        $("typed-native-command").setCustomValidity("Enter a slash followed by the command name.");
+        $("typed-native-command").reportValidity();
+        return;
+      }
+      this.apply({ native_command: [this.ctx.id, text] }, "command");
     };
   }
   reset() {
@@ -162,6 +171,10 @@ export class SessionControls {
     $("session-controls").hidden = true;
     this.show(false);
     $("command-args").value = "";
+    $("typed-native-command").value = "";
+    $("typed-native-command").setCustomValidity("");
+    $("native-command").replaceChildren();
+    delete $("native-command").dataset.selection;
     $("permission").removeAttribute("data-selection");
   }
   show(open) {
@@ -335,9 +348,18 @@ export class SessionControls {
       (v) => change({ speed: v || null }),
     );
     this.commandRows = nativeChoices(schema);
+    if (scope.route.runtime === "claude")
+      this.commandRows.push(["custom", "Enter a Claude command…"]);
     $("native-command-form").hidden =
       !this.caps.includes("native_commands") || !this.commandRows.length;
-    choices($("native-command"), this.commandRows, undefined);
+    const commandMenu = $("native-command");
+    const previous = commandMenu.value;
+    choices(commandMenu, this.commandRows, undefined);
+    if (this.commandRows.some(([value]) => value === previous)) commandMenu.value = previous;
+    const custom = commandMenu.value === "custom";
+    $("typed-native-command").hidden = !custom;
+    $("typed-native-command").disabled = !custom;
+    $("command-args").hidden = custom;
     $("native-command-form").querySelector("button").disabled =
       !ready || this.pending.has("command");
     const timeline = state.transcripts[id];

@@ -194,7 +194,7 @@ impl Workbench {
         let discovering = is_command && (!store.has_command_schema() || store.commands_loading());
         let term = is_command
             && matches!(
-                ox_desk_core::slash::parse(draft, &caps),
+                store.parse_command(key, draft),
                 Some(ox_desk_core::slash::Action::Terminal)
             );
         let enabled = enabled && !discovering;
@@ -212,8 +212,12 @@ impl Workbench {
             "Send"
         };
         let effective = store.applied_access(key);
-        let mode = if key.is_some() {
-            effective
+        let mode = if let Some(id) = key {
+            effective.or_else(|| {
+                store
+                    .session_mark(id, "resume_access")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+            })
         } else {
             effective.or_else(|| store.next_access())
         };

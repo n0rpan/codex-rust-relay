@@ -18,7 +18,7 @@ const sessionKey = (scope, id) => scopeKey(scope) + " " + id;
  * is one. The stamp carries the parent's full scope, so a worker in another
  * checkout or billing route still points at the conversation that started it.
  * @param {{scope: Scope, session: any}} entry
- * @returns {{project: string, scope: Scope|null, id: string}|null}
+ * @returns {{project: string, scope: Scope|null, id: string, runtime?: string|null}|null}
  */
 export function sessionParent(entry) {
   const origin = entry?.session?.detail?.origin;
@@ -29,46 +29,71 @@ export function sessionParent(entry) {
       project: parent.project ?? entry.scope.project,
       scope: parent.scope ?? null,
       id: parent.session,
+      runtime: parent.runtime,
     };
   if (entry?.session?.parent)
     return { project: entry.scope.project, scope: entry.scope, id: entry.session.parent };
   return null;
+}
+// External parents carry a native session id and a runtime, but no billing
+// scope. Index all known rows so filtering the sidebar cannot hide a collision.
+export function catalogParentResolver(entries) {
+  const byProject = new Map();
+  for (const entry of entries) {
+    const { scope, session } = entry;
+    const native = scope.route.runtime === "claude"
+      ? /^claude:(?:api|subscription):([a-zA-Z0-9_-]+)$/.exec(session.id)
+      : null;
+    for (const id of native ? [session.id, native[1]] : [session.id]) {
+      const key = JSON.stringify([scope.project, id]);
+      const group = byProject.get(key) ?? [];
+      group.push(entry);
+      byProject.set(key, group);
+    }
+  }
+  return (entry) => {
+    const recorded = sessionParent(entry);
+    if (!recorded) return null;
+    const candidates = byProject.get(JSON.stringify([recorded.project, recorded.id])) ?? [];
+    let { scope, id } = recorded;
+    let match;
+    if (scope) {
+      match = candidates.find((row) =>
+        row.session.id === id && scopeKey(row.scope) === scopeKey(scope));
+    } else {
+      const matches = candidates.filter((row) =>
+        !recorded.runtime || row.scope.route.runtime === recorded.runtime);
+      if (matches.length !== 1) return null;
+      [match] = matches;
+      scope = match.scope;
+      id = match.session.id;
+    }
+    return {
+      key: sessionKey(scope, id),
+      scope,
+      project: scope.project,
+      id,
+      title: match?.session.title ?? null,
+    };
+  };
 }
 /**
  * Group catalog entries into a worker tree. A parent may live in another
  * project or route; a filter that hides it keeps the child as a root with a
  * navigable recorded parent instead of dropping the relationship.
  * @param {Array<{scope: Scope, session: any}>} entries
+ * @param {Array<{scope: Scope, session: any}>} catalog
  */
-export function catalogTree(entries) {
+export function catalogTree(entries, catalog = entries) {
   const byKey = new Map(entries.map((entry) => [sessionKey(entry.scope, entry.session.id), entry]));
-  const byProject = new Map(entries.map(({ scope, session }) => [JSON.stringify([scope.project, session.id]), scope]));
+  const parentOf = catalogParentResolver(catalog);
   const links = new Map();
   const children = new Map();
   const roots = [];
   for (const entry of entries) {
     const own = sessionKey(entry.scope, entry.session.id);
-    const recorded = sessionParent(entry);
-    let target = null;
-    if (recorded) {
-      let scope = recorded.scope;
-      if (!scope) {
-        // A terminal parent has no host scope. Its native id still matches a
-        // catalog row in the recorded project.
-        scope = byProject.get(JSON.stringify([recorded.project, recorded.id])) ?? null;
-      }
-      if (scope) {
-        const key = sessionKey(scope, recorded.id);
-        target = {
-          key,
-          scope,
-          project: scope.project,
-          id: recorded.id,
-          title: byKey.get(key)?.session.title ?? null,
-        };
-        links.set(own, target);
-      }
-    }
+    const target = parentOf(entry);
+    if (target) links.set(own, target);
     if (target && target.key !== own && byKey.has(target.key)) {
       const group = children.get(target.key) ?? [];
       group.push(entry);

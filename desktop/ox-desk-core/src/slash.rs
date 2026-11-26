@@ -275,6 +275,7 @@ pub enum Action {
     Resume,
     Terminal,
     SessionCommand,
+    DiscoverClaudeCommand,
     Hint(String),
 }
 
@@ -283,10 +284,30 @@ impl Action {
         matches!(
             self,
             Self::SessionCommand
+                | Self::DiscoverClaudeCommand
                 | Self::Native(NativeCommand::Goal(Goal::Set(_)) | NativeCommand::Speed(Some(_)))
         )
     }
 }
+pub(crate) fn possible_claude_command(name: &str) -> bool {
+    !(name.is_empty()
+        || name.starts_with('_')
+        || name.chars().any(|c| c.is_whitespace() || c.is_control())
+        || matches!(
+            name,
+            "model"
+                | "effort"
+                | "fast"
+                | "goal"
+                | "speed"
+                | "clear"
+                | "terminal"
+                | "new"
+                | "resume"
+                | "status"
+        ))
+}
+
 pub fn parse(text: &str, caps: &Capabilities) -> Option<Action> {
     let text = text.trim();
     text.strip_prefix('/')?;

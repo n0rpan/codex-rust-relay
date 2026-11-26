@@ -28,7 +28,7 @@ pub struct Launch {
     /// A worker launch carries the shared worker contract (tools, sandbox
     /// settings); an ordinary session passes `None`.
     pub contract: Option<crate::claude_worker_contract::Contract>,
-    /// The exact subscription model a pinned worker runs, passed as `--model` so the
+    /// The selected subscription model or exact worker pin, passed as `--model` so the
     /// first inference already uses it. Ignored on an API route, whose alias is the model.
     pub model: Option<String>,
 }

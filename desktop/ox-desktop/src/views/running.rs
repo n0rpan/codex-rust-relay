@@ -96,6 +96,7 @@ fn now_secs() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+#[derive(Default)]
 pub struct Running {
     processes: Vec<ProcessView>,
     loaded: bool,
@@ -114,7 +115,7 @@ pub struct Running {
     monitor: Arc<platform::ProcessMonitor>,
     /// The list is expanded above the sidebar footer.
     pub(super) open: bool,
-    _poll: Task<()>,
+    poll: Option<Task<()>>,
 }
 
 impl Running {
@@ -123,50 +124,38 @@ impl Running {
         self.processes.len()
     }
 
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        let poll = cx.spawn(async move |this, cx| {
-            loop {
-                let wait = this
-                    .update(cx, |s, _| {
-                        if s.processes.is_empty() {
-                            POLL_EMPTY
-                        } else {
-                            POLL
-                        }
-                    })
-                    .unwrap_or(POLL);
-                cx.background_executor().timer(wait).await;
-                let Ok(due) = this.update(cx, |s, _| s.shown) else {
-                    break;
-                };
-                if due {
-                    let _ = this.update(cx, |s, cx| s.refresh(cx));
-                }
-            }
-        });
-        Self {
-            processes: vec![],
-            loaded: false,
-            loading: false,
-            again: false,
-            ending: false,
-            error: None,
-            end_error: None,
-            confirm: None,
-            shown: false,
-            monitor: Arc::default(),
-            open: false,
-            _poll: poll,
-        }
-    }
-
     pub(super) fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
         if self.shown != shown {
             self.shown = shown;
             if shown {
                 self.refresh(cx);
+            } else {
+                self.poll = None;
             }
         }
+    }
+
+    /// Update the monitor snapshot and report whether the visible panel needs painting.
+    fn apply_process_list(&mut self, result: io::Result<Vec<ProcessView>>) -> bool {
+        let old_count = self.process_count();
+        let was_open = self.open;
+        match result {
+            Ok(processes) => {
+                self.open &= !processes.is_empty();
+                self.processes = processes;
+                self.loaded = true;
+                self.error = None;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotConnected => {
+                // The host was stopped: nothing is running under it any more.
+                self.processes.clear();
+                self.error = Some(HOST_NOT_RUNNING.to_owned());
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+        // The collapsed footer displays only the count. An open panel also
+        // shows elapsed time, so its labels change while the list stays open.
+        was_open || old_count != self.process_count()
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -174,6 +163,7 @@ impl Running {
             self.again = true;
             return;
         }
+        self.poll = None;
         self.loading = true;
         let monitor = self.monitor.clone();
         let task = cx.background_spawn(async move { monitor.list() });
@@ -181,24 +171,27 @@ impl Running {
             let result = task.await;
             let _ = this.update(cx, |s, cx| {
                 s.loading = false;
-                match result {
-                    Ok(processes) => {
-                        s.open &= !processes.is_empty();
-                        s.processes = processes;
-                        s.loaded = true;
-                        s.error = None;
+                let repaint = s.apply_process_list(result);
+                if s.shown {
+                    if repaint {
+                        cx.notify();
                     }
-                    Err(e) if e.kind() == io::ErrorKind::NotConnected => {
-                        // The host was stopped: nothing is running under it any more.
-                        s.processes.clear();
-                        s.error = Some(HOST_NOT_RUNNING.to_owned());
+                    if std::mem::take(&mut s.again) {
+                        s.refresh(cx);
+                    } else {
+                        let wait = if s.processes.is_empty() {
+                            POLL_EMPTY
+                        } else {
+                            POLL
+                        };
+                        s.poll = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(wait).await;
+                            let _ = this.update(cx, |s, cx| s.refresh(cx));
+                        }));
                     }
-                    Err(e) => s.error = Some(e.to_string()),
+                } else {
+                    s.again = false;
                 }
-                if std::mem::take(&mut s.again) {
-                    s.refresh(cx);
-                }
-                cx.notify();
             });
         })
         .detach();
@@ -524,7 +517,7 @@ impl Render for Running {
 
 #[cfg(test)]
 mod tests {
-    use super::{idle_label, idle_rows, project_name, span, still_idle};
+    use super::{Running, idle_label, idle_rows, project_name, span, still_idle};
     use ox_desk_core::host_protocol::{ProcessView, Scope};
     use std::path::Path;
 
@@ -557,6 +550,21 @@ mod tests {
         assert_eq!(span(86_399), "23h");
         assert_eq!(span(86_400), "1d");
         assert_eq!(span(3 * 86_400 + 5), "3d");
+    }
+
+    #[test]
+    fn collapsed_process_poll_updates_the_snapshot_without_repainting_a_stable_count() {
+        let mut state = Running::default();
+        assert!(state.apply_process_list(Ok(vec![process(&["a"], false, 5)])));
+        assert!(!state.apply_process_list(Ok(vec![process(&["b"], true, 10)])));
+        assert_eq!(state.processes[0].threads, ["b"]);
+        assert!(state.processes[0].running);
+
+        state.open = true;
+        assert!(state.apply_process_list(Ok(state.processes.clone())));
+        assert!(state.apply_process_list(Ok(vec![])));
+        assert!(!state.open);
+        assert!(!state.apply_process_list(Ok(vec![])));
     }
 
     #[test]

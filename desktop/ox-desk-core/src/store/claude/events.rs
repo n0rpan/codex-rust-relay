@@ -59,15 +59,12 @@ impl Store {
                         .unwrap()
                         .events
                         .needs_sign_in = true;
-                    if !self
-                        .claude()
-                        .sessions
-                        .iter()
-                        .any(|(key, p)| key != &owner && p.initialized && p.link.is_some())
-                    {
-                        self.state = Connection::SignInRequired;
-                        self.changed.mark(Changed::CONNECTION);
-                    }
+                    // Stock has already refused this account. Restore pending input
+                    // before a client reconnect can replace the route.
+                    self.claude_closed(
+                        &owner,
+                        "Sign in to Claude Code to use the subscription.".into(),
+                    );
                 }
                 Ok(())
             }
@@ -112,16 +109,22 @@ impl Store {
         t.access = mode;
         t.error = None;
         self.resume_access.remove(owner);
+        self.resume_models.remove(owner);
+        self.unsaved_claude_drafts.remove(owner);
         t.model = model;
         self.state = Connection::Ready;
         self.changed.mark(Changed::CONNECTION);
         self.flush_claude(owner)?;
         self.changed.transcript(owner);
+        self.reopen_claude_history();
+        Ok(())
+    }
+
+    pub(in crate::store) fn reopen_claude_history(&mut self) {
         let reopen = std::mem::take(&mut self.reopen);
         for key in reopen {
             let parent = key.split('/').next().unwrap_or(&key);
-            if parent != owner
-                && self.claude().catalog.contains_key(parent)
+            if self.claude().catalog.contains_key(parent)
                 && !self.claude().sessions.contains_key(parent)
                 && let Err(err) = self.claude_open(parent)
             {
@@ -129,19 +132,18 @@ impl Store {
                 self.changed.transcript(parent);
             }
         }
-        Ok(())
     }
 
     fn claude_closed(&mut self, owner: &str, reason: String) {
         let Some(mut p) = self.claude_mut().sessions.remove(owner) else {
             return;
         };
-        let mut unsent = p.events.awaiting_echo;
-        unsent.extend(p.first.take());
-        self.restore_claude_drafts(owner, unsent);
-        if self.claude().blank.as_deref() == Some(owner) {
-            self.claude_mut().blank = None;
+        if p.deferred_command.as_ref().is_some_and(|c| c.new_thread)
+            && let Some((_, command)) = &p.first
+        {
+            self.publish_command_thread(owner, command);
         }
+        self.restore_claude_input(owner, &mut p);
         let removed: HashSet<_> = self
             .claude()
             .asks
@@ -161,11 +163,12 @@ impl Store {
                 self.changed.transcript(id);
             }
         }
-        if !self
-            .claude()
-            .sessions
-            .values()
-            .any(|s| s.initialized && s.link.is_some())
+        if p.viewer.is_none()
+            && !self
+                .claude()
+                .sessions
+                .values()
+                .any(|s| s.initialized && s.link.is_some())
         {
             self.state = if p.events.needs_sign_in || self.state == Connection::SignInRequired {
                 Connection::SignInRequired
@@ -176,6 +179,24 @@ impl Store {
         self.notice = Some(reason);
         self.changed
             .mark(Changed::CONNECTION | Changed::NOTICE | Changed::ASK | Changed::THREADS);
+    }
+
+    pub(super) fn restore_claude_input(&mut self, owner: &str, p: &mut Process) {
+        let mut unsent = p.events.take_awaiting_echo();
+        unsent.extend(p.first.take());
+        if !unsent.is_empty() {
+            self.ended_threads.insert(owner.into());
+            if p.started_new {
+                self.unsaved_claude_drafts.insert(owner.into());
+            }
+            if let Some(mode) = p.mode.or_else(|| Access::from_mode(&p.launch_mode)) {
+                self.resume_access.insert(owner.into(), mode);
+            }
+            if let Some(model) = p.selected_model.take() {
+                self.resume_models.insert(owner.into(), model);
+            }
+        }
+        self.restore_claude_drafts(owner, unsent);
     }
 
     pub(super) fn restore_claude_drafts(&mut self, owner: &str, messages: Vec<(String, String)>) {
@@ -664,13 +685,9 @@ impl Store {
                 self.transcripts.entry(owner.into()).or_default().access = Some(mode);
             }
             Control::Model(model) if result["model"] == model => {
-                if let Some(c) = &mut self
-                    .claude_mut()
-                    .sessions
-                    .get_mut(owner)
-                    .unwrap()
-                    .capabilities
-                {
+                let p = self.claude_mut().sessions.get_mut(owner).unwrap();
+                p.selected_model = Some(model.clone());
+                if let Some(c) = &mut p.capabilities {
                     c.model = model.clone();
                 }
                 self.transcripts.entry(owner.into()).or_default().model = Some(model.clone());
@@ -750,23 +767,7 @@ pub(super) fn rebase_agents(
 }
 
 fn headless_command(name: &str, builtin: bool) -> bool {
-    if name.is_empty()
-        || name.starts_with('_')
-        || name.chars().any(|c| c.is_whitespace() || c.is_control())
-        || matches!(
-            name,
-            "model"
-                | "effort"
-                | "fast"
-                | "goal"
-                | "speed"
-                | "clear"
-                | "terminal"
-                | "new"
-                | "resume"
-                | "status"
-        )
-    {
+    if !crate::slash::possible_claude_command(name) {
         return false;
     }
     // The initialize list includes terminal menus and internal commands. These shipped
@@ -837,7 +838,7 @@ mod tests {
             sessions: Default::default(),
             catalog: Default::default(),
             asks: Default::default(),
-            blank: None,
+            dispatching_worker: None,
             worker: None,
             worker_blank: None,
             worker_model: None,
@@ -1021,9 +1022,9 @@ mod tests {
     /// A send that reopens an ended session runs its first turn in the access mode the
     /// user had chosen, whether they ended the session or the host reaped the route
     /// (the replacement store is seeded through `restore_ended`). Opening the session from
-    /// the list is a fresh start and keeps `default`.
+    /// the list reads its history without consuming the chosen mode.
     #[test]
-    fn a_resumed_send_keeps_the_access_mode_but_opening_from_the_list_does_not() {
+    fn browsing_is_passive_and_a_resumed_send_keeps_the_access_mode() {
         let (mut s, a, b) = fixture();
         s.claude_mut().deliver = Arc::new(|_| ());
         for k in [&a, &b] {
@@ -1034,7 +1035,9 @@ mod tests {
         s.submit(Some(&a)).unwrap();
         assert_eq!(s.claude().sessions[&a].launch_mode, "plan");
         s.claude_open(&b).unwrap();
-        assert_eq!(s.claude().sessions[&b].launch_mode, "default");
+        assert!(s.is_viewer(&b));
+        assert!(!s.has_live_session(&b));
+        assert_eq!(s.resume_access[&b], Access::Plan);
         // A resume that fails keeps the mode for the retry.
         s.claude_mut().sessions.remove(&a);
         s.mark_ended(&a);

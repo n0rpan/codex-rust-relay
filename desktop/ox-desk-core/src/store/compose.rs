@@ -109,11 +109,6 @@ impl Store {
         }
         self.selection += 1;
         self.selected = None;
-        if self.is_session_scoped()
-            && let Err(error) = self.prepare_claude_draft()
-        {
-            self.notice = Some(error.to_string());
-        }
     }
     pub fn draft(&self, id: Option<&str>) -> &str {
         self.drafts
@@ -217,7 +212,7 @@ impl Store {
                     "Remove the attachment before submitting to Claude Code",
                 ));
             }
-            return self.claude_resume_send(id);
+            return self.claude_resume_send(id, None);
         }
         if text.trim_start().starts_with('/') {
             return Err(io::Error::other("Open this command in stock Codex"));
@@ -592,7 +587,7 @@ impl Store {
             .map(|(id, _)| id.clone())
             .collect()
     }
-    /// The thread is the blank Claude process kept warm for new sessions.
+    /// The thread belongs to a worker launch waiting for its first input.
     pub fn is_draft(&self, id: &str) -> bool {
         self.remote().is_none() && self.is_session_scoped() && self.claude_is_blank(id)
     }

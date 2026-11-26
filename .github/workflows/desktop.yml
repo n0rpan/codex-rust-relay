@@ -91,9 +91,31 @@ jobs:
         run: |
           rustup toolchain install 1.100.0 --profile minimal
           rustup default 1.100.0
+      - name: Check archive validation and identify the Ubuntu runner image
+        id: apt-image
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m unittest discover -s desktop/ci -p test_apt_archives.py
+          echo "version=${ImageVersion}-$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+      - name: Restore downloaded Ubuntu package archives
+        id: apt-cache
+        if: runner.os == 'Linux'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ox-package-debs/*.deb
+          key: ox-apt-v1-${{ matrix.runner }}-${{ runner.arch }}-${{ hashFiles('desktop/ci/linux-deps.sh', 'desktop/ci/apt_archives.py', '.github/workflows/desktop.yml') }}-${{ steps.apt-image.outputs.version }}
+          restore-keys: ox-apt-v1-${{ matrix.runner }}-${{ runner.arch }}-
       - name: Install Linux development libraries
         if: runner.os == 'Linux'
+        env:
+          OX_CACHE_PACKAGE_DEBS: '1'
         run: desktop/ci/linux-deps.sh bubblewrap imagemagick tesseract-ocr fonts-dejavu-core sway grim wtype wl-clipboard fcitx5 fcitx5-chinese-addons dbus-daemon
+      - name: Save current Ubuntu archives for subsequent builds
+        if: runner.os == 'Linux' && github.ref == 'refs/heads/main' && steps.apt-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ox-package-debs/*.deb
+          key: ${{ steps.apt-cache.outputs.cache-primary-key }}
       - name: Prepare the Metal compiler
         if: runner.os == 'macOS'
         run: |

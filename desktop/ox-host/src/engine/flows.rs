@@ -360,7 +360,7 @@ impl Engine {
                 let start = a.start.clone();
                 // A busy route keeps the request pending so the operator can retry.
                 let mut l = self
-                    .prepare_worker(&target, origin, start)
+                    .prepare_launch(&target, origin, Payload::Worker(start))
                     .map_err(io::Error::other)?;
                 l.detached = true;
                 self.asking.remove(&job);

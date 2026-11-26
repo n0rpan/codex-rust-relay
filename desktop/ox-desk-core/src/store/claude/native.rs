@@ -22,6 +22,9 @@ pub(super) struct Native {
 }
 #[derive(Default)]
 pub(super) struct Viewer {
+    /// The session was closed when selected; release the viewer after the first read.
+    snapshot_only: bool,
+    confirm_alias: bool,
     loaded: Option<SystemTime>,
     /// Drain child-only appends once after the native owner disappears.
     checked_after_exit: bool,
@@ -77,7 +80,7 @@ impl Store {
             .any(|s| s.viewer.is_some())
             .then(|| p.native.next.unwrap_or_else(Instant::now))
     }
-    pub(super) fn native_live_now(&mut self, id: &str) -> bool {
+    pub(in crate::store) fn native_live_now(&mut self, id: &str) -> bool {
         self.refresh_native(Instant::now(), true);
         self.claude().native.live.contains(id)
     }
@@ -240,9 +243,18 @@ impl Store {
         }
     }
 
+    /// Read history from disk. Keep following only while stock owns the journal.
     pub(super) fn view_native(&mut self, id: &str) -> io::Result<()> {
+        self.view_journal(id, false)
+    }
+
+    pub(super) fn view_journal(&mut self, id: &str, confirm_alias: bool) -> io::Result<()> {
         if self.claude().sessions.contains_key(id) {
             return Ok(());
+        }
+        let snapshot_only = !self.is_native_live(id);
+        if snapshot_only {
+            self.ended_threads.insert(id.into());
         }
         let p = self.claude_mut();
         p.serial += 1;
@@ -251,7 +263,11 @@ impl Store {
             id.to_owned(),
             Process {
                 generation,
-                viewer: Some(Viewer::default()),
+                viewer: Some(Viewer {
+                    snapshot_only,
+                    confirm_alias,
+                    ..Viewer::default()
+                }),
                 ..Default::default()
             },
         );
@@ -287,6 +303,7 @@ impl Store {
         };
         viewer.checked_after_exit = !p.native.live.contains(id);
         let mut follower = viewer.follower.take();
+        let confirm_alias = viewer.confirm_alias;
         viewer.loading = true;
         viewer.loaded = launcher
             .profiles
@@ -309,8 +326,7 @@ impl Store {
             let loaded = match resumed {
                 Ok(true) => Ok(follower),
                 Ok(false) => launcher
-                    .profiles
-                    .session(&profile.project, &raw, origin)
+                    .saved_session(&profile, &raw, confirm_alias)
                     .and_then(|saved| {
                         history::Follower::load(
                             &profile,
@@ -345,6 +361,15 @@ impl Store {
     }
 
     pub(super) fn viewed(&mut self, owner: &str, follower: Option<Box<history::Follower>>) {
+        if !self.is_native_live(owner)
+            && self.claude().sessions[owner]
+                .viewer
+                .as_ref()
+                .is_some_and(|v| v.snapshot_only)
+        {
+            self.leave_native(owner);
+            return;
+        }
         if let Some(v) = self
             .claude_mut()
             .sessions
@@ -451,7 +476,7 @@ mod tests {
             sessions: Default::default(),
             catalog: Default::default(),
             asks: Default::default(),
-            blank: None,
+            dispatching_worker: None,
             worker: None,
             worker_blank: None,
             worker_model: None,
@@ -577,7 +602,7 @@ mod tests {
             sessions: Default::default(),
             catalog: Default::default(),
             asks: Default::default(),
-            blank: None,
+            dispatching_worker: None,
             worker: None,
             worker_blank: None,
             worker_model: None,
@@ -1008,7 +1033,7 @@ mod tests {
         append_as(&r, "cli", "typed into stock claude --continue");
         assert!(r.store.native_live_now(&r.key));
         assert!(
-            r.store.claude_resume_send(&r.key).is_err(),
+            r.store.claude_resume_send(&r.key, None).is_err(),
             "no second writer"
         );
     }
@@ -1064,6 +1089,44 @@ mod tests {
         let mut old = rig(2);
         append_as(&old, "cli", "fresh");
         assert!(old.store.native_live_now(&old.key));
+    }
+
+    #[test]
+    fn a_terminal_handoff_rechecks_the_owner_of_a_browsed_journal() {
+        let mut r = rig(2);
+        pump(&mut r.store, &r.rx);
+        let registry = r
+            .store
+            .claude()
+            .launcher
+            .profiles
+            .subscription
+            .join("sessions");
+        std::fs::create_dir_all(&registry).unwrap();
+        assert!(!r.store.native_live_now(&r.key));
+        assert!(r.store.can_configure_saved_claude(&r.key));
+
+        let pid = std::process::id();
+        std::fs::write(
+            registry.join(format!("{pid}.json")),
+            json!({"pid":pid,"sessionId":ID,"entrypoint":"cli"}).to_string(),
+        )
+        .unwrap();
+        assert!(!r.store.is_native_live(&r.key));
+        let result = r.store.dispatch(crate::actions::Action::TerminalText(
+            Some(r.key.clone()),
+            "/terminal".into(),
+        ));
+        assert_eq!(
+            result
+                .err()
+                .expect("terminal accepted another writer")
+                .to_string(),
+            HINT
+        );
+        assert!(r.store.is_native_live(&r.key));
+        assert!(!r.store.in_terminal(&r.key));
+        assert!(r.store.take_handoff().is_none());
     }
 
     #[test]

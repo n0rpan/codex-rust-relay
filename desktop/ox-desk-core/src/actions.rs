@@ -125,7 +125,10 @@ impl Store {
             Action::NativeCommand(id, text) => {
                 // This action can never fall through to a terminal on the host. Check the
                 // current route schema immediately before applying the native command.
-                match crate::slash::parse(&text, &self.command_caps(id.as_deref())) {
+                match self.parse_command(id.as_deref(), &text) {
+                    Some(crate::slash::Action::DiscoverClaudeCommand) => {
+                        self.defer_claude_command(id.as_deref(), &text, false)?;
+                    }
                     Some(
                         crate::slash::Action::Native(_) | crate::slash::Action::SessionCommand,
                     ) => return self.run_command(id.as_deref(), Some(&text)),

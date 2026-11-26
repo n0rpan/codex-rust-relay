@@ -21,7 +21,7 @@ import {
   Projection,
   emptyScope,
   catalogTree,
-  sessionParent,
+  catalogParentResolver,
 } from "./model.js";
 import {
   deviceKey,
@@ -766,7 +766,7 @@ function catalog() {
   // Nest by the recorded parent scope, not the child's project: a worker may run
   // in a review checkout on another route. A filtered-out parent still leaves a
   // navigable reference on the child.
-  const tree = catalogTree(visible);
+  const tree = catalogTree(visible, rows);
   const byProject = new Map();
   for (const entry of tree.roots) {
     const list = byProject.get(entry.scope.project) ?? [];
@@ -1226,7 +1226,6 @@ function conversation() {
   // A worker says what it runs as: its billing route, the model the runtime
   // confirmed (pending until then), the access ceiling and its checkout.
   const worker = origin && origin.relation !== "handoff";
-  const recorded = worker ? sessionParent({ scope, session: row }) : null;
   $("context").textContent =
     (worker ? "checkout " + leaf(scope.project) : leaf(scope.project)) +
     " · " +
@@ -1237,26 +1236,15 @@ function conversation() {
         ? " · handoff"
         : "");
   $("context").title = worker ? scope.project : "";
-  if (worker && recorded?.id) {
-    const all = entries(),
-      parentScope =
-        recorded.scope ??
-        all.find(
-          (candidate) =>
-            candidate.session.id === recorded.id &&
-            candidate.scope.project === recorded.project,
-        )?.scope;
-    if (parentScope) {
-      const title = all.find(
-        (candidate) =>
-          candidate.session.id === recorded.id &&
-          scopeKey(candidate.scope) === scopeKey(parentScope),
-      )?.session.title;
-      const link = button(`↳ ${title || "Parent session"}`, () =>
-        open(parentScope, recorded.id),
+  if (worker) {
+    const parentOf = catalogParentResolver(entries());
+    const parent = parentOf({ scope, session: row });
+    if (parent) {
+      const link = button(`↳ ${parent.title || "Parent session"}`, () =>
+        open(parent.scope, parent.id),
       );
       link.className = "context-link";
-      link.title = parentScope.project;
+      link.title = parent.project;
       $("context").append(document.createTextNode(" · "), link);
     }
   }

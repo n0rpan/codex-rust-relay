@@ -5,6 +5,7 @@ from http.server import ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import socket
 import subprocess
@@ -62,6 +63,14 @@ def run(gui, codex, claude, root, failure_image=None):
         for key in ("XAUTHORITY", "VK_DRIVER_FILES", "LD_LIBRARY_PATH"):
             if key in os.environ:
                 env[key] = os.environ[key]
+        # All terminal seeding above is deliberate. Record every subsequent OX launch,
+        # including version probes that never contact the vendor.
+        launches = root / "claude-launches"
+        executable = root / "bin/claude"
+        executable.unlink()
+        executable.write_text("#!/bin/sh\n" + f"echo launch >> {shlex.quote(str(launches))}\n"
+                              + f'exec {shlex.quote(str(claude))} "$@"\n')
+        executable.chmod(0o755)
         stack.enter_context(session_host(gui.with_name("ox-host"),root,env))
         with subprocess.Popen([gui, "--desk-stats", alpha], env=env) as app, socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as probe:
             window = None
@@ -83,12 +92,14 @@ def run(gui, codex, claude, root, failure_image=None):
                 # The permission chip (id access-preset) spells Claude's Default as "Ask before edits".
                 assert "ask before edits" in window.control("access-preset")["label"].casefold()
                 assert len(vendor.requests) == calls_before_refresh, "Refreshing or resuming generated a model request"
+                assert not launches.exists(), "Restoring or browsing native history launched the stock Claude CLI"
                 window.press("Thread actions")  # An icon button: no visible word to OCR.
                 window.word("Generate", click=True)
                 window.word("Orchard")
                 assert len(vendor.requests) == calls_before_refresh + 1, "Expected one title request"
                 window.prompt("APPROVAL from the imported relay conversation")
                 window.wait(lambda s: s["selected_requests"], "imported session approval")
+                assert launches.exists(), "The recording executable missed the explicit Claude send"
                 window.key("ctrl+alt+1")
                 window.wait(lambda s: not s["visible_turn"] and (beta / "approved.txt").exists(), "write in the original project")
                 assert not (alpha / "approved.txt").exists()

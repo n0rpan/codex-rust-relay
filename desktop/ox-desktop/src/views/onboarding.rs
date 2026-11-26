@@ -18,15 +18,11 @@ const POLL_FOR: Duration = Duration::from_secs(600);
 
 /// Route for a fresh install, from local CLI state and any already-saved API model.
 pub(super) fn first_launch_route() -> Route {
-    platform::onboarding::initial_route(
-        platform::onboarding::probe(Runtime::Codex),
-        platform::onboarding::probe(Runtime::Claude),
-        || {
-            crate::settings::load()
-                .ok()
-                .and_then(|s| s.models.first().cloned())
-        },
-    )
+    platform::onboarding::initial_route(platform::onboarding::probe(Runtime::Codex), || {
+        crate::settings::load()
+            .ok()
+            .and_then(|s| s.models.first().cloned())
+    })
 }
 
 /// Secondary choices beside the main action of an onboarding card.
@@ -65,15 +61,9 @@ pub(super) enum Issue {
     Provider,
 }
 impl Workbench {
-    /// API route for `model`, driven by this window's CLI when installed.
+    /// Keep the runtime the user selected when switching billing routes.
     pub(super) fn api_route(&self, model: String) -> Route {
-        let missing = |r| platform::onboarding::missing(r);
-        let runtime = if !missing(self.route.runtime) {
-            self.route.runtime
-        } else {
-            platform::onboarding::api_runtime(!missing(Runtime::Codex), !missing(Runtime::Claude))
-        };
-        runtime.route(Some(model))
+        self.route.runtime.route(Some(model))
     }
     pub(super) fn first_run_issue(&self) -> Option<Issue> {
         if self.connecting {

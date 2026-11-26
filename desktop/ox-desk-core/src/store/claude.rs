@@ -47,11 +47,11 @@ pub struct Project {
     sessions: HashMap<String, Process>,
     catalog: HashMap<String, ThreadRow>,
     asks: HashMap<RequestId, (String, wire::Permission)>,
-    blank: Option<String>,
+    /// Routes the synchronous dispatch of a worker's first input to its already verified process.
+    dispatching_worker: Option<String>,
     /// The worker contract the next new session starts with; one launch consumes it.
     worker: Option<crate::claude_worker_contract::Contract>,
-    /// The process started under that contract for one worker launch. It is kept apart
-    /// from `blank`, so no other send can take it, and no worker can take a normal blank.
+    /// The process reserved for one worker or handoff until it can accept input.
     worker_blank: Option<String>,
     /// The exact subscription model the next worker process is pinned to with `--model`.
     worker_model: Option<String>,
@@ -72,16 +72,23 @@ struct Process {
     mode: Option<Access>,
     controls: HashMap<String, Control>,
     first: Option<(String, String)>,
+    deferred_command: Option<DeferredCommand>,
     /// The sender statement of `first`, fixed when the host accepted that message. It
     /// waits with the message while the process starts, and goes out with it.
     first_context: Option<String>,
     /// The permission mode this process was launched with.
-    #[cfg_attr(not(test), allow(dead_code))]
     launch_mode: String,
-    /// Read-only view of a journal a stock client is writing right now: no process.
+    /// The explicit subscription model to reuse if a turn needs to be retried.
+    selected_model: Option<String>,
+    started_new: bool,
+    /// Reading a saved journal, optionally following a live external client.
     viewer: Option<native::Viewer>,
     /// Models that answered top-level turns in this process, in first-answer order.
     answering: Vec<String>,
+}
+struct DeferredCommand {
+    new_thread: bool,
+    terminal_allowed: bool,
 }
 enum Control {
     Mode(Access),
@@ -176,7 +183,7 @@ fn row(profile: &Profile, id: String, title: String, updated_at: i64) -> ThreadR
         activity_order: 0,
     }
 }
-/// Read only session metadata in both native profiles. A client is spawned when a user opens a session.
+/// Read session metadata in both native profiles without running either client.
 pub fn saved_rows(profiles: &Profiles, index: &std::path::Path) -> io::Result<Vec<ThreadRow>> {
     let aliases = Bindings::new(index.into()).aliases(&profiles.api)?;
     Ok(profiles
@@ -222,6 +229,37 @@ fn saved_row(
 }
 
 impl Launcher {
+    fn saved_session(
+        &self,
+        profile: &Profile,
+        source: &str,
+        confirm_missing_alias: bool,
+    ) -> io::Result<wire::catalog::Session> {
+        let origin = if profile.route.is_api() {
+            Origin::Api
+        } else {
+            Origin::Subscription
+        };
+        let saved = self.profiles.session(&profile.project, source, origin)?;
+        if let Billing::Api(alias) = &profile.route.billing {
+            let index = Bindings::new(self.index.clone());
+            let bound = index
+                .alias(&profile.project, &self.profiles.api, source)?
+                .or(saved.model.clone());
+            match bound.as_deref() {
+                Some(bound) if bound == alias => (),
+                None if confirm_missing_alias => {
+                    index.bind(&profile.project, &self.profiles.api, source, alias)?
+                }
+                _ => {
+                    return Err(io::Error::other(
+                        "This session was saved with a different model alias. Choose the saved alias in the sidebar to resume it.",
+                    ));
+                }
+            }
+        }
+        Ok(saved)
+    }
     fn catalog(&self, profile: &Profile) -> io::Result<HashMap<String, ThreadRow>> {
         let aliases = Bindings::new(self.index.clone()).aliases(&self.profiles.api)?;
         let mut rows = HashMap::new();
@@ -305,31 +343,12 @@ impl Store {
         }
         matches!(self.link, links::Link::Claude(_))
     }
-    pub(super) fn prepare_claude_draft(&mut self) -> io::Result<()> {
-        if self.claude().blank.is_none() {
-            let owner = self.spawn_claude(Session::New(new_id()?), None, false)?;
-            self.claude_mut().blank = Some(owner);
-        }
-        Ok(())
-    }
-    /// A session-scoped Claude route whose blank draft was consumed by a send and
-    /// whose next one is not prepared yet. Choosing the next access prepares it, so a
-    /// launch can proceed from here instead of waiting for a draft nobody will start.
-    pub fn claude_blank_missing(&self) -> bool {
-        self.state == Connection::Ready
-            && matches!(self.link, links::Link::Claude(_))
-            && self.claude().blank.is_none()
-    }
-    /// Start a dedicated process for one worker launch: under the shared worker
-    /// contract, pinned to an exact subscription model, or both. A process without
-    /// a contract starts in `access`, the mode the launch was granted.
-    /// The warm blank is left alone: only `send_on_worker_blank` ever uses this process,
-    /// so a send from any other session keeps getting a normal draft.
+    /// A worker's first input must go to the process started with its contract.
     pub fn stage_claude_worker(
         &mut self,
         contract: Option<crate::claude_worker_contract::Contract>,
         model: Option<String>,
-        access: Option<Access>,
+        mode: Access,
     ) -> io::Result<()> {
         if !matches!(self.link, links::Link::Claude(_)) {
             return Ok(());
@@ -340,11 +359,14 @@ impl Store {
             ));
         }
         self.drop_claude_worker();
-        let preset = std::mem::replace(&mut self.next_preset, access);
+        let id = new_id()?;
+        let preset = self.next_preset.replace(mode);
+        let options = self.next_options.take();
         self.claude_mut().worker = contract;
         self.claude_mut().worker_model = model;
-        let spawned = self.spawn_claude(Session::New(new_id()?), None, false);
+        let spawned = self.spawn_claude(Session::New(id), None, false);
         self.next_preset = preset;
+        self.next_options = options;
         let p = self.claude_mut();
         p.worker = None;
         p.worker_model = None;
@@ -352,6 +374,21 @@ impl Store {
         self.claude_mut().worker_blank = Some(owner);
         Ok(())
     }
+    /// The mode reported by stock on this launch's own process.
+    pub fn claude_worker_access(&self) -> Option<Access> {
+        let project = self.claude();
+        project.sessions.get(project.worker_blank.as_ref()?)?.mode
+    }
+
+    pub fn set_claude_worker_access(&mut self, preset: Access) -> io::Result<()> {
+        let owner = self
+            .claude()
+            .worker_blank
+            .clone()
+            .ok_or_else(|| io::Error::other("The worker's runtime is not prepared"))?;
+        self.claude_mode(&owner, preset)
+    }
+
     /// The account's picker as the worker's own process reported it at initialization,
     /// in the runtime's order. None until that process has initialized.
     pub fn claude_worker_picker(&self) -> Option<Vec<crate::claude_models::PickerModel>> {
@@ -394,7 +431,9 @@ impl Store {
             None => WorkerBlank::None,
             Some(k) => match p.sessions.get(k) {
                 None => WorkerBlank::Lost,
-                Some(s) if s.initialized && s.link.is_some() => WorkerBlank::Ready,
+                Some(s) if s.initialized && s.link.is_some() && s.controls.is_empty() => {
+                    WorkerBlank::Ready
+                }
                 Some(_) => WorkerBlank::Starting,
             },
         }
@@ -408,17 +447,20 @@ impl Store {
         let Some(owner) = self.claude_mut().worker_blank.take() else {
             return Err(io::Error::other("The worker's runtime is not prepared"));
         };
-        let normal = self.claude_mut().blank.replace(owner);
+        self.claude_mut().dispatching_worker = Some(owner.clone());
         let result = self.dispatch_as(action, sender);
-        // The send consumed the dedicated process; the normal draft stays as it was.
         let p = self.claude_mut();
-        p.blank = normal;
+        p.dispatching_worker = None;
+        if result.is_err() {
+            p.sessions.remove(&owner);
+        }
         result.map(|_| ())
     }
     /// Close a dedicated process its launch did not use.
     pub fn drop_claude_worker(&mut self) {
         if let links::Link::Claude(p) = &mut self.link {
             p.worker = None;
+            p.worker_model = None;
             if let Some(owner) = p.worker_blank.take() {
                 p.sessions.remove(&owner);
             }
@@ -426,22 +468,30 @@ impl Store {
     }
     pub(super) fn claude_applied_access(&self, id: Option<&str>) -> Option<Access> {
         let project = self.claude();
-        let owner = id.or(project.blank.as_deref())?;
+        let owner = id.or(project.dispatching_worker.as_deref())?;
         let session = project.sessions.get(owner)?;
         session.link.as_ref()?;
         session.mode
     }
     pub(super) fn claude_can_submit(&self, id: Option<&str>) -> bool {
         let project = self.claude();
-        let owner = id.or(project.blank.as_deref());
+        let owner = id.or(project.dispatching_worker.as_deref());
+        if owner.is_none() {
+            return true;
+        }
         owner
             .and_then(|k| project.sessions.get(k))
             .is_some_and(|p| p.initialized && p.link.is_some() && p.handoff.is_none())
             && !self.claude_settings_pending(id)
     }
+    pub(super) fn can_configure_saved_claude(&self, id: &str) -> bool {
+        self.is_session_scoped()
+            && self.can_resume_send(id)
+            && self.transcript(id).is_some_and(|t| t.ready && t.verified)
+    }
     pub(super) fn claude_settings_pending(&self, id: Option<&str>) -> bool {
         let p = self.claude();
-        id.or(p.blank.as_deref())
+        id.or(p.dispatching_worker.as_deref())
             .and_then(|k| p.sessions.get(k))
             .is_some_and(|s| {
                 s.controls
@@ -450,7 +500,12 @@ impl Store {
             })
     }
     pub(super) fn handing_off_claude(&self) -> bool {
-        self.is_session_scoped() && self.claude().sessions.values().any(|p| p.handoff.is_some())
+        matches!(&self.link, links::Link::Claude(project) if project.sessions.values().any(|p|
+            p.handoff.is_some() || p.deferred_command.as_ref().is_some_and(|c| c.terminal_allowed)))
+    }
+    pub(super) fn opening_claude_command(&self) -> bool {
+        matches!(&self.link, links::Link::Claude(project) if project.sessions.values().any(|p|
+            p.deferred_command.as_ref().is_some_and(|c| c.new_thread)))
     }
     pub(super) fn release_claude(
         &mut self,
@@ -493,21 +548,10 @@ impl Store {
             })
             .collect()
     }
-    pub(super) fn claude_next_mode(&mut self, mode: Access) -> io::Result<bool> {
-        if let Some(id) = self.claude().blank.clone() {
-            self.claude_mode(&id, mode)?;
-            return Ok(true);
-        }
-        // A reconnect can show a new local composer after the original host draft
-        // was consumed. Prepare the explicit mode so stock can confirm it.
-        self.next_preset = Some(mode);
-        self.prepare_claude_draft()?;
-        Ok(true)
-    }
     pub(super) fn claude_caps(&self, owner: Option<&str>) -> crate::slash::Capabilities {
         let p = self.claude();
         owner
-            .or(p.blank.as_deref())
+            .or(p.dispatching_worker.as_deref())
             .and_then(|k| p.sessions.get(k.split('/').next()?))
             .and_then(|s| s.capabilities.clone())
             .unwrap_or_else(|| self.commands.schema.clone().unwrap_or_default())
@@ -524,7 +568,7 @@ impl Store {
             catalog,
             sessions: Default::default(),
             asks: Default::default(),
-            blank: None,
+            dispatching_worker: None,
             worker: None,
             worker_blank: None,
             worker_model: None,
@@ -533,9 +577,8 @@ impl Store {
         };
         let mut store = Self::with_link(profile, links::Link::Claude(Box::new(project)));
         store.claude_list();
-        let id = new_id()?;
-        let owner = store.spawn_claude(Session::New(id), None, false)?;
-        store.claude_mut().blank = Some(owner);
+        store.state = Connection::Ready;
+        store.changed.mark(Changed::CONNECTION);
         Ok(store)
     }
     fn claude(&self) -> &Project {
@@ -650,6 +693,25 @@ impl Store {
         }
         .or_else(|| contract.map(|c| c.permission_mode().to_owned()))
         .unwrap_or_else(|| "default".to_owned());
+        let model = model.or_else(|| match &session {
+            Session::New(_) if contract.is_none() && !profile.route.is_api() => {
+                self.next_options.take().map(|options| options.model)
+            }
+            Session::Resume(_) if !profile.route.is_api() => {
+                self.resume_models.get(&owner).cloned()
+            }
+            _ => None,
+        });
+        // A failed first send may have a reserved ID but no stock journal. Retry
+        // only that creation, preserving the session's options and the unrelated new draft.
+        let session = if matches!(session, Session::Resume(_))
+            && baseline.is_none()
+            && self.unsaved_claude_drafts.contains(&owner)
+        {
+            Session::New(id.clone())
+        } else {
+            session
+        };
         let first_context = first.as_ref().and_then(|_| self.sender_context());
         let p = self.claude_mut();
         p.serial += 1;
@@ -664,6 +726,8 @@ impl Store {
                 first,
                 first_context,
                 launch_mode: mode.clone(),
+                selected_model: model.clone(),
+                started_new: matches!(session, Session::New(_)),
                 ..Default::default()
             },
         );
@@ -686,27 +750,10 @@ impl Store {
                     _ => None,
                 };
                 if let Some(source) = source {
-                    let origin = if profile.route.is_api() {
-                        Origin::Api
-                    } else {
-                        Origin::Subscription
-                    };
-                    let saved = launcher
-                        .profiles
-                        .session(&profile.project, source, origin)?;
-                    if let Billing::Api(alias) = &profile.route.billing {
-                        let bound = index
-                            .alias(&profile.project, &launcher.profiles.api, source)?
-                            .or(saved.model.clone());
-                        match bound.as_deref() {
-                            Some(bound) if bound == alias => (),
-                            None if confirm_missing_alias => (),
-                            _ => {
-                                return Err(io::Error::other(
-                                    "This session was saved with a different model alias. Choose the saved alias in the sidebar to resume it.",
-                                ));
-                            }
-                        }
+                    let saved = launcher.saved_session(&profile, source, confirm_missing_alias)?;
+                    if source != &id
+                        && let Billing::Api(alias) = &profile.route.billing
+                    {
                         index.bind(&profile.project, &launcher.profiles.api, source, alias)?;
                     }
                     history::load(&profile, &history_owner, &saved, &alive, |batch| {
@@ -746,17 +793,33 @@ impl Store {
         if id.contains('/') {
             return Ok(());
         }
-        let raw = stock_id(id)?.to_owned();
-        if self.native_live_now(id) {
-            return self.view_native(id);
+        stock_id(id)?;
+        if confirm {
+            return self.claude_resume(id, true);
         }
+        self.native_live_now(id);
+        self.view_native(id)
+    }
+
+    /// Explicitly resume an existing conversation, without sending any input.
+    pub(super) fn claude_resume(&mut self, id: &str, confirm: bool) -> io::Result<()> {
+        if self.native_live_now(id) {
+            if confirm && self.is_viewer(id) {
+                self.claude_mut().sessions.remove(id);
+            }
+            return self.view_journal(id, confirm);
+        }
+        if self.is_viewer(id) {
+            self.claude_mut().sessions.remove(id);
+        }
+        self.spawn_claude(Session::Resume(stock_id(id)?.to_owned()), None, confirm)?;
+        self.ended_threads.remove(id);
         self.transcripts.entry(id.into()).or_default().loading = true;
-        self.spawn_claude(Session::Resume(raw), None, confirm)?;
         Ok(())
     }
     /// Resume an ended Claude session with the draft as its first input, so the message
     /// goes out as soon as the process is initialised.
-    pub(super) fn claude_resume_send(&mut self, id: &str) -> io::Result<()> {
+    pub(super) fn claude_resume_send(&mut self, id: &str, command: Option<&str>) -> io::Result<()> {
         let row = self
             .catalog
             .get(id)
@@ -766,13 +829,15 @@ impl Store {
         if self.native_live_now(id) {
             return Err(io::Error::other(native::HINT));
         }
-        let text = self.draft(Some(id)).to_owned();
+        if self.is_viewer(id) {
+            self.claude_mut().sessions.remove(id);
+        }
+        let text = command.unwrap_or_else(|| self.draft(Some(id))).to_owned();
         self.restored_drafts.remove(id);
         let raw = stock_id(id)?.to_owned();
         // A send continues the conversation the user was having, so its first turn runs
         // in the access mode they had chosen, also after the host reaped the idle route
-        // behind their back. Opening the session from the list is a fresh start and keeps
-        // `default`, as does a session that never had a chosen mode.
+        // behind their back. History selection leaves that choice untouched.
         let mode = self.resume_access.get(id).copied();
         self.spawn_claude_in(Session::Resume(raw), Some((new_id()?, text)), false, mode)?;
         self.ended_threads.remove(id);
@@ -781,7 +846,9 @@ impl Store {
         t.error = None;
         self.selected = Some(id.into());
         self.selection += 1;
-        self.edit(Some(id), String::new());
+        if command.is_none() {
+            self.edit(Some(id), String::new());
+        }
         self.changed.transcript(id);
         self.changed.mark(Changed::THREADS | Changed::CONNECTION);
         Ok(())
@@ -791,6 +858,11 @@ impl Store {
         id: Option<&str>,
         command: Option<&str>,
     ) -> io::Result<()> {
+        if let (Some(id), Some(command)) = (id, command)
+            && self.can_configure_saved_claude(id)
+        {
+            return self.claude_resume_send(id, Some(command));
+        }
         if !self.can_send(id) || id.is_some_and(|s| s.contains('/')) {
             return Err(io::Error::other(
                 "Open a ready parent Claude session to send",
@@ -812,7 +884,7 @@ impl Store {
         let message = new_id()?;
         let owner = match id {
             Some(id) => id.to_owned(),
-            None => match self.claude_mut().blank.take() {
+            None => match self.claude_mut().dispatching_worker.take() {
                 Some(id) => id,
                 None => self.spawn_claude(Session::New(new_id()?), None, false)?,
             },
@@ -862,6 +934,102 @@ impl Store {
         }
         Ok(())
     }
+    pub(crate) fn defer_claude_command(
+        &mut self,
+        id: Option<&str>,
+        command: &str,
+        terminal_allowed: bool,
+    ) -> io::Result<()> {
+        let owner = if let Some(id) = id {
+            if !self.can_resume_send(id) {
+                return Err(io::Error::other("Wait for this Claude session to be ready"));
+            }
+            self.claude_resume_send(id, Some(command))?;
+            id.to_owned()
+        } else {
+            if !self.can_send(None) || self.opening_claude_command() {
+                return Err(io::Error::other("Wait for the opening Claude session"));
+            }
+            self.spawn_claude(
+                Session::New(new_id()?),
+                Some((new_id()?, command.into())),
+                false,
+            )?
+        };
+        self.claude_mut()
+            .sessions
+            .get_mut(&owner)
+            .unwrap()
+            .deferred_command = Some(DeferredCommand {
+            new_thread: id.is_none(),
+            terminal_allowed,
+        });
+        Ok(())
+    }
+
+    fn publish_command_thread(&mut self, owner: &str, command: &str) {
+        self.remember_claude(row(
+            &self.profile,
+            owner.into(),
+            command.chars().take(120).collect(),
+            now_secs(),
+        ));
+        self.selected = Some(owner.into());
+        self.selection += 1;
+        self.host_opened = Some(owner.into());
+    }
+
+    /// Return whether the verified process should receive the buffered input.
+    fn resolve_claude_command(
+        &mut self,
+        owner: &str,
+        deferred: DeferredCommand,
+    ) -> io::Result<bool> {
+        let (_, text) = self.claude().sessions[owner]
+            .first
+            .as_ref()
+            .expect("deferred command input");
+        let text = text.clone();
+        if matches!(
+            self.parse_command(Some(owner), &text),
+            Some(crate::slash::Action::SessionCommand)
+        ) {
+            if deferred.new_thread {
+                self.publish_command_thread(owner, &text);
+            }
+            return Ok(true);
+        }
+        if deferred.terminal_allowed {
+            let thread = (!deferred.new_thread).then(|| owner.to_owned());
+            let handoff = super::commands::Handoff {
+                argv: self.handoff_argv(thread.as_deref())?,
+                thread: thread.clone(),
+                command: text,
+            };
+            if let Some(thread) = thread {
+                self.terminal_threads.insert(thread);
+            }
+            self.claude_mut()
+                .sessions
+                .get_mut(owner)
+                .unwrap()
+                .first
+                .take();
+            self.release_claude(owner, handoff)?;
+        } else {
+            if deferred.new_thread {
+                self.publish_command_thread(owner, &text);
+            }
+            self.claude_end(owner)?;
+            self.notice = Some(format!(
+                "{} is not available on this model route.",
+                text.split_whitespace().next().unwrap_or("Command")
+            ));
+            self.changed.mark(Changed::NOTICE);
+        }
+        Ok(false)
+    }
+
     fn flush_claude(&mut self, owner: &str) -> io::Result<()> {
         let Some(process) = self.claude_mut().sessions.get_mut(owner) else {
             return Ok(());
@@ -869,6 +1037,11 @@ impl Store {
         let (Some(_), true) = (&process.link, process.initialized) else {
             return Ok(());
         };
+        if let Some(command) = process.deferred_command.take()
+            && !self.resolve_claude_command(owner, command)?
+        {
+            return Ok(());
+        }
         let transcript = self.transcripts.entry(owner.into()).or_default();
         transcript.loading = false;
         transcript.ready = true;
@@ -927,10 +1100,10 @@ impl Store {
         Ok(())
     }
     /// Drop a session's process, which closes its link and kills the process
-    /// group. The thread stays in the catalog; selecting it resumes it.
+    /// group. A later send can resume the saved thread.
     pub(super) fn claude_end(&mut self, id: &str) -> io::Result<()> {
         let project = self.claude();
-        if project.blank.as_deref() == Some(id) || !project.sessions.contains_key(id) {
+        if project.dispatching_worker.as_deref() == Some(id) || !project.sessions.contains_key(id) {
             return Err(io::Error::other("No active Claude session"));
         }
         if project.sessions[id].viewer.is_some() {
@@ -949,10 +1122,8 @@ impl Store {
         if let Some(mode) = p.mode.filter(|_| p.link.is_some()) {
             self.resume_access.insert(id.into(), mode);
         }
-        let mut unsent = p.events.take_awaiting_echo();
-        unsent.extend(p.first.take());
+        self.restore_claude_input(id, &mut p);
         drop(p);
-        self.restore_claude_drafts(id, unsent);
         let removed: std::collections::HashSet<_> = self
             .claude()
             .asks
@@ -978,28 +1149,21 @@ impl Store {
     }
     pub(super) fn claude_has_live(&self, id: &str) -> bool {
         let project = self.claude();
-        project.blank.as_deref() != Some(id)
+        project.dispatching_worker.as_deref() != Some(id)
             && project.worker_blank.as_deref() != Some(id)
             && project.sessions.get(id).is_some_and(|p| p.viewer.is_none())
     }
     pub(super) fn claude_is_blank(&self, id: &str) -> bool {
-        self.claude().blank.as_deref() == Some(id)
+        self.claude().worker_blank.as_deref() == Some(id)
     }
-    /// Every OS process this store owns: the live sessions, and for Claude the warm blank
-    /// draft too. `live_threads` leaves the blank out because it is not a session to end
-    /// or reap, but the process list still has to show the process the host keeps.
+    /// Include a dedicated worker process while its first input is being prepared.
     pub fn process_threads(&self) -> Vec<String> {
         let mut ids = self.live_threads();
-        if self.remote().is_none()
-            && self.is_session_scoped()
-            && let Some(blank) = self.claude().blank.as_deref()
-            && self
-                .claude()
-                .sessions
-                .get(blank)
-                .is_some_and(|p| p.viewer.is_none() && (p.link.is_some() || !p.initialized))
+        if let links::Link::Claude(p) = &self.link
+            && let Some(id) = &p.worker_blank
+            && p.sessions.contains_key(id)
         {
-            ids.push(blank.to_owned());
+            ids.push(id.clone());
         }
         ids
     }
@@ -1009,7 +1173,7 @@ impl Store {
             .sessions
             .iter()
             .filter(|(k, p)| {
-                project.blank.as_deref() != Some(k.as_str())
+                project.dispatching_worker.as_deref() != Some(k.as_str())
                     && project.worker_blank.as_deref() != Some(k.as_str())
                     && p.viewer.is_none()
             })
@@ -1043,19 +1207,27 @@ impl Store {
         let super::routes_thread::Choice::Model(model) = choice else {
             return Err(io::Error::other("Unsupported Claude session setting"));
         };
-        let owner = id
-            .or(self.claude().blank.as_deref())
-            .ok_or_else(|| io::Error::other("Open a Claude session first"))?
-            .to_owned();
         if self.profile.route.is_api() {
             return Err(io::Error::other(
                 "Start a new Claude session to change its billing alias",
             ));
         }
+        let Some(owner) = id else {
+            self.next_options = Some(super::routes_thread::Options {
+                model,
+                ..Default::default()
+            });
+            return Ok(());
+        };
+        if self.can_configure_saved_claude(owner) {
+            self.resume_models.insert(owner.to_owned(), model);
+            self.changed.transcript(owner);
+            return Ok(());
+        }
         let p = self
             .claude_mut()
             .sessions
-            .get_mut(&owner)
+            .get_mut(owner)
             .ok_or_else(|| io::Error::other("Claude session has closed"))?;
         let link = p
             .link

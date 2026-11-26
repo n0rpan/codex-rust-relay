@@ -216,9 +216,8 @@ impl Store {
         text: String,
         from_draft: bool,
     ) -> io::Result<Effect> {
-        use crate::slash::{self, Action as Command};
-        let caps = self.command_caps(owner.as_deref());
-        match slash::parse(&text, &caps) {
+        use crate::slash::Action as Command;
+        match self.parse_command(owner.as_deref(), &text) {
             Some(Command::New) => {
                 self.dispatch_remote(Action::NewDraft)?;
                 if from_draft {
@@ -357,8 +356,11 @@ impl Store {
                 scope,
                 thread,
                 command,
-                ..
+                id,
             } if scope.project == self.profile.project && scope.route == self.profile.route => {
+                if self.remote().unwrap().await_new.as_deref() == Some(&id) {
+                    self.remote_mut().await_new = None;
+                }
                 self.handoff_ready = Some(commands::Handoff {
                     thread,
                     command,

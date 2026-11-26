@@ -175,9 +175,11 @@ impl Host {
             cx,
         );
         let route_refresh = Self::refresh_routes(window, cx);
-        cx.observe_window_visibility(window, |_, _, w, cx| {
+        cx.observe_window_visibility(window, |s, _, w, cx| {
             if w.is_visible() {
                 cx.notify()
+            } else {
+                s.running.update(cx, |r, cx| r.set_shown(false, cx));
             }
         })
         .detach();
@@ -231,7 +233,7 @@ impl Host {
             catalog_versions: vec![],
             catalog: vec![],
             discovery: Discovery::default(),
-            running: cx.new(Running::new),
+            running: cx.new(|_| Running::default()),
             list_focus: cx.focus_handle().tab_stop(true),
             list_scroll: Default::default(),
             choose_route: None,
@@ -1569,7 +1571,8 @@ impl Host {
         }
         let inline = !compact && self.sidebar_visible;
         let shown = inline || self.drawer_open;
-        self.running.update(cx, |r, cx| r.set_shown(shown, cx));
+        self.running
+            .update(cx, |r, cx| r.set_shown(shown && window.is_visible(), cx));
         let pane_width = window.viewport_size().width
             - if inline {
                 px(self.sidebar_width as f32 + DIVIDER_WIDTH)

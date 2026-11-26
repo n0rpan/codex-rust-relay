@@ -76,6 +76,48 @@ test("a terminal parent resolves by its recorded project and native id", () => {
   );
 });
 
+const native = "7591d38f-791e-484e-a394-604615be60dc";
+const imported = (project, tag) => ({
+  ...entry(project, `claude:${tag}:${native}`),
+  scope: scope(project, "claude", tag === "subscription" ? tag : { api: "fixture/demo" }),
+});
+const terminalChild = (runtime) => {
+  const detail = worker(scope("/work/app"), native);
+  Object.assign(detail.origin.parent, { scope: null, runtime });
+  return entry("/work/review", "child", detail);
+};
+
+for (const tag of ["api", "subscription"]) {
+  test(`an external Claude parent opens the imported ${tag} session`, () => {
+    const parent = imported("/work/app", tag);
+    const child = terminalChild("claude");
+    const tree = catalogTree([child, entry("/work/app", native), imported("/other", tag), parent]);
+    const parentKey = keyOf(parent.scope, parent.session.id);
+    assert.deepEqual(tree.children.get(parentKey), [child]);
+    assert.deepEqual(tree.links.get(keyOf(child.scope, "child")), {
+      key: parentKey, scope: parent.scope, project: "/work/app",
+      id: parent.session.id, title: parent.session.title,
+    });
+  });
+}
+
+test("a terminal parent shared by billing routes stays unresolved even under a filter", () => {
+  const child = terminalChild("claude");
+  const parent = imported("/work/app", "subscription");
+  const other = imported("/work/app", "api");
+  for (const all of [[child, parent, other], [other, parent, child]]) {
+    const tree = catalogTree([child, parent], all);
+    assert.equal(tree.links.has(keyOf(child.scope, "child")), false);
+    assert.deepEqual(tree.roots, [child, parent]);
+  }
+});
+
+test("a missing parent runtime cannot disambiguate a Codex and a Claude session", () => {
+  const child = terminalChild(null);
+  const tree = catalogTree([child, entry("/work/app", native), imported("/work/app", "api")]);
+  assert.equal(tree.links.has(keyOf(child.scope, "child")), false);
+});
+
 test("a handoff keeps its own row rather than claiming a worker parent", () => {
   const parent = entry("/work/app", "parent");
   const target = entry(

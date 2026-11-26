@@ -185,6 +185,30 @@ impl Store {
         }
         caps
     }
+    /// An unknown command on a cold Claude route can be an installed project skill.
+    /// Only its submission asks the runtime which commands this session supports.
+    pub fn parse_command(&self, id: Option<&str>, text: &str) -> Option<crate::slash::Action> {
+        let caps = self.command_caps(id);
+        let action = crate::slash::parse(text, &caps)?;
+        if action == Action::Terminal
+            && self.is_session_scoped()
+            && caps.session_commands.is_none()
+            && text
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.strip_prefix('/'))
+                .is_some_and(|name| {
+                    // Account commands must reach the interactive client even before sign-in.
+                    !matches!(name, "login" | "logout")
+                        && crate::slash::possible_claude_command(name)
+                })
+        {
+            Some(Action::DiscoverClaudeCommand)
+        } else {
+            Some(action)
+        }
+    }
+
     pub fn command_notice(&self) -> Option<&str> {
         self.selected()
             .and_then(|id| self.transcript(id))
@@ -218,7 +242,8 @@ impl Store {
         }
         let caps = self.command_caps(id);
         let text = palette_text.unwrap_or_else(|| self.draft(id)).trim();
-        let action = crate::slash::parse(text, &caps)
+        let action = self
+            .parse_command(id, text)
             .ok_or_else(|| io::Error::other("Enter a slash command"))?;
         if !matches!(
             action,
@@ -226,7 +251,7 @@ impl Store {
         ) && (self.commands_loading() || !self.has_command_schema())
         {
             return Err(io::Error::other(
-                "Discovering commands from the installed Codex",
+                "Discovering commands from the installed runtime",
             ));
         }
         let message = match action {
@@ -245,6 +270,14 @@ impl Store {
             }
             Action::Terminal => {
                 self.handoff_text(id.map(str::to_owned), text.to_owned())?;
+                return Ok(Effect::Applied);
+            }
+            Action::DiscoverClaudeCommand => {
+                let command = text.to_owned();
+                self.defer_claude_command(id, &command, true)?;
+                if palette_text.is_none() {
+                    self.edit(id, String::new());
+                }
                 return Ok(Effect::Applied);
             }
             Action::SessionCommand => {
@@ -361,7 +394,10 @@ impl Store {
         thread: Option<String>,
         command: String,
     ) -> io::Result<()> {
-        if !self.can_send(thread.as_deref()) {
+        let saved_claude = thread
+            .as_deref()
+            .is_some_and(|id| self.can_configure_saved_claude(id));
+        if !saved_claude && !self.can_send(thread.as_deref()) {
             return Err(io::Error::other("Wait for this thread to be ready"));
         }
         if self.handing_off_claude()
@@ -395,8 +431,14 @@ impl Store {
                     "Finish the current turn and its workers before opening the parent session in the terminal",
                 ));
             }
+            if saved_claude && self.native_live_now(&id) {
+                return Err(io::Error::other(self.native_live_hint()));
+            }
             self.terminal_threads.insert(id.clone());
-            if self.is_session_scoped() {
+            if saved_claude {
+                self.handoff_ready = Some(handoff);
+                Ok(())
+            } else if self.is_session_scoped() {
                 self.release_claude(&id, handoff)
             } else {
                 self.request(Call::Unsubscribe(id), Pending::LeaveForTerminal(handoff))
@@ -426,6 +468,10 @@ impl Store {
         }
         // The terminal can have appended to the rollout. Load its authoritative tail.
         self.transcripts.remove(id);
-        self.open_catalog_id(id)
+        if self.is_session_scoped() {
+            self.claude_resume(id, false)
+        } else {
+            self.open_catalog_id(id)
+        }
     }
 }

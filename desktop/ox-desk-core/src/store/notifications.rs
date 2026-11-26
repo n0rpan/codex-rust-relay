@@ -38,23 +38,13 @@ impl Store {
         {
             return;
         }
-        if self.is_session_scoped() {
-            match self.claude_next_mode(access) {
-                Ok(true) => return,
-                Ok(false) => (),
-                Err(e) => {
-                    self.notice = Some(e.to_string());
-                    return;
-                }
-            }
-        }
         self.next_preset = (access != crate::codex::access::Access::Configured).then_some(access);
     }
     pub fn can_change_access(&self, id: &str) -> bool {
         if let Some(remote) = self.remote() {
             return remote.can(id, "access");
         }
-        self.can_send(Some(id))
+        (self.can_send(Some(id)) || self.can_configure_saved_claude(id))
             && self.transcripts[id].active_turn().is_none()
             && !self.asks.iter().any(|a| a.thread.as_deref() == Some(id))
             && !self
@@ -74,6 +64,11 @@ impl Store {
             ));
         }
         if self.is_session_scoped() {
+            if self.can_configure_saved_claude(id) {
+                self.resume_access.insert(id.into(), preset);
+                self.changed.transcript(id);
+                return Ok(());
+            }
             if self.applied_access(Some(id)) == Some(preset) {
                 return Ok(());
             }
