@@ -124,6 +124,10 @@ impl Process {
         });
         Ok(Self { write, close })
     }
+    /// A handle the reader can use to answer a request without going through the link.
+    pub(super) fn writer(&self) -> mpsc::Sender<Value> {
+        self.write.clone()
+    }
     pub(super) fn send(&self, value: Value) -> io::Result<()> {
         self.write
             .send(value)
