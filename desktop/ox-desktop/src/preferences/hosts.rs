@@ -1,3 +1,4 @@
+mod worker_links;
 use crate::{
     appearance::{Palette, Step},
     kit::{button, field},
@@ -11,6 +12,9 @@ use ox_host_web::host_updates::{Channel, Command, Mode, Status};
 use std::io;
 
 pub(crate) struct Hosts {
+    links: Option<worker_links::Directory>,
+    worker_address: Entity<InputState>,
+    worker_code: Entity<InputState>,
     address: Entity<InputState>,
     profile_fields: Option<(HostProfile, Entity<InputState>, Entity<InputState>)>,
     code: Entity<InputState>,
@@ -28,6 +32,9 @@ impl Hosts {
     pub fn new(w: &mut Window, cx: &mut Context<Self>) -> Self {
         let loaded = hosts::list();
         Self {
+            links: None,
+            worker_address: field("", "Worker invitation or host URL", false, w, cx),
+            worker_code: field("", "Code (for a host URL)", true, w, cx),
             profile_fields: None,
             address: field(
                 "",
@@ -79,6 +86,7 @@ impl Hosts {
         cx.notify();
     }
     fn select(&mut self, host: Option<SavedHost>, cx: &mut Context<Self>) {
+        self.links = None;
         self.selected = host;
         self.policy = None;
         self.profile_fields = None;
@@ -230,6 +238,7 @@ impl Hosts {
             move |s, rows, cx| {
                 s.hosts = rows;
                 s.selected = None;
+                s.links = None;
                 s.policy = None;
                 s.profile_fields = None;
                 s.review = None;
@@ -502,6 +511,9 @@ impl Render for Hosts {
                     cx.listener(|s, _, _, cx| s.edit_policy(None, cx)),
                 ));
             }
+        }
+        if self.selected.is_some() || !cx.global::<crate::app::ClientOnly>().0 {
+            list = list.child(self.worker_controls(p, cx));
         }
         if let Some(status) = &self.status {
             list = list.child(format!("OX {} · {}", status.installed, status.message));

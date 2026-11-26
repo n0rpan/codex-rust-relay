@@ -157,6 +157,7 @@ const USAGE: &str = "Usage: ox-host COMMAND [--socket PATH] [--state-dir PATH] [
   status                    show whether the host and its login service run
   stop                      stop the host now; running turns are interrupted
   restart [--timeout SECS]  finish running turns (default bound 600s), then start the installed host
+  pair --worker-host        invite another OX host to launch workers here
   pair [--terminal]         print a private Serve invitation, optionally granting a terminal
   update [setting]          install when idle or set automatic, download, manual, stable or dev
   name [NAME]               show or set the name shown to clients
@@ -215,9 +216,19 @@ fn entry() -> io::Result<()> {
         (Some(kind @ ("name" | "labels")), rest) => pairing::profile(&paths, kind, rest),
         (Some("policy"), rest) => pairing::mode_policy(&paths, rest),
         (Some("update"), rest) => updates::cli(&paths, rest),
-        (Some("pair"), []) => pairing::pair(&paths, false).map_err(io::Error::other),
-        (Some("pair"), [flag]) if flag == "--terminal" => {
-            pairing::pair(&paths, true).map_err(io::Error::other)
+        (Some("pair"), []) => pairing::pair(
+            &paths,
+            ox_host_web::access::Operation::Pair { terminal: false },
+        )
+        .map_err(io::Error::other),
+        (Some("pair"), [flag]) if flag == "--terminal" => pairing::pair(
+            &paths,
+            ox_host_web::access::Operation::Pair { terminal: true },
+        )
+        .map_err(io::Error::other),
+        (Some("pair"), [flag]) if flag == "--worker-host" => {
+            pairing::pair(&paths, ox_host_web::access::Operation::PairWorker)
+                .map_err(io::Error::other)
         }
         (Some("devices"), []) => pairing::devices(&paths).map_err(io::Error::other),
         (Some("terminal"), [id, setting]) if matches!(setting.as_str(), "on" | "off") => {

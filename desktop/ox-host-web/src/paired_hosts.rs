@@ -38,7 +38,7 @@ pub struct SavedHost {
     #[serde(skip)]
     client: Arc<OnceLock<PairedClient>>,
 }
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     id.len() == 36
         && id.bytes().enumerate().all(|(i, c)| {
             if matches!(i, 8 | 13 | 18 | 23) {
@@ -84,6 +84,14 @@ pub(crate) fn destinations(path: &Path) -> io::Result<Vec<SavedHost>> {
         host.background = true;
     }
     Ok(hosts)
+}
+#[cfg(feature = "server")]
+pub(crate) fn worker_links(path: &Path) -> io::Result<Vec<SavedHost>> {
+    let mut rows = read_hosts(path)?;
+    for row in &mut rows {
+        row.background = true;
+    }
+    Ok(rows)
 }
 impl SavedHost {
     pub fn same_pairing(&self, other: &Self) -> bool {
@@ -137,13 +145,16 @@ impl SavedHost {
         self.forget()
     }
     pub fn forget(&self) -> io::Result<()> {
+        self.forget_from(&directory()?.join("hosts.json"))
+    }
+    pub(crate) fn forget_from(&self, registry: &Path) -> io::Result<()> {
         // Keep the reference available if the OS key store needs to be unlocked.
         keys::remove(&self.key_id, self.storage)?;
         ox_desk_core::state_file::update_preference_at(
-            &directory()?.join("hosts.json"),
+            registry,
             Vec::new,
             |mut rows: Vec<SavedHost>| {
-                rows.retain(|s| s.key_id != self.key_id);
+                rows.retain(|s| !s.same_pairing(self));
                 rows
             },
         )
@@ -176,6 +187,7 @@ pub fn pair(address: &str, code: &str, label: &str) -> io::Result<SavedHost> {
         label,
         &directory()?.join("hosts.json"),
         false,
+        None,
         |_, _| true,
     )
 }
@@ -184,18 +196,27 @@ pub(crate) fn enroll(
     label: &str,
     registry: &Path,
     background: bool,
+    worker_source: Option<&str>,
     accept: impl FnOnce(&[SavedHost], &SavedHost) -> bool,
 ) -> io::Result<SavedHost> {
     let origin = invite.origin.clone();
     let rt = client::runtime()?;
-    let credential = rt.block_on(client::register(invite, label))?;
+    let credential = rt.block_on(client::register_as(invite, label, worker_source))?;
+    let revoke = |client: &PairedClient| {
+        if worker_source.is_some() {
+            let _ = rt.block_on(client.worker_request(json!({"action":"revoke_self"})));
+        } else {
+            let _ = rt.block_on(client.revoke_self());
+        }
+    };
     let client = PairedClient::new(&origin, &credential).inspect_err(|_| {
         let _ = credential.discard_key();
     })?;
-    let host = prepare_pairing(origin, &credential, &client, background).inspect_err(|_| {
-        let _ = rt.block_on(client.revoke_self());
-        let _ = credential.discard_key();
-    })?;
+    let host = prepare_pairing(origin, &credential, &client, background, worker_source)
+        .inspect_err(|_| {
+            revoke(&client);
+            let _ = credential.discard_key();
+        })?;
     let mut old = Vec::new();
     let mut duplicate = false;
     let saved = ox_desk_core::state_file::update_preference_at(
@@ -219,7 +240,7 @@ pub(crate) fn enroll(
         },
     );
     if saved.is_err() || duplicate {
-        let _ = rt.block_on(client.revoke_self());
+        revoke(&client);
         let _ = keys::remove(&host.key_id, host.storage);
         saved?;
         return Err(io::Error::new(
@@ -230,7 +251,7 @@ pub(crate) fn enroll(
     for mut previous in old {
         previous.background = background;
         if let Ok(client) = previous.client() {
-            let _ = rt.block_on(client.revoke_self());
+            revoke(client);
         }
         let _ = keys::remove(&previous.key_id, previous.storage);
     }
@@ -241,7 +262,46 @@ fn prepare_pairing(
     credential: &client::Credential,
     client: &PairedClient,
     background: bool,
+    worker_source: Option<&str>,
 ) -> io::Result<SavedHost> {
+    let (id, name) = if let Some(source) = worker_source {
+        let info = client::runtime()?.block_on(client.worker_request(json!({"action":"info"})))?;
+        if info["grant"]["source"].as_str() != Some(source) {
+            return Err(io::Error::other(
+                "The receiving host did not bind this link to its source",
+            ));
+        }
+        (
+            info["id"].as_str().map(str::to_owned),
+            info["name"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+        )
+    } else {
+        operator_identity(client)?
+    };
+    let id = id
+        .filter(|s| valid_id(s))
+        .ok_or_else(|| io::Error::other("Update this OX host to report its identity."))?;
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce).map_err(io::Error::other)?;
+    let key_id = format!("{:032x}", u128::from_be_bytes(nonce));
+    let storage = keys::save(&key_id, credential, background)?;
+    Ok(SavedHost {
+        id,
+        name: name.unwrap_or_else(|| origin.clone()),
+        origin,
+        key_id,
+        storage,
+        background,
+        #[cfg(feature = "server")]
+        web_destination: background,
+        client: Arc::new(OnceLock::from(client.clone())),
+    })
+}
+
+fn operator_identity(client: &PairedClient) -> io::Result<(Option<String>, Option<String>)> {
     let mut socket = client::runtime()?.block_on(client.session())?;
     socket.set_read_timeout(Some(Duration::from_secs(15)))?;
     ox_desk_core::host_protocol::write_frame(&mut socket, &Client::Hello { version: VERSION })?;
@@ -254,25 +314,7 @@ fn prepare_pairing(
             "Update this OX host to report its identity.",
         ));
     };
-    let id = info
-        .id
-        .filter(|id| valid_id(id))
-        .ok_or_else(|| io::Error::other("Update this OX host to report its identity."))?;
-    let mut nonce = [0u8; 16];
-    getrandom::fill(&mut nonce).map_err(io::Error::other)?;
-    let key_id = format!("{:032x}", u128::from_be_bytes(nonce));
-    let storage = keys::save(&key_id, credential, background)?;
-    Ok(SavedHost {
-        id,
-        name: info.name.unwrap_or_else(|| origin.clone()),
-        origin,
-        key_id,
-        storage,
-        background,
-        #[cfg(feature = "server")]
-        web_destination: background,
-        client: Arc::new(OnceLock::from(client.clone())),
-    })
+    Ok((info.id, info.name))
 }
 
 #[derive(Deserialize)]

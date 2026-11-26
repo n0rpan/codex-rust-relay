@@ -82,6 +82,9 @@ export async function settingsRequest(key, operation) {
   const request = JSON.stringify(operation);
   const proof = await signedOperation(key, "settings", request);
   const transfer = [
+    "add_worker_link",
+    "link_paired_host",
+    "remove_worker_link",
     "pair_key_destination",
     "review_key_transfer",
     "send_key_transfer",

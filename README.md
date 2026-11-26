@@ -57,6 +57,12 @@ The same installer adds **OX Desktop** to your application launcher. It runs on 
 
 [Phone setup in detail](desktop/README.md#keep-sessions-running-and-pair-a-phone)
 
+### Pair a headless host
+
+On the server, run the installer with `--host`, then run `ox host pair`. Paste the invitation into **Settings → Hosts** on OX Desktop. To reuse configured API keys, select the server and choose **Send API keys…**. From a paired browser, open **Settings → Credentials → Copy keys to another host…** on the host that already has the keys. Choose the destination, select the provider or Brave Search keys you want, and send. The receiver can use those keys and incur charges until you remove or rotate them.
+
+Managed headless hosts install updates automatically when idle. Use **Settings → Host updates** in the paired web UI, or select the server in desktop **Settings → Hosts**, to choose Automatic, Download only or Manual and the Dev or Stable channel.
+
 ### Terminal only
 
 If you only want the relay in your terminal, leave out `--desktop`:

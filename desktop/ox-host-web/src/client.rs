@@ -111,6 +111,10 @@ async fn checked(response: Result<Response, reqwest::Error>, denied: &str) -> io
     let response = response.map_err(|e| io::Error::other(e.without_url()))?;
     match response.status() {
         s if s.is_success() => Ok(response),
+        reqwest::StatusCode::BAD_REQUEST => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "The OX host did not accept this request.",
+        )),
         reqwest::StatusCode::UNPROCESSABLE_ENTITY => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "This host does not recognize the request. Update OX on the host and try again.",
@@ -253,6 +257,13 @@ impl DeviceKey {
     }
 }
 pub async fn register(invite: Invitation, label: &str) -> io::Result<Credential> {
+    register_as(invite, label, None).await
+}
+pub(crate) async fn register_as(
+    invite: Invitation,
+    label: &str,
+    source: Option<&str>,
+) -> io::Result<Credential> {
     #[cfg(test)]
     let test_transport = fixture::transport(&invite.origin);
     #[cfg(test)]
@@ -263,12 +274,20 @@ pub async fn register(invite: Invitation, label: &str) -> io::Result<Credential>
     #[cfg(not(test))]
     let (http, (key, saved)) = (http()?, DeviceKey::generate()?);
     let result: io::Result<String> = async {
-        let payload = json!({"code":invite.code, "signature":key.sign(&invite.code)?,
-            "key":key.public()?, "class":"desktop","label":label});
+        let (class, message, refusal) = if let Some(source) = source {
+            ("host", format!("{}.host.{source}", invite.code),
+             "Worker pairing was refused. Use a fresh worker invitation from the receiving host (ox host pair --worker-host). Both hosts need the invited Tailscale login.")
+        } else {
+            ("desktop", invite.code.clone(),
+             "Pairing was refused. Check your Tailscale login and get a fresh invitation with ox host pair.")
+        };
+        let mut payload = json!({"code":invite.code, "signature":key.sign(&message)?,
+            "key":key.public()?, "class":class,"label":label});
+        if let Some(source) = source { payload["source"] = json!(source); }
         let response = checked(
             http.post(format!("{}/api/pair", invite.origin))
                 .header(header::ORIGIN, &invite.origin).json(&payload).send().await,
-            "Pairing was refused. Check your Tailscale login and get a fresh invitation with ox host pair.",
+            refusal,
         ).await?;
         response.headers().get_all(header::SET_COOKIE).iter()
             .filter_map(|v| v.to_str().ok()?.split(';').next()?.split_once('='))
@@ -294,6 +313,17 @@ impl Credential {
     }
 }
 impl PairedClient {
+    pub async fn worker_request(&self, call: Value) -> io::Result<Value> {
+        let request = call.to_string();
+        let proof = self.proof("worker", Some(&request)).await?;
+        self.post(
+            "worker-link",
+            json!({"request":request,"proof":proof}),
+            "Worker link was revoked or is no longer valid.",
+            Duration::from_secs(12),
+        )
+        .await
+    }
     pub async fn revoke_self(&self) -> io::Result<()> {
         let devices = self.settings(json!({"action":"devices"})).await?;
         let id = devices["self"]
@@ -332,10 +362,17 @@ impl PairedClient {
             settings_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
         })
     }
-    async fn post(&self, path: &str, data: Value, denied: &str) -> io::Result<Value> {
+    async fn post(
+        &self,
+        path: &str,
+        data: Value,
+        denied: &str,
+        timeout: Duration,
+    ) -> io::Result<Value> {
         let reply = checked(
             self.http
                 .post(format!("{}/api/{path}", self.origin))
+                .timeout(timeout)
                 .header(header::ORIGIN, &self.origin)
                 .header(header::COOKIE, self.cookie.clone())
                 .json(&data)
@@ -351,11 +388,14 @@ impl PairedClient {
             .post(
                 "challenge",
                 json!({"purpose":purpose}),
-                if purpose == "terminal" {
+                if purpose == "worker" {
+                    "The worker link is no longer available. Reconnect it with a fresh worker invitation."
+                } else if purpose == "terminal" {
                     "On the host, run ox host devices, then ox host terminal <device> on."
                 } else {
                     "This desktop needs to pair again. Run ox host pair on the host."
                 },
+                Duration::from_secs(12),
             )
             .await?;
         let nonce = reply["nonce"]
@@ -369,6 +409,17 @@ impl PairedClient {
         Ok(json!({"nonce":nonce,"signature":self.key.sign(&message)?}))
     }
     pub async fn settings(&self, action: Value) -> io::Result<Value> {
+        let timeout = match action["action"].as_str() {
+            Some(
+                "add_worker_link"
+                | "link_paired_host"
+                | "remove_worker_link"
+                | "pair_key_destination"
+                | "review_key_transfer"
+                | "send_key_transfer",
+            ) => Duration::from_secs(75),
+            _ => Duration::from_secs(12),
+        };
         let request = action.to_string();
         let _slot = self
             .settings_slots
@@ -383,6 +434,7 @@ impl PairedClient {
                     "settings",
                     json!({"request":request,"proof":proof}),
                     "The host refused this settings request.",
+                    timeout,
                 )
                 .await
             }

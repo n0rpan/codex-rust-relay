@@ -112,6 +112,11 @@ impl Access {
                     {
                         return Ok(Some(Client::Surface {
                             surface: match self.class {
+                                crate::admin::DeviceClass::Host => {
+                                    return Err(io::Error::other(
+                                        "Worker hosts use the worker link",
+                                    ));
+                                }
                                 crate::admin::DeviceClass::Phone => {
                                     ox_desk_core::surface::Surface::Phone
                                 }

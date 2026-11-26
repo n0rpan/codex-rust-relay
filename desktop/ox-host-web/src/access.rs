@@ -25,6 +25,7 @@ pub enum Operation {
     Enable,
     Disable,
     Pair { terminal: bool },
+    PairWorker,
     Revoke(String),
     TerminalGrant(String, bool),
 }
@@ -341,7 +342,10 @@ pub fn status(paths: &ox_host_service::Paths) -> Result<Reply, String> {
     let until = Instant::now() + Duration::from_secs(2);
     loop {
         match admin::request(&paths.state_dir, &Request::Status) {
-            Ok(status) => return Ok(status),
+            Ok(mut status) => {
+                status.devices.append(&mut status.worker_hosts);
+                return Ok(status);
+            }
             Err(e)
                 if matches!(
                     e.kind(),
@@ -363,15 +367,17 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
         Operation::Status => prior,
         Operation::TerminalGrant(id, enabled) => request(Request::TerminalGrant { id, enabled })?,
         Operation::Revoke(id) => request(Request::Revoke { id })?,
-        Operation::Pair { terminal } => {
+        Operation::Pair { .. } | Operation::PairWorker => {
             let node = network.as_ref().map_err(Clone::clone)?;
             if !node.ready() || !prior.enabled || prior.origin.as_ref() != Some(&node.origin) {
                 return Err("Enable tailnet access before pairing a device.".into());
             }
-            request(Request::Pair {
-                terminal,
-                login: node.login.clone(),
-            })?
+            let login = node.login.clone();
+            if let Operation::Pair { terminal } = op {
+                request(Request::Pair { terminal, login })?
+            } else {
+                request(Request::WorkerInvitation { login })?
+            }
         }
         Operation::Enable => {
             let node = network.as_ref().map_err(Clone::clone)?;

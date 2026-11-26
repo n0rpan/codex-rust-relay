@@ -219,6 +219,7 @@ Checks and next steps
                           home: and a next: line with the command to run.
   ox doctor --fix         Repair what ox can repair; files are backed up first.
   ox host pair            Pair a desktop or phone over your tailnet.
+  ox host pair --worker-host  Create an invitation for a worker host.
   ox host pair --terminal Include terminal access for the device that pairs.
   ox host name [NAME]     Show or change the name shown on paired devices.
   ox host policy          Show the host mode policy. Use set POLICY to change it.

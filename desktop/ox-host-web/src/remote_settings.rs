@@ -33,6 +33,13 @@ enum DeviceAction {
     },
     Devices,
     PairDevice,
+    InviteWorkerHost,
+    EditWorkerLink {
+        id: String,
+        before: crate::admin::WorkerGrant,
+        may_launch: bool,
+        ceiling: ox_desk_core::modes::Level,
+    },
     HostUpdate {
         command: crate::host_updates::Command,
     },
@@ -87,7 +94,14 @@ pub(super) async fn settings(
                         .into_iter()
                         .filter(|d| d.login == identity)
                         .collect::<Vec<_>>();
-                    Some(json!({"devices":devices,"self":id,"origin":reply.origin}))
+                    let worker_hosts: Vec<_> = reply
+                        .worker_hosts
+                        .into_iter()
+                        .filter(|d| d.login == identity)
+                        .collect();
+                    Some(
+                        json!({"devices":devices,"worker_hosts":worker_hosts,"self":id,"origin":reply.origin}),
+                    )
                 }
                 DeviceAction::PairDevice => Some(
                     serde_json::to_value(
@@ -95,13 +109,30 @@ pub(super) async fn settings(
                     )
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
                 ),
+                DeviceAction::InviteWorkerHost => Some(json!(
+                    state.worker_invite(&id).map_err(|_| StatusCode::CONFLICT)?
+                )),
+                DeviceAction::EditWorkerLink {
+                    id: target,
+                    before,
+                    may_launch,
+                    ceiling,
+                } => {
+                    if !state.belongs_to_login(target, identity) {
+                        return Err(DENY);
+                    }
+                    Some(
+                        match state.edit_worker(target, before, *may_launch, *ceiling) {
+                            Ok(()) => json!({"status":"applied"}),
+                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                                json!({"error": e.to_string()})
+                            }
+                            Err(_) => return Err(StatusCode::CONFLICT),
+                        },
+                    )
+                }
                 DeviceAction::RevokeDevice { id: target } => {
-                    if !state
-                        .reply(None)
-                        .devices
-                        .iter()
-                        .any(|d| &d.id == target && d.login == identity)
-                    {
+                    if !state.belongs_to_login(target, identity) {
                         return Err(DENY);
                     }
                     state
@@ -114,6 +145,9 @@ pub(super) async fn settings(
                 return Ok(Json(data));
             }
         }
+    }
+    if let Ok(action) = serde_json::from_str::<super::worker_links::Action>(text) {
+        return super::worker_links::apply(app, id, action).await;
     }
     if let Ok(action) = serde_json::from_str::<super::key_transfer::KeyAction>(text) {
         return super::key_transfer::apply(app, id, identity.to_owned(), action).await;

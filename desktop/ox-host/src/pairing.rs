@@ -9,7 +9,7 @@ use std::{
     process::Command,
 };
 
-pub fn pair(paths: &Paths, terminal: bool) -> Result<(), String> {
+pub fn pair(paths: &Paths, operation: Operation) -> Result<(), String> {
     let report = access::run(paths, Operation::Enable)?;
     if let Some(help) = report.denied {
         if !io::stdin().is_terminal() {
@@ -31,7 +31,9 @@ pub fn pair(paths: &Paths, terminal: bool) -> Result<(), String> {
             return Err(error);
         }
     }
-    let reply = access::run(paths, Operation::Pair { terminal })?.host;
+    let terminal = matches!(operation, Operation::Pair { terminal: true });
+    let worker = matches!(operation, Operation::PairWorker);
+    let reply = access::run(paths, operation)?.host;
     let pairing = reply
         .pairing
         .ok_or("The host did not issue an invitation")?;
@@ -40,17 +42,24 @@ pub fn pair(paths: &Paths, terminal: bool) -> Result<(), String> {
             "This invitation grants terminal access on this host to the device that redeems it."
         );
     }
-    let qr = qrcode::QrCode::new(&pairing.url).map_err(|e| e.to_string())?;
-    println!(
-        "{}",
-        qr.render::<qrcode::render::unicode::Dense1x2>()
-            .module_dimensions(1, 1)
-            .build()
-    );
-    println!(
-        "Scan on your phone or paste this invitation into Add host on your desktop. It expires in five minutes.\n{}",
-        pairing.url
-    );
+    if worker {
+        println!(
+            "Paste this invitation in Settings → Remote access → Worker host links on the sending host. It expires in five minutes.\n{}",
+            pairing.url
+        );
+    } else {
+        let qr = qrcode::QrCode::new(&pairing.url).map_err(|e| e.to_string())?;
+        println!(
+            "{}",
+            qr.render::<qrcode::render::unicode::Dense1x2>()
+                .module_dimensions(1, 1)
+                .build()
+        );
+        println!(
+            "Scan on your phone or paste this invitation into Add host on your desktop. It expires in five minutes.\n{}",
+            pairing.url
+        );
+    }
     if let (Some(origin), Some(code)) = (reply.origin, pairing.short_code) {
         println!("Host  {origin}\nCode  {code}");
     }
@@ -64,9 +73,21 @@ pub fn devices(paths: &Paths) -> Result<(), String> {
     }
     for device in reply.devices {
         let class = match device.class {
+            DeviceClass::Host => "worker host",
             DeviceClass::Phone => "phone",
             DeviceClass::Desktop => "desktop",
         };
+        if let Some(worker) = &device.worker {
+            println!(
+                "{}  {}  {class}  {}  launches {}  ceiling {}",
+                device.id,
+                device.label,
+                device.login,
+                if worker.may_launch { "on" } else { "off" },
+                worker.ceiling.name()
+            );
+            continue;
+        }
         let grant = if device.terminal {
             "terminal enabled"
         } else {

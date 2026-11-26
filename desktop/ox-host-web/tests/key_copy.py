@@ -133,3 +133,65 @@ def exercise(js, wait, invite, saved, receiver_state, source):
     assert js(request_key, review_query)["pairing"] == old
     assert js("window.fetch = window.originalTransferFetch; return window.observedKeySend && !window.transferExposedValue")
     print("PASS web UI sends only Brave Search, rejects stale reviews and foreign-owned peers, and preserves existing desktop pairings", flush=True)
+
+
+def worker_links(js, wait, state, source):
+    from browser import admin
+    # The source web service uses a mock engine in this fixture.
+    source_id = "06f2bbe4-12bb-4243-ab20-657f19c02d36"
+    (source / "host-id").write_text(source_id + "\n")
+    invite = admin(state, {"type": "worker_invitation", "login": "phone@example.test"})["pairing"]["url"]
+
+    def click(label):
+        wait(lambda: js("""const button=[...document.querySelectorAll('#settings button')]
+            .find(b => b.textContent.trim()===arguments[0] && b.getClientRects().length && !b.disabled);
+            if (!button) return false; button.click(); return true;""", label))
+
+    # Reopen Settings at its top-level menu.
+    js("document.getElementById('open-phone-settings').click()")
+    click("Host updates")
+    form = "#settings select[name="
+    wait(lambda: js("return document.querySelector(arguments[0])?.value",form+"mode]") == "automatic")
+    def select(name, value):
+        js("""const s=document.querySelector(arguments[0]); s.value=arguments[1];
+            s.dispatchEvent(new Event('change'));""",form+name+"]",value)
+        wait(lambda: js("const e=document.querySelector(arguments[0]); return e && !e.disabled && e.value===arguments[1]",
+                        form+name+"]",value))
+    select("channel", "dev")
+    select("mode", "manual")
+    click("Update when idle")
+    click("Cancel scheduled update")
+    wait(lambda: js("return document.querySelector('#settings').innerText.includes('Update when idle')"))
+    prefs = json.loads((source / "managed-host-fixture/update-preferences.json").read_text())
+    assert (prefs["mode"],prefs["channel"],prefs["scheduled"]) == ("manual","dev",False)
+    select("mode", "download")
+    select("channel", "stable")
+    click("← Settings")
+    click("Remote access")
+    click("Worker host links")
+    wait(lambda: js("return !!document.querySelector('input[name=worker_address]')"))
+    js("document.querySelector('input[name=worker_address]').value=arguments[0]", invite)
+    click("Link worker host")
+    try:
+        wait(lambda: js("return document.querySelector('#settings').innerText.includes('Remove outgoing link')"))
+    except AssertionError as exc:
+        raise AssertionError(js("return document.querySelector('#settings').innerText")) from exc
+    report = admin(state, {"type": "status"})
+    rows = report["devices"]
+    link, = report["worker_hosts"]
+    assert link["worker"] == {"source": source_id, "may_launch": True, "ceiling": "yolo"}
+    assert not link["terminal"]
+    local_view = admin(state, {"type": "worker_links", "command": {"action": "worker_links"}})["worker_links"]
+    assert [d["id"] for d in local_view["incoming"]] == [link["id"]]
+    edited = admin(state, {"type": "worker_access", "id": link["id"], "before": link["worker"],
+                          "may_launch": False, "ceiling": "read"})
+    assert edited["worker_hosts"][0]["worker"] == dict(link["worker"],may_launch=False,ceiling="read")
+    click("Remove outgoing link")
+    wait(lambda: not admin(state, {"type":"status"}).get("worker_hosts"))
+    assert {row["id"] for row in rows if row["class"] == "desktop"} == {row["id"] for row in admin(state, {"type":"status"})["devices"]}
+    known = json.loads((source / "home/state/ox/desktop/hosts.json").read_text())[0]
+    click("Link " + known["name"])
+    wait(lambda: bool(admin(state, {"type":"status"}).get("worker_hosts")))
+    click("Remove outgoing link")
+    wait(lambda: not admin(state, {"type":"status"}).get("worker_hosts"))
+    print("PASS web update modes and channels, idle scheduling and cancellation, worker link invitations, one-click pairing, local grant editing and independent revocation", flush=True)

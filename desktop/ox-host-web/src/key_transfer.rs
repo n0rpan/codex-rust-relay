@@ -34,7 +34,7 @@ fn description(h: &SavedHost) -> Value {
     json!({"id":h.id, "name":h.name, "origin":h.origin})
 }
 
-fn tailnet(origin: &str) -> Option<String> {
+pub(super) fn tailnet(origin: &str) -> Option<String> {
     let url = url::Url::parse(origin).ok()?;
     let (_, tailnet) = url.host_str()?.split_once('.')?;
     tailnet.ends_with(".ts.net").then(|| tailnet.to_owned())
@@ -64,19 +64,7 @@ pub(super) async fn apply(
 }
 
 fn execute(app: &App, device: &str, login: &str, action: KeyAction) -> Result<Value, &'static str> {
-    // This runs inside ox-host, which has no window to answer Keychain prompts.
-    #[cfg(target_os = "macos")]
-    {
-        use security_framework::os::macos::keychain::{KeychainUserInteractionLock, SecKeychain};
-        static NONINTERACTIVE: std::sync::OnceLock<Option<KeychainUserInteractionLock>> =
-            std::sync::OnceLock::new();
-        if NONINTERACTIVE
-            .get_or_init(|| SecKeychain::disable_user_interaction().ok())
-            .is_none()
-        {
-            return Err("The background host could not open Keychain without a prompt.");
-        }
-    }
+    super::background_keychain()?;
     let (origin, registry) = {
         let state = app.state.lock().unwrap();
         if !state.alive(device) {
@@ -153,7 +141,7 @@ fn execute(app: &App, device: &str, login: &str, action: KeyAction) -> Result<Va
                 .chars()
                 .take(64)
                 .collect();
-            let h = paired_hosts::enroll(invite, &label, &registry, true, accept).map_err(|_| {
+            let h = paired_hosts::enroll(invite, &label, &registry, true, None, accept).map_err(|_| {
                 "Could not save the pairing. Check this host’s credential store and connection, then try a fresh invitation."
             })?;
             Ok(description(&h))

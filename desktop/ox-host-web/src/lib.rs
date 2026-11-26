@@ -27,6 +27,11 @@ mod fixture {
         let dir =
             std::env::var_os("OX_TEST_REMOTE_DIR").expect("isolated browser test state directory");
         let root = std::path::PathBuf::from(dir);
+        let store = root.join("managed-host-fixture");
+        std::fs::create_dir(&store).unwrap();
+        std::fs::write(store.join("headless"), []).unwrap();
+        let updates = super::host_updates::Controller::open(&root, Some(&store), "1.0.0").unwrap();
+        assert!(super::host_updates::UPDATES.set(updates).is_ok());
         super::run(root.clone(), root.join("mock-host.sock")).unwrap();
     }
 }

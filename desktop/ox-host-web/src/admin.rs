@@ -59,6 +59,19 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         terminal: bool,
     },
+    WorkerLinks {
+        command: WorkerLinkAction,
+    },
+    #[cfg(feature = "client")]
+    WorkerAccess {
+        id: String,
+        before: WorkerGrant,
+        may_launch: bool,
+        ceiling: ox_desk_core::modes::Level,
+    },
+    WorkerInvitation {
+        login: String,
+    },
     Revoke {
         id: String,
     },
@@ -74,12 +87,25 @@ pub enum DeviceClass {
     #[default]
     Phone,
     Desktop,
+    Host,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[cfg(feature = "client")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerGrant {
+    /// Stable ID of the OX host that redeemed this invitation.
+    pub source: String,
+    pub may_launch: bool,
+    pub ceiling: ox_desk_core::modes::Level,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Device {
     #[serde(default)]
     pub class: DeviceClass,
+    #[cfg(feature = "client")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerGrant>,
     #[serde(default)]
     pub terminal: bool,
     pub id: String,
@@ -107,11 +133,23 @@ pub struct Reply {
     pub origin: Option<String>,
     pub port: u16,
     pub devices: Vec<Device>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_hosts: Vec<Device>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_links: Option<serde_json::Value>,
     pub pairing: Option<Pairing>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reservation: Option<String>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerLinkAction {
+    WorkerLinks,
+    AddWorkerLink { address: String, code: String },
+    LinkPairedHost { host: String },
+    RemoveWorkerLink { host: String },
+}
 // Listener configuration and terminal grants have a private, same-user administration socket.
 pub fn request(state_dir: &Path, req: &Request) -> io::Result<Reply> {
     exchange(state_dir, req).map(|(_, reply)| reply)
@@ -176,7 +214,14 @@ fn exchange(state_dir: &Path, req: &Request) -> io::Result<(UnixStream, Reply)> 
         ));
     }
     let mut stream = UnixStream::connect(path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(8)))?;
+    // Pairing can include several bounded HTTPS exchanges on the remote host.
+    stream.set_read_timeout(Some(Duration::from_secs(
+        if matches!(req, Request::WorkerLinks { .. }) {
+            75
+        } else {
+            8
+        },
+    )))?;
     stream.set_write_timeout(Some(Duration::from_secs(4)))?;
     serde_json::to_writer(&mut stream, req)?;
     stream.write_all(b"\n")?;

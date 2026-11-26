@@ -48,6 +48,24 @@ mod operator_handoff;
 mod remote_settings;
 #[path = "weather.rs"]
 mod weather;
+#[path = "worker_links.rs"]
+mod worker_links;
+fn background_keychain() -> Result<(), &'static str> {
+    // This runs inside ox-host, which has no window to answer Keychain prompts.
+    #[cfg(target_os = "macos")]
+    {
+        use security_framework::os::macos::keychain::{KeychainUserInteractionLock, SecKeychain};
+        static NONINTERACTIVE: std::sync::OnceLock<Option<KeychainUserInteractionLock>> =
+            std::sync::OnceLock::new();
+        if NONINTERACTIVE
+            .get_or_init(|| SecKeychain::disable_user_interaction().ok())
+            .is_none()
+        {
+            return Err("The background host could not open Keychain without a prompt.");
+        }
+    }
+    Ok(())
+}
 type ErrCode = StatusCode;
 const DENY: StatusCode = StatusCode::FORBIDDEN;
 pub fn run(state_dir: PathBuf, host_socket: PathBuf) -> io::Result<()> {
@@ -104,19 +122,26 @@ async fn serve(dir: PathBuf, socket: PathBuf) -> io::Result<()> {
         else {
             continue;
         };
-        if let Request::Update { command } = req {
-            let mut reply = app.state.lock().unwrap().reply(None);
+        if matches!(req, Request::Update { .. } | Request::WorkerLinks { .. }) {
+            let active = app.clone();
             tokio::spawn(async move {
-                let status =
-                    tokio::task::spawn_blocking(move || crate::host_updates::control(command))
-                        .await;
-                let result = status
-                    .map_err(|_| "The update service stopped".to_owned())
-                    .and_then(|s| s.map_err(|e| e.to_string()))
-                    .map(|s| {
-                        reply.update = Some(s);
-                        reply
-                    });
+                let result = tokio::task::spawn_blocking(move || -> io::Result<Reply> {
+                    let mut reply = active.state.lock().unwrap().reply(None);
+                    match req {
+                        Request::Update { command } => {
+                            reply.update = Some(crate::host_updates::control(command)?)
+                        }
+                        Request::WorkerLinks { command } => {
+                            reply.worker_links =
+                                Some(worker_links::execute(&active, None, command)?)
+                        }
+                        _ => unreachable!(),
+                    }
+                    Ok(reply)
+                })
+                .await
+                .map_err(|_| "Host settings service stopped".to_owned())
+                .and_then(|s| s.map_err(|e| e.to_string()));
                 if let Ok(mut bytes) = serde_json::to_vec(&result) {
                     bytes.push(b'\n');
                     let _ = tokio::time::timeout(Duration::from_secs(2), stream.write_all(&bytes))
@@ -195,7 +220,19 @@ async fn administer(
         ));
     }
     match req {
-        Request::Update { .. } => unreachable!("handled before Serve administration"),
+        Request::WorkerAccess {
+            id,
+            before,
+            may_launch,
+            ceiling,
+        } => app
+            .state
+            .lock()
+            .unwrap()
+            .edit_worker(&id, &before, may_launch, ceiling)?,
+        Request::Update { .. } | Request::WorkerLinks { .. } => {
+            unreachable!("handled before Serve administration")
+        }
         Request::HostProfile { edit } => {
             let state = app.state.lock().unwrap();
             let mut reply = state.reply(None);
@@ -203,6 +240,14 @@ async fn administer(
             return Ok(reply);
         }
         Request::Status => {}
+        Request::WorkerInvitation { login } => {
+            if listener.is_none() || staged.is_some() {
+                return Err(io::Error::other(
+                    "Enable remote access before inviting a worker host",
+                ));
+            }
+            pairing = Some(app.state.lock().unwrap().local_worker_invite(login)?);
+        }
         Request::Pair { login, terminal } => {
             if listener.is_none() || staged.is_some() {
                 return Err(io::Error::other(
@@ -459,6 +504,7 @@ fn start_listener(app: App, origin: String, listener: TcpListener) -> Listener {
         )
         .route("/api/pair", post(pair))
         .route("/api/challenge", post(challenge))
+        .route("/api/worker-link", post(worker_link))
         .route("/api/push", post(subscribe))
         .route("/api/weather", post(weather::weather))
         .route("/api/operator", get(operator::upgrade))
@@ -559,6 +605,13 @@ fn token(h: &HeaderMap) -> Result<&str, ErrCode> {
     Ok(token)
 }
 fn device(app: &App, h: &HeaderMap) -> Result<String, ErrCode> {
+    let id = paired_identity(app, h)?;
+    if app.state.lock().unwrap().device_class(&id) == Some(crate::admin::DeviceClass::Host) {
+        return Err(DENY);
+    }
+    Ok(id)
+}
+fn paired_identity(app: &App, h: &HeaderMap) -> Result<String, ErrCode> {
     let token = token(h)?;
     app.state
         .lock()
@@ -571,6 +624,7 @@ fn device(app: &App, h: &HeaderMap) -> Result<String, ErrCode> {
 struct Pair {
     #[serde(default)]
     class: crate::admin::DeviceClass,
+    source: Option<String>,
     code: String,
     key: String,
     signature: String,
@@ -591,7 +645,10 @@ async fn pair(
             &p.key,
             &p.signature,
             &p.label,
-            p.class,
+            state::Enrollment {
+                class: p.class,
+                source: p.source.as_deref(),
+            },
         )
         .ok_or(DENY)?;
     Ok((
@@ -616,8 +673,13 @@ async fn challenge(
     h: HeaderMap,
     Json(c): Json<Challenge>,
 ) -> Result<Response, ErrCode> {
-    let id = device(&app, &h)?;
+    let id = paired_identity(&app, &h)?;
     let mut s = app.state.lock().unwrap();
+    if (s.device_class(&id) == Some(crate::admin::DeviceClass::Host))
+        != (c.purpose == Purpose::Worker)
+    {
+        return Err(DENY);
+    }
     let terminal = s.terminal_generation(&id).is_some();
     if c.purpose == Purpose::Terminal && !terminal {
         return Err(DENY);
@@ -649,6 +711,47 @@ async fn challenge(
 pub(crate) struct Proof {
     pub nonce: String,
     pub signature: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerEnvelope {
+    proof: Proof,
+    request: String,
+}
+
+async fn worker_link(
+    Extract(app): Extract<App>,
+    headers: HeaderMap,
+    Json(body): Json<WorkerEnvelope>,
+) -> Result<Json<serde_json::Value>, ErrCode> {
+    let id = paired_identity(&app, &headers)?;
+    let mut state = app.state.lock().unwrap();
+    if !state.prove_worker(&id, &body.proof.nonce, &body.proof.signature, &body.request) {
+        return Err(DENY);
+    }
+    #[derive(Deserialize)]
+    #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+    enum Call {
+        Info,
+        RevokeSelf,
+    }
+    match serde_json::from_str(&body.request).map_err(|_| StatusCode::BAD_REQUEST)? {
+        Call::Info => {
+            let profile = state
+                .host_profile(None)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            Ok(Json(
+                json!({"id":state.host_id().map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?, "name":profile.name, "labels":profile.labels,
+                "policy":state.mode_policy(None).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?, "grant":state.worker_grant(&id)}),
+            ))
+        }
+        Call::RevokeSelf => {
+            state
+                .revoke(&id)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            Ok(Json(json!({"revoked":true})))
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

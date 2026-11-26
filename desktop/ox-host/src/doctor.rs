@@ -250,6 +250,18 @@ fn remote(paths: &Paths, report: &mut Report, tailscale: &Tailscale) {
             if d.terminal { ", terminal allowed" } else { "" }
         ));
     }
+    for host in &status.worker_hosts {
+        if let Some(grant) = &host.worker {
+            report.info(format!(
+                "worker host: {} ({}), launches {}, ceiling {}, last contact {}",
+                host.label,
+                host.login,
+                if grant.may_launch { "on" } else { "off" },
+                grant.ceiling.name(),
+                ago(now, host.last_used)
+            ));
+        }
+    }
     if !status.enabled {
         report.info("remote access: off");
         return;

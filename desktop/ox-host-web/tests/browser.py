@@ -1173,6 +1173,8 @@ def run(harness, screenshot=None):
         if copy_fixture:
             from key_copy import exercise as copy_keys
             copy_keys(js, wait, *copy_fixture[1:])
+            from key_copy import worker_links
+            worker_links(js, wait, *copy_fixture[-2:])
         export = {"action": "export_keys", "selected": [brave], "revision": after_transfer["revisions"]["keys"]}
         assert js("return import('./device.js').then(async m=>m.settingsRequest(await m.deviceKey(),"
                   + json.dumps(export) + ").then(()=>false,e=>e.status===403))")
