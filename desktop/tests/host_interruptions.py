@@ -1118,14 +1118,38 @@ def case_4(ctx):
     resume_checks(run, ctx, pre, "completed")
 
 
+def completed_parent_history(run):
+    """The exact history through the parent's reply to its worker completion notice."""
+    ctx = run.ctx
+    run.settle()
+    job = check_end_to_end(ctx, run)["job_id"]
+    notice = f"OX worker #{job}: completed (update 1).\n{FINAL}"
+    # Wait for the three distinct parent turns: prep, the delegating turn that
+    # reads status, and the automatic completion notice. The last provider
+    # request contains the notice, but its reply is only visible in the transcript.
+    def finished_turns():
+        return sum(c["kind"] == "notification" and c["event"] == "finished" and c["thread"] == run.thread
+                   for f in run.desk.frames for c in f.get("changes", []))
+    run.wait_until(lambda: finished_turns() >= 3 and run.lead_saw(notice), "the parent to answer its worker notice")
+    assert finished_turns() == 3
+    views = [lead_view(request) for request in lead_requests(ctx)]
+    status_request, = [view for view in views if any(block[:2] == ("tool_result", "toolu_lead_status")
+                                                     for block in view[-1][1])]
+    notice_input = ("user", [("text", notice)])
+    assert views[-1] == status_request + [("assistant", [("text", "LEAD-SAW")]), notice_input]
+    assert sum(view[-1] == notice_input for view in views) == 1
+    messages = [(i["role"], i["text"]) for i in transcript_items(desk_snapshot(ctx, run), run.thread)
+                if i["role"] in ("user", "assistant")]
+    assert messages[-2:] == [("user", notice), ("assistant", "LEAD-OK")], messages[-2:]
+    return views[-1] + [("assistant", [("text", messages[-1][1])])]
+
+
 def case_5(ctx):
     """After the reap, just before the first resend."""
     run = Run(ctx).boot()
     run.prep()
     run.send(LEAD_PROMPT, "go")
-    run.settle()
-    check_end_to_end(ctx, run)
-    pre = lead_view(lead_requests(ctx)[-1]) + [("assistant", [("text", "LEAD-SAW")])]
+    pre = completed_parent_history(run)
     before, ledger = ctx.journals(), ctx.ledger()
     run.desk.client.act(ctx.scope, "end", {"end_session": run.thread})
     reply = run.desk.wait(lambda f: f["type"] in ("ack", "error") and f.get("id") == "end", "end reply")
@@ -1157,9 +1181,7 @@ def case_6(ctx):
     run = Run(ctx).boot()
     run.prep()
     run.send(LEAD_PROMPT, "go")
-    run.settle()
-    check_end_to_end(ctx, run)
-    pre = lead_view(lead_requests(ctx)[-1]) + [("assistant", [("text", "LEAD-SAW")])]
+    pre = completed_parent_history(run)
     ctx.stop_host(kill=True)
     ledger_path = ctx.root / "state/ox/host/ownership-v1.json"
     good = ledger_path.read_bytes()
