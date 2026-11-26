@@ -5409,45 +5409,8 @@ mod tests {
             std::sync::mpsc::Receiver<ox_desk_core::links::LinkEvent>,
         ) {
             use ox_desk_core::store::claude::{Launcher, SUBSCRIPTION_PROVIDER};
-            use std::os::unix::fs::PermissionsExt;
             // The fixture's journal records the real cwd; macOS temp dirs sit behind /var -> /private/var.
             let root = &root.canonicalize().unwrap();
-            let helper = root.join("private-fixture");
-            std::fs::write(
-                &helper,
-                r#"#!/usr/bin/python3
-import json,sys
-mode=sys.argv[sys.argv.index("--permission-mode")+1] if "--permission-mode" in sys.argv else "default"
-sid=next((sys.argv[i+1] for i,a in enumerate(sys.argv) if a in ("--session-id","--resume")),"none")
-pinned=sys.argv[sys.argv.index("--model")+1] if "--model" in sys.argv else None
-picker=[{"value":"default","resolvedModel":"claude-opus-5-5","displayName":"Default (recommended)"},{"value":"fable","resolvedModel":"claude-fable-5-2","displayName":"Fable 5.2"}] if pinned else []
-open("argv-"+sid,"a").write(json.dumps(sys.argv)+"\n")
-if "--session-id" in sys.argv:
- import os,re
- d=os.path.join(os.getcwd(),"native","projects",re.sub("[^A-Za-z0-9]","-",os.path.realpath(os.getcwd())))
- os.makedirs(d,exist_ok=True)
- u="00000000-0000-4000-8000-0000000000"
- rows=[{"type":k,"uuid":u+n,"cwd":os.path.realpath(os.getcwd()),"sessionId":sid,"entrypoint":"sdk-cli","message":{"role":k,"id":u+n,"content":"hi" if k=="user" else [{"type":"text","text":"ok"}]}} for k,n in (("user","01"),("assistant","02"))]
- open(os.path.join(d,sid+".jsonl"),"w").write("".join(json.dumps(r)+"\n" for r in rows))
-for line in sys.stdin:
- r=json.loads(line)
- if r.get("type")=="control_request":
-  body=r["request"]
-  if body.get("subtype")=="set_permission_mode":
-   mode=body["mode"]
-   data={"mode":mode}
-  else:
-   data={"claude_code_version":"2.2.0","current_permission_mode":mode,"commands":[],"models":picker,"account":{"apiProvider":"firstParty","subscriptionType":"pro"}}
-  print(json.dumps({"type":"control_response","response":{"request_id":r["request_id"],"subtype":"success","response":data}}),flush=True)
- elif r.get("type")=="user":
-  print(json.dumps({"type":"user","message":r["message"],"uuid":r.get("uuid"),"session_id":sid,"isReplay":True}),flush=True)
-  if pinned:
-   print(json.dumps({"type":"assistant","uuid":"a-"+sid,"session_id":sid,"parent_tool_use_id":None,"message":{"id":"m-"+sid,"role":"assistant","model":next((m["resolvedModel"] for m in picker if pinned in (m["value"],m["resolvedModel"])),pinned),"content":[{"type":"text","text":"reviewed"}]}}),flush=True)
-  print(json.dumps({"type":"result","subtype":"success","is_error":False,"session_id":sid,"stop_reason":"end_turn","result":"ok"}),flush=True)
-"#,
-            )
-            .unwrap();
-            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
             let scope = Scope {
                 project: root.to_owned(),
                 route: Runtime::Claude.route(None),
@@ -5460,8 +5423,9 @@ for line in sys.stdin:
                     provider: SUBSCRIPTION_PROVIDER.into(),
                 },
                 Launcher {
-                    ox: helper,
-                    path: "/bin:/usr/bin".into(),
+                    ox: Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/worker-claude.py"),
+                    path: std::env::var_os("PATH").unwrap(),
                     profiles: ox_desk_core::claude::catalog::Profiles {
                         api: root.join("api"),
                         subscription: root.join("native"),
@@ -5474,8 +5438,20 @@ for line in sys.stdin:
                 },
             )
             .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(20);
             while !store.can_send(None) {
-                store.apply(rx.recv_timeout(Duration::from_secs(5)).unwrap());
+                if let ox_desk_core::store::Connection::Closed(reason) = store.state() {
+                    panic!("Claude fixture failed initialization: {reason}");
+                }
+                let event = rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "Claude fixture initialization: {err}, state {:?}",
+                            store.state()
+                        )
+                    });
+                store.apply(event);
             }
             store
                 .dispatch(Action::SendText(None, "lead first turn".into()))
@@ -6072,8 +6048,9 @@ for line in sys.stdin:
                     provider: ox_desk_core::store::claude::SUBSCRIPTION_PROVIDER.into(),
                 },
                 ox_desk_core::store::claude::Launcher {
-                    ox: root.path().join("private-fixture"),
-                    path: "/bin:/usr/bin".into(),
+                    ox: Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/worker-claude.py"),
+                    path: std::env::var_os("PATH").unwrap(),
                     profiles: ox_desk_core::claude::catalog::Profiles {
                         api: root.path().join("api"),
                         subscription: root.path().join("native"),

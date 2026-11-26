@@ -6,7 +6,6 @@ use ox_desk_core::{
 use serde_json::{Value, json};
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     time::Duration,
@@ -20,22 +19,7 @@ fn fixture(root: &Path, version: &str, account: Value) -> PathBuf {
     fs::write(root.join("initialize.response"),json!({"type":"control_response","response":{
         "subtype":"success","request_id":"ox-init","response":{"claude_code_version":version,"account":account,"commands":[],"models":[]}
     }}).to_string()+"\n").unwrap();
-    let exe = root.join("fixture");
-    fs::write(
-        &exe,
-        r#"#!/bin/sh
-printf '%s\n' "$@" > args
-IFS= read -r row || exit 1
-printf '%s\n' "$row" > wire
-cat initialize.response
-while IFS= read -r row; do
-  printf '%s\n' "$row" >> wire
-done
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
-    exe
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude-link.sh")
 }
 fn spawn(
     project: &Path,

@@ -4748,6 +4748,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shlex",
+ "socket2",
  "tempfile",
  "toml_edit 0.25.20+spec-1.1.0",
  "vt100",
