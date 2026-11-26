@@ -15,6 +15,8 @@ mod runtime;
 mod transport;
 mod updates;
 mod worker_notices;
+#[path = "../../../src/worker_placement.rs"]
+mod worker_placement;
 mod workers;
 mod yolo;
 

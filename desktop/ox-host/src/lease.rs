@@ -22,6 +22,7 @@ use std::{
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
+    WorkerPlacement,
     Lease {
         id: String,
         parent: Option<String>,
@@ -174,6 +175,7 @@ fn serve(
     let mut frame = vec![0; size];
     socket.read_exact(&mut frame)?;
     match serde_json::from_slice(&frame)? {
+        Request::WorkerPlacement => socket.write_all(&[1])?,
         Request::Lease { id, parent } => {
             groups.lock().unwrap().register(&id, parent, &socket)?;
             let result = (|| {

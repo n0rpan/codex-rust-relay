@@ -163,19 +163,12 @@ impl Engine {
         )?;
         let peers = paired_hosts::worker_links(&self.state_dir.join("worker-links.json"))
             .map_err(|e| e.to_string())?;
-        let mut matches = peers
+        let host = peers
             .into_iter()
-            .filter(|h| h.id == selector || h.name.eq_ignore_ascii_case(selector));
-        let host = matches.next().ok_or_else(|| {
-            format!(
-                "No paired worker host named {selector:?}. Use list_ox_hosts to see your hosts."
-            )
-        })?;
-        if matches.next().is_some() {
-            return Err(format!(
-                "Several worker hosts are named {selector:?}. Choose the host ID from list_ox_hosts."
-            ));
-        }
+            .find(|h| h.id == selector)
+            .ok_or_else(|| {
+                format!("Worker host {selector:?} is no longer paired. See list_ox_hosts.")
+            })?;
         let level = source.unwrap_or(crate::workers::TERMINAL_CEILING);
         if external && start.mode_request() == ModeRequest::Inherit {
             start.permission = Some(ModeRequest::Level(resolved.level));
@@ -205,7 +198,7 @@ impl Engine {
             operation: Operation::Start {
                 parent: parent_ref,
                 level,
-                start,
+                start: Box::new(start),
             },
         }
         .save(&queue)

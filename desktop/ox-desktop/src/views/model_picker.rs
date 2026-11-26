@@ -375,6 +375,7 @@ pub(super) struct ModelPicker {
     handoff: bool,
     /// Aliases found in settings that the session's own list lacks need a new session.
     discovered_new_session: bool,
+    target_catalog: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -411,8 +412,10 @@ impl ModelPicker {
                 match result {
                     Ok(settings) => {
                         this.favorites = settings.favorites;
-                        this.providers = settings.providers;
-                        this.add_aliases(settings.aliases);
+                        if !this.target_catalog {
+                            this.providers = settings.providers;
+                            this.add_aliases(settings.aliases);
+                        }
                     }
                     Err(error) => this.notice = Some(error),
                 }
@@ -435,8 +438,18 @@ impl ModelPicker {
             providers: true,
             handoff: false,
             discovered_new_session: false,
+            target_catalog: false,
             _subscriptions: subscriptions,
         }
+    }
+
+    pub(super) fn with_target_aliases(mut self, aliases: Vec<String>) -> Self {
+        self.target_catalog = true;
+        if aliases.is_empty() {
+            self.notice = Some("This worker host reports no API models for this runtime.".into());
+        }
+        self.add_aliases(aliases);
+        self
     }
 
     /// Show the "Run with" control, starting on `runtime`.
@@ -934,7 +947,11 @@ impl Render for ModelPicker {
             .w_full();
             view = view.child(list);
         }
-        match footer(&self.entries, self.providers) {
+        match if self.target_catalog {
+            Footer::None
+        } else {
+            footer(&self.entries, self.providers)
+        } {
             Footer::None => {}
             Footer::AddProvider => {
                 view = view.child(kit::toolbar_button(

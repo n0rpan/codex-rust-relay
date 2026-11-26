@@ -155,9 +155,15 @@ class Host(socketserver.StreamRequestHandler):
                             "version": 1,
                             "routes": [f.scope["route"]],
                             "projects": [f.scope["project"]],
-                            "capabilities": ["snapshot", "resume", "actions"],
+                            "capabilities": ["snapshot", "resume", "actions", "worker_placement"],
                         }
                     )
+                elif frame["type"] == "worker_hosts":
+                    assert frame["project"] == f.scope["project"]
+                    send({"type":"worker_reply","id":frame["id"],"result":{"hosts":[
+                        {"host":{"id":"laptop","name":"laptop"},"status":"online","parent_host":True,"routes":[f.scope["route"]]},
+                        {"host":{"id":"build-id","name":"Build","resources":{"load_one_minute":0.4,"available_memory":64_000_000_000}},
+                         "status":"online","parent_host":False,"routes":[{"runtime":"claude","billing":{"api":"build/only"}}]}]}})
                 elif frame["type"] == "discover":
                     send(
                         {
@@ -283,6 +289,10 @@ class Host(socketserver.StreamRequestHandler):
                         assert command in ("/status", "/project:lint src/mobile.rs")
                         f.detail["notice"] = "Native status received" if command == "/status" else "Native lint received"
                         changes.append({"kind":"state","connection":"ready","capabilities":f.caps,"detail":f.detail})
+                    if "start_worker" in action:
+                        refused = action["start_worker"]["task"] == "Unmet hardware"
+                        send({"type":"worker_reply","id":frame["id"],"error":"No host has 128 CPUs" if refused else None,
+                              "result":None if refused else {"job_id":52,"status":"running","model":"fixture/demo"}})
                     if changes:
                         sequence += 1
                         send({"type":"delta", "scope":f.scope, "cursor":{"epoch":"fixture","seq":sequence}, "changes":changes})
@@ -1038,8 +1048,29 @@ def run(harness, screenshot=None):
         js("document.getElementById('worker-runtime').value='claude';document.getElementById('worker-task').value='Check the pool limits';document.getElementById('worker-form').requestSubmit()")
         wait(lambda: any(isinstance(a, dict) and a.get("start_worker", {}).get("parent") == "child"
                          and a["start_worker"]["task"] == "Check the pool limits" for a in host.actions))
+        wait(lambda: js("return document.getElementById('worker-form').hidden"))
         assert any(a["start_worker"].get("permission") == "inherit" for a in host.actions
                    if isinstance(a, dict) and "start_worker" in a), "workers inherit by default"
+        js("document.getElementById('start-worker').click()")
+        wait(lambda: js("return [...document.getElementById('worker-host').options].some(o=>o.value==='build-id' && o.text.includes('64.0 GB free'))"))
+        choose("worker-runtime","claude")
+        choose("worker-host","build-id")
+        choose("worker-model","build/only")
+        js("document.getElementById('worker-task').value='Remote-only model'; document.getElementById('worker-form').requestSubmit()")
+        wait(lambda: any(a.get("start_worker",{}).get("host")=="build-id" and a["start_worker"]["model"]=="build/only" for a in host.actions if isinstance(a,dict)))
+        wait(lambda: js("return document.getElementById('worker-form').hidden"))
+        js("document.getElementById('start-worker').click()")
+        wait(lambda: js("return [...document.getElementById('worker-host').options].some(o=>o.value==='auto')"))
+        choose("worker-runtime","claude")
+        choose("worker-host","auto")
+        choose("worker-model","build/only")
+        js("document.getElementById('worker-memory').value='64'; document.getElementById('worker-cpus').value='8'; document.getElementById('worker-gpu').checked=true; document.getElementById('worker-os').value='linux'; document.getElementById('worker-task').value='Run on the build machine'; document.getElementById('worker-form').requestSubmit()")
+        wait(lambda: any(a.get("start_worker",{}).get("needs")=={"memory_gb":64,"cpus":8,"gpu":True,"os":"linux"} and a["start_worker"]["host"]=="auto" for a in host.actions if isinstance(a,dict)))
+        wait(lambda: js("return document.getElementById('worker-form').hidden"))
+        js("document.getElementById('start-worker').click(); document.getElementById('worker-task').value='Unmet hardware'; document.getElementById('worker-form').requestSubmit()")
+        wait(lambda: js("return !document.getElementById('worker-submit').disabled && !document.getElementById('worker-form').hidden && document.getElementById('worker-task').value==='Unmet hardware'") and any(a.get("start_worker", {}).get("task") == "Unmet hardware" for a in host.actions if isinstance(a,dict)))
+        js("document.getElementById('worker-cancel').click()")
+        print("PASS Chromium worker placement, target-only model and optional Auto requirements",flush=True)
         # The operator continues the open session in another route with the inherited mode.
         js("document.getElementById('continue-in').click()")
         js("const r=document.getElementById('handoff-runtime');for(const v of ['codex','claude']){r.value=v;r.dispatchEvent(new Event('change'));if(document.getElementById('handoff-route').options.length)break}"

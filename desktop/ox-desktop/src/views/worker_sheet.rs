@@ -1,6 +1,7 @@
 //! The "Start worker" and "Continue in…" sheets. They dispatch the same `StartWorker` and
 //! `StartHandoff` actions as the `/worker` and `/handoff` commands. The commands stay as
 //! shortcuts; these sheets show the same choices as fields.
+mod hosts;
 use super::handoff_sheet::{self, HandoffDraft};
 use super::model_picker::{ModelPicker, ModelPickerEvent};
 use super::workbench::Workbench;
@@ -53,10 +54,11 @@ pub(super) struct WorkerDraft {
     pub choice: Choice,
     pub mode: WorkerMode,
     pub task: Entity<TextareaState>,
+    hosts: hosts::Picker,
 }
 
 pub(super) enum Launch {
-    Worker(WorkerDraft),
+    Worker(Box<WorkerDraft>),
     Handoff(HandoffDraft),
 }
 
@@ -150,6 +152,8 @@ pub(super) fn worker_start(
     let yolo = yolo_confirmed(permission);
     let start = WorkerStart {
         host: None,
+        needs: None,
+        placement: None,
         parent: owner.to_owned(),
         runtime,
         model: model_or_none(model),
@@ -234,11 +238,13 @@ impl Workbench {
                         .placeholder("What should the worker do?")
                 });
                 task.read(cx).focus_handle(cx).focus(window, cx);
-                Launch::Worker(WorkerDraft {
+                let hosts = hosts::Picker::new(self.link.clone(), self.project.clone(), window, cx);
+                Launch::Worker(Box::new(WorkerDraft {
+                    hosts,
                     choice,
                     mode: WorkerMode::Session,
                     task,
-                })
+                }))
             }
             LaunchKind::Handoff => {
                 let request = cx.new(|cx| {
@@ -283,6 +289,7 @@ impl Workbench {
     }
 
     pub(super) fn set_launch_runtime(&mut self, runtime: Runtime, cx: &mut Context<Self>) {
+        self.launch_picker = None;
         self.set_launch_choice(|c| c.runtime = runtime, cx);
         if let Some(Launch::Worker(draft)) = self.launch.as_mut()
             && !mode_allowed(runtime, draft.mode)
@@ -327,13 +334,24 @@ impl Workbench {
         // The target is an OX API alias, so the source session's own native command models
         // (subscription names like "default") are not candidates. Any catalog model may be
         // chosen, starred or not: the picker lists settings and the discovered catalog.
-        let picker =
-            cx.new(|cx| ModelPicker::new(self.link.clone(), vec![], window, cx).with_catalog(cx));
+        let aliases = match launch {
+            Launch::Worker(draft) => draft.hosts.aliases(draft.choice.runtime),
+            _ => None,
+        };
+        let picker = cx.new(|cx| {
+            let picker = ModelPicker::new(self.link.clone(), vec![], window, cx);
+            match aliases {
+                Some(aliases) => picker.with_target_aliases(aliases),
+                None => picker.with_catalog(cx),
+            }
+        });
         let subscription = cx.subscribe_in(
             &picker,
             window,
             |s: &mut Workbench, _, event: &ModelPickerEvent, _, cx| match event {
-                ModelPickerEvent::Choose(id) => s.choose_launch_model(Some(id.clone()), cx),
+                ModelPickerEvent::Choose(id) => {
+                    s.choose_launch_model(Some(super::model_picker::bare(id).to_owned()), cx)
+                }
                 ModelPickerEvent::Close => {
                     s.launch_picker = None;
                     cx.notify();
@@ -360,7 +378,10 @@ impl Workbench {
                     c.model.as_deref(),
                     &task,
                 )
-                .map(DeskAction::StartWorker)
+                .and_then(|mut start| {
+                    draft.hosts.apply(&mut start, cx)?;
+                    Ok(DeskAction::StartWorker(start))
+                })
             }
             Some(Launch::Handoff(draft)) => {
                 let request = draft.request.read(cx).value().to_string();
@@ -420,7 +441,10 @@ impl Workbench {
         let default = self
             .store
             .as_ref()
-            .filter(|s| s.profile().route.runtime == choice.runtime)
+            .filter(|s| {
+                s.profile().route.runtime == choice.runtime
+                    && !matches!(&self.launch, Some(Launch::Worker(d)) if !d.hosts.same_as_parent())
+            })
             .and_then(|store| {
                 let caps = store.command_caps(Some(&choice.owner));
                 let id = caps.default_model()?.to_owned();
@@ -579,6 +603,7 @@ impl Workbench {
         match launch {
             Launch::Worker(draft) => {
                 body = body
+                    .child(self.host_row(p, draft, cx))
                     .child(self.mode_row(p, draft, cx))
                     .child(self.model_row(p, kind, &choice, cx));
             }

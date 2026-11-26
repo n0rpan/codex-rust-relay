@@ -239,6 +239,17 @@ impl Access {
                 self.selected = None;
                 true
             }
+            Client::WorkerHosts { id, project }
+                if self.ready && !id.is_empty() && id.len() <= 96 =>
+            {
+                self.projects.contains(project)
+                    || app
+                        .discovered
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|s| &s.project == project)
+            }
             // A read-only listing of the host's live processes, answered by `Server::Processes`.
             Client::ListProcesses { id } if self.ready && id.len() <= 96 && !id.is_empty() => true,
             Client::Subscribe {

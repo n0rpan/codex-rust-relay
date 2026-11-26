@@ -155,8 +155,31 @@ impl HostLink {
         } else {
             15
         });
+        let placement = start.as_ref().is_some_and(|s| {
+            !s["placement"].is_null()
+                || !s["needs"].is_null()
+                || s["host"]
+                    .as_str()
+                    .is_some_and(|h| h == "auto" || h.starts_with("label:"))
+        });
+        let explicit_parent = start
+            .as_ref()
+            .is_some_and(|s| s["host"] == "parent" && !placement);
+        let update =
+            "Update the parent OX host to choose a worker host by requirements or project rules.";
         tokio::task::spawn_blocking(move || match self {
             Self::Hosted { addr, scope } => {
+                let mut start = start;
+                if (placement || explicit_parent)
+                    && request(&addr, json!({"type":"worker_placement"})).is_err()
+                {
+                    if placement {
+                        return Err(update.into());
+                    }
+                    if let Some(v) = start.as_mut().and_then(Value::as_object_mut) {
+                        v.remove("host");
+                    }
+                }
                 let body = match (start, call) {
                     (Some(mut start), _) => {
                         start["parent"] = hint.unwrap_or_default().into();
@@ -204,12 +227,39 @@ impl HostLink {
                         json!({"type":"worker_call","id":id,"caller":caller,"call":call})
                     }
                 };
-                for line in [json!({"type":"hello","version":1}), frame] {
-                    let mut bytes = serde_json::to_vec(&line).map_err(|e| e.to_string())?;
-                    bytes.push(b'\n');
-                    stream.write_all(&bytes).map_err(|e| e.to_string())?;
+                stream
+                    .write_all(b"{\"type\":\"hello\",\"version\":1}\n")
+                    .map_err(|e| e.to_string())?;
+                let mut reader = io::BufReader::new(stream);
+                let mut frame = frame;
+                if placement || explicit_parent {
+                    let mut hello = String::new();
+                    io::BufRead::read_line(&mut reader, &mut hello).map_err(|e| e.to_string())?;
+                    let hello: Value = serde_json::from_str(&hello).map_err(|e| e.to_string())?;
+                    if hello["type"] != "hello" {
+                        return Err(hello["message"]
+                            .as_str()
+                            .unwrap_or("The session host did not return a hello.")
+                            .to_owned());
+                    }
+                    if !hello["capabilities"]
+                        .as_array()
+                        .is_some_and(|caps| caps.iter().any(|c| c == "worker_placement"))
+                    {
+                        if placement {
+                            return Err(update.into());
+                        }
+                        if let Some(s) = frame["start"].as_object_mut() {
+                            s.remove("host");
+                        }
+                    }
                 }
-                let reader = io::BufReader::new(stream);
+                let mut bytes = serde_json::to_vec(&frame).map_err(|e| e.to_string())?;
+                bytes.push(b'\n');
+                reader
+                    .get_mut()
+                    .write_all(&bytes)
+                    .map_err(|e| e.to_string())?;
                 for line in io::BufRead::lines(reader) {
                     let line =
                         line.map_err(|_| "The session host did not answer the worker request.")?;
@@ -259,6 +309,65 @@ mod parent_lease_tests {
             .get_envs()
             .find(|(key, _)| *key == PARENT_LEASE)
             .and_then(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn older_host_keeps_parent_starts_and_refuses_advanced_placement() {
+        use std::{io::BufRead, os::unix::net::UnixListener};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("host.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            for advanced in [false, true] {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(4)))
+                    .unwrap();
+                let mut reader = io::BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                writeln!(
+                    reader.get_mut(),
+                    "{}",
+                    json!({"type":"hello","capabilities":[]})
+                )
+                .unwrap();
+                line.clear();
+                let length = reader.read_line(&mut line).unwrap();
+                if advanced {
+                    assert_eq!(length, 0);
+                    continue;
+                }
+                let start: Value = serde_json::from_str(&line).unwrap();
+                assert!(start["start"].get("host").is_none());
+                writeln!(
+                    reader.get_mut(),
+                    "{}",
+                    json!({"type":"worker_reply","id":start["id"],"result":{"ok":true}})
+                )
+                .unwrap();
+            }
+        });
+        for advanced in [false, true] {
+            let target = if advanced { "auto" } else { "parent" };
+            let result = HostLink::External {
+                socket: path.clone(),
+            }
+            .send(
+                "fixture".into(),
+                json!({}),
+                None,
+                Some(json!({"host":target})),
+                None,
+            )
+            .await;
+            if advanced {
+                assert!(result.unwrap_err().contains("Update the parent"));
+            } else {
+                assert_eq!(result.unwrap(), json!({"ok":true}));
+            }
+        }
+        server.join().unwrap();
     }
 
     #[test]

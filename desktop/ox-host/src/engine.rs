@@ -337,7 +337,7 @@ pub(crate) struct Engine {
     preparing: Vec<Preparing>,
     reading: Vec<Reading>,
     forward: forwarding::State,
-    host_queries: HashMap<PathBuf, Vec<Replier>>,
+    host_queries: HashMap<PathBuf, Vec<HostQuery>>,
     in_flows: bool,
     draining: Option<Instant>,
     state_dir: PathBuf,
@@ -349,6 +349,8 @@ mod flows;
 mod forward_queue;
 pub(crate) mod forwarding;
 mod linked;
+mod placement;
+use placement::HostQuery;
 mod mode_requests;
 mod notices;
 
@@ -569,9 +571,7 @@ impl Engine {
                     }
                 }
                 Some(Message::HostsListed(project, result)) => {
-                    for reply in self.host_queries.remove(&project).unwrap_or_default() {
-                        self.answer(reply, result.clone())?;
-                    }
+                    self.hosts_listed(project, result)?
                 }
                 Some(Message::Outbound(event)) => self.outbound(*event)?,
                 Some(Message::LinkedJob(job, reply)) => self.linked_job(*job, reply)?,
@@ -732,6 +732,7 @@ impl Engine {
                 .map(str::to_owned)
                 .into();
                 capabilities.push("worker_inventory".into());
+                capabilities.push("worker_placement".into());
                 capabilities.push("linked_read_workers".into());
                 if prepared.is_some() {
                     capabilities.push("worker_routes_known".into());
@@ -819,6 +820,16 @@ impl Engine {
                     Some(_) => Err(io::Error::other(
                         "This connection already declared a different surface",
                     )),
+                }
+            }
+            Client::WorkerHosts { id: key, project } => {
+                let reply = Replier::Client(id, key);
+                if !key_ok(&reply) {
+                    return self.answer(reply, Err("Invalid worker inventory request.".into()));
+                }
+                match project.canonicalize() {
+                    Ok(project) => self.query_hosts(project, HostQuery::List(reply)),
+                    Err(e) => self.answer(reply, Err(e.to_string())),
                 }
             }
             Client::ListProcesses { id: key } => {
@@ -2153,24 +2164,6 @@ impl Engine {
                 .filter(|j| j.preparing())
                 .count()
     }
-    /// Check policy, then hand the launch to the worker's own runtime. Nothing
-    /// starts unless every check passes. The reply waits for the native session,
-    /// or, for a YOLO child that needs the operator, returns at once with
-    /// `waiting_for_operator`.
-    fn launch(&mut self, caller: Caller, mut start: WorkerStart, reply: Replier) -> io::Result<()> {
-        if self.update_reserved() {
-            return self.answer(reply, Err(crate::handover::REFUSAL.into()));
-        }
-        if let Some(host) = start.host.take()
-            && host != "parent"
-            && host != self.host_id.to_string()
-        {
-            let result = self.forward_launch(caller, start, &host);
-            return self.answer(reply, result);
-        }
-        let accepted = self.accept_launch(&caller, start);
-        self.start_accepted(accepted, reply)
-    }
     fn start_accepted(
         &mut self,
         accepted: Result<Accepted, String>,
@@ -2520,50 +2513,6 @@ impl Engine {
                 .filter(|c| c.catalog || c.subscription.is_some())
                 .count(),
         }
-    }
-    fn list_hosts(&mut self, caller: &Caller, reply: Replier) -> io::Result<()> {
-        use crate::workers::Resolved;
-        let project = match self.resolve(caller) {
-            Ok(Resolved::Hosted { scope, .. }) => scope.project,
-            Ok(Resolved::Terminal { project, .. }) => project,
-            Ok(Resolved::Linked { .. }) => {
-                return self.answer(reply, Err("Query worker hosts on the parent host.".into()));
-            }
-            Err(error) => return self.answer(reply, Err(error)),
-        };
-        if let Some(waiting) = self.host_queries.get_mut(&project) {
-            waiting.push(reply);
-            return Ok(());
-        }
-        self.host_queries.insert(project.clone(), vec![reply]);
-        let host = self.host_info();
-        let config = self.config.clone();
-        let registry = self.state_dir.join("worker-links.json");
-        let tx = self.tx.clone();
-        thread::spawn(move || {
-            let runtimes = config.installed_runtimes();
-            let prepared = config.prepare();
-            let routes: Vec<_> = prepared
-                .as_ref()
-                .into_iter()
-                .flat_map(|p| {
-                    p.routes.iter().filter(|r| {
-                        runtimes.contains(&r.runtime) && (!r.is_api() || p.has_api_provider())
-                    })
-                })
-                .collect();
-            let local = json!({"host":host, "parent_host":true, "status":"online", "runtimes":runtimes,
-                "routes":routes, "routes_known":prepared.is_ok(), "has_project":true});
-            let result = ox_host_web::inventory::list(
-                &registry,
-                &project,
-                host.id.as_deref().unwrap_or_default(),
-                local,
-            )
-            .map_err(|e| e.to_string());
-            let _ = tx.send(Message::HostsListed(project, result));
-        });
-        Ok(())
     }
     /// The parent agent's four tools. Every answer comes from host session state.
     fn parent_call(&mut self, caller: &Caller, call: ParentCall) -> Result<Value, String> {
@@ -3950,6 +3899,8 @@ mod tests {
     fn internal_dispatch_paths_name_their_own_sender() {
         let worker = Payload::Worker(WorkerStart {
             host: None,
+            needs: None,
+            placement: None,
             parent: "p".into(),
             subscription_model: None,
             checkout: None,
@@ -4286,6 +4237,8 @@ mod tests {
         fn start(write: bool) -> WorkerStart {
             WorkerStart {
                 host: None,
+                needs: None,
+                placement: None,
                 parent: String::new(),
                 runtime: Runtime::Codex,
                 model: Some("fixture".into()),
@@ -4950,6 +4903,8 @@ mod tests {
                 None,
                 &WorkerStart {
                     host: None,
+                    needs: None,
+                    placement: None,
                     parent: String::new(),
                     runtime: Runtime::Codex,
                     model: Some("fixture".into()),

@@ -51,6 +51,11 @@ pub enum Client {
     /// Reserve a quiescent host until this same-user connection closes.
     ReserveIdleUpdate,
     WatchCatalog,
+    /// List the execution hosts linked to this host for a project. Answers WorkerReply.
+    WorkerHosts {
+        id: String,
+        project: PathBuf,
+    },
     /// Opt in to host-wide samples, including when no projects are open.
     WatchHost,
     TerminalPreview {

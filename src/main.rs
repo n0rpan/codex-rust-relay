@@ -38,6 +38,7 @@ mod upstream;
 mod version;
 mod weather;
 mod worker_checkout;
+mod worker_placement;
 mod workers;
 
 use std::collections::BTreeSet;

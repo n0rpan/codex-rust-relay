@@ -30,7 +30,7 @@ pub enum Operation {
     Start {
         parent: ParentRef,
         level: Level,
-        start: WorkerStart,
+        start: Box<WorkerStart>,
     },
     Control {
         call: ParentCall,
@@ -198,7 +198,7 @@ mod tests {
         let start = request(Operation::Start {
             parent,
             level: Level::Yolo,
-            start,
+            start: Box::new(start),
         });
         let status = request(Operation::Control {
             call: ParentCall::Status { job_id: 42 },

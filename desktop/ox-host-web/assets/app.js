@@ -331,6 +331,7 @@ class Link {
         routes = msg.routes;
         projects = msg.projects;
       }
+      this.placement = msg.capabilities.includes("worker_placement");
       const liveCatalog =
         !this.scope && msg.capabilities.includes("live_catalog");
       this.send(
@@ -390,6 +391,19 @@ class Link {
       return;
     }
     if (msg.type === "worker_reply") {
+      if (this.inventoryRequest === msg.id) {
+        this.inventoryRequest = null;
+        if (this === detailLink && !$("worker-form").hidden) showWorkerHosts(msg.result, msg.error);
+        return;
+      }
+      if (workerSubmission === msg.id) {
+        workerSubmission = null;
+        $("worker-submit").disabled = false;
+        if (!msg.error) {
+          $("worker-form").hidden = true;
+          $("worker-task").value = "";
+        }
+      }
       if (!msg.error && msg.result?.relation === "handoff") {
         notice(`Continued in ${routesLabel(msg.result.scope.route)}.`);
         if (pendingGrant?.key === msg.id)
@@ -453,6 +467,8 @@ class Link {
   lost() {
     if (this.closed) return;
     this.ready = false;
+    this.inventoryRequest = null;
+    if (this === detailLink) { workerSubmission = null; $("worker-submit").disabled = false; }
     if (!this.scope) {
       this.discoveryResult = null;
       notificationTarget.reconnect();
@@ -517,6 +533,8 @@ class Link {
   close() {
     this.closed = true;
     this.ready = false;
+    this.inventoryRequest = null;
+    if (this === detailLink) { workerSubmission = null; $("worker-submit").disabled = false; }
     if (!this.scope) notificationTarget.reconnect();
     clearTimeout(this.timer);
     this.socket?.close();
@@ -729,6 +747,7 @@ function home() {
   repaint();
 }
 function open(scope, id) {
+  $("worker-form").hidden = true;
   controls.reset();
   detailLink?.close();
   selected = { scope, id, revealLatest: Boolean(id) };
@@ -2026,12 +2045,62 @@ function addCatalogRoutes() {
 // The model the worker sheet should start from: the parent session's route, set when
 // the sheet opens (desktop worker_sheet.rs Choice::new). Cleared when the runtime changes.
 let workerSeed = null;
+let workerSubmission = null;
+let workerHosts = [];
+function requestWorkerHosts() {
+  if (!detailLink?.ready || !detailLink.placement || detailLink.inventoryRequest || $("worker-form").hidden) return;
+  detailLink.inventoryRequest = crypto.randomUUID();
+  detailLink.send({type:"worker_hosts", id:detailLink.inventoryRequest, project:detailLink.scope.project});
+}
+function showWorkerHosts(result, error) {
+  $("worker-inventory-note").textContent = error || result?.warning || result?.placement_error || "";
+  if (!result?.hosts) return;
+  workerHosts = result.hosts;
+  const select = $("worker-host"), previous = select.value;
+  const options = workerHosts.map(row => {
+    const name = row.parent_host ? "Same as parent" : row.paired_name || row.host.name;
+    const r = row.host.resources;
+    const info = r ? `load ${r.load_one_minute.toFixed(1)} · ${(r.available_memory / 1e9).toFixed(1)} GB free` : row.status;
+    const opt = new Option(name + " · " + info, row.parent_host ? "parent" : row.host.id);
+    opt.disabled = row.status !== "online";
+    return opt;
+  });
+  if (result.project_placement) {
+    const rule = result.project_placement;
+    options.push(new Option(["Project rule", rule.host || "Prefer parent", rule.os].filter(Boolean).join(" · "), "project"));
+  }
+  options.push(new Option("Auto", "auto"));
+  // Keep an explicit choice visible if the link was removed while the sheet was open.
+  if (previous && !options.some(o => o.value === previous)) {
+    const gone = new Option(select.selectedOptions[0].text + " · unavailable", previous);
+    gone.disabled = true;
+    options.push(gone);
+  }
+  select.replaceChildren(...options);
+  select.value = previous || "parent";
+  fillWorkerModels();
+}
+function workerRoutes() {
+  const host = $("worker-host").value;
+  if (!detailLink?.placement || host === "parent") return null;
+  return workerHosts.filter(r => r.status === "online" && (host === "auto" || host === "project" || r.host.id === host)).flatMap(r => r.routes || []);
+}
+$("worker-host").onchange = () => {
+  const auto = $("worker-host").value === "auto";
+  $("worker-needs").hidden = $("worker-needs").disabled = !auto;
+  workerSeed = null;
+  fillWorkerModels();
+};
+$("worker-model").onchange = () => { workerSeed = null; };
+setInterval(() => { if (!document.hidden) requestWorkerHosts(); }, 30_000);
 function fillWorkerModels() {
   const select = $("worker-model"),
     runtime = $("worker-runtime").value,
     current = workerSeed ? workerSeed.model : select.value,
-    starred = modelChoices.starred,
-    rest = modelChoices.all.filter((m) => !starred.includes(m));
+    eligible = workerRoutes(),
+    aliases = eligible ? [...new Set(eligible.filter(r => r.runtime === runtime && r.billing?.api).map(r => r.billing.api))] : modelChoices.all,
+    starred = modelChoices.starred.filter(m => aliases.includes(m)),
+    rest = aliases.filter((m) => !starred.includes(m));
   const option = (m) => new Option(m, m);
   // A Codex worker needs an OX API model (desktop worker_sheet.rs subscription_ok).
   const subscription = new Option(
@@ -2050,7 +2119,7 @@ function fillWorkerModels() {
   if (runtime === "codex" && !select.value && select.options.length > 1)
     select.value = select.options[1].value;
   // Free text is the fallback only when the phone has no model list at all.
-  const free = !modelChoices.all.length;
+  const free = !aliases.length;
   select.hidden = free;
   $("worker-model-free").hidden = !free;
 }
@@ -2130,6 +2199,15 @@ $("worker-runtime").onchange = () => {
 $("worker-permission").onchange = renderWorkerPermission;
 $("start-worker").onclick = () => {
   // Start from the parent session's route, as the desktop sheet does.
+  workerSubmission = null;
+  $("worker-submit").disabled = false;
+  workerHosts = [];
+  $("worker-placement").hidden = !detailLink?.placement;
+  $("worker-host").replaceChildren(new Option("Same as parent","parent"));
+  $("worker-needs").hidden = $("worker-needs").disabled = true;
+  for (const id of ["worker-memory","worker-cpus","worker-os"]) $(id).value = "";
+  $("worker-gpu").checked = false;
+  $("worker-inventory-note").textContent = detailLink?.placement ? "Loading worker hosts…" : "";
   const route = selected?.scope?.route;
   if (route) {
     $("worker-runtime").value = route.runtime;
@@ -2139,6 +2217,7 @@ $("start-worker").onclick = () => {
   renderWorkerMode();
   renderWorkerPermission();
   $("worker-form").hidden = false;
+  requestWorkerHosts();
   $("worker-task").focus();
   loadModelChoices();
 };
@@ -2156,7 +2235,7 @@ $("worker-form").onsubmit = (e) => {
   // No model chosen means the runtime's subscription, which must be configured.
   if (
     !workerModelValue() &&
-    !routes.some((r) => r.runtime === runtime && r.billing === "subscription")
+    !(workerRoutes() || routes).some((r) => r.runtime === runtime && r.billing === "subscription")
   ) {
     notice(
       `${runtimeName(runtime)} has no subscription configured on this host. Choose an OX API model or sign in on the host.`,
@@ -2175,13 +2254,24 @@ $("worker-form").onsubmit = (e) => {
     // Choosing YOLO in the sheet is the confirmation, as for any YOLO change.
     yolo_confirmed: permission === "yolo",
   };
-  detailLink?.act({ start_worker: start }, null, (ok, message) => {
-    if (!ok) notice(message || "The host refused this worker.");
-    else {
-      $("worker-form").hidden = true;
-      $("worker-task").value = "";
+  if (detailLink?.placement) {
+    if ($("worker-host").value !== "project") start.host = $("worker-host").value;
+    if (start.host === "auto") {
+      start.needs = {gpu:$("worker-gpu").checked};
+      if ($("worker-memory").value) start.needs.memory_gb = $("worker-memory").valueAsNumber;
+      if ($("worker-cpus").value) start.needs.cpus = $("worker-cpus").valueAsNumber;
+      if ($("worker-os").value.trim()) start.needs.os = $("worker-os").value.trim();
+    }
+  }
+  if (workerSubmission) return;
+  workerSubmission = detailLink?.act({ start_worker: start }, null, (ok, message, id) => {
+    if (!ok && id === workerSubmission) {
+      workerSubmission = null;
+      $("worker-submit").disabled = false;
+      notice(message || "The host refused this worker.");
     }
   });
+  $("worker-submit").disabled = Boolean(workerSubmission);
 };
 $("draft").oninput = () => {
   mentionInput();

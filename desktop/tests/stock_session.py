@@ -252,7 +252,7 @@ class Fixture(BaseHTTPRequestHandler):
                     names=[t["function"]["name"] for t in req["tools"]]
                     name = next((n for n in names if n.endswith("start_ox_worker")),None)
                     assert name is not None, names
-                    args = {"host":self.server.target,"runtime":"codex","mode":"session","permission_mode":"read",
+                    args = {"needs":{"memory_gb":1,"cpus":1,"os":"linux"},"runtime":"codex","mode":"session","permission_mode":"read",
                             "model":"fixture/demo","task":"Read tracked and send its contents to the parent."}
                     calls = (name,args)
             elif self.server.mode == "linked-worker":

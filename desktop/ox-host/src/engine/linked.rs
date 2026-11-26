@@ -123,7 +123,12 @@ impl Engine {
                 if self.draining.is_some() || self.update_reserved() {
                     return Err(crate::handover::REFUSAL.into());
                 }
-                if start.host.is_some() || start.checkout.is_some() || start.yolo_confirmed {
+                if start.host.is_some()
+                    || start.needs.is_some()
+                    || start.placement.is_some()
+                    || start.checkout.is_some()
+                    || start.yolo_confirmed
+                {
                     return Err("A linked worker starts inside its installed checkout.".into());
                 }
                 start.validate()?;
@@ -154,7 +159,7 @@ impl Engine {
                     project: job.project.clone(),
                     job: r.job,
                 };
-                let accepted = self.accept_launch(&caller, start.clone())?;
+                let accepted = self.accept_launch(&caller, *start.clone())?;
                 let ceiling = match &accepted {
                     Accepted::Launch(_, l) => l.origin.ceiling,
                     Accepted::Ask(a) => a.origin.ceiling,

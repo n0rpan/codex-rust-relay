@@ -92,6 +92,33 @@ impl HostLink {
             None => file.to_owned(),
         }
     }
+    pub(crate) fn worker_hosts(&self, project: PathBuf) -> io::Result<Option<serde_json::Value>> {
+        let (mut input, mut socket, caps) = self.handshake()?;
+        if !caps.iter().any(|c| c == "worker_placement") {
+            return Ok(None);
+        }
+        socket.set_read_timeout(Some(Duration::from_secs(20)))?;
+        write_frame(
+            &mut socket,
+            &Client::WorkerHosts {
+                id: "sheet".into(),
+                project,
+            },
+        )?;
+        match read_frame(&mut input)? {
+            Server::WorkerReply {
+                result: Some(value),
+                ..
+            } => Ok(Some(value)),
+            Server::WorkerReply {
+                error: Some(error), ..
+            }
+            | Server::Error { message: error, .. } => Err(io::Error::other(error)),
+            _ => Err(io::Error::other(
+                "Could not read this project's worker hosts.",
+            )),
+        }
+    }
     fn handshake(&self) -> io::Result<StreamHello> {
         match self {
             Self::Local => {
@@ -245,7 +272,8 @@ impl HostLink {
             project: project.clone(),
             route: route.clone(),
         };
-        let (mut input, mut socket, _) = self.handshake()?;
+        let (mut input, mut socket, caps) = self.handshake()?;
+        let placement = caps.iter().any(|c| c == "worker_placement");
         write_frame(
             &mut socket,
             &Client::Subscribe {
@@ -263,7 +291,14 @@ impl HostLink {
             .name("ox-host-write".into())
             .spawn(move || {
                 let mut out = BufWriter::new(socket);
-                for (id, action, approval) in rx {
+                for (id, mut action, approval) in rx {
+                    if !placement
+                        && let Action::StartWorker(s) = &mut action
+                        && s.host.as_deref() == Some("parent")
+                        && s.needs.is_none()
+                    {
+                        s.host = None;
+                    }
                     if let Err(e) = write_frame(
                         &mut out,
                         &Client::Act {

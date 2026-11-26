@@ -142,6 +142,33 @@ impl Origin {
     }
 }
 
+/// Minimum installed hardware. Available memory and load rank eligible machines.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkerNeeds {
+    pub memory_gb: Option<u32>,
+    pub cpus: Option<u32>,
+    pub gpu: bool,
+    pub os: Option<String>,
+}
+
+impl WorkerNeeds {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.memory_gb == Some(0) || self.cpus == Some(0) {
+            return Err("Memory and CPU requirements must be positive.".into());
+        }
+        if self
+            .os
+            .as_ref()
+            .is_some_and(|s| s.trim().is_empty() || s.len() > 128)
+        {
+            return Err("Provide an operating system such as linux or macos.".into());
+        }
+        Ok(())
+    }
+}
+
 /// An operator's request to start a worker attached to a session in the subscribed scope.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -150,6 +177,10 @@ pub struct WorkerStart {
     /// A paired worker host name or stable ID. Omit to run on the parent's host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs: Option<WorkerNeeds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<String>,
     pub parent: String,
     pub runtime: Runtime,
     pub model: Option<String>,
@@ -239,6 +270,8 @@ impl WorkerStart {
         }
         let start = Self {
             host,
+            needs: None,
+            placement: None,
             parent: parent.to_owned(),
             runtime,
             model,
@@ -261,6 +294,16 @@ impl WorkerStart {
             .is_some_and(|h| h.trim().is_empty() || h.len() > 256)
         {
             return Err("Provide a worker host name or ID.".into());
+        }
+        if let Some(needs) = &self.needs {
+            needs.validate()?;
+        }
+        if self
+            .placement
+            .as_deref()
+            .is_some_and(|s| s.trim().is_empty() || s.len() > 128 || s == "os")
+        {
+            return Err("Provide a named project placement rule.".into());
         }
         if self.max_minutes.is_some_and(|m| m == 0 || m > 7 * 24 * 60) {
             return Err("max_minutes must be between 1 and 10080.".into());

@@ -37,6 +37,8 @@ pub(super) struct Jobs {
 pub(super) struct Start {
     #[serde(default)]
     pub host: Option<String>,
+    pub needs: Option<Value>,
+    pub placement: Option<String>,
     runtime: Runtime,
     mode: Mode,
     #[serde(default)]
@@ -485,7 +487,13 @@ impl Start {
             "max_minutes": self.max_minutes,
             "permission": self.permission_mode.as_deref().map(|m| permission_level(m).ok().flatten().unwrap_or("inherit")),
         });
-        if let Some(host) = self.host.as_deref().filter(|s| *s != "parent") {
+        if let Some(needs) = &self.needs {
+            start["needs"] = needs.clone();
+        }
+        if let Some(rule) = &self.placement {
+            start["placement"] = json!(rule);
+        }
+        if let Some(host) = self.host.as_deref() {
             start["host"] = json!(host);
         }
         if let Some(path) = &self.checkout {

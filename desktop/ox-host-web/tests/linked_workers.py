@@ -64,7 +64,7 @@ def parent_restart(root, project, target, tls_env, restart_target):
             }
         )
 
-    def launch(name):
+    def launch(name=None, **placement):
         return exchange(
             {
                 "type": "worker_launch",
@@ -77,6 +77,7 @@ def parent_restart(root, project, target, tls_env, restart_target):
                     "model": "fixture/demo",
                     "permission": "read",
                     "host": name,
+                    **placement,
                     "task": "linked-parent-offline-fixture. Read tracked.",
                 },
             }
@@ -89,6 +90,9 @@ def parent_restart(root, project, target, tls_env, restart_target):
         return state
 
     with ExitStack() as first:
+        (target / "host-profile.json").write_text(
+            json.dumps({"name": "build", "labels": ["fixture-build"]})
+        )
         state = start(first)
         invitation = admin(target, {"type": "worker_invitation", "login": "phone@example.test"})[
             "pairing"
@@ -101,11 +105,26 @@ def parent_restart(root, project, target, tls_env, restart_target):
             },
         )
         (peer,) = json.loads((state / "worker-links.json").read_text())
-        assert "No paired worker host" in launch("never-paired")["error"]
+        assert "No known worker host" in launch("never-paired")["error"]
+
+        def inventory_refreshed():
+            hosts = exchange({"type": "worker_hosts", "id": "sheet", "project": str(project)})[
+                "result"
+            ]["hosts"]
+            return any(
+                h["host"]["id"] == peer["id"]
+                and h["has_project"]
+                and "fixture-build" in h["host"].get("labels", [])
+                for h in hosts
+            )
+
+        wait(inventory_refreshed, 25)
+        refusal = launch(needs={"memory_gb": 4000000000}).get("error") or ""
+        assert "4000000000 GB" in refusal, refusal
         receiver = Path(tls_env["OX_TEST_NATIVE_DIR"])
         (receiver / "hold-start").touch()
-        result = launch(peer["name"])
-        assert result["result"]["status"] == "preparing", result
+        result = launch("label:fixture-build")
+        assert result.get("result") and result["result"]["status"] == "preparing", result
         job = result["result"]["job_id"]
         wait(lambda: (receiver / "start-rejected").exists(), 45)
         assert not (receiver / "request-received").exists()
@@ -135,7 +154,6 @@ def parent_restart(root, project, target, tls_env, restart_target):
 
         source_vendor = ThreadingHTTPServer(("127.0.0.1", 0), Fixture)
         source_vendor.mode = "linked-parent"
-        source_vendor.target = peer["name"]
         source_vendor.project = root
         managed_server(second, source_vendor)
         cfg = Path(env["CODEX_HOME"])
@@ -192,7 +210,11 @@ def parent_restart(root, project, target, tls_env, restart_target):
         # A second job accepts control while the inference is in flight.
         (receiver / "request-received").unlink()
         (receiver / "release-request").unlink()
-        another = launch(peer["id"])["result"]["job_id"]
+        rules = project.parent / "codeox.toml"
+        rules.write_text(
+            '[workers.placement]\ndefault = "parent"\nheavy = ' + json.dumps(peer["id"]) + "\n"
+        )
+        another = launch(placement="heavy")["result"]["job_id"]
         wait(lambda: (receiver / "request-received").exists(), 45)
         steer = control(another, "steer", text="Include the filename in your reply.")
         assert steer["result"]["accepted"], steer
@@ -252,6 +274,6 @@ def parent_restart(root, project, target, tls_env, restart_target):
             {"type": "worker_links", "command": {"action": "remove_worker_link", "host": peer["id"]}},
         )
     print(
-        "PASS named remote read worker on stock Codex, ownership, signed control, parent restart and completion delivered into a hosted parent",
+        "PASS named, labelled, project-rule and hardware-selected stock Codex worker, ownership, signed control, parent restart and completion delivered into a hosted parent",
         flush=True,
     )

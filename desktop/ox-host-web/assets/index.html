@@ -243,6 +243,18 @@
         </details>
         <form id="worker-form" class="sheet" hidden aria-label="Start worker">
           <h2 class="sheet-title">Start worker</h2>
+          <div id="worker-placement" hidden>
+            <label for="worker-host">Worker host</label>
+            <select id="worker-host"><option value="parent">Same as parent</option></select>
+            <fieldset id="worker-needs" hidden disabled>
+              <legend>Hardware requirements</legend>
+              <label>Memory (GB)<input id="worker-memory" type="number" min="1" step="1" placeholder="Any" /></label>
+              <label>CPUs<input id="worker-cpus" type="number" min="1" step="1" placeholder="Any" /></label>
+              <label>OS<input id="worker-os" placeholder="Any" /></label>
+              <label><input id="worker-gpu" type="checkbox" /> Require GPU</label>
+            </fieldset>
+            <p class="note" id="worker-inventory-note"></p>
+          </div>
           <label for="worker-runtime">Runtime</label>
           <select id="worker-runtime">
             <option value="codex">Codex</option>

@@ -570,9 +570,35 @@ impl Service {
         )
     }
 
-    async fn start_job(&self, request: jobs::Start, thread: Option<&str>) -> Result<Value, String> {
+    async fn start_job(
+        &self,
+        mut request: jobs::Start,
+        thread: Option<&str>,
+    ) -> Result<Value, String> {
         request.validate()?;
-        let remote = request.host.as_deref().is_some_and(|h| h != "parent");
+
+        let host = crate::host_lifetime::HostLink::find(&self.cwd, self.host_policy)?;
+        let rule = if request.host.is_none() && request.needs.is_none() {
+            crate::worker_placement::rule(&self.cwd, request.placement.as_deref())?
+        } else {
+            Default::default()
+        };
+        let target = request.host.as_deref().or(rule.host.as_deref());
+        let mut remote =
+            target.is_some_and(|h| h != "parent") || request.needs.is_some() || rule.os.is_some();
+        if host.is_none()
+            && request.needs.is_none()
+            && matches!(target, None | Some("auto" | "parent"))
+            && rule
+                .os
+                .as_ref()
+                .is_none_or(|os| os.eq_ignore_ascii_case(std::env::consts::OS))
+        {
+            remote = false;
+        }
+        if request.placement.is_none() && (rule.host.is_some() || rule.os.is_some()) && remote {
+            request.placement = Some("default".into());
+        }
         if !remote && let Some(model) = &request.subscription_model {
             self.check_subscription_model(model).await?;
         }
@@ -588,7 +614,7 @@ impl Service {
         }
         // A running session host owns the worker, so it outlives this helper and
         // its approvals reach the human clients. Without one, run it here as before.
-        if let Some(host) = crate::host_lifetime::HostLink::find(&self.cwd, self.host_policy)? {
+        if let Some(host) = host {
             let start = request.host_start(&app.secrets);
             let caller = self.caller(thread);
             let unbound = caller["session"].is_null();
@@ -974,7 +1000,9 @@ fn tools() -> Value {
                         "task": {"type": "string", "description": "The job objective, desired validation, and stopping condition."},
                         "permission_mode": {"enum": ["inherit", "read", "write", "classifier", "yolo"], "default": "inherit", "description": "read: Codex Read only or Claude Plan. Standalone Claude read workers get only read tools. write: workspace edits and shell access. Codex uses its Workspace sandbox. Claude Code pre-approves Bash and uses its own sandbox when available. Without it, commands can run unsandboxed. classifier: Codex Auto-review / Claude Auto. yolo: Codex YOLO / Claude bypass. Above your mode is refused."},
                         "max_minutes": {"type": "integer", "minimum": 1, "maximum": 10080, "description": "Optional wall-clock limit for this worker in minutes. No limit by default (OX_WORKER_MAX_MINUTES sets one)."},
-                        "host": {"type":"string","description":"Paired execution host name or ID from list_ox_hosts. Omit to use the parent host."},
+                        "needs": {"type":"object","additionalProperties":false,"properties":{"memory_gb":{"type":"integer","minimum":1},"cpus":{"type":"integer","minimum":1},"gpu":{"type":"boolean"},"os":{"type":"string"}},"description":"Minimum installed hardware. Auto selects by current load and free memory among eligible hosts."},
+                        "placement":{"type":"string","description":"Select a named [workers.placement] project rule, such as heavy."},
+                        "host": {"type":"string","description":"Host name or ID, parent, label:LABEL, or auto. Explicit choices override project rules."},
                         "checkout": {"type":"string","description":"Existing execution directory, absolute or relative to the parent workspace. The current thread remains the worker’s parent."},
                         "workspace_write": {"type": "boolean", "description": "Deprecated: false means read, true means write. Use permission_mode."},
                     },

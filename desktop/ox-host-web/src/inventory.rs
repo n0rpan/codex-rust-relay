@@ -17,6 +17,9 @@ use std::{
 };
 use tokio::{io::BufReader, time::timeout};
 
+mod placement;
+pub use placement::choose;
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Inventory {
     pub host: HostInfo,
@@ -191,7 +194,14 @@ pub fn check_launch(
     let repo = repository_id(project)
         .ok_or_else(|| io::Error::other("Remote workers need a shared Git origin."))?;
     let peer = client::runtime()?.block_on(query_peer(host, source, Some(&repo), true))?;
-    let target = &host.name;
+    check_peer(&peer, &host.name, start, parent)
+}
+fn check_peer(
+    peer: &Peer,
+    target: &str,
+    start: &ox_desk_core::origin::WorkerStart,
+    parent: ox_desk_core::modes::Level,
+) -> io::Result<()> {
     if !peer.inventory.linked_read {
         return Err(io::Error::other(format!(
             "Update {target} to run linked workers."
@@ -241,6 +251,7 @@ async fn probe(host: paired_hosts::SavedHost, source: &str, project: Option<&str
     // A repaired link gets a fresh key ID and is probed immediately.
     static UNAVAILABLE: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Default::default);
     let key = host.key_id.clone();
+    let paired_name = host.name.clone();
     {
         let mut offline = UNAVAILABLE.lock().unwrap();
         offline.retain(|_, since| since.elapsed() < Duration::from_secs(15));
@@ -256,6 +267,7 @@ async fn probe(host: paired_hosts::SavedHost, source: &str, project: Option<&str
         .await??;
         let peer = query_peer(&host, source, project, false).await?;
         let mut row = serde_json::to_value(peer)?;
+        row["paired_name"] = paired_name.into();
         row["parent_host"] = false.into();
         row["status"] = "online".into();
         Ok::<_, io::Error>(row)

@@ -4827,6 +4827,7 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "tokio",
+ "toml_edit 0.25.20+spec-1.1.0",
  "uuid",
 ]
 

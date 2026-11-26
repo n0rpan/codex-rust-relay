@@ -1011,6 +1011,28 @@
         },
         {
           "additionalProperties": false,
+          "description": "List the execution hosts linked to this host for a project. Answers WorkerReply.",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "project": {
+              "type": "string"
+            },
+            "type": {
+              "const": "worker_hosts",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "project"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "Opt in to host-wide samples, including when no projects are open.",
           "properties": {
             "type": {
@@ -2459,6 +2481,42 @@
       ],
       "type": "string"
     },
+    "WorkerNeeds": {
+      "additionalProperties": false,
+      "description": "Minimum installed hardware. Available memory and load rank eligible machines.",
+      "properties": {
+        "cpus": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "gpu": {
+          "default": false,
+          "type": "boolean"
+        },
+        "memory_gb": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "os": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "WorkerStart": {
       "additionalProperties": false,
       "description": "An operator's request to start a worker attached to a session in the subscribed scope.",
@@ -2495,6 +2553,16 @@
             "null"
           ]
         },
+        "needs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkerNeeds"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "parent": {
           "type": "string"
         },
@@ -2508,6 +2576,12 @@
             }
           ],
           "description": "The requested permission mode. Wins over `write`. Absent means inherit."
+        },
+        "placement": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "runtime": {
           "$ref": "#/$defs/Runtime"
