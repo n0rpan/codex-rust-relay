@@ -153,6 +153,41 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::build(
+            project,
+            route,
+            first_frame,
+            stats,
+            route_models,
+            true,
+            window,
+            cx,
+        )
+    }
+
+    /// Create a background pane without connecting to `ox-host` or spawning a runtime yet.
+    /// It connects on its first `set_front(true, window, cx)`.
+    pub fn new_lazy(
+        project: PathBuf,
+        route: Route,
+        stats: bool,
+        route_models: Entity<Vec<String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(project, route, None, stats, route_models, false, window, cx)
+    }
+
+    fn build(
+        project: PathBuf,
+        route: Route,
+        first_frame: Option<Instant>,
+        stats: bool,
+        route_models: Entity<Vec<String>>,
+        front: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.observe_window_activation(window, |s, window, cx| {
             if s.front {
                 cx.notify();
@@ -177,7 +212,12 @@ impl Workbench {
             }
         })
         .detach();
-        let (wake, pump) = Self::connection(project.clone(), route.clone(), window, cx);
+        let (wake, pump) = if front {
+            Self::connection(project.clone(), route.clone(), window, cx)
+        } else {
+            let (wake, _) = flume::bounded(1);
+            (wake, Task::ready(()))
+        };
         Self {
             enter_sends: cx
                 .global::<crate::preferences::behavior::Active>()
@@ -193,7 +233,7 @@ impl Workbench {
             launch_request: None,
             launch: None,
             launch_picker: None,
-            front: true,
+            front,
             query: String::new(),
             pending_selection: None,
             project,
@@ -206,7 +246,7 @@ impl Workbench {
             file_hover: None,
             image_work: Default::default(),
             pending_command: None,
-            connecting: true,
+            connecting: front,
             awaiting_login: false,
             retry_available: true,
             first_frame,
@@ -658,6 +698,27 @@ impl Workbench {
         self.front = front;
         if let Some(store) = &mut self.store {
             store.set_front(front);
+        }
+        if front {
+            cx.notify();
+        } else {
+            self.runner = None;
+            self.fire = None;
+        }
+    }
+
+    pub(super) fn set_front_in(
+        &mut self,
+        front: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.front = front;
+        if let Some(store) = &mut self.store {
+            store.set_front(front);
+        }
+        if front && self.store.is_none() && !self.connecting {
+            self.reconnect(window, cx);
         }
         if front {
             cx.notify();

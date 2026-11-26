@@ -251,6 +251,15 @@ impl Discovery {
     pub(super) fn all(&self) -> impl Iterator<Item = &Saved> {
         self.hosted.iter().map(|h| &h.saved).chain(&self.rows)
     }
+    /// Count of sessions waiting on operator input in `(project, route)`, from the live catalog.
+    pub(super) fn waiting_count(&self, project: &Path, route: &Route) -> usize {
+        self.hosted
+            .iter()
+            .filter(|h| {
+                h.saved.row.cwd == project && &h.route == route && h.status == "needs_input"
+            })
+            .count()
+    }
     /// Fold or unfold one day group of the sidebar.
     pub(super) fn toggle_day(&mut self, day: Option<chrono::NaiveDate>) {
         if !self.folded_days.remove(&day) {
@@ -1117,13 +1126,21 @@ mod tests {
             library.route_status(project, saved.scope, &saved.row),
             Some((route.clone(), Some("Running")))
         );
+        assert_eq!(library.waiting_count(project, &route), 0);
         assert!(!library.live_event(CatalogEvent::Update(origin.clone(), session.clone())));
         session.status = "needs_input".into();
         assert!(library.live_event(CatalogEvent::Update(origin.clone(), session.clone())));
+        let saved = &library.hosted[0].saved;
+        assert_eq!(
+            library.route_status(project, saved.scope, &saved.row),
+            Some((route.clone(), Some("Needs you")))
+        );
+        assert_eq!(library.waiting_count(project, &route), 1);
         library.replace(Some(true), vec![]);
         assert_eq!(library.all().count(), 1);
         assert!(library.live_event(CatalogEvent::Replace(origin, vec![])));
         assert_eq!(library.all().count(), 0);
+        assert_eq!(library.waiting_count(project, &route), 0);
     }
 
     #[test]

@@ -744,7 +744,8 @@ impl Host {
             self.preferences =
                 Some(cx.new(|cx| crate::preferences::Preferences::new(project, window, cx)));
         }
-        self.panes[self.active].update(cx, |p, cx| p.set_front(self.preferences.is_none(), cx));
+        let front = self.preferences.is_none();
+        self.panes[self.active].update(cx, |p, cx| p.set_front_in(front, window, cx));
         cx.notify();
     }
     /// Open Settings on its Remote access page, or move an open Settings there.
@@ -863,8 +864,26 @@ impl Host {
     ) -> Entity<Workbench> {
         let pane =
             cx.new(|cx| Workbench::new(project, route, first_frame, stats, models, window, cx));
+        Self::subscribe_pane(&pane, window, cx);
+        pane
+    }
+
+    fn lazy_pane(
+        project: PathBuf,
+        route: Route,
+        stats: bool,
+        models: Entity<Vec<String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Workbench> {
+        let pane = cx.new(|cx| Workbench::new_lazy(project, route, stats, models, window, cx));
+        Self::subscribe_pane(&pane, window, cx);
+        pane
+    }
+
+    fn subscribe_pane(pane: &Entity<Workbench>, window: &mut Window, cx: &mut Context<Self>) {
         cx.subscribe_in(
-            &pane,
+            pane,
             window,
             |s, _, _: &super::workbench::FocusSearch, window, cx| {
                 s.reveal_sidebar(window, cx);
@@ -873,7 +892,7 @@ impl Host {
         )
         .detach();
         cx.subscribe_in(
-            &pane,
+            pane,
             window,
             |s, _, _: &super::workbench::empty::OpenProject, window, cx| {
                 s.pick_project(window, cx);
@@ -881,7 +900,7 @@ impl Host {
         )
         .detach();
         cx.subscribe_in(
-            &pane,
+            pane,
             window,
             |s, owner, event: &super::onboarding::SwitchRoute, window, cx| {
                 let project = owner.read(cx).project.clone();
@@ -900,7 +919,7 @@ impl Host {
         )
         .detach();
         cx.subscribe_in(
-            &pane,
+            pane,
             window,
             |s, owner, _: &super::onboarding::ConfigureProvider, window, cx| {
                 s.provider_onboarding = Some(s.models.read(cx).clone());
@@ -909,7 +928,7 @@ impl Host {
         )
         .detach();
         cx.subscribe_in(
-            &pane,
+            pane,
             window,
             |s, owner, event: &super::route_chip::NewModelRoute, window, cx| {
                 let project = owner.read(cx).project.clone();
@@ -928,27 +947,26 @@ impl Host {
         )
         .detach();
         cx.subscribe_in(
-            &pane,
+            pane,
             window,
             |s, owner, _: &super::route_chip::OpenProviders, window, cx| {
                 s.open_providers(owner, window, cx);
             },
         )
         .detach();
-        cx.subscribe(&pane, |s, _, _: &CatalogChanged, cx| {
+        cx.subscribe(pane, |s, _, _: &CatalogChanged, cx| {
             s.refresh_palette_search(cx);
             cx.notify();
         })
         .detach();
         cx.subscribe_in(
-            &pane,
+            pane,
             window,
             |s, owner, event: &super::workbench::OpenThread, window, cx| {
                 s.open_thread(owner, event.0.clone(), window, cx);
             },
         )
         .detach();
-        pane
     }
     fn open_providers(
         &mut self,
@@ -966,7 +984,7 @@ impl Host {
         self.close_drawer(window, cx);
         if self.preferences.take().is_some() {
             self.before_settings = None;
-            self.panes[self.active].update(cx, |p, cx| p.set_front(true, cx));
+            self.panes[self.active].update(cx, |p, cx| p.set_front_in(true, window, cx));
             cx.notify();
         }
         if self.active == index {
@@ -976,7 +994,7 @@ impl Host {
         self.active = index;
         self.choose_route = None;
         self.search(self.filter.read(cx).value().trim().to_owned(), cx);
-        self.panes[index].update(cx, |p, cx| p.set_front(true, cx));
+        self.panes[index].update(cx, |p, cx| p.set_front_in(true, window, cx));
         let p = self.panes[index].read(cx);
         self.recent.remember(&p.project, &p.route);
         if let Err(err) = LastWorkspace::save(&p.project, &p.route) {
@@ -1142,6 +1160,12 @@ impl Host {
         self.choose_route = None;
         self.panes[self.active].update(cx, |pane, cx| pane.select_catalog(row, false, cx));
         cx.notify();
+    }
+    fn pane_waiting_count(&self, pane: &Workbench) -> usize {
+        pane.store.as_ref().map_or_else(
+            || self.discovery.waiting_count(&pane.project, &pane.route),
+            |s| s.asks().len(),
+        )
     }
     fn project_row_state(
         &self,
@@ -1637,7 +1661,7 @@ impl Host {
                     i,
                     pane.project.display().to_string(),
                     pane.route.label(),
-                    pane.store.as_ref().map_or(0, |s| s.asks().len()),
+                    self.pane_waiting_count(pane),
                 )
             })
             .collect();
@@ -1708,7 +1732,7 @@ impl Host {
             .filter(|(i, _)| *i != self.active)
         {
             let other = other.read(cx);
-            let waiting = other.store.as_ref().map_or(0, |s| s.asks().len());
+            let waiting = self.pane_waiting_count(other);
             if waiting > 0 {
                 background_waiting += waiting;
                 background.push(
