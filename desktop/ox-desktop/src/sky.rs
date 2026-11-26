@@ -298,11 +298,42 @@ fn any_visible(cx: &mut App) -> bool {
     })
 }
 
+fn any_active(cx: &mut App) -> bool {
+    cx.windows().into_iter().any(|w| {
+        w.update(cx, |_, window, _| {
+            window.is_visible() && window.is_window_active()
+        })
+        .unwrap_or(false)
+    })
+}
+
+/// Advance the sky state for one tick. Weather particles animate only when the window is
+/// both visible and active (focused); when visible but unfocused, the clock and solar
+/// position still update without advancing the particle frame.
+fn step_sky(
+    visible: bool,
+    active: bool,
+    motion: bool,
+    mut sky: Sky,
+    frame: u32,
+) -> Option<(Sky, u32, bool)> {
+    if !visible {
+        return None;
+    }
+    let animating = motion && active && sky.condition.animated();
+    let next_frame = if animating {
+        frame.wrapping_add(1)
+    } else {
+        frame
+    };
+    sky.frame = if motion { next_frame } else { 0 };
+    Some((sky, next_frame, animating))
+}
+
 /// Recompute the sky; true when something on screen is still moving.
 fn tick(cx: &mut App) -> bool {
-    if !any_visible(cx) {
-        return false;
-    }
+    let visible = any_visible(cx);
+    let active = visible && any_active(cx);
     let live = cx.try_global::<Live>().copied().unwrap_or_default();
     let weather = if cx
         .global::<crate::preferences::behavior::Active>()
@@ -314,16 +345,12 @@ fn tick(cx: &mut App) -> bool {
         None
     };
     let motion = Palette::get(cx).motion;
-    let mut sky = Sky::at(unix_now(), live.place, local_minutes(), weather);
-    let animating = motion && sky.condition.animated();
+    let sky = Sky::at(unix_now(), live.place, local_minutes(), weather);
     let frame = cx.try_global::<Frame>().map_or(0, |f| f.0);
-    let frame = if animating {
-        frame.wrapping_add(1)
-    } else {
-        frame
+    let Some((sky, frame, animating)) = step_sky(visible, active, motion, sky, frame) else {
+        return false;
     };
     cx.set_global(Frame(frame));
-    sky.frame = if motion { frame } else { 0 };
     if cx.try_global::<Current>().map(|c| c.0) != Some(sky) {
         cx.set_global(Current(sky));
         cx.refresh_windows();
@@ -332,7 +359,8 @@ fn tick(cx: &mut App) -> bool {
 }
 
 /// Start the clock and weather refreshers. The clock part wakes once a minute (every 400 ms
-/// only while weather particles are moving in a visible window); it does nothing while hidden.
+/// only while weather particles are moving in an active, focused window); when unfocused it
+/// drops to the 60 s minute tick, and it does nothing while hidden.
 pub fn start(cx: &mut App) {
     cx.spawn(async move |cx| {
         loop {
@@ -674,7 +702,8 @@ fn paint(p: Palette, sky: Sky, b: Bounds<Pixels>, window: &mut Window) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Condition, Duration, Phase, Sky, moon_phase, next_wait, parse_answer, sun_at, sun_times,
+        Condition, Duration, Phase, Sky, moon_phase, next_wait, parse_answer, step_sky, sun_at,
+        sun_times,
     };
 
     fn utc(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
@@ -778,5 +807,32 @@ mod tests {
     fn weather_attaches_to_the_sky() {
         let sky = Sky::at(0, None, 720.0, Some((Condition::Rain, Some(7))));
         assert!(sky.live && sky.condition == Condition::Rain && sky.temperature == Some(7));
+    }
+
+    #[test]
+    fn unfocused_window_in_rain_advances_zero_frames_while_updating_clock() {
+        let rain = Sky::at(0, None, 720.0, Some((Condition::Rain, Some(7))));
+        let mut frame = 10;
+        // Over 25 ticks (10 seconds at 400 ms) while visible but unfocused, frame count
+        // stays unchanged and animating is false (falling back to the 60 s minute timer).
+        for _ in 0..25 {
+            let (sky, next_frame, animating) = step_sky(true, false, true, rain, frame).unwrap();
+            assert!(!animating);
+            assert_eq!(next_frame, 10);
+            assert_eq!(sky.frame, 10);
+            frame = next_frame;
+        }
+        // Once focused, rain animates and advances the frame.
+        let (sky, next_frame, animating) = step_sky(true, true, true, rain, frame).unwrap();
+        assert!(animating);
+        assert_eq!(next_frame, 11);
+        assert_eq!(sky.frame, 11);
+        // Clear weather never animates even when focused.
+        let clear = Sky::at(0, None, 720.0, Some((Condition::Clear, Some(15))));
+        let (_, next_frame, animating) = step_sky(true, true, true, clear, next_frame).unwrap();
+        assert!(!animating);
+        assert_eq!(next_frame, 11);
+        // Hidden windows do not compute or refresh at all.
+        assert!(step_sky(false, false, true, rain, next_frame).is_none());
     }
 }
