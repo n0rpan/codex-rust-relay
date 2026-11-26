@@ -105,6 +105,8 @@ class Fixture:
         self.project.mkdir()
         self.log = (root / "app.log").open("w+")
         self.client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        # One snapshot is one datagram; macOS's default receive room (4 KiB) is smaller.
+        self.client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
         self.client.bind(str(root / "probe.sock"))
         self.client.settimeout(3)
         self.proc = None
