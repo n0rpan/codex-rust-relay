@@ -2,52 +2,12 @@
 use crate::settings_protocol::{Request, VERSION, model::Snapshot};
 use serde::de::DeserializeOwned;
 use std::{
-    env,
     ffi::OsStr,
-    io::{self, Write},
-    os::unix::fs::MetadataExt,
-    path::{Path, PathBuf},
+    io::Write,
+    path::Path,
     process::{Command, Stdio},
 };
 
-type FileIdentity = (u64, u64, u64, i64, i64, i64, i64);
-pub type RouteInputs = [Option<FileIdentity>; 4];
-
-/// File identities behind the settings snapshot’s provider aliases and favorites.
-/// An unreadable input produces no stamp so callers bypass their cache.
-pub fn route_inputs() -> Option<RouteInputs> {
-    let home = env::var_os("CODEX_HOME")
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|p| PathBuf::from(p).join(".codex")))?;
-    let mut ids = [None; 4];
-    for (i, name) in [
-        "codeox.toml",
-        "config.toml",
-        "ox-api-keys.json",
-        "ox-favorites.json",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        match std::fs::metadata(home.join(name)) {
-            Ok(m) => {
-                ids[i] = Some((
-                    m.dev(),
-                    m.ino(),
-                    m.len(),
-                    m.mtime(),
-                    m.mtime_nsec(),
-                    m.ctime(),
-                    m.ctime_nsec(),
-                ))
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-            Err(_) => return None,
-        }
-    }
-    Some(ids)
-}
 pub fn request<T: DeserializeOwned>(
     ox: &Path,
     path: &OsStr,

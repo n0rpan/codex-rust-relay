@@ -1,5 +1,6 @@
 use ox_desk_core::ports::ox;
 pub use ox_desk_core::settings_protocol::{self as protocol, Credential, model};
+use ox_host_service::{RouteInputs, route_inputs};
 pub type Settings = model::Snapshot;
 use protocol::Request;
 use serde::de::DeserializeOwned;
@@ -14,7 +15,7 @@ pub struct PickerSettings {
 
 // The picker only needs model names and provider presence. Keep that projection
 // in memory while the backing files are unchanged, including edits from another client.
-static PICKER: Mutex<Option<(ox::RouteInputs, PickerSettings)>> = Mutex::new(None);
+static PICKER: Mutex<Option<(RouteInputs, PickerSettings)>> = Mutex::new(None);
 
 impl From<&Settings> for PickerSettings {
     fn from(settings: &Settings) -> Self {
@@ -27,7 +28,7 @@ impl From<&Settings> for PickerSettings {
 }
 
 pub fn picker_settings() -> Result<PickerSettings, String> {
-    if let Some(files) = ox::route_inputs()
+    if let Some(files) = route_inputs()
         && let Some((_, cached)) = PICKER
             .lock()
             .unwrap()
@@ -47,10 +48,10 @@ pub fn request<T: DeserializeOwned>(request: Request) -> Result<T, String> {
     )
 }
 pub fn load() -> Result<Settings, String> {
-    let before = ox::route_inputs();
+    let before = route_inputs();
     let snapshot = ox::snapshot(&crate::platform::ox(), &crate::platform::child_path())?;
     if let Some(files) = before
-        && Some(&files) == ox::route_inputs().as_ref()
+        && Some(&files) == route_inputs().as_ref()
     {
         *PICKER.lock().unwrap() = Some((files, PickerSettings::from(&snapshot)));
     }

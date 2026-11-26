@@ -10,6 +10,7 @@ use ox_desk_core::{
         claude::{API_PROVIDER, Launcher, SUBSCRIPTION_PROVIDER},
     },
 };
+use ox_host_service::{RouteInputs, route_inputs};
 use std::{
     env,
     ffi::OsString,
@@ -27,19 +28,19 @@ pub(crate) struct Prepared {
     provider: Option<String>,
     pub routes: Vec<Route>,
     pub yolo_grant_projects: Vec<PathBuf>,
-    inputs: Option<ox::RouteInputs>,
+    inputs: Option<RouteInputs>,
     when: std::time::Instant,
 }
 impl Prepared {
     fn current(&self) -> bool {
         self.when.elapsed() < std::time::Duration::from_secs(5)
             && self.inputs.is_some()
-            && self.inputs == ox::route_inputs()
+            && self.inputs == route_inputs()
     }
 }
 #[derive(Default)]
 struct CatalogCache {
-    key: Option<(PathBuf, Option<ox::RouteInputs>)>,
+    key: Option<(PathBuf, Option<RouteInputs>)>,
     at: Option<std::time::Instant>,
     models: Vec<String>,
     loading: bool,
@@ -129,9 +130,9 @@ impl RuntimeConfig {
             .collect()
     }
     pub(crate) fn prepare(&self) -> io::Result<Prepared> {
-        let before = ox::route_inputs();
+        let before = route_inputs();
         let s = ox::snapshot(&self.ox, &self.path).map_err(io::Error::other)?;
-        let after = ox::route_inputs();
+        let after = route_inputs();
         // Stars only order: the snapshot's static and starred aliases first, then every other
         // catalog alias. Discovery asks the providers, so it runs off the caller's thread and
         // the list fills in once it lands.
@@ -156,7 +157,7 @@ impl RuntimeConfig {
     }
     /// `base` followed by the cached discovered catalog; stale or missing entries start a
     /// background refresh (one at a time) and never block the caller.
-    fn catalog(&self, base: &[String], inputs: Option<ox::RouteInputs>) -> Vec<String> {
+    fn catalog(&self, base: &[String], inputs: Option<RouteInputs>) -> Vec<String> {
         const FRESH: std::time::Duration = std::time::Duration::from_secs(120);
         let mut cache = CATALOG.lock().unwrap_or_else(|e| e.into_inner());
         let key = (self.ox.clone(), inputs);
