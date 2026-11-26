@@ -64,7 +64,15 @@ pub(super) struct Submit {
     inject: Vec<serde_json::Value>,
     /// The sender statement for this message, fixed when the host accepted it.
     context: Option<String>,
+    worker_notice: Option<u64>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerNoticeReceipt {
+    Accepted(u64),
+    Rejected(u64),
+}
+
 #[derive(Debug)]
 pub(super) enum Operation {
     New(Submit),
@@ -74,6 +82,12 @@ pub(super) enum Operation {
     Stop(String),
 }
 impl Operation {
+    pub(super) fn worker_notice(&self) -> Option<u64> {
+        match self {
+            Self::Send(s) | Self::Account(s) => s.worker_notice,
+            _ => None,
+        }
+    }
     pub(super) fn thread(&self) -> Option<&str> {
         match self {
             Self::New(s) | Self::Account(s) | Self::Send(s) | Self::Inject(s) => s.owner.as_deref(),
@@ -82,6 +96,17 @@ impl Operation {
     }
 }
 impl Store {
+    pub(super) fn worker_notice_id(&self) -> Option<u64> {
+        match self.sender {
+            Some(crate::surface::Sender::WorkerNotice { id }) => Some(id),
+            _ => None,
+        }
+    }
+
+    pub fn take_worker_notice_receipts(&mut self) -> Vec<WorkerNoticeReceipt> {
+        std::mem::take(&mut self.worker_notice_receipts)
+    }
+
     /// Dispatch an action the host accepted from `sender`. A message this submits, now or
     /// later from a queue or a deferred resume, carries that sender's statement.
     pub fn dispatch_as(
@@ -400,6 +425,7 @@ impl Store {
                 vec![]
             },
             context: self.sender_context(),
+            worker_notice: self.worker_notice_id(),
         };
         if id.is_none() {
             let model = submit
@@ -444,6 +470,10 @@ impl Store {
             || self.state != Connection::Ready
         {
             let message = "The active turn or billing route changed before sending";
+            if let Some(id) = submit.worker_notice {
+                self.worker_notice_receipts
+                    .push(WorkerNoticeReceipt::Rejected(id));
+            }
             self.compose_failed(Operation::Send(submit), message.into());
             return Err(io::Error::other(message));
         }
@@ -705,6 +735,7 @@ impl Store {
             | Operation::Inject(s) => {
                 if let Some(d) = self.drafts.get_mut(&s.owner)
                     && let Some(SentInput::Draft(mut sent, mut images)) = d.sent.take()
+                    && s.worker_notice.is_none()
                 {
                     images.append(&mut d.images);
                     d.images = images;
@@ -742,6 +773,10 @@ impl Store {
                 self.transmit(s)
             }
             (Operation::Account(s), Reply::Account(_)) => {
+                if let Some(id) = s.worker_notice {
+                    self.worker_notice_receipts
+                        .push(WorkerNoticeReceipt::Rejected(id));
+                }
                 self.state = Connection::SignInRequired;
                 self.compose_failed(
                     Operation::Account(s),
@@ -793,6 +828,10 @@ impl Store {
                 Ok(())
             }
             (Operation::Send(s), Reply::Turn(turn)) if s.expected_turn.is_none() => {
+                if let Some(id) = s.worker_notice {
+                    self.worker_notice_receipts
+                        .push(WorkerNoticeReceipt::Accepted(id));
+                }
                 let t = self
                     .transcripts
                     .get_mut(s.owner.as_deref().unwrap())
@@ -978,6 +1017,7 @@ mod tests {
             command: None,
             inject: vec![],
             context: None,
+            worker_notice: None,
         };
         // While the thread opens, the new-chat composer gets text and an image; the operator
         // then selects another thread, so the opened thread must not take either.
@@ -1008,6 +1048,42 @@ mod tests {
     }
 
     #[test]
+    fn worker_notice_rejection_and_user_edits_are_independent() {
+        let mut store = ready();
+        let owner = "parent";
+        store.profile.route = Route::codex_api("fixture".into());
+        let t = store.transcripts.entry(owner.into()).or_default();
+        t.ready = true;
+        t.verified = true;
+        for invalid_reply in [false, true] {
+            store
+                .dispatch_as(
+                    crate::actions::Action::SendText(Some(owner.into()), "worker update".into()),
+                    crate::surface::Sender::WorkerNotice { id: 42 },
+                )
+                .unwrap();
+            store.edit(Some(owner), "my draft".into());
+            store.apply(LinkEvent::Frame(Frame::Reply {
+                id: RequestId::Number(store.seq),
+                result: Err(RpcError {
+                    invalid_reply,
+                    code: -32603,
+                    message: "refused".into(),
+                    data: None,
+                }),
+            }));
+            assert_eq!(store.draft(Some(owner)), "my draft");
+            store.edit(Some(owner), String::new());
+            let receipts = store.take_worker_notice_receipts();
+            if invalid_reply {
+                assert!(receipts.is_empty());
+            } else {
+                assert_eq!(receipts, [WorkerNoticeReceipt::Rejected(42)]);
+            }
+        }
+    }
+
+    #[test]
     fn image_only_failure_restores_sent_files_before_edits_made_in_flight() {
         let mut store = ready();
         store.attach_image(None, ImageInput::File("/tmp/first.png".into()));
@@ -1018,6 +1094,7 @@ mod tests {
         store.apply(LinkEvent::Frame(Frame::Reply {
             id: RequestId::Number(store.seq),
             result: Err(RpcError {
+                invalid_reply: false,
                 code: -1,
                 message: "fixture".into(),
                 data: None,

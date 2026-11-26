@@ -294,7 +294,14 @@ impl Engine {
     pub(super) fn ask_yolo(&mut self, asking: Asking, reply: Replier) -> io::Result<()> {
         let parent = asking.origin.parent.scope.clone();
         let origin = asking.origin.clone();
-        self.ledger.change(|d| d.asking.push(origin))?;
+        self.ledger.change(|d| {
+            d.worker_notices.observe(
+                &origin,
+                "waiting_for_operator",
+                "The operator needs to answer the worker’s access request.",
+            );
+            d.asking.push(origin);
+        })?;
         let job = asking.origin.job_id;
         self.asking.insert(job, asking);
         let status = crate::yolo::status(&self.asking[&job], self.operators().connected);
@@ -336,7 +343,7 @@ impl Engine {
                 self.asking.remove(&job);
                 self.ledger.change(|d| {
                     d.asking.retain(|o| o.job_id != job);
-                    d.outcomes.push(Outcome {
+                    d.record_outcome(Outcome {
                         origin,
                         status: "declined".into(),
                         message: "The operator declined to start this worker in YOLO.".into(),
@@ -531,7 +538,9 @@ impl Engine {
             window,
             ..
         } = prep;
-        let window = window.lock().unwrap().flatten();
+        let window = window.lock().unwrap().unwrap_or_else(|| {
+            crate::durable::handoff_window(&self.ledger.data.windows, &start.route(), None)
+        });
         macro_rules! fail {
             ($e:expr) => {
                 return Err((reply, $e))
@@ -693,7 +702,9 @@ impl Engine {
             return Ok(());
         }
         self.in_flows = true;
-        let result = self.advance_flows_inner();
+        let result = self
+            .advance_flows_inner()
+            .and_then(|()| self.deliver_worker_notices());
         self.in_flows = false;
         result
     }
@@ -939,7 +950,7 @@ impl Engine {
         let origin = a.origin.clone();
         self.ledger.change(|d| {
             d.asking.retain(|o| o.job_id != job_id);
-            d.outcomes.push(Outcome {
+            d.record_outcome(Outcome {
                 origin,
                 status: "cancelled".into(),
                 message: message.into(),
@@ -1001,7 +1012,7 @@ impl Engine {
             self.ledger.change(|d| {
                 d.asking.retain(|o| !under(o));
                 for origin in stale {
-                    d.outcomes.push(Outcome {
+                    d.record_outcome(Outcome {
                         origin,
                         status: "cancelled".into(),
                         message: ENDED_PARENT.into(),

@@ -1392,6 +1392,9 @@ impl Host {
                     },
                 )
             };
+            let worker_notice = route
+                .as_ref()
+                .and_then(|r| self.discovery.worker_notice(project, r, &t.id));
             let badge = match confirmed_model {
                 Some(model) => format!("{badge} · {model}"),
                 None => badge,
@@ -1460,6 +1463,9 @@ impl Host {
                         if tree.running > 0 {
                             route.push_str(&format!(", {} running", tree.running));
                         }
+                    }
+                    if let Some(update) = worker_notice {
+                        route = format!("{update} · {route}");
                     }
                     route
                 },

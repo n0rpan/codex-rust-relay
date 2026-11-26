@@ -98,6 +98,8 @@ impl Hosted {
 pub(super) struct Discovery {
     pub rows: Vec<Saved>,
     hosted: Vec<Hosted>,
+    // Cold host rows carry worker updates even before native discovery supplies their titles.
+    worker_notices: HashMap<ox_desk_core::host_protocol::Scope, HashMap<String, String>>,
     archived: HashMap<ox_desk_core::host_protocol::Scope, HashSet<String>>,
     watch: Option<platform::CatalogWatch>,
     pub revision: usize,
@@ -264,11 +266,27 @@ impl Discovery {
         }
         self.revision += 1;
     }
+    pub(super) fn worker_notice(&self, project: &Path, route: &Route, id: &str) -> Option<&str> {
+        let scope = ox_desk_core::host_protocol::Scope {
+            project: project.to_owned(),
+            route: route.clone(),
+        };
+        self.worker_notices.get(&scope)?.get(id).map(String::as_str)
+    }
     fn live_event(&mut self, event: platform::CatalogEvent) -> bool {
         use platform::CatalogEvent;
+        let summary = |view: &ox_desk_core::host_protocol::SessionView| {
+            let event = &view.detail["worker_notice"];
+            let job = event["job_id"].as_u64()?;
+            let status = event["status"].as_str()?.replace('_', " ");
+            Some(format!("Worker #{job} {status}"))
+        };
         match event {
             CatalogEvent::Reset => {
-                let changed = !self.hosted.is_empty() || !self.archived.is_empty();
+                let changed = !self.hosted.is_empty()
+                    || !self.archived.is_empty()
+                    || !self.worker_notices.is_empty();
+                self.worker_notices.clear();
                 self.archived.clear();
                 self.hosted.clear();
                 changed
@@ -284,6 +302,15 @@ impl Discovery {
                 true
             }
             CatalogEvent::Replace(scope, views) => {
+                let updates: HashMap<_, _> = views
+                    .iter()
+                    .filter_map(|v| Some((v.id.clone(), summary(v)?)))
+                    .collect();
+                let previous = self.worker_notices.remove(&scope).unwrap_or_default();
+                let changed = previous != updates;
+                if !updates.is_empty() {
+                    self.worker_notices.insert(scope.clone(), updates);
+                }
                 let rows: Vec<_> = views
                     .iter()
                     .filter_map(|v| Hosted::from_view(&scope, v))
@@ -291,15 +318,28 @@ impl Discovery {
                 let matches =
                     |r: &Hosted| r.route == scope.route && r.saved.row.cwd == scope.project;
                 if self.hosted.iter().filter(|r| matches(r)).eq(&rows) {
-                    return false;
+                    return changed;
                 }
                 self.hosted.retain(|r| !matches(r));
                 self.hosted.extend(rows);
                 true
             }
             CatalogEvent::Update(scope, view) => {
+                let changed = if let Some(label) = summary(&view) {
+                    let old = self
+                        .worker_notices
+                        .entry(scope.clone())
+                        .or_default()
+                        .insert(view.id.clone(), label.clone());
+                    old.as_ref() != Some(&label)
+                } else {
+                    self.worker_notices
+                        .get_mut(&scope)
+                        .and_then(|rows| rows.remove(&view.id))
+                        .is_some()
+                };
                 let Some(row) = Hosted::from_view(&scope, &view) else {
-                    return false;
+                    return changed;
                 };
                 if let Some(old) = self.hosted.iter_mut().find(|r| {
                     r.route == scope.route
@@ -307,7 +347,7 @@ impl Discovery {
                         && r.saved.row.id == view.id
                 }) {
                     if *old == row {
-                        return false;
+                        return changed;
                     }
                     *old = row;
                 } else {
@@ -1019,6 +1059,35 @@ mod tests {
         assert_eq!(resolve(native, &row("codeox", Some("vendor/demo"))), None);
         assert_eq!(resolve(relay, &row("openai", None)), None);
         assert_eq!(resolve(relay, &row("codeox", None)), None);
+    }
+
+    #[test]
+    fn a_cold_parents_last_worker_update_survives_a_catalog_snapshot() {
+        use crate::platform::CatalogEvent;
+        use ox_desk_core::host_protocol::{Scope as Origin, SessionView};
+        let project = Path::new("/project");
+        let scope = Origin {
+            project: project.into(),
+            route: Route::CODEX_SUBSCRIPTION,
+        };
+        let view = SessionView {
+            id: "parent".into(),
+            title: "Build".into(),
+            parent: None,
+            updated_at: 1,
+            status: "idle".into(),
+            capabilities: vec![],
+            detail: serde_json::json!({"owned":true, "worker_notice":{"job_id": 42, "status": "interrupted"}}),
+        };
+        let mut library = Discovery::default();
+        assert!(library.live_event(CatalogEvent::Replace(scope.clone(), vec![view.clone()])));
+        assert_eq!(
+            library.worker_notice(project, &scope.route, "parent"),
+            Some("Worker #42 interrupted")
+        );
+        assert!(!library.live_event(CatalogEvent::Update(scope.clone(), view)));
+        assert!(library.live_event(CatalogEvent::Replace(scope.clone(), vec![])));
+        assert_eq!(library.worker_notice(project, &scope.route, "parent"), None);
     }
 
     #[test]

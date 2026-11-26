@@ -78,6 +78,7 @@ class Fixture:
         self.gates = {}             # name -> Event the test sets to release a held reply
         self.reached = {}           # name -> Event set when the provider holds at that point
         self.worker_done = threading.Event()
+        self.parent_waits_for_notice = False
         self.hold = set()           # gate names currently armed
         self.drop_at = {}           # name -> callable run when the gate is reached
         self.worker_final_sent = 0
@@ -184,6 +185,8 @@ class Fixture:
         if tr:
             kind = names.get(tr[-1]["tool_use_id"], "")
             if kind.endswith("start_ox_worker"):
+                if self.parent_waits_for_notice:
+                    return [{"type": "text", "text": "I'll wait for the worker."}]
                 self.pause("lead_after_start")
                 self.worker_done.wait(90)
                 time.sleep(self.settle_delay)  # the host has seen the worker finish
@@ -836,6 +839,34 @@ def one_route(ctx):
     assert {b["model"] for b in lead_requests(ctx)} == {lead_requests(ctx)[0]["model"]}
 
 
+def case_worker_notice(ctx):
+    """An idle hosted parent receives its API worker's result without polling, including with no window open."""
+    ctx.fixture.parent_waits_for_notice = True
+    ctx.fixture.arm("before_final")
+    run = Run(ctx).boot()
+    run.prep()
+    before = len(run.desk.frames)
+    run.send(LEAD_PROMPT, "go")
+    run.wait_until(lambda: ctx.fixture.reached["before_final"].is_set(), "the worker's last reply")
+    run.wait_until(lambda: any((n := change(frame, "notification")) and n["event"] == "finished"
+                               and n["thread"] == run.thread for frame in run.desk.frames[before:]),
+                   "the parent to finish its own turn")
+    job = start_result(ctx)["job_id"]
+    for connection in list(ctx.pipes):
+        drop(connection)
+    ctx.fixture.gates["before_final"].set()
+    heading = f"OX worker #{job}: completed"
+    run.wait_until(lambda: run.lead_saw(heading), "the provider to receive the worker update")
+    latest = next(b for b in lead_requests(ctx)
+                  if heading in str(conversation(b)[-1]["content"]))
+    assert FINAL in str(conversation(latest)[-1]["content"])
+    assert not any(status_result(b) for b in lead_requests(ctx))
+    run.wait_until(lambda: not json.loads(ctx.ledger())["worker_notices"]["pending"], "native receipt")
+    assert sum(heading in text for text in user_texts(latest)) == 1
+    assert sum(heading in str(conversation(body)[-1]["content"]) for body in lead_requests(ctx)) == 1
+    assert ctx.side_effects() == 1
+
+
 def case_0(ctx):
     """No interruption: the baseline the cuts are compared with."""
     run = Run(ctx).boot()
@@ -1234,7 +1265,7 @@ def case_observer(ctx):
     assert status["status"] == "completed" and status["partial"] is False and status["result"] == PART1 + PART2, status
 
 
-CASES = [("0", case_0), ("1a", case_1a), ("1b", case_1b), ("2", case_2), ("3", case_3), ("4", case_4), ("5", case_5), ("6", case_6), ("stop", case_stop), ("observer", case_observer)]
+CASES = [("notice", case_worker_notice), ("0", case_0), ("1a", case_1a), ("1b", case_1b), ("2", case_2), ("3", case_3), ("4", case_4), ("5", case_5), ("6", case_6), ("stop", case_stop), ("observer", case_observer)]
 
 
 def main_entry():

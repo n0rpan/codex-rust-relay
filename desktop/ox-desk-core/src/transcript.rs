@@ -119,6 +119,9 @@ impl Transcript {
     pub fn is_loading(&self) -> bool {
         self.loading
     }
+    pub fn older_cursor(&self) -> Option<&str> {
+        self.cursor.as_deref()
+    }
     pub fn has_older(&self) -> bool {
         self.cursor.is_some()
     }

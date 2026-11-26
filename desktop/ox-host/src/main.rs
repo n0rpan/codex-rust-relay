@@ -9,6 +9,7 @@ mod receipts;
 mod replay;
 mod runtime;
 mod transport;
+mod worker_notices;
 mod workers;
 mod yolo;
 

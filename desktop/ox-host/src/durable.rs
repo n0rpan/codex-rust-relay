@@ -10,6 +10,8 @@ use std::{
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) struct Owned {
     pub(crate) scopes: Vec<SavedScope>,
+    #[serde(default)]
+    pub(crate) worker_notices: crate::worker_notices::Notices,
     pub(crate) reserved: u64,
     /// Sessions whose YOLO grant covers their workers' and handoffs' YOLO starts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -28,6 +30,14 @@ pub(crate) struct Owned {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) windows: Vec<Window>,
 }
+impl Owned {
+    pub(crate) fn record_outcome(&mut self, outcome: Outcome) {
+        self.worker_notices
+            .observe(&outcome.origin, &outcome.status, &outcome.message);
+        self.outcomes.push(outcome);
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Window {
     pub(crate) route: ox_desk_core::runtime::Route,
@@ -48,23 +58,27 @@ pub(crate) fn record_window(windows: &mut Vec<Window>, window: Window) {
     windows.drain(..excess);
 }
 
-/// The window a later handoff to `route` uses: the newest one reported on that
-/// route, bounded by OX's catalog when both are known. Without either, the
-/// selection's conservative default applies.
+/// An API handoff names its model. Subscription handoffs let the stock
+/// client select a model, so an observed window can only lower the fallback.
 pub(crate) fn handoff_window(
     windows: &[Window],
     route: &ox_desk_core::runtime::Route,
     catalog: Option<u64>,
 ) -> Option<u64> {
-    let seen = windows
-        .iter()
-        .rev()
-        .find(|w| &w.route == route)
-        .map(|w| w.tokens);
-    match (seen, catalog) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
+    let reports = windows.iter().filter(|w| &w.route == route && w.tokens > 0);
+    if let ox_desk_core::runtime::Billing::Api(alias) = &route.billing {
+        let matched = reports
+            .clone()
+            .filter(|w| w.model.as_ref() == Some(alias))
+            .map(|w| w.tokens);
+        if let Some(limit) = matched.chain(catalog.filter(|&n| n > 0)).min() {
+            return Some(limit);
+        }
     }
+    reports
+        .map(|w| w.tokens)
+        .min()
+        .map(|limit| limit.min(ox_desk_core::handoff::DEFAULT_CONTEXT))
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Grant {
@@ -309,7 +323,7 @@ impl Ledger {
     pub(crate) fn retire(&mut self, cause: &str) -> io::Result<()> {
         self.change(|data| {
             for origin in std::mem::take(&mut data.asking) {
-                data.outcomes.push(Outcome {
+                data.record_outcome(Outcome {
                     origin,
                     status: "declined".into(),
                     message: format!("The OX session host {cause} before the operator answered, so the YOLO request was declined. Start the worker again if it is still needed."),
@@ -372,7 +386,7 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn handoffs_use_reported_windows_and_fall_back_only_until_one_is_seen() {
+    fn handoffs_match_the_destination_and_bound_an_unknown_model_conservatively() {
         use ox_desk_core::runtime::Runtime;
         let sub = Runtime::Claude.route(None);
         let api = Runtime::Codex.route(Some("fixture".into()));
@@ -393,13 +407,13 @@ mod tests {
                 tokens: 200_000,
             },
         );
-        assert_eq!(handoff_window(&windows, &sub, None), Some(200_000));
+        assert_eq!(handoff_window(&windows, &sub, None), Some(64_000));
         assert_eq!(
             handoff_window(&windows, &api, None),
             None,
             "windows are per route"
         );
-        // A newer report replaces the same model and wins over older ones.
+        // A subscription can launch yet another model, independent of report order.
         record_window(
             &mut windows,
             Window {
@@ -417,7 +431,7 @@ mod tests {
             },
         );
         assert_eq!(windows.len(), 2);
-        assert_eq!(handoff_window(&windows, &sub, None), Some(180_000));
+        assert_eq!(handoff_window(&windows, &sub, None), Some(64_000));
         // Reported and catalog windows together: the tighter one.
         record_window(
             &mut windows,
@@ -428,6 +442,34 @@ mod tests {
             },
         );
         assert_eq!(handoff_window(&windows, &api, Some(128_000)), Some(128_000));
+        // A secondary model reported on this same route never overrides the destination.
+        record_window(
+            &mut windows,
+            Window {
+                route: api.clone(),
+                model: Some("helper".into()),
+                tokens: 1_000_000,
+            },
+        );
+        assert_eq!(handoff_window(&windows, &api, None), Some(272_000));
+        record_window(
+            &mut windows,
+            Window {
+                route: api.clone(),
+                model: Some("helper".into()),
+                tokens: 8_000,
+            },
+        );
+        assert_eq!(handoff_window(&windows, &api, Some(128_000)), Some(128_000));
+        record_window(
+            &mut windows,
+            Window {
+                route: sub.clone(),
+                model: None,
+                tokens: 32_000,
+            },
+        );
+        assert_eq!(handoff_window(&windows, &sub, None), Some(32_000));
         for n in 0..100 {
             record_window(
                 &mut windows,

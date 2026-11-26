@@ -184,6 +184,10 @@ impl Store {
     pub(super) fn restore_claude_input(&mut self, owner: &str, p: &mut Process) {
         let mut unsent = p.events.take_awaiting_echo();
         unsent.extend(p.first.take());
+        if let Some((uuid, _)) = p.worker_notice.take() {
+            // The host outbox owns uncertain notices. Only human messages belong in the composer.
+            unsent.retain(|(id, _)| id != &uuid);
+        }
         if !unsent.is_empty() {
             self.ended_threads.insert(owner.into());
             if p.started_new {
@@ -360,13 +364,14 @@ impl Store {
                 let display = self.claude_display(owner, scope);
                 let is_user = matches!(item, Item::UserMessage { .. });
                 if display == owner && is_user {
-                    self.claude_mut()
-                        .sessions
-                        .get_mut(owner)
-                        .unwrap()
-                        .events
-                        .awaiting_echo
-                        .retain(|(uuid, _)| uuid != &id);
+                    let process = self.claude_mut().sessions.get_mut(owner).unwrap();
+                    process.events.awaiting_echo.retain(|(uuid, _)| uuid != &id);
+                    if let Some((_, notice)) =
+                        process.worker_notice.take_if(|(uuid, _)| uuid == &id)
+                    {
+                        self.worker_notice_receipts
+                            .push(crate::store::WorkerNoticeReceipt::Accepted(notice));
+                    }
                 }
                 rebase_agents(owner, &display, &mut item, |child, tool, status| {
                     self.claude_child(owner, &display, child, tool);
@@ -709,17 +714,20 @@ impl Store {
                     .filter_map(Value::as_str)
                     .collect();
                 if !cancelled.is_empty() {
-                    let pending = &mut self
-                        .claude_mut()
-                        .sessions
-                        .get_mut(owner)
-                        .unwrap()
-                        .events
-                        .awaiting_echo;
-                    let (cancelled, survivors): (Vec<_>, _) = std::mem::take(pending)
+                    let process = self.claude_mut().sessions.get_mut(owner).unwrap();
+                    let notice = process
+                        .worker_notice
+                        .take_if(|(uuid, _)| cancelled.contains(uuid.as_str()));
+                    let pending = &mut process.events.awaiting_echo;
+                    let (mut cancelled, survivors): (Vec<_>, _) = std::mem::take(pending)
                         .into_iter()
                         .partition(|(id, _)| cancelled.contains(id.as_str()));
                     *pending = survivors;
+                    if let Some((uuid, notice)) = notice {
+                        self.worker_notice_receipts
+                            .push(crate::store::WorkerNoticeReceipt::Rejected(notice));
+                        cancelled.retain(|(id, _)| id != &uuid);
+                    }
                     self.restore_claude_drafts(owner, cancelled);
                 }
                 if let Some(count) = result["still_queued"]
