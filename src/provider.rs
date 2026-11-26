@@ -1634,6 +1634,25 @@ impl Route {
     }
 }
 
+/// A static entry can make an already-discovered model mandatory after
+/// discovery filtered its defaults, so the final policy is enforced here:
+/// `none` is neither offered nor used as the default.
+fn reasoning_policy(model: &ModelSpec) -> ReasoningPolicy {
+    let mut supported = model.reasoning_efforts.clone();
+    let mut default = model.default_reasoning_effort.clone();
+    if model.reasoning_mandatory {
+        supported.retain(|effort| effort != "none");
+        if default.as_deref() == Some("none") {
+            default = None;
+        }
+    }
+    ReasoningPolicy {
+        supported,
+        default,
+        mandatory: model.reasoning_mandatory,
+    }
+}
+
 pub enum Resolution {
     Route(Route),
     Ambiguous(Vec<String>),
@@ -1662,11 +1681,7 @@ impl Routes {
                     upstream_model: model.id.clone(),
                     max_output_tokens: model.max_output_tokens,
                     wire: vendor.wire,
-                    reasoning: ReasoningPolicy {
-                        supported: model.reasoning_efforts.clone(),
-                        default: model.default_reasoning_effort.clone(),
-                        mandatory: model.reasoning_mandatory,
-                    },
+                    reasoning: reasoning_policy(model),
                 };
                 if let Some(previous) = by_alias.insert(alias.clone(), route) {
                     return Err(format!(
@@ -2251,6 +2266,29 @@ sort = "price"
         let mut payload = serde_json::json!({"reasoning": {"effort": "none"}});
         assert!(route.normalize_reasoning(&mut payload).is_some());
         // The closest supported level to "none" is the lowest one.
+        assert_eq!(payload["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn an_override_that_makes_a_model_mandatory_drops_none_from_the_route() {
+        let model = ModelSpec {
+            reasoning_efforts: vec!["none".to_owned(), "low".to_owned(), "high".to_owned()],
+            default_reasoning_effort: Some("none".to_owned()),
+            reasoning_mandatory: true,
+            ..spec("gpt")
+        };
+        let policy = reasoning_policy(&model);
+        assert_eq!(policy.supported, ["low", "high"]);
+        assert_eq!(policy.default, None);
+        let route = Route {
+            vendor: 0,
+            upstream_model: "gpt".to_owned(),
+            wire: Wire::Responses,
+            max_output_tokens: None,
+            reasoning: policy,
+        };
+        let mut payload = serde_json::json!({"reasoning": {"effort": "none"}});
+        assert!(route.normalize_reasoning(&mut payload).is_some());
         assert_eq!(payload["reasoning"]["effort"], "low");
     }
 
