@@ -341,6 +341,9 @@ pub(crate) fn parent_may_answer(
             Ok(())
         };
     }
+    if ask.detail.chars().count() > REQUEST_DETAIL_LIMIT {
+        return Err("This request is too long to show you in full, so the operator decides.");
+    }
     if worker.ceiling == Level::Read {
         return Err(
             "This is a read worker: approving its request would let it do more than read, so the operator decides.",
@@ -354,9 +357,17 @@ pub(crate) fn parent_may_answer(
     }
 }
 
+/// The longest request detail a parent sees. An approval whose action does not
+/// fit is never the parent's to answer, so a parent never approves arguments it
+/// could not read.
+pub(crate) const REQUEST_DETAIL_LIMIT: usize = 16_000;
+
 /// One open worker request as its parent agent sees it.
 pub(crate) fn request_view(ask: &ox_desk_core::asks::Ask, may: Result<(), &str>) -> Value {
-    let detail: String = ask.detail.chars().take(4000).collect();
+    let mut detail: String = ask.detail.chars().take(REQUEST_DETAIL_LIMIT).collect();
+    if detail.len() < ask.detail.len() {
+        detail.push_str("\n[… detail cut: the operator answers this request]");
+    }
     let mut view = json!({
         "request_id": ask.id,
         "title": ask.title(),

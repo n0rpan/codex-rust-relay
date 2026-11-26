@@ -4088,6 +4088,37 @@ mod tests {
                     "{status}"
                 );
             }
+            // An approval too long to show in full is never the parent's to answer.
+            let mut long = ask(13, "w");
+            long.detail = "x".repeat(crate::workers::REQUEST_DETAIL_LIMIT + 1);
+            engine
+                .running
+                .get_mut(&worker)
+                .unwrap()
+                .store
+                .apply(LinkEvent::Host(Box::new(Server::Delta {
+                    cursor: Cursor {
+                        epoch: "e".into(),
+                        seq: 5,
+                    },
+                    scope: worker.clone(),
+                    changes: vec![Change::Asks {
+                        asks: vec![ask(9, "w"), ask(10, "r"), long],
+                    }],
+                })));
+            let status = engine
+                .parent_call(&me, ParentCall::Status { job_id: 41 })
+                .unwrap();
+            let shown = &status["requests"][1];
+            assert_eq!(shown["request_id"], 13);
+            assert_eq!(shown["parent_may_answer"], false);
+            assert!(
+                shown["detail"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("the operator answers this request]")
+            );
+            assert!(engine.parent_call(&me, answer(41, 13)).is_err());
             // A request of another worker is not this job's to answer.
             assert!(engine.parent_call(&me, answer(41, 10)).is_err());
             assert!(log.lock().unwrap().is_empty());
