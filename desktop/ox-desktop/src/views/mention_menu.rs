@@ -149,45 +149,6 @@ pub fn remove_mention_from_text(text: &str, target_tag: &str) -> String {
     result
 }
 
-/// Try to convert a HEIC/HEIF image to PNG bytes using `sips` (macOS), `heif-convert`, or `magick`/`ffmpeg`.
-fn convert_heic_to_png(path: &Path) -> Result<Vec<u8>, String> {
-    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
-    let out = dir.path().join("converted.png");
-    let candidates: &[(&str, &[&str])] = &[
-        ("sips", &["-s", "format", "png"]),
-        ("heif-convert", &[]),
-        ("magick", &[]),
-        ("ffmpeg", &["-y", "-i"]),
-    ];
-    for (bin, prefix) in candidates {
-        let mut cmd = std::process::Command::new(bin);
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        match *bin {
-            "sips" => {
-                cmd.args(*prefix).arg(path).arg("--out").arg(&out);
-            }
-            "ffmpeg" => {
-                cmd.args(*prefix).arg(path).arg(&out);
-            }
-            _ => {
-                cmd.arg(path).arg(&out);
-            }
-        }
-        if cmd.status().is_ok_and(|s| s.success())
-            && let Ok(bytes) = std::fs::read(&out)
-            && !bytes.is_empty()
-        {
-            return Ok(bytes);
-        }
-    }
-    Err(format!(
-        "Could not convert {} from HEIC to PNG. Convert it to PNG or JPEG first.",
-        path.file_name().unwrap_or_default().to_string_lossy()
-    ))
-}
-
 fn mime(format: ImageFormat) -> Option<&'static str> {
     Some(match format {
         ImageFormat::Png => "image/png",
@@ -377,7 +338,7 @@ impl Workbench {
                 let mut converted = Vec::new();
                 let mut errors = Vec::new();
                 for path in heic_paths {
-                    match convert_heic_to_png(&path) {
+                    match crate::platform::convert_heic_to_png(&path) {
                         Ok(bytes) => {
                             if bytes.len() as u64 > MAX_IMAGE_BYTES {
                                 let name = path.file_name().unwrap_or_default().to_string_lossy();

@@ -225,6 +225,45 @@ fn open_terminal(project: &Path, command: &[OsString], path: &OsStr) -> Result<(
     Ok(())
 }
 
+/// Try to convert a HEIC/HEIF image to PNG bytes using `sips` (macOS), `heif-convert`, or `magick`/`ffmpeg`.
+pub fn convert_heic_to_png(path: &Path) -> Result<Vec<u8>, String> {
+    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let out = dir.path().join("converted.png");
+    let candidates: &[(&str, &[&str])] = &[
+        ("sips", &["-s", "format", "png"]),
+        ("heif-convert", &[]),
+        ("magick", &[]),
+        ("ffmpeg", &["-y", "-i"]),
+    ];
+    for (bin, prefix) in candidates {
+        let mut cmd = Command::new(bin);
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        match *bin {
+            "sips" => {
+                cmd.args(*prefix).arg(path).arg("--out").arg(&out);
+            }
+            "ffmpeg" => {
+                cmd.args(*prefix).arg(path).arg(&out);
+            }
+            _ => {
+                cmd.arg(path).arg(&out);
+            }
+        }
+        if cmd.status().is_ok_and(|s| s.success())
+            && let Ok(bytes) = std::fs::read(&out)
+            && !bytes.is_empty()
+        {
+            return Ok(bytes);
+        }
+    }
+    Err(format!(
+        "Could not convert {} from HEIC to PNG. Convert it to PNG or JPEG first.",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
