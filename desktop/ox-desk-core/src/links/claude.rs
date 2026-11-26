@@ -264,20 +264,6 @@ impl Link {
         }
         sent
     }
-    /// Submit a user message with OX's sender statement for it (see `crate::surface`).
-    ///
-    /// TODO(claude-transport): the per-submit delivery (a `UserPromptSubmit` hook matched
-    /// to this `uuid`) is integrated separately. Until then Claude keeps its generic OX
-    /// context and the statement is not sent; the user text is unchanged either way.
-    pub fn send_user_with_context(
-        &self,
-        uuid: &str,
-        content: Vec<Value>,
-        context: Option<&str>,
-    ) -> io::Result<()> {
-        let _ = context;
-        self.send_user(uuid, content)
-    }
     pub fn interrupt(&self) -> io::Result<String> {
         self.control(json!({"subtype":"interrupt"}))
     }

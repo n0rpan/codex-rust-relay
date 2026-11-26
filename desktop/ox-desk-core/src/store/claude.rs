@@ -813,12 +813,12 @@ impl Store {
         let Some((id, text)) = process.first.as_ref() else {
             return Ok(());
         };
-        process.link.as_ref().unwrap().send_user_with_context(
-            id,
-            vec![json!({"type":"text","text":text})],
-            process.first_context.as_deref(),
-        )?;
-        let (id, text) = process.first.take().unwrap();
+        let link = process.link.as_ref().unwrap();
+        let content = vec![json!({"type":"text","text":text})];
+        match process.first_context.as_deref() {
+            Some(context) => link.send_user_with_context(id, content, context),
+            None => link.send_user(id, content),
+        }?;
         process.first_context = None;
         process.events.sent(&id, &text);
         let transcript = self.transcripts.get_mut(owner).unwrap();
