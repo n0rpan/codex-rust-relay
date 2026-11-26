@@ -801,8 +801,8 @@ fn new_session_id() -> Result<String, RelayError> {
     ))
 }
 
-/// The settings document a write worker passes so Claude Code's own sandbox
-/// confines its shell to the workspace. Bash is auto-allowed only inside it.
+/// The settings document that enables Claude Code's sandbox for write workers.
+/// The worker contract also pre-approves Bash when assembling the tool arguments.
 pub(crate) fn claude_sandbox_document() -> Value {
     crate::claude_worker_contract::sandbox_document()
 }

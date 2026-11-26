@@ -512,8 +512,7 @@ impl Start {
         ))
     }
 
-    /// Set when a Claude write worker starts without Bash because Claude
-    /// Code's sandbox cannot run here. The start notice says so.
+    /// Warn when a Claude write worker's Bash commands can run unsandboxed.
     pub(super) fn claude_fallback_notice(&self) -> Option<&'static str> {
         (self.runtime == Runtime::Claude)
             .then(|| self.claude_contract().ok()?.fallback_notice())

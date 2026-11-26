@@ -85,9 +85,8 @@ pub struct Origin {
 }
 
 impl Origin {
-    /// The shared worker contract a hosted Claude Write worker starts under, as
-    /// the standalone builder does: sandbox settings, Bash, the edits-only
-    /// fallback and the Workflow rule. Other workers keep the ordinary launch.
+    /// The shared worker contract a hosted Claude Write worker starts under, with
+    /// the same Bash permissions, sandbox settings and Workflow rule as a standalone worker.
     pub fn claude_contract(
         &self,
         mode: WorkerMode,

@@ -766,22 +766,21 @@ The main agent can lower it with `start_ox_worker`'s `permission_mode`
 that would start in YOLO or bypass waits until you accept it in OX Desktop or
 on a paired phone, unless you granted YOLO for that session's workers and
 handoffs. Without a host, workers start with read access, and write access
-when you tell the main agent a worker may edit files. Read workers without a
-host run Claude Code in `dontAsk` mode with only read tools, which is read-only
-but not the same mode name as the host's Claude Plan. Classifier and YOLO
-requests are refused without a host rather than falling back to read. A write worker gets a
-sandboxed shell and can write the workspace on both runtimes: Codex uses its
-Workspace sandbox, and Claude Code runs Bash under its own sandbox with
-`autoAllowBashIfSandboxed`, so commands inside the workspace need no prompt
-while writes outside it fail. The sandbox may restrict network access; a task
-that needs broader access should use the classifier level instead. Claude Code's
-sandbox is built in on macOS and needs `bwrap` and `socat` on Linux. Without
-them a Claude write worker keeps its shell and runs commands unsandboxed, as
-`claude` in a terminal does, and its progress warns about it. Read workers have no shell on either
-runtime. Give concurrent writers separate working directories by starting their
-parent sessions there. The main session and
-its built-in subagents use your subscription. The worker bills the API provider
-you picked or the Claude subscription you requested.
+when you tell the main agent a worker may edit files. Claude read workers use
+Plan mode with the host and `dontAsk` with only read tools in a standalone
+launch. Classifier and YOLO require the session host.
+
+Write workers can edit files and run shell commands. Codex uses its Workspace
+sandbox. For Claude Code, OX pre-approves Bash and enables Claude Code’s own
+sandbox. The sandbox can restrict filesystem and network access. It is built
+in on macOS and needs `bwrap` and `socat` on Linux. If those dependencies are
+missing, OX shows a warning and Claude Code can run Bash unsandboxed with the
+worker’s OS permissions. Codex read workers use the Read only sandbox.
+
+Give concurrent writers separate working directories by starting their parent
+sessions there. The main session and its built-in subagents use your subscription.
+The worker bills the API provider you picked or the Claude subscription you
+requested.
 
 For a second opinion on a piece of text, ask for `delegate_to_ox_model`.
 That tool makes one model request with a 90-second timeout. For development,
