@@ -49,11 +49,31 @@ fn decode(cached: &Value, account: &str, at: i64) -> Option<Vec<PickerModel>> {
         .filter(|models| !models.is_empty())
 }
 
+// Invalidate immediately when the installed CLI changes, without starting it on
+// every cache hit. Following the symlink also catches versioned native installs.
+fn installed_client() -> Option<Value> {
+    let path = crate::setup::find_on_path("claude", std::env::var_os("PATH").as_deref())?
+        .canonicalize()
+        .ok()?;
+    let meta = path.metadata().ok()?;
+    let modified = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some(json!([
+        path,
+        meta.len(),
+        modified.as_secs(),
+        modified.subsec_nanos()
+    ]))
+}
+
 /// The cached picker for the saved account, if it is fresh.
 pub(super) fn cached(home: &Path) -> Option<Vec<PickerModel>> {
     let account = crate::native::claude_account_id()?;
     let text = std::fs::read_to_string(home.join(FILE)).ok()?;
-    decode(&serde_json::from_str(&text).ok()?, &account, now())
+    let cache: Value = serde_json::from_str(&text).ok()?;
+    if cache["installed_client"] != installed_client()? {
+        return None;
+    }
+    decode(&cache, &account, now())
 }
 
 /// Remember a picker the account's own Claude Code reported.
@@ -64,12 +84,12 @@ pub(super) fn remember(home: &Path, version: Option<&str>, models: &[PickerModel
     if models.is_empty() {
         return;
     }
-    let path = home.join(FILE);
-    let temp = path.with_extension(format!("json.{}", std::process::id()));
-    let text = encode(&account, version, now(), models).to_string();
-    if std::fs::write(&temp, text).is_ok() && std::fs::rename(&temp, &path).is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
+    let Some(installed) = installed_client() else {
+        return;
+    };
+    let mut cache = encode(&account, version, now(), models);
+    cache["installed_client"] = installed;
+    let _ = crate::setup::write_config_atomic(&home.join(FILE), &cache.to_string());
 }
 
 /// The account's picker: from the cache unless `refresh`, else from a fresh probe.

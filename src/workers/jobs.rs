@@ -127,7 +127,6 @@ struct Instruction {
 }
 
 struct Job {
-    checkout: std::path::PathBuf,
     sender: mpsc::Sender<Instruction>,
     state: Arc<Mutex<State>>,
     task: AbortHandle,
@@ -135,6 +134,7 @@ struct Job {
 }
 
 struct State {
+    checkout: std::path::PathBuf,
     runtime: Runtime,
     mode: Mode,
     can_steer: bool,
@@ -221,6 +221,7 @@ impl State {
             "job_id": job_id, "mode":self.mode, "runtime":self.runtime,
             "can_steer": self.can_steer && self.status == "running",
             "status": self.status,
+            "checkout": self.checkout,
             "model": self.model,
             "native_session": self.native_session,
             "progress": self.progress,
@@ -326,6 +327,7 @@ impl Jobs {
         };
         let (sender, instructions) = mpsc::channel(4);
         let state = Arc::new(Mutex::new(State {
+            checkout: cwd.clone(),
             status: "running",
             can_steer: false,
             runtime: request.runtime,
@@ -402,7 +404,6 @@ impl Jobs {
         self.entries.insert(
             id,
             Job {
-                checkout: cwd,
                 sender,
                 state,
                 task: handle.abort_handle(),
@@ -418,7 +419,7 @@ impl Jobs {
             && self
                 .entries
                 .values()
-                .any(|job| job.writes && job.checkout == checkout && !job.task.is_finished()))
+                .any(|job| job.writes && !job.task.is_finished() && job.state.lock().unwrap().checkout == checkout))
         .then(|| {
             "Another worker had write access to this checkout when this job started. Use a separate git worktree for independent edits."
                 .to_owned()
@@ -1197,6 +1198,7 @@ printf flushed > "$MARKER"
             "runtime": "codex", "mode": "session", "task": "say hi", "model": "fixture"
         }));
         let state = Mutex::new(State {
+            checkout: ".".into(),
             runtime: Runtime::Codex,
             mode: Mode::Session,
             can_steer: false,
@@ -1245,6 +1247,7 @@ printf '%s\n' '{"type":"result","is_error":true,"result":"overloaded right now"}
             "runtime": "claude", "mode": "session", "task": "say hi", "model": "fixture"
         }));
         let state = Mutex::new(State {
+            checkout: ".".into(),
             runtime: Runtime::Claude,
             mode: Mode::Session,
             can_steer: false,
@@ -1300,6 +1303,7 @@ done
     #[cfg(unix)]
     fn pinned_state(request: &Start) -> Mutex<State> {
         Mutex::new(State {
+            checkout: ".".into(),
             runtime: Runtime::Claude,
             mode: Mode::Session,
             can_steer: false,
@@ -1411,9 +1415,9 @@ done
         let (sender, _) = mpsc::channel(1);
         let task = tokio::spawn(std::future::pending::<()>());
         Job {
-            checkout: ".".into(),
             sender,
             state: Arc::new(Mutex::new(State {
+                checkout: ".".into(),
                 runtime: Runtime::Codex,
                 mode: Mode::Session,
                 can_steer: false,

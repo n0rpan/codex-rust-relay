@@ -42,6 +42,7 @@ export function sessionParent(entry) {
  */
 export function catalogTree(entries) {
   const byKey = new Map(entries.map((entry) => [sessionKey(entry.scope, entry.session.id), entry]));
+  const byProject = new Map(entries.map(({ scope, session }) => [JSON.stringify([scope.project, session.id]), scope]));
   const links = new Map();
   const children = new Map();
   const roots = [];
@@ -54,12 +55,7 @@ export function catalogTree(entries) {
       if (!scope) {
         // A terminal parent has no host scope. Its native id still matches a
         // catalog row in the recorded project.
-        const hit =
-          entries.find(
-            (candidate) =>
-              candidate.session.id === recorded.id && candidate.scope.project === recorded.project,
-          ) ?? entries.find((candidate) => candidate.session.id === recorded.id);
-        scope = hit?.scope ?? null;
+        scope = byProject.get(JSON.stringify([recorded.project, recorded.id])) ?? null;
       }
       if (scope) {
         const key = sessionKey(scope, recorded.id);

@@ -38,7 +38,7 @@ pub(crate) enum Message {
     Discovered(u64, Box<Server>),
     Gateway {
         caller: Caller,
-        request: Gateway,
+        request: Box<Gateway>,
         reply: Replier,
     },
     Stop,
@@ -503,7 +503,7 @@ impl Engine {
                     caller,
                     request,
                     reply,
-                }) => match request {
+                }) => match *request {
                     Gateway::Launch(_) if self.draining.is_some() => {
                         self.answer(reply, Err(crate::handover::REFUSAL.into()))?
                     }
@@ -1955,15 +1955,11 @@ impl Engine {
             .and_then(|l| l.store.terminal_session_id(id).ok())
             .unwrap_or_else(|| id.rsplit(':').next().unwrap_or(id));
         let ready = live.is_some_and(|l| l.store.state() == &Connection::Ready);
-        Ok(crate::workers::status(
-            entry,
-            id,
-            native,
-            view,
-            timeline,
-            ready,
-            self.operators(),
-        ))
+        let mut status =
+            crate::workers::status(entry, id, native, view, timeline, ready, self.operators());
+        status["checkout"] = json!(scope.project);
+        status["parent"] = json!(entry.origin.parent);
+        Ok(status)
     }
     /// Resolve the caller to exactly one parent identity, or refuse. Every
     /// parent operation uses this one result.
