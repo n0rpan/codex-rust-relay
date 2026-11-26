@@ -46,7 +46,8 @@ pub fn clamp_reasoning_effort(
         .iter()
         .min_by_key(|level| {
             let rank = reasoning_rank(level).unwrap_or(target);
-            (rank.abs_diff(target), std::cmp::Reverse(rank))
+            // Equal distances pick the lower level, never the more expensive one.
+            (rank.abs_diff(target), rank)
         })
         .cloned()
 }
@@ -799,6 +800,12 @@ mod tests {
             Some("high")
         );
         assert_eq!(clamp_reasoning_effort("medium", &supported, None), None);
+        // `medium` sits exactly between `low` and `high`; the cheaper one wins.
+        let gap = ["low", "high"].map(str::to_owned).to_vec();
+        assert_eq!(
+            clamp_reasoning_effort("medium", &gap, None).as_deref(),
+            Some("low")
+        );
     }
 
     #[test]

@@ -187,13 +187,75 @@ pub fn classify(status: u16, message: &str, body: &Value) -> Option<Action> {
             "invalid",
         ],
     ) {
-        for field in DROPPABLE {
-            if body.get(*field).is_some() && text.contains(field) {
-                return Some(Action::Drop(field));
-            }
+        return named_field(&text, body).map(Action::Drop);
+    }
+    None
+}
+
+/// Picks the request field an error names, without mistaking a field name that
+/// appears inside a rejected value for the parameter itself.
+///
+/// `Invalid include value: reasoning.encrypted_content` names `include`; the
+/// `reasoning` in the value is not the offending parameter. Quoted parameter
+/// paths win (`'reasoning.summary'` means `reasoning`), then whole tokens that
+/// are not followed by a dot.
+fn named_field(text: &str, body: &Value) -> Option<&'static str> {
+    let quoted = quoted_tokens(text);
+    for field in DROPPABLE {
+        if body.get(*field).is_some()
+            && quoted
+                .iter()
+                .any(|token| *token == *field || token.split('.').next() == Some(*field))
+        {
+            return Some(field);
+        }
+    }
+    for field in DROPPABLE {
+        if body.get(*field).is_some() && names_token(text, field) {
+            return Some(field);
         }
     }
     None
+}
+
+fn quoted_tokens(text: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    for quote in ['\'', '"', '`'] {
+        let mut rest = text;
+        while let Some(start) = rest.find(quote) {
+            let after = &rest[start + 1..];
+            let Some(end) = after.find(quote) else {
+                break;
+            };
+            tokens.push(&after[..end]);
+            rest = &after[end + 1..];
+        }
+    }
+    tokens
+}
+
+fn names_token(text: &str, field: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(position) = text[from..].find(field) {
+        let start = from + position;
+        let end = start + field.len();
+        let before = start == 0 || !is_ident_byte(bytes[start - 1]);
+        // A dot means the match is part of a path/value such as
+        // `reasoning.encrypted_content`, not the parameter itself.
+        let after = bytes
+            .get(end)
+            .is_none_or(|byte| !is_ident_byte(*byte) && *byte != b'.');
+        if before && after {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn mentions(text: &str, words: &[&str]) -> bool {
@@ -360,6 +422,32 @@ mod tests {
         assert_eq!(
             classify(400, "Unsupported parameter: 'text' is not supported", &body),
             None
+        );
+    }
+
+    #[test]
+    fn a_field_name_inside_a_rejected_value_is_not_the_parameter() {
+        let body = json!({
+            "model": "m",
+            "reasoning": {"effort": "high"},
+            "include": ["reasoning.encrypted_content"],
+        });
+        assert_eq!(
+            classify(
+                400,
+                "Invalid include value: reasoning.encrypted_content",
+                &body
+            ),
+            Some(Action::Drop("include"))
+        );
+        let body = json!({"model": "m", "reasoning": {"summary": "auto"}});
+        assert_eq!(
+            classify(
+                400,
+                "Unsupported parameter: 'reasoning.summary' is not supported with this model.",
+                &body
+            ),
+            Some(Action::Drop("reasoning"))
         );
     }
 
