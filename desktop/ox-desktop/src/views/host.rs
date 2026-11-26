@@ -1527,25 +1527,56 @@ impl Host {
         cx: &mut Context<Self>,
     ) {
         self.with_project_dir(project, false, window, cx, move |s, project, window, cx| {
-            let (route, _) = s.project_row_state(&project, &row, scope, cx);
-            if let Some(route) = route {
-                s.open_catalog(project, row, route, window, cx);
-            } else if (row.needs_claude_alias()
-                || (scope.api && s.api_provider.as_deref() == Some(&row.model_provider)))
-                && !s.models.read(cx).is_empty()
-            {
-                s.choose_route = Some((project, row));
-                s.reveal_sidebar(window, cx);
-                cx.notify();
-            } else {
-                s.reveal_sidebar(window, cx);
-                s.message = Some(format!(
-                    "Set up {} in Settings to open this thread.",
-                    row.model_provider
-                ));
-                cx.notify();
-            }
+            s.activate_row_then(project, scope, row, None, window, cx);
         });
+    }
+
+    fn activate_row_with_action(
+        &mut self,
+        project: PathBuf,
+        scope: Scope,
+        row: ThreadRow,
+        action: super::workbench::DeferredRowAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.with_project_dir(project, false, window, cx, move |s, project, window, cx| {
+            s.activate_row_then(project, scope, row, Some(action), window, cx);
+        });
+    }
+
+    fn activate_row_then(
+        &mut self,
+        project: PathBuf,
+        scope: Scope,
+        row: ThreadRow,
+        action: Option<super::workbench::DeferredRowAction>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = row.id.clone();
+        let (route, _) = self.project_row_state(&project, &row, scope, cx);
+        if let Some(route) = route {
+            self.open_catalog(project, row, route, window, cx);
+            if let Some(action) = action {
+                self.panes[self.active]
+                    .update(cx, |p, cx| p.queue_row_action(id, action, window, cx));
+            }
+        } else if (row.needs_claude_alias()
+            || (scope.api && self.api_provider.as_deref() == Some(&row.model_provider)))
+            && !self.models.read(cx).is_empty()
+        {
+            self.choose_route = Some((project, row));
+            self.reveal_sidebar(window, cx);
+            cx.notify();
+        } else {
+            self.reveal_sidebar(window, cx);
+            self.message = Some(format!(
+                "Set up {} in Settings to open this thread.",
+                row.model_provider
+            ));
+            cx.notify();
+        }
     }
 
     fn navigate(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1585,11 +1616,12 @@ impl Host {
                     return;
                 }
                 "u" => {
+                    let (_, status) = self.project_row_state(&project, &row, scope, cx);
                     let currently_unread = self
                         .sidebar
                         .thread(&key)
                         .and_then(|m| m.unread_override)
-                        .unwrap_or(row.unread);
+                        .unwrap_or(row.unread || status == Some("Unread"));
                     self.sidebar
                         .set_unread_override(&key, Some(!currently_unread));
                     self.save_sidebar(cx);
@@ -1828,11 +1860,14 @@ impl Host {
                 .disabled(custom_title)
                 .on_click(move |_, window, cx| {
                     let _ = host_gen.update(cx, |s, cx| {
-                        s.activate_row(key_gen.project.clone(), scope, row_gen.clone(), window, cx);
-                        let id = key_gen.id.clone();
-                        s.panes[s.active].update(cx, |p, cx| {
-                            p.action(cx, DeskAction::GenerateTitle(id));
-                        });
+                        s.activate_row_with_action(
+                            key_gen.project.clone(),
+                            scope,
+                            row_gen.clone(),
+                            super::workbench::DeferredRowAction::GenerateTitle,
+                            window,
+                            cx,
+                        );
                     });
                 }),
         );
@@ -1967,14 +2002,14 @@ impl Host {
         menu = menu.item(crate::kit::menu_item("Find in transcript").on_click(
             move |_, window, cx| {
                 let _ = host_find.update(cx, |s, cx| {
-                    s.activate_row(
+                    s.activate_row_with_action(
                         key_find.project.clone(),
                         scope,
                         row_find.clone(),
+                        super::workbench::DeferredRowAction::FindInTranscript,
                         window,
                         cx,
                     );
-                    s.panes[s.active].update(cx, |p, cx| p.find_in_transcript(window, cx));
                 });
             },
         ));
@@ -2013,15 +2048,14 @@ impl Host {
                 .disabled(native_live.is_some())
                 .on_click(move |_, window, cx| {
                     let _ = host_arch.update(cx, |s, cx| {
-                        s.activate_row(
+                        s.activate_row_with_action(
                             key_arch.project.clone(),
                             scope,
                             row_arch.clone(),
+                            super::workbench::DeferredRowAction::Archive,
                             window,
                             cx,
                         );
-                        let id = key_arch.id.clone();
-                        s.panes[s.active].update(cx, |p, cx| p.request_archive(id, cx));
                     });
                 }),
         );
@@ -2032,9 +2066,14 @@ impl Host {
             menu = menu.item(crate::kit::menu_item("End running session").on_click(
                 move |_, window, cx| {
                     let _ = host_end.update(cx, |s, cx| {
-                        s.activate_row(key_end.project.clone(), scope, row_end.clone(), window, cx);
-                        let id = key_end.id.clone();
-                        s.panes[s.active].update(cx, |p, cx| p.request_end(id, cx));
+                        s.activate_row_with_action(
+                            key_end.project.clone(),
+                            scope,
+                            row_end.clone(),
+                            super::workbench::DeferredRowAction::End,
+                            window,
+                            cx,
+                        );
                     });
                 },
             ));
@@ -2449,7 +2488,13 @@ impl Host {
             let custom_title = meta.and_then(|m| m.custom_title.clone());
             let has_custom_title = custom_title.is_some();
             let display_title = custom_title.unwrap_or_else(|| t.title().to_owned());
-            let unread = meta.and_then(|m| m.unread_override).unwrap_or(t.unread);
+            let unread_override = meta.and_then(|m| m.unread_override);
+            let unread = unread_override.unwrap_or(t.unread || status == Some("Unread"));
+            let status = if status == Some("Unread") && unread_override == Some(false) {
+                None
+            } else {
+                status
+            };
             let fold_key = (project.clone(), t.id.clone());
             let folded = tree.as_ref().is_some_and(|tree| tree.children > 0)
                 && self.discovery.collapsed.contains(&fold_key);

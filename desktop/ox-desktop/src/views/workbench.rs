@@ -68,6 +68,15 @@ fn current_activity(store: &Store) -> Option<(activity::Scene, u64)> {
     ))
 }
 
+/// A row-level action requested while a pane or thread was still opening.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::views) enum DeferredRowAction {
+    Archive,
+    End,
+    GenerateTitle,
+    FindInTranscript,
+}
+
 pub struct Workbench {
     pub(super) pending_local_command: Option<super::terminal_review::Pending>,
     pub(super) enter_sends: bool,
@@ -92,6 +101,7 @@ pub struct Workbench {
     pub(super) front: bool,
     pub(super) query: String,
     pending_selection: Option<(ox_desk_core::store::ThreadRow, bool)>,
+    pending_row_action: Option<(String, DeferredRowAction)>,
     pending_draft: Option<(String, Vec<ox_desk_core::mentions::ImageInput>)>,
     pub(super) store: Option<Store>,
     pub(super) launch_error: Option<String>,
@@ -239,6 +249,7 @@ impl Workbench {
             front,
             query: String::new(),
             pending_selection: None,
+            pending_row_action: None,
             pending_draft: None,
             project,
             route,
@@ -467,6 +478,7 @@ impl Workbench {
                             }
                             s.finish_local_command(local_result, cx);
                             s.finish_command_discovery(cx);
+                            s.finish_pending_row_action(window, cx);
                             s.launch_handoff(cx);
                             if disconnected {
                                 s.retry_once(window, cx);
@@ -543,6 +555,65 @@ impl Workbench {
             });
         })
         .detach();
+    }
+
+    pub(super) fn queue_row_action(
+        &mut self,
+        id: String,
+        action: DeferredRowAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_row_action = Some((id, action));
+        self.finish_pending_row_action(window, cx);
+    }
+
+    fn finish_pending_row_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((id, action)) = self.pending_row_action.clone() else {
+            return;
+        };
+        let Some(store) = &self.store else {
+            return;
+        };
+        if store.state() != &Connection::Ready || store.selected() != Some(id.as_str()) {
+            return;
+        }
+        match action {
+            DeferredRowAction::Archive => {
+                if !store.can_manage_thread(&id) {
+                    return;
+                }
+                self.pending_row_action = None;
+                self.request_archive(id, cx);
+            }
+            DeferredRowAction::End => {
+                self.pending_row_action = None;
+                self.request_end(id, cx);
+            }
+            DeferredRowAction::GenerateTitle => {
+                if !store.can_generate_title(&id) {
+                    return;
+                }
+                self.pending_row_action = None;
+                self.action(cx, DeskAction::GenerateTitle(id));
+            }
+            DeferredRowAction::FindInTranscript => {
+                if !store
+                    .transcript(&id)
+                    .is_some_and(|t| t.is_ready() || t.active_turn().is_some())
+                {
+                    return;
+                }
+                self.pending_row_action = None;
+                if !self.transcript_views.contains_key(&id) {
+                    // Render once so `transcript_views` creates the entry for `id`, then open Find.
+                    self.pending_row_action = Some((id, action));
+                    cx.notify();
+                    return;
+                }
+                self.find_in_transcript(window, cx);
+            }
+        }
     }
 
     pub(super) fn select_catalog(
@@ -623,6 +694,7 @@ impl Workbench {
         ) {
             cx.emit(CatalogChanged);
             self.pending_selection = None;
+            self.pending_row_action = None;
             self.model_picker = None;
             self.thread_edit = None;
             self.pending_command = None;
@@ -866,6 +938,9 @@ impl Workbench {
                 .as_ref()
                 .is_some_and(|s| s.state() == &Connection::Ready && s.selected().is_none());
         let transcript = (!ready).then(|| self.transcript_panel(cx));
+        if self.pending_row_action.is_some() {
+            self.finish_pending_row_action(window, cx);
+        }
         let controls = self.thread_menu(cx);
         let review_toggle = self.review_toggle(cx);
         let inline_request = self.pane_width < px(825.);
