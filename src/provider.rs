@@ -487,6 +487,8 @@ pub struct ModelEntry {
     pub context_window: Option<u64>,
     pub input_modalities: Option<Vec<String>>,
     pub reasoning_efforts: Option<Vec<String>>,
+    pub default_reasoning_effort: Option<String>,
+    pub reasoning_mandatory: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -1153,6 +1155,29 @@ fn parse_models(provider_key: &str, item: &Item) -> Result<Vec<ModelEntry>, Rela
             .into());
         }
         let reasoning_efforts = opt_strings(table, "reasoning_efforts")?;
+        if let Some(efforts) = &reasoning_efforts
+            && let Some(unknown) = efforts
+                .iter()
+                .find(|effort| crate::catalog::reasoning_rank(effort).is_none())
+        {
+            return Err(format!(
+                "providers.{provider_key}.models entry {id:?} has an unknown reasoning effort {unknown:?}; use none, minimal, low, medium, high, xhigh or max"
+            )
+            .into());
+        }
+        let default_reasoning_effort = match opt_str(table, "default_reasoning_effort")? {
+            Some(effort) => {
+                if crate::catalog::reasoning_rank(&effort).is_none() {
+                    return Err(format!(
+                        "providers.{provider_key}.models entry {id:?} has an unknown default_reasoning_effort {effort:?}"
+                    )
+                    .into());
+                }
+                Some(effort)
+            }
+            None => None,
+        };
+        let reasoning_mandatory = opt_bool(table, "reasoning_mandatory")?;
         entries.push(ModelEntry {
             id,
             alias,
@@ -1160,6 +1185,8 @@ fn parse_models(provider_key: &str, item: &Item) -> Result<Vec<ModelEntry>, Rela
             context_window,
             input_modalities,
             reasoning_efforts,
+            default_reasoning_effort,
+            reasoning_mandatory,
         });
     }
     Ok(entries)
@@ -1197,6 +1224,19 @@ pub struct Route {
     pub upstream_model: String,
     pub wire: Wire,
     pub max_output_tokens: Option<u64>,
+    pub reasoning: ReasoningPolicy,
+}
+
+/// What a routed model accepts for reasoning, when the provider says so.
+///
+/// An empty `supported` list means "unknown": OX leaves the caller's choice
+/// alone and lets the provider answer. A non-empty list is authoritative, and
+/// `mandatory` means every way of disabling reasoning is rejected.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReasoningPolicy {
+    pub supported: Vec<String>,
+    pub default: Option<String>,
+    pub mandatory: bool,
 }
 
 impl Route {
@@ -1218,6 +1258,74 @@ impl Route {
         if requested.is_some_and(|requested| requested > limit) {
             payload[field] = limit.into();
         }
+    }
+
+    /// Removes a reasoning setting this model cannot accept.
+    ///
+    /// Codex sends `reasoning.effort: "none"` from its own global default long
+    /// after the user changed models. Providers that treat reasoning as
+    /// mandatory answer that with HTTP 400, so the value is replaced with the
+    /// provider's default (or dropped) before the request leaves OX.
+    ///
+    /// Returns a short description of the change for the one-line notice.
+    pub fn normalize_reasoning(&self, payload: &mut serde_json::Value) -> Option<String> {
+        let supported = self.reasoning.supported.clone();
+        if supported.is_empty() {
+            return None;
+        }
+        let reasoning = payload.get_mut("reasoning")?.as_object_mut()?;
+        let requested = reasoning
+            .get("effort")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let disabled = reasoning
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+        if requested.is_none() && !disabled {
+            return None;
+        }
+        let supports_none = supported.iter().any(|level| level == "none");
+        let wants_off = requested.as_deref() == Some("none") || disabled;
+        if wants_off && supports_none && !self.reasoning.mandatory {
+            return None;
+        }
+        if !wants_off
+            && let Some(effort) = requested.as_deref()
+            && supported.iter().any(|level| level == effort)
+        {
+            return None;
+        }
+        let replacement = self
+            .reasoning
+            .default
+            .clone()
+            .filter(|default| supported.contains(default))
+            .or_else(|| {
+                crate::catalog::clamp_reasoning_effort(
+                    requested.as_deref().unwrap_or("none"),
+                    &supported,
+                    None,
+                )
+            });
+        let replacement = replacement?;
+        if requested.as_deref() == Some(replacement.as_str()) && !disabled {
+            return None;
+        }
+        reasoning.remove("enabled");
+        reasoning.insert(
+            "effort".to_owned(),
+            serde_json::Value::String(replacement.clone()),
+        );
+        let notice = match requested.as_deref() {
+            Some("none") | None => {
+                format!("reasoning cannot be disabled on this model; using {replacement:?}")
+            }
+            Some(previous) => {
+                format!("reasoning effort {previous:?} is not supported; using {replacement:?}")
+            }
+        };
+        Some(notice)
     }
 }
 
@@ -1249,6 +1357,11 @@ impl Routes {
                     upstream_model: model.id.clone(),
                     max_output_tokens: model.max_output_tokens,
                     wire: vendor.wire,
+                    reasoning: ReasoningPolicy {
+                        supported: model.reasoning_efforts.clone(),
+                        default: model.default_reasoning_effort.clone(),
+                        mandatory: model.reasoning_mandatory,
+                    },
                 };
                 if let Some(previous) = by_alias.insert(alias.clone(), route) {
                     return Err(format!(
@@ -1298,6 +1411,7 @@ impl Routes {
                 upstream_model: rest.to_owned(),
                 max_output_tokens: None,
                 wire: *wire,
+                reasoning: ReasoningPolicy::default(),
             });
         }
         match self.by_upstream.get(requested) {
@@ -1592,7 +1706,109 @@ mod tests {
             max_output_tokens: None,
             input_modalities: vec!["text".to_owned()],
             reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            reasoning_mandatory: false,
         }
+    }
+
+    fn reasoning_route(supported: &[&str], default: Option<&str>, mandatory: bool) -> Route {
+        Route {
+            vendor: 0,
+            upstream_model: "gpt".to_owned(),
+            wire: Wire::Responses,
+            max_output_tokens: None,
+            reasoning: ReasoningPolicy {
+                supported: supported.iter().map(|level| (*level).to_owned()).collect(),
+                default: default.map(str::to_owned),
+                mandatory,
+            },
+        }
+    }
+
+    #[test]
+    fn a_mandatory_model_never_keeps_effort_none() {
+        let route = reasoning_route(&["low", "medium", "high"], Some("medium"), true);
+        let mut payload = serde_json::json!({
+            "model": "alpha/gpt",
+            "reasoning": {"effort": "none", "summary": "auto"},
+        });
+        let notice = route.normalize_reasoning(&mut payload).expect("a notice");
+        assert_eq!(payload["reasoning"]["effort"], "medium");
+        assert_eq!(payload["reasoning"]["summary"], "auto");
+        assert!(notice.contains("cannot be disabled"), "{notice}");
+
+        // `enabled: false` is the other way a client asks for no reasoning.
+        let mut payload = serde_json::json!({"reasoning": {"enabled": false}});
+        assert!(route.normalize_reasoning(&mut payload).is_some());
+        assert!(payload["reasoning"].get("enabled").is_none());
+        assert_eq!(payload["reasoning"]["effort"], "medium");
+    }
+
+    #[test]
+    fn a_mandatory_model_without_a_default_uses_the_lowest_level() {
+        let route = reasoning_route(&["low", "high"], None, true);
+        let mut payload = serde_json::json!({"reasoning": {"effort": "none"}});
+        assert!(route.normalize_reasoning(&mut payload).is_some());
+        // The closest supported level to "none" is the lowest one.
+        assert_eq!(payload["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn an_unsupported_effort_is_clamped_to_the_provider_default() {
+        let route = reasoning_route(&["low", "medium", "high"], Some("medium"), false);
+        let mut payload = serde_json::json!({"reasoning": {"effort": "max"}});
+        assert!(route.normalize_reasoning(&mut payload).is_some());
+        assert_eq!(payload["reasoning"]["effort"], "medium");
+    }
+
+    #[test]
+    fn supported_choices_are_left_untouched() {
+        let route = reasoning_route(&["none", "low", "high"], Some("low"), false);
+        for effort in ["none", "low", "high"] {
+            let mut payload = serde_json::json!({"reasoning": {"effort": effort}});
+            assert!(
+                route.normalize_reasoning(&mut payload).is_none(),
+                "{effort}"
+            );
+        }
+        // An unknown model keeps the caller's value; the provider decides.
+        let route = reasoning_route(&[], None, false);
+        let mut payload = serde_json::json!({"reasoning": {"effort": "none"}});
+        assert!(route.normalize_reasoning(&mut payload).is_none());
+    }
+
+    #[test]
+    fn static_entries_declare_reasoning_policy() {
+        let config = CodeoxConfig::load_from_str(
+            r#"
+[providers.alpha]
+base_url = "https://alpha.example/v1"
+
+[[providers.alpha.models]]
+id = "gpt"
+reasoning_efforts = ["low", "high"]
+default_reasoning_effort = "high"
+reasoning_mandatory = true
+"#,
+        )
+        .unwrap();
+        let model = &config.vendors[0].models[0];
+        assert_eq!(model.default_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(model.reasoning_mandatory, Some(true));
+
+        let error = CodeoxConfig::load_from_str(
+            r#"
+[providers.alpha]
+base_url = "https://alpha.example/v1"
+
+[[providers.alpha.models]]
+id = "gpt"
+default_reasoning_effort = "extreme"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("default_reasoning_effort"), "{error}");
     }
 
     #[test]

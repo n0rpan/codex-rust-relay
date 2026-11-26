@@ -13,6 +13,44 @@ use serde_json::{Value, json};
 
 use crate::provider::ModelEntry;
 
+/// Reasoning effort names in increasing strength. Providers publish them in
+/// their own order and vocabulary, so OX ranks by this list instead.
+pub const REASONING_LEVELS: [&str; 7] =
+    ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+pub(crate) fn reasoning_rank(level: &str) -> Option<usize> {
+    REASONING_LEVELS.iter().position(|known| *known == level)
+}
+
+/// Picks the effort to send when the requested one is not available.
+///
+/// A provider's own default wins because it is what the provider would have
+/// used had the request stayed silent. Otherwise the closest supported level is
+/// used, preferring the lower one on a tie so a clamp never quietly spends more
+/// reasoning tokens than the caller asked for.
+pub fn clamp_reasoning_effort(
+    requested: &str,
+    supported: &[String],
+    default: Option<&str>,
+) -> Option<String> {
+    if supported.iter().any(|level| level == requested) {
+        return None;
+    }
+    if let Some(default) = default
+        && supported.iter().any(|level| level == default)
+    {
+        return Some(default.to_owned());
+    }
+    let target = reasoning_rank(requested).unwrap_or(3);
+    supported
+        .iter()
+        .min_by_key(|level| {
+            let rank = reasoning_rank(level).unwrap_or(target);
+            (rank.abs_diff(target), std::cmp::Reverse(rank))
+        })
+        .cloned()
+}
+
 #[derive(Deserialize)]
 pub struct ProviderModels {
     #[serde(deserialize_with = "parse_model_rows")]
@@ -78,6 +116,13 @@ pub struct ModelSpec {
     pub max_output_tokens: Option<u64>,
     pub input_modalities: Vec<String>,
     pub reasoning_efforts: Vec<String>,
+    /// The effort to use when the caller does not pick one, as published by the
+    /// provider. Codex otherwise falls back to its own global default, which may
+    /// be `none` on a model that cannot disable reasoning.
+    pub default_reasoning_effort: Option<String>,
+    /// The model rejects every attempt to disable reasoning. OX must never send
+    /// `effort: "none"`, `enabled: false` or `thinking: {"type":"disabled"}`.
+    pub reasoning_mandatory: bool,
 }
 
 /// One row of the Codex model catalog.
@@ -89,6 +134,8 @@ pub struct CatalogModel {
     pub max_output_tokens: Option<u64>,
     pub input_modalities: Vec<String>,
     pub reasoning_efforts: Vec<String>,
+    pub default_reasoning_effort: Option<String>,
+    pub reasoning_mandatory: bool,
     /// Offer Codex's freeform `apply_patch` tool. Enabled for translated
     /// vendors, where the adapter normalizes it to a function tool; Responses
     /// vendors keep their previous tool surface.
@@ -174,6 +221,8 @@ impl ModelSpec {
         {
             input_modalities.push("image".to_owned());
         }
+        let (reasoning_efforts, default_reasoning_effort, reasoning_mandatory) =
+            reasoning_capabilities(model, &strings("/capabilities/reasoning/effort"));
         Some(Self {
             id: id.to_owned(),
             alias: None,
@@ -197,10 +246,9 @@ impl ModelSpec {
                 "/max_tokens",
             ]),
             input_modalities,
-            reasoning_efforts: strings("/capabilities/reasoning/effort")
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+            reasoning_efforts,
+            default_reasoning_effort,
+            reasoning_mandatory,
         })
     }
 
@@ -213,6 +261,8 @@ impl ModelSpec {
             max_output_tokens: None,
             input_modalities: vec!["text".to_owned()],
             reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            reasoning_mandatory: false,
         };
         spec.apply_override(entry);
         spec
@@ -234,7 +284,54 @@ impl ModelSpec {
         if let Some(reasoning_efforts) = &entry.reasoning_efforts {
             self.reasoning_efforts = reasoning_efforts.clone();
         }
+        if let Some(default) = &entry.default_reasoning_effort {
+            self.default_reasoning_effort = Some(default.clone());
+        }
+        if let Some(mandatory) = entry.reasoning_mandatory {
+            self.reasoning_mandatory = mandatory;
+        }
     }
+}
+
+/// Reads the reasoning capabilities a provider publishes.
+///
+/// OpenRouter describes them in a `reasoning` object: `supported_efforts` (a
+/// descending list, or `null` for "every gateway effort"), `default_effort`,
+/// `mandatory` and `supports_max_tokens`. Other vendors such as Alibaba's Model
+/// Studio use `capabilities.reasoning.effort`; that list is the fallback.
+fn reasoning_capabilities(model: &Value, fallback: &[&str]) -> (Vec<String>, Option<String>, bool) {
+    let mandatory = model
+        .pointer("/reasoning/mandatory")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut efforts: Vec<String> = match model.pointer("/reasoning/supported_efforts") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        // `null` means every gateway effort is accepted.
+        Some(Value::Null) => REASONING_LEVELS
+            .iter()
+            .map(|level| (*level).to_owned())
+            .collect(),
+        _ => fallback.iter().map(|level| (*level).to_owned()).collect(),
+    };
+    efforts.retain(|effort| reasoning_rank(effort).is_some());
+    let mut seen = HashSet::new();
+    efforts.retain(|effort| seen.insert(effort.clone()));
+    // A mandatory model rejects every way of turning reasoning off, so it must
+    // not be offered in the catalog either.
+    if mandatory {
+        efforts.retain(|effort| effort != "none");
+    }
+    let default = model
+        .pointer("/reasoning/default_effort")
+        .or_else(|| model.pointer("/capabilities/reasoning/default_effort"))
+        .and_then(Value::as_str)
+        .filter(|effort| efforts.iter().any(|level| level == effort))
+        .map(str::to_owned);
+    (efforts, default, mandatory)
 }
 
 /// Model Studio's compatibility catalog omits capacity for this snapshot.
@@ -279,6 +376,8 @@ impl ProviderModels {
                 max_output_tokens: spec.max_output_tokens,
                 input_modalities: spec.input_modalities,
                 reasoning_efforts: spec.reasoning_efforts,
+                default_reasoning_effort: spec.default_reasoning_effort,
+                reasoning_mandatory: spec.reasoning_mandatory,
                 apply_patch: false,
             })
             .collect::<Vec<_>>();
@@ -341,6 +440,7 @@ impl CatalogModel {
         let levels = self
             .reasoning_efforts
             .iter()
+            .filter(|effort| !(self.reasoning_mandatory && effort.as_str() == "none"))
             .filter_map(|effort| {
                 let description = match effort.as_str() {
                     "none" => "Reasoning off",
@@ -355,9 +455,17 @@ impl CatalogModel {
                 Some(json!({ "effort": effort, "description": description }))
             })
             .collect::<Vec<_>>();
-        let default_effort = ["medium", "low", "high", "xhigh", "max", "minimal", "none"]
-            .into_iter()
-            .find(|effort| levels.iter().any(|level| level["effort"] == *effort));
+        // Prefer what the provider says it uses by default, then the levels
+        // most clients expect. A mandatory model never defaults to `none`.
+        let default_effort = self
+            .default_reasoning_effort
+            .as_deref()
+            .filter(|effort| levels.iter().any(|level| level["effort"] == *effort))
+            .or_else(|| {
+                ["medium", "low", "high", "xhigh", "max", "minimal", "none"]
+                    .into_iter()
+                    .find(|effort| levels.iter().any(|level| level["effort"] == *effort))
+            });
 
         let mut entry = json!({
             "slug": self.slug,
@@ -469,6 +577,8 @@ mod tests {
                 context_window: Some(200_000),
                 input_modalities: Some(vec!["text".to_owned(), "image".to_owned()]),
                 reasoning_efforts: Some(vec!["low".to_owned(), "high".to_owned()]),
+                default_reasoning_effort: Some("high".to_owned()),
+                reasoning_mandatory: Some(true),
             },
             ModelEntry {
                 id: "offline-model".to_owned(),
@@ -484,6 +594,102 @@ mod tests {
         assert_eq!(specs[0].input_modalities, ["text", "image"]);
         assert_eq!(specs[1].id, "offline-model");
         assert_eq!(specs[1].input_modalities, ["text"]);
+    }
+
+    #[test]
+    fn openrouter_reasoning_metadata_drives_the_offered_levels() {
+        let discovered = serde_json::from_value::<ProviderModels>(json!({
+            "data": [{
+                "id": "openai/gpt-6.1-sol",
+                "name": "GPT-6.1 Sol",
+                "context_length": 1_050_000,
+                "reasoning": {
+                    "mandatory": true,
+                    "default_enabled": true,
+                    "supported_efforts": ["max", "xhigh", "high", "medium", "low"],
+                    "default_effort": "medium"
+                }
+            }]
+        }))
+        .unwrap();
+        let specs = merge_models(Some(discovered), &[]);
+        assert_eq!(
+            specs[0].reasoning_efforts,
+            ["max", "xhigh", "high", "medium", "low"]
+        );
+        assert_eq!(specs[0].default_reasoning_effort.as_deref(), Some("medium"));
+        assert!(specs[0].reasoning_mandatory);
+
+        let models = vec![CatalogModel {
+            slug: "openrouter/openai/gpt-6.1-sol".to_owned(),
+            display_name: "GPT-6.1 Sol".to_owned(),
+            description: "OpenRouter".to_owned(),
+            context_window: specs[0].context_window,
+            max_output_tokens: None,
+            input_modalities: specs[0].input_modalities.clone(),
+            reasoning_efforts: specs[0].reasoning_efforts.clone(),
+            default_reasoning_effort: specs[0].default_reasoning_effort.clone(),
+            reasoning_mandatory: specs[0].reasoning_mandatory,
+            apply_patch: false,
+        }];
+        let catalog = catalog_json(&models, &bundled());
+        let entry = &catalog["models"][0];
+        assert_eq!(entry["default_reasoning_level"], "medium");
+        let levels = entry["supported_reasoning_levels"].as_array().unwrap();
+        assert!(
+            levels.iter().all(|level| level["effort"] != "none"),
+            "{levels:?}"
+        );
+    }
+
+    #[test]
+    fn a_mandatory_model_drops_none_even_when_the_provider_lists_it() {
+        let discovered = serde_json::from_value::<ProviderModels>(json!({
+            "data": [{
+                "id": "gpt",
+                "reasoning": {
+                    "mandatory": true,
+                    "supported_efforts": ["high", "low", "none"],
+                    "default_effort": "none"
+                }
+            }]
+        }))
+        .unwrap();
+        let spec = merge_models(Some(discovered), &[]).remove(0);
+        assert_eq!(spec.reasoning_efforts, ["high", "low"]);
+        assert_eq!(spec.default_reasoning_effort, None, "none is not a default");
+    }
+
+    #[test]
+    fn a_null_effort_list_means_every_gateway_level() {
+        let discovered = serde_json::from_value::<ProviderModels>(json!({
+            "data": [{
+                "id": "gpt",
+                "reasoning": {"mandatory": false, "supported_efforts": null, "default_effort": "low"}
+            }]
+        }))
+        .unwrap();
+        let spec = merge_models(Some(discovered), &[]).remove(0);
+        assert_eq!(spec.reasoning_efforts, REASONING_LEVELS);
+        assert_eq!(spec.default_reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn reasoning_clamping_prefers_the_provider_default_then_the_nearest_level() {
+        let supported = ["low", "medium", "high"].map(str::to_owned).to_vec();
+        assert_eq!(
+            clamp_reasoning_effort("none", &supported, Some("high")).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            clamp_reasoning_effort("none", &supported, None).as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            clamp_reasoning_effort("max", &supported, None).as_deref(),
+            Some("high")
+        );
+        assert_eq!(clamp_reasoning_effort("medium", &supported, None), None);
     }
 
     #[test]
@@ -558,6 +764,8 @@ mod tests {
             max_output_tokens: Some(16384),
             input_modalities: vec!["text".to_owned()],
             reasoning_efforts: vec!["medium".to_owned()],
+            default_reasoning_effort: None,
+            reasoning_mandatory: false,
             apply_patch: true,
         }];
         let catalog = catalog_json(&models, &bundled());

@@ -94,6 +94,9 @@ struct App {
     max_request_bytes: usize,
     /// Configured vendor credentials, used to scrub upstream error text.
     secrets: Arc<Vec<String>>,
+    /// One line per provider/model adaptation, so a corrected default is
+    /// explained once instead of on every turn.
+    notices: std::sync::Mutex<std::collections::HashSet<String>>,
     /// One pooled Brave client, present only when live search is opted in and
     /// its credential reference is usable.
     search: Option<BraveSearch>,
@@ -695,6 +698,7 @@ impl App {
             local_auth: provider::bearer(token)?,
             max_request_bytes: MAX_REQUEST_BYTES,
             secrets: Arc::new(secrets),
+            notices: std::sync::Mutex::default(),
             search: None,
         })
     }
@@ -828,6 +832,8 @@ impl App {
                     max_output_tokens: spec.max_output_tokens,
                     input_modalities: spec.input_modalities.clone(),
                     reasoning_efforts: spec.reasoning_efforts.clone(),
+                    default_reasoning_effort: spec.default_reasoning_effort.clone(),
+                    reasoning_mandatory: spec.reasoning_mandatory,
                     apply_patch: vendor.wire.is_translated(),
                 });
             }
@@ -857,8 +863,22 @@ impl App {
             local_auth: provider::bearer(token)?,
             max_request_bytes,
             secrets: Arc::new(secrets),
+            notices: std::sync::Mutex::default(),
             search,
         })
+    }
+
+    /// Prints one adaptation notice per provider/model for the life of the
+    /// process. The condition it explains is a configuration default, not a
+    /// per-turn event, so repeating it in the log would only add noise.
+    fn notice_once(&self, key: impl std::fmt::Display, message: impl std::fmt::Display) {
+        let mut notices = self
+            .notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if notices.insert(key.to_string()) {
+            eprintln!("{message}");
+        }
     }
 
     fn visible_models(&self) -> impl Iterator<Item = &Value> {
@@ -1158,6 +1178,15 @@ impl App {
                 };
                 if path == "/responses" {
                     route.bound_output(&mut payload, "max_output_tokens", &state.vendor);
+                }
+                if let Some(notice) = route.normalize_reasoning(&mut payload) {
+                    self.notice_once(
+                        format!("reasoning:{}:{}", state.vendor.key, route.upstream_model),
+                        format!(
+                            "ox: provider {:?}: model {:?}: {notice}",
+                            state.vendor.key, route.upstream_model
+                        ),
+                    );
                 }
                 if translate::sanitize_replayed_history(&mut payload, route.wire) {
                     eprintln!(
@@ -3217,6 +3246,87 @@ env_key = "BETA_KEY"
         assert_eq!(
             text, r#"{"error":{"message":"provider returned HTTP 500"}}"#,
             "an oversized error body contributes no text at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mandatory_reasoning_model_never_receives_effort_none() {
+        let mock = spawn_mock(
+            Ok(json!({"data": [{
+                "id": "gpt-6.1-sol",
+                "name": "GPT-6.1 Sol",
+                "context_length": 1_050_000,
+                "reasoning": {
+                    "mandatory": true,
+                    "supported_efforts": ["high", "medium", "low"],
+                    "default_effort": "high"
+                }
+            }]})),
+            None,
+        )
+        .await;
+        let relay = start_relay(
+            &one_vendor_config(&mock.base),
+            &[("ALPHA_KEY", "alpha-secret")],
+            1 << 20,
+        )
+        .await;
+
+        // Codex can still send the global default from an earlier model choice.
+        let response = post(
+            &relay,
+            json!({
+                "model": "alpha/gpt-6.1-sol",
+                "input": [],
+                "reasoning": {"effort": "none", "summary": "auto"},
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+
+        let hits = mock.responses_hits();
+        assert_eq!(hits.len(), 1);
+        let body = hits[0].body.as_ref().expect("the relay sends a JSON body");
+        assert_eq!(body["model"], "gpt-6.1-sol");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+    }
+
+    #[tokio::test]
+    async fn a_model_that_supports_it_keeps_effort_none() {
+        let mock = spawn_mock(
+            Ok(json!({"data": [{
+                "id": "gpt-5.4-mini",
+                "reasoning": {
+                    "mandatory": false,
+                    "supported_efforts": ["high", "low", "none"],
+                    "default_effort": "medium"
+                }
+            }]})),
+            None,
+        )
+        .await;
+        let relay = start_relay(
+            &one_vendor_config(&mock.base),
+            &[("ALPHA_KEY", "alpha-secret")],
+            1 << 20,
+        )
+        .await;
+
+        let response = post(
+            &relay,
+            json!({
+                "model": "alpha/gpt-5.4-mini",
+                "input": [],
+                "reasoning": {"effort": "none"},
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let hits = mock.responses_hits();
+        assert_eq!(
+            hits[0].body.as_ref().unwrap()["reasoning"]["effort"],
+            "none"
         );
     }
 
