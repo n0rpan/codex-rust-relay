@@ -236,6 +236,7 @@ fn target_mirrors_use_the_targets_origin_and_survive_an_offline_refresh() {
         .arg(&origin))
     .unwrap();
     run(git(&target).args(["remote", "add", "origin", "../upstream.git"])).unwrap();
+    run(git(&target).args(["update-ref", "refs/remotes/origin/second", "HEAD"])).unwrap();
     let cache = tmp.path().join("mirrors");
     fs::create_dir(&cache).unwrap();
     let mirror = Mirror::from_checkout(&cache, &target).unwrap();
@@ -283,8 +284,23 @@ fn target_mirrors_use_the_targets_origin_and_survive_an_offline_refresh() {
         mirror.known(std::slice::from_ref(&second)).unwrap(),
         std::slice::from_ref(&second)
     );
+    Mirror::from_checkout(&cache, &target).unwrap();
+    assert_eq!(
+        object(mirror.path(), "refs/remotes/origin/second").unwrap(),
+        second
+    );
+    run(git(&target).args(["fetch", "origin"])).unwrap();
+    run(git(&target).args(["checkout", "--detach", "origin/second"])).unwrap();
+    run(git(&target).args(["commit", "--allow-empty", "-qm", "third"])).unwrap();
+    run(git(&target).args(["update-ref", "refs/remotes/origin/second", "HEAD"])).unwrap();
+    let third = object(&target, "HEAD").unwrap();
     fs::rename(&origin, tmp.path().join("unavailable")).unwrap();
     assert!(mirror.refresh().is_err());
+    Mirror::from_checkout(&cache, &target).unwrap();
+    assert_eq!(
+        mirror.known(std::slice::from_ref(&third)).unwrap(),
+        std::slice::from_ref(&third)
+    );
     let packet = Snapshot::capture(
         tmp.path(),
         &src,
@@ -296,7 +312,7 @@ fn target_mirrors_use_the_targets_origin_and_survive_an_offline_refresh() {
     assert_eq!(object(&worker, "HEAD").unwrap(), second);
     assert_eq!(
         object(&worker, "refs/remotes/origin/second").unwrap(),
-        second
+        third
     );
     assert_eq!(
         line(run(git(&worker).args(["remote", "get-url", "origin"])).unwrap()).unwrap(),

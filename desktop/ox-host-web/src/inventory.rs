@@ -62,20 +62,49 @@ pub(crate) async fn local(app: &App, project: Option<String>) -> io::Result<Inve
     Ok(inventory)
 }
 
-async fn sample(app: &App) -> io::Result<(Inventory, HashSet<String>)> {
+async fn hello(app: &App) -> io::Result<Server> {
     let frame = timeout(Duration::from_secs(6), async {
         let mut conn = bridge::connect(&app.host).await?;
         bridge::write(&mut conn, &Client::Hello { version: VERSION }).await?;
         bridge::line(&mut BufReader::new(conn), &mut Vec::new()).await
     })
     .await??;
+    Ok(serde_json::from_slice(&frame)?)
+}
+fn add_discovered(app: &App, projects: &mut Vec<std::path::PathBuf>) {
+    projects.extend(
+        app.discovered
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.project.clone()),
+    );
+    projects.sort();
+    projects.dedup();
+}
+/// A transfer always resolves the receiver's current registered directories again.
+pub(crate) async fn projects(app: &App, target: &str) -> io::Result<Vec<std::path::PathBuf>> {
+    match hello(app).await? {
+        Server::Hello {
+            host: Some(host),
+            mut projects,
+            ..
+        } if host.id.as_deref() == Some(target) => {
+            add_discovered(app, &mut projects);
+            Ok(projects)
+        }
+        _ => Err(io::Error::other("Worker host identity changed.")),
+    }
+}
+async fn sample(app: &App) -> io::Result<(Inventory, HashSet<String>)> {
+    let hello = hello(app).await?;
     let Server::Hello {
         host: Some(host),
         capabilities,
         mut projects,
         mut routes,
         ..
-    } = serde_json::from_slice(&frame)?
+    } = hello
     else {
         return Err(io::Error::other(
             "Session host did not return its identity.",
@@ -92,17 +121,16 @@ async fn sample(app: &App) -> io::Result<(Inventory, HashSet<String>)> {
     routes.retain(|r| {
         runtimes.contains(&r.runtime) && (!r.is_api() || supports("worker_api_provider"))
     });
-    projects.extend(
-        app.discovered
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|s| s.project.clone()),
-    );
+    add_discovered(app, &mut projects);
+    let private = app.state.lock().unwrap().worker_directory();
     let projects = tokio::task::spawn_blocking(move || {
-        projects.sort();
-        projects.dedup();
-        projects.iter().filter_map(|p| repository_id(p)).collect()
+        let private = private.canonicalize().unwrap_or(private);
+        projects
+            .iter()
+            .filter_map(|p| p.canonicalize().ok())
+            .filter(|p| !p.starts_with(&private))
+            .filter_map(|p| repository_id(&p))
+            .collect()
     })
     .await?;
     Ok((

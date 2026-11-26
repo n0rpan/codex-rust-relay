@@ -346,6 +346,9 @@ impl State {
         }
         Ok(id.to_owned())
     }
+    pub fn worker_directory(&self) -> PathBuf {
+        self.dir.join("linked-work")
+    }
     pub fn worker_links_path(&self) -> PathBuf {
         self.dir.join("worker-links.json")
     }

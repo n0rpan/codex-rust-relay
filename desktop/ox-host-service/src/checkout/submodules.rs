@@ -134,7 +134,7 @@ pub(super) fn unpack(
         let mut child = input.take(u64::from_be_bytes(size));
         let staging = staging.join(format!("module-{}", prepared.len()));
         fs::create_dir(&staging)?;
-        let checkout = receive_inner(&staging, job, None, &mut child, depth + 1)?;
+        let checkout = receive_inner(&staging, job, None, &mut child, depth + 1, None)?;
         if child.limit() != 0
             || checkout != staging.join(job.to_string())
             || object(&checkout, "HEAD")? != expected

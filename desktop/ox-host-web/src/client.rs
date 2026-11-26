@@ -15,7 +15,7 @@ use tokio_tungstenite::{
 };
 
 const COOKIE: &str = "__Host-ox-device";
-type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+pub(crate) type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 const LIMIT: usize = 64 * 1024 * 1024;
 
 pub fn runtime() -> io::Result<&'static tokio::runtime::Runtime> {
@@ -385,7 +385,7 @@ impl PairedClient {
         .await?;
         reply.json().await.map_err(io::Error::other)
     }
-    async fn proof(&self, purpose: &str, request: Option<&str>) -> io::Result<Value> {
+    pub(crate) async fn proof(&self, purpose: &str, request: Option<&str>) -> io::Result<Value> {
         let reply = self
             .post(
                 "challenge",
@@ -456,7 +456,7 @@ impl PairedClient {
         }
         Ok(response)
     }
-    async fn websocket(&self, path: &str, first: Value) -> io::Result<Socket> {
+    pub(crate) async fn websocket(&self, path: &str, first: Value) -> io::Result<Socket> {
         let mut req = format!(
             "wss://{}/api/{path}",
             self.origin.trim_start_matches("https://")

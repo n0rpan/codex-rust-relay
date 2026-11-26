@@ -29,6 +29,13 @@ def receiver(d, stack):
     (package / "git").symlink_to(shutil.which("git"))
     project = root / "build-checkout"
     repo(project, "git@code.example.test:owner/ox.git")
+    (project / "base.bin").write_bytes(os.urandom(2 * 1024 * 1024))
+    (project / "nested").mkdir()
+    (project / "nested/tracked").write_text("target base")
+    (project / ".gitignore").write_text(".env\n")
+    subprocess.run(["git", "-C", project, "add", "."], check=True)
+    subprocess.run(["git", "-C", project, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
+                    "-c", "commit.gpgsign=false", "commit", "-qm", "shared base"], check=True)
     stack.enter_context(session_host(package / "ox-host", root, env))
     state = Path(env["OX_HOST_STATE_DIR"])
     wait(lambda: (state / "remote-admin.sock").exists())
@@ -203,6 +210,51 @@ def worker_links(js, wait, state, source, harness, source_env):
     repo(source / "another/ox", "https://code.example.test/different/ox")
     subprocess.run([harness, "--exact", "inventory::tests::paired_inventory", "--ignored"],
                    env=source_env, check=True, timeout=45)
+    target = source / "receiver/build-checkout"
+    parent = source / "inventory-source/ox"
+    def git(path, *args):
+        return subprocess.check_output(["git", "-C", path, *args])
+    git(parent, "fetch", "--quiet", target, "HEAD")
+    git(parent, "checkout", "--quiet", "-B", "laptop", "FETCH_HEAD")
+    (parent / "nested/tracked").write_text("staged")
+    git(parent, "add", "nested/tracked")
+    (parent / "nested/tracked").write_text("uncommitted on laptop")
+    private = os.urandom(600_000)
+    (parent / "nested/input").write_bytes(private)
+    (parent / ".env").write_text("ignored")
+    def state_of(path):
+        return (git(path, "status", "--porcelain=v1"), git(path, "diff", "--cached"), git(path, "show-ref"))
+    before = (state_of(parent), state_of(target))
+    def transfer(env):
+        subprocess.run([harness,"--exact","worker_checkout::tests::linked_checkout","--ignored"],
+                       env=env, check=True, timeout=60)
+    transfer(dict(source_env, OX_TEST_DENIED_LINK="1"))
+    assert not (state / "linked-work/jobs").exists()
+    admin(state, {"type": "worker_access", "id": link["id"], "before": edited["worker_hosts"][0]["worker"],
+                  "may_launch": True, "ceiling": "read"})
+    transfer(source_env)
+    job = state / "linked-work/jobs" / source_id / "42"
+    work = job / "checkout"
+    receipt = json.loads((job / "receipt.json").read_text())
+    assert bytes(receipt["cwd"]) == b"nested"
+    assert receipt["receipt"]["commit"] == git(work, "rev-parse", "HEAD").decode().strip()
+    assert git(work,"branch","--show-current").strip() == b"ox/42"
+    assert git(work,"remote","get-url","origin").strip() == b"git@code.example.test:owner/ox.git"
+    assert (work / "nested/tracked").read_text() == "uncommitted on laptop"
+    assert (work / "nested/input").read_bytes() == private and not (work / ".env").exists()
+    git(work, "add", "-A")
+    assert git(work,"diff","--cached","--name-only") == b""
+    assert before == (state_of(parent),state_of(target))
+    enabled = admin(state, {"type": "status"})["worker_hosts"][0]["worker"]
+    with subprocess.Popen([harness, "--exact", "worker_checkout::sender::tests::interrupted_checkout", "--ignored"],
+                          env=source_env) as upload:
+        wait(lambda: (source / "upload-started").exists() and any(job.parent.glob(".incoming-*")))
+        admin(state, {"type": "worker_access", "id": link["id"], "before": enabled,
+                      "may_launch": False, "ceiling": "read"})
+        assert upload.wait(timeout=12) == 0
+    wait(lambda: not any(job.parent.glob(".incoming-*")))
+    assert not (job.parent / "44").exists()
+    print("PASS signed checkout transfer, shared-base negotiation, dirty and untracked inputs, retry and link admission", flush=True)
     click("Remove outgoing link")
     wait(lambda: not admin(state, {"type":"status"}).get("worker_hosts"))
     assert {row["id"] for row in rows if row["class"] == "desktop"} == {row["id"] for row in admin(state, {"type":"status"})["devices"]}

@@ -77,6 +77,7 @@ pub fn run(state_dir: PathBuf, host_socket: PathBuf) -> io::Result<()> {
 }
 async fn serve(dir: PathBuf, socket: PathBuf) -> io::Result<()> {
     let store = State::load(&dir)?;
+    crate::worker_checkout::receiver::recover(&store.worker_directory())?;
     let app = App {
         state: Arc::new(Mutex::new(store)),
         host: Arc::new(socket),
@@ -507,6 +508,10 @@ fn start_listener(app: App, origin: String, listener: TcpListener) -> Listener {
         .route("/api/pair", post(pair))
         .route("/api/challenge", post(challenge))
         .route("/api/worker-link", post(worker_link))
+        .route(
+            "/api/worker-checkout",
+            get(crate::worker_checkout::receiver::upgrade),
+        )
         .route("/api/push", post(subscribe))
         .route("/api/weather", post(weather::weather))
         .route("/api/operator", get(operator::upgrade))
@@ -613,7 +618,7 @@ fn device(app: &App, h: &HeaderMap) -> Result<String, ErrCode> {
     }
     Ok(id)
 }
-fn paired_identity(app: &App, h: &HeaderMap) -> Result<String, ErrCode> {
+pub(crate) fn paired_identity(app: &App, h: &HeaderMap) -> Result<String, ErrCode> {
     let token = token(h)?;
     app.state
         .lock()

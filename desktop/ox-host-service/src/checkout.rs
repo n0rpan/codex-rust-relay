@@ -343,10 +343,40 @@ impl Snapshot {
     }
 }
 
+/// The archive must physically fit on the receiving filesystem. Git may also
+/// need space for the unpacked worktree; its normal write errors still apply.
+pub fn check_archive_space(file: &File, bytes: u64) -> io::Result<()> {
+    if let Ok(space) = rustix::fs::fstatvfs(file) {
+        let unit = if space.f_frsize == 0 {
+            space.f_bsize
+        } else {
+            space.f_frsize
+        };
+        let available = (space.f_bavail as u128) * (unit as u128);
+        if available < u128::from(bytes) {
+            return Err(io::Error::other(format!(
+                "Worker checkout needs {bytes} archive bytes; only {available} bytes are available."
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Install into a fresh, owner-controlled job directory on the same device as
 /// `jobs`. Only a fully prepared worktree is made visible at the final job path.
 pub fn receive(jobs: &Path, job: u64, mirror: &Path, mut input: impl Read) -> io::Result<PathBuf> {
-    receive_inner(jobs, job, Some(mirror), &mut input, 0)
+    receive_inner(jobs, job, Some(mirror), &mut input, 0, None)
+}
+
+/// Receive an archive only if its embedded commit matches the announced snapshot.
+pub fn receive_commit(
+    jobs: &Path,
+    job: u64,
+    mirror: &Path,
+    mut input: impl Read,
+    commit: &str,
+) -> io::Result<PathBuf> {
+    receive_inner(jobs, job, Some(mirror), &mut input, 0, Some(commit))
 }
 
 fn receive_inner(
@@ -355,6 +385,7 @@ fn receive_inner(
     mirror: Option<&Path>,
     mut input: &mut dyn Read,
     depth: usize,
+    expected: Option<&str>,
 ) -> io::Result<PathBuf> {
     submodules::check_depth(depth)?;
     let mut magic = [0; MAGIC.len()];
@@ -364,6 +395,11 @@ fn receive_inner(
     }
     let commit = files::read_field(&mut input)?;
     let commit = oid(&commit)?;
+    if expected.is_some_and(|id| id != commit) {
+        return Err(io::Error::other(
+            "Checkout commit differs from the announced snapshot.",
+        ));
+    }
     let relative = files::read_field(&mut input)?;
     let relative = Path::new(OsStr::from_bytes(&relative));
     if !relative.as_os_str().is_empty() {

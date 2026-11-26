@@ -19,6 +19,8 @@ mod server;
 #[cfg(feature = "server")]
 mod state;
 #[cfg(feature = "server")]
+pub mod worker_checkout;
+#[cfg(feature = "server")]
 pub use server::run;
 
 #[cfg(all(test, feature = "server"))]

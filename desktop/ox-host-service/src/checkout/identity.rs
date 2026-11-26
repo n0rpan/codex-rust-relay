@@ -9,7 +9,7 @@ pub fn repository_id(project: &Path) -> Option<String> {
     identity(origin.to_str()?)
 }
 
-fn identity(remote: &str) -> Option<String> {
+pub(super) fn identity(remote: &str) -> Option<String> {
     if remote.chars().any(char::is_control) {
         return None;
     }
