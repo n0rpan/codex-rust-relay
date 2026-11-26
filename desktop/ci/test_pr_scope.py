@@ -70,3 +70,9 @@ class PullRequestLanes(unittest.TestCase):
                 flags = lanes([path, "desktop/package.sh"], False)
                 self.assertTrue(flags["packages"] and flags["mac_package"])
                 self.assertCountEqual(flags["focused"], ["macos-26", "ubuntu-24.04"])
+
+    def test_package_archive_checks_run_in_the_linux_package_lane(self):
+        for path in ("desktop/ci/apt_archives.py", "desktop/ci/test_apt_archives.py"):
+            flags = lanes([path], False)
+            self.assertTrue(flags["packages"])
+            self.assertFalse(flags["mac_package"])
