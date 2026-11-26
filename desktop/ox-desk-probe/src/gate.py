@@ -324,10 +324,10 @@ if len(sys.argv) == 2 and "Tailscale" in sys.argv[1]:
         )
         project = home / "ox-clients/claude/projects" / key
         project.mkdir(parents=True)
-        self.claude_ids = {}
+        self.claude_ids = []
         for i, name in enumerate(("Mercury", "Venus", "Saturn", "Neptune"), 1):
             ident = f"00000000-0000-4000-8000-{i:012d}"
-            self.claude_ids[name.lower()] = ident
+            self.claude_ids.append(ident)
             rows = [
                 {
                     "type": "user",
@@ -352,9 +352,9 @@ if len(sys.argv) == 2 and "Tailscale" in sys.argv[1]:
             ]
             journal = project / (ident + ".jsonl")
             journal.write_text("".join(json.dumps(r) + "\n" for r in rows))
-            # A journal written in the last 90 s belongs to a running native client and the
-            # session opens read-only. These are saved sessions, so make them old.
-            old = time.time() - 3600
+            # Saved sessions open read/write. Start them in an earlier date group so
+            # the sidebar exercises the same reorder regardless of the runner's clock.
+            old = time.time() - 24 * 3600
             os.utime(journal, (old, old))
 
     def stats(self, reset=False):
@@ -982,21 +982,23 @@ def claude_gate(f):
         / idle_start["clock_ticks_per_second"]
         / seconds
     )
-    for name, ident in f.claude_ids.items():
-        f.click(f.wait_for(f"the Claude thread {name!r} in the list", lambda: f.words().get(name)))
-        f.wait_for(
-            f"Claude thread {name!r} to be selected",
-            lambda: f.stats()["selected_thread"] == "claude:api:" + ident,
-        )
+    for ident in f.claude_ids:
+        thread = "claude:api:" + ident
+        # Sending moves the previous row into today's group. Resolve the intended
+        # sidebar control at click time instead of clicking old screenshot coordinates.
+        row = f"thread-{f.project}-true-{thread}"
+        f.wait_for(f"Claude sidebar row {thread}", lambda: f.control(row))
+        f.press(row)
+        f.wait_for(f"Claude session {thread} to be selected", lambda: f.stats()["selected_thread"] == thread)
         f.x("key", "ctrl+l")
         f.x("type", "Generate a measured Claude stream")
         f.x("key", "ctrl+Return")
         f.wait_for(
-            f"the Claude fixture to receive the user turn for {name!r}",
+            f"the Claude fixture to receive the user turn for {ident}",
             lambda: any(e["id"] == ident for e in f.events("claude-user")),
         )
     first = f.stats(reset=True)
-    for ident in f.claude_ids.values():
+    for ident in f.claude_ids:
         f.client.sendto(b"stream", str(Path(f.control_socket).with_name("c-" + ident)))
     wait(lambda: len(f.events("claude-stream-start")) == 4)
     f.x("key", "ctrl+l")
