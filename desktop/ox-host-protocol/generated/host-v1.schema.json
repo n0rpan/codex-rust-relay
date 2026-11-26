@@ -984,6 +984,20 @@
         },
         {
           "additionalProperties": false,
+          "description": "Reserve a quiescent host until this same-user connection closes.",
+          "properties": {
+            "type": {
+              "const": "reserve_idle_update",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "properties": {
             "type": {
               "const": "watch_catalog",
@@ -1727,6 +1741,22 @@
     },
     "Server": {
       "oneOf": [
+        {
+          "properties": {
+            "ready": {
+              "type": "boolean"
+            },
+            "type": {
+              "const": "idle_update",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "ready"
+          ],
+          "type": "object"
+        },
         {
           "properties": {
             "id": {

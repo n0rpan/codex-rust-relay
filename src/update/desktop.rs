@@ -388,7 +388,20 @@ pub(super) async fn command(
     args: &[OsString],
 ) -> Result<u8, RelayError> {
     let background = args.len() == 1 && args[0] == "--background";
-    let _lock = store_lock(store, background)?;
+    let opportunistic = command == "--try-apply-desktop";
+    let _lock = if opportunistic {
+        let file = open_lock_file(store)?;
+        match file.try_lock() {
+            Ok(()) => file,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                println!("busy");
+                return Ok(0);
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+    } else {
+        store_lock(store, background)?
+    };
     if background && !automatic_enabled() {
         println!("null");
         return Ok(0);
@@ -398,7 +411,7 @@ pub(super) async fn command(
             "{}",
             serde_json::to_string(&stage_for_caller(store, background).await?)?
         );
-    } else if command == "--apply-desktop"
+    } else if (command == "--apply-desktop" || opportunistic)
         && let [version, digest] = args
     {
         if digest == "current" {

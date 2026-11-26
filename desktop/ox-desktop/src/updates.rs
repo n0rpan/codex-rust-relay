@@ -3,7 +3,7 @@ use crate::{appearance::Palette, kit, platform, version::VERSION};
 use gpui::{prelude::*, *};
 use ox_host_service::managed_install::package_store;
 use platform::versions::{self, Candidate};
-use std::{path::PathBuf, time::Duration};
+use std::{os::unix::net::UnixStream, path::PathBuf, time::Duration};
 
 #[derive(Default)]
 enum State {
@@ -12,7 +12,12 @@ enum State {
     Checking,
     Current,
     Ready(Candidate),
-    Applying(String),
+    WaitingForIdle(Candidate),
+    IdleCheckFailed(Candidate, String),
+    Applying {
+        version: String,
+        idle: bool,
+    },
     Failed(String),
     RestartFailed(Candidate, String),
 }
@@ -23,6 +28,7 @@ pub struct Updates {
     state: State,
     dismissed: Option<String>,
     manual: bool,
+    idle_wait: Option<Task<()>>,
 }
 impl Global for Updates {}
 
@@ -62,12 +68,18 @@ fn check(manual: bool, cx: &mut App) {
         return;
     }
     let u = cx.global_mut::<Updates>();
-    if matches!(u.state, State::Checking | State::Applying(_)) {
+    if matches!(
+        u.state,
+        State::Checking | State::WaitingForIdle(_) | State::Applying { .. }
+    ) {
         return;
     }
     if manual {
         u.dismissed = None;
-    } else if matches!(u.state, State::Ready(_) | State::RestartFailed(_, _)) {
+    } else if matches!(
+        u.state,
+        State::Ready(_) | State::RestartFailed(_, _) | State::IdleCheckFailed(_, _)
+    ) {
         return;
     }
     u.manual = manual;
@@ -87,21 +99,81 @@ fn check(manual: bool, cx: &mut App) {
     .detach();
 }
 
-fn apply(candidate: Candidate, cx: &mut App) {
+pub fn can_schedule(cx: &App) -> bool {
+    cx.try_global::<Updates>()
+        .is_some_and(|u| matches!(u.state, State::Ready(_) | State::IdleCheckFailed(..)))
+}
+
+pub fn schedule_idle(cx: &mut App) {
+    let candidate = match &cx.global::<Updates>().state {
+        State::Ready(c) | State::IdleCheckFailed(c, _) => c.clone(),
+        _ => return,
+    };
     let u = cx.global_mut::<Updates>();
-    if !matches!(u.state, State::Ready(_) | State::RestartFailed(_, _)) {
+    u.state = State::WaitingForIdle(candidate.clone());
+    u.dismissed = None;
+    u.manual = true;
+    let task = cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(Duration::from_secs(3)).await;
+            match cx
+                .background_spawn(async { platform::reserve_idle_update() })
+                .await
+            {
+                Ok(None) => continue,
+                Ok(Some(socket)) => cx.update(|cx| apply(candidate, Some(socket), cx)),
+                Err(e) => cx.update(|cx| {
+                    cx.global_mut::<Updates>().state =
+                        State::IdleCheckFailed(candidate, e.to_string());
+                }),
+            }
+            break;
+        }
+    });
+    cx.global_mut::<Updates>().idle_wait = Some(task);
+}
+
+fn cancel_idle(cx: &mut App) {
+    let u = cx.global_mut::<Updates>();
+    if let State::WaitingForIdle(c) = &u.state {
+        u.state = State::Ready(c.clone());
+        u.idle_wait = None;
+    }
+}
+
+fn apply(candidate: Candidate, reservation: Option<UnixStream>, cx: &mut App) {
+    let u = cx.global_mut::<Updates>();
+    if !matches!(
+        u.state,
+        State::Ready(_)
+            | State::RestartFailed(_, _)
+            | State::WaitingForIdle(_)
+            | State::IdleCheckFailed(..)
+    ) {
         return;
     }
     let Some(store) = u.store.clone() else { return };
-    u.state = State::Applying(candidate.version.clone());
+    u.state = State::Applying {
+        version: candidate.version.clone(),
+        idle: reservation.is_some(),
+    };
     u.manual = true;
     cx.spawn(async move |cx| {
         let request = candidate.clone();
         let result = cx
-            .background_spawn(async move { versions::apply(&request) })
+            .background_spawn(async move {
+                match reservation {
+                    Some(socket) => versions::apply_if_idle(&request, socket),
+                    None => versions::apply(&request).map(|_| true),
+                }
+            })
             .await;
         cx.update(|cx| match result {
-            Ok(_) => {
+            Ok(false) => {
+                cx.global_mut::<Updates>().state = State::Ready(candidate);
+                schedule_idle(cx);
+            }
+            Ok(true) => {
                 #[cfg(target_os = "macos")]
                 let path = store.join("current/OX Desktop.app");
                 #[cfg(not(target_os = "macos"))]
@@ -128,8 +200,9 @@ fn apply(candidate: Candidate, cx: &mut App) {
 pub fn action_label(cx: &App) -> (&'static str, bool) {
     match &cx.global::<Updates>().state {
         State::Checking => ("Checking…", false),
-        State::Applying(_) => ("Restarting…", false),
-        State::Ready(_) => ("Restart to update", true),
+        State::WaitingForIdle(_) => ("Cancel scheduled restart", true),
+        State::Applying { .. } => ("Restarting…", false),
+        State::Ready(_) | State::IdleCheckFailed(..) => ("Restart to update", true),
         State::RestartFailed(_, _) => ("Retry restart", true),
         State::Failed(_) => ("Retry check", true),
         _ => ("Check for updates", true),
@@ -138,7 +211,10 @@ pub fn action_label(cx: &App) -> (&'static str, bool) {
 
 pub fn perform_action(cx: &mut App) {
     match &cx.global::<Updates>().state {
-        State::Ready(c) | State::RestartFailed(c, _) => apply(c.clone(), cx),
+        State::Ready(c) | State::RestartFailed(c, _) | State::IdleCheckFailed(c, _) => {
+            apply(c.clone(), None, cx)
+        }
+        State::WaitingForIdle(_) => cancel_idle(cx),
         _ => check(true, cx),
     }
 }
@@ -156,7 +232,19 @@ pub fn about(cx: &App) -> String {
             "OX {} is downloaded and verified. Restart when you’re ready.",
             c.version
         ),
-        State::Applying(version) => format!(
+        State::WaitingForIdle(c) => format!(
+            "OX will restart to update to {} when all agents on this host are idle.",
+            c.version
+        ),
+        State::IdleCheckFailed(_, e) => e.clone(),
+        State::Applying {
+            version,
+            idle: true,
+        } => format!("Agents are idle. Restarting OX to update to {version}…"),
+        State::Applying {
+            version,
+            idle: false,
+        } => format!(
             "Updating to OX {version}. Any earlier update finishes first. Active turns have up to 10 minutes to finish before OX reopens."
         ),
         State::RestartFailed(_, e) | State::Failed(e) => e.clone(),
@@ -175,10 +263,12 @@ pub fn banner(p: Palette, cx: &App) -> Option<AnyElement> {
         .text_color(rgb(p.fg));
     Some(
         match &u.state {
-            State::Ready(c) if u.dismissed.as_deref() != Some(&c.digest) => {
+            State::Ready(c) | State::IdleCheckFailed(c, _) if u.dismissed.as_deref() != Some(&c.digest) => {
                 let c = c.clone();
                 let digest = c.digest.clone();
-                let message = if c.digest == "current" {
+                let message = if let State::IdleCheckFailed(_, e) = &u.state {
+                    e.clone()
+                } else if c.digest == "current" {
                     format!("OX {} is installed. Restart to use it in this window.", c.version)
                 } else {
                     format!("OX {} is ready. Restart Desktop and the session host to update. Active turns have up to 10 minutes to finish.", c.version)
@@ -190,8 +280,9 @@ pub fn banner(p: Palette, cx: &App) -> Option<AnyElement> {
                     "Restart to update",
                     true,
                     true,
-                    move |_, _, cx| apply(c.clone(), cx),
+                    move |_, _, cx| apply(c.clone(), None, cx),
                 ))
+                .child(kit::button(p, "ox-update-when-idle", "Restart when idle", false, true, |_, _, cx| schedule_idle(cx)))
                 .child(kit::button(
                     p,
                     "ox-update-later",
@@ -203,7 +294,8 @@ pub fn banner(p: Palette, cx: &App) -> Option<AnyElement> {
                     },
                 ))
             }
-            State::Applying(_) => bar.child(about(cx)),
+            State::WaitingForIdle(_) => bar.child(about(cx)).child(kit::button(p, "ox-update-cancel-idle", "Cancel scheduled restart", false, true, |_, _, cx| cancel_idle(cx))),
+            State::Applying { .. } => bar.child(about(cx)),
             State::Failed(e) | State::RestartFailed(_, e) if u.manual => bar
                 .child(e.clone())
                 .child(kit::button(

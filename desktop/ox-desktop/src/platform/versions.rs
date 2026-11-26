@@ -3,10 +3,14 @@ use serde::Deserialize;
 use std::process::{Command, Stdio};
 
 fn output(args: &[&str]) -> Result<Vec<u8>, String> {
+    output_with_stdin(args, Stdio::null())
+}
+
+fn output_with_stdin(args: &[&str], stdin: Stdio) -> Result<Vec<u8>, String> {
     let reply = Command::new(ox())
         .args(args)
         .env("PATH", child_path())
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .output()
         .map_err(|e| format!("Could not start the companion ox executable: {e}"))?;
     if !reply.status.success() {
@@ -64,4 +68,25 @@ pub fn apply(candidate: &Candidate) -> Result<(), String> {
         &candidate.digest,
     ])
     .map(|_| ())
+}
+
+pub fn apply_if_idle(
+    candidate: &Candidate,
+    reservation: std::os::unix::net::UnixStream,
+) -> Result<bool, String> {
+    let fd = std::os::fd::OwnedFd::from(reservation);
+    let reply = output_with_stdin(
+        &[
+            "update",
+            "--try-apply-desktop",
+            &candidate.version,
+            &candidate.digest,
+        ],
+        Stdio::from(fd),
+    )?;
+    match reply.as_slice() {
+        b"" => Ok(true),
+        b"busy\n" => Ok(false),
+        _ => Err("Could not confirm whether the update was installed.".into()),
+    }
 }

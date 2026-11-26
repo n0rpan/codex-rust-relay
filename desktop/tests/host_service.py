@@ -144,10 +144,51 @@ def run(ox, host, root):
         first = (directories["state"] / "mock-service-pid").read_text()
         command("install")
         assert (directories["state"] / "mock-service-pid").read_text() == first
+        saved_unit = unit.read_text()
         command("uninstall")
         wait(lambda: not sock.exists())
         assert not unit.exists() and "stopped" in command("status").stdout
         command("uninstall")
+        # A previous apply switched the package, drained the old host, then lost
+        # the restart. The marker must survive if a service revives an older host.
+        version = subprocess.check_output([host, "--version"], text=True).split()[1]
+        marker = directories["state"] / "pending-update-restart"
+        marker.write_text(version)
+        unit.write_text(saved_unit)
+        wrong_host = binary / "older-host"
+        wrong_host.write_text("""#!/usr/bin/env python3
+import json, os, socket
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+    path = os.environ["OX_HOST_SOCKET"]
+    server.bind(path)
+    os.chmod(path, 0o600)
+    server.listen()
+    while True:
+        conn, _ = server.accept()
+        with conn:
+            if conn.recv(1024):
+                reply = dict(type="hello", version=1, capabilities=[], routes=[], projects=[],
+                             host=dict(version="old-fixture", epoch="old"))
+                conn.sendall(json.dumps(reply).encode() + bytes([10]))
+                break
+    os.unlink(path)
+""")
+        wrong_host.chmod(0o700)
+        helper = [host, "restart-if-updated"]
+        failed = subprocess.run(helper, env=dict(env, FIXTURE_HOST=str(wrong_host)), text=True,
+                                capture_output=True, timeout=15)
+        assert failed.returncode and "version differs" in failed.stderr, failed
+        assert marker.read_text() == version
+        wait(lambda: not sock.exists())
+        unit.unlink()
+        (directories["state"] / "mock-service-pid").unlink(missing_ok=True)
+        subprocess.run(helper, env=env, check=True, timeout=15)
+        assert sock.is_socket() and not marker.exists()
+        command("stop")
+        wait(lambda: not sock.exists())
+        subprocess.run(helper, env=env, check=True, timeout=15)
+        assert not sock.exists()
+        print("PASS: an incorrect host retains the restart marker; retry recovers a stopped host on the installed version.")
         print("Gateway service install, idempotent reinstall/status, private daemon socket and SIGTERM uninstall passed.")
     finally:
         if (directories["state"] / "mock-service-pid").exists():

@@ -243,14 +243,18 @@ fn write_error(store: &Path, error: std::io::Error) -> String {
         format!("Could not stage the update in {}: {error}", store.display())
     }
 }
-fn store_lock(store: &Path, background: bool) -> Result<File, RelayError> {
-    let file = File::options()
+fn open_lock_file(store: &Path) -> Result<File, RelayError> {
+    File::options()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(store.join("update.lock"))
-        .map_err(|e| write_error(store, e))?;
+        .map_err(|e| write_error(store, e).into())
+}
+
+fn store_lock(store: &Path, background: bool) -> Result<File, RelayError> {
+    let file = open_lock_file(store)?;
     // Manual operations wait for the download (15 minutes) and bounded host
     // drain (10 minutes). Background pollers leave the current owner alone.
     let until = std::time::Instant::now() + Duration::from_secs(30 * 60);
@@ -322,7 +326,10 @@ pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
     }
     let store = crate::managed_install::package_store(&executable);
     if let [command, rest @ ..] = args
-        && (command == "--stage-desktop" || command == "--apply-desktop")
+        && matches!(
+            command.to_str(),
+            Some("--stage-desktop" | "--apply-desktop" | "--try-apply-desktop")
+        )
     {
         let store = store
             .as_deref()

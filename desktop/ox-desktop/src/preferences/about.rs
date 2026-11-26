@@ -106,6 +106,16 @@ impl About {
                 enabled && matches!(&self.companion, Ok(v) if v == VERSION),
                 cx.listener(|s, _, _, cx| s.check(cx)),
             )))
+            .when(crate::updates::can_schedule(cx), |section| {
+                section.child(kit::button(
+                    p,
+                    "ox-about-update-when-idle",
+                    "Restart when idle",
+                    false,
+                    true,
+                    |_, _, cx| crate::updates::schedule_idle(cx),
+                ))
+            })
             .children(
                 (if crate::updates::managed(cx) {
                     Some(crate::updates::about(cx))

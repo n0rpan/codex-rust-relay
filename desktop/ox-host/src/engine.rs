@@ -322,6 +322,7 @@ pub(crate) struct Engine {
     reading: Vec<Reading>,
     in_flows: bool,
     draining: Option<Instant>,
+    idle_update_owner: Option<u64>,
     state_dir: PathBuf,
     idle: Duration,
     next_reap: Instant,
@@ -381,6 +382,7 @@ impl Engine {
             reading: Default::default(),
             in_flows: false,
             draining: None,
+            idle_update_owner: None,
             state_dir: dir.to_owned(),
             idle: idle_timeout(std::env::var("OX_HOST_IDLE_MINUTES").ok().as_deref()),
             next_reap: Instant::now() + REAP_EVERY,
@@ -504,6 +506,9 @@ impl Engine {
                     request,
                     reply,
                 }) => match *request {
+                    _ if self.update_reserved() => {
+                        self.answer(reply, Err(crate::handover::REFUSAL.into()))?
+                    }
                     Gateway::Launch(_) if self.draining.is_some() => {
                         self.answer(reply, Err(crate::handover::REFUSAL.into()))?
                     }
@@ -532,6 +537,9 @@ impl Engine {
                 }
                 Some(Message::Disconnect(id)) => {
                     self.clients.remove(&id);
+                    if self.idle_update_owner == Some(id) {
+                        self.idle_update_owner = None;
+                    }
                 }
                 Some(Message::Request(id, request)) => {
                     if let Err(e) = self.request(id, *request) {
@@ -596,7 +604,43 @@ impl Engine {
         if !client.hello && !matches!(message, Client::Hello { .. }) {
             return Err(io::Error::other("Send a protocol hello first"));
         }
+        if self.update_reserved() {
+            match &message {
+                Client::Act { id: key, .. } => {
+                    return self.reply(
+                        id,
+                        Server::Error {
+                            id: Some(key.clone()),
+                            message: crate::handover::REFUSAL.into(),
+                        },
+                    );
+                }
+                Client::WorkerLaunch { id: key, .. } | Client::WorkerCall { id: key, .. } => {
+                    return self.answer(
+                        Replier::Client(id, key.clone()),
+                        Err(crate::handover::REFUSAL.into()),
+                    );
+                }
+                _ => {}
+            }
+        }
         match message {
+            Client::ReserveIdleUpdate => {
+                let ready = self.draining.is_none()
+                    && !self.update_reserved()
+                    && self.running_turns() == 0
+                    && self.asking.is_empty()
+                    && self.running.values().all(|live| {
+                        !live.store.has_pending_turn()
+                            && live.store.asks().is_empty()
+                            && live.opening.is_none()
+                            && live.terminal.is_none()
+                    });
+                if ready {
+                    self.idle_update_owner = Some(id);
+                }
+                self.reply(id, Server::IdleUpdate { ready })
+            }
             Client::Hello { version } => {
                 if version != wire::VERSION {
                     let message = wire::version_mismatch(wire::VERSION, version);
@@ -639,6 +683,7 @@ impl Engine {
                             "live_catalog",
                             "end",
                             "processes",
+                            wire::IDLE_UPDATE,
                             ox_desk_core::surface::CAPABILITY,
                         ]
                         .map(str::to_owned)
@@ -1757,6 +1802,11 @@ impl Engine {
         });
         self.answer(f.reply, result)
     }
+    fn update_reserved(&self) -> bool {
+        self.idle_update_owner
+            .is_some_and(|owner| self.clients.contains_key(&owner))
+    }
+
     /// Work a drain waits for: turns in progress in any loaded thread, worker
     /// launches and handoff targets not yet confirmed, and handoffs still
     /// preparing or reading their source.

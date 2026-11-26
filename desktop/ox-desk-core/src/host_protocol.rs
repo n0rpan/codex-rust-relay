@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf};
 
+pub const IDLE_UPDATE: &str = "idle_update";
 pub const VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -36,6 +37,8 @@ pub enum Client {
     Surface {
         surface: crate::surface::Surface,
     },
+    /// Reserve a quiescent host until this same-user connection closes.
+    ReserveIdleUpdate,
     WatchCatalog,
     TerminalPreview {
         id: String,
@@ -101,6 +104,9 @@ pub fn version_mismatch(host: u32, client: u32) -> String {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Server {
+    IdleUpdate {
+        ready: bool,
+    },
     Opened {
         id: String,
         scope: Scope,

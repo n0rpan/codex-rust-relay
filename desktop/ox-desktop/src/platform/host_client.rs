@@ -48,6 +48,28 @@ fn read_frame(input: &mut BufReader<UnixStream>) -> io::Result<Server> {
 fn connect() -> io::Result<(BufReader<UnixStream>, UnixStream)> {
     handshake().map(|(input, socket, _)| (input, socket))
 }
+/// The socket owns the reservation. Passing it to the installer keeps the host
+/// gated even if the window closes while the package is switching.
+pub(crate) fn reserve_idle_update() -> io::Result<Option<UnixStream>> {
+    let (mut input, mut socket, caps) = handshake()?;
+    if !caps
+        .iter()
+        .any(|c| c == ox_desk_core::host_protocol::IDLE_UPDATE)
+    {
+        return Err(io::Error::other(
+            "This session host cannot confirm when agents are idle. Choose Restart to update when you’re ready.",
+        ));
+    }
+    socket.set_read_timeout(Some(Duration::from_secs(15)))?;
+    write_frame(&mut socket, &Client::ReserveIdleUpdate)?;
+    match read_frame(&mut input)? {
+        Server::IdleUpdate { ready } => Ok(ready.then_some(socket)),
+        Server::Error { message, .. } => Err(io::Error::other(message)),
+        _ => Err(io::Error::other(
+            "The session host could not confirm whether agents are idle.",
+        )),
+    }
+}
 /// Shown when the host is not up. Polls treat it as a quiet state, not an error.
 pub(crate) const HOST_NOT_RUNNING: &str = "Session host not running";
 
