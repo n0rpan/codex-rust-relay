@@ -234,7 +234,12 @@ impl Workbench {
             }
             (Some(_), None) if granted => "YOLO allowed for workers".to_owned(),
             (_, Some(m)) => permission_value(m),
-            _ => default_permission(self.route.runtime).to_owned(),
+            _ => default_permission(
+                self.route.runtime,
+                cx.try_global::<crate::preferences::behavior::Active>()
+                    .map(|a| a.0)
+                    .unwrap_or_default(),
+            ),
         };
         let access_hint = if key.is_none() {
             format!("Permissions for the next thread: {value}")
@@ -524,11 +529,21 @@ impl Workbench {
     }
 }
 
-/// What a runtime does when no permission mode has been chosen yet.
-fn default_permission(runtime: ox_desk_core::runtime::Runtime) -> &'static str {
-    match runtime {
-        ox_desk_core::runtime::Runtime::Claude => "Ask before edits",
-        ox_desk_core::runtime::Runtime::Codex => "Configured in Codex",
+/// What a new session starts in when no permission mode has been chosen for it:
+/// the "New sessions start in" setting, or the runtime's own default.
+fn default_permission(
+    runtime: ox_desk_core::runtime::Runtime,
+    behavior: ox_desk_core::desktop_behavior::Behavior,
+) -> String {
+    use ox_desk_core::runtime::Runtime;
+    let start = match runtime {
+        Runtime::Claude => behavior.claude_start,
+        Runtime::Codex => behavior.codex_start,
+    };
+    match (runtime, start) {
+        (_, Some(mode)) => permission_value(mode),
+        (Runtime::Claude, None) => "Claude Code default".to_owned(),
+        (Runtime::Codex, None) => "Configured in Codex".to_owned(),
     }
 }
 

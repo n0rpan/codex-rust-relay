@@ -24,7 +24,8 @@ pub struct Launch {
     pub project: PathBuf,
     pub billing: Billing,
     pub session: Session,
-    pub permission_mode: String,
+    /// `None` passes no `--permission-mode`: Claude Code's configured default.
+    pub permission_mode: Option<String>,
     /// A worker launch carries the shared worker contract (tools, sandbox
     /// settings); an ordinary session passes `None`.
     pub contract: Option<crate::claude_worker_contract::Contract>,
@@ -103,14 +104,17 @@ impl Launch {
             "--replay-user-messages",
             "--permission-prompt-tool",
             "stdio",
-            "--permission-mode",
-            &self.permission_mode,
         ]);
-        cmd.arg(if self.permission_mode == "bypassPermissions" {
-            "--dangerously-skip-permissions"
-        } else {
-            "--allow-dangerously-skip-permissions"
-        });
+        if let Some(mode) = &self.permission_mode {
+            cmd.args(["--permission-mode", mode]);
+        }
+        cmd.arg(
+            if self.permission_mode.as_deref() == Some("bypassPermissions") {
+                "--dangerously-skip-permissions"
+            } else {
+                "--allow-dangerously-skip-permissions"
+            },
+        );
         if let Some(contract) = &self.contract {
             cmd.args(contract.args());
         }
@@ -446,7 +450,7 @@ mod tests {
             project: "/".into(),
             billing,
             session: Session::New("id".into()),
-            permission_mode: "acceptEdits".into(),
+            permission_mode: Some("acceptEdits".into()),
             contract,
             model: None,
         };
@@ -488,7 +492,7 @@ mod tests {
                 project: "/".into(),
                 billing,
                 session: Session::New("id".into()),
-                permission_mode: "plan".into(),
+                permission_mode: Some("plan".into()),
                 contract: None,
                 model: Some("claude-fable-5-2".into()),
             }

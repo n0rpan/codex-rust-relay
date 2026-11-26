@@ -89,8 +89,9 @@ def run(gui, codex, claude, root, failure_image=None):
                 window.word("Maple")
                 window.word("Birch", click=True)
                 window.wait(lambda s: s["connected"] and s["selected_thread"] == thread, "imported relay session")
-                # The permission chip (id access-preset) spells Claude's Default as "Ask before edits".
-                assert "ask before edits" in window.control("access-preset")["label"].casefold()
+                # The permission chip (id access-preset): a session that is not running yet starts
+                # in Claude Code's own default, as in a terminal.
+                assert "claude code default" in window.control("access-preset")["label"].casefold()
                 assert len(vendor.requests) == calls_before_refresh, "Refreshing or resuming generated a model request"
                 assert not launches.exists(), "Restoring or browsing native history launched the stock Claude CLI"
                 window.press("Thread actions")  # An icon button: no visible word to OCR.

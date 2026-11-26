@@ -193,7 +193,10 @@ impl Store {
             if p.started_new {
                 self.unsaved_claude_drafts.insert(owner.into());
             }
-            if let Some(mode) = p.mode.or_else(|| Access::from_mode(&p.launch_mode)) {
+            if let Some(mode) = p
+                .mode
+                .or_else(|| p.launch_mode.as_deref().and_then(Access::from_mode))
+            {
                 self.resume_access.insert(owner.into(), mode);
             }
             if let Some(model) = p.selected_model.take() {
@@ -1041,7 +1044,7 @@ mod tests {
         }
         s.edit(Some(&a), "go on".into());
         s.submit(Some(&a)).unwrap();
-        assert_eq!(s.claude().sessions[&a].launch_mode, "plan");
+        assert_eq!(s.claude().sessions[&a].launch_mode.as_deref(), Some("plan"));
         s.claude_open(&b).unwrap();
         assert!(s.is_viewer(&b));
         assert!(!s.has_live_session(&b));
@@ -1051,7 +1054,42 @@ mod tests {
         s.mark_ended(&a);
         s.edit(Some(&a), "again".into());
         s.submit(Some(&a)).unwrap();
-        assert_eq!(s.claude().sessions[&a].launch_mode, "plan");
+        assert_eq!(s.claude().sessions[&a].launch_mode.as_deref(), Some("plan"));
+    }
+    /// A new session nobody chose a mode for starts in the "New sessions start in"
+    /// setting, or with no `--permission-mode` at all: Claude Code's own default.
+    #[test]
+    fn a_new_session_starts_in_the_setting_or_the_terminal_default() {
+        for (setting, expected) in [(None, None), (Some(Access::Auto), Some("auto"))] {
+            let (mut s, _, _) = fixture();
+            s.claude_mut().deliver = Arc::new(|_| ());
+            s.set_start_mode(if setting.is_some() {
+                |_| Some(Access::Auto)
+            } else {
+                |_| None
+            });
+            let id = s
+                .spawn_claude(
+                    Session::New("00000000-0000-4000-8000-00000000000c".into()),
+                    None,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(s.claude().sessions[&id].launch_mode.as_deref(), expected);
+            // A mode chosen in the composer still wins for its session.
+            s.set_next_access(Access::Plan);
+            let id = s
+                .spawn_claude(
+                    Session::New("00000000-0000-4000-8000-00000000000d".into()),
+                    None,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(
+                s.claude().sessions[&id].launch_mode.as_deref(),
+                Some("plan")
+            );
+        }
     }
     #[test]
     fn a_later_init_after_cd_keeps_the_session_but_a_first_init_elsewhere_does_not() {

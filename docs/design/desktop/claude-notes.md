@@ -25,6 +25,8 @@ The common arguments are `-p --verbose --input-format stream-json --output-forma
 
 ## Permission modes
 
+A new session nobody chose a mode for starts without `--permission-mode`, so Claude Code applies its own configured default exactly as `claude` does in a terminal (for an eligible account this can be `auto`). The store reads the effective mode from the initialize reply (`current_permission_mode`) and the `init` event, so the composer shows the real mode. **Settings › Accounts › Agents › New Claude sessions** (`claude_start` in the shared Desktop preferences) picks a fixed mode instead; a mode chosen in the composer, a resume's recorded mode and a worker's contract or preset all take precedence. Codex works the same way with `codex_start`: unset, a new thread uses the Codex configuration. The terminal handoff (`terminal_args`) also passes no mode.
+
 `--permission-mode default --allow-dangerously-skip-permissions` initialized in `default`. An explicit control request to switch to `bypassPermissions` yielded `mode: bypassPermissions`. Switching back yielded `mode: default`. An explicitly requested bypass launch uses stock `--dangerously-skip-permissions`. Advance the visible selection on confirmation. Native policy or platform restrictions can reject a switch. The picker also exposes `plan`, `acceptEdits` and `auto`. On stock 2.1.331 the Auto selection returned `mode: auto`. With `permissions.disableAutoMode` set to `"disable"`, stock rejected that request and the picker retained its previous mode. Auto uses a classifier to review actions. Availability depends on the active model, provider and policy. [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes)
 
 ## Catalog and verification

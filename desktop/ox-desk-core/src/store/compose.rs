@@ -436,7 +436,7 @@ impl Store {
                     Billing::Api(alias) => Some(alias.clone()),
                     Billing::Subscription => None,
                 });
-            let preset = self.next_preset;
+            let preset = self.next_preset.or_else(|| self.start_mode());
             self.request(
                 Call::New {
                     preset,

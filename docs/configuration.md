@@ -629,6 +629,12 @@ setup or run `ox claude` to open a Claude session. With no API provider, `ox doc
 saved accounts without launching either client. Each client validates its own
 credentials when you open a subscription session. If Codex uses its keyring,
 ox reports the configured store and leaves the account check to Codex.
+New sessions in OX Desktop and on the phone start the way the stock client
+starts in your terminal: Claude Code in its own default mode (Auto when your
+account uses it) and Codex with the access settings in your Codex
+configuration. To start every new session in a fixed mode instead, choose one
+under Settings › Accounts › Agents › **New Claude sessions** or **New Codex
+sessions**. A mode you pick in the composer still applies to that session.
 `ox help subscriptions` lists the sign-in commands. `ox help settings` maps
 providers, accounts and remote access to their labels in OX Desktop and on the
 phone, and names the files and checks behind them.
@@ -733,6 +739,12 @@ they stop when the parent ox launch exits. When the session host is running
 (OX Desktop or `ox host install`), it owns the worker as an ordinary session:
 the worker keeps running after you close the terminal, its approvals reach
 your desktop and paired phone, and a resumed parent can still read its status.
+The parent agent can answer its workers' questions with `answer_ox_worker`. It
+can also approve their actions when its own mode runs without asking you (Auto,
+Auto-review or YOLO), except for read-only workers. Mode changes and YOLO
+always ask you. To answer every worker request yourself, choose **I answer**
+under Settings › Accounts › Agents › Worker requests. A read-only Claude worker
+that finishes its plan reports back without waiting for anyone.
 The status includes the stock client's session ID when available.
 Work already written to the project stays there if you cancel.
 To keep a finished worker's status and final answer available after its

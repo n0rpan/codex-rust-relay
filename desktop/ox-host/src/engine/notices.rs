@@ -129,6 +129,7 @@ impl Engine {
             }
             let row = live.state.sessions.iter().find(|s| s.id == id);
             let state = row.map(|r| r.status.as_str());
+            let asking;
             let (status, preview) = if entry.marks.cancelled {
                 (
                     "cancelled",
@@ -139,9 +140,24 @@ impl Engine {
                     },
                 )
             } else if state == Some("needs_input") {
+                let requests = self.worker_requests(scope, id, origin);
+                asking = requests
+                    .iter()
+                    .find(|r| r["parent_may_answer"] == true)
+                    .map(|r| {
+                        format!(
+                            "The worker asks you: {} (request_id {}). Answer it with answer_ox_worker (job_id {}), or leave it for the user in OX.\n{}",
+                            r["title"].as_str().unwrap_or("request"),
+                            r["request_id"],
+                            origin.job_id,
+                            r["detail"].as_str().unwrap_or_default(),
+                        )
+                    });
                 (
                     "waiting_for_operator",
-                    "The worker is waiting for a person to answer an approval or question in OX.",
+                    asking.as_deref().unwrap_or(
+                        "The worker is waiting for a person to answer an approval or question in OX.",
+                    ),
                 )
             } else if state == Some("running") {
                 ("running", "")
