@@ -2320,11 +2320,9 @@ impl Engine {
             .ok_or("This worker has no open request with that request_id. Read its requests with ox_worker_status.")?;
         crate::workers::parent_may_answer(&origin, level, ask, setting).map_err(str::to_owned)?;
         let result = match (choice, answers) {
-            (Some(choice), None) if choice < ask.decisions().len() => {
+            (Some(choice), None) => {
+                crate::workers::parent_may_choose(ask, choice).map_err(str::to_owned)?;
                 live.store.answer(&request, choice)
-            }
-            (Some(_), None) => {
-                return Err("That choice is not one of the request's choices.".into());
             }
             (None, Some(answers)) if !ask.questions.is_empty() => {
                 live.store.answer_questions(&request, &answers)
@@ -4119,6 +4117,43 @@ mod tests {
                     .ends_with("the operator answers this request]")
             );
             assert!(engine.parent_call(&me, answer(41, 13)).is_err());
+            // A choice that sets a lasting rule shows its scope and stays with the operator.
+            let mut rule = ask(14, "w");
+            rule.choices = vec!["Allow once".into(), "Always allow this prefix".into()];
+            rule.choice_details = vec![None, Some("\"cargo\"".into())];
+            engine
+                .running
+                .get_mut(&worker)
+                .unwrap()
+                .store
+                .apply(LinkEvent::Host(Box::new(Server::Delta {
+                    cursor: Cursor {
+                        epoch: "e".into(),
+                        seq: 6,
+                    },
+                    scope: worker.clone(),
+                    changes: vec![Change::Asks {
+                        asks: vec![ask(9, "w"), ask(10, "r"), rule],
+                    }],
+                })));
+            let status = engine
+                .parent_call(&me, ParentCall::Status { job_id: 41 })
+                .unwrap();
+            let shown = &status["requests"][1];
+            assert_eq!(shown["choice_details"], json!([null, "\"cargo\""]));
+            assert_eq!(shown["parent_choices"], json!([0]));
+            let lasting = ParentCall::Answer {
+                job_id: 41,
+                request: RequestId::Number(14),
+                choice: Some(1),
+                answers: None,
+            };
+            assert!(
+                engine
+                    .parent_call(&me, lasting)
+                    .unwrap_err()
+                    .contains("lasting rule")
+            );
             // A request of another worker is not this job's to answer.
             assert!(engine.parent_call(&me, answer(41, 10)).is_err());
             assert!(log.lock().unwrap().is_empty());

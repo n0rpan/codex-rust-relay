@@ -357,6 +357,23 @@ pub(crate) fn parent_may_answer(
     }
 }
 
+/// Whether a parent may pick this choice of a request it may answer. A choice
+/// that sets a lasting rule (Codex "Always allow this prefix", a host rule or
+/// any other policy amendment, which carry their scope as the choice detail)
+/// outlives the task, so it stays with the operator.
+pub(crate) fn parent_may_choose(
+    ask: &ox_desk_core::asks::Ask,
+    choice: usize,
+) -> Result<(), &'static str> {
+    match ask.decisions().get(choice) {
+        None => Err("That choice is not one of the request's choices."),
+        Some(d) if d.detail.is_some() => Err(
+            "This choice sets a lasting rule, so the operator decides. Pick a one-time choice or leave the request to the operator.",
+        ),
+        Some(_) => Ok(()),
+    }
+}
+
 /// The longest request detail a parent sees. An approval whose action does not
 /// fit is never the parent's to answer, so a parent never approves arguments it
 /// could not read.
@@ -373,6 +390,11 @@ pub(crate) fn request_view(ask: &ox_desk_core::asks::Ask, may: Result<(), &str>)
         "title": ask.title(),
         "detail": detail,
         "choices": ask.decisions().iter().map(|d| &d.label).collect::<Vec<_>>(),
+        // The scope of a rule-setting choice, such as the command prefix or host.
+        "choice_details": ask.decisions().iter().map(|d| &d.detail).collect::<Vec<_>>(),
+        "parent_choices": (0..ask.decisions().len())
+            .filter(|&i| parent_may_choose(ask, i).is_ok())
+            .collect::<Vec<_>>(),
         "questions": ask.questions.iter().map(|q| json!({
             "question": q.question,
             "options": q.options.as_ref().map(|o| o.iter().map(|c| &c.label).collect::<Vec<_>>()),

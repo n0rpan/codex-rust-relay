@@ -999,7 +999,7 @@ fn tools() -> Value {
             },
             {
                 "name": "answer_ox_worker",
-                "description": "Answer an approval or question of a host-owned worker you started, in place of the user. Only requests that ox_worker_status lists with parent_may_answer true are accepted: questions, and approvals when your own mode already runs actions without a person (Auto, Auto-review or YOLO) and the worker is not read-only. Approve only what serves the task you gave the worker and that you would run yourself; deny anything else. Raising a worker's mode always stays with the user.",
+                "description": "Answer an approval or question of a host-owned worker you started, in place of the user. Only requests that ox_worker_status lists with parent_may_answer true are accepted: questions, and approvals when your own mode already runs actions without a person (Auto, Auto-review or YOLO) and the worker is not read-only. Pick only an index listed in the request's parent_choices: choices that set a lasting rule stay with the user. Approve only what serves the task you gave the worker and that you would run yourself; deny anything else. Raising a worker's mode always stays with the user.",
                 "inputSchema": {"type":"object","properties":{
                     "job_id":{"type":"integer","minimum":1},
                     "request_id":{"type":["integer","string"],"description":"request_id from the worker's requests."},
