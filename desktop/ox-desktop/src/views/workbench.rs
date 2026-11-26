@@ -13,7 +13,7 @@ use std::{collections::HashMap, path::PathBuf, time::Instant};
 
 pub(super) mod empty;
 mod review;
-mod thread_menu;
+pub(super) mod thread_menu;
 mod usage;
 mod worker;
 
@@ -68,6 +68,15 @@ fn current_activity(store: &Store) -> Option<(activity::Scene, u64)> {
     ))
 }
 
+/// A row-level action requested while a pane or thread was still opening.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::views) enum DeferredRowAction {
+    Archive,
+    End,
+    GenerateTitle,
+    FindInTranscript,
+}
+
 pub struct Workbench {
     pub(super) pending_local_command: Option<super::terminal_review::Pending>,
     pub(super) enter_sends: bool,
@@ -92,6 +101,8 @@ pub struct Workbench {
     pub(super) front: bool,
     pub(super) query: String,
     pending_selection: Option<(ox_desk_core::store::ThreadRow, bool)>,
+    pending_row_action: Option<(String, DeferredRowAction)>,
+    pending_draft: Option<(String, Vec<ox_desk_core::mentions::ImageInput>)>,
     pub(super) store: Option<Store>,
     pub(super) launch_error: Option<String>,
     pub(super) mention_index: usize,
@@ -112,6 +123,7 @@ pub struct Workbench {
         HashMap<ox_desk_core::runtime::RequestId, Vec<Entity<gpui_component::input::InputState>>>,
     pub(super) fire: Option<Entity<activity::Runner>>,
     pub(super) runner: Option<Entity<activity::Runner>>,
+    pub(super) mascot_frame: u8,
     /// The selected thread's running turn at the last render, to notice it ending.
     last_turn: Option<(String, String)>,
     /// A just-ended turn's one-shot scene, kept until it has been seen once.
@@ -153,6 +165,42 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::build(
+            project,
+            route,
+            Some(first_frame),
+            stats,
+            route_models,
+            window,
+            cx,
+        )
+    }
+
+    /// Create a background pane without connecting to `ox-host` or spawning a runtime yet.
+    /// It connects on its first `set_front(true, window, cx)`.
+    pub fn new_lazy(
+        project: PathBuf,
+        route: Route,
+        stats: bool,
+        route_models: Entity<Vec<String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(project, route, None, stats, route_models, window, cx)
+    }
+
+    /// `active`: `Some(first_frame)` starts connected as the front pane; `None` starts lazy.
+    fn build(
+        project: PathBuf,
+        route: Route,
+        active: Option<Option<Instant>>,
+        stats: bool,
+        route_models: Entity<Vec<String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let front = active.is_some();
+        let first_frame = active.flatten();
         cx.observe_window_activation(window, |s, window, cx| {
             if s.front {
                 cx.notify();
@@ -177,7 +225,12 @@ impl Workbench {
             }
         })
         .detach();
-        let (wake, pump) = Self::connection(project.clone(), route.clone(), window, cx);
+        let (wake, pump) = if front {
+            Self::connection(project.clone(), route.clone(), window, cx)
+        } else {
+            let (wake, _) = flume::bounded(1);
+            (wake, Task::ready(()))
+        };
         Self {
             enter_sends: cx
                 .global::<crate::preferences::behavior::Active>()
@@ -193,9 +246,11 @@ impl Workbench {
             launch_request: None,
             launch: None,
             launch_picker: None,
-            front: true,
+            front,
             query: String::new(),
             pending_selection: None,
+            pending_row_action: None,
+            pending_draft: None,
             project,
             route,
             store: None,
@@ -206,7 +261,7 @@ impl Workbench {
             file_hover: None,
             image_work: Default::default(),
             pending_command: None,
-            connecting: true,
+            connecting: front,
             awaiting_login: false,
             retry_available: true,
             first_frame,
@@ -219,6 +274,7 @@ impl Workbench {
             finale_watch: None,
             fire: None,
             focused_ask: None,
+            mascot_frame: 0,
             editors: HashMap::new(),
             answer_fields: HashMap::new(),
             transcript_views: HashMap::new(),
@@ -267,6 +323,15 @@ impl Workbench {
                             s.launch_error = None;
                             if let Err(e) = store.search(s.query.clone()) {
                                 s.launch_error = Some(e.to_string());
+                            }
+                            if let Some((text, images)) = s.pending_draft.take() {
+                                while !store.draft_images(None).is_empty() {
+                                    store.remove_image(None, 0);
+                                }
+                                store.edit(None, text);
+                                for img in images {
+                                    store.attach_image(None, img);
+                                }
                             }
                             deadline = store.next_deadline();
                             store.set_front(s.front);
@@ -414,6 +479,7 @@ impl Workbench {
                             }
                             s.finish_local_command(local_result, cx);
                             s.finish_command_discovery(cx);
+                            s.finish_pending_row_action(window, cx);
                             s.launch_handoff(cx);
                             if disconnected {
                                 s.retry_once(window, cx);
@@ -492,6 +558,75 @@ impl Workbench {
         .detach();
     }
 
+    pub(super) fn queue_row_action(
+        &mut self,
+        id: String,
+        action: DeferredRowAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_row_action = Some((id, action));
+        self.finish_pending_row_action(window, cx);
+    }
+
+    fn finish_pending_row_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((id, action)) = self.pending_row_action.clone() else {
+            return;
+        };
+        let Some(store) = &self.store else {
+            return;
+        };
+        if store.state() != &Connection::Ready || store.selected() != Some(id.as_str()) {
+            return;
+        }
+        match action {
+            DeferredRowAction::Archive => {
+                if !store.can_edit_thread_metadata() {
+                    self.pending_row_action = None;
+                    return;
+                }
+                if !store.can_manage_thread(&id) {
+                    return;
+                }
+                self.pending_row_action = None;
+                self.request_archive(id, cx);
+            }
+            DeferredRowAction::End => {
+                self.pending_row_action = None;
+                self.request_end(id, cx);
+            }
+            DeferredRowAction::GenerateTitle => {
+                if !store
+                    .transcript(&id)
+                    .is_some_and(|t| t.is_ready() || t.active_turn().is_some())
+                {
+                    return;
+                }
+                self.pending_row_action = None;
+                if !store.can_generate_title(&id) {
+                    return;
+                }
+                self.action(cx, DeskAction::GenerateTitle(id));
+            }
+            DeferredRowAction::FindInTranscript => {
+                if !store
+                    .transcript(&id)
+                    .is_some_and(|t| t.is_ready() || t.active_turn().is_some())
+                {
+                    return;
+                }
+                self.pending_row_action = None;
+                if !self.transcript_views.contains_key(&id) {
+                    // Render once so `transcript_views` creates the entry for `id`, then open Find.
+                    self.pending_row_action = Some((id, action));
+                    cx.notify();
+                    return;
+                }
+                self.find_in_transcript(window, cx);
+            }
+        }
+    }
+
     pub(super) fn select_catalog(
         &mut self,
         row: ox_desk_core::store::ThreadRow,
@@ -528,6 +663,33 @@ impl Workbench {
     pub(super) fn restore_selection(&mut self, row: ox_desk_core::store::ThreadRow) {
         self.pending_selection = Some((row, false))
     }
+    /// Carry over an unsent first-prompt draft (text and attached images) when switching
+    /// routes/models before sending.
+    pub(super) fn adopt_new_draft(
+        &mut self,
+        text: String,
+        images: Vec<ox_desk_core::mentions::ImageInput>,
+        cx: &mut Context<Self>,
+    ) {
+        if text.is_empty() && images.is_empty() {
+            return;
+        }
+        if let Some(store) = &mut self.store {
+            let _ = store.dispatch(DeskAction::NewDraft);
+            while !store.draft_images(None).is_empty() {
+                store.remove_image(None, 0);
+            }
+            store.edit(None, text);
+            for img in images {
+                store.attach_image(None, img);
+            }
+            cx.notify();
+        } else {
+            self.pending_selection = None;
+            self.pending_draft = Some((text, images));
+            cx.notify();
+        }
+    }
     pub(super) fn layout_selection(&self) -> Option<&ox_desk_core::store::ThreadRow> {
         self.pending_selection
             .as_ref()
@@ -544,6 +706,7 @@ impl Workbench {
         ) {
             cx.emit(CatalogChanged);
             self.pending_selection = None;
+            self.pending_row_action = None;
             self.model_picker = None;
             self.thread_edit = None;
             self.pending_command = None;
@@ -666,6 +829,27 @@ impl Workbench {
             self.fire = None;
         }
     }
+
+    pub(super) fn set_front_in(
+        &mut self,
+        front: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.front = front;
+        if let Some(store) = &mut self.store {
+            store.set_front(front);
+        }
+        if front && self.store.is_none() && !self.connecting {
+            self.reconnect(window, cx);
+        }
+        if front {
+            cx.notify();
+        } else {
+            self.runner = None;
+            self.fire = None;
+        }
+    }
 }
 
 impl Render for Workbench {
@@ -766,6 +950,9 @@ impl Workbench {
                 .as_ref()
                 .is_some_and(|s| s.state() == &Connection::Ready && s.selected().is_none());
         let transcript = (!ready).then(|| self.transcript_panel(cx));
+        if self.pending_row_action.is_some() {
+            self.finish_pending_row_action(window, cx);
+        }
         let controls = self.thread_menu(cx);
         let review_toggle = self.review_toggle(cx);
         let inline_request = self.pane_width < px(825.);
@@ -979,7 +1166,7 @@ impl Workbench {
                                 .children(usage);
                             let dock = row().w_full().justify_center().child(dock);
                             if ready {
-                                view.child(self.empty_state(p, dock))
+                                view.child(self.empty_state(p, dock, cx))
                             } else {
                                 view.child(dock.flex_shrink_0().pt(px(SPACE_S)))
                             }

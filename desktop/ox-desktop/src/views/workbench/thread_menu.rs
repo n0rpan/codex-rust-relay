@@ -23,6 +23,14 @@ impl ThreadEdit {
     }
 }
 
+/// Notify `Host` that the user renamed a thread from the workbench header menu so
+/// `sidebar.json` records the custom title.
+pub(in crate::views) struct ThreadRenamed {
+    pub id: String,
+    pub name: String,
+}
+impl EventEmitter<ThreadRenamed> for Workbench {}
+
 impl Workbench {
     fn apply_thread_edit(&mut self, cx: &mut Context<Self>) {
         let action = match &self.thread_edit {
@@ -31,6 +39,10 @@ impl Workbench {
                 if name.trim().is_empty() {
                     return;
                 }
+                cx.emit(ThreadRenamed {
+                    id: id.clone(),
+                    name: name.trim().to_owned(),
+                });
                 Action::RenameThread(id.clone(), name.to_string())
             }
             Some(ThreadEdit::Archive(id)) => Action::ArchiveThread(id.clone()),
@@ -39,6 +51,16 @@ impl Workbench {
         };
         self.thread_edit = None;
         self.action(cx, action);
+    }
+    pub(crate) fn request_archive(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.store.as_ref().is_some_and(|store| {
+            store.can_manage_thread(&id)
+                && store.can_edit_thread_metadata()
+                && !store.is_native_live(&id)
+        }) {
+            self.thread_edit = Some(ThreadEdit::Archive(id));
+            cx.notify();
+        }
     }
     /// End a thread's live process. A busy thread (running turn, pending approval or
     /// running worker) asks first, inline, because ending it cancels that work.

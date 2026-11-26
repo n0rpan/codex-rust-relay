@@ -12,19 +12,33 @@ impl EventEmitter<OpenProject> for Workbench {}
 impl Workbench {
     /// The empty main area: the ox above "What shall we work on?", the project name and
     /// `dock`, the centred composer column. Typing in it starts the new session.
-    pub(super) fn empty_state(&mut self, p: Palette, dock: Div) -> Div {
+    pub(super) fn empty_state(&mut self, p: Palette, dock: Div, cx: &mut Context<Self>) -> Div {
         let project = self
             .project
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .filter(|n| !n.is_empty());
+        let frame = self.mascot_frame;
         col()
             .flex_1()
             .min_h_0()
             .items_center()
             .justify_center()
             .px(px(SPACE_L))
-            .child(crate::activity::ox(p, 0, 4.))
+            .child(
+                div()
+                    .id("empty-mascot")
+                    .cursor_pointer()
+                    .tooltip(|window, cx| {
+                        gpui_component::tooltip::Tooltip::new("READY PLAYER ONE · Click to trot")
+                            .build(window, cx)
+                    })
+                    .on_click(cx.listener(|s, _, _, cx| {
+                        s.mascot_frame = (s.mascot_frame + 1) % 8;
+                        cx.notify();
+                    }))
+                    .child(crate::activity::ox(p, frame, 4.)),
+            )
             .child(
                 div()
                     .mt(px(SPACE_L))
@@ -43,5 +57,13 @@ impl Workbench {
                 )
             })
             .child(div().mt(px(24.)).w_full().child(dock))
+            .child(
+                div()
+                    .mt(px(12.))
+                    .font_family(crate::appearance::LABEL_FONT)
+                    .text_size(p.text(Step::Label) * 0.9)
+                    .text_color(rgb(p.quiet()))
+                    .child("PASTE OR DROP SCREENSHOTS & FILES · @ TO MENTION · / FOR COMMANDS"),
+            )
     }
 }
