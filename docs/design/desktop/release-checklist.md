@@ -6,14 +6,17 @@ Run this before tagging a release. CI covers most of it. The manual section cove
 
 | Area | Check | Where it runs |
 | --- | --- | --- |
-| Fast feedback | fmt, clippy, unit tests, Linux workbench, stock-client protocol on baseline and latest | `fast.yml`, every push |
-| Packages and windows | four platform packages, window tests, stock sessions in the packaged app | `desktop.yml`, `full-ci` label, main, nightly, tags |
+| Fast feedback | fmt, clippy, unit tests, Linux workbench, stock-client protocol on baseline and latest | `fast.yml`, on the proposed merge commit and before publishing |
+| Native portability | Core, host and CLI tests on Linux ARM64, Apple silicon and Intel macOS | Native changes on PRs, main and releases |
+| Packages and windows | Packaged app, window tests, stock sessions and clean-account installation | Packaging or window-test changes, `full-ci`, main, nightly and tags |
 | Install as a new account | install, `ox host install`, doctor, restart, crash restart, reinstall restarts the host, uninstall keeps state, `--purge` removes it and leaves Codex and Claude Code data | `desktop/tests/host_clean_account.sh` (Linux systemd, macOS launchd) |
 | Upgrade mid-turn | turn keeps running during the drain, new turns refused with the reason, new host under a new epoch, client reconnects, session idle and continues | `desktop/tests/host_upgrade_session.py`, Claude floor and latest |
 | Host crash | SIGKILL mid-approval: new epoch, approval retired, session interrupted, stale answer refused, no native child left | `desktop/tests/host_stock_session.py` |
 | Restart retirements | YOLO requests declined, unstarted handoffs failed, reasons name the update | `ox-host` `durable` and `handover` unit tests |
 | Remote rules | loopback bind, identity only via Serve, invitation and pairing expiry, revocation, Funnel refused, push payloads | `ox-host-web` and `ox-desktop` unit tests, listed in [tailnet-check.md](tailnet-check.md) |
 | Diagnostics | doctor fails on a stopped host, Serve off, Funnel, a stock client below its floor | `ox-host` `doctor` unit tests |
+
+The required **OX merge check** runs on GitHub’s proposed merge commit. The fast lane targets ten minutes on a warm cache. The check also waits for the native or packaged tests selected for that change.
 
 Before tagging, the latest `main` run of `CI` and `OX Desktop` must be green on all four legs, and the last nightly must be green, quarantined tests included.
 

@@ -1,11 +1,7 @@
 name: Fast lane
 
-# The fast lane answers "is this push sane?" in under five minutes on a warm
-# cache. It runs on every push to a branch; a pull request's checks come from
-# the push run on its head commit. (No pull_request trigger: a second run per
-# push only added a row of skipped checks.)
-# On main, tags and manual release runs, ci.yml calls this workflow instead,
-# so the same checks gate the dev and tagged releases.
+# CI runs this lane on the proposed merge commit and before publishing a release.
+# A branch can also run it manually before opening a pull request.
 #
 # Jobs run in parallel; none waits on another:
 #   - root:      fmt, clippy and unit tests of the `ox` crate, installer lint
@@ -19,8 +15,6 @@ name: Fast lane
 # dependency build and none evicts it. The full lane (packages, window tests,
 # stock sessions in the packaged app) lives in desktop.yml.
 on:
-  push:
-    branches: ['**', '!main']
   workflow_dispatch:
   workflow_call:
 
@@ -100,6 +94,7 @@ jobs:
           echo "ca1f81a5b86533eb45ab97e0064aa88e925e53aab9a698ca6331a7cad1f85f07  $RUNNER_TEMP/nextest.tar.gz" | sha256sum --check
           tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$HOME/.cargo/bin" cargo-nextest
       - run: cargo fmt --manifest-path desktop/Cargo.toml --all -- --check
+      - run: python3 -m unittest discover -s desktop/ci -p test_pr_scope.py
       - run: python3 desktop/ci/contract.py --final
       - run: python3 desktop/ci/quarantine.py --self-test && python3 desktop/ci/quarantine.py --check
       - run: cargo clippy --manifest-path desktop/Cargo.toml --locked --workspace --all-targets -- -D warnings
