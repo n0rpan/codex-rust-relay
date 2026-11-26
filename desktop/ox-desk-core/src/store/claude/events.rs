@@ -188,12 +188,12 @@ impl Store {
             self.ended_threads.insert(owner.into());
             if p.started_new {
                 self.unsaved_claude_drafts.insert(owner.into());
-                if let Some(mode) = p.mode.or_else(|| Access::from_mode(&p.launch_mode)) {
-                    self.resume_access.insert(owner.into(), mode);
-                }
-                if let Some(model) = p.launch_model.take() {
-                    self.resume_models.insert(owner.into(), model);
-                }
+            }
+            if let Some(mode) = p.mode.or_else(|| Access::from_mode(&p.launch_mode)) {
+                self.resume_access.insert(owner.into(), mode);
+            }
+            if let Some(model) = p.selected_model.take() {
+                self.resume_models.insert(owner.into(), model);
             }
         }
         self.restore_claude_drafts(owner, unsent);
@@ -676,13 +676,9 @@ impl Store {
                 self.transcripts.entry(owner.into()).or_default().access = Some(mode);
             }
             Control::Model(model) if result["model"] == model => {
-                if let Some(c) = &mut self
-                    .claude_mut()
-                    .sessions
-                    .get_mut(owner)
-                    .unwrap()
-                    .capabilities
-                {
+                let p = self.claude_mut().sessions.get_mut(owner).unwrap();
+                p.selected_model = Some(model.clone());
+                if let Some(c) = &mut p.capabilities {
                     c.model = model.clone();
                 }
                 self.transcripts.entry(owner.into()).or_default().model = Some(model.clone());

@@ -73,7 +73,8 @@ struct Process {
     deferred_command: Option<DeferredCommand>,
     /// The permission mode this process was launched with.
     launch_mode: String,
-    launch_model: Option<String>,
+    /// The explicit subscription model to reuse if a turn needs to be retried.
+    selected_model: Option<String>,
     started_new: bool,
     /// Reading a saved journal, optionally following a live external client.
     viewer: Option<native::Viewer>,
@@ -655,7 +656,7 @@ impl Store {
                 generation,
                 first,
                 launch_mode: mode.clone(),
-                launch_model: subscription_model.clone(),
+                selected_model: subscription_model.clone(),
                 started_new: matches!(session, Session::New(_)),
                 ..Default::default()
             },

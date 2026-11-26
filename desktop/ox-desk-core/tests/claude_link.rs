@@ -440,6 +440,17 @@ fn refused_initialization_keeps_the_first_slash_input_without_sending_or_opening
     assert_eq!(wait_lines(&project.join("wire"), 1).len(), 1);
 }
 
+fn make_saved_history(project: &Path, profiles: &Profiles) -> String {
+    let journals = profiles.subscription.join("projects").join(
+        project
+            .to_string_lossy()
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "-"),
+    );
+    fs::create_dir_all(&journals).unwrap();
+    fs::write(journals.join(format!("{FIRST}.jsonl")), format!("{}\n", json!({"uuid":SECOND, "type":"user","cwd":project,"sessionId":FIRST,"entrypoint":"sdk-cli","message":{"role":"user","content":"Earlier message"}}))).unwrap();
+    format!("claude:subscription:{FIRST}")
+}
+
 /// Start and recover actual stores with a stock executable that records every invocation
 /// and input. A saved Claude route opens at login, and history selection is a disk read.
 #[test]
@@ -455,15 +466,8 @@ fn browsing_and_restoring_never_run_claude_and_each_first_input_is_delivered_onc
         subscription: project.join("stock"),
         api: project.join("api"),
     };
-    let journals = profiles.subscription.join("projects").join(
-        project
-            .to_string_lossy()
-            .replace(|c: char| !c.is_ascii_alphanumeric(), "-"),
-    );
-    fs::create_dir_all(&journals).unwrap();
-    fs::write(journals.join(format!("{FIRST}.jsonl")), format!("{}\n", json!({"uuid":SECOND, "type":"user","cwd":project,"sessionId":FIRST,"entrypoint":"sdk-cli","message":{"role":"user","content":"Earlier message"}}))).unwrap();
+    let history = make_saved_history(&project, &profiles);
     let open = || recording_store(&project, &exe, &profiles);
-    let history = format!("claude:subscription:{FIRST}");
     let (mut store, events) = open();
     assert_eq!(store.state(), &Connection::Ready);
     assert!(store.can_send(None));
@@ -594,5 +598,76 @@ fn a_refused_first_turn_can_retry_its_reserved_id_after_sign_in() {
     assert_eq!(
         wait_lines(&project.join("wire"), 2)[1]["message"]["content"][0]["text"],
         "Keep my first turn"
+    );
+}
+
+#[test]
+fn retrying_a_resumed_turn_after_initialize_keeps_its_access_and_model() {
+    let root = TempDir::new().unwrap();
+    let project = root.path().canonicalize().unwrap();
+    let exe = fixture(
+        &project,
+        minimum(),
+        json!({"apiProvider":"firstParty","subscriptionType":"Claude Max"}),
+    );
+    let profiles = Profiles {
+        subscription: project.join("stock"),
+        api: project.join("api"),
+    };
+    let owner = make_saved_history(&project, &profiles);
+    let (mut store, events) = recording_store(&project, &exe, &profiles);
+    store.select(&owner).unwrap();
+    while !store.can_change_access(&owner) {
+        store.apply(events.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    store
+        .dispatch(Action::SetAccess(owner.clone(), Access::Plan))
+        .unwrap();
+    store
+        .dispatch(Action::ModelOptions(
+            Some(owner.clone()),
+            Choice::Model("opus".into()),
+        ))
+        .unwrap();
+    let disconnect = project.join("disconnect-before-echo");
+    fs::write(&disconnect, "").unwrap();
+    store
+        .dispatch(Action::SendText(
+            Some(owner.clone()),
+            "Keep this plan".into(),
+        ))
+        .unwrap();
+    while !matches!(store.state(), Connection::Closed(_)) {
+        store.apply(events.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    assert_eq!(store.draft(Some(&owner)), "Keep this plan");
+    assert_eq!(
+        wait_lines(&project.join("wire"), 2)[1]["message"]["content"][0]["text"],
+        "Keep this plan"
+    );
+    fs::remove_file(disconnect).unwrap();
+    let (mut replacement, events) = recording_store(&project, &exe, &profiles);
+    replacement.recover_from(&mut store);
+    replacement
+        .dispatch(Action::Submit(Some(owner.clone())))
+        .unwrap();
+    while !replacement
+        .transcript(&owner)
+        .is_some_and(|t| t.active_turn().is_some())
+    {
+        replacement.apply(events.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    let launches = fs::read_to_string(project.join("launches")).unwrap();
+    let calls = launches.lines().collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[0].contains(&format!("--resume {FIRST}")));
+    assert!(calls[0].contains("--permission-mode plan") && calls[0].contains("--model opus"));
+    assert_eq!(
+        calls[1], calls[0],
+        "retry changed the saved session's launch options"
+    );
+    assert_eq!(
+        wait_lines(&project.join("wire"), 2)[1]["message"]["content"][0]["text"],
+        "Keep this plan"
     );
 }
