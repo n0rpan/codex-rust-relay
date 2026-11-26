@@ -14,7 +14,6 @@ use ox_desk_core::{
 use serde_json::{Value, json};
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
@@ -40,24 +39,7 @@ fn fixture(root: &Path) -> PathBuf {
     fs::write(root.join("after.init"),json!({"type":"control_response","response":{
         "subtype":"success","request_id":"ox-init","response":{"claude_code_version":minimum(),"account":account,"commands":[],"models":[]}
     }}).to_string()+"\n").unwrap();
-    let exe = root.join("fixture");
-    fs::write(
-        &exe,
-        r#"#!/bin/sh
-while IFS= read -r row; do
-  printf '%s\n' "$row" >> wire
-  case "$row" in
-    *'"request_id":"ox-init"'*) key=init ;;
-    *'"type":"user"'*) key=$(printf '%s' "$row" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p') ;;
-    *) key= ;;
-  esac
-  [ -n "$key" ] && [ -f "after.$key" ] && cat "after.$key"
-done
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
-    exe
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude-prompt-context.sh")
 }
 fn after(root: &Path, uuid: &str, frames: &[&Value]) {
     let text: String = frames.iter().map(|f| format!("{f}\n")).collect();
