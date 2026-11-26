@@ -1781,12 +1781,7 @@ async fn offer_codex_update(old: &str, codex: &Path) -> bool {
         use std::io::Write;
         eprint!("{prompt}");
         let _ = std::io::stderr().flush();
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer).is_ok()
-            && matches!(
-                answer.trim().to_ascii_lowercase().as_str(),
-                "" | "y" | "yes"
-            )
+        read_codex_update_confirmation(std::io::stdin().lock())
     })
     .await
     .unwrap_or(false);
@@ -1808,6 +1803,15 @@ async fn offer_codex_update(old: &str, codex: &Path) -> bool {
             false
         }
     }
+}
+
+fn read_codex_update_confirmation(mut input: impl std::io::BufRead) -> bool {
+    let mut answer = String::new();
+    matches!(input.read_line(&mut answer), Ok(1..))
+        && matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "" | "y" | "yes"
+        )
 }
 
 /// `codex --version` output, used only to explain a failed launch.
@@ -1960,6 +1964,14 @@ mod tests {
     use tokio::task::JoinHandle;
 
     const RELAY_TOKEN: &str = "relay-test-token";
+
+    #[test]
+    fn codex_update_prompt_distinguishes_eof_from_enter() {
+        assert!(!read_codex_update_confirmation("".as_bytes()));
+        assert!(read_codex_update_confirmation("\n".as_bytes()));
+        assert!(read_codex_update_confirmation("YES\n".as_bytes()));
+        assert!(!read_codex_update_confirmation("n\n".as_bytes()));
+    }
 
     struct MockVendor {
         base: String,
