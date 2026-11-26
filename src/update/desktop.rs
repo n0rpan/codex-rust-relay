@@ -165,7 +165,9 @@ fn prune_unused(store: &Path, active: &Path) {
     let Ok(entries) = fs::read_dir(store) else {
         return;
     };
-    for entry in entries.flatten() {
+    // Renaming children while a directory iterator is live can skip a sibling.
+    let entries: Vec<_> = entries.flatten().collect();
+    for entry in entries {
         let path = entry.path();
         let name = entry.file_name();
         let digest = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
@@ -519,8 +521,8 @@ mod tests {
         installer_user.lock_shared().unwrap();
         prune_unused(&store, &packages[0]);
         assert!(installer.exists());
-        drop(installer_user);
-        drop(lease);
+        installer_user.unlock().unwrap();
+        lease.unlock().unwrap();
         prune_unused(&store, &packages[0]);
         assert!(!packages[2].exists());
         assert!(!installer.exists());
