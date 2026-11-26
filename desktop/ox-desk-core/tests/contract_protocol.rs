@@ -100,6 +100,7 @@ fn installed_protocol() {
             "threadId itemsView limit cursor sortDirection",
         ),
         ("ThreadTurnsListResponse", "nextCursor data"),
+        ("ThreadReadParams", "threadId includeTurns"),
         (
             "ThreadSettingsUpdateParams",
             "threadId approvalPolicy approvalsReviewer sandboxPolicy effort model serviceTier",

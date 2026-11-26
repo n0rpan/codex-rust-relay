@@ -242,19 +242,59 @@ impl Store {
             }
             self.sync_title(&identity);
             self.transcripts.entry(id.into()).or_default().read_updated = identity.updated_at;
-            self.request(
-                Call::Resume {
-                    thread: id.into(),
-                    project: identity
-                        .parent_thread_id
-                        .is_none()
-                        .then(|| self.profile.project.clone()),
-                },
-                Pending::Resume(id.into()),
-            )
+            self.request_resume(id, false)
         })();
         if let Err(err) = result {
             self.failed(Pending::Read(id.into()), err.to_string());
+        }
+    }
+
+    fn request_resume(&mut self, id: &str, full_history: bool) -> io::Result<()> {
+        self.request(
+            Call::Resume {
+                thread: id.into(),
+                project: (!self.child_threads.contains_key(id))
+                    .then(|| self.profile.project.clone()),
+                full_history,
+            },
+            if full_history {
+                Pending::ResumeFullHistory(id.into())
+            } else {
+                Pending::Resume(id.into())
+            },
+        )
+    }
+
+    /// Some Codex thread stores cannot page a newly discovered worker yet.
+    /// Ask once for its full history, preserving the original read/write intent.
+    pub(super) fn rpc_failed(&mut self, pending: Pending, error: crate::codex::frame::RpcError) {
+        if error.code != -32601 || error.message != "list_turns is not supported yet" {
+            return self.failed(pending, error.message);
+        }
+        let fallback = match &pending {
+            Pending::Resume(id) => self.request_resume(id, true),
+            Pending::History(id) => self.request(
+                Call::ReadFullHistory(id.clone()),
+                Pending::ReadFullHistory(id.clone()),
+            ),
+            Pending::ReadFullHistory(id) | Pending::ResumeFullHistory(id) => {
+                let action = if self.transcript(id).is_some_and(Transcript::has_older) {
+                    "Load earlier turns again"
+                } else {
+                    "Open the session again"
+                };
+                return self.failed(
+                    pending,
+                    format!(
+                        "Codex could not read the session history. {action} to retry. ({})",
+                        error.message
+                    ),
+                );
+            }
+            _ => return self.failed(pending, error.message),
+        };
+        if let Err(error) = fallback {
+            self.failed(pending, error.to_string());
         }
     }
 
@@ -375,9 +415,7 @@ impl Store {
 
     /// A read, resume or history request for the thread is still waiting for Codex.
     pub(super) fn native_request_outstanding(&self, id: &str) -> bool {
-        self.pending.values().any(|(_, p)| {
-            matches!(p, Pending::Read(x) | Pending::Resume(x) | Pending::History(x) if x == id)
-        })
+        self.pending.values().any(|(_, p)| p.loads_history_for(id))
     }
 
     /// Probe the selected natively-held Codex thread every few seconds: a resume that is
@@ -397,6 +435,18 @@ impl Store {
             t.native_next = Some(now + std::time::Duration::from_secs(4));
         }
         let _ = self.request(Call::Read(id.clone()), Pending::Read(id));
+    }
+
+    pub(super) fn full_history_read(&mut self, id: String, read: ReadThread, mut page: TurnPage) {
+        if let Err(error) = self.verify_identity(&id, &read.thread) {
+            return self.failed(Pending::ReadFullHistory(id), error.to_string());
+        }
+        if let Some(t) = self.transcripts.get(&id)
+            && let Err(error) = t.trim_full_history_to_cursor(&mut page)
+        {
+            return self.failed(Pending::ReadFullHistory(id), error.to_string());
+        }
+        self.history_page(&id, page);
     }
 
     fn history_preview(&mut self, id: &str, page: &TurnPage) {

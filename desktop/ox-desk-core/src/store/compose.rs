@@ -562,10 +562,7 @@ impl Store {
         // A Read, Resume or History still in flight must not reopen the thread when its
         // reply lands after the End: a sibling keeps this scope's runtime up, so nothing
         // else would close it again. The Unsubscribe below follows them on the wire.
-        self.pending.retain(|_, (_, p)| {
-            !matches!(p, Pending::Read(x) | Pending::Resume(x) | Pending::History(x)
-                if x.as_str() == id)
-        });
+        self.pending.retain(|_, (_, p)| !p.loads_history_for(id));
         self.changed.transcript(id);
         self.changed.mark(Changed::THREADS);
         self.request(Call::Unsubscribe(id.into()), Pending::Unsubscribe)
@@ -1256,6 +1253,8 @@ mod tests {
             Pending::Read("gone".into()),
             Pending::Resume("gone".into()),
             Pending::History("gone".into()),
+            Pending::ReadFullHistory("gone".into()),
+            Pending::ResumeFullHistory("gone".into()),
             Pending::Read("sibling".into()),
         ]
         .into_iter()
@@ -1271,10 +1270,10 @@ mod tests {
         }
         store.end_session("gone").unwrap();
         assert!(
-            store.pending.values().all(|(_, p)| !matches!(
-                p,
-                Pending::Read(t) | Pending::Resume(t) | Pending::History(t) if t == "gone"
-            )),
+            store
+                .pending
+                .values()
+                .all(|(_, p)| !p.loads_history_for("gone")),
             "late replies for the ended thread are dropped"
         );
         assert!(
