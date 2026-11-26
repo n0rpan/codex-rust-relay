@@ -145,10 +145,12 @@ impl HostLink {
         call: Option<Value>,
     ) -> Result<Value, String> {
         let hint = env::var("OX_HOST_WORKER_PARENT").ok().or(thread);
-        let reading = call.as_ref().is_some_and(|c| c["op"] == "read_thread");
+        let needs_host_lookup = call
+            .as_ref()
+            .is_some_and(|c| matches!(c["op"].as_str(), Some("read_thread" | "list_hosts")));
         let wait = Duration::from_secs(if start.is_some() {
             80
-        } else if reading {
+        } else if needs_host_lookup {
             50
         } else {
             15

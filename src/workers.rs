@@ -964,7 +964,7 @@ fn tools() -> Value {
             },
             {
                 "name":"list_ox_hosts",
-                "description":"List execution hosts available to this session, their resources, labels, installed runtimes and configured billing routes.",
+                "description":"List the parent and its paired worker hosts with live resources, labels, installed runtimes, configured billing routes, link permissions and whether each host has this repository. Unreachable hosts remain listed.",
                 "inputSchema":{"type":"object","properties":{},"additionalProperties":false},
                 "annotations":{"readOnlyHint":true,"openWorldHint":false}
             },

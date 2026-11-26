@@ -57,6 +57,7 @@ fn paired_phone() -> (tempfile::TempDir, App, String, Subscription) {
         state: Arc::new(std::sync::Mutex::new(state)),
         host: Arc::new(dir.path().join("unused.sock")),
         slots: Arc::new(tokio::sync::Semaphore::new(1)),
+        inventory: Default::default(),
         discovered: Default::default(),
     };
     (dir, app, id, sub)

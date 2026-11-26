@@ -4,6 +4,13 @@ import json
 import os
 import shutil
 import ssl
+import subprocess
+
+
+def repo(path, origin):
+    path.mkdir(parents=True)
+    subprocess.run(["git", "init", "--quiet", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "remote", "add", "origin", origin], check=True)
 
 
 def receiver(d, stack):
@@ -19,9 +26,15 @@ def receiver(d, stack):
         shutil.copy2(os.environ[var], package / name)
     env = dict(HOME=str(home), CODEX_HOME=str(home / ".codex"), XDG_STATE_HOME=str(home / "state"),
                PATH=str(package), OX_NO_BACKGROUND_UPDATE="1", SHELL="/bin/sh")
+    (package / "git").symlink_to(shutil.which("git"))
+    project = root / "build-checkout"
+    repo(project, "git@code.example.test:owner/ox.git")
     stack.enter_context(session_host(package / "ox-host", root, env))
     state = Path(env["OX_HOST_STATE_DIR"])
     wait(lambda: (state / "remote-admin.sock").exists())
+    listed = subprocess.check_output([package / "ox", "host", "project", "add", project], env=env, text=True)
+    assert listed.strip() == str(project)
+    assert not (home / "state/ox/desktop/workspace.json").exists()
     public = ThreadedTCP(("127.0.0.1", 0), Forward)
     port = public.server_address[1]
     name = "build.fixture.ts.net"
@@ -135,7 +148,7 @@ def exercise(js, wait, invite, saved, receiver_state, source):
     print("PASS web UI sends only Brave Search, rejects stale reviews and foreign-owned peers, and preserves existing desktop pairings", flush=True)
 
 
-def worker_links(js, wait, state, source):
+def worker_links(js, wait, state, source, harness, source_env):
     from browser import admin
     # The source web service uses a mock engine in this fixture.
     source_id = "06f2bbe4-12bb-4243-ab20-657f19c02d36"
@@ -186,6 +199,10 @@ def worker_links(js, wait, state, source):
     edited = admin(state, {"type": "worker_access", "id": link["id"], "before": link["worker"],
                           "may_launch": False, "ceiling": "read"})
     assert edited["worker_hosts"][0]["worker"] == dict(link["worker"],may_launch=False,ceiling="read")
+    repo(source / "inventory-source/ox", "https://user:fixture-secret@code.example.test/owner/ox")
+    repo(source / "another/ox", "https://code.example.test/different/ox")
+    subprocess.run([harness, "--exact", "inventory::tests::paired_inventory", "--ignored"],
+                   env=source_env, check=True, timeout=45)
     click("Remove outgoing link")
     wait(lambda: not admin(state, {"type":"status"}).get("worker_hosts"))
     assert {row["id"] for row in rows if row["class"] == "desktop"} == {row["id"] for row in admin(state, {"type":"status"})["devices"]}

@@ -2,6 +2,8 @@
 //! stash or refs. The caller supplies the authenticated transport and the
 //! receiving host's local mirror. The mirror refresh is the only upstream fetch.
 mod files;
+mod identity;
+pub use identity::repository_id;
 mod lfs;
 pub use files::changed_private_inputs;
 mod mirror;

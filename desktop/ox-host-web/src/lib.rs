@@ -7,6 +7,8 @@ mod bridge;
 pub mod client;
 pub mod host_profile;
 pub mod host_updates;
+#[cfg(feature = "server")]
+pub mod inventory;
 #[cfg(feature = "client")]
 pub mod paired_hosts;
 #[cfg(feature = "server")]

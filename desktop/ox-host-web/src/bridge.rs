@@ -408,6 +408,7 @@ mod tests {
             )),
             host: Default::default(),
             slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            inventory: Default::default(),
             discovered: Default::default(),
         };
         let hello = |capabilities: Vec<String>| {
@@ -484,6 +485,7 @@ mod tests {
             )),
             host: Default::default(),
             slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            inventory: Default::default(),
             discovered: Default::default(),
         };
         let mut a = Access::default();
@@ -575,6 +577,7 @@ mod tests {
             )),
             host: Default::default(),
             slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            inventory: Default::default(),
             discovered: Default::default(),
         };
         let route = Route::CODEX_SUBSCRIPTION;
@@ -688,6 +691,7 @@ mod tests {
             )),
             host: Default::default(),
             slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            inventory: Default::default(),
             discovered: Default::default(),
         };
         let route = Route::CODEX_SUBSCRIPTION;
@@ -766,6 +770,7 @@ mod tests {
             )),
             host: Default::default(),
             slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            inventory: Default::default(),
             discovered: Default::default(),
         };
         let route = Route::CODEX_SUBSCRIPTION;
@@ -827,6 +832,7 @@ mod tests {
             )),
             host: Default::default(),
             slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            inventory: Default::default(),
             discovered: Default::default(),
         };
         let route = Route::CODEX_SUBSCRIPTION;
@@ -914,6 +920,7 @@ mod tests {
             )),
             host: Default::default(),
             slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            inventory: Default::default(),
             discovered: Default::default(),
         };
         (dir, app)

@@ -91,6 +91,7 @@ const HOST_USAGE: &str = "Usage: ox host COMMAND
   pair --worker-host        invite another OX host to launch workers here
   update [setting]          install when idle or set automatic, download, manual, stable or dev
   name [NAME]               show or change this host’s display name
+  project [list | add DIR | remove DIR]  manage registered checkouts
   labels [set LABEL…]       show or replace placement labels
   policy [set POLICY]       show or change the host mode policy
   devices                   list paired devices and their IDs
@@ -112,6 +113,7 @@ pub(crate) fn host(args: &[OsString]) -> Result<u8, RelayError> {
         "policy",
         "name",
         "labels",
+        "project",
         "update",
         "revoke",
         "terminal",

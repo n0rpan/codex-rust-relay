@@ -1,5 +1,7 @@
 """Exercise the native desktop client over TLS against a disposable headless host."""
 import argparse
+import json
+import socket
 from contextlib import ExitStack
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -28,6 +30,27 @@ def certificate(root, hostname="studio.fixture.ts.net"):
                                      "extendedKeyUsage=serverAuth\n")
     openssl("x509", "-req", "-in", "server.csr", "-CA", "ca.pem", "-CAkey", "ca.key",
             "-CAcreateserial", "-days", "1", "-extfile", "extensions", "-out", "server.pem")
+
+
+def parent_inventory(env, project, host_id):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(12)
+        conn.connect(env["OX_HOST_SOCKET"])
+        with conn.makefile("rwb") as frames:
+            def request(frame):
+                frames.write(json.dumps(frame).encode() + b"\n")
+                frames.flush()
+                return json.loads(frames.readline())
+
+            hello = request({"type": "hello", "version": 1})
+            assert "worker_inventory" in hello["capabilities"]
+            reply = request({"type": "worker_call", "id": "inventory",
+                             "caller": {"project": str(project), "runtime": "codex",
+                                        "launch": "fixture-list", "session": None},
+                             "call": {"op": "list_hosts"}})
+            row, = reply["result"]["hosts"]
+            assert row["host"]["id"] == host_id
+            assert row["parent_host"] and row["has_project"] and row["status"] == "online"
 
 
 def run(host, cli, harness, stock=None):
@@ -75,6 +98,7 @@ def run(host, cli, harness, stock=None):
         stack.enter_context(session_host(package / "ox-host", root, env))
         host_state = Path(env["OX_HOST_STATE_DIR"])
         wait(lambda: (host_state / "remote-admin.sock").exists())
+        parent_inventory(env, root, (host_state / "host-id").read_text().strip())
         assert host_cli("name", "Studio") == host_cli("name") == "Studio"
         assert host_cli("labels", "set", "build") == host_cli("labels") == "build"
         public = ThreadedTCP(("127.0.0.1", 0), Forward)

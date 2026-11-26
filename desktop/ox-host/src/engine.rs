@@ -37,6 +37,7 @@ pub(crate) enum Message {
     Runtime(Scope, u64),
     Schema(Scope, u64, Box<ox_desk_core::slash::Capabilities>),
     Discovered(u64, Box<Server>),
+    HostsListed(PathBuf, Result<Value, String>),
     Gateway {
         caller: Caller,
         request: Box<Gateway>,
@@ -333,6 +334,7 @@ pub(crate) struct Engine {
     mode_requests: BTreeMap<u64, mode_requests::ModeRequest>,
     preparing: Vec<Preparing>,
     reading: Vec<Reading>,
+    host_queries: HashMap<PathBuf, Vec<Replier>>,
     in_flows: bool,
     draining: Option<Instant>,
     state_dir: PathBuf,
@@ -411,6 +413,7 @@ impl Engine {
             mode_requests: Default::default(),
             preparing: Default::default(),
             reading: Default::default(),
+            host_queries: Default::default(),
             in_flows: false,
             draining: None,
             state_dir: dir.to_owned(),
@@ -555,6 +558,11 @@ impl Engine {
                         self.process(&scope, vec![], true)?;
                     }
                 }
+                Some(Message::HostsListed(project, result)) => {
+                    for reply in self.host_queries.remove(&project).unwrap_or_default() {
+                        self.answer(reply, result.clone())?;
+                    }
+                }
                 Some(Message::Gateway {
                     caller,
                     request,
@@ -564,6 +572,7 @@ impl Engine {
                         self.answer(reply, Err(crate::handover::REFUSAL.into()))?
                     }
                     Gateway::Launch(start) => self.launch(caller, start, reply)?,
+                    Gateway::Call(ParentCall::ListHosts) => self.list_hosts(&caller, reply)?,
                     Gateway::Call(call @ ParentCall::ReadThread { .. }) => {
                         self.read_thread(&caller, call, reply)?
                     }
@@ -697,10 +706,45 @@ impl Engine {
                     .as_ref()
                     .map(|s| s.routes.clone())
                     .unwrap_or_default();
+                let mut capabilities: Vec<String> = [
+                    "snapshot",
+                    "resume",
+                    "actions",
+                    "approvals",
+                    "workers",
+                    "live_catalog",
+                    "host_status",
+                    "host_mode_policy",
+                    "end",
+                    "processes",
+                    wire::IDLE_UPDATE,
+                    ox_desk_core::surface::CAPABILITY,
+                ]
+                .map(str::to_owned)
+                .into();
+                capabilities.push("worker_inventory".into());
+                if prepared.is_some() {
+                    capabilities.push("worker_routes_known".into());
+                }
+                capabilities.extend(
+                    self.config
+                        .installed_runtimes()
+                        .iter()
+                        .map(|runtime| format!("worker_runtime_{}", runtime.executable())),
+                );
+                if prepared.as_ref().is_some_and(|s| s.has_api_provider()) {
+                    capabilities.push("worker_api_provider".into());
+                }
                 let client = self.clients.get_mut(&id).unwrap();
                 client.hello = true;
                 client.prepared = prepared;
                 let mut projects = self.config.projects();
+                projects.extend(
+                    crate::projects::registered(&self.state_dir)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|p| p.is_dir()),
+                );
                 projects.extend(
                     self.running
                         .keys()
@@ -714,22 +758,7 @@ impl Engine {
                     id,
                     Server::Hello {
                         version,
-                        capabilities: [
-                            "snapshot",
-                            "resume",
-                            "actions",
-                            "approvals",
-                            "workers",
-                            "live_catalog",
-                            "host_status",
-                            "host_mode_policy",
-                            "end",
-                            "processes",
-                            wire::IDLE_UPDATE,
-                            ox_desk_core::surface::CAPABILITY,
-                        ]
-                        .map(str::to_owned)
-                        .into(),
+                        capabilities,
                         routes,
                         projects,
                         host,
@@ -852,14 +881,15 @@ impl Engine {
                 if matches!(call, ParentCall::ReadThread { .. }) {
                     return self.read_thread(&Caller::External(caller), call, reply);
                 }
-                let result = caller
-                    .project
-                    .canonicalize()
-                    .map_err(|e| e.to_string())
-                    .and_then(|project| {
-                        caller.project = project;
-                        self.parent_call(&Caller::External(caller), call)
-                    });
+                match caller.project.canonicalize() {
+                    Ok(project) => caller.project = project,
+                    Err(e) => return self.answer(reply, Err(e.to_string())),
+                }
+                let caller = Caller::External(caller);
+                if matches!(call, ParentCall::ListHosts) {
+                    return self.list_hosts(&caller, reply);
+                }
+                let result = self.parent_call(&caller, call);
                 self.answer(reply, result)
             }
             Client::Act {
@@ -2353,6 +2383,47 @@ impl Engine {
                 .count(),
         }
     }
+    fn list_hosts(&mut self, caller: &Caller, reply: Replier) -> io::Result<()> {
+        use crate::workers::Resolved;
+        let project = match self.resolve(caller) {
+            Ok(Resolved::Hosted { scope, .. }) => scope.project,
+            Ok(Resolved::Terminal { project, .. }) => project,
+            Err(error) => return self.answer(reply, Err(error)),
+        };
+        if let Some(waiting) = self.host_queries.get_mut(&project) {
+            waiting.push(reply);
+            return Ok(());
+        }
+        self.host_queries.insert(project.clone(), vec![reply]);
+        let host = self.host_info();
+        let config = self.config.clone();
+        let registry = self.state_dir.join("worker-links.json");
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let runtimes = config.installed_runtimes();
+            let prepared = config.prepare();
+            let routes: Vec<_> = prepared
+                .as_ref()
+                .into_iter()
+                .flat_map(|p| {
+                    p.routes.iter().filter(|r| {
+                        runtimes.contains(&r.runtime) && (!r.is_api() || p.has_api_provider())
+                    })
+                })
+                .collect();
+            let local = json!({"host":host, "parent_host":true, "status":"online", "runtimes":runtimes,
+                "routes":routes, "routes_known":prepared.is_ok(), "has_project":true});
+            let result = ox_host_web::inventory::list(
+                &registry,
+                &project,
+                host.id.as_deref().unwrap_or_default(),
+                local,
+            )
+            .map_err(|e| e.to_string());
+            let _ = tx.send(Message::HostsListed(project, result));
+        });
+        Ok(())
+    }
     /// The parent agent's four tools. Every answer comes from host session state.
     fn parent_call(&mut self, caller: &Caller, call: ParentCall) -> Result<Value, String> {
         if self.update_reserved() && matches!(call, ParentCall::Steer { .. }) {
@@ -2387,25 +2458,7 @@ impl Engine {
                 }
                 return Ok(json!({ "bound": bound }));
             }
-            ParentCall::ListHosts => {
-                use ox_desk_core::runtime::Runtime;
-                use std::os::unix::fs::PermissionsExt;
-                let runtimes: Vec<_> = [Runtime::Codex, Runtime::Claude]
-                    .into_iter()
-                    .filter(|r| {
-                        std::env::split_paths(&self.config.path).any(|p| {
-                            p.join(r.executable())
-                                .metadata()
-                                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                        })
-                    })
-                    .collect();
-                let mut routes = self.config.prepare().map_err(|e| e.to_string())?.routes;
-                routes.retain(|r| runtimes.contains(&r.runtime));
-                return Ok(json!({ "hosts": [{
-                    "host": self.host_info(), "parent_host": true, "runtimes": runtimes, "routes": routes,
-                }] }));
-            }
+            ParentCall::ListHosts => unreachable!("host inventory is answered asynchronously"),
             ParentCall::List => {
                 let mut jobs: Vec<u64> = self
                     .workers

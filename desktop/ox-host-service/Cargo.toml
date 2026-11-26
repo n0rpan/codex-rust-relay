@@ -9,3 +9,4 @@ libc = "0.2"
 sha2 = "0.10"
 rustix = { version = "1", features = ["fs"] }
 tempfile = "3"
+url = "2"

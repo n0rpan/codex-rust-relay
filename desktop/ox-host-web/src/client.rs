@@ -115,10 +115,12 @@ async fn checked(response: Result<Response, reqwest::Error>, denied: &str) -> io
             io::ErrorKind::InvalidInput,
             "The OX host did not accept this request.",
         )),
-        reqwest::StatusCode::UNPROCESSABLE_ENTITY => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "This host does not recognize the request. Update OX on the host and try again.",
-        )),
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "This host does not recognize the request. Update OX on the host and try again.",
+            ))
+        }
         reqwest::StatusCode::TOO_MANY_REQUESTS => Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "The host is busy. Try again shortly.",

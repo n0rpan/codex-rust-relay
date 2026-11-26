@@ -1,0 +1,251 @@
+//! Signed probes return host resources, launch permissions and registered project membership.
+use crate::{admin::WorkerGrant, bridge, client, paired_hosts, server::App};
+use futures_util::future::join_all;
+use ox_desk_core::{
+    host_protocol::{Client, HostInfo, Server, VERSION},
+    runtime::{Route, Runtime},
+};
+use ox_host_service::checkout::repository_id;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    path::Path,
+    sync::{LazyLock, Mutex},
+    time::{Duration, Instant},
+};
+use tokio::{io::BufReader, time::timeout};
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Inventory {
+    pub host: HostInfo,
+    #[serde(deserialize_with = "known_values")]
+    runtimes: Vec<Runtime>,
+    #[serde(deserialize_with = "known_values")]
+    routes: Vec<Route>,
+    routes_known: bool,
+    has_project: Option<bool>,
+}
+// A newer host may also run an agent or billing route this client cannot launch.
+fn known_values<'de, D, T>(input: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    Ok(Vec::<Value>::deserialize(input)?
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect())
+}
+#[derive(Serialize, Deserialize)]
+struct Peer {
+    #[serde(flatten)]
+    inventory: Inventory,
+    grant: WorkerGrant,
+}
+#[derive(Default)]
+pub(crate) struct Cache(tokio::sync::Mutex<Option<(Instant, Inventory, HashSet<String>)>>);
+
+pub(crate) async fn local(app: &App, project: Option<String>) -> io::Result<Inventory> {
+    let mut cache = app.inventory.0.lock().await;
+    if cache
+        .as_ref()
+        .is_none_or(|(when, ..)| when.elapsed() >= Duration::from_secs(10))
+    {
+        let (inventory, projects) = sample(app).await?;
+        *cache = Some((Instant::now(), inventory, projects));
+    }
+    let (_, inventory, projects) = cache.as_ref().expect("initialized above");
+    let mut inventory = inventory.clone();
+    inventory.has_project = project.map(|id| projects.contains(&id));
+    Ok(inventory)
+}
+
+async fn sample(app: &App) -> io::Result<(Inventory, HashSet<String>)> {
+    let frame = timeout(Duration::from_secs(6), async {
+        let mut conn = bridge::connect(&app.host).await?;
+        bridge::write(&mut conn, &Client::Hello { version: VERSION }).await?;
+        bridge::line(&mut BufReader::new(conn), &mut Vec::new()).await
+    })
+    .await??;
+    let Server::Hello {
+        host: Some(host),
+        capabilities,
+        mut projects,
+        mut routes,
+        ..
+    } = serde_json::from_slice(&frame)?
+    else {
+        return Err(io::Error::other(
+            "Session host did not return its identity.",
+        ));
+    };
+    let supports = |cap: &str| capabilities.iter().any(|s| s == cap);
+    if !supports("worker_inventory") {
+        return Err(io::ErrorKind::Unsupported.into());
+    }
+    let runtimes: Vec<_> = [Runtime::Codex, Runtime::Claude]
+        .into_iter()
+        .filter(|r| supports(&format!("worker_runtime_{}", r.executable())))
+        .collect();
+    routes.retain(|r| {
+        runtimes.contains(&r.runtime) && (!r.is_api() || supports("worker_api_provider"))
+    });
+    projects.extend(
+        app.discovered
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.project.clone()),
+    );
+    let projects = tokio::task::spawn_blocking(move || {
+        projects.sort();
+        projects.dedup();
+        projects.iter().filter_map(|p| repository_id(p)).collect()
+    })
+    .await?;
+    Ok((
+        Inventory {
+            host,
+            runtimes,
+            routes,
+            has_project: None,
+            routes_known: supports("worker_routes_known"),
+        },
+        projects,
+    ))
+}
+pub(crate) fn report(inventory: Inventory, grant: WorkerGrant) -> io::Result<Value> {
+    Ok(serde_json::to_value(Peer { inventory, grant })?)
+}
+async fn probe(host: paired_hosts::SavedHost, source: &str, project: Option<&str>) -> Value {
+    let saved = json!({"id":host.id,"name":host.name});
+    // Avoid a new network wait on every tool call while a laptop is asleep.
+    // A repaired link gets a fresh key ID and is probed immediately.
+    static UNAVAILABLE: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Default::default);
+    let key = host.key_id.clone();
+    {
+        let mut offline = UNAVAILABLE.lock().unwrap();
+        offline.retain(|_, since| since.elapsed() < Duration::from_secs(15));
+        if offline.contains_key(&key) {
+            return json!({"host":saved,"parent_host":false,"status":"unavailable"});
+        }
+    }
+    let id = host.id.clone();
+    let fetch = async {
+        let host = tokio::task::spawn_blocking(move || -> io::Result<_> {
+            host.client()?;
+            Ok(host)
+        })
+        .await??;
+        let reply = host
+            .client()?
+            .worker_request(json!({"action":"inventory","project":project}))
+            .await?;
+        let peer: Peer = serde_json::from_value(reply).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Incompatible inventory from the worker host.",
+            )
+        })?;
+        if peer.inventory.host.id.as_ref() != Some(&id) || peer.grant.source != source {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Worker link identity changed.",
+            ));
+        }
+        let mut row = serde_json::to_value(peer)?;
+        row["parent_host"] = false.into();
+        row["status"] = "online".into();
+        Ok(row)
+    };
+    let status = match timeout(Duration::from_secs(5), fetch).await {
+        Ok(Ok(row)) => return row,
+        Ok(Err(e)) => match e.kind() {
+            io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported => "needs_update",
+            io::ErrorKind::PermissionDenied => "access_denied",
+            io::ErrorKind::WouldBlock => "busy",
+            _ => "unavailable",
+        },
+        Err(_) => "unavailable",
+    };
+    if status == "unavailable" {
+        UNAVAILABLE.lock().unwrap().insert(key, Instant::now());
+    }
+    json!({"host":saved,"parent_host":false,"status":status})
+}
+
+/// List the parent's host and its explicitly paired worker destinations in saved order.
+pub fn list(registry: &Path, project: &Path, source: &str, local: Value) -> io::Result<Value> {
+    let mut hosts = vec![local];
+    let links = match paired_hosts::worker_links(registry) {
+        Ok(links) => links,
+        Err(_) => {
+            return Ok(
+                json!({"hosts":hosts, "warning":"The saved worker host list could not be read."}),
+            );
+        }
+    };
+    if !links.is_empty() {
+        let rt = client::runtime();
+        if crate::server::background_keychain().is_err() || rt.is_err() {
+            hosts.extend(links.iter().map(|h|json!({"host":{"id":h.id,"name":h.name},"parent_host":false,"status":"unavailable"})));
+            return Ok(
+                json!({"hosts":hosts, "warning":"Could not open the background worker connections."}),
+            );
+        }
+        let project = repository_id(project);
+        let remote = rt?.block_on(join_all(
+            links
+                .into_iter()
+                .map(|h| probe(h, source, project.as_deref())),
+        ));
+        hosts.extend(remote);
+    }
+    Ok(json!({"hosts":hosts}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn broken_registry_preserves_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("worker-links.json");
+        std::fs::write(&path, b"bad json").unwrap();
+        let local = json!({"parent_host":true});
+        let result = list(&path, temp.path(), "local", local.clone()).unwrap();
+        assert_eq!(result["hosts"], json!([local]));
+        assert!(result["warning"].is_string());
+    }
+
+    #[test]
+    #[ignore = "launched by the two-host TLS fixture"]
+    fn paired_inventory() {
+        let state = std::path::PathBuf::from(std::env::var_os("OX_TEST_REMOTE_DIR").unwrap());
+        let source = std::fs::read_to_string(state.join("host-id")).unwrap();
+        let list_for = |project: &str| {
+            let result = list(
+                &state.join("worker-links.json"),
+                &state.join(project),
+                source.trim(),
+                json!({"parent_host":true}),
+            )
+            .unwrap();
+            let rows = result["hosts"].as_array().unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0]["parent_host"], true);
+            assert!(!result.to_string().contains("fixture-secret"));
+            rows[1].clone()
+        };
+        let row = list_for("inventory-source/ox");
+        assert_eq!(row["status"], "online", "{row}");
+        assert_eq!(row["has_project"], true);
+        assert_eq!(row["grant"]["may_launch"], false);
+        assert_eq!(row["grant"]["ceiling"], "read");
+        assert!(row["host"]["resources"]["total_memory"].as_u64().unwrap() > 0);
+        assert_eq!(list_for("another/ox")["has_project"], false);
+        assert!(list_for("fixture")["has_project"].is_null());
+    }
+}

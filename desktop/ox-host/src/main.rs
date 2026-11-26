@@ -7,6 +7,7 @@ mod identity;
 mod lease;
 mod pairing;
 mod policy;
+mod projects;
 mod receipts;
 mod replay;
 mod resources;
@@ -214,6 +215,7 @@ fn entry() -> io::Result<()> {
         (Some("restart-if-updated"), []) => control::restart_if_updated(&paths),
         (Some("restart"), rest) => control::restart(&paths, control::timeout(rest)?),
         (Some(kind @ ("name" | "labels")), rest) => pairing::profile(&paths, kind, rest),
+        (Some("project"), rest) => projects::cli(&paths.state_dir, rest),
         (Some("policy"), rest) => pairing::mode_policy(&paths, rest),
         (Some("update"), rest) => updates::cli(&paths, rest),
         (Some("pair"), []) => pairing::pair(

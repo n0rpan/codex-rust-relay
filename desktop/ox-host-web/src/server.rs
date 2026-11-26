@@ -35,6 +35,7 @@ use tokio::{
 pub(crate) struct App {
     pub state: Arc<Mutex<State>>,
     pub host: Arc<PathBuf>,
+    pub inventory: Arc<crate::inventory::Cache>,
     pub slots: Arc<Semaphore>,
     pub discovered: Arc<Mutex<std::collections::HashSet<ox_desk_core::host_protocol::Scope>>>,
 }
@@ -50,7 +51,7 @@ mod remote_settings;
 mod weather;
 #[path = "worker_links.rs"]
 mod worker_links;
-fn background_keychain() -> Result<(), &'static str> {
+pub(crate) fn background_keychain() -> Result<(), &'static str> {
     // This runs inside ox-host, which has no window to answer Keychain prompts.
     #[cfg(target_os = "macos")]
     {
@@ -80,6 +81,7 @@ async fn serve(dir: PathBuf, socket: PathBuf) -> io::Result<()> {
         state: Arc::new(Mutex::new(store)),
         host: Arc::new(socket),
         slots: Arc::new(Semaphore::new(64)),
+        inventory: Default::default(),
         discovered: Default::default(),
     };
     let local = crate::admin::socket_path(&dir);
@@ -725,33 +727,71 @@ async fn worker_link(
     Json(body): Json<WorkerEnvelope>,
 ) -> Result<Json<serde_json::Value>, ErrCode> {
     let id = paired_identity(&app, &headers)?;
-    let mut state = app.state.lock().unwrap();
-    if !state.prove_worker(&id, &body.proof.nonce, &body.proof.signature, &body.request) {
-        return Err(DENY);
-    }
     #[derive(Deserialize)]
     #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
     enum Call {
         Info,
+        Inventory { project: Option<String> },
         RevokeSelf,
     }
-    match serde_json::from_str(&body.request).map_err(|_| StatusCode::BAD_REQUEST)? {
-        Call::Info => {
-            let profile = state
-                .host_profile(None)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            Ok(Json(
-                json!({"id":state.host_id().map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?, "name":profile.name, "labels":profile.labels,
+    let call = serde_json::from_str(&body.request).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let project = {
+        let mut state = app.state.lock().unwrap();
+        if !state.prove_worker(&id, &body.proof.nonce, &body.proof.signature, &body.request) {
+            return Err(DENY);
+        }
+        match call {
+            Call::Inventory { project } => project,
+            Call::Info => {
+                let profile = state
+                    .host_profile(None)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                return Ok(Json(
+                    json!({"id":state.host_id().map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?, "name":profile.name, "labels":profile.labels,
                 "policy":state.mode_policy(None).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?, "grant":state.worker_grant(&id)}),
-            ))
+                ));
+            }
+            Call::RevokeSelf => {
+                state
+                    .revoke(&id)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                return Ok(Json(json!({"revoked":true})));
+            }
         }
-        Call::RevokeSelf => {
-            state
-                .revoke(&id)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            Ok(Json(json!({"revoked":true})))
-        }
+    };
+    if project.as_ref().is_some_and(|id| {
+        id.len() != 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }) {
+        return Err(StatusCode::BAD_REQUEST);
     }
+    let _slot = app
+        .slots
+        .try_acquire()
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+    let inventory = crate::inventory::local(&app, project)
+        .await
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::Unsupported => StatusCode::UNPROCESSABLE_ENTITY,
+            _ => StatusCode::SERVICE_UNAVAILABLE,
+        })?;
+    let state = app.state.lock().unwrap();
+    let grant = state.worker_grant(&id).ok_or(DENY)?;
+    if inventory.host.id.as_deref()
+        != Some(
+            &state
+                .host_id()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        )
+    {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(Json(
+        crate::inventory::report(inventory, grant.clone())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    ))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -911,6 +951,7 @@ mod tests {
                 state: Arc::new(Mutex::new(state)),
                 host: Arc::new(socket),
                 slots: Arc::new(Semaphore::new(4)),
+                inventory: Default::default(),
                 discovered: Default::default(),
             };
             let tcp = bind(0).await.unwrap();
