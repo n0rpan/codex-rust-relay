@@ -627,7 +627,9 @@ if only Claude has a saved account. With no API provider, `ox doctor` checks for
 saved accounts without launching either client. Each client validates its own
 credentials when you open a subscription session. If Codex uses its keyring,
 ox reports the configured store and leaves the account check to Codex.
-`ox help subscriptions` lists the sign-in commands.
+`ox help subscriptions` lists the sign-in commands. `ox help settings` maps
+providers, accounts and remote access to their labels in OX Desktop and on the
+phone, and names the files and checks behind them.
 
 | Launch | Where the client saves its settings and history |
 | --- | --- |
@@ -706,6 +708,20 @@ Approve the tool call when your client prompts.
 | Codex goal on an API model | A stock Codex app-server thread with Goal mode |
 | Claude Code session or workflow on an API model | Stock Claude Code in the project with the selected ox alias |
 | Claude Code session or workflow on your subscription | Stock Claude Code on the host's saved Claude account. Ask for a subscription worker and omit the API alias. |
+
+The main agent treats these as choices, not commands. A review it suggests is
+an offer. A question about how to get one asks for an explanation. A second
+opinion starts one read-only review on your established reviewer or
+subscription preference and says which it used; if the billing route is
+ambiguous and changes who pays, it asks one short billing question first.
+
+| You say | What the agent does |
+| --- | --- |
+| “What do you think?” or “Review your plan.” | Answers with its own assessment; starts nothing. |
+| “I'm worried we missed something.” | Addresses the concern and may offer one concrete review, naming the model and who pays. |
+| “Get a second opinion.” | Starts one read-only independent review on your established reviewer or subscription route. |
+| “Have Fable 5.2 check this on my subscription.” | Starts a review on your Claude subscription and reports the model the runtime confirms. If the build cannot pin that exact model, it says so before starting. |
+| “How would I get another model to review this?” | Explains the route; starts nothing. |
 
 `start_ox_worker` returns a job ID. Ask for status or the result with
 `ox_worker_status`, or ask to stop it with `cancel_ox_worker`. Jobs run between

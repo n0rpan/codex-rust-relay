@@ -237,6 +237,7 @@ fn first_run_and_help_work_with_only_native_codex_settings() {
     assert!(String::from_utf8_lossy(&setup.stdout).contains("--env-key"));
     for (topic, text) in [
         ("setup", "--env-key"),
+        ("settings", "Settings → Remote access"),
         ("desktop", "Model Providers & Gateways"),
         ("share", "tailscale serve --bg"),
         ("t3", "Claude Agent SDK"),
@@ -250,7 +251,6 @@ fn first_run_and_help_work_with_only_native_codex_settings() {
         assert!(output.status.success(), "ox help {topic}");
         assert!(String::from_utf8_lossy(&output.stdout).contains(text));
     }
-
     for command in ["codex", "claude"] {
         let missing_provider = run(&[command]);
         assert!(!missing_provider.status.success());
@@ -570,6 +570,14 @@ fn errors_name_the_problem_and_the_command_that_fixes_it() {
     assert!(!topic.status.success());
     assert!(
         stderr(&topic).contains("\n  fix: ox help desktop"),
+        "{}",
+        stderr(&topic)
+    );
+
+    let topic = run(&["help", "settngs"]);
+    assert!(!topic.status.success());
+    assert!(
+        stderr(&topic).contains("\n  fix: ox help settings"),
         "{}",
         stderr(&topic)
     );

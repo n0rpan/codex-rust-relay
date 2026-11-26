@@ -33,7 +33,7 @@ The same installer adds **OX Desktop** to your application launcher. It runs on 
 
 ### First session
 
-1. **Connect.** The first-run card has a Codex, Claude Code and API key switch. It checks again by itself while you install or sign in. Later, choose the runtime and billing route in the header. To add an API model, open **Settings → Accounts → Configure provider**, or run `ox setup`. A saved provider becomes the active route.
+1. **Connect.** The first-run card has a Codex, Claude Code and API key switch. It checks again by itself while you install or sign in. Later, choose the runtime and billing route in the header. To add an API model, open **Settings → Accounts → Configure provider**, or run `ox setup`. A saved provider becomes the active route. Run `ox help settings` for the desktop and phone screens, file paths and checks.
 2. **Send a prompt.** Choose **New session**, type, press Enter. Existing Codex and Claude Code sessions from your terminal appear in the sidebar.
 3. **Keep it running.** Run `ox host install` so the session host starts at login. Close the window during a turn; reopen it and the turn is still there.
 4. **Check the setup.** `ox host doctor` checks the host, Tailscale Serve, paired devices and the stock client versions, and names the fix for anything that blocks.
