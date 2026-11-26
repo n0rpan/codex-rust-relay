@@ -146,6 +146,16 @@ impl Store {
     pub fn edit(&mut self, id: Option<&str>, text: String) {
         self.drafts.entry(id.map(str::to_owned)).or_default().text = text;
     }
+    /// Includes the interval between accepting a send and receiving turn/started.
+    pub fn has_pending_turn(&self) -> bool {
+        !self.resume_sends.is_empty()
+            || self.drafts.values().any(|d| d.sent.is_some())
+            || self
+                .pending
+                .values()
+                .any(|(_, p)| matches!(p, Pending::Compose(_)))
+    }
+
     pub fn sending(&self, id: Option<&str>) -> bool {
         if let Some(remote) = self.remote() {
             return remote.sending.contains(id.unwrap_or("")) || self.pending_input(id);

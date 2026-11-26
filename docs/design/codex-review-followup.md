@@ -23,4 +23,4 @@ Local evidence on this machine
 - `/tmp/ox11-followup-life.v5ShQw/{probe,draft-probe,contract-probe}.log`
 - `/tmp/ox11-client-recheck.Z3S7sL/{client-rust,client-stop}.log`
 - `/tmp/ox11-followup.GJEZ83/{terminal-probe,desktop-run,failed-ci}.log`
-- [Stock clients CI](https://github.com/n0rpan/ox/actions/runs/45692559631/job/139481535245) and [packaged Linux CI](https://github.com/n0rpan/ox/actions/runs/45692562042/job/139481545529)
+- [Stock clients CI](https://github.com/oxstack/ox/actions/runs/45692559631/job/139481535245) and [packaged Linux CI](https://github.com/oxstack/ox/actions/runs/45692562042/job/139481545529)

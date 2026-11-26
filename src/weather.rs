@@ -19,7 +19,7 @@ const ENDPOINT: &str = "https://api.met.no/weatherapi/locationforecast/2.0/compa
 const MIN_INTERVAL: i64 = 30 * 60;
 /// After a 429 or a server error, stay away for an hour.
 const BACKOFF: i64 = 60 * 60;
-const USER_AGENT_SITE: &str = "github.com/n0rpan/ox";
+const USER_AGENT_SITE: &str = "github.com/oxstack/ox";
 
 pub(crate) const USAGE: &str = "\
 Usage: ox weather [--json]

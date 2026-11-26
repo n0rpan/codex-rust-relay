@@ -116,7 +116,7 @@ or `ox claude --resume <session-id>`.
 [Profiles and session recovery](configuration.md#sessions-and-sign-in)
 ## Release channels
 
-The table covers the standalone CLI. For desktop updates, rerun the installer with `--dev --desktop` to get a matching set of binaries.
+The table covers the standalone CLI. On a managed desktop installation, `ox update` updates the entire package. Older desktop installations need one run of the installer with `--desktop` first.
 
 | Channel | What it is | Version looks like | Install | Stay current |
 | --- | --- | --- | --- | --- |
@@ -134,7 +134,7 @@ The table covers the standalone CLI. For desktop updates, rerun the installer wi
   switch channels.
 - **Manual download.** Every release has `ox-<target>.tar.gz` and a matching
   `.sha256` for four platforms on the
-  [Releases page](https://github.com/n0rpan/ox/releases).
+  [Releases page](https://github.com/oxstack/ox/releases).
   [Manual steps, platform names and source builds](configuration.md#install-options)
 ## Common tasks
 

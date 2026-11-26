@@ -1,8 +1,8 @@
 #!/bin/sh
 # Install ox, the local model gateway for stock Codex and Claude Code.
 #
-#   curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh
-#   curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh -s -- --dev
+#   curl -fsSL https://raw.githubusercontent.com/oxstack/ox/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/oxstack/ox/main/install.sh | sh -s -- --dev
 #
 # Options (flags win over environment variables):
 #   --stable                 Install the latest stable release (default)
@@ -18,7 +18,7 @@
 
 set -eu
 
-REPOSITORY="n0rpan/ox"
+REPOSITORY="oxstack/ox"
 MIN_GLIBC_MINOR=39
 
 bold=""
@@ -168,6 +168,14 @@ pick_tools() {
 # fetch URL FILE: returns 0 on success, 44 when the server says the file does
 # not exist, and 1 for every other failure.
 fetch() {
+    case "$1" in
+        file:///*)
+            local_file=${1#file://}
+            [ -f "$local_file" ] || return 1
+            cp "$local_file" "$2" || return 1
+            return 0
+            ;;
+    esac
     status=0
     if [ "$fetcher" = "curl" ]; then
         curl --fail --silent --show-error --location --retry 2 \
@@ -260,7 +268,7 @@ prepare_desktop() {
         *) binary_subdir=ox-desktop ;;
     esac
     for existing in "$packages/$actual".*; do
-        if [ -f "$existing/.ready" ] && [ -x "$existing/$binary_subdir/ox-desktop" ]; then
+        if [ -f "$existing/.ready" ] && [ -x "$existing/$binary_subdir/ox-host" ] && [ -x "$existing/$binary_subdir/ox-desktop" ]; then
             desktop_binary_dir="$existing/$binary_subdir"
             return
         fi
@@ -276,9 +284,8 @@ prepare_desktop() {
     helper_version="$("$desktop_binary_dir/ox" --version)" || die "the packaged ox could not start."
     desktop_version="$("$desktop_binary_dir/ox-desktop" --version)" || die_missing_libraries "$desktop_binary_dir/ox-desktop"
     [ "${desktop_version#ox-desktop }" = "${helper_version#ox }" ] || die "the packaged desktop and CLI versions differ."
-    if [ -x "$desktop_binary_dir/ox-host" ]; then
-        [ "$("$desktop_binary_dir/ox-host" --version)" = "ox-host ${helper_version#ox }" ] || die "the packaged host and CLI versions differ."
-    fi
+    [ "$("$desktop_binary_dir/ox-host" --version)" = "ox-host ${helper_version#ox }" ] || die "the packaged host and CLI versions differ."
+    touch "$desktop_stage/.in-use"
     touch "$desktop_stage/.ready"
     desktop_stage=""
 }
@@ -304,6 +311,21 @@ restart_host() {
 }
 
 install_desktop_entry() {
+    # Every public entry resolves through this single package pointer. Future
+    # updates can switch the app, host, CLI and resources with one rename.
+    generation=${desktop_binary_dir%/"$binary_subdir"}
+    if "$desktop_binary_dir/ox" update --help | grep -q -- '--stage '; then
+        "$desktop_binary_dir/ox" update --select-package
+        desktop_binary_dir="$packages/current/$binary_subdir"
+        replace_link "$desktop_binary_dir/ox" "$install_dir/ox"
+    else
+        # A legacy CLI updates itself in place. Keep its public copy outside
+        # the immutable package (especially the signed macOS app).
+        replace_link "$generation" "$packages/current"
+        desktop_binary_dir="$packages/current/$binary_subdir"
+        cp "$desktop_binary_dir/ox" "$install_dir/.ox-install.$$"
+        mv -f "$install_dir/.ox-install.$$" "$install_dir/ox"
+    fi
     replace_link "$desktop_binary_dir/ox-desktop" "$install_dir/ox-desktop"
     if [ -x "$desktop_binary_dir/ox-host" ]; then replace_link "$desktop_binary_dir/ox-host" "$install_dir/ox-host"; fi
     if [ "$os" = Darwin ]; then
@@ -377,6 +399,7 @@ main() {
         *) die "OX_INSTALL_DIR must be an absolute path, not '${install_dir}'." ;;
     esac
 
+    if [ -L "$install_dir/.ox-desktop/current" ]; then desktop=1; fi
     detect_target
     check_glibc
     pick_tools
@@ -441,31 +464,31 @@ main() {
 
     if [ "$desktop" = 1 ]; then
         prepare_desktop
-        source_binary="$desktop_binary_dir/ox"
+        install_desktop_entry
     else
         mkdir "$work/unpacked"
         tar -xzf "$work/${asset}" -C "$work/unpacked" || die "could not unpack ${asset}."
         source_binary="$work/unpacked/ox"
         [ -f "$source_binary" ] || die "${asset} does not contain the ox binary."
         chmod 755 "$source_binary"
-    fi
-
-    step "Installing to ${install_dir}/ox"
-    mkdir -p "$install_dir" || die "could not create ${install_dir}."
-    if [ -d "${install_dir}/ox" ]; then
-        die "${install_dir}/ox is a directory. Remove it or set OX_INSTALL_DIR."
-    fi
-    # Stage inside the destination directory so the final rename is atomic and
-    # a running ox keeps its old file until it exits.
-    staged="${install_dir}/.ox-install.$$"
-    cp "$source_binary" "$staged" || die "could not write to ${install_dir}. Set OX_INSTALL_DIR to a directory you own."
-    chmod 755 "$staged"
-    if ! mv -f "$staged" "${install_dir}/ox"; then
-        rm -f "$staged"
-        die "could not replace ${install_dir}/ox."
-    fi
-    if [ "$(uname -s)" = "Darwin" ] && command -v xattr >/dev/null 2>&1; then
-        xattr -d com.apple.quarantine "${install_dir}/ox" 2>/dev/null || true
+        step "Installing to ${install_dir}/ox"
+        mkdir -p "$install_dir" || die "could not create ${install_dir}."
+        if [ -d "${install_dir}/ox" ]; then
+            die "${install_dir}/ox is a directory. Remove it or set OX_INSTALL_DIR."
+        fi
+        # Stage inside the destination directory so the final rename is atomic and
+        # a running ox keeps its old file until it exits.
+        staged="${install_dir}/.ox-install.$$"
+        cp "$source_binary" "$staged" || die "could not write to ${install_dir}. Set OX_INSTALL_DIR to a directory you own."
+        chmod 755 "$staged"
+        if ! mv -f "$staged" "${install_dir}/ox"; then
+            rm -f "$staged"
+            die "could not replace ${install_dir}/ox."
+        fi
+        mkdir -p "$install_dir/.ox-cli-update"
+        if [ "$(uname -s)" = "Darwin" ] && command -v xattr >/dev/null 2>&1; then
+            xattr -d com.apple.quarantine "${install_dir}/ox" 2>/dev/null || true
+        fi
     fi
 
     if ! installed="$("${install_dir}/ox" --version 2>&1)"; then
@@ -479,7 +502,6 @@ main() {
     info ""
     info "${green}Installed ${installed}${reset} ${dim}(${install_dir}/ox)${reset}"
     if [ "$desktop" = 1 ]; then
-        install_desktop_entry
         restart_host
     fi
     path_hint
@@ -490,7 +512,7 @@ main() {
     info ""
     if [ "$channel" = "dev" ] && [ -z "${OX_INSTALL_BASE_URL:-}" ]; then
         if [ "$desktop" = 1 ]; then
-            info "${dim}To update the app, host and CLI together, rerun the installer with --dev --desktop.${reset}"
+            info "${dim}OX Desktop downloads updates in the background. You can also run ox update.${reset}"
         else
             info "${dim}This is a development build. ox update keeps it on the dev channel.${reset}"
         fi

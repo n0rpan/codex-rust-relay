@@ -8,6 +8,7 @@ mod preferences;
 mod settings;
 mod sky;
 mod terminal;
+mod updates;
 #[path = "../../../src/version.rs"]
 mod version;
 mod views;
@@ -20,6 +21,8 @@ use std::path::PathBuf;
 use workspace_state::LastWorkspace;
 
 fn main() {
+    platform::init_companion();
+    let _package = ox_host_service::managed_install::hold_generation();
     ox_host_service::configure_allocator();
     app::install_panic_hook();
     let started = std::time::Instant::now();
@@ -56,6 +59,7 @@ fn main() {
             gpui_component::init(cx);
             appearance::init(cx);
             sky::start(cx);
+            updates::start(smoke, cx);
             workspace_state::finish_writes(cx);
             let layouts = views::host::layout::SavedLayouts::load();
             let bounds = Bounds::centered(None, layouts.for_project(&project).window_size(), cx);

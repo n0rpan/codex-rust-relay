@@ -37,6 +37,53 @@ extern "C" fn stop_signal(signal: libc::c_int) {
         );
     }
 }
+/// Stage releases for a headless install too. Activation belongs to the operator.
+fn stage_background_updates() {
+    use ox_host_service::managed_install::{active_binary, package_store};
+    use std::{
+        process::{Command, Stdio},
+        time::Duration,
+    };
+    if env::var_os("OX_NO_BACKGROUND_UPDATE").is_some() {
+        return;
+    }
+    let Some(store) = env::current_exe().ok().and_then(|p| package_store(&p)) else {
+        return;
+    };
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(60));
+        loop {
+            let _ = Command::new(active_binary(&store, "ox"))
+                .args(["update", "--stage-desktop", "--background"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            thread::sleep(Duration::from_secs(1800));
+        }
+    });
+}
+
+fn report_staged_update() {
+    use ox_host_service::managed_install::{active_binary, package_store};
+    let Some(store) = env::current_exe().ok().and_then(|p| package_store(&p)) else {
+        return;
+    };
+    if !store.join("pending.json").is_file() {
+        return;
+    }
+    let reply = std::process::Command::new(active_binary(&store, "ox"))
+        .args(["update", "--status", "--json"])
+        .output();
+    if let Ok(output) = reply
+        && output.status.success()
+        && let Ok(status) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        && let Some(version) = status["staged"].as_str()
+    {
+        println!("OX {version} is downloaded. Run ox update to install it.");
+    }
+}
+
 fn run(paths: Paths) -> io::Result<()> {
     ox_host_service::configure_allocator();
     let guard = SocketGuard::bind(&paths)?;
@@ -85,6 +132,7 @@ fn run(paths: Paths) -> io::Result<()> {
             }
         }
     });
+    stage_background_updates();
     lease.listen(tx.clone())?;
     let listener = guard.listener.try_clone()?;
     thread::spawn(move || {
@@ -152,18 +200,23 @@ fn entry() -> io::Result<()> {
         .by_ref()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
+    if matches!(op.to_str(), Some("status" | "doctor")) {
+        report_staged_update();
+    }
     match (op.to_str(), rest.as_slice()) {
         (Some("run"), []) => run(paths),
         (Some(action @ ("install" | "status")), []) => ox_host_service::manage(action, &paths),
         (Some("uninstall"), []) => ox_host_service::manage("uninstall", &paths),
         (Some("uninstall"), [purge]) if purge == "--purge" => control::purge(&paths),
         (Some("stop"), []) => control::stop(&paths),
+        (Some("restart-if-updated"), []) => control::restart_if_updated(&paths),
         (Some("restart"), rest) => control::restart(&paths, control::timeout(rest)?),
         (Some("doctor"), rest) => doctor::run(&paths, rest),
         _ => Err(io::Error::other(USAGE)),
     }
 }
 fn main() -> std::process::ExitCode {
+    let _package = ox_host_service::managed_install::hold_generation();
     match entry() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {

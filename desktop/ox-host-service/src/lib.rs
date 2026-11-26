@@ -1,7 +1,9 @@
 //! Per-user host discovery and lifecycle shared by the daemon and local desktop.
 pub mod errlog;
+#[path = "../../../src/managed_install.rs"]
+pub mod managed_install;
 mod manager;
-pub use manager::manage;
+pub use manager::{manage, refresh_update_service};
 
 /// Whether the login service (launchd agent or systemd user unit) is installed.
 pub fn service_installed() -> io::Result<bool> {
@@ -225,6 +227,18 @@ fn socket_meta(path: &Path) -> io::Result<Option<fs::Metadata>> {
         Err(e) => Err(e),
     }
 }
+/// Keep an absent host from binding while Desktop selects a package. If another
+/// process owns the lock it is already running, starting, or shutting down.
+pub fn reserve_stopped_host(paths: &Paths) -> io::Result<Option<File>> {
+    paths.prepare()?;
+    let lock = lock_file(&paths.state_dir.join("owner.lock"))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(Some(lock)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
 pub struct SocketGuard {
     pub listener: UnixListener,
     socket: PathBuf,
@@ -291,7 +305,11 @@ fn executable(path: &Path) -> bool {
         .is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0)
 }
 fn binary() -> io::Result<PathBuf> {
-    let sibling = env::current_exe()?.with_file_name("ox-host");
+    let executable_path = env::current_exe()?;
+    if let Some(store) = managed_install::package_store(&executable_path) {
+        return Ok(managed_install::active_binary(&store, "ox-host"));
+    }
+    let sibling = executable_path.with_file_name("ox-host");
     if executable(&sibling) {
         return Ok(sibling);
     }
@@ -381,6 +399,23 @@ mod tests {
             socket: root.join("runtime/host.sock"),
         }
     }
+    #[test]
+    fn idle_update_reserves_a_stopped_host_without_starting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            state_dir: dir.path().join("state"),
+            socket: dir.path().join("runtime/host.sock"),
+        };
+        let guard = reserve_stopped_host(&paths).unwrap().unwrap();
+        assert!(!is_running(&paths).unwrap());
+        assert!(SocketGuard::bind(&paths).is_err());
+        drop(guard);
+        let host = SocketGuard::bind(&paths).unwrap();
+        assert!(reserve_stopped_host(&paths).unwrap().is_none());
+        drop(host);
+        assert!(reserve_stopped_host(&paths).unwrap().is_some());
+    }
+
     #[test]
     fn only_one_host_can_own_a_state_directory_or_socket() {
         let tmp = tempfile::tempdir().unwrap();

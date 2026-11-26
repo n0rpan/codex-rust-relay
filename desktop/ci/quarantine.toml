@@ -10,6 +10,6 @@
 # [[test]]
 # name = "host_continuity_window"      # desktop/tests/<name>.py or a gate scenario set
 # runners = ["ubuntu-24.04-arm"]       # optional; default: every runner
-# issue = 123                          # required: github.com/n0rpan/ox/issues/123
+# issue = 123                          # required: github.com/oxstack/ox/issues/123
 # until = 2026-12-24                  # required, at most 30 days ahead
 # reason = "transcript find not opened by xdotool ctrl+f on ARM"

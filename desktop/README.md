@@ -2,16 +2,18 @@
 
 ## Install or update the dev release
 
-The rolling dev release is published after a successful build of `main`. Once its assets include `ox-desktop-linux-*` and `ox-desktop-macos-*`, the installer can choose the right package for Linux x86-64 or ARM64, Intel macOS or Apple Silicon. [Dev release and assets](https://github.com/n0rpan/ox/releases/tag/dev)
+The rolling dev release is published after a successful build of `main`. Once its assets include `ox-desktop-linux-*` and `ox-desktop-macos-*`, the installer can choose the right package for Linux x86-64 or ARM64, Intel macOS or Apple Silicon. [Dev release and assets](https://github.com/oxstack/ox/releases/tag/dev)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh -s -- --dev --desktop
+curl -fsSL https://raw.githubusercontent.com/oxstack/ox/main/install.sh | sh -s -- --dev --desktop
 ox desktop .
 ```
 
 Run the launch command from the project you want to open, or pass a directory such as `ox desktop ~/Work/my-project`. The installer verifies the archive checksum, installs `ox`, `ox-desktop` and `ox-host` under `~/.local/bin` by default, and adds **OX Desktop** to your Linux launcher or macOS **~/Applications**. Follow the installer's PATH hint if your shell cannot find `ox`.
 
-For an update, run the same installer command again. `ox update --dev` updates the standalone CLI. The desktop installer updates the whole package and keeps existing settings and native histories. If the session host is running, the installer restarts it on the new version: running turns finish first (for up to 10 minutes), new turns wait for the new host, and connected desktops and phones reconnect on their own. `ox host restart` does the same by hand. Check installed versions with `ox --version`, `ox-desktop --version` and `ox-host --version`, and the running host with `ox host doctor`.
+Once installed, OX Desktop and the headless session host check for releases in the background. Desktop offers **Restart to update** after it has verified the entire package. **Later** keeps the current release running. Open **Settings → Accounts → Restart to update** to see the prompt again. From a terminal, `ox update` applies the staged release or downloads one. Older desktop installations need one more run of the installer above to enable this behavior.
+
+The desktop, session host, phone interface and CLI switch together. A running host allows up to ten minutes for active turns to finish. Turns still running at the deadline can be interrupted. Paired phones reconnect to the updated host. Use `ox host doctor` to check the running host version.
 
 ## First run
 
@@ -94,7 +96,7 @@ OX stores its desktop state under `$XDG_STATE_HOME/ox/desktop` when that variabl
 
 ## Run a packaged build
 
-Download the artifact for your OS and architecture from the [OX Desktop workflow](https://github.com/n0rpan/ox/actions/workflows/desktop.yml). Each archive includes the matching desktop app, session host and CLI. Use the artifact from the branch and commit you intend to test.
+Download the artifact for your OS and architecture from the [OX Desktop workflow](https://github.com/oxstack/ox/actions/workflows/desktop.yml). Each archive includes the matching desktop app, session host and CLI. Use the artifact from the branch and commit you intend to test.
 
 - On macOS, extract the ZIP and open **OX Desktop.app**. These builds are ad-hoc signed. If Gatekeeper requests confirmation, use System Settings → Privacy & Security → Open Anyway for the downloaded app. Terminal may request Automation permission for native sign-in or a terminal handoff.
 - On Linux, extract the tarball and run `./ox-desktop/ox-desktop`. Keep all three executables in the extracted directory. Linux builds target glibc 2.39 or later and use Wayland or X11 with a Vulkan-capable driver. The tarball contains its shared library requirements in `shared-libraries.txt`.

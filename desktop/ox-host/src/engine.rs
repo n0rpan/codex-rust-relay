@@ -322,6 +322,7 @@ pub(crate) struct Engine {
     reading: Vec<Reading>,
     in_flows: bool,
     draining: Option<Instant>,
+    idle_update_owner: Option<u64>,
     state_dir: PathBuf,
     idle: Duration,
     next_reap: Instant,
@@ -381,6 +382,7 @@ impl Engine {
             reading: Default::default(),
             in_flows: false,
             draining: None,
+            idle_update_owner: None,
             state_dir: dir.to_owned(),
             idle: idle_timeout(std::env::var("OX_HOST_IDLE_MINUTES").ok().as_deref()),
             next_reap: Instant::now() + REAP_EVERY,
@@ -532,6 +534,9 @@ impl Engine {
                 }
                 Some(Message::Disconnect(id)) => {
                     self.clients.remove(&id);
+                    if self.idle_update_owner == Some(id) {
+                        self.idle_update_owner = None;
+                    }
                 }
                 Some(Message::Request(id, request)) => {
                     if let Err(e) = self.request(id, *request) {
@@ -597,6 +602,22 @@ impl Engine {
             return Err(io::Error::other("Send a protocol hello first"));
         }
         match message {
+            Client::ReserveIdleUpdate => {
+                let ready = self.draining.is_none()
+                    && !self.update_reserved()
+                    && self.running_turns() == 0
+                    && self.asking.is_empty()
+                    && self.running.values().all(|live| {
+                        !live.store.has_pending_turn()
+                            && live.store.asks().is_empty()
+                            && live.opening.is_none()
+                            && live.terminal.is_none()
+                    });
+                if ready {
+                    self.idle_update_owner = Some(id);
+                }
+                self.reply(id, Server::IdleUpdate { ready })
+            }
             Client::Hello { version } => {
                 if version != wire::VERSION {
                     let message = wire::version_mismatch(wire::VERSION, version);
@@ -639,6 +660,7 @@ impl Engine {
                             "live_catalog",
                             "end",
                             "processes",
+                            wire::IDLE_UPDATE,
                             ox_desk_core::surface::CAPABILITY,
                         ]
                         .map(str::to_owned)
@@ -826,7 +848,9 @@ impl Engine {
                         fail("Open this project and billing route before sending actions".into()),
                     );
                 };
-                if self.draining.is_some() && crate::handover::starts_work(&action) {
+                if (self.draining.is_some() || self.update_reserved())
+                    && crate::handover::starts_work(&action)
+                {
                     return self.reply(id, fail(crate::handover::REFUSAL.into()));
                 }
                 let hash = digest(&action, &approval)?;
@@ -1757,6 +1781,11 @@ impl Engine {
         });
         self.answer(f.reply, result)
     }
+    fn update_reserved(&self) -> bool {
+        self.idle_update_owner
+            .is_some_and(|owner| self.clients.contains_key(&owner))
+    }
+
     /// Work a drain waits for: turns in progress in any loaded thread, worker
     /// launches and handoff targets not yet confirmed, and handoffs still
     /// preparing or reading their source.
@@ -1777,6 +1806,9 @@ impl Engine {
     /// or, for a YOLO child that needs the operator, returns at once with
     /// `waiting_for_operator`.
     fn launch(&mut self, caller: Caller, start: WorkerStart, reply: Replier) -> io::Result<()> {
+        if self.update_reserved() {
+            return self.answer(reply, Err(crate::handover::REFUSAL.into()));
+        }
         match self.accept_launch(&caller, start) {
             Ok(Accepted::Launch(scope, launching)) => {
                 let live = self.running.get_mut(&scope).expect("ensured worker scope");
@@ -2010,6 +2042,9 @@ impl Engine {
     }
     /// The parent agent's four tools. Every answer comes from host session state.
     fn parent_call(&mut self, caller: &Caller, call: ParentCall) -> Result<Value, String> {
+        if self.update_reserved() && matches!(call, ParentCall::Steer { .. }) {
+            return Err(crate::handover::REFUSAL.into());
+        }
         let me = self.resolve(caller)?;
         let owned = |e: &crate::workers::Entry| crate::workers::owns(&me, e);
         let job_id = match &call {

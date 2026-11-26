@@ -45,7 +45,11 @@ fn run(tool: &str, args: &[&OsStr]) -> io::Result<()> {
     )))
 }
 fn stable_binary() -> io::Result<PathBuf> {
-    let real = binary()?.canonicalize()?;
+    let selected = binary()?;
+    if let Some(store) = super::managed_install::package_store(&selected) {
+        return Ok(super::managed_install::active_binary(&store, "ox-host"));
+    }
+    let real = selected.canonicalize()?;
     Ok(env::var_os("PATH")
         .and_then(|s| {
             env::split_paths(&s)
@@ -70,6 +74,7 @@ fn environment() -> Vec<(&'static str, std::ffi::OsString)> {
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
         "XDG_CACHE_HOME",
+        "OX_NO_BACKGROUND_UPDATE",
     ]
     .into_iter()
     .filter_map(|key| env::var_os(key).map(|v| (key, v)))
@@ -242,6 +247,91 @@ fn owned_contents(file: &Path) -> io::Result<Option<String>> {
         Err(e) => Err(e),
     }
 }
+/// Older installs without the public launcher on PATH recorded an immutable
+/// host path. Preserve the original service arguments and environment.
+pub fn refresh_update_service() -> io::Result<()> {
+    use super::managed_install::package_store;
+    let Some(store) = package_store(&std::env::current_exe()?) else {
+        return Ok(());
+    };
+    refresh_definition(&unit_path()?, &store, || {
+        #[cfg(target_os = "linux")]
+        service(&["daemon-reload"])?;
+        #[cfg(target_os = "macos")]
+        if let Some(domain) = loaded_domain()? {
+            run(
+                "launchctl",
+                &["bootout".as_ref(), format!("{domain}/{LABEL}").as_ref()],
+            )?;
+        }
+        Ok(())
+    })
+}
+
+fn refresh_definition(
+    file: &Path,
+    store: &Path,
+    reload: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    use super::managed_install::{BIN_DIR, active_binary};
+    let Some(content) = owned_contents(file)? else {
+        return Ok(());
+    };
+    let executable = |path: &Path| -> io::Result<String> {
+        let value = text(path.as_os_str())?;
+        #[cfg(target_os = "linux")]
+        return Ok(format!("ExecStart={} ", systemd_quote(value, true)));
+        #[cfg(target_os = "macos")]
+        return Ok(format!(
+            "<key>ProgramArguments</key><array>\n<string>{}</string>",
+            value
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+        ));
+    };
+    let stable = executable(&active_binary(store, "ox-host"))?;
+    for entry in fs::read_dir(store)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() || !entry.path().join(".ready").is_file() {
+            continue;
+        }
+        let Ok(old) = executable(&entry.path().join(BIN_DIR).join("ox-host")) else {
+            continue;
+        };
+        if content.contains(&old) {
+            let revised = content.replacen(&old, &stable, 1);
+            write_definition(file, &revised)?;
+            if let Err(error) = reload() {
+                // Leave the old definition in place so a retry reloads it again.
+                write_definition(file, &content)?;
+                return Err(error);
+            }
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn write_definition(file: &Path, content: &str) -> io::Result<()> {
+    let parent = file.parent().unwrap();
+    fs::create_dir_all(parent)?;
+    let tmp = file.with_extension(format!("tmp-{}", std::process::id()));
+    let mut output = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    let update = (|| {
+        output.write_all(content.as_bytes())?;
+        output.sync_all()?;
+        fs::rename(&tmp, file)
+    })();
+    if update.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    update
+}
 fn install(paths: &Paths, file: &Path) -> io::Result<()> {
     let executable = stable_binary()?;
     #[cfg(target_os = "linux")]
@@ -249,23 +339,7 @@ fn install(paths: &Paths, file: &Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     let content = plist(&executable, paths)?;
     if owned_contents(file)?.as_deref() != Some(&content) {
-        let parent = file.parent().unwrap();
-        fs::create_dir_all(parent)?;
-        let tmp = file.with_extension(format!("tmp-{}", std::process::id()));
-        let mut output = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        let update = (|| {
-            output.write_all(content.as_bytes())?;
-            output.sync_all()?;
-            fs::rename(&tmp, file)
-        })();
-        if update.is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
-        update?;
+        write_definition(file, &content)?;
     }
     #[cfg(target_os = "linux")]
     {
@@ -335,8 +409,40 @@ pub fn manage(action: &str, paths: &Paths) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Paths, plist, systemd_unit};
+    use super::{Paths, plist, refresh_definition, systemd_unit};
     use std::path::Path;
+    use std::{fs, io};
+    #[test]
+    fn update_retries_failed_reload_and_preserves_service_arguments() {
+        use super::super::managed_install::{BIN_DIR, active_binary};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join(".ox-desktop");
+        let old = store.join("previous package");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join(".ready"), "").unwrap();
+        let paths = Paths {
+            socket: tmp.path().join("custom socket"),
+            state_dir: tmp.path().join("custom state"),
+        };
+        #[cfg(target_os = "linux")]
+        let render = systemd_unit;
+        #[cfg(target_os = "macos")]
+        let render = plist;
+        let original = render(&old.join(BIN_DIR).join("ox-host"), &paths).unwrap();
+        let file = tmp.path().join("service");
+        fs::write(&file, &original).unwrap();
+        assert!(
+            refresh_definition(&file, &store, || Err(io::Error::other("reload failed"))).is_err()
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), original);
+        refresh_definition(&file, &store, || Ok(())).unwrap();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            render(&active_binary(&store, "ox-host"), &paths).unwrap()
+        );
+        refresh_definition(&file, &store, || panic!("already migrated")).unwrap();
+    }
+
     #[test]
     fn native_services_encode_literal_program_arguments_without_a_shell() {
         let paths = Paths {

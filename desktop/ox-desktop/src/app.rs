@@ -58,6 +58,7 @@ pub fn try_draw<T: 'static, R>(
 pub struct Workspace {
     host: Option<Entity<Host>>,
     _failure: Subscription,
+    _updates: Subscription,
 }
 impl Workspace {
     pub fn new(host: Entity<Host>, cx: &mut Context<Self>) -> Self {
@@ -69,6 +70,7 @@ impl Workspace {
         Self {
             host: Some(host),
             _failure: failure,
+            _updates: cx.observe_global::<crate::updates::Updates>(|_, cx| cx.notify()),
         }
     }
 }
@@ -76,6 +78,13 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::platform::layout_probe::begin_frame(window, "OX Desktop", || ());
         if let Some(host) = &self.host {
+            if let Some(banner) = crate::updates::banner(Palette::get(cx), cx) {
+                return kit::col()
+                    .size_full()
+                    .child(banner)
+                    .child(div().relative().flex_1().min_h_0().child(host.clone()))
+                    .into_any_element();
+            }
             return host.clone().into_any_element();
         }
         let p = Palette::get(cx);

@@ -24,6 +24,7 @@ class PullRequestLanes(unittest.TestCase):
 
     def test_shared_packaging_selects_both_platforms(self):
         for path in ("desktop/package.sh", "desktop/packaging/Info.plist", "install.sh",
+                     "src/update.rs", "src/update/desktop.rs", "src/managed_install.rs",
                      ".github/workflows/desktop.yml", "desktop/tests/packaged-window.swift",
                      "desktop/ox-desk-probe/src/gate.py", "desktop/gate.toml"):
             with self.subTest(path=path):

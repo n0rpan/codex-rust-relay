@@ -2,7 +2,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    env,
     fs::{self, OpenOptions},
     io::{self, Write},
     os::unix::fs::OpenOptionsExt,
@@ -26,6 +25,7 @@ pub struct Behavior {
     pub reduce_motion: bool,
     /// Show the weather from MET Norway on the header horizon.
     pub live_weather: bool,
+    pub background_updates: bool,
 }
 impl Default for Behavior {
     fn default() -> Self {
@@ -35,6 +35,7 @@ impl Default for Behavior {
             font_size: 16,
             reduce_motion: false,
             live_weather: true,
+            background_updates: true,
         }
     }
 }
@@ -50,21 +51,9 @@ pub enum Outcome {
     ChangedOnDisk { revision: String },
 }
 
-pub fn directory() -> Option<PathBuf> {
-    let state = env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| {
-            env::var_os("HOME").map(|p| {
-                PathBuf::from(p).join(if cfg!(target_os = "macos") {
-                    "Library/Application Support"
-                } else {
-                    ".local/state"
-                })
-            })
-        })?;
-    Some(state.join("ox/desktop"))
-}
+#[path = "../../../src/desktop_state.rs"]
+mod desktop_state;
+pub use desktop_state::directory;
 pub fn path() -> io::Result<PathBuf> {
     directory()
         .map(|p| p.join("preferences.json"))

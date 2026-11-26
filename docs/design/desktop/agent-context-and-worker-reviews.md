@@ -1,6 +1,6 @@
 # OX agent context and worker reviews
 
-Proposed against n0rpan/ox at `be347b0`. Reviewed on the author's Claude subscription by Fable 5.2 in read-only OX worker `4177928940944705`.
+Proposed against oxstack/ox at `be347b0`. Reviewed on the author's Claude subscription by Fable 5.2 in read-only OX worker `4177928940944705`.
 
 ## What the user should experience
 

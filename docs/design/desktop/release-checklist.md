@@ -29,12 +29,13 @@ Write the result of each line as pass, fail (with what happened) or skipped (wit
 
 ### Fresh install (macOS and Linux)
 
-- [ ] On an account that has never run OX: `curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh -s -- --desktop`, then `ox desktop .`. The app opens and the host starts.
+- [ ] On an account that has never run OX: `curl -fsSL https://raw.githubusercontent.com/oxstack/ox/main/install.sh | sh -s -- --desktop`, then `ox desktop .`. The app opens and the host starts.
 - [ ] `ox host install`. Log out and in: `ox host status` says running and installed.
 - [ ] Pair the phone (README, "Pair a phone"). Run one Claude and one Codex session from the phone and from the desktop.
 
 ### Upgrade
 
+- [ ] Stage an update and choose **Later**. Confirm the original CLI, desktop and host are still active. Disconnect from the network, open About, and choose **Restart to update**. Confirm all three versions match and the paired phone reconnects.
 - [ ] With a long turn running, rerun the installer. The installer says it is restarting the host; the turn finishes; the phone shows the turn's result without re-pairing; `ox host doctor` shows the new version.
 - [ ] Repeat with a turn that outlasts `ox host restart --timeout 30`. The turn is reported as interrupted, and the installer output says how many turns were interrupted.
 

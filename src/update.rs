@@ -16,12 +16,15 @@ use serde::Deserialize;
 
 use crate::provider::RelayError;
 
-const REPOSITORY: &str = "n0rpan/ox";
+mod desktop;
+mod standalone;
+
+const REPOSITORY: &str = "oxstack/ox";
 const CURRENT: &str = crate::VERSION;
 const DEV_TAG: &str = "dev";
 const MAX_RELEASE_BYTES: usize = 512 * 1024;
 const MAX_BINARY_BYTES: u64 = 64 * 1024 * 1024;
-const USAGE: &str = "Usage: ox update [--check [--json]] [--dev|--stable]";
+const USAGE: &str = "Usage: ox update [--check [--json]] [--dev|--stable]\n       ox update --stage | --apply | --status --json";
 
 /// A release version: `X.Y.Z` or the development form `X.Y.Z-dev.N`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,13 +180,196 @@ fn parse_args(args: &[OsString]) -> Result<Command, RelayError> {
     })
 }
 
+fn automatic_enabled() -> bool {
+    if std::env::var_os("OX_NO_BACKGROUND_UPDATE").is_some() {
+        return false;
+    }
+    let Some(dir) = crate::desktop_state::directory() else {
+        return false;
+    };
+    match File::open(dir.join("preferences.json")) {
+        Ok(file) => serde_json::from_reader::<_, serde_json::Value>(file)
+            .is_ok_and(|v| v["background_updates"].as_bool().unwrap_or(true)),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+fn fresh_stamp(path: &Path, age_limit: Duration) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|time| time.elapsed().ok())
+        .is_some_and(|age| age < age_limit)
+        && std::fs::read_to_string(path).ok().as_deref() == Some(CURRENT)
+}
+
+fn recent_check(store: &Path) -> bool {
+    fresh_stamp(&store.join("last-check"), Duration::from_secs(6 * 3600))
+}
+fn retry_later(store: &Path) -> bool {
+    fresh_stamp(&store.join("failed-check"), Duration::from_secs(3600))
+}
+
+fn record_check<T>(
+    store: &Path,
+    result: Result<Option<T>, RelayError>,
+) -> Result<Option<T>, RelayError> {
+    let failed = store.join("failed-check");
+    match &result {
+        Ok(candidate) => {
+            let _ = std::fs::remove_file(failed);
+            if candidate.is_none() {
+                std::fs::write(store.join("last-check"), CURRENT)?;
+            }
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(store.join("last-check"));
+            let _ = std::fs::write(failed, CURRENT);
+        }
+    }
+    result
+}
+
+fn write_error(store: &Path, error: std::io::Error) -> String {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+    ) {
+        format!(
+            "Cannot write to {}. Check that your account can update this installation.",
+            store.display()
+        )
+    } else {
+        format!("Could not stage the update in {}: {error}", store.display())
+    }
+}
+fn open_lock_file(store: &Path) -> Result<File, RelayError> {
+    File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(store.join("update.lock"))
+        .map_err(|e| write_error(store, e).into())
+}
+
+fn store_lock(store: &Path, background: bool) -> Result<File, RelayError> {
+    let file = open_lock_file(store)?;
+    // Manual operations wait for the download (15 minutes) and bounded host
+    // drain (10 minutes). Background pollers leave the current owner alone.
+    let until = std::time::Instant::now() + Duration::from_secs(30 * 60);
+    let mut announced = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+            Err(std::fs::TryLockError::WouldBlock) if background => {
+                return Err("An OX update is already running.".into());
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= until {
+                    return Err("Timed out waiting for the other OX update to finish.".into());
+                }
+                if !announced {
+                    eprintln!("Waiting for the current OX update to finish…");
+                    announced = true;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+    Ok(file)
+}
+
+pub(crate) fn on_terminal_launch() {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let store = crate::managed_install::package_store(&exe).or_else(|| standalone::store(&exe));
+    let Some(store) = store else { return };
+    if !automatic_enabled() {
+        return;
+    }
+    if let Some(version) = staged_version(&store) {
+        eprintln!("OX {version} is downloaded. Run ox update to install it.");
+    } else if !recent_check(&store) && !retry_later(&store) {
+        // The interactive client starts immediately, even on a slow or offline connection.
+        if let Ok(mut child) = Command::new(exe)
+            .args(["update", "--background"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+    }
+}
+
+fn staged_version(store: &Path) -> Option<String> {
+    if store.ends_with(".ox-desktop") {
+        desktop::pending_version(store)
+    } else {
+        standalone::pending_version(store)
+    }
+}
+
 pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
+    let executable = std::env::current_exe()?;
+    if args.len() == 1 && args[0] == "--select-package" {
+        return desktop::select_installer_package(&executable);
+    }
+    let store = crate::managed_install::package_store(&executable);
+    if let [command, rest @ ..] = args
+        && matches!(
+            command.to_str(),
+            Some("--stage-desktop" | "--apply-desktop" | "--try-apply-desktop")
+        )
+    {
+        let store = store
+            .as_deref()
+            .ok_or("This desktop installation is unmanaged. Run install.sh --desktop first.")?;
+        return desktop::command(store, command, rest).await;
+    }
+    let options: Vec<_> = args.iter().map(|a| a.to_str().unwrap_or("")).collect();
+    if matches!(
+        options.as_slice(),
+        ["--stage" | "--apply" | "--background"] | ["--status", "--json"]
+    ) {
+        let desktop = store.is_some();
+        let store = store
+            .or_else(|| standalone::store(&executable))
+            .ok_or("Staged updates require an installer-managed OX installation.")?;
+        if options[0] == "--status" {
+            let staged = staged_version(&store);
+            println!(
+                "{}",
+                serde_json::json!({"installed": CURRENT, "staged": staged})
+            );
+            return Ok(0);
+        }
+        if options[0] == "--background" && !automatic_enabled() {
+            return Ok(0);
+        }
+        if desktop {
+            return desktop::public_command(&store, options[0]).await;
+        }
+        return standalone::command(&store, &executable, options[0]).await;
+    }
     let (check_only, json, requested) = match parse_args(args)? {
         Command::Help => {
             println!("{USAGE}");
-            println!("Install the newest ox release over the running executable.");
+            println!("Update the managed desktop package or standalone CLI.");
             println!("A stable build follows stable releases. A dev build follows the dev");
             println!("pre-release that is rebuilt from every commit on main.");
+            println!("  --stage    Download and verify an update without applying it");
+            println!("  --apply    Apply the staged update offline");
+            println!("  --status --json    Show installed and staged versions offline");
             println!("  --check    Look for a newer release without installing it");
             println!("  --json     Report installed and available versions with --check");
             println!("  --dev      Switch to the dev pre-release");
@@ -204,23 +390,26 @@ pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
     // An explicit move to the other channel installs that channel's build even
     // when its version number is lower (for example dev back to stable).
     let switching = channel != Channel::of(running);
+    if let Some(store) = store.as_deref() {
+        return desktop::update(store, channel, check_only, json).await;
+    }
+    if !check_only && executable.with_file_name("ox-desktop").is_file() {
+        return Err(
+            "To update this desktop installation, run the installer with --desktop.".into(),
+        );
+    }
+    if !check_only
+        && !switching
+        && let Some(cache) = standalone::store(&executable)
+    {
+        return standalone::command(&cache, &executable, "update").await;
+    }
     let installation = if check_only {
         None
     } else {
-        Some(Installation::lock(&std::env::current_exe()?)?)
+        Some(Installation::lock(&executable)?)
     };
-    let client = Client::builder()
-        .user_agent(format!("ox/{CURRENT}"))
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(120))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 || !release_host(attempt.url()) {
-                attempt.error("unexpected GitHub release redirect")
-            } else {
-                attempt.follow()
-            }
-        }))
-        .build()?;
+    let client = release_client()?;
     let metadata_url = channel.metadata_url();
     let update = latest(&client, &metadata_url, channel, switching, CURRENT, target).await?;
     if json {
@@ -265,6 +454,21 @@ pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
     Ok(0)
 }
 
+fn release_client() -> Result<Client, RelayError> {
+    Ok(Client::builder()
+        .user_agent(format!("ox/{CURRENT}"))
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 || !release_host(attempt.url()) {
+                attempt.error("unexpected GitHub release redirect")
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()?)
+}
+
 fn target_triple(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
         ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
@@ -299,12 +503,21 @@ async fn latest(
     current: &str,
     target: &str,
 ) -> Result<Option<Update>, RelayError> {
+    let release = release_metadata(client, url, channel).await?;
+    select_update(release, channel, switching, current, target, None)
+}
+
+async fn release_metadata(
+    client: &Client,
+    url: &str,
+    channel: Channel,
+) -> Result<Release, RelayError> {
     let response = client
         .get(url)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
-        .map_err(|_| "could not reach GitHub for an ox update")?;
+        .map_err(|_| "Could not reach GitHub to check for OX updates. Check your connection and try again.")?;
     match response.status() {
         StatusCode::OK => {}
         StatusCode::NOT_FOUND => {
@@ -316,14 +529,14 @@ async fn latest(
             }
             .into());
         }
-        status => return Err(format!("GitHub release check returned HTTP {status}").into()),
+        status => return Err(format!("GitHub returned HTTP {status} while checking for OX updates. Try again in a few minutes.").into()),
     }
     let body = crate::read_upstream(response, MAX_RELEASE_BYTES)
         .await
         .map_err(|_| "GitHub release metadata was too large or unreadable")?;
     let release: Release =
         serde_json::from_slice(&body).map_err(|_| "invalid GitHub release metadata")?;
-    select_update(release, channel, switching, current, target)
+    Ok(release)
 }
 
 fn select_update(
@@ -332,6 +545,7 @@ fn select_update(
     switching: bool,
     current: &str,
     target: &str,
+    archive: Option<&str>,
 ) -> Result<Option<Update>, RelayError> {
     let installed = parse_version(current).ok_or("this ox build has no update version")?;
     if release.draft {
@@ -367,7 +581,14 @@ fn select_update(
         return Ok(None);
     }
 
-    let name = format!("ox-{version}-{target}");
+    let name = archive
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("ox-{version}-{target}"));
+    let max_bytes = if archive.is_some() {
+        256 * 1024 * 1024
+    } else {
+        MAX_BINARY_BYTES
+    };
     let mut matching = release
         .assets
         .into_iter()
@@ -375,7 +596,7 @@ fn select_update(
     let asset = matching
         .next()
         .ok_or_else(|| format!("release {version} has no ox binary for {target}"))?;
-    if matching.next().is_some() || !(1..=MAX_BINARY_BYTES).contains(&asset.size) {
+    if matching.next().is_some() || !(1..=max_bytes).contains(&asset.size) {
         return Err("invalid ox release asset metadata".into());
     }
     let digest = asset
@@ -437,6 +658,45 @@ fn parse_number(part: &str) -> Option<u64> {
     part.parse().ok()
 }
 
+async fn download_verified(
+    client: &Client,
+    url: &str,
+    update: &Update,
+    file: &mut File,
+) -> Result<(), RelayError> {
+    use std::io::Write;
+    let mut response = client
+        .get(url)
+        .timeout(Duration::from_secs(15 * 60))
+        .send()
+        .await
+        .map_err(|_| "could not download the ox release asset from GitHub")?;
+    if response.status() != StatusCode::OK {
+        return Err(format!("ox download returned HTTP {}", response.status()).into());
+    }
+    let mut sha256 = digest::Context::new(&digest::SHA256);
+    let mut received = 0_u64;
+    while let Some(chunk) = response.chunk().await.map_err(|_| {
+        format!(
+            "The OX {} download was interrupted. Check your connection and retry.",
+            update.version
+        )
+    })? {
+        received += chunk.len() as u64;
+        if received > update.size {
+            return Err("ox download exceeds its published size".into());
+        }
+        file.write_all(&chunk)?;
+        sha256.update(&chunk);
+    }
+    if received != update.size || sha256.finish().as_ref() != update.sha256 {
+        return Err(
+            format!("The OX {} download did not match its published size and SHA-256 digest. It was discarded.", update.version).into(),
+        );
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 async fn install(
     client: &Client,
@@ -444,71 +704,33 @@ async fn install(
     update: &Update,
     installation: &Installation,
 ) -> Result<(), RelayError> {
-    use std::fs::{self, File, OpenOptions, Permissions};
-    use std::io::Write;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-    use std::path::PathBuf;
-
-    struct StagingFile(PathBuf);
-    impl Drop for StagingFile {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
-        }
-    }
-
-    let executable = &installation.path;
-    let parent = executable
+    let parent = installation
+        .path
         .parent()
-        .ok_or("ox executable has no parent directory")?;
+        .ok_or("Missing CLI install directory.")?;
+    let mut stage = tempfile::NamedTempFile::new_in(parent)?;
+    download_verified(client, url, update, stage.as_file_mut()).await?;
+    replace_cli(stage.path(), installation)
+}
+
+fn replace_cli(stage: &Path, installation: &Installation) -> Result<(), RelayError> {
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let executable = &installation.path;
     let metadata = installation.file.metadata()?;
-
-    let mut random = [0_u8; 16];
-    getrandom::fill(&mut random).map_err(|_| "could not generate an ox update file name")?;
-    let stage_path = parent.join(format!(".ox-update-{}", hex::encode(random)));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&stage_path)
-        .map_err(|error| format!("could not stage an update in {}: {error}", parent.display()))?;
-    let stage = StagingFile(stage_path);
-    let mut response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|_| "could not download the ox release binary from GitHub")?;
-    if response.status() != StatusCode::OK {
-        return Err(format!("ox binary download returned HTTP {}", response.status()).into());
-    }
-    let mut sha256 = digest::Context::new(&digest::SHA256);
-    let mut received = 0_u64;
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|_| "ox binary download was interrupted")?
-    {
-        received += chunk.len() as u64;
-        if received > update.size {
-            return Err("ox binary download exceeds its published size".into());
-        }
-        file.write_all(&chunk)?;
-        sha256.update(&chunk);
-    }
-    if received != update.size || sha256.finish().as_ref() != update.sha256 {
-        return Err(
-            "downloaded ox binary did not match its published size and SHA-256 digest".into(),
-        );
-    }
-    file.set_permissions(Permissions::from_mode(metadata.mode() & 0o777))?;
+    let file = File::open(stage)?;
+    file.set_permissions(fs::Permissions::from_mode(metadata.mode() & 0o777))?;
     file.sync_all()?;
-
     let current = fs::symlink_metadata(executable)?;
     if !current.is_file() || current.dev() != metadata.dev() || current.ino() != metadata.ino() {
         return Err(
             "the installed ox executable changed during the update. Run ox update again".into(),
         );
     }
-    fs::rename(&stage.0, executable)?;
+    fs::rename(stage, executable)?;
+    let parent = executable
+        .parent()
+        .ok_or("Missing CLI install directory.")?;
     if let Ok(directory) = File::open(parent) {
         let _ = directory.sync_all();
     }
@@ -587,7 +809,44 @@ mod tests {
         current: &str,
     ) -> Result<Option<Update>, RelayError> {
         let release: Release = serde_json::from_value(release).unwrap();
-        select_update(release, channel, switching, current, TARGET)
+        select_update(release, channel, switching, current, TARGET, None)
+    }
+
+    #[test]
+    fn failed_checks_back_off_and_recover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        record_check::<()>(dir, Ok(None)).unwrap();
+        assert!(recent_check(dir));
+        assert!(record_check::<()>(dir, Err("offline".into())).is_err());
+        assert!(!recent_check(dir));
+        assert!(retry_later(dir));
+        let stamp = File::open(dir.join("failed-check")).unwrap();
+        stamp
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(3601))
+            .unwrap();
+        assert!(!retry_later(dir));
+        record_check(dir, Ok(Some(()))).unwrap();
+        assert!(!dir.join("failed-check").exists());
+    }
+
+    #[test]
+    fn manual_update_waits_while_background_checks_yield() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let owner = store_lock(dir, true).unwrap();
+        assert!(store_lock(dir, true).is_err());
+        std::thread::scope(|scope| {
+            let (sent, received) = std::sync::mpsc::channel();
+            let waiting = scope.spawn(move || {
+                sent.send(()).unwrap();
+                store_lock(dir, false).unwrap()
+            });
+            received.recv().unwrap();
+            assert!(!waiting.is_finished());
+            drop(owner);
+            let _lock = waiting.join().unwrap();
+        });
     }
 
     #[test]
@@ -729,11 +988,11 @@ mod tests {
 
         assert_eq!(
             Channel::Stable.metadata_url(),
-            "https://api.github.com/repos/n0rpan/ox/releases/latest"
+            "https://api.github.com/repos/oxstack/ox/releases/latest"
         );
         assert_eq!(
             Channel::Dev.metadata_url(),
-            "https://api.github.com/repos/n0rpan/ox/releases/tags/dev"
+            "https://api.github.com/repos/oxstack/ox/releases/tags/dev"
         );
         let update = Update {
             version: "0.2.1-dev.7".to_owned(),
@@ -743,7 +1002,7 @@ mod tests {
         };
         assert_eq!(
             Channel::Dev.download_url(&update),
-            format!("https://github.com/n0rpan/ox/releases/download/dev/ox-0.2.1-dev.7-{TARGET}")
+            format!("https://github.com/oxstack/ox/releases/download/dev/ox-0.2.1-dev.7-{TARGET}")
         );
         let update = Update {
             version: "0.2.0".to_owned(),
@@ -754,7 +1013,7 @@ mod tests {
         let url = Channel::Stable.download_url(&update);
         assert_eq!(
             url,
-            format!("https://github.com/n0rpan/ox/releases/download/v0.2.0/ox-0.2.0-{TARGET}")
+            format!("https://github.com/oxstack/ox/releases/download/v0.2.0/ox-0.2.0-{TARGET}")
         );
         assert!(release_host(&Url::parse(&url).unwrap()));
         assert!(release_host(
@@ -995,7 +1254,9 @@ mod tests {
 
     /// Serves `/latest` (stable metadata), `/dev` (dev metadata), `/missing`
     /// (HTTP 404) and the binary on every other path.
-    async fn mock_release(binary: &'static [u8]) -> (String, tokio::task::JoinHandle<()>) {
+    pub(super) async fn mock_release(
+        binary: &'static [u8],
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let stable = Bytes::from(stable_release(binary).to_string());

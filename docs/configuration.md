@@ -5,7 +5,7 @@
 ## Install options
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/n0rpan/ox/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/oxstack/ox/main/install.sh | sh
 ```
 
 The installer works on macOS and Linux. It picks the build for your machine,
@@ -40,8 +40,8 @@ and prints the [source build](#build-from-source) command.
 
 | Channel | Source | Version | Fixed download URL |
 | --- | --- | --- | --- |
-| stable | A pushed tag `vX.Y.Z` | `X.Y.Z` | `https://github.com/n0rpan/ox/releases/latest/download/ox-<target>.tar.gz` |
-| dev | Every commit on `main` | `X.Y.(Z+1)-dev.N` | `https://github.com/n0rpan/ox/releases/download/dev/ox-<target>.tar.gz` |
+| stable | A pushed tag `vX.Y.Z` | `X.Y.Z` | `https://github.com/oxstack/ox/releases/latest/download/ox-<target>.tar.gz` |
+| dev | Every commit on `main` | `X.Y.(Z+1)-dev.N` | `https://github.com/oxstack/ox/releases/download/dev/ox-<target>.tar.gz` |
 
 **No stable release has been tagged yet.** Until one is, the dev pre-release is
 the only download. Run without a channel, the installer says
@@ -84,15 +84,17 @@ how `ox update --stable` returns a dev build to stable. From a stable or source
 build before the first stable release, `ox update` reports
 `no stable ox release has been published yet` and points to `ox update --dev`.
 
-`ox update` verifies the binary against the SHA-256 digest published by GitHub,
-then replaces the running executable's file. Use an install directory writable
-by your own account. Restart any running `ox serve` or ox-launched sessions to
-use the new binary. The updater leaves provider settings and credentials alone.
-Running the installer again has the same effect as `ox update`.
+On a desktop installation, both OX Desktop and the headless session host can download the full package in the background. They share a cache and check GitHub at most every six hours after an up-to-date response. Failed background checks retry after one hour. A manual check bypasses that delay. Choose **Settings → Appearance & input → OX updates → Check manually**, or set `OX_NO_BACKGROUND_UPDATE=1` in the process environment, to turn off automatic checks. Manual checks still work. To enable background downloads on a pre-updater installation, rerun the installer once. Use `--desktop` for the full suite or omit it for a standalone CLI.
+
+OX checks the release archive against GitHub's SHA-256 digest, verifies the macOS signature where applicable, and checks the versions reported by all three executables. Choose **Restart to update** in Desktop, or run `ox update` in a terminal to apply a staged update even offline. A single package switch updates the CLI, desktop, host and phone interface. With **Restart to update**, a running host drains for up to ten minutes. For an update that waits as long as necessary, choose **Restart when idle** and keep Desktop open. You can keep starting work or cancel the scheduled restart while OX waits. Once every host-managed agent has finished its turn and pending sends, approvals and handoffs have cleared, OX reserves the idle host and restarts. Check its version with `ox host doctor`. If the package has already switched and the host restart fails, Desktop keeps **Retry restart** available until recovery finishes. Desktop resumes checking for subsequent releases after that restart.
+
+Use `ox update --stage` to download without installing, `ox update --status --json` to inspect what is staged locally, and `ox update --apply` to apply it offline. An interactive `ox codex` or `ox claude` launch from an installer-managed CLI also checks in the background and announces a staged release on the next launch.
+
+On a standalone CLI installation, `ox update` replaces the executable after verifying its size and SHA-256 digest. Restart existing `ox serve` processes or ox-launched sessions to use the new executable.
 
 ### Manual download
 
-Every release on the [Releases page](https://github.com/n0rpan/ox/releases)
+Every release on the [Releases page](https://github.com/oxstack/ox/releases)
 carries these files for each platform, each with a matching `.sha256` file:
 
 | File | Contents |
@@ -106,8 +108,8 @@ to the channel you want:
 
 ```sh
 target='x86_64-unknown-linux-gnu'
-base='https://github.com/n0rpan/ox/releases/download/dev'
-# For stable: base='https://github.com/n0rpan/ox/releases/latest/download'
+base='https://github.com/oxstack/ox/releases/download/dev'
+# For stable: base='https://github.com/oxstack/ox/releases/latest/download'
 curl -fsSLO "$base/ox-$target.tar.gz"
 curl -fsSLO "$base/ox-$target.tar.gz.sha256"
 sha256sum -c "ox-$target.tar.gz.sha256" &&
@@ -123,7 +125,7 @@ add the same line to `~/.bashrc` or `~/.zshrc` for future terminals. Run
 
 Each CI run on a pull request also keeps its four `ox-<target>` builds as
 workflow artifacts. Sign in to GitHub to download one from the run page.
-[GitHub Actions builds](https://github.com/n0rpan/ox/actions/workflows/ci.yml)
+[GitHub Actions builds](https://github.com/oxstack/ox/actions/workflows/ci.yml)
 
 ### Build from source
 
@@ -132,7 +134,7 @@ Gatekeeper blocks a downloaded binary. CI uses Rust 1.100.0.
 [Apple’s Gatekeeper guidance](https://support.apple.com/en-us/102445)
 
 ```sh
-cargo install --locked --git https://github.com/n0rpan/ox
+cargo install --locked --git https://github.com/oxstack/ox
 ox --version
 ```
 

@@ -1,7 +1,7 @@
 mod host_client;
 pub(crate) use host_client::{
-    CatalogEvent, CatalogWatch, HOST_NOT_RUNNING, ProcessMonitor, discover, end_threads,
-    open_store, watch_catalog,
+    CatalogEvent, CatalogWatch, HOST_NOT_RUNNING, IdleReservation, ProcessMonitor, discover,
+    end_threads, open_store, reserve_idle_update, watch_catalog,
 };
 pub mod onboarding;
 pub(crate) mod remote;
@@ -30,14 +30,26 @@ pub(crate) fn find(name: &str, path: &OsStr) -> Option<PathBuf> {
         .find(|p| executable(p))
 }
 
+/// Capture the companion beside the executable that started this window. On
+/// macOS the launch path can pass through the mutable installer symlink.
+static PACKAGED_OX: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+fn sibling_ox(executable_path: &Path) -> Option<PathBuf> {
+    let sibling = executable_path.canonicalize().ok()?.with_file_name("ox");
+    executable(&sibling).then_some(sibling)
+}
+
+pub fn init_companion() {
+    PACKAGED_OX.get_or_init(|| env::current_exe().ok().and_then(|path| sibling_ox(&path)));
+}
+
 pub fn ox() -> PathBuf {
-    if let Ok(this) = env::current_exe() {
-        let sibling = this.with_file_name("ox");
-        if executable(&sibling) {
-            return sibling;
-        }
-    }
-    find("ox", &child_path()).unwrap_or_else(|| PathBuf::from("ox"))
+    PACKAGED_OX
+        .get()
+        .cloned()
+        .flatten()
+        .or_else(|| find("ox", &child_path()))
+        .unwrap_or_else(|| PathBuf::from("ox"))
 }
 
 /// Supply the known application icon before AppKit initializes the first window's tabs.
@@ -216,6 +228,27 @@ fn open_terminal(project: &Path, command: &[OsString], path: &OsStr) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn launched_companion_stays_with_its_package_after_a_switch() {
+        let root = tempfile::tempdir().unwrap();
+        let current = root.path().join("current");
+        for package in ["first", "second"] {
+            let path = root.path().join(package);
+            std::fs::create_dir(&path).unwrap();
+            for name in ["ox", "ox-desktop"] {
+                let file = path.join(name);
+                std::fs::write(&file, "").unwrap();
+                std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        std::os::unix::fs::symlink("first", &current).unwrap();
+        let pinned = sibling_ox(&current.join("ox-desktop")).unwrap();
+        std::fs::remove_file(&current).unwrap();
+        std::os::unix::fs::symlink("second", &current).unwrap();
+        assert_eq!(pinned, root.path().join("first/ox").canonicalize().unwrap());
+        assert_ne!(Some(pinned), sibling_ox(&current.join("ox-desktop")));
+    }
+
     #[test]
     fn lookup_skips_relative_paths_and_nonexecutables() {
         let dir = env::temp_dir().join(format!("ox-desktop-platform-{}", std::process::id()));

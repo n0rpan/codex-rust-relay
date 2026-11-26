@@ -45,6 +45,11 @@ def hello(path):
     return client, frame
 
 
+def reserve_idle(client):
+    client.send(type="reserve_idle_update")
+    return client.until(lambda frame: frame["type"] == "idle_update")["ready"]
+
+
 def finish(client, scope):
     def step(frame):
         if pending := ask(frame):
@@ -105,8 +110,29 @@ def run(root, host, ox, claude):
                 phone.open(scope)
                 phone.until(lambda f: f["type"] == "snapshot")
 
-                desktop.act(scope, "long", {"send_text": [thread, "LONG-TURN keep working"]})
+                reservation, caps = hello(socket_path)
+                assert "idle_update" in caps["capabilities"]
+                assert reserve_idle(reservation)
+                assert not reserve_idle(phone), "only one updater can reserve the host"
+                phone.act(scope, "still-readable", {"select_thread": thread})
+                assert phone.until(lambda f: f.get("id") == "still-readable")["type"] == "ack"
+                phone.act(scope, "idle-race", {"send_text": [thread, "must not start"]})
+                refused = phone.until(lambda f: f.get("id") == "idle-race")
+                assert refused["type"] == "error" and "restarting" in refused["message"], refused
+                reservation.close()
+                # A disconnect and a send from another connection can reach the mailbox in either order.
+                until = time.monotonic() + 5
+                while True:
+                    key = uuid.uuid4().hex
+                    desktop.act(scope, key, {"send_text": [thread, "LONG-TURN keep working"]})
+                    reply = desktop.until(lambda f: f.get("id") == key and f["type"] in ("ack", "error"))
+                    if reply["type"] == "ack":
+                        break
+                    assert "restarting" in reply["message"] and time.monotonic() < until, reply
+                    time.sleep(.025)
                 assert started.wait(90), "the long turn never reached the provider"
+                assert not reserve_idle(phone), "an update must wait for the real agent turn"
+                print("PASS: idle restart reserves an empty host, releases on cancel, and waits for active Claude turns")
                 restart = subprocess.Popen(
                     [root / "bin" / "ox-host", "restart", "--timeout", "120"], env=env,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)

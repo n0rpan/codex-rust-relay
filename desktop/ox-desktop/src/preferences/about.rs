@@ -5,6 +5,7 @@ use gpui::{prelude::*, *};
 pub(super) struct About {
     companion: Result<String, String>,
     checking: bool,
+    _updates: Subscription,
     notice: Option<String>,
 }
 impl About {
@@ -23,11 +24,16 @@ impl About {
         Self {
             companion: Ok(String::new()),
             checking: false,
+            _updates: cx.observe_global::<crate::updates::Updates>(|_, cx| cx.notify()),
             notice: None,
         }
     }
 
     fn check(&mut self, cx: &mut Context<Self>) {
+        if crate::updates::managed(cx) {
+            crate::updates::perform_action(cx);
+            return;
+        }
         if self.checking {
             return;
         }
@@ -40,7 +46,7 @@ impl About {
                 s.checking = false;
                 s.notice = Some(match result {
                     Ok(update) => match update.available {
-                        Some(version) => format!("OX {version} is available. Run the installer with --desktop to update the pair."),
+                        Some(version) => format!("OX {version} is available. Run the installer with --desktop to update the app, host and CLI and enable background updates."),
                         None => format!("OX {} is up to date.", update.installed),
                     },
                     Err(message) => message,
@@ -70,6 +76,13 @@ impl About {
             ),
             Err(e) => (format!("OX Desktop {VERSION} · {e}"), true),
         };
+        let (action, enabled) = if crate::updates::managed(cx) {
+            crate::updates::action_label(cx)
+        } else if self.checking {
+            ("Checking…", false)
+        } else {
+            ("Check for updates", true)
+        };
         div()
             .flex()
             .flex_col()
@@ -88,19 +101,29 @@ impl About {
             .child(div().child(kit::button(
                 p,
                 "ox-update-check",
-                if self.checking {
-                    "Checking…"
-                } else {
-                    "Check for updates"
-                },
+                action,
                 false,
-                !self.checking && matches!(&self.companion, Ok(v) if v == VERSION),
+                enabled && matches!(&self.companion, Ok(v) if v == VERSION),
                 cx.listener(|s, _, _, cx| s.check(cx)),
             )))
+            .when(crate::updates::can_schedule(cx), |section| {
+                section.child(kit::button(
+                    p,
+                    "ox-about-update-when-idle",
+                    "Restart when idle",
+                    false,
+                    true,
+                    |_, _, cx| crate::updates::schedule_idle(cx),
+                ))
+            })
             .children(
-                self.notice
-                    .clone()
-                    .map(|text| div().text_size(p.text(Step::Ui)).child(text)),
+                (if crate::updates::managed(cx) {
+                    Some(crate::updates::about(cx))
+                } else {
+                    self.notice.clone()
+                })
+                .filter(|s| !s.is_empty())
+                .map(|text| div().text_size(p.text(Step::Ui)).child(text)),
             )
             .child(
                 div()
