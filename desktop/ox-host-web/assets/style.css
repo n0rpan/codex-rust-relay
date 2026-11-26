@@ -241,6 +241,29 @@ h1 {
   font: 600 0.76rem/1.5 var(--mono);
   color: var(--muted);
   overflow-wrap: anywhere;
+  cursor: pointer;
+  user-select: none;
+}
+.project.pinned-project {
+  color: var(--accent);
+}
+.session[data-accent="cobalt"] {
+  border-left: 3px solid var(--accent);
+}
+.session[data-accent="amber"] {
+  border-left: 3px solid var(--warning);
+}
+.session[data-accent="emerald"] {
+  border-left: 3px solid var(--success);
+}
+.session[data-accent="coral"] {
+  border-left: 3px solid var(--error);
+}
+.session[data-accent="violet"] {
+  border-left: 3px solid color-mix(in srgb, #d4a5ff 75%, var(--accent));
+}
+.session[data-accent="cyan"] {
+  border-left: 3px solid color-mix(in srgb, #7ee8fa 75%, var(--success));
 }
 #sessions-heading:focus {
   outline: none;
@@ -1490,4 +1513,18 @@ main:has(#conversation:not([hidden])) {
   margin: 0 0 8px;
   color: var(--muted);
   font-size: 0.9em;
+}
+#attached-images .image-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: 34px;
+  padding: 0.25rem 0.55rem;
+  font-size: 0.8rem;
+}
+#attached-images .chip-thumb {
+  width: 20px;
+  height: 20px;
+  object-fit: cover;
+  border-radius: 2px;
 }

@@ -218,6 +218,11 @@ function readFile(file) {
     reader.readAsDataURL(file);
   });
 }
+function formatBytes(bytes) {
+  if (!bytes || bytes < 1024) return (bytes || 0) + " B";
+  if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+}
 $("attach-image").onchange = async (event) => {
   const key = owner,
     files = Array.from(event.target.files);
@@ -259,8 +264,21 @@ export function updateExtras(state, caps, link, id) {
     itemsShown = images;
     $("attached-images").replaceChildren(
       ...(images ?? []).map((file, i) => {
-        const b = element("button", "Remove " + file.file);
+        const b = document.createElement("button");
         b.type = "button";
+        b.className = "image-chip";
+        b.setAttribute("aria-label", "Remove " + file.file);
+        const dataUrl = file.image?.clipboard?.[1];
+        if (dataUrl) {
+          const thumb = document.createElement("img");
+          thumb.src = dataUrl;
+          thumb.alt = "";
+          thumb.className = "chip-thumb";
+          b.append(thumb);
+        }
+        b.append(
+          element("span", `${file.file} (${formatBytes(file.bytes)}) ×`),
+        );
         b.onclick = () => {
           drafts.set(
             owner,
