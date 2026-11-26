@@ -52,7 +52,7 @@ pub(super) async fn public_command(store: &Path, action: &str) -> Result<u8, Rel
         let _lock = store_lock(store, false)?;
         let candidate =
             pending(store).ok_or("No staged desktop update. Run ox update --stage first.")?;
-        activate(store, &candidate)?;
+        activate(store, &candidate, None)?;
         println!("Installed OX {}.", candidate.version);
         return Ok(0);
     }
@@ -79,7 +79,13 @@ fn active_caller(store: &Path) -> Result<bool, RelayError> {
     Ok(active_binary(store, "ox").canonicalize()? == std::env::current_exe()?.canonicalize()?)
 }
 
-fn host_restart(store: &Path, version: &str) -> Result<(), RelayError> {
+fn host_restart(store: &Path, version: &str, stopped_host: Option<File>) -> Result<(), RelayError> {
+    // The desktop passed the daemon's ownership lock on stdin. Release it
+    // after switching, before marker recovery can start the newly selected host.
+    if let Some(lock) = stopped_host {
+        lock.unlock()?;
+    }
+
     let output = Process::new(active_binary(store, "ox-host"))
         .arg("restart-if-updated")
         .output().map_err(|e| format!("OX {version} is installed. Could not start the session host: {e}. Retry the restart."))?;
@@ -100,6 +106,12 @@ pub(super) fn select_installer_package(executable: &Path) -> Result<u8, RelayErr
     let store = generation.parent().ok_or("Missing OX package store.")?;
     let _lock = store_lock(store, false)?;
     switch_generation(store, &generation)?;
+    // Only a package selected by a lease-aware installer is eligible for
+    // cleanup. In-flight extractions and legacy, unleased packages stay intact.
+    if generation.join(".in-use").is_file() {
+        File::create(generation.join(".installer-managed"))?;
+    }
+    prune_unused(store, &generation);
     Ok(0)
 }
 
@@ -120,7 +132,11 @@ fn switch_generation(store: &Path, generation: &Path) -> Result<(), RelayError> 
     Ok(())
 }
 
-fn activate(store: &Path, candidate: &Candidate) -> Result<(), RelayError> {
+fn activate(
+    store: &Path,
+    candidate: &Candidate,
+    stopped_host: Option<File>,
+) -> Result<(), RelayError> {
     let generation = candidate.generation(store)?;
     if fs::read_to_string(generation.join(".ready"))? != candidate.version {
         return Err("The staged OX release is incomplete.".into());
@@ -134,7 +150,7 @@ fn activate(store: &Path, candidate: &Candidate) -> Result<(), RelayError> {
         switch_generation(store, &generation)?;
     }
     // Keep the pending record on failure. A retry can finish an interrupted host drain.
-    host_restart(store, &candidate.version)?;
+    host_restart(store, &candidate.version, stopped_host)?;
     prune_unused(store, &generation);
     if pending(store).as_ref() == Some(candidate) {
         fs::remove_file(store.join("pending.json"))?;
@@ -152,10 +168,16 @@ fn prune_unused(store: &Path, active: &Path) {
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name();
-        let owned = name
-            .to_str()
-            .and_then(|s| s.strip_prefix("release-"))
-            .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+        let digest = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
+        let owned = name.to_str().is_some_and(|s| {
+            s.strip_prefix("release-").is_some_and(digest)
+                || s.split_once('.').is_some_and(|(hash, suffix)| {
+                    digest(hash)
+                        && suffix.len() == 6
+                        && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
+                        && path.join(".installer-managed").is_file()
+                })
+        });
         if !owned
             || path == active
             || path == previous
@@ -343,7 +365,7 @@ pub(super) async fn update(
         return Err("Run the installed ox launcher to update the active package.".into());
     }
     if let Some(candidate) = record_check(store, prepare(store, channel).await)? {
-        activate(store, &candidate)?;
+        activate(store, &candidate, None)?;
         println!(
             "Installed OX {}. Reopen any running OX Desktop windows.",
             candidate.version
@@ -402,6 +424,16 @@ pub(super) async fn command(
     } else {
         store_lock(store, background)?
     };
+    let (args, stopped_host) =
+        if opportunistic && args.last().is_some_and(|s| s == "--host-stopped") {
+            use std::os::fd::AsFd;
+            (
+                &args[..args.len() - 1],
+                Some(File::from(std::io::stdin().as_fd().try_clone_to_owned()?)),
+            )
+        } else {
+            (args, None)
+        };
     if background && !automatic_enabled() {
         println!("null");
         return Ok(0);
@@ -419,7 +451,7 @@ pub(super) async fn command(
             if reported.trim() != format!("ox {}", version.to_string_lossy()) {
                 return Err("The active OX version changed. Check for updates again.".into());
             }
-            host_restart(store, &version.to_string_lossy())?;
+            host_restart(store, &version.to_string_lossy(), stopped_host)?;
             if let Some(candidate) = pending(store)
                 && candidate.generation(store)? == store.join("current").canonicalize()?
             {
@@ -432,6 +464,7 @@ pub(super) async fn command(
                     version: version.to_string_lossy().into(),
                     digest: digest.to_string_lossy().into(),
                 },
+                stopped_host,
             )?;
         }
     } else {
@@ -471,15 +504,26 @@ mod tests {
                 path
             })
             .collect();
+        let installer = store.join(format!("{:064x}.aB12Cd", 42));
+        fs::create_dir(&installer).unwrap();
+        File::create(installer.join(".in-use")).unwrap();
         symlink(&packages[1], store.join("previous")).unwrap();
         let lease = File::open(packages[2].join(".in-use")).unwrap();
         lease.lock_shared().unwrap();
         prune_unused(&store, &packages[0]);
         assert!(packages[..3].iter().all(|p| p.exists()));
         assert!(!packages[3].exists());
+        assert!(installer.exists());
+        File::create(installer.join(".installer-managed")).unwrap();
+        let installer_user = File::open(installer.join(".in-use")).unwrap();
+        installer_user.lock_shared().unwrap();
+        prune_unused(&store, &packages[0]);
+        assert!(installer.exists());
+        drop(installer_user);
         drop(lease);
         prune_unused(&store, &packages[0]);
         assert!(!packages[2].exists());
+        assert!(!installer.exists());
     }
 
     #[cfg(target_os = "linux")]

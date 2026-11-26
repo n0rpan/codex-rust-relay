@@ -227,6 +227,18 @@ fn socket_meta(path: &Path) -> io::Result<Option<fs::Metadata>> {
         Err(e) => Err(e),
     }
 }
+/// Keep an absent host from binding while Desktop selects a package. If another
+/// process owns the lock it is already running, starting, or shutting down.
+pub fn reserve_stopped_host(paths: &Paths) -> io::Result<Option<File>> {
+    paths.prepare()?;
+    let lock = lock_file(&paths.state_dir.join("owner.lock"))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(Some(lock)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
 pub struct SocketGuard {
     pub listener: UnixListener,
     socket: PathBuf,
@@ -387,6 +399,23 @@ mod tests {
             socket: root.join("runtime/host.sock"),
         }
     }
+    #[test]
+    fn idle_update_reserves_a_stopped_host_without_starting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            state_dir: dir.path().join("state"),
+            socket: dir.path().join("runtime/host.sock"),
+        };
+        let guard = reserve_stopped_host(&paths).unwrap().unwrap();
+        assert!(!is_running(&paths).unwrap());
+        assert!(SocketGuard::bind(&paths).is_err());
+        drop(guard);
+        let host = SocketGuard::bind(&paths).unwrap();
+        assert!(reserve_stopped_host(&paths).unwrap().is_none());
+        drop(host);
+        assert!(reserve_stopped_host(&paths).unwrap().is_some());
+    }
+
     #[test]
     fn only_one_host_can_own_a_state_directory_or_socket() {
         let tmp = tempfile::tempdir().unwrap();

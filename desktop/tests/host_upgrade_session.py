@@ -114,6 +114,8 @@ def run(root, host, ox, claude):
                 assert "idle_update" in caps["capabilities"]
                 assert reserve_idle(reservation)
                 assert not reserve_idle(phone), "only one updater can reserve the host"
+                phone.act(scope, "still-readable", {"select_thread": thread})
+                assert phone.until(lambda f: f.get("id") == "still-readable")["type"] == "ack"
                 phone.act(scope, "idle-race", {"send_text": [thread, "must not start"]})
                 refused = phone.until(lambda f: f.get("id") == "idle-race")
                 assert refused["type"] == "error" and "restarting" in refused["message"], refused

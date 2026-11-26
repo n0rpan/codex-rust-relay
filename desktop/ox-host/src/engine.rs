@@ -506,9 +506,6 @@ impl Engine {
                     request,
                     reply,
                 }) => match *request {
-                    _ if self.update_reserved() => {
-                        self.answer(reply, Err(crate::handover::REFUSAL.into()))?
-                    }
                     Gateway::Launch(_) if self.draining.is_some() => {
                         self.answer(reply, Err(crate::handover::REFUSAL.into()))?
                     }
@@ -603,26 +600,6 @@ impl Engine {
         };
         if !client.hello && !matches!(message, Client::Hello { .. }) {
             return Err(io::Error::other("Send a protocol hello first"));
-        }
-        if self.update_reserved() {
-            match &message {
-                Client::Act { id: key, .. } => {
-                    return self.reply(
-                        id,
-                        Server::Error {
-                            id: Some(key.clone()),
-                            message: crate::handover::REFUSAL.into(),
-                        },
-                    );
-                }
-                Client::WorkerLaunch { id: key, .. } | Client::WorkerCall { id: key, .. } => {
-                    return self.answer(
-                        Replier::Client(id, key.clone()),
-                        Err(crate::handover::REFUSAL.into()),
-                    );
-                }
-                _ => {}
-            }
         }
         match message {
             Client::ReserveIdleUpdate => {
@@ -871,7 +848,9 @@ impl Engine {
                         fail("Open this project and billing route before sending actions".into()),
                     );
                 };
-                if self.draining.is_some() && crate::handover::starts_work(&action) {
+                if (self.draining.is_some() || self.update_reserved())
+                    && crate::handover::starts_work(&action)
+                {
                     return self.reply(id, fail(crate::handover::REFUSAL.into()));
                 }
                 let hash = digest(&action, &approval)?;
@@ -1827,6 +1806,9 @@ impl Engine {
     /// or, for a YOLO child that needs the operator, returns at once with
     /// `waiting_for_operator`.
     fn launch(&mut self, caller: Caller, start: WorkerStart, reply: Replier) -> io::Result<()> {
+        if self.update_reserved() {
+            return self.answer(reply, Err(crate::handover::REFUSAL.into()));
+        }
         match self.accept_launch(&caller, start) {
             Ok(Accepted::Launch(scope, launching)) => {
                 let live = self.running.get_mut(&scope).expect("ensured worker scope");
@@ -2060,6 +2042,9 @@ impl Engine {
     }
     /// The parent agent's four tools. Every answer comes from host session state.
     fn parent_call(&mut self, caller: &Caller, call: ParentCall) -> Result<Value, String> {
+        if self.update_reserved() && matches!(call, ParentCall::Steer { .. }) {
+            return Err(crate::handover::REFUSAL.into());
+        }
         let me = self.resolve(caller)?;
         let owned = |e: &crate::workers::Entry| crate::workers::owns(&me, e);
         let job_id = match &call {

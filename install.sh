@@ -285,6 +285,7 @@ prepare_desktop() {
     desktop_version="$("$desktop_binary_dir/ox-desktop" --version)" || die_missing_libraries "$desktop_binary_dir/ox-desktop"
     [ "${desktop_version#ox-desktop }" = "${helper_version#ox }" ] || die "the packaged desktop and CLI versions differ."
     [ "$("$desktop_binary_dir/ox-host" --version)" = "ox-host ${helper_version#ox }" ] || die "the packaged host and CLI versions differ."
+    touch "$desktop_stage/.in-use"
     touch "$desktop_stage/.ready"
     desktop_stage=""
 }

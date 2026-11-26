@@ -48,22 +48,43 @@ fn read_frame(input: &mut BufReader<UnixStream>) -> io::Result<Server> {
 fn connect() -> io::Result<(BufReader<UnixStream>, UnixStream)> {
     handshake().map(|(input, socket, _)| (input, socket))
 }
-/// The socket owns the reservation. Passing it to the installer keeps the host
-/// gated even if the window closes while the package is switching.
-pub(crate) fn reserve_idle_update() -> io::Result<Option<UnixStream>> {
-    let (mut input, mut socket, caps) = handshake()?;
+pub(crate) enum IdleReservation {
+    Running(UnixStream),
+    Stopped(std::fs::File),
+}
+
+/// Probe the package lock first so normal agent requests continue throughout a
+/// background download. The installer rechecks it before committing the switch.
+pub(crate) fn reserve_idle_update(store: &std::path::Path) -> io::Result<Option<IdleReservation>> {
+    let lock = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(store.join("update.lock"))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => return Err(e),
+    }
+    let paths = Paths::discover()?;
+    if !is_running(&paths)? {
+        return Ok(ox_host_service::reserve_stopped_host(&paths)?.map(IdleReservation::Stopped));
+    }
+    let (mut input, mut socket, caps) = open_handshake(&paths)?;
     if !caps
         .iter()
         .any(|c| c == ox_desk_core::host_protocol::IDLE_UPDATE)
     {
-        return Err(io::Error::other(
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
             "This session host cannot confirm when agents are idle. Choose Restart to update when you’re ready.",
         ));
     }
     socket.set_read_timeout(Some(Duration::from_secs(15)))?;
     write_frame(&mut socket, &Client::ReserveIdleUpdate)?;
     match read_frame(&mut input)? {
-        Server::IdleUpdate { ready } => Ok(ready.then_some(socket)),
+        Server::IdleUpdate { ready } => Ok(ready.then_some(IdleReservation::Running(socket))),
         Server::Error { message, .. } => Err(io::Error::other(message)),
         _ => Err(io::Error::other(
             "The session host could not confirm whether agents are idle.",
@@ -101,13 +122,15 @@ fn open_handshake(paths: &Paths) -> io::Result<(BufReader<UnixStream>, UnixStrea
             ..
         } => capabilities,
         Server::Hello { version, .. } => {
-            return Err(io::Error::other(
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
                 ox_desk_core::host_protocol::version_mismatch(version, VERSION),
             ));
         }
         Server::Error { message, .. } => return Err(io::Error::other(message)),
         _ => {
-            return Err(io::Error::other(
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
                 "The installed OX host uses an incompatible protocol",
             ));
         }

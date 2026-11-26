@@ -72,18 +72,22 @@ pub fn apply(candidate: &Candidate) -> Result<(), String> {
 
 pub fn apply_if_idle(
     candidate: &Candidate,
-    reservation: std::os::unix::net::UnixStream,
+    reservation: super::IdleReservation,
 ) -> Result<bool, String> {
-    let fd = std::os::fd::OwnedFd::from(reservation);
-    let reply = output_with_stdin(
-        &[
-            "update",
-            "--try-apply-desktop",
-            &candidate.version,
-            &candidate.digest,
-        ],
-        Stdio::from(fd),
-    )?;
+    let mut args = vec![
+        "update",
+        "--try-apply-desktop",
+        &candidate.version,
+        &candidate.digest,
+    ];
+    let stdin = match reservation {
+        super::IdleReservation::Running(socket) => Stdio::from(std::os::fd::OwnedFd::from(socket)),
+        super::IdleReservation::Stopped(lock) => {
+            args.push("--host-stopped");
+            Stdio::from(lock)
+        }
+    };
+    let reply = output_with_stdin(&args, stdin)?;
     match reply.as_slice() {
         b"" => Ok(true),
         b"busy\n" => Ok(false),
