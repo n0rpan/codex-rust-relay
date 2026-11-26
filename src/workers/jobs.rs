@@ -334,7 +334,7 @@ impl Jobs {
                 .values()
                 .any(|job| job.writes && job.checkout == checkout && !job.task.is_finished()))
         .then(|| {
-            "Another write worker is editing this project. Consider a separate git worktree."
+            "Another worker had write access to this checkout when this job started. Use a separate git worktree for independent edits."
                 .to_owned()
         })
     }

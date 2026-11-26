@@ -72,11 +72,10 @@ impl Hosted {
         if view.detail["owned"] != true {
             return None;
         }
-        let mut row = ox_desk_core::store::replica::row(view)?;
+        let row = ox_desk_core::store::replica::row(view)?;
         if row.cwd != scope.project {
             return None;
         }
-        row.parent_thread_id = view.parent.clone().or(row.parent_thread_id);
         Some(Self {
             saved: Saved {
                 row,
@@ -220,11 +219,6 @@ fn unfold_ancestors(
     unfolded
 }
 
-/// A child's parent link survives a merge with a richer row that has none.
-fn keep_parent(known: Option<String>, incoming: Option<String>) -> Option<String> {
-    incoming.or(known)
-}
-
 /// The identity of one catalog row: project, scope, thread id and provider.
 type Key = (PathBuf, Scope, String, String);
 
@@ -235,6 +229,20 @@ struct Indexed {
     parent: Option<String>,
     quality: (bool, bool, bool, bool, bool, i64),
     origin: Option<Origin>,
+}
+
+impl Indexed {
+    fn merge(&mut self, mut incoming: Self) {
+        // Display quality and activity can differ across catalogs. Preserve
+        // the host stamp even when a native row has a better title.
+        let order = self.order.max(incoming.order);
+        if incoming.quality > self.quality {
+            std::mem::swap(self, &mut incoming);
+        }
+        self.order = order;
+        self.parent = self.parent.take().or(incoming.parent);
+        self.origin = self.origin.take().or(incoming.origin);
+    }
 }
 
 impl Discovery {
@@ -798,26 +806,19 @@ impl Host {
                 matches!(loc, Location::Live(..) | Location::Hosted(..)),
                 r.updated_at,
             );
-            let origin = self.origin_at(loc, cx);
+            let candidate = Indexed {
+                order,
+                loc,
+                parent: r.parent_thread_id.clone(),
+                quality,
+                origin: self.origin_at(loc, cx),
+            };
             match entries.entry(key) {
                 std::collections::hash_map::Entry::Occupied(mut slot) => {
-                    let entry = slot.get_mut();
-                    entry.order = entry.order.max(order);
-                    if quality > entry.quality {
-                        entry.loc = loc;
-                        entry.parent = keep_parent(entry.parent.take(), r.parent_thread_id.clone());
-                        entry.quality = quality;
-                        entry.origin = origin;
-                    }
+                    slot.get_mut().merge(candidate)
                 }
                 std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(Indexed {
-                        order,
-                        loc,
-                        parent: r.parent_thread_id.clone(),
-                        quality,
-                        origin,
-                    });
+                    slot.insert(candidate);
                 }
             }
         }
@@ -854,13 +855,24 @@ impl Host {
                 .as_ref()
                 .and_then(|parent| resolve_parent_key(parent, &by_scope, &by_project));
             // Native subagent rows carry only a parent thread id in the same project.
-            if resolved.is_none()
+            if recorded.is_none()
                 && let Some(parent) = &entry.parent
             {
                 resolved = by_scope
                     .get(&(key.0.clone(), key.1, parent.clone()))
                     .or_else(|| by_project.get(&(key.0.clone(), parent.clone())))
                     .copied();
+            }
+            if let Some(mut link) = recorded {
+                if let Some((row, project, scope)) =
+                    resolved.and_then(|k| self.located(entries[k].loc, cx))
+                {
+                    link.title = Some(row.title().to_owned());
+                    if link.route.is_none() {
+                        link.route = self.project_row_state(project, row, scope, cx).0;
+                    }
+                }
+                links.insert((key.0.clone(), key.2.clone()), link);
             }
             if let Some(parent_key) = resolved.filter(|parent| *parent != *key) {
                 parents.insert(
@@ -874,27 +886,6 @@ impl Host {
             } else {
                 roots.push(node);
             }
-        }
-        // Keep every recorded parent, including one a filter hid, so the worker
-        // can still offer a return link. The title comes from the visible parent
-        // when there is one; otherwise the project and session id identify it.
-        for key in &ordered {
-            let Some(mut link) = entries[*key]
-                .origin
-                .as_ref()
-                .and_then(ParentLink::from_origin)
-            else {
-                continue;
-            };
-            if let Some((row, scope)) =
-                self.find_row(&link.project, &link.id, link.route.as_ref(), cx)
-            {
-                link.title = Some(row.title().to_owned());
-                if link.route.is_none() {
-                    link.route = self.project_row_state(&link.project, &row, scope, cx).0;
-                }
-            }
-            links.insert((key.0.clone(), key.2.clone()), link);
         }
         // Counts cover the whole tree, folded or not, so a collapsed parent can still
         // say what is running under it.
@@ -1144,19 +1135,6 @@ mod status_filter_tests {
 }
 
 #[cfg(test)]
-mod parent_merge_tests {
-    use super::keep_parent;
-    #[test]
-    fn a_richer_row_without_a_parent_keeps_the_known_parent() {
-        let p = |s: &str| Some(s.to_owned());
-        assert_eq!(keep_parent(p("parent"), None), p("parent"));
-        assert_eq!(keep_parent(None, p("parent")), p("parent"));
-        assert_eq!(keep_parent(p("old"), p("new")), p("new"));
-        assert_eq!(keep_parent(None, None), None);
-    }
-}
-
-#[cfg(test)]
 mod parent_link_tests {
     use super::{ParentLink, Scope, resolve_parent_key};
     use ox_desk_core::origin::{Origin, Relation};
@@ -1190,6 +1168,41 @@ mod parent_link_tests {
         ox_desk_core::host_protocol::Scope {
             project: PathBuf::from("/work/parent"),
             route: Route::CODEX_SUBSCRIPTION,
+        }
+    }
+
+    #[test]
+    fn worker_lineage_survives_richer_native_rows_in_either_catalog_order() {
+        use super::{Indexed, Location};
+        for host_first in [true, false] {
+            let candidate = |host: bool| Indexed {
+                order: (if host { 2 } else { 1 }, 0),
+                loc: if host {
+                    Location::Hosted(0)
+                } else {
+                    Location::Saved(0)
+                },
+                parent: host.then(|| "p".to_owned()),
+                quality: (!host, false, false, false, false, 0),
+                origin: host.then(|| {
+                    origin(
+                        Relation::Worker,
+                        "/work/parent",
+                        Some(hosted_parent()),
+                        Some("p"),
+                    )
+                }),
+            };
+            let mut row = candidate(host_first);
+            row.merge(candidate(!host_first));
+            assert!(matches!(row.loc, Location::Saved(0)));
+            assert_eq!(row.order.0, 2);
+            assert_eq!(row.parent.as_deref(), Some("p"));
+            let parent = ParentLink::from_origin(row.origin.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                (parent.id.as_str(), parent.route),
+                ("p", Some(Route::CODEX_SUBSCRIPTION))
+            );
         }
     }
 

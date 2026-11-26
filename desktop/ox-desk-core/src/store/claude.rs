@@ -819,6 +819,7 @@ impl Store {
             Some(context) => link.send_user_with_context(id, content, context),
             None => link.send_user(id, content),
         }?;
+        let (id, text) = process.first.take().unwrap();
         process.first_context = None;
         process.events.sent(&id, &text);
         let transcript = self.transcripts.get_mut(owner).unwrap();

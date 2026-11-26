@@ -3187,6 +3187,7 @@ mod tests {
     fn internal_dispatch_paths_name_their_own_sender() {
         let worker = Payload::Worker(WorkerStart {
             parent: "p".into(),
+            checkout: None,
             runtime: ox_desk_core::runtime::Runtime::Codex,
             model: None,
             mode: WorkerMode::Session,

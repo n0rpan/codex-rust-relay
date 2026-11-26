@@ -146,7 +146,7 @@ impl Engine {
                     && self.worker_active(e.origin.job_id)
             })
             .then(|| {
-                "Another write worker is editing this project. Consider a separate git worktree."
+                "Another worker had write access to this checkout when this job started. Use a separate git worktree for independent edits."
                     .to_owned()
             })
     }

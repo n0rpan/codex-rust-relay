@@ -68,6 +68,7 @@ fn bits<T: DeserializeOwned>(value: &Value) -> Option<T> {
 }
 pub fn row(view: &SessionView) -> Option<ThreadRow> {
     let mut row: ThreadRow = bits(&view.detail["row"])?;
+    row.parent_thread_id = view.parent.clone().or(row.parent_thread_id);
     row.worker = view.detail["worker"] == true;
     row.generated_title = bits(&view.detail["generated"]);
     row.unread = view.detail["unread"] == true;
