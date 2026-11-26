@@ -197,7 +197,8 @@ Phone (the paired web app)
   Sessions → ••• → Settings
   Accounts                Sign in; Configure API provider.
   Providers & models      The same provider editor.
-  Credentials             Provider keys.
+  Credentials             Manage provider and Brave Search keys. Copy selected keys
+                          from this host to a paired host with a destination review.
   Favorites               Order the model lists.
   Web search              Brave Search for both clients.
   Remote access           Pair another device and review paired devices.

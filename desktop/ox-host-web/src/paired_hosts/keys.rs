@@ -1,5 +1,5 @@
 //! Only the credential-store reference appears in hosts.json.
-use ox_host_web::client::Credential;
+use crate::client::Credential;
 use serde::{Deserialize, Serialize};
 use std::io;
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -25,6 +25,10 @@ mod linux {
     fn unavailable(error: &Error) -> bool {
         match error {
             Error::Unavailable => true,
+            Error::Zbus(zbus::Error::Connection(cause, _)) => matches!(
+                cause.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ),
             Error::Zbus(zbus::Error::MethodError(name, _, _)) => {
                 name.as_str() == "org.freedesktop.DBus.Error.ServiceUnknown"
             }
@@ -54,7 +58,11 @@ mod linux {
         }
         Ok(dir.join(id))
     }
-    pub(crate) fn save(id: &str, credential: &Credential) -> io::Result<Storage> {
+    pub(crate) fn save(id: &str, credential: &Credential, background: bool) -> io::Result<Storage> {
+        // A web request cannot answer a Secret Service unlock or creation prompt.
+        if background {
+            return save_private(id, credential);
+        }
         match service() {
             Ok(s) => {
                 let collection = match s.get_default_collection() {
@@ -76,19 +84,20 @@ mod linux {
                     .map_err(io::Error::other)?;
                 Ok(Storage::Keychain)
             }
-            Err(e) if unavailable(&e) => {
-                let dest = file(id)?;
-                let mut tmp = tempfile::NamedTempFile::new_in(dest.parent().unwrap())?;
-                serde_json::to_writer(&mut tmp, credential)?;
-                tmp.flush()?;
-                tmp.as_file().sync_all()?;
-                tmp.persist_noclobber(dest)?;
-                Ok(Storage::PrivateFile)
-            }
+            Err(e) if unavailable(&e) => save_private(id, credential),
             Err(e) => Err(io::Error::other(e)),
         }
     }
-    pub(crate) fn load(id: &str, storage: Storage) -> io::Result<Credential> {
+    fn save_private(id: &str, credential: &Credential) -> io::Result<Storage> {
+        let dest = file(id)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(dest.parent().unwrap())?;
+        serde_json::to_writer(&mut tmp, credential)?;
+        tmp.flush()?;
+        tmp.as_file().sync_all()?;
+        tmp.persist_noclobber(dest)?;
+        Ok(Storage::PrivateFile)
+    }
+    pub(crate) fn load(id: &str, storage: Storage, background: bool) -> io::Result<Credential> {
         let bytes = match storage {
             Storage::Keychain => {
                 let s = service().map_err(io::Error::other)?;
@@ -101,6 +110,12 @@ mod linux {
                             "Device key missing from Secret Service. Pair this host again.",
                         )
                     })?;
+                    if background {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "The desktop keyring is locked.",
+                        ));
+                    }
                     item.unlock().map_err(io::Error::other)?;
                     item
                 };
@@ -148,7 +163,7 @@ pub(super) use linux::{load, remove, save};
 #[cfg(target_os = "macos")]
 const SERVICE: &str = "dev.ox.desktop.host-pairing";
 #[cfg(target_os = "macos")]
-pub(super) fn save(id: &str, credential: &Credential) -> io::Result<Storage> {
+pub(super) fn save(id: &str, credential: &Credential, _: bool) -> io::Result<Storage> {
     security_framework::passwords::set_generic_password(
         SERVICE,
         id,
@@ -158,7 +173,7 @@ pub(super) fn save(id: &str, credential: &Credential) -> io::Result<Storage> {
     Ok(Storage::Keychain)
 }
 #[cfg(target_os = "macos")]
-pub(super) fn load(id: &str, _: Storage) -> io::Result<Credential> {
+pub(super) fn load(id: &str, _: Storage, _: bool) -> io::Result<Credential> {
     Ok(serde_json::from_slice(
         &security_framework::passwords::get_generic_password(SERVICE, id)
             .map_err(io::Error::other)?,

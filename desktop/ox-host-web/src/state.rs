@@ -203,6 +203,9 @@ impl State {
     fn signal(&self) {
         self.changed.send_modify(|n| *n = n.wrapping_add(1))
     }
+    pub fn key_destinations_path(&self) -> std::path::PathBuf {
+        self.dir.join("key-destinations.json")
+    }
     pub fn host_profile(
         &self,
         edit: Option<crate::host_profile::Edit>,

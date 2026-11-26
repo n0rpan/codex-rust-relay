@@ -1,5 +1,5 @@
 // Only the static shell is cached. Device proofs, session frames and approvals stay off disk.
-const shell = "ox-remote-shell-v11";
+const shell = "ox-remote-shell-v12";
 const files = [
   "/",
   "/app.js",

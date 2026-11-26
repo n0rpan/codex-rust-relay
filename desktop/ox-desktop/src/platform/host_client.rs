@@ -1,5 +1,6 @@
 //! The desktop owns only this subscription. Dropping it closes its socket and
 //! leaves the daemon, native runtimes and outstanding requests alive.
+pub(super) use ox_desk_core::host_protocol::{read_frame, write_frame};
 use ox_desk_core::{
     actions::Action,
     host_protocol::{Client, ProcessView, Scope, Server, VERSION},
@@ -7,9 +8,11 @@ use ox_desk_core::{
     store::{Profile, Route, Store, ThreadRow, replica},
 };
 use ox_host_service::{Paths, ensure_running, is_running};
+#[cfg(test)]
+use std::io::BufRead as _;
 use std::{
     collections::HashSet,
-    io::{self, BufRead, BufReader, BufWriter, Read, Write},
+    io::{self, BufReader, BufWriter, Write},
     net::Shutdown,
     os::unix::net::UnixStream,
     path::PathBuf,
@@ -21,30 +24,6 @@ use std::{
     thread,
     time::Duration,
 };
-const MAX_FRAME: u64 = 64 * 1024 * 1024;
-
-pub(super) fn write_frame(out: &mut impl Write, request: &Client) -> io::Result<()> {
-    serde_json::to_writer(&mut *out, request)?;
-    out.write_all(b"\n")?;
-    out.flush()
-}
-pub(super) fn read_frame(input: &mut BufReader<UnixStream>) -> io::Result<Server> {
-    let mut bytes = Vec::new();
-    let n = input.take(MAX_FRAME).read_until(b'\n', &mut bytes)?;
-    if n == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "Session host disconnected",
-        ));
-    }
-    if bytes.last() != Some(&b'\n') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Incomplete or oversized host frame",
-        ));
-    }
-    Ok(serde_json::from_slice(&bytes)?)
-}
 #[derive(Clone, Default)]
 pub(crate) enum HostLink {
     #[default]

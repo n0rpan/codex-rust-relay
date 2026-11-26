@@ -38,6 +38,8 @@ pub(crate) struct App {
     pub slots: Arc<Semaphore>,
     pub discovered: Arc<Mutex<std::collections::HashSet<ox_desk_core::host_protocol::Scope>>>,
 }
+#[path = "key_transfer.rs"]
+mod key_transfer;
 #[path = "operator.rs"]
 mod operator;
 #[path = "operator_handoff.rs"]

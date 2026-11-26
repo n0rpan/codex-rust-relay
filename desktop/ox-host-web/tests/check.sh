@@ -16,11 +16,11 @@ if [[ ! -x "$OX_TEST_SETTINGS_OX" ]]; then
     cargo build --locked --manifest-path Cargo.toml --bin ox --profile "${OX_TEST_CARGO_PROFILE:-dev}"
     export OX_TEST_SETTINGS_OX="$root/target/$profile/ox"
 fi
-python3 desktop/ox-host-web/tests/browser.py "$harness"
 host="${OX_TEST_HOST_BIN:-$root/desktop/target/$profile/ox-host}"
 if [[ -z "${OX_TEST_HOST_BIN:-}" ]]; then
     cargo build --locked --manifest-path desktop/Cargo.toml --profile "${OX_TEST_CARGO_PROFILE:-dev}" -p ox-host
 fi
+OX_TEST_HOST_BIN="$host" python3 desktop/ox-host-web/tests/browser.py "$harness"
 set -- "$host" "$OX_TEST_SETTINGS_OX" "$harness"
 if [[ -n "${CODEOX_TEST_CODEX_BIN:-}" && -n "${OX_TEST_CLAUDE_BIN:-}" ]]; then
     set -- "$@" --stock "$CODEOX_TEST_CODEX_BIN" "$OX_TEST_CLAUDE_BIN"

@@ -6,10 +6,11 @@ publish = false
 
 [features]
 default = []
-client = ["dep:ox-desk-core", "dep:flume", "dep:security-framework", "dep:base64", "dep:p256", "dep:reqwest", "dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:sha2", "reqwest/json", "tokio/rt-multi-thread"]
-server = ["dep:flume", "dep:httpdate", "dep:axum", "dep:base64", "dep:ox-desk-core", "dep:p256", "dep:qrcode", "dep:reqwest", "dep:ring", "dep:tempfile", "dep:tokio", "dep:web-push-native"]
+client = ["dep:tempfile", "dep:getrandom", "dep:secret-service", "dep:zbus", "dep:ox-desk-core", "dep:flume", "dep:security-framework", "dep:base64", "dep:p256", "dep:reqwest", "dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:sha2", "reqwest/json", "tokio/rt-multi-thread"]
+server = ["client", "dep:flume", "dep:httpdate", "dep:axum", "dep:base64", "dep:ox-desk-core", "dep:p256", "dep:qrcode", "dep:reqwest", "dep:ring", "dep:tempfile", "dep:tokio", "dep:web-push-native"]
 
 [dependencies]
+getrandom = {version="0.3", optional=true}
 httpdate = { version = "1", optional = true }
 flume = { version="0.12", optional=true, default-features=false, features=["async"] }
 ox-pty = { path = "../ox-pty" }
@@ -38,3 +39,7 @@ tokio = { version = "1", features = ["test-util"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { version = "3", features = ["OSX_10_15"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "5.1", features = ["rt-async-io-crypto-rust"], optional = true }
+zbus = { version = "5", default-features = false, optional = true }

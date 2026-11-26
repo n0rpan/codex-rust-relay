@@ -4800,8 +4800,6 @@ dependencies = [
  "ox-host-web",
  "ox-pty",
  "raw-window-handle",
- "secret-service",
- "security-framework",
  "serde",
  "serde_json",
  "shlex",
@@ -4809,7 +4807,6 @@ dependencies = [
  "tempfile",
  "toml_edit 0.25.20+spec-1.1.0",
  "vt100",
- "zbus 5.19.0",
 ]
 
 [[package]]
@@ -4858,6 +4855,7 @@ dependencies = [
  "base64 0.22.1",
  "flume",
  "futures-util",
+ "getrandom 0.3.4",
  "httpdate",
  "libc",
  "ox-desk-core",
@@ -4868,6 +4866,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rustls",
+ "secret-service",
  "security-framework",
  "serde",
  "serde_json",
@@ -4877,6 +4876,7 @@ dependencies = [
  "tokio-tungstenite",
  "url",
  "web-push-native",
+ "zbus 5.19.0",
 ]
 
 [[package]]

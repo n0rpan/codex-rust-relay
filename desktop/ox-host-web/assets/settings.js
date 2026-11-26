@@ -247,7 +247,11 @@ export function setupSettings({ request, open, close, notifications, login }) {
       button(
         back === close
           ? "← Sessions"
-          : back === providers
+          : back === credentials
+            ? "← Credentials"
+            : back === keyDestinations
+              ? "← Destinations"
+            : back === providers
             ? "← Providers"
             : "← Settings",
         back,
@@ -608,8 +612,126 @@ export function setupSettings({ request, open, close, notifications, login }) {
         ),
       );
   }
+  async function keyDestinations() {
+    const id = screen("Copy API keys", credentials);
+    const data = await readPage(id, { action: "key_destinations" });
+    if (!data) return;
+    if (data.hosts.length) {
+      body.append(node("h2", "Destination host"));
+      for (const host of data.hosts)
+        body.append(
+          action(host.name + " · " + host.origin, () =>
+            reviewTransfer(host.id),
+          ),
+        );
+    }
+    const form = node("form", undefined, "phone-settings-card");
+    form.autocomplete = "off";
+    form.append(
+      node("h2", "Pair a destination"),
+      node(
+        "p",
+        "On the receiving host, run ox host pair or create an invitation in Remote access. This host will remember the destination for future transfers.",
+      ),
+    );
+    const address = textField(
+      form,
+      "Invitation link or host URL",
+      "destination",
+    );
+    const code = textField(
+      form,
+      "Pairing code (for a host URL)",
+      "code",
+      "password",
+    );
+    address.required = true;
+    address.spellcheck = false;
+    address.setAttribute("autocapitalize", "none");
+    code.autocomplete = "off";
+    submit(form, "Pair destination", async () => {
+      const host = await request({
+        action: "pair_key_destination",
+        address: address.value.trim(),
+        code: code.value.trim(),
+      });
+      address.value = code.value = "";
+      if (id === pageId && !panel.hidden) await reviewTransfer(host.id);
+    });
+    body.append(form);
+  }
+  async function reviewTransfer(host) {
+    const id = screen("Review API keys", keyDestinations);
+    const review = await readPage(id, { action: "review_key_transfer", host });
+    if (!review) return;
+    body.append(node("h2", review.host.name), node("p", review.host.origin));
+    if (!review.rows.length) {
+      body.append(node("p", "This host has no configured API keys to copy."));
+      return;
+    }
+    body.append(
+      node(
+        "p",
+        "Anyone with access to the destination’s OX key store can use these keys and incur charges. The originals stay on this host. Revoking the pairing later leaves the copies on the destination.",
+        "warning",
+      ),
+    );
+    const inputs = [];
+    const form = node("form", undefined, "phone-settings-card");
+    for (const row of review.rows) {
+      const label = node("label");
+      const box = node("input");
+      box.type = "checkbox";
+      box.checked = row.selected;
+      box.disabled = !row.available;
+      const name =
+        row.key.scope === "https://api.search.brave.com/"
+          ? "Brave Search · " + row.key.name
+          : row.key.name;
+      label.append(
+        box,
+        document.createTextNode(name),
+        node("small", row.key.scope + " · " + row.status),
+      );
+      form.append(label);
+      inputs.push([box, row.key]);
+    }
+    const chosen = () =>
+      inputs
+        .filter(([box]) => !box.disabled && box.checked)
+        .map(([, key]) => key);
+    submit(form, "Send selected keys", async () => {
+      const result = await request({
+        action: "send_key_transfer",
+        host,
+        pairing: review.pairing,
+        source: review.source,
+        target: review.target,
+        selected: chosen(),
+      });
+      if (id !== pageId || panel.hidden) return;
+      credentials();
+      status.textContent =
+        "Sent " +
+        result.sent +
+        (result.sent === 1 ? " key to " : " keys to ") +
+        review.host.name +
+        ".";
+    });
+    const send = form.querySelector('button[type="submit"]');
+    const selection = () => {
+      send.disabled = !chosen().length;
+    };
+    form.addEventListener("change", selection);
+    selection();
+    body.append(
+      form,
+      action("Refresh review", () => reviewTransfer(host), "quiet"),
+    );
+  }
   function credentials() {
     screen("Credentials");
+    body.append(action("Copy keys to another host…", keyDestinations));
     if (!snapshot.credentials.length)
       body.append(
         node("p", "Configure a provider or Brave Search to add a credential."),

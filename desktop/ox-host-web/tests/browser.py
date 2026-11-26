@@ -820,9 +820,13 @@ def run(harness, screenshot=None):
         codex=isolated/".codex"
         codex.mkdir(mode=0o700,parents=True)
         (codex/"codeox.toml").write_text('[providers.garden]\nname="Garden"\nbase_url="https://garden.invalid/v1"\nenv_key="GARDEN_TOKEN"\nwire_api="chat_completions"\ndiscovery=false\n[[providers.garden.models]]\nid="orchard"\n')
+        copy_fixture = None
+        if os.environ.get("OX_TEST_HOST_BIN"):
+            from key_copy import receiver
+            copy_fixture = receiver(d, stack)
         service = subprocess.Popen(
             [harness, "--exact", "fixture::browser_service", "--ignored"],
-            env=dict(os.environ, SHELL="/bin/sh", GARDEN_TOKEN="fixture-env-token", HOME=str(isolated), CODEX_HOME=str(codex), CLAUDE_CONFIG_DIR=str(isolated/".claude"), XDG_STATE_HOME=str(isolated/"state"), XDG_CONFIG_HOME=str(isolated/"config"), OX_TEST_REMOTE_DIR=str(d)),
+            env=dict(os.environ, **(copy_fixture[0] if copy_fixture else {}), DBUS_SESSION_BUS_ADDRESS="unix:path="+str(d/"no-session-bus"), SHELL="/bin/sh", GARDEN_TOKEN="fixture-env-token", HOME=str(isolated), CODEX_HOME=str(codex), CLAUDE_CONFIG_DIR=str(isolated/".claude"), XDG_STATE_HOME=str(isolated/"state"), XDG_CONFIG_HOME=str(isolated/"config"), OX_TEST_REMOTE_DIR=str(d)),
             stdout=subprocess.DEVNULL,
         )
         stack.callback(service.wait, 5)
@@ -1166,6 +1170,9 @@ def run(harness, screenshot=None):
         after_transfer = settings({"action": "read_rows"})
         assert "fixture-transfer-brave" not in json.dumps(after_transfer)
         assert "fixture-transfer-brave" in (codex / "ox-api-keys.json").read_text()
+        if copy_fixture:
+            from key_copy import exercise as copy_keys
+            copy_keys(js, wait, *copy_fixture[1:])
         export = {"action": "export_keys", "selected": [brave], "revision": after_transfer["revisions"]["keys"]}
         assert js("return import('./device.js').then(async m=>m.settingsRequest(await m.deviceKey(),"
                   + json.dumps(export) + ").then(()=>false,e=>e.status===403))")

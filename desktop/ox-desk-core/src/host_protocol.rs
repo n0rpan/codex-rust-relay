@@ -349,3 +349,29 @@ pub enum NotificationKind {
     Approval,
     Question,
 }
+
+use std::io::{self, BufRead as _};
+const MAX_FRAME: u64 = 64 * 1024 * 1024;
+
+pub fn write_frame(out: &mut impl std::io::Write, request: &Client) -> io::Result<()> {
+    serde_json::to_writer(&mut *out, request)?;
+    out.write_all(b"\n")?;
+    out.flush()
+}
+pub fn read_frame(input: &mut impl std::io::BufRead) -> io::Result<Server> {
+    let mut bytes = Vec::new();
+    let n = std::io::Read::take(input, MAX_FRAME).read_until(b'\n', &mut bytes)?;
+    if n == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Session host disconnected",
+        ));
+    }
+    if bytes.last() != Some(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Incomplete or oversized host frame",
+        ));
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}

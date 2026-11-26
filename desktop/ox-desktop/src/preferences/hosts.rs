@@ -294,7 +294,12 @@ impl Render for Hosts {
                             let host = host.clone();
                             s.work(
                                 cx,
-                                move || KeyReview::prepare(host),
+                                move || {
+                                    KeyReview::prepare(
+                                        host,
+                                        crate::settings::load().map_err(io::Error::other)?,
+                                    )
+                                },
                                 |s, r, _| s.review = Some(r),
                             );
                         }),
@@ -407,7 +412,7 @@ impl Render for Hosts {
                             if let Some(r) = s.review.take() {
                                 s.work(
                                     cx,
-                                    move || r.send(),
+                                    move || r.send(crate::settings::request),
                                     |s, count, _| s.notice = format!("Sent {count} API keys."),
                                 );
                             }

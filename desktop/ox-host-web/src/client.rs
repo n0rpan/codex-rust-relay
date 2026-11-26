@@ -253,14 +253,15 @@ impl DeviceKey {
     }
 }
 pub async fn register(invite: Invitation, label: &str) -> io::Result<Credential> {
-    register_via(invite, label, http()?, DeviceKey::generate()?).await
-}
-async fn register_via(
-    invite: Invitation,
-    label: &str,
-    http: Client,
-    (key, saved): (DeviceKey, SavedKey),
-) -> io::Result<Credential> {
+    #[cfg(test)]
+    let test_transport = fixture::transport(&invite.origin);
+    #[cfg(test)]
+    let (http, (key, saved)) = match test_transport {
+        Some((http, _, _)) => (http, DeviceKey::software()),
+        None => (http()?, DeviceKey::generate()?),
+    };
+    #[cfg(not(test))]
+    let (http, (key, saved)) = (http()?, DeviceKey::generate()?);
     let result: io::Result<String> = async {
         let payload = json!({"code":invite.code, "signature":key.sign(&invite.code)?,
             "key":key.public()?, "class":"desktop","label":label});
@@ -314,13 +315,20 @@ impl PairedClient {
         let mut cookie = header::HeaderValue::from_str(&format!("{COOKIE}={}", credential.token))
             .map_err(io::Error::other)?;
         cookie.set_sensitive(true);
+        #[cfg(test)]
+        let (http, fixture) = match fixture::transport(&origin) {
+            Some((http, addr, connector)) => (http, Some((addr, connector))),
+            None => (http()?, None),
+        };
+        #[cfg(not(test))]
+        let http = http()?;
         Ok(Self {
             origin,
             key,
             cookie,
-            http: http()?,
+            http,
             #[cfg(test)]
-            fixture: None,
+            fixture,
             settings_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
         })
     }

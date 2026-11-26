@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use tokio::sync::Semaphore;
-static HELPERS: Semaphore = Semaphore::const_new(3);
+pub(super) static HELPERS: Semaphore = Semaphore::const_new(3);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -108,6 +108,9 @@ pub(super) async fn settings(
                 return Ok(Json(data));
             }
         }
+    }
+    if let Ok(action) = serde_json::from_str::<super::key_transfer::KeyAction>(text) {
+        return super::key_transfer::apply(app, id, identity.to_owned(), action).await;
     }
     if let Some(DeviceAction::HostUpdate { command }) = device_action {
         let active = app.state.clone();

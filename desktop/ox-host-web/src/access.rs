@@ -266,6 +266,39 @@ fn output(args: &[&str]) -> Result<Vec<u8>, String> {
 fn configuration(v: &Value, authority: &str) -> Config {
     crate::serve::configuration(v, authority, HTTPS, PROXY)
 }
+/// A browser can select a new key recipient without someone at the source console.
+#[cfg(feature = "server")]
+pub(crate) fn verify_key_destination(origin: &str, login: &str) -> Result<(), &'static str> {
+    let status = output(&["status", "--json"])
+        .map_err(|_| "Could not check the destination’s owner with Tailscale.")?;
+    let status: Value = serde_json::from_slice(&status)
+        .map_err(|_| "Tailscale returned an unreadable peer list.")?;
+    let url = url::Url::parse(origin).map_err(|_| "Invalid destination address.")?;
+    let name = url.host_str().ok_or("Invalid destination address.")?;
+    let owner = &status["Self"]["UserID"];
+    let id = owner
+        .as_u64()
+        .map(|id| id.to_string())
+        .or_else(|| owner.as_str().map(str::to_owned));
+    let same_login = id.is_some_and(|id| status["User"][id]["LoginName"].as_str() == Some(login));
+    let owned = status["Peer"]
+        .as_object()
+        .into_iter()
+        .flat_map(|peers| peers.values())
+        .any(|peer| {
+            peer["DNSName"]
+                .as_str()
+                .is_some_and(|dns| dns.trim_end_matches('.').eq_ignore_ascii_case(name))
+                && peer["UserID"] == *owner
+                && peer["Tags"].as_array().is_none_or(|tags| tags.is_empty())
+        });
+    if status["BackendState"] == "Running" && same_login && owned {
+        Ok(())
+    } else {
+        Err("Choose a destination owned by your Tailscale login, or pair it in OX Desktop.")
+    }
+}
+
 fn inspect() -> Result<Node, String> {
     let v: Value = serde_json::from_slice(&output(&["status", "--json", "--peers=false"])?)
         .map_err(|_| "Tailscale returned an unreadable status.")?;

@@ -14,17 +14,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests"))
 from host_fixture import session_host
 
 
-def certificate(root):
+def certificate(root, hostname="studio.fixture.ts.net"):
     def openssl(*args):
         subprocess.run(["openssl", *args], cwd=root, check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj",
             "/CN=OX native fixture CA", "-addext", "basicConstraints=critical,CA:TRUE",
             "-keyout", "ca.key", "-out", "ca.pem")
-    openssl("req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=studio.fixture.ts.net",
+    openssl("req", "-newkey", "rsa:2048", "-nodes", "-subj", f"/CN={hostname}",
             "-keyout", "server.key", "-out", "server.csr")
     (root / "extensions").write_text("basicConstraints=critical,CA:FALSE\n"
-                                     "subjectAltName=DNS:studio.fixture.ts.net\n"
+                                     f"subjectAltName=DNS:{hostname}\n"
                                      "extendedKeyUsage=serverAuth\n")
     openssl("x509", "-req", "-in", "server.csr", "-CA", "ca.pem", "-CAkey", "ca.key",
             "-CAcreateserial", "-days", "1", "-extfile", "extensions", "-out", "server.pem")
