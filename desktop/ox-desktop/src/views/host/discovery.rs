@@ -1,6 +1,7 @@
 //! Paged native metadata and the merged navigation index. Opening a row is the only
 //! operation here that creates a project workbench.
 use super::*;
+use crate::sidebar_state::{GroupingMode, ThreadMetaKey};
 use ox_desk_core::origin::{Origin, Relation};
 use ox_desk_core::runtime::Runtime;
 use std::{
@@ -45,6 +46,7 @@ pub(super) enum Location {
     Live(usize, usize),
     Saved(usize),
     Hosted(usize),
+    PinnedCache(usize),
 }
 
 #[derive(PartialEq)]
@@ -98,6 +100,7 @@ impl Hosted {
 pub(super) struct Discovery {
     pub rows: Vec<Saved>,
     hosted: Vec<Hosted>,
+    pub pinned_cache: Vec<Saved>,
     // Cold host rows carry worker updates even before native discovery supplies their titles.
     worker_notices: HashMap<ox_desk_core::host_protocol::Scope, HashMap<String, String>>,
     archived: HashMap<ox_desk_core::host_protocol::Scope, HashSet<String>>,
@@ -226,7 +229,7 @@ struct Indexed {
     order: (i64, u128),
     loc: Location,
     parent: Option<String>,
-    quality: (bool, bool, bool, bool, bool, i64),
+    quality: (bool, bool, bool, bool, bool, bool, i64),
     origin: Option<Origin>,
 }
 
@@ -247,6 +250,15 @@ impl Indexed {
 impl Discovery {
     pub(super) fn all(&self) -> impl Iterator<Item = &Saved> {
         self.hosted.iter().map(|h| &h.saved).chain(&self.rows)
+    }
+    /// Count of sessions waiting on operator input in `(project, route)`, from the live catalog.
+    pub(super) fn waiting_count(&self, project: &Path, route: &Route) -> usize {
+        self.hosted
+            .iter()
+            .filter(|h| {
+                h.saved.row.cwd == project && &h.route == route && h.status == "needs_input"
+            })
+            .count()
     }
     /// Fold or unfold one day group of the sidebar.
     pub(super) fn toggle_day(&mut self, day: Option<chrono::NaiveDate>) {
@@ -580,18 +592,22 @@ impl Host {
                 let saved = self.discovery.rows.get(index)?;
                 Some((&saved.row, &saved.row.cwd, saved.scope))
             }
+            Location::PinnedCache(index) => {
+                let saved = self.discovery.pinned_cache.get(index)?;
+                Some((&saved.row, &saved.row.cwd, saved.scope))
+            }
         }
     }
 
     pub(super) fn located_entry<'a>(
         &'a self,
-        entry: CatalogEntry,
+        entry: &CatalogEntry,
         cx: &'a App,
     ) -> Option<(&'a ThreadRow, &'a Path, Scope)> {
         let CatalogEntry::Thread { loc, .. } = entry else {
             return None;
         };
-        self.located(loc, cx)
+        self.located(*loc, cx)
     }
 
     /// The launch stamp for an indexed row. Only host-owned sessions carry one.
@@ -604,7 +620,7 @@ impl Host {
                 store.origin(&row.id).cloned()
             }
             Location::Hosted(index) => self.discovery.hosted.get(index)?.origin.clone(),
-            Location::Saved(_) => None,
+            Location::Saved(_) | Location::PinnedCache(_) => None,
         }
     }
 
@@ -618,7 +634,7 @@ impl Host {
                 store.actual_model(&row.id).map(str::to_owned)
             }
             Location::Hosted(index) => self.discovery.hosted.get(index)?.actual_model.clone(),
-            Location::Saved(_) => None,
+            Location::Saved(_) | Location::PinnedCache(_) => None,
         }
     }
 
@@ -787,6 +803,24 @@ impl Host {
         }
         self.discovery.indexed = Some(state);
         self.catalog_versions = versions;
+        // Synthesize cached rows for pinned threads so they survive restart and render
+        // even before discovery completes or if the thread dropped out of the live catalog.
+        let mut pinned_cache = Vec::new();
+        for (encoded, meta) in &self.sidebar.threads {
+            if meta.pinned_at.is_some()
+                && !meta.hidden
+                && let Some(key) = ThreadMetaKey::decode(encoded)
+            {
+                pinned_cache.push(Saved {
+                    row: meta.cached_row(&key),
+                    scope: Scope {
+                        runtime: key.runtime,
+                        api: meta.cached_api.unwrap_or(false),
+                    },
+                });
+            }
+        }
+        self.discovery.pinned_cache = pinned_cache;
         let locations = self
             .catalog_versions
             .iter()
@@ -801,13 +835,26 @@ impl Host {
                     .map(move |j| Location::Live(i, j))
             })
             .chain((0..self.discovery.hosted.len()).map(Location::Hosted))
-            .chain((0..self.discovery.rows.len()).map(Location::Saved));
+            .chain((0..self.discovery.rows.len()).map(Location::Saved))
+            .chain((0..self.discovery.pinned_cache.len()).map(Location::PinnedCache));
         let mut entries: HashMap<Key, Indexed> = HashMap::new();
         for loc in locations {
             let Some((r, project, scope)) = self.located(loc, cx) else {
                 continue;
             };
             if self.archived(project, scope, &r.id, cx) {
+                continue;
+            }
+            let meta_key = ThreadMetaKey::new(project.to_path_buf(), scope.runtime, r.id.clone());
+            let meta = self.sidebar.thread(&meta_key);
+            if meta.is_some_and(|m| m.hidden) {
+                continue;
+            }
+            if matches!(loc, Location::PinnedCache(_))
+                && entries
+                    .keys()
+                    .any(|k| k.0 == project && k.1.runtime == scope.runtime && k.2 == r.id)
+            {
                 continue;
             }
             if let Some(wanted) = status_filter {
@@ -817,14 +864,17 @@ impl Host {
                     (StatusFilter::Waiting, Some("Needs you")) => true,
                     (StatusFilter::Finished, Some("Running" | "Needs you")) => false,
                     (StatusFilter::Finished, _) => true,
+                    (StatusFilter::Pinned, _) => meta.and_then(|m| m.pinned_at).is_some(),
                     _ => false,
                 };
                 if !matches {
                     continue;
                 }
             }
+            let custom_title = meta.and_then(|m| m.custom_title.as_deref());
             if !query.is_empty()
                 && !r.title().to_lowercase().contains(&query)
+                && !custom_title.is_some_and(|t| t.to_lowercase().contains(&query))
                 && !r.preview.to_lowercase().contains(&query)
                 && !project.to_string_lossy().to_lowercase().contains(&query)
                 && !matches!(loc, Location::Live(i, _) if self.panes[i].read(cx).query.to_lowercase() == query)
@@ -841,6 +891,7 @@ impl Host {
             // Prefer authoritative, richer identity for rendering. Keep the newest
             // positive activity date independently when two catalogs describe the same row.
             let quality = (
+                !matches!(loc, Location::PinnedCache(_)),
                 r.worker || r.activity_order != 0,
                 r.name.is_some() || r.agent_nickname.is_some(),
                 r.generated_title.is_some(),
@@ -916,7 +967,14 @@ impl Host {
                 }
                 links.insert((key.0.clone(), key.2.clone()), link);
             }
-            if let Some(parent_key) = resolved.filter(|parent| *parent != *key) {
+            let mkey = ThreadMetaKey::new(key.0.clone(), key.1.runtime, key.2.clone());
+            let promoted = self.sidebar.thread(&mkey).is_some_and(|m| {
+                m.pinned_at.is_some()
+                    || m.section
+                        .as_deref()
+                        .is_some_and(|id| self.sidebar.sections.iter().any(|s| s.id == id))
+            });
+            if !promoted && let Some(parent_key) = resolved.filter(|parent| *parent != *key) {
                 parents.insert(
                     (node.0.0.clone(), node.0.2.clone()),
                     (parent_key.0.clone(), parent_key.2.clone()),
@@ -940,40 +998,49 @@ impl Host {
             index.parents = links;
         });
         self.discovery.parents = parents;
-        let mut catalog = Vec::new();
-        let mut previous = None;
-        let mut ordinal = 0;
-        let mut per_day: HashMap<Option<chrono::NaiveDate>, usize> = HashMap::new();
-        for (_, timestamp, _) in &roots {
-            *per_day.entry(session_day(*timestamp)).or_default() += 1;
+        let filtering = !query.is_empty() || status_filter.is_some();
+        let mut pinned_roots = Vec::new();
+        let mut unpinned_roots = Vec::new();
+        for root in roots {
+            let mkey =
+                ThreadMetaKey::new((root.0).0.clone(), (root.0).1.runtime, (root.0).2.clone());
+            if let Some(pinned_at) = self.sidebar.thread(&mkey).and_then(|m| m.pinned_at) {
+                let order = self
+                    .sidebar
+                    .thread(&mkey)
+                    .and_then(|m| m.order)
+                    .unwrap_or(i64::MAX);
+                pinned_roots.push((order, pinned_at, root));
+            } else {
+                unpinned_roots.push(root);
+            }
         }
-        for (key, timestamp, loc) in roots {
-            let day = session_day(timestamp);
-            let folded = self.discovery.folded_days.contains(&day);
-            if previous != Some(day) {
-                catalog.push(CatalogEntry::Day {
-                    day,
-                    count: per_day.get(&day).copied().unwrap_or_default(),
-                    folded,
-                });
-            }
-            previous = Some(day);
-            if folded {
-                continue;
-            }
-            let mut stack = vec![(key, loc, timestamp, 0)];
+        // Pinned threads sort by explicit order first, then most recently pinned first.
+        pinned_roots.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| (b.2).1.cmp(&(a.2).1))
+        });
+        let mut catalog = Vec::new();
+        let mut ordinal = 0;
+        let push_tree = |catalog: &mut Vec<CatalogEntry>,
+                         children: &mut HashMap<&Key, Vec<(&Key, i64, Location)>>,
+                         ordinal: &mut usize,
+                         root: (&Key, i64, Location)| {
+            let mut stack = vec![(root.0, root.2, root.1, 0)];
             while let Some((key, loc, timestamp, depth)) = stack.pop() {
                 catalog.push(CatalogEntry::Thread {
                     loc,
                     timestamp,
-                    ordinal,
+                    ordinal: *ordinal,
                     depth,
                 });
-                ordinal += 1;
-                if self
-                    .discovery
-                    .collapsed
-                    .contains(&(key.0.clone(), key.2.clone()))
+                *ordinal += 1;
+                if !filtering
+                    && self
+                        .discovery
+                        .collapsed
+                        .contains(&(key.0.clone(), key.2.clone()))
                 {
                     continue;
                 }
@@ -983,6 +1050,178 @@ impl Host {
                             .rev()
                             .map(|(k, time, loc)| (k, loc, time, depth + 1)),
                     );
+                }
+            }
+        };
+        let node_rollup = |nodes: &[(&Key, i64, Location)],
+                           tree: &HashMap<(PathBuf, String), Tree>| {
+            let mut running = 0;
+            let mut waiting = 0;
+            for (key, _, loc) in nodes {
+                let own = self.status_at(*loc, cx);
+                if own == Some("Running") {
+                    running += 1;
+                } else if own == Some("Needs you") {
+                    waiting += 1;
+                }
+                if let Some(sub) = tree.get(&(key.0.clone(), key.2.clone())) {
+                    running += sub.running;
+                    waiting += sub.waiting;
+                }
+            }
+            (running, waiting)
+        };
+        let tree_snapshot = self.workers.read(cx).trees.clone();
+        if !pinned_roots.is_empty() {
+            let nodes: Vec<_> = pinned_roots.iter().map(|(_, _, r)| *r).collect();
+            let (running, waiting) = node_rollup(&nodes, &tree_snapshot);
+            let folded = !filtering && self.sidebar.pinned_collapsed;
+            catalog.push(CatalogEntry::Pinned {
+                count: nodes.len(),
+                folded,
+                running,
+                waiting,
+            });
+            if !folded {
+                for node in nodes {
+                    push_tree(&mut catalog, &mut children, &mut ordinal, node);
+                }
+            }
+        }
+        match self.sidebar.grouping {
+            GroupingMode::Timeline => {
+                let mut previous = None;
+                let mut per_day: HashMap<Option<chrono::NaiveDate>, usize> = HashMap::new();
+                for (_, timestamp, _) in &unpinned_roots {
+                    *per_day.entry(session_day(*timestamp)).or_default() += 1;
+                }
+                for root in unpinned_roots {
+                    let day = session_day(root.1);
+                    let folded = !filtering && self.discovery.folded_days.contains(&day);
+                    if previous != Some(day) {
+                        catalog.push(CatalogEntry::Day {
+                            day,
+                            count: per_day.get(&day).copied().unwrap_or_default(),
+                            folded,
+                        });
+                    }
+                    previous = Some(day);
+                    if !folded {
+                        push_tree(&mut catalog, &mut children, &mut ordinal, root);
+                    }
+                }
+            }
+            GroupingMode::Folders => {
+                let mut by_section: HashMap<String, Vec<(&Key, i64, Location)>> = HashMap::new();
+                let mut by_project: HashMap<PathBuf, Vec<(&Key, i64, Location)>> = HashMap::new();
+                for root in unpinned_roots {
+                    let mkey = ThreadMetaKey::new(
+                        (root.0).0.clone(),
+                        (root.0).1.runtime,
+                        (root.0).2.clone(),
+                    );
+                    if let Some(sec_id) = self
+                        .sidebar
+                        .thread(&mkey)
+                        .and_then(|m| m.section.clone())
+                        .filter(|id| self.sidebar.sections.iter().any(|s| &s.id == id))
+                    {
+                        by_section.entry(sec_id).or_default().push(root);
+                    } else {
+                        by_project.entry((root.0).0.clone()).or_default().push(root);
+                    }
+                }
+                // Sort threads inside user sections by explicit order when set, else newest first.
+                for section in &self.sidebar.sections {
+                    let mut list = by_section.remove(&section.id).unwrap_or_default();
+                    if filtering && list.is_empty() {
+                        continue;
+                    }
+                    list.sort_by(|a, b| {
+                        let ka =
+                            ThreadMetaKey::new((a.0).0.clone(), (a.0).1.runtime, (a.0).2.clone());
+                        let kb =
+                            ThreadMetaKey::new((b.0).0.clone(), (b.0).1.runtime, (b.0).2.clone());
+                        let oa = self
+                            .sidebar
+                            .thread(&ka)
+                            .and_then(|m| m.order)
+                            .unwrap_or(i64::MAX);
+                        let ob = self
+                            .sidebar
+                            .thread(&kb)
+                            .and_then(|m| m.order)
+                            .unwrap_or(i64::MAX);
+                        oa.cmp(&ob).then_with(|| b.1.cmp(&a.1))
+                    });
+                    let (running, waiting) = node_rollup(&list, &tree_snapshot);
+                    let folded = !filtering && section.collapsed;
+                    catalog.push(CatalogEntry::Section {
+                        id: section.id.clone(),
+                        name: section.name.clone(),
+                        color: section.color,
+                        count: list.len(),
+                        folded,
+                        running,
+                        waiting,
+                    });
+                    if !folded {
+                        for node in list {
+                            push_tree(&mut catalog, &mut children, &mut ordinal, node);
+                        }
+                    }
+                }
+                // Ensure the active project always has a folder header when not filtering,
+                // so a fresh project shows its folder even with zero threads.
+                let active_project = self.panes[self.active].read(cx).project.clone();
+                if !filtering {
+                    by_project.entry(active_project.clone()).or_default();
+                }
+                let mut project_groups: Vec<_> = by_project.into_iter().collect();
+                project_groups.sort_by(|(pa, la), (pb, lb)| {
+                    let active_a = *pa == active_project;
+                    let active_b = *pb == active_project;
+                    let newest_a = la.first().map_or(0, |r| r.1);
+                    let newest_b = lb.first().map_or(0, |r| r.1);
+                    active_b
+                        .cmp(&active_a)
+                        .then_with(|| newest_b.cmp(&newest_a))
+                        .then_with(|| pa.cmp(pb))
+                });
+                for (project, mut list) in project_groups {
+                    list.sort_by(|a, b| {
+                        let ka =
+                            ThreadMetaKey::new((a.0).0.clone(), (a.0).1.runtime, (a.0).2.clone());
+                        let kb =
+                            ThreadMetaKey::new((b.0).0.clone(), (b.0).1.runtime, (b.0).2.clone());
+                        let oa = self
+                            .sidebar
+                            .thread(&ka)
+                            .and_then(|m| m.order)
+                            .unwrap_or(i64::MAX);
+                        let ob = self
+                            .sidebar
+                            .thread(&kb)
+                            .and_then(|m| m.order)
+                            .unwrap_or(i64::MAX);
+                        oa.cmp(&ob).then_with(|| b.1.cmp(&a.1))
+                    });
+                    let (running, waiting) = node_rollup(&list, &tree_snapshot);
+                    let folded = !filtering && self.sidebar.is_project_collapsed(&project);
+                    let color = self.sidebar.project_color(&project);
+                    catalog.push(CatalogEntry::Project {
+                        project,
+                        color,
+                        count: list.len(),
+                        folded,
+                        running,
+                        waiting,
+                    });
+                    if !folded {
+                        for node in list {
+                            push_tree(&mut catalog, &mut children, &mut ordinal, node);
+                        }
+                    }
                 }
             }
         }
@@ -1121,13 +1360,21 @@ mod tests {
             library.route_status(project, saved.scope, &saved.row),
             Some((route.clone(), Some("Running")))
         );
+        assert_eq!(library.waiting_count(project, &route), 0);
         assert!(!library.live_event(CatalogEvent::Update(origin.clone(), session.clone())));
         session.status = "needs_input".into();
         assert!(library.live_event(CatalogEvent::Update(origin.clone(), session.clone())));
+        let saved = &library.hosted[0].saved;
+        assert_eq!(
+            library.route_status(project, saved.scope, &saved.row),
+            Some((route.clone(), Some("Needs you")))
+        );
+        assert_eq!(library.waiting_count(project, &route), 1);
         library.replace(Some(true), vec![]);
         assert_eq!(library.all().count(), 1);
         assert!(library.live_event(CatalogEvent::Replace(origin, vec![])));
         assert_eq!(library.all().count(), 0);
+        assert_eq!(library.waiting_count(project, &route), 0);
     }
 
     #[test]
@@ -1165,6 +1412,7 @@ pub(super) enum StatusFilter {
     Running,
     Waiting,
     Finished,
+    Pinned,
 }
 
 /// Split a leading or trailing `is:` token from the catalog search text.
@@ -1177,6 +1425,7 @@ pub(super) fn split_status_filter(query: &str) -> (Option<StatusFilter>, String)
                 "is:running" => Some(StatusFilter::Running),
                 "is:waiting" | "is:approval" => Some(StatusFilter::Waiting),
                 "is:finished" | "is:done" => Some(StatusFilter::Finished),
+                "is:pinned" => Some(StatusFilter::Pinned),
                 _ => None,
             };
             filter = filter.or(found);
@@ -1256,7 +1505,7 @@ mod parent_link_tests {
                     Location::Saved(0)
                 },
                 parent: host.then(|| "p".to_owned()),
-                quality: (!host, false, false, false, false, 0),
+                quality: (true, !host, false, false, false, false, 0),
                 origin: host.then(|| {
                     origin(
                         Relation::Worker,

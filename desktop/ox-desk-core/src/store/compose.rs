@@ -1287,6 +1287,10 @@ mod tests {
     fn fixed_host_start_honors_a_lower_draft_and_never_restores_a_broader_preset() {
         use crate::{host_policy::HostPolicy, runtime::Access};
         let mut store = ready();
+        store.set_start_mode(|_| Some(Access::Yolo));
+        assert_eq!(store.next_access(), Some(Access::Yolo));
+        store.use_host_policy(HostPolicy::AlwaysRead);
+        assert_eq!(store.next_access(), Some(Access::ReadOnly));
         store.use_host_policy(HostPolicy::AlwaysWrite);
         store.set_next_access(Access::Yolo);
         assert_eq!(store.next_access(), Some(Access::Workspace));

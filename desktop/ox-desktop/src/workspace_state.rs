@@ -36,6 +36,7 @@ enum WriteTask {
     Layout(String, crate::views::host::layout::Layout),
     Save(Option<String>, PathBuf, Route),
     Host(Option<String>),
+    Sidebar(String, crate::sidebar_state::SidebarState),
     Flush(flume::Sender<()>),
 }
 fn writer() -> &'static std::sync::mpsc::Sender<WriteTask> {
@@ -61,6 +62,16 @@ fn writer() -> &'static std::sync::mpsc::Sender<WriteTask> {
                                 write_json(&path.with_file_name("selected-host.json"), &id)
                         {
                             eprintln!("Could not remember selected host: {e}");
+                        }
+                    }
+                    WriteTask::Sidebar(name, state) => {
+                        if let Some(path) = path()
+                            && let Err(e) = crate::sidebar_state::SidebarState::save_at(
+                                &path.with_file_name(name),
+                                state,
+                            )
+                        {
+                            eprintln!("Could not save sidebar metadata: {e}")
                         }
                     }
                     WriteTask::Flush(done) => {
@@ -98,6 +109,9 @@ pub fn remember_host(id: Option<String>) {
 
 pub fn remember_layout(name: String, layout: crate::views::host::layout::Layout) {
     let _ = writer().send(WriteTask::Layout(name, layout));
+}
+pub fn remember_sidebar(name: String, state: crate::sidebar_state::SidebarState) {
+    let _ = writer().send(WriteTask::Sidebar(name, state));
 }
 pub fn finish_writes(cx: &gpui::App) {
     cx.on_app_quit(|_| {

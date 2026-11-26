@@ -26,18 +26,18 @@ pub(crate) fn read_images(paths: &[PathBuf]) -> Result<Vec<ImageInput>, String> 
     let mut images = Vec::with_capacity(paths.len());
     let mut remaining = MAX_BYTES;
     for path in paths {
-        let mime = match path
+        let extension = path
             .extension()
             .and_then(|v| v.to_str())
             .unwrap_or("")
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "png" => "image/png",
+            .to_ascii_lowercase();
+        let heic = matches!(extension.as_str(), "heic" | "heif");
+        let mime = match extension.as_str() {
+            "png" | "heic" | "heif" => "image/png",
             "jpg" | "jpeg" => "image/jpeg",
             "gif" => "image/gif",
             "webp" => "image/webp",
-            _ => return Err("Choose a PNG, JPEG, GIF or WebP image.".into()),
+            _ => return Err("Choose a PNG, JPEG, GIF, WebP or HEIC image.".into()),
         };
         let file = OpenOptions::new()
             .read(true)
@@ -48,13 +48,21 @@ pub(crate) fn read_images(paths: &[PathBuf]) -> Result<Vec<ImageInput>, String> 
         if !meta.is_file() {
             return Err("Choose an image file.".into());
         }
-        if meta.len() > remaining as u64 {
-            return Err(LIMIT.into());
-        }
-        let mut bytes = Vec::new();
-        file.take(remaining as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| e.to_string())?;
+        let bytes = if heic {
+            if meta.len() > 20 * 1024 * 1024 {
+                return Err("Choose a HEIC image of 20 MiB or less.".into());
+            }
+            super::convert_heic_to_png(path)?
+        } else {
+            if meta.len() > remaining as u64 {
+                return Err(LIMIT.into());
+            }
+            let mut bytes = Vec::new();
+            file.take(remaining as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| e.to_string())?;
+            bytes
+        };
         if bytes.is_empty() {
             return Err(format!("{} is empty.", path.display()));
         }

@@ -1149,7 +1149,8 @@ def run(harness, screenshot=None):
         snapshot=settings({"action":"read_rows"})
         assert any(p["id"]=="garden" for p in snapshot["registry"]["providers"])
         laptop=settings({"action":"read_behavior"})
-        changed=dict(laptop["behavior"],reduce_motion=not laptop["behavior"]["reduce_motion"])
+        changed=dict(laptop["behavior"],reduce_motion=not laptop["behavior"]["reduce_motion"],
+                     worker_approvals="operator", claude_start="plan", codex_start="workspace")
         assert settings({"action":"save_behavior","revision":laptop["revision"],"behavior":changed})=={"status":"applied"}
         assert settings({"action":"read_behavior"})["behavior"]==changed
         assert settings({"action":"save_behavior","revision":laptop["revision"],"behavior":laptop["behavior"]})["status"]=="changed_on_disk"

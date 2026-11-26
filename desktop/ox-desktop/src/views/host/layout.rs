@@ -212,19 +212,16 @@ impl Host {
                 active = Some(panes.len());
                 first.clone()
             } else {
-                let extra = Self::pane(
+                Self::lazy_pane(
                     self.link.clone(),
                     self.workers.clone(),
                     saved.project.clone(),
                     r,
-                    None,
                     self.stats,
                     self.models.clone(),
                     window,
                     cx,
-                );
-                extra.update(cx, |b, cx| b.set_front(false, cx));
-                extra
+                )
             };
             saved.restore(&p, cx);
             panes.push(p);
@@ -259,18 +256,16 @@ impl Host {
             }) {
                 continue;
             }
-            let pane = Self::pane(
+            let pane = Self::lazy_pane(
                 self.link.clone(),
                 self.workers.clone(),
                 saved.project.clone(),
                 route,
-                None,
                 self.stats,
                 self.models.clone(),
                 window,
                 cx,
             );
-            pane.update(cx, |view, cx| view.set_front(false, cx));
             saved.restore(&pane, cx);
             self.panes.push(pane);
         }

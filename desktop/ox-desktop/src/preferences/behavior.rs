@@ -1,9 +1,11 @@
 //! Desktop-owned display and input preferences.
-use super::Preferences;
+use super::{Page, Preferences};
 use crate::appearance::Palette;
 use crate::appearance::Step;
 use gpui::{prelude::*, *};
-pub use ox_desk_core::desktop_behavior::{Behavior, ThemeSource};
+use ox_desk_core::desktop_behavior::{self, Outcome, Snapshot};
+pub use ox_desk_core::desktop_behavior::{Behavior, ThemeSource, WorkerApprovals};
+use ox_desk_core::runtime::{Access, Runtime};
 pub struct Active(pub Behavior);
 impl Global for Active {}
 impl std::ops::Deref for Active {
@@ -12,7 +14,48 @@ impl std::ops::Deref for Active {
         &self.0
     }
 }
+/// "Same as terminal" plus every native preset of `runtime`, as start-mode choices.
+fn start_choices(runtime: Runtime, b: Behavior) -> Vec<(&'static str, Behavior)> {
+    let with = |start: Option<Access>| match runtime {
+        Runtime::Claude => Behavior {
+            claude_start: start,
+            ..b
+        },
+        Runtime::Codex => Behavior {
+            codex_start: start,
+            ..b
+        },
+    };
+    std::iter::once(("Same as terminal", with(None)))
+        .chain(Access::choices(runtime).iter().map(|&mode| {
+            let label = match mode {
+                Access::Default => "Ask before edits",
+                other => other.label(),
+            };
+            (label, with(Some(mode)))
+        }))
+        .collect()
+}
 impl Preferences {
+    pub(super) fn refresh_remote_behavior(&mut self, cx: &mut Context<Self>) {
+        let Some(host) = self.link.remote().cloned() else {
+            return;
+        };
+        self.remote_behavior = None;
+        let read = cx.background_spawn(async move {
+            host.settings(serde_json::json!({"action":"read_behavior"}))
+                .and_then(|v| Ok(serde_json::from_value::<Snapshot>(v)?.behavior))
+                .map_err(|e| e.to_string())
+        });
+        cx.spawn(async move |view, cx| {
+            let result = read.await;
+            let _ = view.update(cx, |s, cx| {
+                s.remote_behavior = Some(result);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
     fn preference_choices(
         &self,
         label: &'static str,
@@ -23,36 +66,14 @@ impl Preferences {
     ) -> Div {
         let mut controls = div().flex().gap_1().flex_wrap();
         for &(caption, next) in options {
-            controls = controls.child(crate::kit::button(p, caption, caption, next == current, true, cx.listener(move |s, _, _, cx| {
-                    if current == next || s.busy {
-                        return;
-                    }
-                    s.busy = true;
-                    cx.notify();
-                    let write = cx.background_spawn(async move {
-                        ox_desk_core::desktop_behavior::write(&ox_desk_core::desktop_behavior::revision(current),next).and_then(|result|match result{ox_desk_core::desktop_behavior::Outcome::Applied=>Ok(()),_=>Err(std::io::Error::other("The preference changed on another device. Review the current setting."))})
-                    });
-                    cx.spawn(async move |view, cx| {
-                        let result = write.await;
-                        let _ = view.update(cx, |s, cx| {
-                            s.busy = false;
-                            match result {
-                                Ok(()) => {
-                                    cx.set_global(Active(next));
-                                    crate::appearance::refresh(cx);
-                                    crate::sky::reload(cx);
-                                    s.report(Ok(()), "Preference saved.", cx);
-                                }
-                                Err(e) => s.report(
-                                    Err(format!("Could not save desktop preference: {e}")),
-                                    "",
-                                    cx,
-                                ),
-                            }
-                        });
-                    })
-                    .detach();
-                })));
+            controls = controls.child(crate::kit::button(
+                p,
+                SharedString::from(format!("{label}:{caption}")),
+                caption,
+                next == current,
+                true,
+                cx.listener(move |s, _, _, cx| s.save_behavior(current, next, cx)),
+            ));
         }
         div()
             .flex()
@@ -66,6 +87,131 @@ impl Preferences {
                     .child(label),
             )
             .child(controls)
+    }
+    fn save_behavior(&mut self, current: Behavior, next: Behavior, cx: &mut Context<Self>) {
+        if current == next || self.busy {
+            return;
+        }
+        self.busy = true;
+        cx.notify();
+        let host = if self.page == Page::Accounts {
+            self.link.remote().cloned()
+        } else {
+            None
+        };
+        let remote = host.is_some();
+        let write = cx.background_spawn(async move {
+            let revision = desktop_behavior::revision(current);
+            let outcome = match host {
+                Some(host) => serde_json::from_value(host.settings(serde_json::json!({
+                    "action":"save_behavior", "revision":revision, "behavior":next
+                }))?)?,
+                None => desktop_behavior::write(&revision, next)?,
+            };
+            match outcome {
+                Outcome::Applied => Ok(()),
+                Outcome::ChangedOnDisk { .. } => Err(std::io::Error::other(
+                    "Preferences changed on another device. Review the current setting.",
+                )),
+            }
+        });
+        cx.spawn(async move |view, cx| {
+            let result = write.await;
+            let _ = view.update(cx, |s, cx| {
+                s.busy = false;
+                match result {
+                    Ok(()) if remote => {
+                        s.remote_behavior = Some(Ok(next));
+                        s.report(Ok(()), "Host preference saved.", cx);
+                    }
+                    Ok(()) => {
+                        cx.set_global(Active(next));
+                        crate::appearance::refresh(cx);
+                        crate::sky::reload(cx);
+                        s.report(Ok(()), "Preference saved.", cx);
+                    }
+                    Err(e) => {
+                        if remote {
+                            s.refresh_remote_behavior(cx);
+                        }
+                        s.report(Err(format!("Could not save preference: {e}")), "", cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+    /// How agents start and who answers their workers, on the Accounts page.
+    pub(super) fn agents_card(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        let b = if self.link.remote().is_some() {
+            match self.remote_behavior.as_ref() {
+                Some(Ok(b)) => *b,
+                Some(Err(e)) => {
+                    return div().child(format!("Could not read host agent settings: {e}"));
+                }
+                None => return div().child("Loading host agent settings…"),
+            }
+        } else {
+            cx.global::<Active>().0
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .border_1()
+            .border_color(rgb(p.line))
+            .rounded_lg()
+            .bg(rgb(p.panel))
+            .child(div().text_size(p.text(Step::Title)).child("Agents"))
+            .child(self.preference_choices(
+                "New Claude sessions",
+                &start_choices(Runtime::Claude, b),
+                b,
+                p,
+                cx,
+            ))
+            .child(self.preference_choices(
+                "New Codex sessions",
+                &start_choices(Runtime::Codex, b),
+                b,
+                p,
+                cx,
+            ))
+            .child(
+                div()
+                    .text_size(p.text(Step::Meta))
+                    .text_color(rgb(p.muted))
+                    .child("Same as terminal starts a new session the way `claude` or `codex` starts in your terminal, using your own Claude Code and Codex settings. A mode you pick in the composer still applies to that one session."),
+            )
+            .child(self.preference_choices(
+                "Worker requests",
+                &[
+                    (
+                        "Parent agent answers",
+                        Behavior {
+                            worker_approvals: WorkerApprovals::Parent,
+                            ..b
+                        },
+                    ),
+                    (
+                        "I answer",
+                        Behavior {
+                            worker_approvals: WorkerApprovals::Operator,
+                            ..b
+                        },
+                    ),
+                ],
+                b,
+                p,
+                cx,
+            ))
+            .child(
+                div()
+                    .text_size(p.text(Step::Meta))
+                    .text_color(rgb(p.muted))
+                    .child("A parent agent answers its workers' questions, and approves their actions when its own mode runs without asking you (Auto, Auto-review or YOLO). Read-only workers and mode changes always ask you. You can still answer any request yourself."),
+            )
     }
     pub(super) fn behavior_page(&self, p: Palette, cx: &mut Context<Self>) -> Div {
         let b = cx.global::<Active>().0;

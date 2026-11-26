@@ -29,7 +29,7 @@ fn scripted_claude_permission_uses_its_captured_session() {
             project,
             session: Session::New("00000000-0000-4000-8000-000000000001".into()),
             billing: Billing::Subscription,
-            permission_mode: "default".into(),
+            permission_mode: Some("default".into()),
             contract: None,
             model: None,
         },

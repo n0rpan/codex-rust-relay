@@ -24,7 +24,7 @@ impl Host {
                 let active = self.panes[self.active].read(cx);
                 let selected = active.store.as_ref().and_then(|s| s.selected());
                 let current = self.catalog.iter().position(|e| {
-                    self.located_entry(*e, cx)
+                    self.located_entry(e, cx)
                         .is_some_and(|(r, project, scope)| {
                             project == active.project
                                 && scope.matches(&active.route)
@@ -35,7 +35,7 @@ impl Host {
                     .catalog
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, e)| Some((i, self.located_entry(*e, cx)?)));
+                    .filter_map(|(i, e)| Some((i, self.located_entry(e, cx)?)));
                 let choice = if key == Command::Next {
                     rows.find(|(i, _)| current.is_none_or(|pos| *i > pos))
                 } else {

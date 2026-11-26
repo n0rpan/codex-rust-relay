@@ -234,7 +234,12 @@ impl Workbench {
             }
             (Some(_), None) if granted => "YOLO allowed for workers".to_owned(),
             (_, Some(m)) => permission_value(m),
-            _ => default_permission(self.route.runtime).to_owned(),
+            _ => default_permission(
+                self.route.runtime,
+                cx.try_global::<crate::preferences::behavior::Active>()
+                    .map(|a| a.0)
+                    .unwrap_or_default(),
+            ),
         };
         let access_hint = if key.is_none() {
             format!("Permissions for the next thread: {value}")
@@ -381,6 +386,23 @@ impl Workbench {
         };
         let native = key.filter(|id| store.is_native_live(id)).map(str::to_owned);
         let editor_for_menu = editor.clone();
+        let attach_owner = selected.clone();
+        let can_attach = store.can_compose(key) && !self.image_work.contains_key(&selected);
+        let attach_button = crate::kit::icon(
+            p,
+            "attach-file",
+            gpui_component::IconName::Plus,
+            "Attach image or file",
+            can_attach,
+            cx.listener(move |s, _, window, cx| {
+                s.prompt_attach_files(attach_owner.clone(), window, cx)
+            }),
+        )
+        .size(px(crate::kit::CHIP_HEIGHT));
+        let hovering_files = self
+            .file_hover
+            .as_ref()
+            .is_some_and(|(id, paths)| *id == selected && !paths.is_empty());
         col()
             .flex_shrink_0()
             .gap(px(crate::kit::SPACE_M))
@@ -389,8 +411,27 @@ impl Workbench {
             .px(px(crate::kit::SPACE_M))
             .rounded(px(crate::kit::OVERLAY_RADIUS))
             .border_1()
-            .border_color(rgb(p.line))
-            .bg(rgb(p.panel))
+            .border_color(rgb(if hovering_files { p.accent } else { p.line }))
+            .bg(rgb(if hovering_files { p.raised } else { p.panel }))
+            .when(hovering_files, |panel| {
+                panel.child(
+                    row()
+                        .gap(px(crate::kit::SPACE_S))
+                        .child(
+                            div()
+                                .font_family(crate::appearance::LABEL_FONT)
+                                .text_size(p.text(Step::Label))
+                                .text_color(rgb(p.accent))
+                                .child("DROP FILES · INSERT CARTRIDGE"),
+                        )
+                        .child(
+                            div()
+                                .text_size(p.text(Step::Meta))
+                                .text_color(rgb(p.muted))
+                                .child("Images attach directly; other files attach as @path"),
+                        ),
+                )
+            })
             .when(!suggestions.is_empty(), |panel| {
                 let mut choices = row().gap_1().flex_wrap();
                 for (i, (text, hint)) in suggestions.into_iter().enumerate() {
@@ -473,6 +514,7 @@ impl Workbench {
                             .gap(px(crate::kit::SPACE_XS))
                             // Chip text lines up with the textarea's text inset.
                             .pl(px(2.))
+                            .child(attach_button)
                             .children(model_controls)
                             .child(access)
                             .when(effective.is_some_and(Access::bypasses_permissions), |r| {
@@ -487,11 +529,21 @@ impl Workbench {
     }
 }
 
-/// What a runtime does when no permission mode has been chosen yet.
-fn default_permission(runtime: ox_desk_core::runtime::Runtime) -> &'static str {
-    match runtime {
-        ox_desk_core::runtime::Runtime::Claude => "Ask before edits",
-        ox_desk_core::runtime::Runtime::Codex => "Configured in Codex",
+/// What a new session starts in when no permission mode has been chosen for it:
+/// the "New sessions start in" setting, or the runtime's own default.
+fn default_permission(
+    runtime: ox_desk_core::runtime::Runtime,
+    behavior: ox_desk_core::desktop_behavior::Behavior,
+) -> String {
+    use ox_desk_core::runtime::Runtime;
+    let start = match runtime {
+        Runtime::Claude => behavior.claude_start,
+        Runtime::Codex => behavior.codex_start,
+    };
+    match (runtime, start) {
+        (_, Some(mode)) => permission_value(mode),
+        (Runtime::Claude, None) => "Claude Code default".to_owned(),
+        (Runtime::Codex, None) => "Configured in Codex".to_owned(),
     }
 }
 

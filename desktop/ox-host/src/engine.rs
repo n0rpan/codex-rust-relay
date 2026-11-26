@@ -14,7 +14,7 @@ use ox_desk_core::{
     host_protocol::{self as wire, Change, Client, Cursor, ProcessView, Scope, ScopeState, Server},
     inbox::Inbox,
     links::LinkEvent,
-    modes::YoloAllowance,
+    modes::{Level, YoloAllowance},
     origin::{Origin, ParentCall, WorkerMode, WorkerStart},
     runtime::RequestId,
     store::{Connection, Store},
@@ -1633,6 +1633,32 @@ impl Engine {
                     .retain(|id, _| live.store.asks().iter().any(|a| &a.id == id));
             }
         }
+        // A read worker asking to leave Plan mode has finished its plan, and no
+        // person could grant the exit within its ceiling. Answer it here so the
+        // worker reports instead of waiting for an operator.
+        let plan_exits: Vec<_> = live
+            .store
+            .asks()
+            .iter()
+            .filter(|ask| {
+                live.store
+                    .claude_ask_tool(&ask.id)
+                    .is_some_and(|(owner, tool)| {
+                        tool == "ExitPlanMode"
+                            && self
+                                .workers
+                                .get(scope, owner)
+                                .is_some_and(|e| crate::workers::declines_plan_exit(&e.origin))
+                    })
+            })
+            .map(|ask| ask.id.clone())
+            .collect();
+        for id in plan_exits {
+            live.tokens.remove(&id);
+            if let Err(e) = live.store.deny_claude_ask(&id, crate::workers::PLAN_REPORT) {
+                eprintln!("ox host: could not answer a read worker's plan exit: {e}");
+            }
+        }
         let reported = live.store.take_context_windows();
         if !reported.is_empty() {
             let route = scope.route.clone();
@@ -2329,7 +2355,45 @@ impl Engine {
             crate::workers::status(entry, id, native, view, timeline, ready, self.operators());
         status["checkout"] = json!(scope.project);
         status["parent"] = json!(entry.origin.parent);
+        let requests = self.worker_requests(scope, id, &entry.origin);
+        if !requests.is_empty() {
+            let answerable = requests.iter().any(|r| r["parent_may_answer"] == true);
+            if answerable && status["waiting_for_operator"].is_object() {
+                status["waiting_for_operator"]["parent_may_answer"] = json!(true);
+                status["waiting_for_operator"]["message"] = json!(format!(
+                    "The worker is waiting on a request you may answer: read requests, then call answer_ox_worker with job_id {job_id} and its request_id. It is also shown to the user in OX Desktop and on paired phones; whoever answers first decides."
+                ));
+            }
+            status["requests"] = json!(requests);
+        }
         Ok(status)
+    }
+    /// The verified level of the hosted session that started this worker, bounded
+    /// by its own stamp. `None` when it is a terminal launch, closed or unverified.
+    pub(super) fn parent_level(&self, origin: &Origin) -> Option<Level> {
+        let scope = origin.parent.scope.as_ref()?;
+        let session = origin.parent.session.as_deref()?;
+        let live = self.running.get(scope)?;
+        crate::workers::source_level(
+            live.store.applied_ceiling(Some(session)),
+            self.workers.get(scope, session).map(|e| &e.origin),
+        )
+    }
+    /// The open requests of one worker session, as its parent agent sees them.
+    pub(super) fn worker_requests(&self, scope: &Scope, id: &str, origin: &Origin) -> Vec<Value> {
+        let Some(live) = self.running.get(scope) else {
+            return vec![];
+        };
+        let level = self.parent_level(origin);
+        let setting = worker_approvals();
+        worker_asks(&live.store, id)
+            .map(|ask| {
+                crate::workers::request_view(
+                    ask,
+                    crate::workers::parent_may_answer(origin, level, ask, setting),
+                )
+            })
+            .collect()
     }
     /// Resolve the caller to exactly one parent identity, or refuse. Every
     /// parent operation uses this one result.
@@ -2426,7 +2490,9 @@ impl Engine {
     }
     /// The parent agent's four tools. Every answer comes from host session state.
     fn parent_call(&mut self, caller: &Caller, call: ParentCall) -> Result<Value, String> {
-        if self.update_reserved() && matches!(call, ParentCall::Steer { .. }) {
+        if self.update_reserved()
+            && matches!(call, ParentCall::Steer { .. } | ParentCall::Answer { .. })
+        {
             return Err(crate::handover::REFUSAL.into());
         }
         let me = self.resolve(caller)?;
@@ -2485,6 +2551,7 @@ impl Engine {
             }
             ParentCall::Status { job_id }
             | ParentCall::Steer { job_id, .. }
+            | ParentCall::Answer { job_id, .. }
             | ParentCall::Cancel { job_id } => *job_id,
             ParentCall::ReadThread { .. } => {
                 return Err("read_ox_thread is answered separately.".into());
@@ -2494,7 +2561,7 @@ impl Engine {
             && let Some(status) = self.unstarted_job(&me, job_id)
         {
             return match call {
-                ParentCall::Steer { .. } => Err(format!(
+                ParentCall::Steer { .. } | ParentCall::Answer { .. } => Err(format!(
                     "This worker has not started: {}.",
                     status["status"].as_str().unwrap_or("waiting")
                 )),
@@ -2524,6 +2591,12 @@ impl Engine {
             | ParentCall::Bind { .. }
             | ParentCall::Status { .. }
             | ParentCall::ReadThread { .. } => self.job_status(job_id),
+            ParentCall::Answer {
+                request,
+                choice,
+                answers,
+                ..
+            } => self.parent_answer(&scope, &id, request, choice, answers),
             ParentCall::Steer { text, .. } => {
                 let text = text.trim();
                 if text.is_empty() || text.len() > 24 * 1024 {
@@ -2534,15 +2607,11 @@ impl Engine {
                     .running
                     .get_mut(&scope)
                     .ok_or("This worker is not accepting input.")?;
-                // Text from the parent never answers a request that waits for the operator.
-                if live
-                    .store
-                    .asks()
-                    .iter()
-                    .any(|a| a.thread.as_deref() == Some(&id))
-                {
+                // Text from the parent never answers an open request.
+                if worker_asks(&live.store, &id).next().is_some() {
                     return Err(
-                        "The worker is waiting for the operator to answer a request.".into(),
+                        "The worker is waiting on an open request. Answer it with answer_ox_worker if you may, or wait for the operator."
+                            .into(),
                     );
                 }
                 if status["can_steer"] != true {
@@ -2578,6 +2647,51 @@ impl Engine {
                 self.job_status(job_id)
             }
         }
+    }
+    /// A parent agent answers one of its worker's open requests, where policy lets it.
+    fn parent_answer(
+        &mut self,
+        scope: &Scope,
+        id: &str,
+        request: RequestId,
+        choice: Option<usize>,
+        answers: Option<Vec<String>>,
+    ) -> Result<Value, String> {
+        let origin = self
+            .workers
+            .get(scope, id)
+            .map(|e| e.origin.clone())
+            .ok_or("Unknown worker job for this parent session.")?;
+        let level = self.parent_level(&origin);
+        let setting = worker_approvals();
+        let live = self
+            .running
+            .get_mut(scope)
+            .ok_or("This worker is not running, so it has no open request.")?;
+        let ask = worker_asks(&live.store, id)
+            .find(|a| a.id == request)
+            .ok_or("This worker has no open request with that request_id. Read its requests with ox_worker_status.")?;
+        crate::workers::parent_may_answer(&origin, level, ask, setting).map_err(str::to_owned)?;
+        let result = match (choice, answers) {
+            (Some(choice), None) => {
+                crate::workers::parent_may_choose(ask, choice).map_err(str::to_owned)?;
+                live.store.answer(&request, choice)
+            }
+            (None, Some(answers)) if !ask.questions.is_empty() => {
+                live.store.answer_questions(&request, &answers)
+            }
+            _ => {
+                return Err(
+                    "Answer an approval with choice, or a question form with answers in order."
+                        .into(),
+                );
+            }
+        };
+        result.map_err(|e| e.to_string())?;
+        live.tokens.remove(&request);
+        self.process(scope, vec![], true)
+            .map_err(|e| e.to_string())?;
+        Ok(json!({"answered": true, "request_id": request}))
     }
     /// Cancel a worker whose runtime is still opening: nothing was sent to it yet, so
     /// the launch is abandoned, its launcher hears "cancelled", and the worker's
@@ -3013,6 +3127,27 @@ impl Engine {
 /// Clients that receive navigation metadata only: the catalog watch and scope-less subscriptions.
 // Only catalog watchers are filtered. A scope-less Subscribe means "every scope"
 // (the phone and web push rely on asks and notifications from it), as on main.
+/// The open requests of one worker session, including those of its subagents.
+fn worker_asks<'a>(
+    store: &'a Store,
+    id: &'a str,
+) -> impl Iterator<Item = &'a ox_desk_core::asks::Ask> + 'a {
+    store.asks().iter().filter(move |a| {
+        a.thread.as_deref() == Some(id)
+            || store
+                .claude_ask_tool(&a.id)
+                .is_some_and(|(owner, _)| owner == id)
+    })
+}
+
+/// Who answers worker requests, from the shared Desktop preferences. A missing or
+/// unreadable file means the default.
+fn worker_approvals() -> ox_desk_core::desktop_behavior::WorkerApprovals {
+    ox_desk_core::desktop_behavior::read()
+        .map(|s| s.behavior.worker_approvals)
+        .unwrap_or_default()
+}
+
 fn catalog_only(client: &ClientState) -> bool {
     client.catalog
 }
@@ -4237,6 +4372,193 @@ mod tests {
                 engine.workers.get(&worker, "w").unwrap().marks.access,
                 Some(Access::Workspace)
             );
+        }
+
+        #[test]
+        fn a_parent_that_runs_without_a_person_answers_its_workers_requests() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker) = scopes(root.path());
+            let ask = |id: i64, thread: &str| AskView {
+                command: None,
+                id: RequestId::Number(id),
+                token: "native".into(),
+                thread: Some(thread.into()),
+                turn: Some("t1".into()),
+                item: None,
+                choice_details: vec![None, None],
+                title: "Run command".into(),
+                detail: "cargo test".into(),
+                choices: vec!["Allow".into(), "Decline".into()],
+                questions: vec![],
+            };
+            let (l, log) = live(
+                &worker,
+                vec![
+                    view(&worker, "w", "needs_input", "workspace"),
+                    view(&worker, "r", "needs_input", "read_only"),
+                ],
+                &["w", "r"],
+                vec![ask(9, "w"), ask(10, "r")],
+            );
+            engine.running.insert(worker.clone(), l);
+            with_parent(&mut engine, &parent, "yolo");
+            engine.workers.stamp(
+                &worker,
+                "w",
+                origin(workers_parent(&parent, "a"), Ceiling::Write),
+            );
+            let mut read = origin(workers_parent(&parent, "a"), Ceiling::Read);
+            read.job_id = 42;
+            engine.workers.stamp(&worker, "r", read);
+            engine.process(&worker, vec![], true).unwrap();
+            let me = thread(&parent, "a");
+            let status = engine
+                .parent_call(&me, ParentCall::Status { job_id: 41 })
+                .unwrap();
+            assert_eq!(status["status"], "waiting_for_operator");
+            assert_eq!(status["waiting_for_operator"]["parent_may_answer"], true);
+            assert_eq!(status["requests"][0]["request_id"], 9);
+            assert_eq!(
+                status["requests"][0]["choices"],
+                json!(["Allow", "Decline"])
+            );
+            let answer = |job_id, request| ParentCall::Answer {
+                job_id,
+                request: RequestId::Number(request),
+                choice: Some(0),
+                answers: None,
+            };
+            // A read worker's approval stays with the operator, even under a YOLO parent.
+            let status = engine
+                .parent_call(&me, ParentCall::Status { job_id: 42 })
+                .unwrap();
+            assert_eq!(status["requests"][0]["parent_may_answer"], false);
+            assert!(engine.parent_call(&me, answer(42, 10)).is_err());
+            // Its question is an answer, not a grant: the parent may fill it in, unless secret.
+            let question = |secret| ox_desk_core::asks::Question {
+                id: "q".into(),
+                question: "Which file?".into(),
+                header: "File".into(),
+                is_other: true,
+                is_secret: secret,
+                multi_select: false,
+                options: None,
+            };
+            for (id, secret) in [(11, false), (12, true)] {
+                let mut q = ask(id, "r");
+                q.choices = vec![];
+                q.choice_details = vec![];
+                q.questions = vec![question(secret)];
+                engine
+                    .running
+                    .get_mut(&worker)
+                    .unwrap()
+                    .store
+                    .apply(LinkEvent::Host(Box::new(Server::Delta {
+                        cursor: Cursor {
+                            epoch: "e".into(),
+                            seq: id as u64,
+                        },
+                        scope: worker.clone(),
+                        changes: vec![Change::Asks {
+                            asks: vec![ask(9, "w"), q],
+                        }],
+                    })));
+                let status = engine
+                    .parent_call(&me, ParentCall::Status { job_id: 42 })
+                    .unwrap();
+                assert_eq!(
+                    status["requests"][0]["parent_may_answer"], !secret,
+                    "{status}"
+                );
+            }
+            // An approval too long to show in full is never the parent's to answer.
+            let mut long = ask(13, "w");
+            long.detail = "x".repeat(crate::workers::REQUEST_DETAIL_LIMIT + 1);
+            engine
+                .running
+                .get_mut(&worker)
+                .unwrap()
+                .store
+                .apply(LinkEvent::Host(Box::new(Server::Delta {
+                    cursor: Cursor {
+                        epoch: "e".into(),
+                        seq: 5,
+                    },
+                    scope: worker.clone(),
+                    changes: vec![Change::Asks {
+                        asks: vec![ask(9, "w"), ask(10, "r"), long],
+                    }],
+                })));
+            let status = engine
+                .parent_call(&me, ParentCall::Status { job_id: 41 })
+                .unwrap();
+            let shown = &status["requests"][1];
+            assert_eq!(shown["request_id"], 13);
+            assert_eq!(shown["parent_may_answer"], false);
+            assert!(
+                shown["detail"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("the operator answers this request]")
+            );
+            assert!(engine.parent_call(&me, answer(41, 13)).is_err());
+            // A choice that sets a lasting rule shows its scope and stays with the operator.
+            let mut rule = ask(14, "w");
+            rule.choices = vec!["Allow once".into(), "Always allow this prefix".into()];
+            rule.choice_details = vec![None, Some("\"cargo\"".into())];
+            engine
+                .running
+                .get_mut(&worker)
+                .unwrap()
+                .store
+                .apply(LinkEvent::Host(Box::new(Server::Delta {
+                    cursor: Cursor {
+                        epoch: "e".into(),
+                        seq: 6,
+                    },
+                    scope: worker.clone(),
+                    changes: vec![Change::Asks {
+                        asks: vec![ask(9, "w"), ask(10, "r"), rule],
+                    }],
+                })));
+            let status = engine
+                .parent_call(&me, ParentCall::Status { job_id: 41 })
+                .unwrap();
+            let shown = &status["requests"][1];
+            assert_eq!(shown["choice_details"], json!([null, "\"cargo\""]));
+            assert_eq!(shown["parent_choices"], json!([0]));
+            let lasting = ParentCall::Answer {
+                job_id: 41,
+                request: RequestId::Number(14),
+                choice: Some(1),
+                answers: None,
+            };
+            assert!(
+                engine
+                    .parent_call(&me, lasting)
+                    .unwrap_err()
+                    .contains("lasting rule")
+            );
+            // A request of another worker is not this job's to answer.
+            assert!(engine.parent_call(&me, answer(41, 10)).is_err());
+            assert!(log.lock().unwrap().is_empty());
+            // A parent whose own mode asks a person cannot approve for its worker.
+            with_parent(&mut engine, &parent, "workspace");
+            let refused = engine.parent_call(&me, answer(41, 9)).unwrap_err();
+            assert!(refused.contains("person"), "{refused}");
+            assert!(log.lock().unwrap().is_empty());
+            with_parent(&mut engine, &parent, "yolo");
+            assert_eq!(
+                engine.parent_call(&me, answer(41, 9)).unwrap()["answered"],
+                true
+            );
+            assert!(matches!(
+                log.lock().unwrap()[0].0,
+                Action::AnswerAsk(RequestId::Number(9), 0)
+            ));
         }
 
         #[test]
@@ -6139,12 +6461,23 @@ mod tests {
             rx: &std::sync::mpsc::Receiver<ox_desk_core::links::LinkEvent>,
             subscription_model: Option<&str>,
         ) -> Result<Value, String> {
+            launch_task_on_warm_claude(engine, scope, lead, rx, subscription_model, "check")
+        }
+        fn launch_task_on_warm_claude(
+            engine: &mut Engine,
+            scope: &Scope,
+            lead: &str,
+            rx: &std::sync::mpsc::Receiver<ox_desk_core::links::LinkEvent>,
+            subscription_model: Option<&str>,
+            task: &str,
+        ) -> Result<Value, String> {
             let caller = Caller::Operator {
                 scope: scope.clone(),
                 parent: lead.to_owned(),
                 device: "probe".into(),
             };
             let mut request = start(false);
+            request.task = task.into();
             request.runtime = Runtime::Claude;
             request.model = None;
             request.parent = lead.to_owned();
@@ -6483,6 +6816,46 @@ mod tests {
                     .unwrap()
                     .user_messages(&n.text, &[]),
                 1
+            );
+        }
+
+        #[test]
+        fn a_read_worker_finishing_its_plan_reports_without_an_operator() {
+            let root = tempfile::tempdir().unwrap();
+            let (scope, lead, mut engine, rx) = warm_claude(root.path());
+            let started = launch_task_on_warm_claude(
+                &mut engine,
+                &scope,
+                &lead,
+                &rx,
+                None,
+                "PLAN-EXIT review",
+            )
+            .expect("a read worker starts");
+            let session = started["session"].as_str().unwrap().to_owned();
+            let raw = session.rsplit(':').next().unwrap().to_owned();
+            let job = engine.workers.get(&scope, &session).unwrap().origin.job_id;
+            pump_engine(&mut engine, &scope, &rx, &|e| {
+                e.job_status(job).unwrap()["status"] == "completed"
+            });
+            // The host turned the exit down itself with the report instruction; no
+            // request ever waited for a person.
+            let answer: Value = serde_json::from_str(
+                &std::fs::read_to_string(root.path().join(format!("plan-exit-{raw}"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(answer["response"]["behavior"], "deny");
+            assert_eq!(answer["response"]["message"], crate::workers::PLAN_REPORT);
+            assert!(engine.running[&scope].store.asks().is_empty());
+            let status = engine.job_status(job).unwrap();
+            assert!(status["waiting_for_operator"].is_null());
+            assert_eq!(status["access_ceiling"], "read");
+            assert_eq!(status["started_mode"], "plan");
+            assert!(
+                status["result"]
+                    .as_str()
+                    .is_some_and(|r| r.contains("the plan is the report")),
+                "{status}"
             );
         }
 

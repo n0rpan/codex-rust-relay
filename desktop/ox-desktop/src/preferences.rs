@@ -65,6 +65,7 @@ pub struct Preferences {
     project: PathBuf,
     prefer_providers: bool,
     settings: Settings,
+    remote_behavior: Option<Result<behavior::Behavior, String>>,
     page: Page,
     section: Section,
     selected: Option<usize>,
@@ -109,6 +110,7 @@ impl Preferences {
             project,
             prefer_providers: false,
             settings: Settings::default(),
+            remote_behavior: None,
             page: Page::Providers,
             section: Section::Connection,
             selected: None,
@@ -158,6 +160,9 @@ impl Preferences {
         self.remote = (page == Page::Remote)
             .then(|| cx.new(|cx| remote::Remote::new(self.project.clone(), cx)));
         self.page = page;
+        if page == Page::Accounts && self.link.remote().is_some() {
+            self.refresh_remote_behavior(cx);
+        }
         self.scroll.set_offset(point(px(0.), px(0.)));
         cx.notify();
     }
@@ -661,6 +666,7 @@ impl Preferences {
                     }),
                 ))),
             )
+            .child(self.agents_card(p, cx))
             .when(self.link.remote().is_none(), |v| {
                 v.child(self.about.clone())
             })

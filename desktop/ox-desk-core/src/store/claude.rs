@@ -79,7 +79,7 @@ struct Process {
     /// Native message UUID and durable host notice id until the CLI echoes it.
     worker_notice: Option<(String, u64)>,
     /// The permission mode this process was launched with.
-    launch_mode: String,
+    launch_mode: Option<String>,
     /// The explicit subscription model to reuse if a turn needs to be retried.
     selected_model: Option<String>,
     started_new: bool,
@@ -699,8 +699,9 @@ impl Store {
             (Session::New(_), Some(c)) => Some(c.permission_mode().to_owned()),
             _ => preset.and_then(Access::mode).map(str::to_owned),
         }
-        .or_else(|| contract.map(|c| c.permission_mode().to_owned()))
-        .unwrap_or_else(|| "default".to_owned());
+        .or_else(|| contract.map(|c| c.permission_mode().to_owned()));
+        // With no chosen mode, Claude Code starts in its own configured default,
+        // as `claude` does in a terminal, and reports that mode on connect.
         let model = model.or_else(|| match &session {
             Session::New(_) if contract.is_none() && !profile.route.is_api() => {
                 self.next_options.take().map(|options| options.model)
@@ -1292,6 +1293,30 @@ impl Store {
             .ok_or_else(|| io::Error::other("Claude session has closed"))?
             .respond(&ask.request_id, answer)?;
         self.claude_mut().asks.remove(id);
+        Ok(())
+    }
+    /// The session that owns an open Claude tool request and the tool it asks
+    /// for. `None` for another runtime or an unknown request.
+    pub fn claude_ask_tool(&self, id: &RequestId) -> Option<(&str, &str)> {
+        let links::Link::Claude(project) = &self.link else {
+            return None;
+        };
+        project
+            .asks
+            .get(id)
+            .map(|(owner, ask)| (owner.as_str(), ask.tool.as_str()))
+    }
+    /// Turn down an open Claude tool request. Claude Code receives `message` as
+    /// the tool's error result and the turn continues.
+    pub fn deny_claude_ask(&mut self, id: &RequestId, message: &str) -> io::Result<()> {
+        let answer = match &self.link {
+            links::Link::Claude(project) => project.asks.get(id).map(|(_, ask)| ask.deny(message)),
+            _ => None,
+        }
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Request already resolved"))?;
+        self.claude_response(id, answer)?;
+        self.asks.retain(|a| &a.id != id);
+        self.changed.mark(Changed::ASK);
         Ok(())
     }
     pub(super) fn claude_questions(&mut self, id: &RequestId, values: &[String]) -> io::Result<()> {

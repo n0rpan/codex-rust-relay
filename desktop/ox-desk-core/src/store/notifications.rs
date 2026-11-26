@@ -103,12 +103,24 @@ impl Store {
             .filter(|&mode| level(mode).is_some_and(|m| Some(m) <= level(fixed)))
             .or(Some(fixed))
     }
+    /// Replace where new sessions read their start mode, for tests and embedders.
+    pub fn set_start_mode(
+        &mut self,
+        source: fn(crate::runtime::Runtime) -> Option<crate::runtime::Access>,
+    ) {
+        self.start_mode = source;
+    }
+    /// The start mode for a new session nobody chose a mode for.
+    pub(crate) fn start_mode(&self) -> Option<crate::runtime::Access> {
+        (self.start_mode)(self.profile.route.runtime)
+    }
     pub fn next_access(&self) -> Option<crate::codex::access::Access> {
         self.starting_access(
             self.host_start
                 .map(|level| level.preset(self.profile.route.runtime)),
             self.next_preset,
         )
+        .or_else(|| self.remote().is_none().then(|| self.start_mode()).flatten())
     }
     pub fn set_next_access(&mut self, access: crate::codex::access::Access) {
         if !crate::runtime::Access::choices(self.profile.route.runtime).contains(&access)

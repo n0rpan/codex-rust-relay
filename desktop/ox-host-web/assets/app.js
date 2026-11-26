@@ -156,7 +156,39 @@ let cold = new Map(),
   unacked = new Map(),
   // The last `restored_draft.message` applied per owner, so each host restore lands once.
   restoredSeen = new Map(),
+  foldedProjects = new Set(),
+  pinnedThreads = new Map(),
+  threadColors = new Map(),
   visibleRows = 200;
+
+const SIDEBAR_META_KEY = "ox-phone-sidebar-v1";
+const ACCENT_COLORS = ["cobalt", "amber", "emerald", "coral", "violet", "cyan"];
+function loadSidebarMeta() {
+  try {
+    const raw = localStorage.getItem(SIDEBAR_META_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    for (const [k, ts] of Object.entries(parsed.pinned || {}))
+      if (typeof ts === "number") pinnedThreads.set(k, ts);
+    for (const [k, c] of Object.entries(parsed.colors || {}))
+      if (ACCENT_COLORS.includes(c)) threadColors.set(k, c);
+    for (const p of parsed.foldedProjects || [])
+      if (typeof p === "string") foldedProjects.add(p);
+  } catch {}
+}
+function saveSidebarMeta() {
+  try {
+    localStorage.setItem(
+      SIDEBAR_META_KEY,
+      JSON.stringify({
+        pinned: Object.fromEntries(pinnedThreads),
+        colors: Object.fromEntries(threadColors),
+        foldedProjects: [...foldedProjects],
+      }),
+    );
+  } catch {}
+}
+loadSidebarMeta();
 const global = new Projection(true);
 const controls = new SessionControls();
 const activityLine = new ActivityLine(
@@ -800,8 +832,21 @@ function catalog() {
   // in a review checkout on another route. A filtered-out parent still leaves a
   // navigable reference on the child.
   const tree = catalogTree(visible, rows);
+  const filtering = Boolean(needle) || filter !== "all";
+  const pinnedList = [];
   const byProject = new Map();
+  for (const entry of visible) {
+    const k = keyOf(entry.scope, entry.session.id);
+    if (pinnedThreads.has(k)) pinnedList.push(entry);
+  }
+  pinnedList.sort(
+    (a, b) =>
+      (pinnedThreads.get(keyOf(b.scope, b.session.id)) || 0) -
+        (pinnedThreads.get(keyOf(a.scope, a.session.id)) || 0) ||
+      b.session.updated_at - a.session.updated_at,
+  );
   for (const entry of tree.roots) {
+    if (pinnedThreads.has(keyOf(entry.scope, entry.session.id))) continue;
     const list = byProject.get(entry.scope.project) ?? [];
     list.push(entry);
     byProject.set(entry.scope.project, list);
@@ -820,61 +865,114 @@ function catalog() {
   const names = new Map();
   for (const project of byProject.keys())
     names.set(leaf(project), (names.get(leaf(project)) || 0) + 1);
+  const done = new Set();
+  const renderEntry = (entry, depth, showProjectTag) => {
+    const { scope, session, needsInput } = entry,
+      key = keyOf(scope, session.id);
+    if (done.has(key)) return;
+    done.add(key);
+    const recorded = tree.links.get(key),
+      elsewhere = recorded && recorded.project !== scope.project,
+      model = actualModel(session),
+      isPinned = pinnedThreads.has(key),
+      accent = threadColors.get(key);
+    const b = button("", () => open(scope, session.id));
+    b.dataset.source =
+      session.parent || session.detail?.worker || session.detail?.origin
+        ? "worker"
+        : scope.route.billing !== "subscription"
+          ? "api"
+          : scope.route.runtime;
+    b.dataset.needsInput = String(Boolean(needsInput));
+    b.dataset.passive = String(
+      !needsInput && ["saved", "idle"].includes(session.status),
+    );
+    b.dataset.threadId = session.id;
+    if (isPinned) b.dataset.pinned = "true";
+    if (accent) b.dataset.accent = accent;
+    b.className = "session" + (depth ? " nested" : "");
+    const head = el("div", "session-top");
+    const titleText =
+      (isPinned ? "★ " : "") + (session.title || "Untitled session");
+    head.append(
+      el("span", "session-name", titleText),
+      el("span", "status", statusText(session, needsInput)),
+    );
+    let meta = depth ? "↳ " : "";
+    if (showProjectTag || (depth && elsewhere))
+      meta += leaf(scope.project) + " · ";
+    else if (!depth && recorded)
+      meta += `↳ ${recorded.title || leaf(recorded.project)} · `;
+    meta += routesLabel(scope.route);
+    if (model) meta += ` · ${model}`;
+    if (session.updated_at > 0 && nowSec >= session.updated_at)
+      meta += ` · ${ago(nowSec - session.updated_at)}`;
+    b.append(head, el("div", "meta", meta));
+    const worker = session.detail?.worker_notice;
+    if (worker?.status)
+      b.append(
+        el(
+          "div",
+          "worker-outcome",
+          `Worker #${worker.job_id} · ${worker.status.replaceAll("_", " ")}`,
+        ),
+      );
+    frag.append(b);
+    for (const child of tree.children.get(key) || [])
+      if (!pinnedThreads.has(keyOf(child.scope, child.session.id)))
+        renderEntry(child, depth + 1, false);
+  };
+  if (pinnedList.length) {
+    const pinKey = "__pinned__";
+    const folded = !filtering && foldedProjects.has(pinKey);
+    const heading = el(
+      "h2",
+      "project pinned-project",
+      `${folded ? "▸" : "▾"} ★ Pinned (${pinnedList.length})`,
+    );
+    heading.onclick = () => {
+      if (foldedProjects.has(pinKey)) foldedProjects.delete(pinKey);
+      else foldedProjects.add(pinKey);
+      saveSidebarMeta();
+      repaint();
+    };
+    frag.append(heading);
+    if (!folded) {
+      for (const entry of pinnedList) renderEntry(entry, 0, true);
+    }
+  }
   for (const [project, list] of [...byProject].sort((a, b) =>
     a[0].localeCompare(b[0]),
   )) {
     const name = leaf(project);
-    const heading = el("h2", "project", names.get(name) === 1 ? name : project);
+    const label = names.get(name) === 1 ? name : project;
+    const folded = !filtering && foldedProjects.has(project);
+    let runningCount = 0,
+      waitingCount = 0;
+    for (const entry of list) {
+      if (entry.needsInput) waitingCount++;
+      else if (entry.session.status === "running") runningCount++;
+    }
+    let badge = ` (${list.length})`;
+    if (waitingCount) badge += ` · ${waitingCount} waiting`;
+    else if (runningCount) badge += ` · ${runningCount} running`;
+    const heading = el(
+      "h2",
+      "project",
+      `${folded ? "▸" : "▾"} ${label}${badge}`,
+    );
     heading.title = project;
-    frag.append(heading);
-    const done = new Set();
-    const add = (entry, depth) => {
-      const { scope, session, needsInput } = entry,
-        key = keyOf(scope, session.id);
-      if (done.has(key)) return;
-      done.add(key);
-      const recorded = tree.links.get(key),
-        elsewhere = recorded && recorded.project !== scope.project,
-        model = actualModel(session);
-      const b = button("", () => open(scope, session.id));
-      b.dataset.source =
-        session.parent || session.detail?.worker || session.detail?.origin
-          ? "worker"
-          : scope.route.billing !== "subscription"
-            ? "api"
-            : scope.route.runtime;
-      b.dataset.needsInput = String(Boolean(needsInput));
-      b.dataset.passive = String(
-        !needsInput && ["saved", "idle"].includes(session.status),
-      );
-      b.dataset.threadId = session.id;
-      b.className = "session" + (depth ? " nested" : "");
-      const head = el("div", "session-top");
-      head.append(
-        el("span", "session-name", session.title || "Untitled session"),
-        el("span", "status", statusText(session, needsInput)),
-      );
-      let meta = depth ? "↳ " : "";
-      if (depth && elsewhere) meta += leaf(scope.project) + " · ";
-      else if (!depth && recorded)
-        meta += `↳ ${recorded.title || leaf(recorded.project)} · `;
-      meta += routesLabel(scope.route);
-      if (model) meta += ` · ${model}`;
-      if (session.updated_at > 0 && nowSec >= session.updated_at)
-        meta += ` · ${ago(nowSec - session.updated_at)}`;
-      b.append(
-        head,
-        el("div", "meta", meta),
-      );
-      const worker = session.detail?.worker_notice;
-      if (worker?.status)
-        b.append(el("div", "worker-outcome",
-          `Worker #${worker.job_id} · ${worker.status.replaceAll("_", " ")}`));
-      frag.append(b);
-      for (const child of tree.children.get(key) || []) add(child, depth + 1);
+    heading.onclick = () => {
+      if (foldedProjects.has(project)) foldedProjects.delete(project);
+      else foldedProjects.add(project);
+      saveSidebarMeta();
+      repaint();
     };
-    list.sort((a, b) => b.session.updated_at - a.session.updated_at);
-    for (const entry of list) add(entry, 0);
+    frag.append(heading);
+    if (!folded) {
+      list.sort((a, b) => b.session.updated_at - a.session.updated_at);
+      for (const entry of list) renderEntry(entry, 0, false);
+    }
   }
   if (!frag.childNodes.length)
     frag.append(
@@ -1336,6 +1434,29 @@ function conversation() {
       confirmIn($("confirm-slot"), question, label, work),
     notice,
     routesLabel,
+    pinned: Boolean(id && pinnedThreads.has(keyOf(scope, id))),
+    color: id ? threadColors.get(keyOf(scope, id)) || null : null,
+    togglePin: () => {
+      if (!id) return;
+      const tk = keyOf(scope, id);
+      if (pinnedThreads.has(tk)) pinnedThreads.delete(tk);
+      else pinnedThreads.set(tk, Date.now());
+      saveSidebarMeta();
+      closeActionMenus();
+      repaint();
+    },
+    cycleColor: () => {
+      if (!id) return;
+      const tk = keyOf(scope, id);
+      const cur = threadColors.get(tk);
+      const idx = cur ? ACCENT_COLORS.indexOf(cur) : -1;
+      if (idx + 1 < ACCENT_COLORS.length)
+        threadColors.set(tk, ACCENT_COLORS[idx + 1]);
+      else threadColors.delete(tk);
+      saveSidebarMeta();
+      closeActionMenus();
+      repaint();
+    },
   });
   $("title").textContent = row?.title || (id ? "Session" : "New session");
   $("nav-title").textContent = $("title").textContent;

@@ -133,6 +133,9 @@ pub struct Store {
     /// its contract so a continuation never falls back to the account default.
     worker_models: HashMap<String, String>,
     child_threads: HashMap<String, (String, PathBuf)>,
+    /// The mode a new session starts in when nobody chose one: the saved
+    /// "New sessions start in" setting, read when the session starts.
+    start_mode: fn(crate::runtime::Runtime) -> Option<crate::runtime::Access>,
     next_preset: Option<crate::codex::access::Access>,
     host_start: Option<crate::modes::Level>,
     review_yolo_resumes: bool,
@@ -243,6 +246,7 @@ impl Store {
             review_yolo_resumes: false,
             held_yolo_resumes: HashMap::new(),
             worker_ceilings: HashMap::new(),
+            start_mode: crate::desktop_behavior::start_mode,
             selection: 0,
             drafts: HashMap::new(),
             changed: Changed::default(),

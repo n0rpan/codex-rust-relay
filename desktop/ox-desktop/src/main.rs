@@ -6,6 +6,7 @@ mod kit;
 mod platform;
 mod preferences;
 mod settings;
+mod sidebar_state;
 mod sky;
 mod terminal;
 mod updates;

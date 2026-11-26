@@ -55,7 +55,7 @@ fn spawn(root: &Path, worker: bool) -> (Link, Receiver<Event>) {
             billing: Billing::Subscription,
             session: Session::New(SESSION.into()),
             model: None,
-            permission_mode: "default".into(),
+            permission_mode: Some("default".into()),
             contract: worker.then(|| {
                 ox_desk_core::claude_worker_contract::Contract::with_support(false, false, false)
             }),

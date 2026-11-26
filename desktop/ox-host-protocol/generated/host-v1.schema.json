@@ -1524,7 +1524,7 @@
       "type": "string"
     },
     "ParentCall": {
-      "description": "The only operations a parent agent has on its workers. Approvals, questions and\npermission changes belong to the human operator and have no variant here.",
+      "description": "The only operations a parent agent has on its workers. Permission changes\nbelong to the human operator and have no variant here. A parent answers a\nworker's approval or question only where the host's policy lets it stand in\nfor the operator.",
       "oneOf": [
         {
           "additionalProperties": false,
@@ -1610,6 +1610,49 @@
           "required": [
             "op",
             "job_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Answer one open request of the worker: `choice` picks one of its listed\nchoices, `answers` fills its questions in order.",
+          "properties": {
+            "answers": {
+              "default": null,
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "choice": {
+              "default": null,
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "job_id": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "op": {
+              "const": "answer",
+              "type": "string"
+            },
+            "request": {
+              "$ref": "#/$defs/RequestId"
+            }
+          },
+          "required": [
+            "op",
+            "job_id",
+            "request"
           ],
           "type": "object"
         },
