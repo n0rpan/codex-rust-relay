@@ -5,6 +5,7 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::input::{Input, InputState};
+use ox_desk_core::host_policy::HostPolicy;
 use ox_host_web::host_profile::{Edit, HostProfile};
 use ox_host_web::host_updates::{Channel, Command, Mode, Status};
 use std::io;
@@ -15,6 +16,9 @@ pub(crate) struct Hosts {
     code: Entity<InputState>,
     hosts: Vec<SavedHost>,
     selected: Option<SavedHost>,
+    policy: Option<HostPolicy>,
+    pair_policy: Option<HostPolicy>,
+    choosing_pair_policy: bool,
     status: Option<Status>,
     review: Option<KeyReview>,
     busy: bool,
@@ -40,6 +44,9 @@ impl Hosts {
                 .unwrap_or_default(),
             hosts: loaded.unwrap_or_default(),
             selected: None,
+            policy: None,
+            pair_policy: None,
+            choosing_pair_policy: false,
             status: None,
             review: None,
             busy: false,
@@ -73,6 +80,7 @@ impl Hosts {
     }
     fn select(&mut self, host: Option<SavedHost>, cx: &mut Context<Self>) {
         self.selected = host;
+        self.policy = None;
         self.profile_fields = None;
         self.status = None;
         self.review = None;
@@ -99,6 +107,29 @@ impl Hosts {
             },
             |s, status, _| s.status = Some(status),
         )
+    }
+    fn host_policy(host: Option<&SavedHost>, set: Option<HostPolicy>) -> io::Result<HostPolicy> {
+        if let Some(h) = host {
+            let response =
+                h.settings(serde_json::json!({"action":"host_mode_policy","set":set}))?;
+            serde_json::from_value(response["policy"].clone())
+                .map_err(|_| io::Error::other("Update the host to manage its mode policy."))
+        } else {
+            let paths = ox_host_service::Paths::discover()?;
+            if let Some(policy) = set {
+                policy.save(&paths.state_dir)?;
+                return Ok(policy);
+            }
+            HostPolicy::read(&paths.state_dir)
+        }
+    }
+    fn edit_policy(&mut self, set: Option<HostPolicy>, cx: &mut Context<Self>) {
+        let host = self.selected.clone();
+        self.work(
+            cx,
+            move || Self::host_policy(host.as_ref(), set),
+            |s, policy, _| s.policy = Some(policy),
+        );
     }
     fn profile(host: Option<SavedHost>, edit: Option<Edit>) -> io::Result<HostProfile> {
         match host {
@@ -199,6 +230,7 @@ impl Hosts {
             move |s, rows, cx| {
                 s.hosts = rows;
                 s.selected = None;
+                s.policy = None;
                 s.profile_fields = None;
                 s.review = None;
                 s.status = None;
@@ -215,9 +247,14 @@ impl Hosts {
     fn add(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let address = self.address.read(cx).value().to_string();
         let code = self.code.read(cx).value().to_string();
+        let choice = self.pair_policy;
         let task = cx.background_spawn(async move {
             let label = hosts::device_label();
-            hosts::pair(&address, &code, &label)
+            let host = hosts::pair(&address, &code, &label)?;
+            let policy = choice
+                .map(|selected| Self::host_policy(Some(&host), Some(selected)))
+                .transpose();
+            Ok::<_, io::Error>((host, policy))
         });
         self.busy = true;
         self.notice.clear();
@@ -227,7 +264,9 @@ impl Hosts {
             let _ = this.update_in(cx, |s, w, cx| {
                 s.busy = false;
                 match result {
-                    Ok(host) => {
+                    Ok((host, policy)) => {
+                        s.pair_policy = None;
+                        s.choosing_pair_policy = false;
                         s.address.update(cx, |v, cx| v.set_value("", w, cx));
                         s.code.update(cx, |v, cx| v.set_value("", w, cx));
                         s.hosts
@@ -235,6 +274,14 @@ impl Hosts {
                         s.hosts.push(host.clone());
                         cx.set_global(HostDirectory(s.hosts.clone()));
                         s.select(Some(host), cx);
+                        match policy {
+                            Ok(current) => s.policy = current,
+                            Err(error) => {
+                                s.notice = format!(
+                                    "Host paired. Its mode policy could not be changed: {error}"
+                                )
+                            }
+                        }
                     }
                     Err(e) => s.notice = e.to_string(),
                 }
@@ -431,6 +478,31 @@ impl Render for Hosts {
                     )),
             );
         }
+        if self.selected.is_some() || !cx.global::<crate::app::ClientOnly>().0 {
+            if let Some(current) = self.policy {
+                let mut choices = div().flex().gap_2().flex_wrap();
+                for (index, mode) in HostPolicy::ALL.into_iter().enumerate() {
+                    choices = choices.child(button(
+                        p,
+                        ("host-mode", index),
+                        mode.label(),
+                        current == mode,
+                        !self.busy,
+                        cx.listener(move |s, _, _, cx| s.edit_policy(Some(mode), cx)),
+                    ));
+                }
+                list = list.child("Host mode policy").child(choices);
+            } else {
+                list = list.child(button(
+                    p,
+                    "edit-host-mode",
+                    "Host mode policy…",
+                    false,
+                    !self.busy,
+                    cx.listener(|s, _, _, cx| s.edit_policy(None, cx)),
+                ));
+            }
+        }
         if let Some(status) = &self.status {
             list = list.child(format!("OX {} · {}", status.installed, status.message));
             if status.managed {
@@ -499,14 +571,37 @@ impl Render for Hosts {
             .child("Run ox host pair on the other machine. Add --terminal to allow shells and subscription sign-in from this desktop.")
             .child(Input::new(&self.address))
             .child(Input::new(&self.code))
-            .child(button(
-                p,
-                "add-host",
-                "Pair host",
-                true,
-                !self.busy,
-                cx.listener(|s, _, w, cx| s.add(w, cx)),
-            ));
+            .child(button(p,"pair-mode", format!("Mode policy · {}", self.pair_policy.map_or("Use host setting", HostPolicy::label)), false, !self.busy,
+                cx.listener(|s,_,_,cx| {s.choosing_pair_policy = !s.choosing_pair_policy; cx.notify();})));
+        if self.choosing_pair_policy {
+            let mut modes = div().flex().gap_2().flex_wrap();
+            for (index, choice) in std::iter::once(None)
+                .chain(HostPolicy::ALL.into_iter().map(Some))
+                .enumerate()
+            {
+                modes = modes.child(button(
+                    p,
+                    ("new-host-mode", index),
+                    choice.map_or("Use host setting", HostPolicy::label),
+                    choice == self.pair_policy,
+                    !self.busy,
+                    cx.listener(move |s, _, _, cx| {
+                        s.pair_policy = choice;
+                        s.choosing_pair_policy = false;
+                        cx.notify();
+                    }),
+                ));
+            }
+            list = list.child(modes);
+        }
+        list = list.child(button(
+            p,
+            "add-host",
+            "Pair host",
+            true,
+            !self.busy,
+            cx.listener(|s, _, w, cx| s.add(w, cx)),
+        ));
         if self.busy {
             list = list.child("Contacting host…");
         }

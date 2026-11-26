@@ -111,6 +111,7 @@ pub struct Store {
     sender: Option<crate::surface::Sender>,
     worker_notice_receipts: Vec<WorkerNoticeReceipt>,
     /// The stamp of each message waiting in `resume_sends`.
+    resume_commands: HashMap<String, (crate::codex::request::ThreadCommand, bool)>,
     resume_senders: HashMap<String, crate::surface::Sender>,
     /// The Claude access mode an ended session had when its process went away, whether
     /// this client ended it or the host reaped the idle route. A send that reopens the
@@ -133,6 +134,11 @@ pub struct Store {
     worker_models: HashMap<String, String>,
     child_threads: HashMap<String, (String, PathBuf)>,
     next_preset: Option<crate::codex::access::Access>,
+    host_start: Option<crate::modes::Level>,
+    review_yolo_resumes: bool,
+    // False until the host publishes this resume's operator ask.
+    held_yolo_resumes: HashMap<String, bool>,
+    worker_ceilings: HashMap<String, crate::modes::Level>,
     selection: u64,
     drafts: HashMap<Option<String>, compose::Draft>,
     changed: Changed,
@@ -223,6 +229,7 @@ impl Store {
             resume_sends: Default::default(),
             sender: None,
             worker_notice_receipts: Vec::new(),
+            resume_commands: Default::default(),
             resume_senders: Default::default(),
             resume_access: Default::default(),
             resume_models: Default::default(),
@@ -232,6 +239,10 @@ impl Store {
             worker_models: Default::default(),
             child_threads: Default::default(),
             next_preset: None,
+            host_start: None,
+            review_yolo_resumes: false,
+            held_yolo_resumes: HashMap::new(),
+            worker_ceilings: HashMap::new(),
             selection: 0,
             drafts: HashMap::new(),
             changed: Changed::default(),
@@ -310,6 +321,7 @@ impl Store {
         self.restored_drafts = std::mem::take(&mut previous.restored_drafts);
         self.worker_contracts = std::mem::take(&mut previous.worker_contracts);
         self.worker_models = std::mem::take(&mut previous.worker_models);
+        self.worker_ceilings = std::mem::take(&mut previous.worker_ceilings);
         self.authorized_models = std::mem::take(&mut previous.authorized_models);
         self.next_options = previous.next_options.take();
         self.selected = previous.selected.clone();
@@ -556,6 +568,9 @@ impl Store {
             Pending::Compose(op) => self.compose_failed(op, message),
             Pending::Initialize | Pending::Account => self.state = Connection::Closed(message),
             Pending::Access(id) => {
+                if let Some(announced) = self.held_yolo_resumes.get_mut(&id) {
+                    *announced = false;
+                }
                 self.transcripts.entry(id).or_default().error = Some(message);
             }
             Pending::Resume(id) | Pending::ResumeFullHistory(id)

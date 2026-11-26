@@ -203,3 +203,35 @@ async fn timed_out_post_recovers_after_backoff_and_gone_removes_the_subscription
     drop(tx);
     sender.await.unwrap();
 }
+
+#[test]
+fn a_draft_push_targets_one_live_request_without_the_draft_or_approval_token() {
+    let mut asks = ActiveAsks::default();
+    let mut frame = json!({
+        "type":"delta", "cursor":{"epoch":"epoch","seq":1},
+        "scope":{"project":"/private/project","route":{"runtime":"codex","billing":"subscription"}},
+        "changes":[{"kind":"asks","asks":[{"id":"ox-yolo-18","thread":null,"token":"private-token","detail":"private prompt"}]}]
+    });
+    let mut deliver = |frame: &serde_json::Value| {
+        let Notices::Delta(_, notices) =
+            notices(&serde_json::to_vec(frame).unwrap(), None, &mut asks).unwrap()
+        else {
+            panic!("expected delta")
+        };
+        notices
+    };
+    let notice = deliver(&frame).pop().unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&notice.bytes).unwrap();
+    assert_eq!(payload["kind"], "approval");
+    assert!(
+        payload["thread"]
+            .as_str()
+            .unwrap()
+            .starts_with("ask:ox-yolo-18~")
+    );
+    assert!(!String::from_utf8(notice.bytes).unwrap().contains("private"));
+    assert!(deliver(&frame).is_empty());
+    frame["changes"][0]["asks"] = json!([]);
+    assert!(deliver(&frame).is_empty());
+    assert!(notice.ask.unwrap().has_changed().is_err());
+}

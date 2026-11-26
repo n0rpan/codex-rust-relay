@@ -657,9 +657,15 @@ impl Store {
         let profile = self.profile.clone();
         // A draft preset belongs only to the new session it was chosen for.
         let preset = match &session {
-            Session::New(_) => self.next_preset.take(),
-            Session::Resume(_) => resume_mode,
-            Session::Fork { .. } => None,
+            Session::New(_) => {
+                let chosen = self.next_access();
+                self.next_preset = None;
+                chosen
+            }
+            Session::Resume(_) => self.starting_access(self.host_start_access(&owner), resume_mode),
+            Session::Fork { source, .. } => {
+                self.host_start_access(&session_key(&self.profile.route.billing, source))
+            }
         };
         // A worker keeps its launch contract on every relaunch: a resume reuses its own,
         // a fork the contract of its source.

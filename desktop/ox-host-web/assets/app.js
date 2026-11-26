@@ -729,6 +729,11 @@ function entries() {
 }
 function catalog() {
   const rows = entries();
+  const drafts = [];
+  for (const state of global.scopes.values()) {
+    const requests = state.detail?.draft_requests ?? state.asks.filter((a) => a.thread == null).map((a) => a.id);
+    for (const id of requests) drafts.push({ scope: state.scope, request: id });
+  }
   const nowSec = Date.now() / 1000;
   const counts = { all: 0, active: 0, requests: 0, finished: 0 };
   const filterLabels = {
@@ -738,14 +743,14 @@ function catalog() {
     finished: "Finished",
   };
   if (globalLink?.ready) {
-    void notificationTarget.resolve(rows, globalLink.discoveryResult, (match) => {
+    void notificationTarget.resolve([...rows, ...drafts], globalLink.discoveryResult, (match) => {
       if (match === "ambiguous")
         notice("This notification matches more than one session. Choose the session from the list.");
       else if (match === "missing")
         notice("This notification’s session is no longer in the list.");
       else if (match === "incomplete")
         notice("OX couldn’t load the full session list for this notification. Reconnect and look for the session.");
-      else open(match.scope, match.session.id);
+      else open(match.scope, match.session?.id ?? null);
     });
   }
   const needle = $("find-sessions").value.trim().toLocaleLowerCase();
@@ -783,6 +788,7 @@ function catalog() {
       continue;
     visible.push({ ...row, needsInput });
   }
+  counts.requests += drafts.length;
   for (const b of $("filters").children) {
     const kind = b.dataset.filter;
     const base = filterLabels[kind] ?? b.textContent;
@@ -801,6 +807,16 @@ function catalog() {
     byProject.set(entry.scope.project, list);
   }
   const frag = document.createDocumentFragment();
+  if (filter === "all" || filter === "requests") {
+    for (const {scope} of drafts) {
+      const title = `New session approval · ${leaf(scope.project)} · ${routesLabel(scope.route)}`;
+      if (needle && !title.toLocaleLowerCase().includes(needle)) continue;
+      const entry = button(title, () => open(scope, null));
+      entry.className = "session";
+      entry.dataset.needsInput = "true";
+      frag.append(entry);
+    }
+  }
   const names = new Map();
   for (const project of byProject.keys())
     names.set(leaf(project), (names.get(leaf(project)) || 0) + 1);
@@ -888,7 +904,7 @@ function showAsks(asks) {
     // A child that would run in YOLO waits here for the operator (ox-host yolo.rs).
     if (String(a.id).startsWith("ox-yolo-")) {
       card.classList.add("yolo");
-      card.append(el("p", "ask-kicker", "Worker waits for YOLO"));
+      card.append(el("p", "ask-kicker", "YOLO approval"));
     }
     card.append(el("h2", "", a.title));
     if (a.detail) card.append(el("p", "", a.detail));
@@ -1648,6 +1664,7 @@ function handoffMarks(row) {
         inherited: "inherited",
         lowered: "lowered",
         operator: "chosen by you",
+        host_policy: "set by the host policy",
         capped: "capped below YOLO",
       }[origin.decided] ?? "unknown";
     nodes.push(
@@ -1799,20 +1816,6 @@ $("handoff-form").onsubmit = (e) => {
   const request = $("handoff-request").value.trim();
   if (!request) {
     notice("Write the request for the new session.");
-    return;
-  }
-  const row = detailLink?.model.scopes
-    .get(scopeKey(selected.scope))
-    ?.sessions.find((x) => x.id === selected.id);
-  const inheritsYolo =
-    mode === "inherit" &&
-    bypassMode(row?.detail?.access) &&
-    row?.detail?.yolo_grant !== true;
-  if (inheritsYolo) {
-    // Inheriting YOLO is still a YOLO start: choose it explicitly or lower it.
-    notice(
-      "This session runs in YOLO. Choose YOLO to confirm it for the new session, or a lower mode.",
-    );
     return;
   }
   const confirmed = mode === "yolo";

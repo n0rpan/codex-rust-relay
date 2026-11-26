@@ -279,9 +279,10 @@ impl Discovery {
             Some(format!("Worker #{job} {status}"))
         };
         match event {
-            CatalogEvent::Host(_) | CatalogEvent::Waiting(..) | CatalogEvent::Disconnected(_) => {
-                false
-            }
+            CatalogEvent::Host(_)
+            | CatalogEvent::DraftWaiting(..)
+            | CatalogEvent::Waiting(..)
+            | CatalogEvent::Disconnected(_) => false,
             CatalogEvent::Reset => {
                 let changed = !self.hosted.is_empty()
                     || !self.archived.is_empty()

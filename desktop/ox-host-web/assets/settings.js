@@ -247,6 +247,8 @@ export function setupSettings({ request, open, close, notifications, login }) {
       button(
         back === close
           ? "← Sessions"
+          : back === remote
+            ? "← Remote access"
           : back === credentials
             ? "← Credentials"
             : back === keyDestinations
@@ -917,11 +919,41 @@ export function setupSettings({ request, open, close, notifications, login }) {
       body.append(details(doc.title, form));
     }
   }
+  async function hostModePolicy() {
+    const id = screen("Host mode policy", remote);
+    const current = await readPage(id, { action: "host_mode_policy" });
+    if (!current) return;
+    const form = node("form", undefined, "phone-settings-card");
+    const label = node("label", "Starting mode on this host");
+    const select = node("select");
+    select.name = "host_mode_policy";
+    for (const [value, name] of [
+      ["follow_interface", "Follow interface"],
+      ["always_read", "Always read"],
+      ["always_write", "Always write"],
+      ["always_classifier", "Always auto-review"],
+      ["always_yolo", "Always YOLO"],
+      ["yolo_asks_every_time", "YOLO asks every time"],
+    ]) select.append(new Option(name, value));
+    select.value = current.policy;
+    label.append(select);
+    form.append(label, node("p",
+      "Applies to sessions opened from any paired device. Always YOLO starts sessions without permission prompts. YOLO asks every time lets any paired device approve each new entry into YOLO.",
+    ));
+    submit(form, "Save host policy", async () => {
+      await request({ action: "host_mode_policy", set: select.value });
+      if (id === pageId && !panel.hidden) status.textContent = "Saved on the host.";
+    });
+    body.append(form);
+  }
   async function remote() {
     const id = screen("Remote access");
     const result = await readPage(id, { action: "devices" });
     if (!result) return;
-    body.append(node("p", result.origin || location.origin));
+    body.append(
+      node("p", result.origin || location.origin),
+      action("Host mode policy", hostModePolicy),
+    );
     const invite = node("div", undefined, "phone-settings-invite");
     body.append(
       action(

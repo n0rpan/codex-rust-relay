@@ -1328,6 +1328,16 @@
           },
           "type": "array"
         },
+        "mode_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "name": {
           "type": [
             "string",
@@ -1353,6 +1363,17 @@
         "epoch"
       ],
       "type": "object"
+    },
+    "HostPolicy": {
+      "enum": [
+        "follow_interface",
+        "always_read",
+        "always_write",
+        "always_classifier",
+        "always_yolo",
+        "yolo_asks_every_time"
+      ],
+      "type": "string"
     },
     "HostResources": {
       "properties": {

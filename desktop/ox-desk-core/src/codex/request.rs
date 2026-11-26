@@ -38,6 +38,7 @@ pub enum Call {
     Read(String),
     ReadFullHistory(String),
     Fork {
+        preset: Option<super::access::Access>,
         thread: String,
         project: PathBuf,
         model: Option<String>,
@@ -50,6 +51,7 @@ pub enum Call {
         cursor: Option<String>,
     },
     Resume {
+        preset: Option<super::access::Access>,
         thread: String,
         project: Option<PathBuf>,
         full_history: bool,
@@ -127,6 +129,24 @@ impl ThreadCommand {
         value
     }
 }
+fn apply_preset(params: &mut Value, preset: Option<super::access::Access>) {
+    use super::access::Access;
+    if let Some(preset) = preset {
+        let (sandbox, policy, reviewer) = match preset {
+            Access::ReadOnly => ("read-only", "on-request", "user"),
+            Access::Workspace => ("workspace-write", "on-request", "user"),
+            Access::AutoReview => ("workspace-write", "on-request", "auto_review"),
+            Access::Yolo => ("danger-full-access", "never", "user"),
+            _ => {
+                unreachable!("only explicit Codex presets can override thread defaults")
+            }
+        };
+        params["sandbox"] = sandbox.into();
+        params["approvalPolicy"] = policy.into();
+        params["approvalsReviewer"] = reviewer.into();
+    }
+}
+
 impl Call {
     pub fn method(&self) -> Method {
         match self {
@@ -192,22 +212,27 @@ impl Call {
                 json!({"ancestorThreadId":root,"sourceKinds":["subAgent","subAgentThreadSpawn","subAgentReview","subAgentCompact","subAgentOther"],"modelProviders":[],"limit":100,"cursor":cursor})
             }
             Self::Fork {
+                preset,
                 thread,
                 project,
                 model,
                 provider,
             } => {
-                json!({"threadId":thread,"cwd":project,"model":model,"modelProvider":provider,"excludeTurns":true,"deferGoalContinuation":true})
+                let mut params = json!({"threadId":thread,"cwd":project,"model":model,"modelProvider":provider,"excludeTurns":true,"deferGoalContinuation":true});
+                apply_preset(&mut params, preset);
+                params
             }
             Self::Archive(thread) => json!({"threadId":thread}),
             Self::Read(thread) => json!({"threadId":thread,"includeTurns":false}),
             Self::ReadFullHistory(thread) => json!({"threadId":thread,"includeTurns":true}),
             Self::Resume {
+                preset,
                 thread,
                 project,
                 full_history,
             } => {
                 let mut params = json!({"threadId":thread,"excludeTurns":!full_history});
+                apply_preset(&mut params, preset);
                 if !full_history {
                     params["initialTurnsPage"] =
                         json!({"limit":TURNS,"sortDirection":"desc","itemsView":"full"});
@@ -227,21 +252,7 @@ impl Call {
             } => {
                 let mut params =
                     json!({"cwd":project,"approvalPolicy":"on-request","approvalsReviewer":"user"});
-                use super::access::Access;
-                if let Some(preset) = preset {
-                    let (sandbox, policy, reviewer) = match preset {
-                        Access::ReadOnly => ("read-only", "on-request", "user"),
-                        Access::Workspace => ("workspace-write", "on-request", "user"),
-                        Access::AutoReview => ("workspace-write", "on-request", "auto_review"),
-                        Access::Yolo => ("danger-full-access", "never", "user"),
-                        _ => {
-                            unreachable!("only explicit Codex presets can override thread defaults")
-                        }
-                    };
-                    params["sandbox"] = sandbox.into();
-                    params["approvalPolicy"] = policy.into();
-                    params["approvalsReviewer"] = reviewer.into();
-                }
+                apply_preset(&mut params, preset);
                 if let Some(m) = model {
                     params["model"] = m.into();
                 }
@@ -312,6 +323,57 @@ impl Outgoing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_host_preset_is_applied_to_new_resumed_and_forked_threads() {
+        use super::super::access::Access;
+        for (preset, sandbox, approvals, reviewer) in [
+            (Access::ReadOnly, "read-only", "on-request", "user"),
+            (Access::Workspace, "workspace-write", "on-request", "user"),
+            (
+                Access::AutoReview,
+                "workspace-write",
+                "on-request",
+                "auto_review",
+            ),
+            (Access::Yolo, "danger-full-access", "never", "user"),
+        ] {
+            let preset = Some(preset);
+            for call in [
+                Call::New {
+                    preset,
+                    project: "/work".into(),
+                    model: None,
+                },
+                Call::Resume {
+                    preset,
+                    thread: "session".into(),
+                    project: None,
+                    full_history: true,
+                },
+                Call::Fork {
+                    preset,
+                    thread: "session".into(),
+                    project: "/work".into(),
+                    model: None,
+                    provider: "openai".into(),
+                },
+            ] {
+                let params = call.params();
+                assert_eq!(params["sandbox"], sandbox);
+                assert_eq!(params["approvalPolicy"], approvals);
+                assert_eq!(params["approvalsReviewer"], reviewer);
+            }
+        }
+        let follow = Call::Resume {
+            preset: None,
+            thread: "old".into(),
+            project: None,
+            full_history: false,
+        }
+        .params();
+        assert!(follow.get("sandbox").is_none() && follow.get("approvalPolicy").is_none());
+    }
 
     #[test]
     fn start_and_steer_send_the_sender_as_one_application_entry() {

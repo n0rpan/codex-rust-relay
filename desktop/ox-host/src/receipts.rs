@@ -73,6 +73,11 @@ impl Receipts {
                 .remove(&self.order.pop_front().expect("nonempty receipts"));
         }
     }
+    pub fn finish(&mut self, scope: &Scope, key: &str, result: Server) {
+        if let Some(receipt) = self.entries.get_mut(&(scope.clone(), key.to_owned())) {
+            receipt.result = result;
+        }
+    }
     pub fn opened(&mut self, scope: &Scope, key: &str, thread: &str) {
         if let Some(r) = self.entries.get_mut(&(scope.clone(), key.to_owned())) {
             r.opened = Some(thread.to_owned());

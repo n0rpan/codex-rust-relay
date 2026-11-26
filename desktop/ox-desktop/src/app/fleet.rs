@@ -12,6 +12,7 @@ struct Project {
     titles: HashMap<String, String>,
     archived: HashSet<String>,
     waiting: HashSet<String>,
+    draft_waiting: bool,
 }
 
 #[derive(Default)]
@@ -76,6 +77,9 @@ impl Inventory {
             CatalogEvent::Archived(scope, ids) => {
                 self.projects.entry(scope).or_default().archived = ids
             }
+            CatalogEvent::DraftWaiting(scope, waiting) => {
+                self.projects.entry(scope).or_default().draft_waiting = waiting
+            }
             CatalogEvent::Waiting(scope, ids) => {
                 self.projects.entry(scope).or_default().waiting = ids
             }
@@ -106,7 +110,7 @@ impl Inventory {
     }
     pub fn status(&self) -> String {
         if self.online {
-            return self
+            let status: String = self
                 .info
                 .as_ref()
                 .and_then(|h| h.resources.as_ref())
@@ -123,6 +127,14 @@ impl Inventory {
                         )
                     },
                 );
+            return match self.info.as_ref().and_then(|host| host.mode_policy) {
+                Some(policy)
+                    if policy != ox_desk_core::host_policy::HostPolicy::FollowInterface =>
+                {
+                    format!("{status} · {}", policy.label())
+                }
+                _ => status,
+            };
         }
         match self.error {
             Some(io::ErrorKind::Unsupported) => "Needs update".into(),
@@ -134,13 +146,13 @@ impl Inventory {
             None => "Connecting…".into(),
         }
     }
-    pub fn rows(&self, waiting_only: bool) -> Vec<(Scope, String, String)> {
+    pub fn rows(&self, waiting_only: bool) -> Vec<(Scope, Option<String>, String)> {
         let mut rows = Vec::new();
         for (scope, project) in &self.projects {
             let add = |id: &String| {
                 (
                     scope.clone(),
-                    id.clone(),
+                    Some(id.clone()),
                     project
                         .titles
                         .get(id)
@@ -151,6 +163,9 @@ impl Inventory {
             };
             if waiting_only {
                 rows.extend(project.waiting.iter().map(add));
+                if project.draft_waiting {
+                    rows.push((scope.clone(), None, "New session approval".into()));
+                }
             } else {
                 rows.extend(
                     project
@@ -165,7 +180,10 @@ impl Inventory {
         rows
     }
     pub fn waiting(&self) -> usize {
-        self.projects.values().map(|p| p.waiting.len()).sum()
+        self.projects
+            .values()
+            .map(|p| p.waiting.len() + usize::from(p.draft_waiting))
+            .sum()
     }
     pub fn online(&self) -> bool {
         self.online
@@ -206,7 +224,7 @@ impl super::Workspace {
         &mut self,
         id: Option<String>,
         scope: Scope,
-        thread: String,
+        thread: Option<String>,
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -365,5 +383,12 @@ mod tests {
         hosts[1].receive(CatalogEvent::Reset);
         assert_eq!(hosts[1].waiting(), 0);
         assert_eq!(hosts[2].waiting(), 1);
+        hosts[0].receive(CatalogEvent::DraftWaiting(scope.clone(), true));
+        assert_eq!(
+            hosts[0].rows(true),
+            vec![(scope.clone(), None, "New session approval".into())]
+        );
+        hosts[0].receive(CatalogEvent::DraftWaiting(scope, false));
+        assert!(hosts[0].rows(true).is_empty());
     }
 }

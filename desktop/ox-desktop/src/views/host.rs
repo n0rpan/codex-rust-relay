@@ -1216,10 +1216,15 @@ impl Host {
     pub(crate) fn show_thread(
         &mut self,
         scope: ox_desk_core::host_protocol::Scope,
-        id: String,
+        id: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(id) = id else {
+            self.open(scope.project, scope.route, window, cx);
+            self.panes[self.active].update(cx, |pane, cx| pane.action(cx, DeskAction::NewDraft));
+            return;
+        };
         let owner = self.panes[self.active].clone();
         self.open_thread(
             &owner,

@@ -168,3 +168,25 @@ pub fn profile(paths: &Paths, kind: &str, args: &[String]) -> io::Result<()> {
     }
     Ok(())
 }
+
+pub fn mode_policy(paths: &Paths, args: &[String]) -> io::Result<()> {
+    use ox_desk_core::host_policy::HostPolicy;
+    const HELP: &str = "ox host policy [set POLICY]
+
+Policies: follow-interface (default), always-read, always-write, always-classifier, always-yolo, yolo-asks-every-time.";
+    let policy = match args {
+        [help] if help == "--help" || help == "-h" => {
+            println!("{HELP}");
+            return Ok(());
+        }
+        [] => HostPolicy::read(&paths.state_dir)?,
+        [set, name] if set == "set" => {
+            let policy = HostPolicy::parse(name)?;
+            policy.save(&paths.state_dir)?;
+            policy
+        }
+        _ => return Err(io::Error::other(HELP)),
+    };
+    println!("{}", policy.label());
+    Ok(())
+}

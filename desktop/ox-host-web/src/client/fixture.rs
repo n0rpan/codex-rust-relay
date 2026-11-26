@@ -93,6 +93,8 @@ fn native_desktop() {
     drop(stream);
     assert_eq!(handshake().0, id);
     let settings = |action| rt.block_on(client.settings(action)).unwrap();
+    let initial_policy = settings(json!({"action":"host_mode_policy"}));
+    assert_eq!(initial_policy["policy"], "follow_interface");
     let before = settings(json!({"action":"host_profile"}));
     let edit = json!({"action":"host_profile","edit":{
         "before":before, "after":{"name":"Studio","labels":["big","linux","big"]}
@@ -142,8 +144,46 @@ fn native_desktop() {
             fs::create_dir(&path).unwrap();
             let scope = json!({"project":path,"route":{"runtime":runtime,"billing":{"api":alias}}});
             settings(json!({"action":"choose_project","route":scope["route"],"path":path}));
-            stock_turn(|| handshake().1, scope, &path);
+            stock_turn(|| handshake().1, scope.clone(), &path, None, false);
+            settings(json!({"action":"host_mode_policy","set":"always_write"}));
+            let policy_path = root.join("workspace").join(format!("{runtime}-policy"));
+            fs::create_dir(&policy_path).unwrap();
+            let policy_scope = json!({"project": policy_path, "route":scope["route"]});
+            settings(
+                json!({"action":"choose_project","route":policy_scope["route"],"path":policy_path}),
+            );
+            stock_turn(
+                || handshake().1,
+                policy_scope,
+                &policy_path,
+                Some(if runtime == "codex" {
+                    "workspace"
+                } else {
+                    "accept_edits"
+                }),
+                false,
+            );
+            settings(json!({"action":"host_mode_policy","set":"yolo_asks_every_time"}));
+            let reviewed_path = root.join("workspace").join(format!("{runtime}-review"));
+            fs::create_dir(&reviewed_path).unwrap();
+            let reviewed_scope = json!({"project":reviewed_path,"route":scope["route"]});
+            settings(
+                json!({"action":"choose_project","route":reviewed_scope["route"],"path":reviewed_path}),
+            );
+            stock_turn(
+                || handshake().1,
+                reviewed_scope,
+                &reviewed_path,
+                Some(if runtime == "codex" {
+                    "yolo"
+                } else {
+                    "bypass_permissions"
+                }),
+                true,
+            );
+            settings(json!({"action":"host_mode_policy","set":"follow_interface"}));
         }
+        settings(json!({"action":"host_mode_policy","set":"follow_interface"}));
     }
     let (input, events) = rt
         .block_on(client.terminal(OpenTerminal::Shell { project }))
@@ -167,6 +207,8 @@ fn stock_turn(
     connect: impl Fn() -> std::io::BufReader<UnixStream>,
     scope: Value,
     project: &std::path::Path,
+    expected_policy_mode: Option<&str>,
+    review: bool,
 ) {
     fn send(stream: &mut std::io::BufReader<UnixStream>, frame: Value) {
         writeln!(stream.get_mut(), "{frame}").unwrap()
@@ -203,6 +245,170 @@ fn stock_turn(
                 .is_some_and(|a| a.iter().any(ready))
         {
             break;
+        }
+    }
+    if let Some(expected) = expected_policy_mode {
+        if review {
+            send(
+                &mut stream,
+                json!({"type":"act","id":"select-draft-mode","scope":scope,"approval":null,"action":{"set_next_access":expected}}),
+            );
+        }
+        let submit = |key| json!({"type":"act","id":key,"scope":scope,"approval":null,"action":{"send_text":[null,"Say hello"]}});
+        let wait_for_open_ask = |stream: &mut std::io::BufReader<UnixStream>, key: &str| loop {
+            let msg = next(stream);
+            assert!(
+                !(msg["type"] == "ack" && msg["id"] == key),
+                "a held message must stay in the requesting composer's draft"
+            );
+            if let Some(ask) = msg["changes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find_map(|c| c["asks"].get(0))
+            {
+                assert_eq!(ask["title"], "Open this session in YOLO?");
+                break ask.clone();
+            }
+        };
+        if review {
+            send(&mut stream, submit("declined-start"));
+            let ask = wait_for_open_ask(&mut stream, "declined-start");
+            send(
+                &mut stream,
+                json!({"type":"act","id":"decline-start","scope":scope,"approval":ask["token"],"action":{"answer_ask":[ask["id"],2]}}),
+            );
+            for replay in [false, true] {
+                if replay {
+                    send(&mut stream, submit("declined-start"));
+                }
+                loop {
+                    let msg = serde_json::to_value(read(&mut stream)).unwrap();
+                    if msg["id"] == "declined-start" {
+                        assert_eq!(msg["type"], "error");
+                        break;
+                    }
+                }
+            }
+        }
+        send(&mut stream, submit("mode-start"));
+        if review {
+            let ask = wait_for_open_ask(&mut stream, "mode-start");
+            drop(stream);
+            stream = connect();
+            subscribe(&mut stream);
+            loop {
+                let frame = next(&mut stream);
+                if frame["scopes"].as_array().into_iter().flatten().any(|s| {
+                    s["scope"] == scope
+                        && s["asks"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|a| a["id"] == ask["id"] && a["token"] == ask["token"])
+                }) {
+                    break;
+                }
+            }
+            send(
+                &mut stream,
+                json!({"type":"act","id":"approve-mode","scope":scope,"approval":ask["token"],"action":{"answer_ask":[ask["id"],0]}}),
+            );
+        }
+        let mut thread = None;
+        let mut finished = None;
+        loop {
+            let frame = next(&mut stream);
+            for change in frame["changes"].as_array().into_iter().flatten() {
+                for row in change
+                    .get("session")
+                    .into_iter()
+                    .chain(change["sessions"].as_array().into_iter().flatten())
+                {
+                    if row["detail"]["access"] == expected {
+                        thread = row["id"].as_str().map(str::to_owned);
+                    }
+                }
+                if change["kind"] == "notification" && change["event"] == "finished" {
+                    finished = change["thread"].as_str().map(str::to_owned);
+                }
+            }
+            if thread.is_some() && (!review || finished == thread) {
+                break;
+            }
+        }
+        if !review {
+            return;
+        }
+        let thread = thread.unwrap();
+        send(
+            &mut stream,
+            json!({"type":"act","id":"end-reviewed","scope":scope,"action":{"end_session":thread}}),
+        );
+        loop {
+            let frame = next(&mut stream);
+            if frame["type"] == "ack" && frame["id"] == "end-reviewed" {
+                break;
+            }
+        }
+        send(
+            &mut stream,
+            json!({"type":"act","id":"resume-reviewed","scope":scope,"action":{"send_text":[thread,"Say hello again"]}}),
+        );
+        let mut lowered = false;
+        let mut effective = None;
+        loop {
+            let frame = next(&mut stream);
+            for change in frame["changes"].as_array().into_iter().flatten() {
+                if !lowered
+                    && let Some(ask) = change["asks"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|a| a["thread"] == thread)
+                {
+                    assert_ne!(ask["token"], Value::Null);
+                    send(
+                        &mut stream,
+                        json!({"type":"act","id":"lower-resume","scope":scope,"approval":ask["token"],"action":{"answer_ask":[ask["id"],1]}}),
+                    );
+                    lowered = true;
+                }
+                for row in change
+                    .get("session")
+                    .into_iter()
+                    .chain(change["sessions"].as_array().into_iter().flatten())
+                {
+                    if row["id"] == thread
+                        && let Some(access) = row["detail"]["access"].as_str()
+                    {
+                        effective = Some(access.to_owned());
+                    }
+                }
+                if change["kind"] == "notification"
+                    && change["event"] == "finished"
+                    && change["thread"] == thread
+                {
+                    // Some stock versions resume with a lower configured preset. If they
+                    // restore YOLO, the new turn must wait for its own approval.
+                    let mode = effective.expect("effective access on resume");
+                    assert_ne!(mode, expected);
+                    if expected == "bypass_permissions" {
+                        assert!(lowered, "Claude should review its saved bypass mode");
+                    }
+                    if lowered {
+                        assert_eq!(
+                            mode,
+                            if expected == "yolo" {
+                                "auto_review"
+                            } else {
+                                "auto"
+                            }
+                        );
+                    }
+                    return;
+                }
+            }
         }
     }
     send(

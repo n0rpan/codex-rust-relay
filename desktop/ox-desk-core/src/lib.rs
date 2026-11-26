@@ -14,6 +14,7 @@ pub mod changed;
 pub mod claude;
 pub mod codex;
 pub mod desktop_behavior;
+pub mod host_policy;
 pub mod host_protocol;
 pub mod inbox;
 pub mod links;

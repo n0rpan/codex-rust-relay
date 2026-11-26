@@ -7,6 +7,7 @@ pub(crate) enum CatalogEvent {
     Reset,
     Disconnected(io::ErrorKind),
     Waiting(Scope, HashSet<String>),
+    DraftWaiting(Scope, bool),
     Archived(Scope, std::collections::HashSet<String>),
     Replace(Scope, Vec<SessionView>),
     Update(Scope, SessionView),
@@ -73,6 +74,11 @@ impl HostLink {
                                     {
                                         emit(CatalogEvent::Archived(s.scope.clone(), ids))?;
                                     }
+                                    let draft = s.detail["draft_requests"]
+                                        .as_array()
+                                        .is_some_and(|ids| !ids.is_empty())
+                                        || s.asks.iter().any(|a| a.thread.is_none());
+                                    emit(CatalogEvent::DraftWaiting(s.scope.clone(), draft))?;
                                     let waiting =
                                         serde_json::from_value(s.detail["request_threads"].clone())
                                             .unwrap_or_else(|_| {
@@ -95,12 +101,22 @@ impl HostLink {
                                             emit(CatalogEvent::Update(scope.clone(), session))?
                                         }
                                         Change::Asks { asks } => {
+                                            emit(CatalogEvent::DraftWaiting(
+                                                scope.clone(),
+                                                asks.iter().any(|a| a.thread.is_none()),
+                                            ))?;
                                             emit(CatalogEvent::Waiting(
                                                 scope.clone(),
                                                 asks.into_iter().filter_map(|a| a.thread).collect(),
                                             ))?;
                                         }
                                         Change::State { detail, .. } => {
+                                            if let Some(ids) = detail["draft_requests"].as_array() {
+                                                emit(CatalogEvent::DraftWaiting(
+                                                    scope.clone(),
+                                                    !ids.is_empty(),
+                                                ))?;
+                                            }
                                             if let Ok(ids) = serde_json::from_value(
                                                 detail["request_threads"].clone(),
                                             ) {

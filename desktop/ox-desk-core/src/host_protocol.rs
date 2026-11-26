@@ -111,6 +111,8 @@ pub struct HostResources {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HostInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_policy: Option<crate::host_policy::HostPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<HostResources>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,

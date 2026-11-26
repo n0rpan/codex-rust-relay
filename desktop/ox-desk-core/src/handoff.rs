@@ -606,6 +606,7 @@ pub fn marker(origin: &crate::origin::Origin) -> Option<String> {
         Some(Decision::Inherited) => "inherited",
         Some(Decision::Lowered) => "lowered",
         Some(Decision::Operator) => "chosen by the operator",
+        Some(Decision::HostPolicy) => "set by the host policy",
         Some(Decision::Capped) => "capped below YOLO",
         None => "unknown",
     };

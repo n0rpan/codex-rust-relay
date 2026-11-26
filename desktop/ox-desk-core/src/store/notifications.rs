@@ -29,8 +29,86 @@ impl Store {
         t.access?;
         t.ceiling
     }
+    pub fn use_host_policy(&mut self, policy: crate::host_policy::HostPolicy) {
+        self.host_start = policy.starting_level();
+        self.review_yolo_resumes = policy == crate::host_policy::HostPolicy::YoloAsksEveryTime;
+        if !self.review_yolo_resumes && !self.held_yolo_resumes.is_empty() {
+            for id in self.held_yolo_resumes.keys().cloned().collect::<Vec<_>>() {
+                self.cancel_held_resume(&id);
+            }
+        }
+    }
+    pub fn new_resume_reviews(&mut self) -> Vec<String> {
+        self.held_yolo_resumes
+            .iter_mut()
+            .filter(|(id, _)| {
+                self.resume_sends.contains(id.as_str())
+                    && self
+                        .transcripts
+                        .get(id.as_str())
+                        .is_some_and(|t| t.ready && t.verified)
+            })
+            .filter_map(|(id, announced)| (!std::mem::replace(announced, true)).then(|| id.clone()))
+            .collect()
+    }
+    pub fn cancel_held_resume(&mut self, id: &str) {
+        self.held_yolo_resumes.remove(id);
+        self.resume_sends.remove(id);
+        self.resume_senders.remove(id);
+        self.resume_commands.remove(id);
+    }
+    pub fn resume_held(&self, id: &str) -> bool {
+        self.held_yolo_resumes.contains_key(id)
+    }
+    pub fn accept_resume_review(&mut self, id: &str) {
+        self.held_yolo_resumes.remove(id);
+    }
+    pub fn decline_resume_review(&mut self, id: &str) -> io::Result<()> {
+        self.cancel_held_resume(id);
+        self.held_yolo_resumes.insert(id.into(), false);
+        self.changed.transcript(id);
+        self.changed.mark(Changed::THREADS);
+        Ok(())
+    }
+    pub fn claude_resume_access(&self, id: &str) -> Option<crate::runtime::Access> {
+        self.resume_access.get(id).copied()
+    }
+    pub fn choose_resume_access(&mut self, id: &str, mode: crate::runtime::Access) {
+        self.resume_access.insert(id.into(), mode);
+    }
+    pub fn set_host_start(&mut self, level: Option<crate::modes::Level>) {
+        self.host_start = level;
+    }
+    pub fn restore_worker_ceiling(&mut self, id: &str, level: crate::modes::Level) {
+        self.worker_ceilings.insert(id.into(), level);
+    }
+    pub(super) fn host_start_access(&self, id: &str) -> Option<crate::runtime::Access> {
+        let mut level = self.host_start?;
+        if let Some(&cap) = self.worker_ceilings.get(id) {
+            level = level.min(cap);
+        }
+        Some(level.preset(self.profile.route.runtime))
+    }
+    /// A fixed host start can be narrowed in the draft picker. Once open, the
+    /// operator can use the session's regular mode control.
+    pub(super) fn starting_access(
+        &self,
+        fixed: Option<crate::runtime::Access>,
+        chosen: Option<crate::runtime::Access>,
+    ) -> Option<crate::runtime::Access> {
+        let Some(fixed) = fixed else { return chosen };
+        let runtime = self.profile.route.runtime;
+        let level = |access| crate::modes::Level::of(runtime, access);
+        chosen
+            .filter(|&mode| level(mode).is_some_and(|m| Some(m) <= level(fixed)))
+            .or(Some(fixed))
+    }
     pub fn next_access(&self) -> Option<crate::codex::access::Access> {
-        self.next_preset
+        self.starting_access(
+            self.host_start
+                .map(|level| level.preset(self.profile.route.runtime)),
+            self.next_preset,
+        )
     }
     pub fn set_next_access(&mut self, access: crate::codex::access::Access) {
         if !crate::runtime::Access::choices(self.profile.route.runtime).contains(&access)
@@ -44,7 +122,11 @@ impl Store {
         if let Some(remote) = self.remote() {
             return remote.can(id, "access");
         }
-        (self.can_send(Some(id)) || self.can_configure_saved_claude(id))
+        (self.can_send(Some(id))
+            || self.can_configure_saved_claude(id)
+            || (self.resume_held(id)
+                && self.resume_sends.contains(id)
+                && self.ready_to_send(Some(id))))
             && self.transcripts[id].active_turn().is_none()
             && !self.asks.iter().any(|a| a.thread.as_deref() == Some(id))
             && !self
@@ -98,6 +180,13 @@ impl Store {
                     t.effort = settings.effort;
                     if t.access != Some(settings.permissions.access) {
                         self.changed.mark(Changed::THREADS);
+                    }
+                    if settings
+                        .permissions
+                        .ceiling
+                        .is_some_and(|level| !level.needs_person())
+                    {
+                        self.held_yolo_resumes.remove(&thread);
                     }
                     t.access = Some(settings.permissions.access);
                     t.ceiling = settings.permissions.ceiling;
@@ -197,6 +286,7 @@ impl Store {
                 }
             }
             Notification::Archived(id) => {
+                self.cancel_held_resume(&id);
                 self.archived_threads.insert(id.clone());
                 self.catalog.remove(&id);
                 self.catalog_revision += 1;

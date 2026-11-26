@@ -10,6 +10,7 @@ use ox_desk_core::{
     actions::Action,
     changed::Changed,
     handoff::HandoffStart,
+    host_policy::HostPolicy,
     host_protocol::{self as wire, Change, Client, Cursor, ProcessView, Scope, ScopeState, Server},
     inbox::Inbox,
     links::LinkEvent,
@@ -176,6 +177,7 @@ struct Preparing {
     /// None means the lookup is still running.
     window: std::sync::Arc<std::sync::Mutex<Option<Option<u64>>>>,
     window_deadline: Instant,
+    mode_approval: Option<YoloAllowance>,
 }
 /// A read_ox_thread call waiting for its source transcript to load.
 struct Reading {
@@ -328,6 +330,7 @@ pub(crate) struct Engine {
     launch_warnings: HashMap<u64, String>,
     discovered: HashMap<(Scope, String), ox_desk_core::store::ThreadRow>,
     asking: BTreeMap<u64, Asking>,
+    mode_requests: BTreeMap<u64, mode_requests::ModeRequest>,
     preparing: Vec<Preparing>,
     reading: Vec<Reading>,
     in_flows: bool,
@@ -335,8 +338,10 @@ pub(crate) struct Engine {
     state_dir: PathBuf,
     idle: Duration,
     next_reap: Instant,
+    last_mode_policy: Option<HostPolicy>,
 }
 mod flows;
+mod mode_requests;
 mod notices;
 
 impl Drop for Engine {
@@ -403,6 +408,7 @@ impl Engine {
             launch_warnings: HashMap::new(),
             discovered: Default::default(),
             asking: Default::default(),
+            mode_requests: Default::default(),
             preparing: Default::default(),
             reading: Default::default(),
             in_flows: false,
@@ -410,6 +416,7 @@ impl Engine {
             state_dir: dir.to_owned(),
             idle: idle_timeout(std::env::var("OX_HOST_IDLE_MINUTES").ok().as_deref()),
             next_reap: Instant::now() + REAP_EVERY,
+            last_mode_policy: HostPolicy::read(dir).ok(),
             schema_reader: Default::default(),
         })
     }
@@ -514,6 +521,7 @@ impl Engine {
                     }
                     if now >= self.next_reap {
                         self.next_reap = now + REAP_EVERY;
+                        self.refresh_mode_policy()?;
                         self.reap_idle(now)?;
                     }
                     self.advance_flows()?;
@@ -648,10 +656,12 @@ impl Engine {
         }
         match message {
             Client::ReserveIdleUpdate => {
+                self.refresh_mode_policy()?;
                 let ready = self.draining.is_none()
                     && !self.update_reserved()
                     && self.running_turns() == 0
                     && self.asking.is_empty()
+                    && self.mode_requests.is_empty()
                     && self.running.values().all(|live| {
                         !live.store.has_pending_turn()
                             && live.store.asks().is_empty()
@@ -712,6 +722,7 @@ impl Engine {
                             "workers",
                             "live_catalog",
                             "host_status",
+                            "host_mode_policy",
                             "end",
                             "processes",
                             wire::IDLE_UPDATE,
@@ -923,6 +934,10 @@ impl Engine {
                 {
                     Err(e) => return self.reply(id, fail(e.to_string())),
                     Ok(Some(receipt)) => {
+                        if let Some(owner) = self.waiting_open_client(&scope, &key) {
+                            *owner = id;
+                            return Ok(());
+                        }
                         if let Some(thread) = receipt.opened {
                             self.reply(
                                 id,
@@ -968,6 +983,7 @@ impl Engine {
                 let accepted = matches!(result, Server::Ack { .. });
                 // Only accepted actions are receipts. A refusal is often transient, so a corrected
                 // retry with the same key must run again rather than replay the refusal.
+                let waiting = accepted && self.waiting_open_client(&scope, &key).is_some();
                 if accepted {
                     self.receipts
                         .insert(scope.clone(), key, generation, hash, result.clone());
@@ -977,6 +993,9 @@ impl Engine {
                     if ends {
                         self.reap_empty(&scope)?;
                     }
+                }
+                if waiting {
+                    return Ok(());
                 }
                 self.reply(id, result)
             }
@@ -1124,6 +1143,9 @@ impl Engine {
         let mut store = self
             .config
             .open(scope, prepared, move |event| into.push(event))?;
+        // Opening the route also subscribes it for stop, approval and recovery.
+        // Actual launches read the policy again and report an unreadable file.
+        store.use_host_policy(HostPolicy::read(&self.state_dir).unwrap_or(HostPolicy::AlwaysRead));
         let previous = self.running.get_mut(scope);
         let prior = previous
             .as_ref()
@@ -1181,6 +1203,7 @@ impl Engine {
                 }),
         );
         let _ = store.drain(vec![], Instant::now());
+        self.withdraw_activations(|r| &r.scope == scope, "The session host closed this route.")?;
         self.running.insert(
             scope.clone(),
             Live {
@@ -1211,6 +1234,18 @@ impl Engine {
         action: Action,
         approval: Option<String>,
     ) -> io::Result<()> {
+        self.refresh_mode_policy()?;
+        self.act_with_mode_approval(id, key, scope, action, approval, None)
+    }
+    fn act_with_mode_approval(
+        &mut self,
+        id: u64,
+        key: &str,
+        scope: &Scope,
+        action: Action,
+        approval: Option<String>,
+        approved_mode: Option<(ox_desk_core::modes::Level, Sender)>,
+    ) -> io::Result<()> {
         let live = self.running.get_mut(scope).expect("validated live scope");
         if let Action::AnswerAsk(ask, _) | Action::AnswerQuestions(ask, _) = &action
             && (approval.is_none() || live.tokens.get(ask) != approval.as_ref())
@@ -1222,6 +1257,13 @@ impl Engine {
         if let Action::AnswerAsk(ask, choice) = &action
             && let Some(job) = crate::yolo::job_of(ask)
         {
+            if self.mode_requests.contains_key(&job) {
+                let result = self.answer_activation(id, scope, job, *choice);
+                if result.is_err() {
+                    self.process(scope, vec![], true)?;
+                }
+                return result;
+            }
             return self.answer_yolo(id, scope, job, *choice);
         }
         if let Action::AnswerQuestions(ask, _) = &action
@@ -1356,7 +1398,10 @@ impl Engine {
         ) && parsed
             .as_ref()
             .is_some_and(|command| command.starts_thread()));
-        if opens && (live.opening.is_some() || live.launching.is_some()) {
+        let pending_open = self.mode_requests.values().any(|r| {
+            &r.scope == scope && matches!(&r.activation, mode_requests::Activation::Open {source, ..} if source == &target)
+        });
+        if opens && (live.opening.is_some() || live.launching.is_some() || pending_open) {
             return Err(io::Error::other(
                 "Another session is opening on this route.",
             ));
@@ -1387,6 +1432,15 @@ impl Engine {
                 | Action::SendImages(Some(_), _, _)
                 | Action::Submit(Some(_))
         );
+        // Stock Claude may start a saved process to execute a slash command, just as for a send.
+        let resume_command = matches!(
+            &action,
+            Action::PaletteCommand(Some(_), _)
+                | Action::NativeCommand(Some(_), _)
+                | Action::ExecuteCommand(Some(_))
+        ) && parsed
+            .as_ref()
+            .is_some_and(|command| command.starts_thread());
         let access = match &action {
             Action::SetAccess(_, mode) => Some(*mode),
             _ => None,
@@ -1404,9 +1458,91 @@ impl Engine {
         }
         // The stamp describes who sent this message. It is fixed here, at acceptance, and
         // travels with the message; it never enters the digest or an authorization check.
-        let sender = self.sender(id);
+        if let Action::SetAccess(owner, mode) = &action
+            && self.stage_mode_change(scope, owner, *mode, approved_mode.is_some())?
+        {
+            return Ok(());
+        }
+        let may_open = opens
+            || operator_turn
+            || matches!(
+                &action,
+                Action::SelectThread(_)
+                    | Action::OpenCatalogRow(_)
+                    | Action::ConfirmAliasAndResume(_)
+                    | Action::PaletteCommand(..)
+                    | Action::NativeCommand(..)
+                    | Action::ExecuteCommand(_)
+            );
+        let sender = approved_mode
+            .as_ref()
+            .map_or_else(|| self.sender(id), |(_, sender)| sender.clone());
         let live = self.running.get_mut(scope).expect("validated live scope");
-        live.store.dispatch_as(action, sender)?;
+        let mut fork_restore = None;
+        if may_open {
+            let policy = HostPolicy::read(&self.state_dir)?;
+            live.store.use_host_policy(policy);
+            let resume = target.as_deref().filter(|t| {
+                (operator_turn || resume_command)
+                    && live.store.is_session_scoped()
+                    && !live.store.has_live_session(t)
+            });
+            if (opens || resume.is_some()) && policy == HostPolicy::YoloAsksEveryTime {
+                let level = if let Some(t) = resume {
+                    live.store
+                        .claude_resume_access(t)
+                        .and_then(|mode| ox_desk_core::modes::Level::of(scope.route.runtime, mode))
+                } else if fork {
+                    (!live.store.is_session_scoped())
+                        .then(|| live.store.applied_ceiling(target.as_deref()))
+                        .flatten()
+                } else {
+                    live.store
+                        .next_access()
+                        .and_then(|mode| ox_desk_core::modes::Level::of(scope.route.runtime, mode))
+                };
+                if let Some((granted, _)) = approved_mode {
+                    if let Some(t) = resume {
+                        live.store
+                            .choose_resume_access(t, granted.preset(scope.route.runtime));
+                    } else if fork {
+                        live.store.set_host_start(Some(granted));
+                        fork_restore = Some(policy.starting_level());
+                    } else {
+                        live.store
+                            .set_next_access(granted.preset(scope.route.runtime));
+                    }
+                } else if level == Some(ox_desk_core::modes::Level::Yolo) {
+                    let action = match action {
+                        Action::Submit(owner) => Action::SendImages(
+                            owner.clone(),
+                            live.store.draft(owner.as_deref()).to_owned(),
+                            live.store.draft_images(owner.as_deref()).to_vec(),
+                        ),
+                        Action::ExecuteCommand(owner) => {
+                            let command = live.store.draft(owner.as_deref()).to_owned();
+                            Action::PaletteCommand(owner, command)
+                        }
+                        other => other,
+                    };
+                    return self.ask_activation(
+                        scope,
+                        mode_requests::Activation::Open {
+                            client: id,
+                            key: key.into(),
+                            action: Box::new(action),
+                            sender,
+                            source: target.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        let sent = live.store.dispatch_as(action, sender);
+        if let Some(before) = fork_restore {
+            live.store.set_host_start(before);
+        }
+        sent?;
         if fork && let (Some(origin), Some(source)) = (&origin, &target) {
             live.fork_origin = Some(origin.fork(source));
         }
@@ -1485,6 +1621,34 @@ impl Engine {
         }
         let launch_failure = advance_launch(live);
         let mut dirty = live.store.drain(vec![], Instant::now());
+        self.mode_requests.retain(|_, request| {
+            &request.scope != scope || !matches!(&request.activation, mode_requests::Activation::Resume(id) if !live.store.resume_held(id))
+        });
+        let archived: HashSet<_> = self
+            .mode_requests
+            .values()
+            .filter(|r| &r.scope == scope)
+            .filter_map(|r| r.view.thread.as_ref())
+            .filter(|t| live.store.archived_threads().contains(*t))
+            .cloned()
+            .collect();
+        let resumes = live.store.new_resume_reviews();
+        if !archived.is_empty() {
+            self.withdraw_activations(
+                |r| {
+                    &r.scope == scope
+                        && r.view
+                            .thread
+                            .as_ref()
+                            .is_some_and(|id| archived.contains(id))
+                },
+                "The session was archived.",
+            )?;
+        }
+        for session in resumes.into_iter().filter(|id| !archived.contains(id)) {
+            self.ask_activation(scope, mode_requests::Activation::Resume(session))?;
+        }
+        let live = self.running.get_mut(scope).expect("live scope");
         if from_action {
             dirty.mark(Changed::THREADS | Changed::ASK | Changed::NOTICE);
             if let Some(id) = live.store.selected() {
@@ -1639,6 +1803,10 @@ impl Engine {
         let mut changes = live.store.host_project(scope, &dirty, &mut live.state);
         crate::yolo::merge(
             &self.asking,
+            self.mode_requests
+                .values()
+                .filter(|r| &r.scope == scope)
+                .map(|r| r.view.clone()),
             scope,
             previous_yolo,
             &mut live.state.asks,
@@ -1868,6 +2036,7 @@ impl Engine {
         let profile =
             ox_host_web::host_profile::HostProfile::read(&self.state_dir).unwrap_or_default();
         wire::HostInfo {
+            mode_policy: HostPolicy::read(&self.state_dir).ok(),
             id: Some(self.host_id.to_string()),
             name: Some(if profile.name.is_empty() {
                 self.host_name.clone()
@@ -1942,6 +2111,7 @@ impl Engine {
                     .observed
                     .contains_key(&candidate)
                 && !self.asking.contains_key(&candidate)
+                && !self.mode_requests.contains_key(&candidate)
                 && !self
                     .ledger
                     .data
@@ -2000,6 +2170,11 @@ impl Engine {
             .and_then(|_| crate::workers::source_level(ceiling, parent_origin.as_ref()));
         let resolved =
             crate::workers::grant(source, external, start.mode_request(), start.runtime)?;
+        let policy = HostPolicy::read(&self.state_dir)
+            .map_err(|e| format!("Could not read the host mode policy: {e}"))?;
+        let ceiling = source.unwrap_or(crate::workers::TERMINAL_CEILING);
+        let requested = resolved.level;
+        let resolved = policy.child_start(resolved, start.mode_request(), ceiling, start.runtime);
         let this_parent = crate::workers::parent_ref(caller, parent.clone());
         self.check_worker_cap(&this_parent)?;
         let project = ox_desk_core::worker_checkout::resolve(
@@ -2014,6 +2189,7 @@ impl Engine {
         .map_err(|e| e.to_string())?;
         let job_id = self.new_job_id()?;
         let mut origin = crate::workers::origin(caller, parent.clone(), &start, job_id, resolved);
+        origin.ceiling = requested.max(resolved.level);
         if let Some(warning) = self.write_overlap(&scope, resolved.level) {
             self.launch_warnings.insert(job_id, warning.clone());
             if let Some(live) = caller_scope(caller).and_then(|s| self.running.get_mut(s)) {
@@ -2022,6 +2198,12 @@ impl Engine {
         }
         if resolved.level.needs_person() {
             match caller {
+                _ if policy == HostPolicy::AlwaysYolo => {
+                    origin.yolo = Some(YoloAllowance::HostPolicy)
+                }
+                _ if policy == HostPolicy::YoloAsksEveryTime => {
+                    return self.worker_ask(origin, start, scope);
+                }
                 Caller::Operator { device, .. } if start.yolo_confirmed => {
                     origin.yolo = Some(YoloAllowance::Operator {
                         device: device.clone(),
@@ -2041,19 +2223,7 @@ impl Engine {
                                 session: session.to_owned(),
                             });
                         }
-                        None => {
-                            let parent_title = self.running[ps]
-                                .store
-                                .catalog_row(session)
-                                .map(|r| r.title().to_owned())
-                                .unwrap_or_else(|| "OX session".into());
-                            return Ok(Accepted::Ask(Asking {
-                                origin,
-                                start,
-                                target: scope,
-                                parent_title,
-                            }));
-                        }
+                        None => return self.worker_ask(origin, start, scope),
                     }
                 }
                 Caller::External(_) => {
@@ -2063,6 +2233,32 @@ impl Engine {
         }
         let launching = self.prepare_launch(&scope, origin, Payload::Worker(start))?;
         Ok(Accepted::Launch(scope, launching))
+    }
+    fn worker_ask(
+        &self,
+        origin: Origin,
+        start: WorkerStart,
+        target: Scope,
+    ) -> Result<Accepted, String> {
+        let session = origin
+            .parent
+            .session
+            .as_deref()
+            .ok_or("A YOLO request needs an open parent session.")?;
+        let parent_title = origin
+            .parent
+            .scope
+            .as_ref()
+            .and_then(|scope| self.running.get(scope))
+            .and_then(|live| live.store.catalog_row(session))
+            .map(|row| row.title().to_owned())
+            .unwrap_or_else(|| "OX session".to_owned());
+        Ok(Accepted::Ask(Asking {
+            origin,
+            start,
+            target,
+            parent_title,
+        }))
     }
     /// Open the child's route and check that nothing else is opening there.
     fn prepare_launch(
@@ -2463,6 +2659,13 @@ impl Engine {
             }
             // A YOLO request held for the operator belongs to its parent: ending or
             // reaping the parent would silently drop a decision a person still owes.
+            if self
+                .mode_requests
+                .values()
+                .any(|r| r.scope == s && r.view.thread.as_deref() == Some(&t))
+            {
+                return true;
+            }
             if self.asking.values().any(|a| {
                 a.origin.parent.scope.as_ref() == Some(&s)
                     && a.origin.parent.session.as_deref() == Some(t.as_str())
@@ -2520,6 +2723,10 @@ impl Engine {
         if busy && let Some(entry) = self.workers.get_mut(scope, thread) {
             entry.marks.cancelled = true;
         }
+        self.withdraw_activations(
+            |r| &r.scope == scope && r.view.thread.as_deref() == Some(thread),
+            "The session ended before its pending mode request was answered.",
+        )?;
         self.end_children(scope, thread)?;
         Ok(())
     }
@@ -2607,12 +2814,14 @@ impl Engine {
             && live.confirming.is_none()
             && live.opening.is_none()
             && live.terminal.is_none()
-            && live.held_handoff.is_none();
+            && live.held_handoff.is_none()
+            && !self.mode_requests.values().any(|r| &r.scope == scope);
         if !idle {
             return Ok(());
         }
         // Keep each worker's final answer: the process is about to close.
         self.capture_finals(scope);
+        self.withdraw_activations(|r| &r.scope == scope, "The session host closed this route.")?;
         let live = self.running.remove(scope).expect("checked above");
         let mut recovered = SavedScope::from_state(&live.state).recover();
         self.ledger.data.worker_notices.apply_to(&mut recovered);
@@ -2796,7 +3005,13 @@ fn catalog_detail(state: &ScopeState) -> serde_json::Value {
         .iter()
         .filter_map(|ask| ask.thread.as_deref())
         .collect();
-    serde_json::json!({"archived":state.detail["archived"],"request_threads":requests})
+    let drafts: Vec<_> = state
+        .asks
+        .iter()
+        .filter(|ask| ask.thread.is_none())
+        .map(|ask| &ask.id)
+        .collect();
+    serde_json::json!({"archived":state.detail["archived"],"request_threads":requests,"draft_requests":drafts})
 }
 fn catalog_snapshot(state: &ScopeState) -> ScopeState {
     ScopeState {
@@ -3034,6 +3249,14 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
         e.1.insert("yolo_children".into(), children.into());
     }
     for (id, entry) in workers.in_scope(scope) {
+        if let Some(ceiling) = entry.origin.limits_children() {
+            let started = entry
+                .origin
+                .started
+                .and_then(|mode| ox_desk_core::modes::Level::of(scope.route.runtime, mode))
+                .unwrap_or(entry.origin.requested);
+            store.restore_worker_ceiling(id, ceiling.min(started));
+        }
         if let Some(contract) = entry.origin.claude_contract(entry.origin.mode) {
             store.restore_worker_contract(id, contract);
         }
@@ -4620,6 +4843,157 @@ mod tests {
             assert!(
                 matches!(launch.origin.yolo, Some(YoloAllowance::Inherited { session }) if session == "a")
             );
+        }
+
+        #[test]
+        fn session_yolo_requires_one_live_token_for_each_activation() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (scope, _, _) = routes(root.path());
+            let (route, log) = live(
+                &scope,
+                vec![view(&scope, "a", "idle", "workspace")],
+                &[],
+                vec![],
+            );
+            engine.running.insert(scope.clone(), route);
+            ox_desk_core::state_file::write_json(
+                &root.path().join("host-mode-policy.json"),
+                &HostPolicy::YoloAsksEveryTime,
+            )
+            .unwrap();
+            let activate = |engine: &mut Engine| {
+                engine
+                    .act(
+                        1,
+                        "mode",
+                        &scope,
+                        Action::SetAccess("a".into(), Access::Yolo),
+                        None,
+                    )
+                    .unwrap();
+                engine.process(&scope, vec![], true).unwrap();
+                engine.running[&scope]
+                    .state
+                    .asks
+                    .iter()
+                    .find(|a| crate::yolo::is_request(a))
+                    .unwrap()
+                    .clone()
+            };
+            let first = activate(&mut engine);
+            assert!(log.lock().unwrap().is_empty());
+            assert!(
+                engine
+                    .act(
+                        2,
+                        "no-proof",
+                        &scope,
+                        Action::AnswerAsk(first.id.clone(), 0),
+                        None
+                    )
+                    .is_err()
+            );
+            engine
+                .act(
+                    2,
+                    "accept",
+                    &scope,
+                    Action::AnswerAsk(first.id.clone(), 0),
+                    Some(first.token.clone()),
+                )
+                .unwrap();
+            assert!(matches!(
+                log.lock().unwrap().last(),
+                Some((Action::SetAccess(_, Access::Yolo), _))
+            ));
+            engine
+                .act(
+                    1,
+                    "lower",
+                    &scope,
+                    Action::SetAccess("a".into(), Access::Workspace),
+                    None,
+                )
+                .unwrap();
+            let next = activate(&mut engine);
+            assert_ne!(first.id, next.id);
+            assert!(
+                engine
+                    .act(
+                        2,
+                        "stale",
+                        &scope,
+                        Action::AnswerAsk(next.id.clone(), 0),
+                        Some(first.token)
+                    )
+                    .is_err()
+            );
+            engine
+                .act(
+                    2,
+                    "lower-instead",
+                    &scope,
+                    Action::AnswerAsk(next.id, 1),
+                    Some(next.token),
+                )
+                .unwrap();
+            assert!(matches!(
+                log.lock().unwrap().last(),
+                Some((Action::SetAccess(_, Access::AutoReview), _))
+            ));
+        }
+
+        #[test]
+        fn host_policy_controls_the_real_worker_admission_path() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker, _) = routes(root.path());
+            with_parent(&mut engine, &parent, "yolo");
+            engine
+                .running
+                .insert(worker.clone(), live(&worker, vec![], &[], vec![]).0);
+            let save = |policy| {
+                ox_desk_core::state_file::write_json(
+                    &root.path().join("host-mode-policy.json"),
+                    &policy,
+                )
+                .unwrap()
+            };
+            let caller = thread(&parent, "a");
+            save(HostPolicy::AlwaysYolo);
+            let origin = launched(engine.accept_launch(&caller, explicit_yolo(Runtime::Codex)));
+            assert_eq!(origin.yolo, Some(YoloAllowance::HostPolicy));
+            assert_eq!(
+                origin.decided,
+                Some(ox_desk_core::modes::Decision::HostPolicy)
+            );
+            save(HostPolicy::AlwaysRead);
+            let child = launched(engine.accept_launch(&caller, inherit(Runtime::Codex)));
+            assert_eq!(child.started, Some(Access::ReadOnly));
+            assert_eq!(child.ceiling, Ceiling::Yolo);
+            assert!(crate::workers::operator_access(&child, Access::Workspace).is_ok());
+            engine.set_grant(&parent, "a", true).unwrap();
+            save(HostPolicy::YoloAsksEveryTime);
+            assert!(matches!(
+                engine
+                    .accept_launch(&caller, inherit(Runtime::Codex))
+                    .unwrap(),
+                Accepted::Ask(_)
+            ));
+            let operator = Caller::Operator {
+                scope: parent.clone(),
+                parent: "a".into(),
+                device: "phone".into(),
+            };
+            let mut requested = explicit_yolo(Runtime::Codex);
+            requested.yolo_confirmed = true;
+            assert!(matches!(
+                engine.accept_launch(&operator, requested).unwrap(),
+                Accepted::Ask(_)
+            ));
         }
 
         #[test]

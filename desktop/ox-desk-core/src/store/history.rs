@@ -255,6 +255,15 @@ impl Store {
     fn request_resume(&mut self, id: &str, full_history: bool) -> io::Result<()> {
         self.request(
             Call::Resume {
+                preset: if self.child_threads.contains_key(id)
+                    || self.transcripts.get(id).is_some_and(|t| t.ready)
+                {
+                    None
+                } else {
+                    self.host_start_access(id).and_then(|fixed| {
+                        self.starting_access(Some(fixed), self.resume_access.get(id).copied())
+                    })
+                },
                 thread: id.into(),
                 project: (!self.child_threads.contains_key(id))
                     .then(|| self.profile.project.clone()),
@@ -329,6 +338,12 @@ impl Store {
             if self.profile.route.is_api() {
                 self.authorized_models
                     .insert(id.into(), reply.model.clone());
+            }
+            if self.review_yolo_resumes
+                && reply.permissions.ceiling == Some(crate::modes::Level::Yolo)
+                && self.transcripts.get(id).is_none_or(|t| !t.ready)
+            {
+                self.held_yolo_resumes.entry(id.into()).or_insert(false);
             }
             let mut initial = reply.initial_turns_page;
             self.transcripts.entry(id.into()).or_default().verified = true;

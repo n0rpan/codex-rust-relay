@@ -89,6 +89,9 @@ const HOST_USAGE: &str = "Usage: ox host COMMAND
   status                    show whether the host and its login service run
   pair                      enable private Serve access and print a device invitation
   update [setting]          install when idle or set automatic, download, manual, stable or dev
+  name [NAME]               show or change this host’s display name
+  labels [set LABEL…]       show or replace placement labels
+  policy [set POLICY]       show or change the host mode policy
   devices                   list paired devices and their IDs
   terminal <device> on|off  change a paired device’s terminal grant
   revoke <device-id>        disconnect a paired device
@@ -99,12 +102,15 @@ const HOST_USAGE: &str = "Usage: ox host COMMAND
                             Codex and Claude Code sessions and sign-ins are never touched.";
 
 pub(crate) fn host(args: &[OsString]) -> Result<u8, RelayError> {
-    const COMMANDS: [&str; 11] = [
+    const COMMANDS: &[&str] = &[
         "install",
         "status",
         "doctor",
         "pair",
         "devices",
+        "policy",
+        "name",
+        "labels",
         "update",
         "revoke",
         "terminal",

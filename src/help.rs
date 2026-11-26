@@ -221,6 +221,7 @@ Checks and next steps
   ox host pair            Pair a desktop or phone over your tailnet.
   ox host pair --terminal Include terminal access for the device that pairs.
   ox host name [NAME]     Show or change the name shown on paired devices.
+  ox host policy          Show the host mode policy. Use set POLICY to change it.
   ox host labels set big  Set placement labels used to identify this host.
   ox host update dev      Follow development builds. Use stable for releases.
   ox host devices         List device IDs for ox host revoke <device-id>.

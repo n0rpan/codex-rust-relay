@@ -25,6 +25,9 @@ pub(super) struct Envelope {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum DeviceAction {
+    HostModePolicy {
+        set: Option<ox_desk_core::host_policy::HostPolicy>,
+    },
     HostProfile {
         edit: Option<crate::host_profile::Edit>,
     },
@@ -65,6 +68,9 @@ pub(super) async fn settings(
         if let Some(op) = &device_action {
             let data = match op {
                 DeviceAction::HostUpdate { .. } => None,
+                DeviceAction::HostModePolicy { set } => Some(
+                    json!({"policy":state.mode_policy(*set).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?}),
+                ),
                 DeviceAction::HostProfile { edit } => {
                     Some(json!(state.host_profile(edit.clone()).map_err(|e| {
                         if e.kind() == std::io::ErrorKind::AlreadyExists {

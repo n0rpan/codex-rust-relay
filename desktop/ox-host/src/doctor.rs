@@ -141,6 +141,9 @@ fn host(paths: &Paths, report: &mut Report) -> bool {
                         probe.version,
                         probe.capabilities.join(", ")
                     ));
+                    if let Some(policy) = info.mode_policy {
+                        report.info(format!("host mode policy: {}", policy.label()));
+                    }
                     if !info.labels.is_empty() {
                         report.info(format!("host labels: {}", info.labels.join(", ")));
                     }

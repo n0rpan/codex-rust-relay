@@ -87,6 +87,16 @@ def exercise(js, wait):
     wait(lambda: js("return !fixtureAccountButton.isConnected && [...document.querySelectorAll('#settings button')].some(b=>b.textContent==='Sign in with Claude')"))
     go("← Settings")
     go("Remote access")
+    go("Host mode policy")
+    wait(lambda: js("return !!document.querySelector('#settings select[name=host_mode_policy]')"))
+    fill("host_mode_policy", "always_read")
+    go("Save host policy")
+    saved()
+    assert settings({"action": "host_mode_policy"})["policy"] == "always_read"
+    fill("host_mode_policy", "follow_interface")
+    go("Save host policy")
+    saved()
+    go("← Remote access")
     go("Pair another device")
     wait(lambda: js("return !!document.querySelector('.phone-settings-invite canvas')"))
     assert js("""return import('./vendor/jsQR-1.4.0.js').then(()=>{

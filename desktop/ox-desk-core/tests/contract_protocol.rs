@@ -89,7 +89,11 @@ fn installed_protocol() {
         ),
         (
             "ThreadResumeParams",
-            "threadId cwd model modelProvider excludeTurns initialTurnsPage",
+            "threadId cwd model modelProvider excludeTurns initialTurnsPage sandbox approvalPolicy approvalsReviewer",
+        ),
+        (
+            "ThreadForkParams",
+            "threadId cwd model modelProvider excludeTurns sandbox approvalPolicy approvalsReviewer",
         ),
         (
             "ThreadListParams",

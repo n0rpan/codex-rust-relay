@@ -64,9 +64,19 @@ def run(host, cli, harness, stock=None):
             shutil.copy2(src, package / name)
         env.update(XDG_STATE_HOME=str(root / "state"), XDG_CONFIG_HOME=str(home / "config"),
                    XDG_DATA_HOME=str(home / "data"), OX_NO_BACKGROUND_UPDATE="1")
+        # Run the packaged public CLI before first startup, then exercise the
+        # live admin commands. The host requires an owner-only state directory.
+        def host_cli(command, *args):
+            return subprocess.check_output([package / "ox", "host", command, *args],
+                                           env=env, text=True, timeout=10).strip()
+        assert host_cli("policy", "set", "always-write") == "Always write"
+        assert host_cli("policy") == "Always write"
+        assert host_cli("policy", "set", "follow-interface") == "Follow interface"
         stack.enter_context(session_host(package / "ox-host", root, env))
         host_state = Path(env["OX_HOST_STATE_DIR"])
         wait(lambda: (host_state / "remote-admin.sock").exists())
+        assert host_cli("name", "Studio") == host_cli("name") == "Studio"
+        assert host_cli("labels", "set", "build") == host_cli("labels") == "build"
         public = ThreadedTCP(("127.0.0.1", 0), Forward)
         port = public.server_address[1]
         origin = f"https://studio.fixture.ts.net:{port}"
@@ -87,7 +97,7 @@ def run(host, cli, harness, stock=None):
         if stock:
             for runtime in ("claude", "codex"):
                 assert (root / "workspace" / runtime / "approved.txt").read_text().strip() == "accepted"
-            print("PASS stock Claude and Codex approved after native desktop reconnect", flush=True)
+            print("PASS stock Claude and Codex command approvals, fixed starts, YOLO review across reconnect and lower-mode resume", flush=True)
         assert not admin(host_state, {"type": "status"})["devices"]
         assert "fixture-native-brave" in (Path(env["CODEX_HOME"]) / "ox-api-keys.json").read_text()
         print("PASS native manual pairing, signed key import, host identity on reconnect, "

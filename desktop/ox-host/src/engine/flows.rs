@@ -479,9 +479,47 @@ impl Engine {
         scope: &Scope,
         start: HandoffStart,
     ) -> io::Result<()> {
+        self.start_handoff_checked(client, key, scope, start, None)
+    }
+    pub(super) fn start_handoff_checked(
+        &mut self,
+        client: u64,
+        key: &str,
+        scope: &Scope,
+        start: HandoffStart,
+        mode_approval: Option<YoloAllowance>,
+    ) -> io::Result<()> {
         start.validate().map_err(io::Error::other)?;
         if let Some(reason) = self.handoff_blocker(scope, &start.source) {
             return Err(io::Error::other(reason));
+        }
+        let policy = HostPolicy::read(&self.state_dir)?;
+        if mode_approval.is_none() && policy.starting_level().is_none() {
+            let source = &start.source;
+            let current = self.running[scope].store.applied_ceiling(Some(source));
+            let stamp = self.workers.get(scope, source).map(|e| &e.origin);
+            let verified = crate::workers::source_level(current, stamp);
+            let resolved = modes::resolve_operator(verified, start.mode, start.runtime)
+                .map_err(io::Error::other)?;
+            if resolved.level.needs_person()
+                && policy == HostPolicy::FollowInterface
+                && !start.yolo_confirmed
+                && self.yolo_grant(scope, source).is_none()
+            {
+                return Err(io::Error::other(
+                    "This handoff would start in YOLO. Choose YOLO to confirm it, or select a lower mode.",
+                ));
+            }
+            if resolved.level.needs_person() && policy == HostPolicy::YoloAsksEveryTime {
+                return self.ask_activation(
+                    scope,
+                    mode_requests::Activation::Handoff {
+                        client,
+                        key: key.into(),
+                        start,
+                    },
+                );
+            }
         }
         // The helper may run provider model discovery, so the catalog lookup
         // never blocks the engine. A slow or failed lookup uses the default budget.
@@ -523,6 +561,7 @@ impl Engine {
             deadline: Instant::now() + LOAD_WAIT,
             window,
             window_deadline: Instant::now() + WINDOW_WAIT,
+            mode_approval,
         });
         Ok(())
     }
@@ -535,6 +574,7 @@ impl Engine {
             reply,
             device,
             surface,
+            mode_approval,
             window,
             ..
         } = prep;
@@ -572,11 +612,42 @@ impl Engine {
             .get(&src, &start.source)
             .map(|e| e.origin.clone());
         let level = crate::workers::source_level(ceiling, src_origin.as_ref());
-        let resolved = match modes::resolve_operator(level, start.mode, start.runtime) {
-            Ok(r) => r,
-            Err(e) => fail!(e),
+        let policy = match HostPolicy::read(&self.state_dir) {
+            Ok(policy) => policy,
+            Err(error) => fail!(format!("Could not read the host mode policy: {error}")),
         };
-        let yolo = if resolved.level.needs_person() {
+        let resolved = if let Some(fixed) = policy.starting_level() {
+            let ceiling = src_origin
+                .as_ref()
+                .and_then(Origin::limits_children)
+                .unwrap_or(modes::Level::Yolo);
+            let start_level = match start.mode {
+                modes::ModeRequest::Inherit => fixed,
+                modes::ModeRequest::Level(requested) => requested.min(fixed),
+            }
+            .min(ceiling);
+            modes::Resolved {
+                level: start_level,
+                access: start_level.preset(start.runtime),
+                decision: Decision::HostPolicy,
+            }
+        } else {
+            match modes::resolve_operator(level, start.mode, start.runtime) {
+                Ok(r) => r,
+                Err(e) => fail!(e),
+            }
+        };
+        let yolo = if resolved.level.needs_person() && policy == HostPolicy::AlwaysYolo {
+            Some(YoloAllowance::HostPolicy)
+        } else if resolved.level.needs_person() && policy == HostPolicy::YoloAsksEveryTime {
+            match mode_approval {
+                Some(accepted) => Some(accepted),
+                None => fail!(
+                    "The host’s mode policy changed. Start this handoff again to review YOLO."
+                        .into()
+                ),
+            }
+        } else if resolved.level.needs_person() {
             match self.yolo_grant(&src, &start.source) {
                 Some(grant) => Some(grant),
                 None if start.yolo_confirmed => Some(YoloAllowance::Operator {
