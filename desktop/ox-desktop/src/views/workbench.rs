@@ -325,9 +325,10 @@ impl Workbench {
                                 s.launch_error = Some(e.to_string());
                             }
                             if let Some((text, images)) = s.pending_draft.take() {
-                                if !text.is_empty() && store.draft(None).is_empty() {
-                                    store.edit(None, text);
+                                while !store.draft_images(None).is_empty() {
+                                    store.remove_image(None, 0);
                                 }
+                                store.edit(None, text);
                                 for img in images {
                                     store.attach_image(None, img);
                                 }
@@ -665,9 +666,10 @@ impl Workbench {
         }
         if let Some(store) = &mut self.store {
             let _ = store.dispatch(DeskAction::NewDraft);
-            if !text.is_empty() {
-                store.edit(None, text);
+            while !store.draft_images(None).is_empty() {
+                store.remove_image(None, 0);
             }
+            store.edit(None, text);
             for img in images {
                 store.attach_image(None, img);
             }

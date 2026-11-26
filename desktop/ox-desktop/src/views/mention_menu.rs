@@ -71,19 +71,22 @@ pub fn format_file_mention_tag(project: &Path, path: &Path) -> String {
     }
 }
 
-pub fn mentions_in_text(text: &str) -> Vec<String> {
+fn mention_spans_in_text(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
     let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(idx) = rest.find('@') {
-        let before_ok = idx == 0
-            || rest[..idx]
+    let mut offset = 0;
+    while let Some(rel) = text[offset..].find('@') {
+        let start = offset + rel;
+        let before_ok = start == 0
+            || text[..start]
                 .chars()
                 .next_back()
                 .is_some_and(char::is_whitespace);
-        rest = &rest[idx + 1..];
-        if !before_ok || rest.is_empty() {
+        let after_at = start + 1;
+        if !before_ok || after_at >= text.len() {
+            offset = after_at;
             continue;
         }
+        let rest = &text[after_at..];
         let mention = if rest.starts_with('"') {
             let mut end = 1;
             let bytes = rest.as_bytes();
@@ -104,14 +107,46 @@ pub fn mentions_in_text(text: &str) -> Vec<String> {
             &rest[..end]
         };
         if !mention.is_empty() {
-            let tag = format!("@{mention}");
-            if !out.contains(&tag) {
-                out.push(tag);
-            }
+            let end = after_at + mention.len();
+            out.push((start..end, format!("@{mention}")));
+            offset = end;
+        } else {
+            offset = after_at;
         }
-        rest = &rest[mention.len()..];
     }
     out
+}
+
+pub fn mentions_in_text(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (_, tag) in mention_spans_in_text(text) {
+        if !out.contains(&tag) {
+            out.push(tag);
+        }
+    }
+    out
+}
+
+/// Removes every complete parsed mention token matching `target_tag` (plus one trailing space if present),
+/// without touching longer mentions that share a prefix or email addresses.
+pub fn remove_mention_from_text(text: &str, target_tag: &str) -> String {
+    let spans: Vec<std::ops::Range<usize>> = mention_spans_in_text(text)
+        .into_iter()
+        .filter(|(_, tag)| tag == target_tag)
+        .map(|(range, _)| range)
+        .collect();
+    if spans.is_empty() {
+        return text.to_owned();
+    }
+    let mut result = text.to_owned();
+    for range in spans.into_iter().rev() {
+        let mut end = range.end;
+        if result[end..].starts_with(' ') {
+            end += 1;
+        }
+        result.replace_range(range.start..end, "");
+    }
+    result
 }
 
 /// Try to convert a HEIC/HEIF image to PNG bytes using `sips` (macOS), `heif-convert`, or `magick`/`ffmpeg`.
@@ -323,13 +358,15 @@ impl Workbench {
         }
         if !mention_tags.is_empty() {
             let mut draft = store.draft(owner).to_owned();
+            let mut existing = mentions_in_text(&draft);
             for tag in mention_tags {
-                if !draft.contains(&tag) {
+                if !existing.contains(&tag) {
                     if !draft.is_empty() && !draft.ends_with(char::is_whitespace) {
                         draft.push(' ');
                     }
                     draft.push_str(&tag);
                     draft.push(' ');
+                    existing.push(tag);
                 }
             }
             let _ = store.dispatch(DeskAction::DraftEdit(owner_key.clone(), draft));
@@ -672,9 +709,7 @@ pub(super) fn composer_input(
                 cx.listener(move |s, _, window, cx| {
                     if let Some(store) = &mut s.store {
                         let current = store.draft(target.as_deref());
-                        let next = current
-                            .replace(&format!("{tag_to_remove} "), "")
-                            .replace(&tag_to_remove, "");
+                        let next = remove_mention_from_text(current, &tag_to_remove);
                         let _ = store.dispatch(DeskAction::DraftEdit(target.clone(), next.clone()));
                         input_for_remove.update(cx, |e, cx| e.set_value(next, window, cx));
                         cx.notify();
@@ -757,6 +792,10 @@ mod tests {
                 "@docs/spec.pdf".to_owned(),
                 r#"@"my docs/notes.md""#.to_owned()
             ]
+        );
+        assert_eq!(
+            remove_mention_from_text("Compare @src/foo @src/foo_test and foo@src/foo", "@src/foo"),
+            "Compare @src/foo_test and foo@src/foo"
         );
     }
 }

@@ -966,12 +966,13 @@ impl Host {
                 links.insert((key.0.clone(), key.2.clone()), link);
             }
             let mkey = ThreadMetaKey::new(key.0.clone(), key.1.runtime, key.2.clone());
-            let is_pinned = self
-                .sidebar
-                .thread(&mkey)
-                .and_then(|m| m.pinned_at)
-                .is_some();
-            if !is_pinned && let Some(parent_key) = resolved.filter(|parent| *parent != *key) {
+            let promoted = self.sidebar.thread(&mkey).is_some_and(|m| {
+                m.pinned_at.is_some()
+                    || m.section
+                        .as_deref()
+                        .is_some_and(|id| self.sidebar.sections.iter().any(|s| s.id == id))
+            });
+            if !promoted && let Some(parent_key) = resolved.filter(|parent| *parent != *key) {
                 parents.insert(
                     (node.0.0.clone(), node.0.2.clone()),
                     (parent_key.0.clone(), parent_key.2.clone()),

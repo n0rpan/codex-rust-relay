@@ -987,29 +987,38 @@ impl Host {
             pane,
             window,
             |s, owner, event: &super::route_chip::NewModelRoute, window, cx| {
-                let (project, carried) = {
-                    let view = owner.read(cx);
-                    let carried = view.store.as_ref().and_then(|store| {
+                let (project, same_route, carried) = owner.update(cx, |view, _| {
+                    let same_route = view.route == event.0;
+                    let carried = view.store.as_mut().and_then(|store| {
                         if store.selected().is_some() {
                             return None;
                         }
                         let text = store.draft(None).to_owned();
                         let images = store.draft_images(None).to_vec();
+                        if !same_route && (!text.is_empty() || !images.is_empty()) {
+                            store.edit(None, String::new());
+                            while !store.draft_images(None).is_empty() {
+                                store.remove_image(None, 0);
+                            }
+                        }
                         (!text.is_empty() || !images.is_empty()).then_some((text, images))
                     });
-                    (view.project.clone(), carried)
-                };
+                    (view.project.clone(), same_route, carried)
+                });
                 match new_route_gate(&event.0, s.models.read(cx), s.native_account) {
                     Ok(()) => {
                         s.open(project, event.0.clone(), window, cx);
                         s.panes[s.active].update(cx, |pane, cx| {
                             pane.action(cx, DeskAction::NewDraft);
-                            if let Some((text, images)) = carried {
+                            if !same_route && let Some((text, images)) = carried {
                                 pane.adopt_new_draft(text, images, cx);
                             }
                         });
                     }
                     Err(message) => {
+                        if !same_route && let Some((text, images)) = carried {
+                            owner.update(cx, |pane, cx| pane.adopt_new_draft(text, images, cx));
+                        }
                         s.message = Some(message.into());
                         cx.notify();
                     }
