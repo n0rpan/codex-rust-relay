@@ -340,7 +340,7 @@ impl Host {
         {
             add(
                 "Start worker…".into(),
-                "Run a task in a worker under this session · /worker codex:<model> [--mode <mode>] [--goal] <task>".into(),
+                "Run a task in a worker under this session · /worker [@host] codex:<model> [--mode <mode>] [--goal] <task>".into(),
                 Target::Worker {
                     pane: self.active,
                     owner: owner.to_owned(),

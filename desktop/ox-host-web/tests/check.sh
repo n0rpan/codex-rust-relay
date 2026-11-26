@@ -20,6 +20,11 @@ host="${OX_TEST_HOST_BIN:-$root/desktop/target/$profile/ox-host}"
 if [[ -z "${OX_TEST_HOST_BIN:-}" ]]; then
     cargo build --locked --manifest-path desktop/Cargo.toml --profile "${OX_TEST_CARGO_PROFILE:-dev}" -p ox-host
 fi
+if [[ -n "${CODEOX_TEST_CODEX_BIN:-}" ]]; then
+    OX_TEST_PARENT_HARNESS=$(cargo test --manifest-path desktop/Cargo.toml --locked --profile "${OX_TEST_CARGO_PROFILE:-dev}" -p ox-host --bin ox-host --no-run --message-format=json |
+        jq -r 'select(.profile.test and .target.name=="ox-host" and .executable!=null) | .executable')
+    export OX_TEST_PARENT_HARNESS
+fi
 OX_TEST_HOST_BIN="$host" python3 desktop/ox-host-web/tests/browser.py "$harness"
 set -- "$host" "$OX_TEST_SETTINGS_OX" "$harness"
 if [[ -n "${CODEOX_TEST_CODEX_BIN:-}" && -n "${OX_TEST_CLAUDE_BIN:-}" ]]; then

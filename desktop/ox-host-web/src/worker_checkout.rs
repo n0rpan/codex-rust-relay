@@ -3,7 +3,7 @@
 mod connection;
 pub(crate) mod receiver;
 mod sender;
-pub use sender::transfer;
+pub use sender::{Sender, transfer};
 use serde::{Deserialize, Serialize};
 
 const CHUNK: usize = 256 * 1024;
@@ -101,6 +101,31 @@ mod tests {
         assert!(replay.recovered);
         assert_eq!(replay.receipt, receipt);
         assert!(send("3d89eff6-a436-40a4-a9ad-fa294b50c48d").is_err());
+        // Drop a connection after freezing the archive but before its chunks leave.
+        // A restarted sender must deliver those exact bytes even after another edit.
+        let spool = tempfile::tempdir_in(&state).unwrap();
+        let project = state.join("inventory-source/ox/nested");
+        let frozen = Sender {
+            host: &hosts[0],
+            source: source.trim(),
+            project: &project,
+            staging: &state,
+            job: 45,
+            request_id: "64e47f98-97b7-47c6-8fd4-2d7872f3f79c",
+        };
+        let stopped = frozen
+            .run(Some(spool.path()), || {
+                spool.path().join("snapshot").exists()
+            })
+            .unwrap_err();
+        assert_eq!(stopped.kind(), std::io::ErrorKind::Interrupted);
+        let path = project.join("tracked");
+        let original = fs::read(&path).unwrap();
+        fs::write(&path, b"later laptop edit").unwrap();
+        let delivered = frozen.run(Some(spool.path()), || false);
+        fs::write(&path, original).unwrap();
+        assert!(!delivered.unwrap().recovered);
+
         assert!(
             transfer(
                 &hosts[0],

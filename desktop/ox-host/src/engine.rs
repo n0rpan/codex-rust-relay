@@ -38,6 +38,8 @@ pub(crate) enum Message {
     Schema(Scope, u64, Box<ox_desk_core::slash::Capabilities>),
     Discovered(u64, Box<Server>),
     HostsListed(PathBuf, Result<Value, String>),
+    Outbound(Box<forwarding::Event>),
+    LinkedJob(Box<ox_host_web::linked_jobs::VerifiedJob>, Replier),
     Gateway {
         caller: Caller,
         request: Box<Gateway>,
@@ -334,6 +336,7 @@ pub(crate) struct Engine {
     mode_requests: BTreeMap<u64, mode_requests::ModeRequest>,
     preparing: Vec<Preparing>,
     reading: Vec<Reading>,
+    forward: forwarding::State,
     host_queries: HashMap<PathBuf, Vec<Replier>>,
     in_flows: bool,
     draining: Option<Instant>,
@@ -343,6 +346,9 @@ pub(crate) struct Engine {
     last_mode_policy: Option<HostPolicy>,
 }
 mod flows;
+mod forward_queue;
+pub(crate) mod forwarding;
+mod linked;
 mod mode_requests;
 mod notices;
 
@@ -372,6 +378,7 @@ impl Engine {
                 workers.restore(&saved.scope, id, origin, marks);
             }
         }
+        forwarding::recover(&ledger, dir)?;
         notices::recover(&mut ledger, &workers)?;
         ledger.retire(&crate::handover::take(dir))?;
         let cold = ledger
@@ -413,6 +420,7 @@ impl Engine {
             mode_requests: Default::default(),
             preparing: Default::default(),
             reading: Default::default(),
+            forward: Default::default(),
             host_queries: Default::default(),
             in_flows: false,
             draining: None,
@@ -459,6 +467,7 @@ impl Engine {
                         .any(|c| c.watch_resources)
                         .then_some(self.next_resources),
                 )
+                .chain(self.forward_deadline())
                 .chain(Some(self.next_reap))
                 .min();
             let msg = if deadline.is_some_and(|at| at <= Instant::now()) {
@@ -527,6 +536,7 @@ impl Engine {
                         self.refresh_mode_policy()?;
                         self.reap_idle(now)?;
                     }
+                    self.poll_forwarded(now)?;
                     self.advance_flows()?;
                 }
                 Some(Message::Replace(binary, _reservation)) => {
@@ -563,6 +573,8 @@ impl Engine {
                         self.answer(reply, result.clone())?;
                     }
                 }
+                Some(Message::Outbound(event)) => self.outbound(*event)?,
+                Some(Message::LinkedJob(job, reply)) => self.linked_job(*job, reply)?,
                 Some(Message::Gateway {
                     caller,
                     request,
@@ -576,10 +588,7 @@ impl Engine {
                     Gateway::Call(call @ ParentCall::ReadThread { .. }) => {
                         self.read_thread(&caller, call, reply)?
                     }
-                    Gateway::Call(call) => {
-                        let result = self.parent_call(&caller, call);
-                        self.answer(reply, result)?;
-                    }
+                    Gateway::Call(call) => self.dispatch_parent_call(&caller, call, reply)?,
                 },
                 Some(Message::Connect(id, peer)) => {
                     self.clients.insert(
@@ -723,6 +732,7 @@ impl Engine {
                 .map(str::to_owned)
                 .into();
                 capabilities.push("worker_inventory".into());
+                capabilities.push("linked_read_workers".into());
                 if prepared.is_some() {
                     capabilities.push("worker_routes_known".into());
                 }
@@ -889,8 +899,7 @@ impl Engine {
                 if matches!(call, ParentCall::ListHosts) {
                     return self.list_hosts(&caller, reply);
                 }
-                let result = self.parent_call(&caller, call);
-                self.answer(reply, result)
+                self.dispatch_parent_call(&caller, call, reply)
             }
             Client::Act {
                 id: key,
@@ -2058,7 +2067,7 @@ impl Engine {
             }
             return self.answer(f.reply, Err(flows::ENDED_PARENT.into()));
         }
-        if f.detached
+        if (f.detached || f.origin.linked.is_some())
             && let Err(e) = &f.result
         {
             let origin = f.origin.clone();
@@ -2136,16 +2145,38 @@ impl Engine {
             .sum::<usize>()
             + self.preparing.len()
             + self.reading.len()
+            + self
+                .ledger
+                .data
+                .forwarded
+                .values()
+                .filter(|j| j.preparing())
+                .count()
     }
     /// Check policy, then hand the launch to the worker's own runtime. Nothing
     /// starts unless every check passes. The reply waits for the native session,
     /// or, for a YOLO child that needs the operator, returns at once with
     /// `waiting_for_operator`.
-    fn launch(&mut self, caller: Caller, start: WorkerStart, reply: Replier) -> io::Result<()> {
+    fn launch(&mut self, caller: Caller, mut start: WorkerStart, reply: Replier) -> io::Result<()> {
         if self.update_reserved() {
             return self.answer(reply, Err(crate::handover::REFUSAL.into()));
         }
-        match self.accept_launch(&caller, start) {
+        if let Some(host) = start.host.take()
+            && host != "parent"
+            && host != self.host_id.to_string()
+        {
+            let result = self.forward_launch(caller, start, &host);
+            return self.answer(reply, result);
+        }
+        let accepted = self.accept_launch(&caller, start);
+        self.start_accepted(accepted, reply)
+    }
+    fn start_accepted(
+        &mut self,
+        accepted: Result<Accepted, String>,
+        reply: Replier,
+    ) -> io::Result<()> {
+        match accepted {
             Ok(Accepted::Launch(scope, launching)) => {
                 let live = self.running.get_mut(&scope).expect("ensured worker scope");
                 live.launching = Some(Launching { reply, ..launching });
@@ -2158,29 +2189,41 @@ impl Engine {
     fn new_job_id(&self) -> Result<u64, String> {
         loop {
             let candidate = getrandom::u64().map_err(|e| e.to_string())? & ((1u64 << 52) - 1);
-            if candidate > 0
-                && !self.workers.job_ids().any(|j| j == candidate)
-                && !self
-                    .ledger
-                    .data
-                    .worker_notices
-                    .observed
-                    .contains_key(&candidate)
-                && !self.asking.contains_key(&candidate)
-                && !self.mode_requests.contains_key(&candidate)
-                && !self
-                    .ledger
-                    .data
-                    .outcomes
-                    .iter()
-                    .any(|o| o.origin.job_id == candidate)
-            {
+            if candidate > 0 && !self.job_in_use(candidate) {
                 return Ok(candidate);
             }
         }
     }
-    fn accept_launch(&mut self, caller: &Caller, start: WorkerStart) -> Result<Accepted, String> {
-        start.validate()?;
+    fn job_in_use(&self, candidate: u64) -> bool {
+        self.ledger.data.forwarded.contains_key(&candidate)
+            || self.workers.job_ids().any(|j| j == candidate)
+            || self
+                .ledger
+                .data
+                .worker_notices
+                .observed
+                .contains_key(&candidate)
+            || self.asking.contains_key(&candidate)
+            || self.mode_requests.contains_key(&candidate)
+            || self
+                .ledger
+                .data
+                .outcomes
+                .iter()
+                .any(|o| o.origin.job_id == candidate)
+            || self.running.values().any(|l| {
+                l.launching
+                    .as_ref()
+                    .is_some_and(|job| job.origin.job_id == candidate)
+                    || l.confirming
+                        .as_ref()
+                        .is_some_and(|c| c.launch.origin.job_id == candidate)
+            })
+    }
+    fn worker_source(
+        &self,
+        caller: &Caller,
+    ) -> Result<(PathBuf, Option<String>, Option<Level>, bool), String> {
         let (project, parent, ceiling, parent_origin, external, parent_scope) = match caller {
             Caller::Hosted { scope, hint, .. } => {
                 let live = self
@@ -2220,10 +2263,19 @@ impl Engine {
                     Some(scope),
                 )
             }
+            Caller::Linked { project, .. } => (project.clone(), None, None, None, false, None),
             Caller::External(c) => (c.project.clone(), None, None, None, true, None),
         };
-        let source = parent_scope
-            .and_then(|_| crate::workers::source_level(ceiling, parent_origin.as_ref()));
+        let source = match caller {
+            Caller::Linked { stamp, .. } => Some(stamp.verified_level.min(stamp.link_ceiling)),
+            _ => parent_scope
+                .and_then(|_| crate::workers::source_level(ceiling, parent_origin.as_ref())),
+        };
+        Ok((project, parent, source, external))
+    }
+    fn accept_launch(&mut self, caller: &Caller, start: WorkerStart) -> Result<Accepted, String> {
+        start.validate()?;
+        let (project, parent, source, external) = self.worker_source(caller)?;
         let resolved =
             crate::workers::grant(source, external, start.mode_request(), start.runtime)?;
         let policy = HostPolicy::read(&self.state_dir)
@@ -2231,6 +2283,11 @@ impl Engine {
         let ceiling = source.unwrap_or(crate::workers::TERMINAL_CEILING);
         let requested = resolved.level;
         let resolved = policy.child_start(resolved, start.mode_request(), ceiling, start.runtime);
+        if matches!(caller, Caller::Linked { .. })
+            && resolved.level != ox_desk_core::modes::Level::Read
+        {
+            return Err("This host version supports cross-host read workers. Choose read mode for this job.".into());
+        }
         let this_parent = crate::workers::parent_ref(caller, parent.clone());
         self.check_worker_cap(&this_parent)?;
         let project = ox_desk_core::worker_checkout::resolve(
@@ -2243,7 +2300,10 @@ impl Engine {
             route: start.route(),
         })
         .map_err(|e| e.to_string())?;
-        let job_id = self.new_job_id()?;
+        let job_id = match caller {
+            Caller::Linked { job, .. } => *job,
+            _ => self.new_job_id()?,
+        };
         let mut origin = crate::workers::origin(caller, parent.clone(), &start, job_id, resolved);
         origin.ceiling = requested.max(resolved.level);
         if let Some(warning) = self.write_overlap(&scope, resolved.level) {
@@ -2281,6 +2341,11 @@ impl Engine {
                         }
                         None => return self.worker_ask(origin, start, scope),
                     }
+                }
+                Caller::Linked { .. } => {
+                    return Err(
+                        "Cross-host YOLO starts require a target-side operator request.".into(),
+                    );
                 }
                 Caller::External(_) => {
                     return Err("A terminal launch cannot start YOLO workers.".into());
@@ -2355,6 +2420,10 @@ impl Engine {
             crate::workers::status(entry, id, native, view, timeline, ready, self.operators());
         status["checkout"] = json!(scope.project);
         status["parent"] = json!(entry.origin.parent);
+        if let Some(link) = &entry.origin.linked {
+            status["parent"] = json!(link.parent);
+            status["linked_parent"] = json!(link);
+        }
         let requests = self.worker_requests(scope, id, &entry.origin);
         if !requests.is_empty() {
             let answerable = requests.iter().any(|r| r["parent_may_answer"] == true);
@@ -2411,6 +2480,11 @@ impl Engine {
                     session,
                 })
             }
+            Caller::Linked { stamp, .. } => Ok(Resolved::Linked {
+                source: stamp.host.clone(),
+                device: stamp.device.clone(),
+                request: stamp.request_id.clone(),
+            }),
             Caller::External(c) => Ok(Resolved::Terminal {
                 project: c.project.clone(),
                 launch: crate::workers::launch_digest("terminal", &c.launch),
@@ -2452,6 +2526,9 @@ impl Engine {
         let project = match self.resolve(caller) {
             Ok(Resolved::Hosted { scope, .. }) => scope.project,
             Ok(Resolved::Terminal { project, .. }) => project,
+            Ok(Resolved::Linked { .. }) => {
+                return self.answer(reply, Err("Query worker hosts on the parent host.".into()));
+            }
             Err(error) => return self.answer(reply, Err(error)),
         };
         if let Some(waiting) = self.host_queries.get_mut(&project) {
@@ -2490,12 +2567,15 @@ impl Engine {
     }
     /// The parent agent's four tools. Every answer comes from host session state.
     fn parent_call(&mut self, caller: &Caller, call: ParentCall) -> Result<Value, String> {
+        let me = self.resolve(caller)?;
+        self.call_as(me, call)
+    }
+    fn call_as(&mut self, me: crate::workers::Resolved, call: ParentCall) -> Result<Value, String> {
         if self.update_reserved()
             && matches!(call, ParentCall::Steer { .. } | ParentCall::Answer { .. })
         {
             return Err(crate::handover::REFUSAL.into());
         }
-        let me = self.resolve(caller)?;
         let owned = |e: &crate::workers::Entry| crate::workers::owns(&me, e);
         let job_id = match &call {
             ParentCall::Bind { session } => {
@@ -2516,7 +2596,18 @@ impl Engine {
                         scopes.push(scope.clone());
                     }
                 }
-                let bound = scopes.len();
+                let mut remote_bound = 0;
+                self.ledger
+                    .change(|d| {
+                        for j in d.forwarded.values_mut().filter(|j| {
+                            j.origin.launch == *launch && j.origin.parent.session.is_none()
+                        }) {
+                            j.origin.parent.session = Some(session.clone());
+                            remote_bound += 1;
+                        }
+                    })
+                    .map_err(|e| e.to_string())?;
+                let bound = scopes.len() + remote_bound;
                 scopes.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
                 scopes.dedup();
                 for scope in scopes {
@@ -2546,6 +2637,14 @@ impl Engine {
                         v.as_object_mut().map(|o| o.remove("messages"));
                         v
                     })
+                    .chain(
+                        self.ledger
+                            .data
+                            .forwarded
+                            .values()
+                            .filter(|j| j.owned(&me))
+                            .map(|j| j.summary()),
+                    )
                     .collect::<Vec<_>>();
                 return Ok(json!({ "jobs": jobs }));
             }
@@ -3459,7 +3558,7 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
 fn caller_scope(caller: &Caller) -> Option<&Scope> {
     match caller {
         Caller::Hosted { scope, .. } | Caller::Operator { scope, .. } => Some(scope),
-        Caller::External(_) => None,
+        Caller::External(_) | Caller::Linked { .. } => None,
     }
 }
 fn key_ok(reply: &Replier) -> bool {
@@ -3850,6 +3949,7 @@ mod tests {
     #[test]
     fn internal_dispatch_paths_name_their_own_sender() {
         let worker = Payload::Worker(WorkerStart {
+            host: None,
             parent: "p".into(),
             subscription_model: None,
             checkout: None,
@@ -4145,6 +4245,7 @@ mod tests {
         }
         fn origin(parent: ParentRef, ceiling: Ceiling) -> Origin {
             Origin {
+                linked: None,
                 relation: Relation::Worker,
                 parent,
                 launch: "helper:test".into(),
@@ -4184,6 +4285,7 @@ mod tests {
         }
         fn start(write: bool) -> WorkerStart {
             WorkerStart {
+                host: None,
                 parent: String::new(),
                 runtime: Runtime::Codex,
                 model: Some("fixture".into()),
@@ -4847,6 +4949,7 @@ mod tests {
                 &launch,
                 None,
                 &WorkerStart {
+                    host: None,
                     parent: String::new(),
                     runtime: Runtime::Codex,
                     model: Some("fixture".into()),

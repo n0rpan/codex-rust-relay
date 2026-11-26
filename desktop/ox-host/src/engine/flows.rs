@@ -121,7 +121,14 @@ impl Engine {
                 .values()
                 .filter(|a| &a.origin.parent == parent)
                 .count();
-        if started + starting >= cap {
+        let remote = self
+            .ledger
+            .data
+            .forwarded
+            .values()
+            .filter(|j| &j.origin.parent == parent && j.active())
+            .count();
+        if started + starting + remote >= cap {
             return Err(format!(
                 "This session already runs {cap} workers. Wait for one to finish or cancel one. The limit is OX_WORKER_MAX_PER_PARENT."
             ));
@@ -707,6 +714,7 @@ impl Engine {
             ),
         };
         let origin = Origin {
+            linked: None,
             relation: Relation::Handoff,
             parent: ParentRef {
                 project: src.project.clone(),

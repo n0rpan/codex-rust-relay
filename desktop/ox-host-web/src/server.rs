@@ -37,6 +37,7 @@ pub(crate) struct App {
     pub host: Arc<PathBuf>,
     pub inventory: Arc<crate::inventory::Cache>,
     pub slots: Arc<Semaphore>,
+    pub jobs: Option<crate::linked_jobs::Dispatch>,
     pub discovered: Arc<Mutex<std::collections::HashSet<ox_desk_core::host_protocol::Scope>>>,
 }
 #[path = "key_transfer.rs"]
@@ -70,15 +71,27 @@ pub(crate) fn background_keychain() -> Result<(), &'static str> {
 type ErrCode = StatusCode;
 const DENY: StatusCode = StatusCode::FORBIDDEN;
 pub fn run(state_dir: PathBuf, host_socket: PathBuf) -> io::Result<()> {
+    run_with_jobs(state_dir, host_socket, None)
+}
+pub fn run_with_jobs(
+    state_dir: PathBuf,
+    host_socket: PathBuf,
+    jobs: Option<crate::linked_jobs::Dispatch>,
+) -> io::Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(serve(state_dir, host_socket))
+        .block_on(serve(state_dir, host_socket, jobs))
 }
-async fn serve(dir: PathBuf, socket: PathBuf) -> io::Result<()> {
+async fn serve(
+    dir: PathBuf,
+    socket: PathBuf,
+    jobs: Option<crate::linked_jobs::Dispatch>,
+) -> io::Result<()> {
     let store = State::load(&dir)?;
     crate::worker_checkout::receiver::recover(&store.worker_directory())?;
     let app = App {
+        jobs,
         state: Arc::new(Mutex::new(store)),
         host: Arc::new(socket),
         slots: Arc::new(Semaphore::new(64)),
@@ -509,6 +522,10 @@ fn start_listener(app: App, origin: String, listener: TcpListener) -> Listener {
         .route("/api/challenge", post(challenge))
         .route("/api/worker-link", post(worker_link))
         .route(
+            "/api/worker-job",
+            post(crate::linked_jobs::handle).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route(
             "/api/worker-checkout",
             get(crate::worker_checkout::receiver::upgrade),
         )
@@ -736,17 +753,21 @@ async fn worker_link(
     #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
     enum Call {
         Info,
-        Inventory { project: Option<String> },
+        Inventory {
+            project: Option<String>,
+            #[serde(default)]
+            fresh: bool,
+        },
         RevokeSelf,
     }
     let call = serde_json::from_str(&body.request).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let project = {
+    let (project, fresh) = {
         let mut state = app.state.lock().unwrap();
         if !state.prove_worker(&id, &body.proof.nonce, &body.proof.signature, &body.request) {
             return Err(DENY);
         }
         match call {
-            Call::Inventory { project } => project,
+            Call::Inventory { project, fresh } => (project, fresh),
             Call::Info => {
                 let profile = state
                     .host_profile(None)
@@ -776,7 +797,7 @@ async fn worker_link(
         .slots
         .try_acquire()
         .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
-    let inventory = crate::inventory::local(&app, project)
+    let inventory = crate::inventory::local(&app, project, fresh)
         .await
         .map_err(|e| match e.kind() {
             io::ErrorKind::Unsupported => StatusCode::UNPROCESSABLE_ENTITY,
@@ -953,6 +974,7 @@ mod tests {
                 }
             });
             let app = App {
+                jobs: None,
                 state: Arc::new(Mutex::new(state)),
                 host: Arc::new(socket),
                 slots: Arc::new(Semaphore::new(4)),

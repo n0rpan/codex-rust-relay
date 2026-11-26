@@ -397,6 +397,10 @@ class Link {
         open(msg.result.scope, msg.result.session);
         return;
       }
+      if (!msg.error && msg.result?.status === "preparing") {
+        notice(`Preparing worker ${msg.result.job_id} on ${msg.result.worker_host?.name || "the linked host"}.`);
+        return;
+      }
       notice(
         msg.error ??
           (msg.result?.status === "waiting_for_operator"
@@ -914,7 +918,7 @@ function catalog() {
         el(
           "div",
           "worker-outcome",
-          `Worker #${worker.job_id} · ${worker.status.replaceAll("_", " ")}`,
+          `Worker #${worker.job_id} · ${worker.status.replaceAll("_", " ")}${worker.host ? " on " + worker.host : ""}`,
         ),
       );
     frag.append(b);

@@ -33,4 +33,4 @@ export type ThreadRow = { agentNickname?: string | null; cwd: string; id: string
 export type Timeline = { detail: unknown; items: Array<TimelineItem> };
 export type TimelineItem = { detail: unknown; id: string; revision: number; role: string; text: string; turn: string };
 export type WorkerMode = "session" | "goal" | "workflow";
-export type WorkerStart = { checkout?: string | null; max_minutes?: number | null; mode: WorkerMode; model?: string | null; parent: string; permission?: (ModeRequest | null); runtime: Runtime; subscription_model?: string | null; task: string; write?: boolean | null; yolo_confirmed?: boolean };
+export type WorkerStart = { checkout?: string | null; host?: string | null; max_minutes?: number | null; mode: WorkerMode; model?: string | null; parent: string; permission?: (ModeRequest | null); runtime: Runtime; subscription_model?: string | null; task: string; write?: boolean | null; yolo_confirmed?: boolean };

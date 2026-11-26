@@ -52,9 +52,23 @@ pub struct ParentRef {
     pub runtime: Option<Runtime>,
 }
 
+/// A parent on another host. Its paths and session identifiers are meaningful only there.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct LinkedParent {
+    pub host: String,
+    pub device: String,
+    pub request_id: String,
+    pub parent: ParentRef,
+    pub verified_level: Ceiling,
+    pub link_ceiling: Ceiling,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Origin {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked: Option<Box<LinkedParent>>,
     pub relation: Relation,
     pub parent: ParentRef,
     /// Non-secret identity of the launching OX helper or operator device.
@@ -133,6 +147,9 @@ impl Origin {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct WorkerStart {
+    /// A paired worker host name or stable ID. Omit to run on the parent's host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub parent: String,
     pub runtime: Runtime,
     pub model: Option<String>,
@@ -165,7 +182,7 @@ impl WorkerStart {
     pub fn mode_request(&self) -> ModeRequest {
         self.permission.unwrap_or(ModeRequest::legacy(self.write))
     }
-    /// The composer form: `/worker <codex|claude>[:<api model>] [--write]
+    /// The composer form: `/worker [@host] <codex|claude>[:<api model>] [--write]
     /// [--mode <mode>] [--goal|--workflow] <task>`. A Claude worker without a model uses the
     /// Claude subscription. Returns None when the text is not a worker command.
     pub fn parse_command(parent: &str, text: &str) -> Option<Result<Self, String>> {
@@ -173,8 +190,18 @@ impl WorkerStart {
         if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
             return None;
         }
-        let usage = "Use /worker codex:<model> [--mode <mode>] [--goal] <task> or /worker claude[:<model>] [--mode <mode>] [--workflow] <task>.";
-        let mut words = rest.trim_start().splitn(2, char::is_whitespace);
+        let usage = "Use /worker [@host] codex:<model> [--mode <mode>] [--goal] <task> or /worker [@host] claude[:<model>] [--mode <mode>] [--workflow] <task>.";
+        let rest = rest.trim_start();
+        let (host, rest) = match rest.strip_prefix('@') {
+            Some(named) => {
+                let Some((host, rest)) = named.split_once(char::is_whitespace) else {
+                    return Some(Err(usage.into()));
+                };
+                (Some(host.to_owned()), rest.trim_start())
+            }
+            None => (None, rest),
+        };
+        let mut words = rest.splitn(2, char::is_whitespace);
         let target = words.next().filter(|w| !w.is_empty());
         let Some(target) = target else {
             return Some(Err(usage.into()));
@@ -211,6 +238,7 @@ impl WorkerStart {
             task = after.trim_start();
         }
         let start = Self {
+            host,
             parent: parent.to_owned(),
             runtime,
             model,
@@ -227,6 +255,13 @@ impl WorkerStart {
     }
     /// The checks the standalone OX gateway applies, shared by every launcher.
     pub fn validate(&self) -> Result<(), String> {
+        if self
+            .host
+            .as_ref()
+            .is_some_and(|h| h.trim().is_empty() || h.len() > 256)
+        {
+            return Err("Provide a worker host name or ID.".into());
+        }
         if self.max_minutes.is_some_and(|m| m == 0 || m > 7 * 24 * 60) {
             return Err("max_minutes must be between 1 and 10080.".into());
         }
@@ -411,6 +446,17 @@ mod tests {
         );
         assert!(
             WorkerStart::parse_command("p", "/worker claude --goal x")
+                .unwrap()
+                .is_err()
+        );
+        let named =
+            WorkerStart::parse_command("p", "/worker @build claude --mode read inspect my changes")
+                .unwrap()
+                .unwrap();
+        assert_eq!(named.host.as_deref(), Some("build"));
+        assert_eq!(named.task, "inspect my changes");
+        assert!(
+            WorkerStart::parse_command("p", "/worker @ claude review")
                 .unwrap()
                 .is_err()
         );

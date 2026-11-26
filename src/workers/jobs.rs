@@ -35,6 +35,8 @@ pub(super) struct Jobs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Start {
+    #[serde(default)]
+    pub host: Option<String>,
     runtime: Runtime,
     mode: Mode,
     #[serde(default)]
@@ -483,6 +485,9 @@ impl Start {
             "max_minutes": self.max_minutes,
             "permission": self.permission_mode.as_deref().map(|m| permission_level(m).ok().flatten().unwrap_or("inherit")),
         });
+        if let Some(host) = self.host.as_deref().filter(|s| *s != "parent") {
+            start["host"] = json!(host);
+        }
         if let Some(path) = &self.checkout {
             start["checkout"] = json!(path);
         }
@@ -510,6 +515,13 @@ impl Start {
         }
     }
     pub(super) fn validate(&self) -> Result<(), String> {
+        if self
+            .host
+            .as_ref()
+            .is_some_and(|h| h.trim().is_empty() || h.len() > 256)
+        {
+            return Err("Provide a worker host name or ID.".into());
+        }
         if self.max_minutes.is_some_and(|m| m == 0 || m > 7 * 24 * 60) {
             return Err("max_minutes must be between 1 and 10080.".into());
         }

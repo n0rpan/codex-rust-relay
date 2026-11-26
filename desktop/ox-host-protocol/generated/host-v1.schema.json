@@ -2470,6 +2470,13 @@
             "null"
           ]
         },
+        "host": {
+          "description": "A paired worker host name or stable ID. Omit to run on the parent's host.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "max_minutes": {
           "description": "Wall-clock limit in minutes. Absent means no limit unless the host sets `OX_WORKER_MAX_MINUTES`.",
           "format": "uint32",

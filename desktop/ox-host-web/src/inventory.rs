@@ -25,6 +25,8 @@ pub(crate) struct Inventory {
     #[serde(deserialize_with = "known_values")]
     routes: Vec<Route>,
     routes_known: bool,
+    #[serde(default)]
+    linked_read: bool,
     has_project: Option<bool>,
 }
 // A newer host may also run an agent or billing route this client cannot launch.
@@ -47,11 +49,16 @@ struct Peer {
 #[derive(Default)]
 pub(crate) struct Cache(tokio::sync::Mutex<Option<(Instant, Inventory, HashSet<String>)>>);
 
-pub(crate) async fn local(app: &App, project: Option<String>) -> io::Result<Inventory> {
+pub(crate) async fn local(
+    app: &App,
+    project: Option<String>,
+    fresh: bool,
+) -> io::Result<Inventory> {
     let mut cache = app.inventory.0.lock().await;
-    if cache
-        .as_ref()
-        .is_none_or(|(when, ..)| when.elapsed() >= Duration::from_secs(10))
+    if fresh
+        || cache
+            .as_ref()
+            .is_none_or(|(when, ..)| when.elapsed() >= Duration::from_secs(10))
     {
         let (inventory, projects) = sample(app).await?;
         *cache = Some((Instant::now(), inventory, projects));
@@ -140,6 +147,7 @@ async fn sample(app: &App) -> io::Result<(Inventory, HashSet<String>)> {
             routes,
             has_project: None,
             routes_known: supports("worker_routes_known"),
+            linked_read: supports("linked_read_workers"),
         },
         projects,
     ))
@@ -147,6 +155,86 @@ async fn sample(app: &App) -> io::Result<(Inventory, HashSet<String>)> {
 pub(crate) fn report(inventory: Inventory, grant: WorkerGrant) -> io::Result<Value> {
     Ok(serde_json::to_value(Peer { inventory, grant })?)
 }
+async fn query_peer(
+    host: &paired_hosts::SavedHost,
+    source: &str,
+    project: Option<&str>,
+    fresh: bool,
+) -> io::Result<Peer> {
+    let mut request = json!({"action":"inventory","project":project});
+    if fresh {
+        request["fresh"] = true.into();
+    }
+    let reply = host.client()?.worker_request(request).await?;
+    let peer: Peer = serde_json::from_value(reply).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Update the receiving OX host to use linked workers.",
+        )
+    })?;
+    if peer.inventory.host.id.as_ref() != Some(&host.id) || peer.grant.source != source {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Worker link identity changed.",
+        ));
+    }
+    Ok(peer)
+}
+/// Check this job against a current target sample before building its checkout.
+pub fn check_launch(
+    host: &paired_hosts::SavedHost,
+    source: &str,
+    project: &Path,
+    start: &ox_desk_core::origin::WorkerStart,
+    parent: ox_desk_core::modes::Level,
+) -> io::Result<()> {
+    let repo = repository_id(project)
+        .ok_or_else(|| io::Error::other("Remote workers need a shared Git origin."))?;
+    let peer = client::runtime()?.block_on(query_peer(host, source, Some(&repo), true))?;
+    let target = &host.name;
+    if !peer.inventory.linked_read {
+        return Err(io::Error::other(format!(
+            "Update {target} to run linked workers."
+        )));
+    }
+    if !peer.grant.may_launch {
+        return Err(io::Error::other(format!(
+            "New worker launches are disabled on {target}."
+        )));
+    }
+    if peer.inventory.has_project != Some(true) {
+        return Err(io::Error::other(format!(
+            "Register a checkout of this repository on {target} with ox host project add DIR."
+        )));
+    }
+    if !peer.inventory.runtimes.contains(&start.runtime) {
+        return Err(io::Error::other(format!(
+            "{} is not installed on {target}.",
+            start.runtime.name()
+        )));
+    }
+    if !peer.inventory.routes.contains(&start.route()) {
+        return Err(io::Error::other(format!(
+            "{} is unavailable on {target}.",
+            start.route().label()
+        )));
+    }
+    let ceiling = parent.min(peer.grant.ceiling);
+    let mode = ox_desk_core::modes::resolve(Some(ceiling), start.mode_request(), start.runtime)
+        .map_err(io::Error::other)?;
+    let policy = peer.inventory.host.mode_policy.unwrap_or_default();
+    if policy
+        .child_start(mode, start.mode_request(), ceiling, start.runtime)
+        .level
+        != ox_desk_core::modes::Level::Read
+    {
+        return Err(io::Error::other(format!(
+            "{target} supports linked read workers. Choose read mode for this job."
+        )));
+    }
+    Ok(())
+}
+
 async fn probe(host: paired_hosts::SavedHost, source: &str, project: Option<&str>) -> Value {
     let saved = json!({"id":host.id,"name":host.name});
     // Avoid a new network wait on every tool call while a laptop is asleep.
@@ -160,33 +248,17 @@ async fn probe(host: paired_hosts::SavedHost, source: &str, project: Option<&str
             return json!({"host":saved,"parent_host":false,"status":"unavailable"});
         }
     }
-    let id = host.id.clone();
     let fetch = async {
         let host = tokio::task::spawn_blocking(move || -> io::Result<_> {
             host.client()?;
             Ok(host)
         })
         .await??;
-        let reply = host
-            .client()?
-            .worker_request(json!({"action":"inventory","project":project}))
-            .await?;
-        let peer: Peer = serde_json::from_value(reply).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Incompatible inventory from the worker host.",
-            )
-        })?;
-        if peer.inventory.host.id.as_ref() != Some(&id) || peer.grant.source != source {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "Worker link identity changed.",
-            ));
-        }
+        let peer = query_peer(&host, source, project, false).await?;
         let mut row = serde_json::to_value(peer)?;
         row["parent_host"] = false.into();
         row["status"] = "online".into();
-        Ok(row)
+        Ok::<_, io::Error>(row)
     };
     let status = match timeout(Duration::from_secs(5), fetch).await {
         Ok(Ok(row)) => return row,

@@ -96,7 +96,7 @@ pub struct PairedClient {
     key: DeviceKey,
     cookie: header::HeaderValue,
     http: Client,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fixture-transport"))]
     fixture: Option<(std::net::SocketAddr, tokio_tungstenite::Connector)>,
     settings_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
@@ -108,7 +108,16 @@ fn http() -> io::Result<Client> {
         .map_err(io::Error::other)
 }
 async fn checked(response: Result<Response, reqwest::Error>, denied: &str) -> io::Result<Response> {
-    let response = response.map_err(|e| io::Error::other(e.without_url()))?;
+    let response = response.map_err(|e| {
+        let kind = if e.is_timeout() {
+            io::ErrorKind::TimedOut
+        } else if e.is_connect() {
+            io::ErrorKind::NotConnected
+        } else {
+            io::ErrorKind::ConnectionAborted
+        };
+        io::Error::new(kind, e.without_url())
+    })?;
     match response.status() {
         s if s.is_success() => Ok(response),
         reqwest::StatusCode::BAD_REQUEST => Err(io::Error::new(
@@ -266,14 +275,14 @@ pub(crate) async fn register_as(
     label: &str,
     source: Option<&str>,
 ) -> io::Result<Credential> {
-    #[cfg(test)]
-    let test_transport = fixture::transport(&invite.origin);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fixture-transport"))]
+    let test_transport = fixture_transport::transport(&invite.origin);
+    #[cfg(any(test, feature = "fixture-transport"))]
     let (http, (key, saved)) = match test_transport {
         Some((http, _, _)) => (http, DeviceKey::software()),
         None => (http()?, DeviceKey::generate()?),
     };
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "fixture-transport")))]
     let (http, (key, saved)) = (http()?, DeviceKey::generate()?);
     let result: io::Result<String> = async {
         let (class, message, refusal) = if let Some(source) = source {
@@ -347,24 +356,24 @@ impl PairedClient {
         let mut cookie = header::HeaderValue::from_str(&format!("{COOKIE}={}", credential.token))
             .map_err(io::Error::other)?;
         cookie.set_sensitive(true);
-        #[cfg(test)]
-        let (http, fixture) = match fixture::transport(&origin) {
+        #[cfg(any(test, feature = "fixture-transport"))]
+        let (http, fixture) = match fixture_transport::transport(&origin) {
             Some((http, addr, connector)) => (http, Some((addr, connector))),
             None => (http()?, None),
         };
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "fixture-transport")))]
         let http = http()?;
         Ok(Self {
             origin,
             key,
             cookie,
             http,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "fixture-transport"))]
             fixture,
             settings_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
         })
     }
-    async fn post(
+    pub(crate) async fn post(
         &self,
         path: &str,
         data: Value,
@@ -470,7 +479,7 @@ impl PairedClient {
         req.headers_mut()
             .insert(header::COOKIE, self.cookie.clone());
         let connect = async {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "fixture-transport"))]
             if let Some((addr, tls)) = &self.fixture {
                 let stream = tokio::net::TcpStream::connect(addr).await?;
                 return tokio_tungstenite::client_async_tls_with_config(
@@ -623,5 +632,9 @@ mod tests {
     }
 }
 
+#[cfg(any(test, feature = "fixture-transport"))]
+mod fixture_transport;
+#[cfg(feature = "fixture-transport")]
+pub use fixture_transport::enable as enable_fixture_transport;
 #[cfg(test)]
 mod fixture;

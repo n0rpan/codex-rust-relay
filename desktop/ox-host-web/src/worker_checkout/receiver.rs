@@ -151,6 +151,54 @@ fn existing(dest: &Path, request: &Checkout, device: &str) -> io::Result<Option<
     }
 }
 
+/// Resolve the engine's cwd from the installed receipt. The source cannot name a destination path.
+pub(crate) fn job_checkout(
+    root: &Path,
+    job: &crate::linked_jobs::JobRequest,
+    device: &str,
+) -> io::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    use std::{ffi::OsStr, path::Component};
+    let directory = root
+        .join("jobs")
+        .join(&job.source)
+        .join(job.job.to_string());
+    let saved: Installed =
+        serde_json::from_reader(fs::File::open(directory.join("receipt.json"))?)?;
+    if saved.device != device
+        || saved.request.source != job.source
+        || saved.request.target != job.target
+        || saved.request.job != job.job
+        || saved.request.request_id != job.request_id
+    {
+        return Err(io::Error::other(
+            "This worker link does not own the installed job.",
+        ));
+    }
+    let relative = Path::new(OsStr::from_bytes(&saved.cwd));
+    if !relative
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)))
+    {
+        return Err(io::Error::other(
+            "Invalid project in the worker checkout receipt.",
+        ));
+    }
+    let root = directory.join("checkout");
+    let mut project = root.join(relative);
+    // Status and cancellation remain available if the worker moved its project after launch.
+    if matches!(job.operation, crate::linked_jobs::Operation::Start { .. }) {
+        if fs::symlink_metadata(&root)?.file_type().is_symlink() {
+            return Err(io::Error::other("The installed checkout has moved."));
+        }
+        let expected = root.canonicalize()?.join(relative);
+        project = project.canonicalize()?;
+        if project != expected || !project.is_dir() {
+            return Err(io::Error::other("The installed worker project has moved."));
+        }
+    }
+    Ok((directory, project))
+}
+
 async fn install(
     app: &App,
     id: &str,

@@ -99,7 +99,8 @@ impl<M: Frame> Connection<M> {
     }
 }
 fn disconnected() -> io::Error {
-    io::Error::other(
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
         "Worker checkout connection closed or timed out. Retry the job to recover its receipt.",
     )
 }

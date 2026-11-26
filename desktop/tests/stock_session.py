@@ -240,6 +240,34 @@ class Fixture(BaseHTTPRequestHandler):
                 chunks.append({"content":"Fixture conversation"})
             elif any(m.get("role") == "user" and "model-switch-" in str(m.get("content")) for m in req["messages"]):
                 chunks.append({"content":"fixture complete"})
+            elif self.server.mode == "linked-parent":
+                if b"OX worker #" in body and b"uncommitted on laptop" in body:
+                    (self.server.project / "parent-received-result").touch()
+                    chunks.append({"content":"I received the remote worker report."})
+                elif has_output:
+                    output = str([m["content"] for m in req["messages"] if m["role"]=="tool"])
+                    (self.server.project / "parent-tool-result").write_text(output)
+                    chunks.append({"content":"Waiting for the remote worker."})
+                else:
+                    names=[t["function"]["name"] for t in req["tools"]]
+                    name = next((n for n in names if n.endswith("start_ox_worker")),None)
+                    assert name is not None, names
+                    args = {"host":self.server.target,"runtime":"codex","mode":"session","permission_mode":"read",
+                            "model":"fixture/demo","task":"Read tracked and send its contents to the parent."}
+                    calls = (name,args)
+            elif self.server.mode == "linked-worker":
+                if b"linked-parent-offline-fixture" in body and not has_output:
+                    (self.server.project / "request-received").touch()
+                    deadline = time.monotonic()+60
+                    while not (self.server.project / "release-request").exists() and time.monotonic()<deadline:
+                        time.sleep(.05)
+                if has_output:
+                    output = str([m["content"] for m in req["messages"] if m["role"] == "tool"])
+                    chunks.append({"content": "Linked read result: " + output})
+                else:
+                    name = next(t["function"]["name"] for t in req["tools"] if t["function"]["name"].endswith("exec_command"))
+                    args = {"cmd": "cat tracked"}
+                    calls = (name, args)
             elif self.server.mode in ("worker-cwd", "worker-inherit"):
                 if has_output:
                     chunks.append({"content": "worker directory checked"})

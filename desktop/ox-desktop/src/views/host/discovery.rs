@@ -288,7 +288,10 @@ impl Discovery {
             let event = &view.detail["worker_notice"];
             let job = event["job_id"].as_u64()?;
             let status = event["status"].as_str()?.replace('_', " ");
-            Some(format!("Worker #{job} {status}"))
+            Some(match event["host"].as_str() {
+                Some(host) => format!("Worker #{job} {status} on {host}"),
+                None => format!("Worker #{job} {status}"),
+            })
         };
         match event {
             CatalogEvent::Host(_)

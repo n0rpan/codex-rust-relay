@@ -71,6 +71,11 @@ class Forward(socketserver.StreamRequestHandler):
             if name.lower() in ("connection", "tailscale-user-login"):
                 continue
             headers.append(line)
+        body = self.rfile.read(length)
+        if fault := getattr(self.server, "job_fault", None):
+            if reply := fault(first, body):
+                self.wfile.write(reply)
+                return
         with socket.create_connection(
             ("127.0.0.1", self.server.backend), timeout=10
         ) as upstream:
@@ -79,7 +84,7 @@ class Forward(socketserver.StreamRequestHandler):
                 first
                 + b"".join(headers)
                 + f"Connection: {connection}\r\nTailscale-User-Login: phone@example.test\r\n\r\n".encode()
-                + self.rfile.read(length)
+                + body
             )
             upstream.settimeout(None)
             if upgrade:
@@ -1174,9 +1179,9 @@ def run(harness, screenshot=None):
         assert "fixture-transfer-brave" in (codex / "ox-api-keys.json").read_text()
         if copy_fixture:
             from key_copy import exercise as copy_keys
-            copy_keys(js, wait, *copy_fixture[1:])
+            copy_keys(js, wait, *copy_fixture[1:5])
             from key_copy import worker_links
-            worker_links(js, wait, *copy_fixture[-2:], harness, source_env)
+            worker_links(js, wait, *copy_fixture[3:], harness, source_env)
         export = {"action": "export_keys", "selected": [brave], "revision": after_transfer["revisions"]["keys"]}
         assert js("return import('./device.js').then(async m=>m.settingsRequest(await m.deviceKey(),"
                   + json.dumps(export) + ").then(()=>false,e=>e.status===403))")

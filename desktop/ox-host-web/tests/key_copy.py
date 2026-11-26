@@ -1,4 +1,5 @@
 """Pair a second service and transfer a single reviewed key using the web controls."""
+from contextlib import ExitStack
 from pathlib import Path
 import json
 import os
@@ -27,6 +28,23 @@ def receiver(d, stack):
     env = dict(HOME=str(home), CODEX_HOME=str(home / ".codex"), XDG_STATE_HOME=str(home / "state"),
                PATH=str(package), OX_NO_BACKGROUND_UPDATE="1", SHELL="/bin/sh")
     (package / "git").symlink_to(shutil.which("git"))
+    if codex := os.environ.get("CODEOX_TEST_CODEX_BIN"):
+        from http.server import ThreadingHTTPServer
+        from stock_session import Fixture
+        vendor = ThreadingHTTPServer(("127.0.0.1", 0), Fixture)
+        vendor.mode = "linked-worker"
+        vendor.project = root
+        managed_server(stack, vendor)
+        (package / "codex").symlink_to(Path(codex).resolve())
+        env.update(PATH=str(package) + ":/usr/bin:/bin", OX_LINK_FIXTURE_KEY="fixture-only", SHELL="/bin/bash")
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            env[name] = env[name.lower()] = "http://127.0.0.1:1"
+        env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost"
+        config = Path(env["CODEX_HOME"])
+        config.mkdir()
+        (config / "codeox.toml").write_text('[providers.fixture]\nname="Fixture"\nwire_api="chat_completions"\n'
+            f'base_url="http://127.0.0.1:{vendor.server_port}/v1"\nenv_key="OX_LINK_FIXTURE_KEY"\ndiscovery=false\n'
+            '[[providers.fixture.models]]\nid="demo"\ncontext_window=131072\n')
     project = root / "build-checkout"
     repo(project, "git@code.example.test:owner/ox.git")
     (project / "base.bin").write_bytes(os.urandom(2 * 1024 * 1024))
@@ -36,7 +54,8 @@ def receiver(d, stack):
     subprocess.run(["git", "-C", project, "add", "."], check=True)
     subprocess.run(["git", "-C", project, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test",
                     "-c", "commit.gpgsign=false", "commit", "-qm", "shared base"], check=True)
-    stack.enter_context(session_host(package / "ox-host", root, env))
+    process=stack.enter_context(ExitStack())
+    process.enter_context(session_host(package / "ox-host", root, env))
     state = Path(env["OX_HOST_STATE_DIR"])
     wait(lambda: (state / "remote-admin.sock").exists())
     listed = subprocess.check_output([package / "ox", "host", "project", "add", project], env=env, text=True)
@@ -46,6 +65,17 @@ def receiver(d, stack):
     port = public.server_address[1]
     name = "build.fixture.ts.net"
     origin = f"https://{name}:{port}"
+    def job_fault(first, body):
+        if not first.startswith(b"POST /api/worker-job "):
+            return None
+        job=json.loads(json.loads(body)["request"])
+        if (root / "hold-start").exists() and job["operation"]["operation"]=="start":
+            (root / "start-rejected").touch()
+            return b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        if (root / "malformed-notices").exists():
+            reply=json.dumps({"Ok":{"job_id":job["job"],"status":"running","linked_notices":"broken"}}).encode()
+            return f"HTTP/1.1 200 OK\r\nContent-Length: {len(reply)}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n".encode()+reply
+    public.job_fault = job_fault
     public.backend = admin(state, {"type": "enable", "port": 0, "origin": origin})["port"]
     invite = admin(state, {"type": "pair", "login": "phone@example.test"})["pairing"]["url"]
     certificate(root, name)
@@ -63,8 +93,12 @@ def receiver(d, stack):
     tool = ts_bin / "tailscale"
     tool.write_text("#!/bin/sh\ncat <<'STATUS'\n" + json.dumps(status) + "\nSTATUS\n")
     tool.chmod(0o700)
+    def restart():
+        process.close()
+        process.enter_context(session_host(package / "ox-host",root,env))
+        public.backend=wait(lambda: admin(state,{"type":"status"}).get("port"))
     return (dict(PATH=str(ts_bin) + os.pathsep + os.environ["PATH"], OX_TEST_ORIGIN=origin, OX_TEST_NATIVE_DIR=str(root),
-                 OX_TEST_LOOPBACK=f"127.0.0.1:{port}"), invite, home / ".codex/ox-api-keys.json", state, d)
+                 OX_TEST_LOOPBACK=f"127.0.0.1:{port}"), invite, home / ".codex/ox-api-keys.json", state, d, restart)
 
 
 def exercise(js, wait, invite, saved, receiver_state, source):
@@ -155,7 +189,7 @@ def exercise(js, wait, invite, saved, receiver_state, source):
     print("PASS web UI sends only Brave Search, rejects stale reviews and foreign-owned peers, and preserves existing desktop pairings", flush=True)
 
 
-def worker_links(js, wait, state, source, harness, source_env):
+def worker_links(js, wait, state, source, restart, harness, source_env):
     from browser import admin
     # The source web service uses a mock engine in this fixture.
     source_id = "06f2bbe4-12bb-4243-ab20-657f19c02d36"
@@ -235,6 +269,7 @@ def worker_links(js, wait, state, source, harness, source_env):
     transfer(source_env)
     job = state / "linked-work/jobs" / source_id / "42"
     work = job / "checkout"
+    assert (job.parent / "45/checkout/nested/tracked").read_text()=="uncommitted on laptop"
     receipt = json.loads((job / "receipt.json").read_text())
     assert bytes(receipt["cwd"]) == b"nested"
     assert receipt["receipt"]["commit"] == git(work, "rev-parse", "HEAD").decode().strip()
@@ -245,7 +280,12 @@ def worker_links(js, wait, state, source, harness, source_env):
     git(work, "add", "-A")
     assert git(work,"diff","--cached","--name-only") == b""
     assert before == (state_of(parent),state_of(target))
-    enabled = admin(state, {"type": "status"})["worker_hosts"][0]["worker"]
+    if os.environ.get("CODEOX_TEST_CODEX_BIN"):
+        subprocess.run([harness, "--exact", "linked_jobs::tests::read_worker", "--ignored", "--nocapture"],
+                       env=source_env, check=True, timeout=110)
+        from linked_workers import parent_restart
+        parent_restart(source / "real-parent", parent / "nested", state, source_env, restart)
+    enabled = next(r["worker"] for r in admin(state, {"type":"status"})["worker_hosts"] if r["id"] == link["id"])
     with subprocess.Popen([harness, "--exact", "worker_checkout::sender::tests::interrupted_checkout", "--ignored"],
                           env=source_env) as upload:
         wait(lambda: (source / "upload-started").exists() and any(job.parent.glob(".incoming-*")))

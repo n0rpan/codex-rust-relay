@@ -86,7 +86,7 @@ pub(crate) fn destinations(path: &Path) -> io::Result<Vec<SavedHost>> {
     Ok(hosts)
 }
 #[cfg(feature = "server")]
-pub(crate) fn worker_links(path: &Path) -> io::Result<Vec<SavedHost>> {
+pub fn worker_links(path: &Path) -> io::Result<Vec<SavedHost>> {
     let mut rows = read_hosts(path)?;
     for row in &mut rows {
         row.background = true;
@@ -94,6 +94,9 @@ pub(crate) fn worker_links(path: &Path) -> io::Result<Vec<SavedHost>> {
     Ok(rows)
 }
 impl SavedHost {
+    pub fn pairing_id(&self) -> &str {
+        &self.key_id
+    }
     pub fn same_pairing(&self, other: &Self) -> bool {
         self.id == other.id && self.key_id == other.key_id
     }

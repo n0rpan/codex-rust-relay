@@ -21,5 +21,8 @@ sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 
 tempfile = "3"
 
+[dev-dependencies]
+ox-host-web = {path="../ox-host-web", features=["server","fixture-transport"]}
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-metal = { version = "0.3", default-features = false, features = ["std", "MTLDevice"] }

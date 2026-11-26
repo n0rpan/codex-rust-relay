@@ -57,94 +57,181 @@ pub fn transfer(
     job: u64,
     request_id: &str,
 ) -> io::Result<Delivery> {
-    let repository = repository_id(project).ok_or_else(|| {
-        io::Error::other("Remote workers need a Git checkout with a shared network origin.")
-    })?;
-    let open = Checkout {
-        source: source.to_owned(),
-        target: host.id.clone(),
-        repository: repository.clone(),
+    Sender {
+        host,
+        source,
+        project,
+        staging,
         job,
-        request_id: request_id.to_owned(),
-    };
-    let client = host.client()?;
-    let rt = client::runtime()?;
-    let (mut socket, existing) = rt.block_on(connect(client, &open))?;
-    if let Some(receipt) = existing {
-        return Ok(Delivery {
-            receipt,
-            recovered: true,
-        });
+        request_id,
     }
-    let known = negotiate(project, |commits| {
+    .run(None, || false)
+}
+
+pub struct Sender<'a> {
+    pub host: &'a SavedHost,
+    pub source: &'a str,
+    pub project: &'a Path,
+    pub staging: &'a Path,
+    pub job: u64,
+    pub request_id: &'a str,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Frozen {
+    repository: String,
+    commit: String,
+}
+
+impl Sender<'_> {
+    /// Keep an exact snapshot for an interrupted upload until the receiver acknowledges it.
+    pub fn run(&self, queue: Option<&Path>, cancelled: impl Fn() -> bool) -> io::Result<Delivery> {
+        use std::fs::{self, File};
+        let Self {
+            host,
+            source,
+            project,
+            staging,
+            job,
+            request_id,
+        } = *self;
+        let check_cancelled = || {
+            if cancelled() {
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Worker preparation was cancelled.",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        check_cancelled()?;
+        let frozen = queue.map(|q| q.join("snapshot"));
+        let prior = match frozen.as_ref().map(|p| File::open(p.join("metadata.json"))) {
+            Some(Ok(f)) => Some(serde_json::from_reader::<_, Frozen>(f)?),
+            Some(Err(e)) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => None,
+        };
+        let repository = prior
+            .as_ref()
+            .map(|s| s.repository.clone())
+            .or_else(|| repository_id(project))
+            .ok_or_else(|| {
+                io::Error::other("Remote workers need a Git checkout with a shared network origin.")
+            })?;
+        let open = Checkout {
+            source: source.to_owned(),
+            target: host.id.clone(),
+            repository: repository.clone(),
+            job,
+            request_id: request_id.to_owned(),
+        };
+        let client = host.client()?;
+        let rt = client::runtime()?;
+        let (mut socket, existing) = rt.block_on(connect(client, &open))?;
+        if let Some(receipt) = existing {
+            return Ok(Delivery {
+                receipt,
+                recovered: true,
+            });
+        }
+        let (archive, commit) = if let Some(previous) = prior {
+            (
+                File::open(frozen.as_ref().unwrap().join("archive"))?,
+                previous.commit,
+            )
+        } else {
+            let known = negotiate(project, |commits| {
+                check_cancelled()?;
+                rt.block_on(async {
+                    send(
+                        &mut socket,
+                        Request::Known {
+                            commits: commits.to_vec(),
+                        },
+                    )
+                    .await?;
+                    match receive(&mut socket).await? {
+                        Reply::Known { commits: known }
+                            if known.iter().all(|s| commits.contains(s)) =>
+                        {
+                            Ok(known)
+                        }
+                        _ => Err(io::Error::other("Invalid worker mirror reply.")),
+                    }
+                })
+            })?;
+            let snapshot = Snapshot::capture(staging, project, &known)?;
+            if repository_id(project).as_ref() != Some(&repository) {
+                return Err(io::Error::other(
+                    "The source checkout's origin changed during capture.",
+                ));
+            }
+            check_cancelled()?;
+            if let (Some(queue), Some(dest)) = (queue, &frozen) {
+                let stage = tempfile::tempdir_in(queue)?;
+                snapshot.retain_archive(&stage.path().join("archive"))?;
+                let f = File::create(stage.path().join("metadata.json"))?;
+                serde_json::to_writer(
+                    &f,
+                    &Frozen {
+                        repository,
+                        commit: snapshot.commit.clone(),
+                    },
+                )?;
+                f.sync_all()?;
+                File::open(stage.path())?.sync_all()?;
+                fs::rename(stage.path(), dest)?;
+                File::open(queue)?.sync_all()?;
+            }
+            (snapshot.open()?, snapshot.commit)
+        };
+        let bytes = archive.metadata()?.len();
         rt.block_on(async {
             send(
                 &mut socket,
-                Request::Known {
-                    commits: commits.to_vec(),
+                Request::Archive {
+                    bytes,
+                    commit: commit.clone(),
+                },
+            )
+            .await?;
+            let mut file = tokio::fs::File::from_std(archive);
+            let mut buffer = vec![0; CHUNK];
+            let mut digest = Sha256::new();
+            loop {
+                check_cancelled()?;
+                let count = file.read(&mut buffer).await?;
+                if count == 0 {
+                    break;
+                }
+                digest.update(&buffer[..count]);
+                socket
+                    .send(Message::binary(buffer[..count].to_vec()))
+                    .await?;
+            }
+            let sha256 = format!("{:x}", digest.finalize());
+            send(
+                &mut socket,
+                Request::Finish {
+                    sha256: sha256.clone(),
                 },
             )
             .await?;
             match receive(&mut socket).await? {
-                Reply::Known { commits: known } if known.iter().all(|s| commits.contains(s)) => {
-                    Ok(known)
+                Reply::Installed(delivery)
+                    if delivery.recovered
+                        || (delivery.receipt.commit == commit
+                            && delivery.receipt.archive_bytes == bytes
+                            && delivery.receipt.sha256 == sha256) =>
+                {
+                    Ok(delivery)
                 }
-                _ => Err(io::Error::other("Invalid worker mirror reply.")),
+                _ => Err(io::Error::other(
+                    "The worker did not confirm this checkout.",
+                )),
             }
         })
-    })?;
-    let snapshot = Snapshot::capture(staging, project, &known)?;
-    if repository_id(project).as_ref() != Some(&repository) {
-        return Err(io::Error::other(
-            "The source checkout's origin changed during capture.",
-        ));
     }
-    let archive = snapshot.open()?;
-    let bytes = archive.metadata()?.len();
-    rt.block_on(async {
-        send(
-            &mut socket,
-            Request::Archive {
-                bytes,
-                commit: snapshot.commit.clone(),
-            },
-        )
-        .await?;
-        let mut file = tokio::fs::File::from_std(archive);
-        let mut buffer = vec![0; CHUNK];
-        let mut digest = Sha256::new();
-        loop {
-            let count = file.read(&mut buffer).await?;
-            if count == 0 {
-                break;
-            }
-            digest.update(&buffer[..count]);
-            socket
-                .send(Message::binary(buffer[..count].to_vec()))
-                .await?;
-        }
-        let sha256 = format!("{:x}", digest.finalize());
-        send(
-            &mut socket,
-            Request::Finish {
-                sha256: sha256.clone(),
-            },
-        )
-        .await?;
-        match receive(&mut socket).await? {
-            Reply::Installed(delivery)
-                if delivery.recovered
-                    || (delivery.receipt.commit == snapshot.commit
-                        && delivery.receipt.archive_bytes == bytes
-                        && delivery.receipt.sha256 == sha256) =>
-            {
-                Ok(delivery)
-            }
-            _ => Err(io::Error::other(
-                "The worker did not confirm this checkout.",
-            )),
-        }
-    })
 }
 
 #[cfg(test)]

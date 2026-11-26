@@ -21,7 +21,9 @@ mod state;
 #[cfg(feature = "server")]
 pub mod worker_checkout;
 #[cfg(feature = "server")]
-pub use server::run;
+pub use server::{run, run_with_jobs};
+#[cfg(feature = "server")]
+pub mod linked_jobs;
 
 #[cfg(all(test, feature = "server"))]
 mod fixture {

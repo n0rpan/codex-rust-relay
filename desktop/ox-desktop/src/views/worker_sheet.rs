@@ -149,6 +149,7 @@ pub(super) fn worker_start(
     }
     let yolo = yolo_confirmed(permission);
     let start = WorkerStart {
+        host: None,
         parent: owner.to_owned(),
         runtime,
         model: model_or_none(model),

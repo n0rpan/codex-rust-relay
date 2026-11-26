@@ -34,7 +34,9 @@ pub(super) fn recover(ledger: &mut Ledger, workers: &Registry) -> io::Result<()>
     ledger.change(|data| {
         for (_, _, e) in workers.jobs() {
             let o = &e.origin;
-            if o.parent.scope.is_none() || o.parent.session.is_none() || o.by_operator {
+            if (o.linked.is_none() && (o.parent.scope.is_none() || o.parent.session.is_none()))
+                || o.by_operator
+            {
                 continue;
             }
             // The outbox can reach disk just before the projected completion
@@ -122,8 +124,8 @@ impl Engine {
             let origin = &entry.origin;
             if origin.relation != ox_desk_core::origin::Relation::Worker
                 || origin.by_operator
-                || origin.parent.scope.is_none()
-                || origin.parent.session.is_none()
+                || (origin.linked.is_none()
+                    && (origin.parent.scope.is_none() || origin.parent.session.is_none()))
             {
                 continue;
             }
@@ -232,22 +234,28 @@ impl Engine {
                 // operator. A job without a session, and a stop with no finished
                 // turn, still need an addressable notification on the parent.
                 let has_worker = self.workers.job(notice.job).is_some();
-                let synthetic = match notice.status.as_str() {
-                    "failed" | "declined" => !has_worker,
-                    "cancelled" | "interrupted" => true,
-                    _ => false,
-                };
-                let label = format!("Worker #{} {}", notice.job, notice.status.replace('_', " "));
+                let remote = self.ledger.data.forwarded.get(&notice.job);
+                let synthetic = remote.is_some()
+                    || match notice.status.as_str() {
+                        "failed" | "declined" => !has_worker,
+                        "cancelled" | "interrupted" => true,
+                        _ => false,
+                    };
+                let mut label =
+                    format!("Worker #{} {}", notice.job, notice.status.replace('_', " "));
+                if let Some(j) = remote {
+                    label.push_str(&format!(" on {}", j.name));
+                }
                 if synthetic {
                     self.broadcast(
                         &notice.scope,
                         vec![Change::Notification {
                             thread: notice.session.clone(),
                             title: label.clone(),
-                            event: if notice.status == "cancelled" {
-                                wire::NotificationKind::Finished
-                            } else {
-                                wire::NotificationKind::Failed
+                            event: match notice.status.as_str() {
+                                "completed" | "cancelled" => wire::NotificationKind::Finished,
+                                "waiting_for_operator" => wire::NotificationKind::Approval,
+                                _ => wire::NotificationKind::Failed,
                             },
                         }],
                     )?;
@@ -265,6 +273,17 @@ impl Engine {
                         self.broadcast(&notice.scope, vec![Change::Session { session: row }])?;
                     }
                 }
+            }
+            if self
+                .ledger
+                .data
+                .forwarded
+                .get(&notice.job)
+                .is_some_and(|j| j.origin.by_operator)
+            {
+                self.ledger
+                    .change(|d| d.worker_notices.pending.retain(|n| n.id != notice.id))?;
+                continue;
             }
             let parent = (notice.scope.clone(), notice.session.clone());
             if !parents.contains(&parent) && !self.deliver_worker_notice(&notice)? {

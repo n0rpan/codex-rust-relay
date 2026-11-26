@@ -113,6 +113,7 @@ fn run(paths: Paths) -> io::Result<()> {
     });
     updates::start(paths.clone(), tx.clone())?;
     lease.listen(tx.clone())?;
+    let jobs = tx.clone();
     let listener = guard.listener.try_clone()?;
     thread::spawn(move || {
         for (id, next) in listener.incoming().enumerate() {
@@ -127,7 +128,20 @@ fn run(paths: Paths) -> io::Result<()> {
     });
     let web_paths = paths.clone();
     thread::spawn(move || {
-        if let Err(e) = ox_host_web::run(web_paths.state_dir, web_paths.socket) {
+        let dispatch = std::sync::Arc::new(move |job| {
+            let (reply, response) = mpsc::sync_channel(1);
+            jobs.send(Message::LinkedJob(
+                Box::new(job),
+                engine::Replier::Channel(reply),
+            ))
+            .map_err(|_| "The target host stopped.".to_owned())?;
+            response
+                .recv()
+                .map_err(|_| "The target worker engine stopped.".to_owned())?
+        });
+        if let Err(e) =
+            ox_host_web::run_with_jobs(web_paths.state_dir, web_paths.socket, Some(dispatch))
+        {
             ox_host_service::errlog::record(&format!("OX remote service: {e}"));
         }
     });
@@ -250,4 +264,16 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "disposable two-host integration using its own TLS trust store"]
+fn linked_parent_fixture() {
+    ox_host_web::client::enable_fixture_transport();
+    run(Paths {
+        socket: env::var_os("OX_HOST_SOCKET").unwrap().into(),
+        state_dir: env::var_os("OX_HOST_STATE_DIR").unwrap().into(),
+    })
+    .unwrap();
 }

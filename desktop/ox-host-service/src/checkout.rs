@@ -338,6 +338,12 @@ impl Snapshot {
         })
     }
 
+    /// Retain the already captured bytes in an owner-only queue on the same filesystem.
+    pub fn retain_archive(&self, destination: &Path) -> io::Result<()> {
+        self.open()?.sync_all()?;
+        fs::hard_link(&self.archive, destination)
+    }
+
     pub fn open(&self) -> io::Result<File> {
         File::open(&self.archive)
     }

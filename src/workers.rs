@@ -157,12 +157,11 @@ impl Relay {
     }
 }
 
-/// Which tools a gateway offers. An API session the session host runs gets only
-/// read_ox_thread, so a handoff target on an API alias can read its source.
+/// Hosted API sessions can manage their own workers and read handoff history.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tools {
     All,
-    HandoffRead,
+    Hosted,
 }
 
 pub(crate) struct Gateway {
@@ -413,17 +412,17 @@ impl Service {
         let result = match method {
             "initialize" => initialize(params),
             "ping" => json!({}),
-            "tools/list" if self.tools == Tools::HandoffRead => {
+            "tools/list" if self.tools == Tools::Hosted => {
                 let mut all = tools();
                 if let Some(list) = all["tools"].as_array_mut() {
-                    list.retain(|t| t["name"] == "read_ox_thread");
+                    list.retain(|t| t["name"] != "delegate_to_ox_model");
                 }
                 all
             }
             "tools/list" => tools(),
             "tools/call"
-                if self.tools == Tools::HandoffRead
-                    && params["name"].as_str() != Some("read_ox_thread") =>
+                if self.tools == Tools::Hosted
+                    && params["name"].as_str() == Some("delegate_to_ox_model") =>
             {
                 return rpc_error(id.clone(), -32602, "Unknown worker tool");
             }
@@ -573,11 +572,13 @@ impl Service {
 
     async fn start_job(&self, request: jobs::Start, thread: Option<&str>) -> Result<Value, String> {
         request.validate()?;
-        if let Some(model) = &request.subscription_model {
+        let remote = request.host.as_deref().is_some_and(|h| h != "parent");
+        if !remote && let Some(model) = &request.subscription_model {
             self.check_subscription_model(model).await?;
         }
         let app = self.app().await?;
-        if let Some(model) = &request.model
+        if !remote
+            && let Some(model) = &request.model
             && let Mode::Codeox {
                 vendors, routes, ..
             } = &app.mode
@@ -610,6 +611,9 @@ impl Service {
                 "This worker is owned by the OX session host. Its approvals and questions appear in OX Desktop and on paired phones. When ox_worker_status lists requests with parent_may_answer, you may answer them with answer_ox_worker; otherwise tell the user where to answer."
             );
             return Ok(reply);
+        }
+        if remote {
+            return Err("Starting a worker on another host requires the parent's OX host. Start OX Desktop or run ox host install.".into());
         }
         self.jobs
             .lock()
@@ -970,6 +974,7 @@ fn tools() -> Value {
                         "task": {"type": "string", "description": "The job objective, desired validation, and stopping condition."},
                         "permission_mode": {"enum": ["inherit", "read", "write", "classifier", "yolo"], "default": "inherit", "description": "read: Codex Read only or Claude Plan. Standalone Claude read workers get only read tools. write: workspace edits and shell access. Codex uses its Workspace sandbox. Claude Code pre-approves Bash and uses its own sandbox when available. Without it, commands can run unsandboxed. classifier: Codex Auto-review / Claude Auto. yolo: Codex YOLO / Claude bypass. Above your mode is refused."},
                         "max_minutes": {"type": "integer", "minimum": 1, "maximum": 10080, "description": "Optional wall-clock limit for this worker in minutes. No limit by default (OX_WORKER_MAX_MINUTES sets one)."},
+                        "host": {"type":"string","description":"Paired execution host name or ID from list_ox_hosts. Omit to use the parent host."},
                         "checkout": {"type":"string","description":"Existing execution directory, absolute or relative to the parent workspace. The current thread remains the worker’s parent."},
                         "workspace_write": {"type": "boolean", "description": "Deprecated: false means read, true means write. Use permission_mode."},
                     },
