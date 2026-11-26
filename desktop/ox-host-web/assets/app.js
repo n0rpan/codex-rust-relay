@@ -1,12 +1,14 @@
 import { openPhoneTerminal } from "./operator.js";
 import {
   copyButton,
+  formatPatchNode,
   messageText,
   showReview,
   imagesFor,
   clearImages,
   moveImages,
   setComposerOwner,
+  syncDraftHeight,
   updateExtras,
   mentionInput,
   forgetComposer,
@@ -149,6 +151,7 @@ let cold = new Map(),
   timelineRows = new Map(),
   askKeys = "",
   pendingNew = null,
+  handoffStamp = "",
   // Message and images sent from a composer whose Ack has not come back, by owner.
   unacked = new Map(),
   // The last `restored_draft.message` applied per owner, so each host restore lands once.
@@ -194,8 +197,10 @@ function restoreHostDrafts(model) {
       const text =
         !current || current === r.text ? r.text : `${r.text}\n${current}`;
       drafts.set(owner, text);
-      if (selected && keyOf(selected.scope, selected.id) === owner)
+      if (selected && keyOf(selected.scope, selected.id) === owner) {
         $("draft").value = text;
+        syncDraftHeight();
+      }
     }
 }
 const repaint = () => {
@@ -276,6 +281,7 @@ class Link {
           for (const id of ["list", "timeline", "asks", "review-content"])
             $(id).replaceChildren();
           $("draft").value = "";
+          syncDraftHeight();
           pairingPage();
         }
       } else this.lost();
@@ -695,10 +701,13 @@ function open(scope, id) {
   visibleRows = 200;
   timelineRows.clear();
   askKeys = "";
+  handoffStamp = "";
+  jumpLatest.reset();
   $("asks").replaceChildren();
   $("timeline").replaceChildren();
   $("draft").value = drafts.get(keyOf(scope, id)) || "";
   page("conversation");
+  syncDraftHeight();
   notice();
   detailLink = new Link(scope, new Projection());
   // Clear the prior session's actionable controls before a new frame can accept input.
@@ -720,6 +729,14 @@ function entries() {
 }
 function catalog() {
   const rows = entries();
+  const nowSec = Date.now() / 1000;
+  const counts = { all: 0, active: 0, requests: 0, finished: 0 };
+  const filterLabels = {
+    all: "All",
+    active: "Running",
+    requests: "Needs you",
+    finished: "Finished",
+  };
   if (globalLink?.ready) {
     void notificationTarget.resolve(rows, globalLink.discoveryResult, (match) => {
       if (match === "ambiguous")
@@ -740,6 +757,11 @@ function catalog() {
         s?.detail?.request_threads?.includes(session.id) ||
         s?.asks?.some((a) => a.thread === session.id);
     if (s?.detail?.archived?.includes(session.id)) continue;
+    counts.all++;
+    if (needsInput) counts.requests++;
+    else if (session.status === "running") counts.active++;
+    else if (!["running", "needs_input"].includes(session.status))
+      counts.finished++;
     if (
       needle &&
       ![
@@ -760,6 +782,13 @@ function catalog() {
     )
       continue;
     visible.push({ ...row, needsInput });
+  }
+  for (const b of $("filters").children) {
+    const kind = b.dataset.filter;
+    const base = filterLabels[kind] ?? b.textContent;
+    const n = counts[kind] ?? 0;
+    b.textContent =
+      (kind === "active" || kind === "requests") && n > 0 ? `${base} (${n})` : base;
   }
   // Nest by the recorded parent scope, not the child's project: a worker may run
   // in a review checkout on another route. A filtered-out parent still leaves a
@@ -815,6 +844,8 @@ function catalog() {
         meta += `↳ ${recorded.title || leaf(recorded.project)} · `;
       meta += routesLabel(scope.route);
       if (model) meta += ` · ${model}`;
+      if (session.updated_at > 0 && nowSec >= session.updated_at)
+        meta += ` · ${ago(nowSec - session.updated_at)}`;
       b.append(
         head,
         el("div", "meta", meta),
@@ -1057,7 +1088,10 @@ function drawToolList(group) {
       row = { node, summary, output };
       node.append(summary, output);
       node.ontoggle = () => {
-        output.textContent = node.open ? toolText(row.item, row.info) : "";
+        if (!node.open) output.replaceChildren();
+        else if (row.info.kind === "FileChange")
+          formatPatchNode(output, toolText(row.item, row.info));
+        else output.textContent = toolText(row.item, row.info);
       };
     }
     if (row.item !== item || row.revision !== item.revision) {
@@ -1065,7 +1099,11 @@ function drawToolList(group) {
       row.revision = item.revision;
       row.info = info;
       row.summary.textContent = info.title;
-      if (row.node.open) row.output.textContent = toolText(item, info);
+      if (row.node.open) {
+        if (info.kind === "FileChange")
+          formatPatchNode(row.output, toolText(item, info));
+        else row.output.textContent = toolText(item, info);
+      }
     }
     next.set(item.id, row);
   }
@@ -1176,7 +1214,8 @@ const jumpLatest = (() => {
     document.documentElement.scrollHeight - innerHeight - scrollY;
   const reduced = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
   let seen = 0,
-    last = 0;
+    last = 0,
+    lastStamp = "";
   const sync = () => {
     const b = $("jump-latest");
     b.onclick ??= () =>
@@ -1197,9 +1236,16 @@ const jumpLatest = (() => {
   addEventListener("scroll", sync, { passive: true });
   return {
     pinned: () => scrollY > 2 && gap() < 80,
-    update(count, pinned) {
+    reset() {
+      seen = 0;
+      last = 0;
+      lastStamp = "";
+    },
+    update(count, stamp, pinned) {
       last = count;
-      if (pinned) scrollTo(0, document.documentElement.scrollHeight);
+      const changed = stamp !== lastStamp;
+      lastStamp = stamp;
+      if (pinned && changed) scrollTo(0, document.documentElement.scrollHeight);
       sync();
     },
   };
@@ -1209,6 +1255,46 @@ const jumpLatest = (() => {
 new IntersectionObserver(([entry]) => {
   $("nav-title").hidden = $("conversation").hidden || entry.boundingClientRect.bottom >= 0;
 }).observe($("title"));
+
+function updateComposerState() {
+  if (!selected) return;
+  const { scope, id } = selected,
+    k = scopeKey(scope);
+  const s = detailLink?.model.scopes.get(k),
+    g = global.scopes.get(k);
+  const row =
+    s?.sessions.find((x) => x.id === id) ??
+    g?.sessions.find((x) => x.id === id) ??
+    cold.get(k)?.sessions.find((x) => x.id === id);
+  const caps = row?.capabilities || [];
+  const inputCaps = id ? caps : (s?.capabilities ?? []);
+  updateExtras(s, inputCaps, detailLink, id);
+  const nativeLive = !!id && caps.includes("native_live");
+  $("native-live").hidden = !nativeLive;
+  $("native-live-text").textContent = nativeLiveText(
+    row?.detail?.native_live ?? "Claude Code",
+  );
+  $("native-live-fork").hidden = !caps.includes("fork");
+  $("native-live-fork").onclick = () => detailLink?.act({ fork_thread: id });
+  $("draft").disabled = nativeLive;
+  const canSend = id
+    ? caps.some((c) => c === "send" || c === "steer")
+    : s?.capabilities.includes("start");
+  $("send").textContent = caps.includes("steer") ? "Steer" : "Send";
+  $("send").disabled =
+    !canSend ||
+    !detailLink?.ready ||
+    (!$("draft").value.trim() && !imagesFor(keyOf(scope, id)).length) ||
+    (imagesFor(keyOf(scope, id)).length > 0 &&
+      !inputCaps.includes("attach_image")) ||
+    Boolean(pendingNew);
+  const running = Boolean(detailLink?.ready && caps.includes("stop"));
+  $("stop").disabled = !running;
+  $("stop").dataset.active = String(running);
+  $("stop").onclick = () => detailLink?.act({ stop: id });
+  $("menu-stop").disabled = $("stop").disabled;
+  $("menu-stop").hidden = !id;
+}
 
 function conversation() {
   if (!selected) return;
@@ -1272,24 +1358,22 @@ function conversation() {
     detailLink.act({ yolo_grant: [id, true] });
   }
   const timeline = s?.transcripts[id];
-  const inputCaps = id ? caps : (s?.capabilities ?? []);
-  updateExtras(s, inputCaps, detailLink, id);
   showReview(timeline?.detail?.reviews);
   const pinnedBottom = jumpLatest.pinned();
+  const items = timeline?.items || [];
+  const tail = items[items.length - 1];
+  const asks = (s?.asks || []).filter((a) => a.thread === id);
   transcript(
-    timeline?.items || [],
+    items,
     !!origin?.handoff && !timeline?.detail?.older,
   );
-  jumpLatest.update(timeline?.items?.length ?? 0, pinnedBottom);
   $("older").hidden = !timeline?.detail?.older;
   $("older").onclick = () => detailLink.act({ load_older: id });
   $("start-worker").hidden = !id || !caps.includes("open");
   $("continue-in").hidden = !id || !caps.includes("open");
-  const asks = (s?.asks || []).filter((a) => a.thread === id);
   showAsks(asks);
   // The activity line only trusts a live link: a reconnect must not look like a finished turn.
   if (detailLink?.ready && s) {
-    const items = timeline?.items || [];
     activityLine.update({
       session: keyOf(scope, id),
       items,
@@ -1299,6 +1383,8 @@ function conversation() {
       stopped: timeline?.detail?.interrupted === true,
     });
   }
+  const streamStamp = `${items.length}:${tail?.id ?? ""}:${tail?.revision ?? 0}:${askKeys}:${document.documentElement.scrollHeight}`;
+  jumpLatest.update(items.length, streamStamp, pinnedBottom);
   if (selected.revealLatest && timeline?.items?.length) {
     selected.revealLatest = false;
     const answers = $("timeline").querySelectorAll(".assistant, .result");
@@ -1323,26 +1409,7 @@ function conversation() {
       }
     }
   }
-  // A session another client is running is read-only here; it can be forked instead.
-  const nativeLive = !!id && caps.includes("native_live");
-  $("native-live").hidden = !nativeLive;
-  $("native-live-text").textContent = nativeLiveText(
-    row?.detail?.native_live ?? "Claude Code",
-  );
-  $("native-live-fork").hidden = !caps.includes("fork");
-  $("native-live-fork").onclick = () => detailLink?.act({ fork_thread: id });
-  $("draft").disabled = nativeLive;
-  const canSend = id
-    ? caps.some((c) => c === "send" || c === "steer")
-    : s?.capabilities.includes("start");
-  $("send").textContent = caps.includes("steer") ? "Steer" : "Send";
-  $("send").disabled =
-    !canSend ||
-    !detailLink?.ready ||
-    (!$("draft").value.trim() && !imagesFor(keyOf(scope, id)).length) ||
-    (imagesFor(keyOf(scope, id)).length > 0 &&
-      !inputCaps.includes("attach_image")) ||
-    Boolean(pendingNew);
+  updateComposerState();
   // A running turn that waits on an approval still gets the session terminal, so the
   // person can review the command there (the desktop offers the same path).
   const awaitingApproval =
@@ -1352,11 +1419,6 @@ function conversation() {
     !!row?.parent ||
     !!origin ||
     !(caps.includes("send") || awaitingApproval);
-  // Stop keeps its slot. It is enabled only while the host reports a running turn.
-  $("stop").disabled = !detailLink?.ready || !caps.includes("stop");
-  $("stop").onclick = () => detailLink?.act({ stop: id });
-  $("menu-stop").disabled = $("stop").disabled;
-  $("menu-stop").hidden = !id;
   $("menu-session").hidden = !id;
   $("menu-workers").hidden = !id || !caps.includes("open");
   $("menu-settings").hidden = $("session-controls").hidden;
@@ -1408,6 +1470,31 @@ $("filters").onclick = (e) => {
     b.setAttribute("aria-pressed", String(b.dataset.filter === filter));
   repaint();
 };
+function fillCreateRoutes() {
+  const select = $("route"),
+    keep = select.value;
+  const subs = [],
+    starred = [],
+    rest = [];
+  const rank = (r) => {
+    const i = modelChoices.starred.indexOf(r.billing?.api);
+    return i < 0 ? Infinity : i;
+  };
+  routes.forEach((r, i) => {
+    const opt = new Option(routesLabel(r), String(i));
+    if (r.billing === "subscription") subs.push(opt);
+    else if (rank(r) !== Infinity) starred.push([rank(r), opt]);
+    else rest.push(opt);
+  });
+  starred.sort((a, b) => a[0] - b[0]);
+  const groups = [];
+  if (subs.length) groups.push(optgroup("Subscriptions", subs));
+  if (starred.length)
+    groups.push(optgroup("Starred", starred.map(([, o]) => o)));
+  if (rest.length) groups.push(optgroup("All models", rest));
+  select.replaceChildren(...groups);
+  if (keep !== "" && routes[+keep]) select.value = keep;
+}
 $("new").onclick = () => {
   const options = (node, values, labels) =>
     node.replaceChildren(
@@ -1423,13 +1510,9 @@ $("new").onclick = () => {
   ];
   $("folder-picker").hidden = true;
   options($("project"), projects, projects);
-  options($("route"), routes, routes.map(routesLabel));
+  fillCreateRoutes();
   page("create");
-  loadModelChoices().then(() => {
-    const keep = $("route").value;
-    options($("route"), routes, routes.map(routesLabel));
-    if (keep !== "") $("route").value = keep;
-  });
+  loadModelChoices();
 };
 let browseSequence = 0,
   folderPage,
@@ -1547,6 +1630,16 @@ function handoffMarks(row) {
     d = row?.detail ?? {},
     origin = d.origin,
     nodes = [];
+  const stamp = JSON.stringify([
+    row?.id ?? null,
+    origin ?? null,
+    d.handed_off_to ?? null,
+    d.handoff_attempts ?? null,
+    d.yolo_grant ?? null,
+    d.yolo_children ?? null,
+  ]);
+  if (stamp === handoffStamp) return;
+  handoffStamp = stamp;
   if (origin?.relation === "handoff" && origin.handoff) {
     const h = origin.handoff,
       sel = h.selection ?? {};
@@ -1769,6 +1862,7 @@ async function loadModelChoices() {
     addCatalogRoutes();
     fillWorkerModels();
     handoffRoutes();
+    if (!$("create").hidden) fillCreateRoutes();
     repaint();
   };
   try {
@@ -1965,8 +2059,14 @@ $("draft").oninput = () => {
   mentionInput();
   if (selected)
     drafts.set(keyOf(selected.scope, selected.id), $("draft").value);
-  conversation();
+  syncDraftHeight();
+  updateComposerState();
 };
+const keepDraftFocus = (event) => {
+  if (document.activeElement === $("draft")) event.preventDefault();
+};
+$("send").onpointerdown = keepDraftFocus;
+$("send").onmousedown = keepDraftFocus;
 $("composer").onsubmit = (e) => {
   e.preventDefault();
   if ($("send").disabled || !selected) return;
@@ -1993,8 +2093,10 @@ $("composer").onsubmit = (e) => {
         if (
           keyOf(selected?.scope || scope, selected?.id) === owner &&
           $("draft").value === content
-        )
+        ) {
           $("draft").value = "";
+          syncDraftHeight();
+        }
         notice(id ? "" : "Message sent. Your new session is in Sessions.");
       }
       repaint();

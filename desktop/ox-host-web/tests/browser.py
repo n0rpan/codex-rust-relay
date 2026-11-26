@@ -936,12 +936,13 @@ def run(harness, screenshot=None):
         js("const d=document.querySelector('#draft');d.value='@mob';d.dispatchEvent(new Event('input'))")
         wait(lambda:js("return !!document.querySelector('#mention-choices button')"))
         js("document.querySelector('#mention-choices button').click()")
-        assert js("return document.getElementById('draft').value==='@src/mobile.rs '")
+        assert js("return document.getElementById('draft').value==='@src/mobile.rs ' && !document.querySelector('#mention-choices button')")
         js("""const data=new DataTransfer();
            data.items.add(new File([Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aWQAAAABJRU5ErkJggg=='),c=>c.charCodeAt(0))], 'pixel.png',{type:'image/png'}));
            const input=document.getElementById('attach-image'); input.files=data.files;
            input.dispatchEvent(new Event('change'));""")
         wait(lambda:js("return !!document.querySelector('#attached-images button')"))
+        assert js("return !!document.querySelector('#attached-images button.attached-chip img')")
         js("document.querySelector('#composer').requestSubmit()")
         wait(lambda:any(isinstance(a,dict) and a.get("send_images",[None])[0]=="parent" for a in host.actions))
         wait(lambda:js("return !document.querySelector('#attached-images button')"))
@@ -1056,6 +1057,21 @@ def run(harness, screenshot=None):
         assert target[0][0] and target[0][1].endswith("Carry on here"), target
         assert not target[1][0] and target[1][1].startswith("<ox-handoff>"), target
         assert js("return !document.getElementById('handoff-marks').hidden && document.getElementById('handoff-marks').textContent.includes('Continued from')")
+        # Typing in the composer must not replace handoff-marks DOM nodes or jump the scroll position.
+        assert js("""
+            const card = document.querySelector('#handoff-marks .link-card');
+            const bubble = document.querySelector('#timeline .bubble');
+            const draft = document.getElementById('draft');
+            draft.focus({ preventScroll: true });
+            window.scrollTo(0, 42);
+            const beforeScroll = window.scrollY;
+            draft.value = 'Typing in a PWA without screen flash';
+            draft.dispatchEvent(new Event('input'));
+            return document.querySelector('#handoff-marks .link-card') === card &&
+                   document.querySelector('#timeline .bubble') === bubble &&
+                   window.scrollY === beforeScroll &&
+                   !document.getElementById('send').disabled;
+        """)
         typed = bubbles("typed-block", "Typed block")
         assert typed and not typed[0][0] and typed[0][1].startswith("<ox-handoff>"), typed
         assert js("return document.getElementById('handoff-marks').hidden")
@@ -1066,7 +1082,9 @@ def run(harness, screenshot=None):
         js("document.getElementById('home').click();document.getElementById('new').click()")
         wait(lambda: js(
             "const o=[...document.querySelectorAll('#route option')].map(x=>x.textContent);"
-            "return ['codex','claude'].every(r=>o.some(t=>t.toLowerCase().includes(r)&&t.includes('orchard')))"
+            "const g=[...document.querySelectorAll('#route optgroup')].map(x=>x.label);"
+            "return g.includes('Subscriptions') && g.includes('All models') && "
+            "['codex','claude'].every(r=>o.some(t=>t.toLowerCase().includes(r)&&t.includes('orchard')))"
         ))
         js(
             "document.getElementById('home').click();document.getElementById('new').click();document.getElementById('new-form').requestSubmit()"

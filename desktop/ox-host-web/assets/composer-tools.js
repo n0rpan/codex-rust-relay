@@ -52,11 +52,10 @@ function renderTokens(parent, tokens) {
       case "code": {
         const box = document.createElement("div");
         box.className = "code-card";
-        box.append(
-          element("span", token.lang || "Code"),
-          copyButton("Copy", token.text),
-          element("pre", token.text),
-        );
+        const head = document.createElement("div");
+        head.className = "code-head";
+        head.append(element("span", token.lang || "Code"), copyButton("Copy", token.text));
+        box.append(head, element("pre", token.text));
         parent.append(box);
         break;
       }
@@ -123,6 +122,36 @@ export function messageText(node, text) {
   }
 }
 
+export function formatPatchNode(node, text) {
+  if (!text) {
+    node.replaceChildren();
+    return;
+  }
+  const lines = String(text).split("\n");
+  const isDiff = lines.some(
+    (l) => l.startsWith("@@ ") || l.startsWith("--- ") || l.startsWith("+++ "),
+  );
+  if (!isDiff) {
+    node.textContent = text;
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const span = element("span", i + 1 < lines.length ? line + "\n" : line);
+    span.className =
+      line.startsWith("+") && !line.startsWith("+++")
+        ? "diff-line diff-add"
+        : line.startsWith("-") && !line.startsWith("---")
+          ? "diff-line diff-del"
+          : line.startsWith("@@")
+            ? "diff-line diff-hunk"
+            : "diff-line";
+    frag.append(span);
+  }
+  node.replaceChildren(frag);
+}
+
 let lastReview;
 export function showReview(reviews) {
   const pane = $("review-pane");
@@ -154,11 +183,15 @@ export function showReview(reviews) {
       for (const file of t.aggregate ??
         (t.items ?? []).flatMap(([, files]) => files)) {
         const details = element("details", "");
-        details.append(
-          element("summary", file.path),
+        const head = document.createElement("div");
+        head.className = "code-head";
+        head.append(
+          element("span", "Patch"),
           copyButton("Copy patch", file.diff),
-          element("pre", file.diff),
         );
+        const pre = element("pre", "");
+        formatPatchNode(pre, file.diff);
+        details.append(element("summary", file.path), head, pre);
         frag.append(details);
       }
     }
@@ -204,6 +237,25 @@ export function setComposerOwner(key, render, notice) {
   $("mention-choices").replaceChildren();
   $("review-pane").open = false;
   lastReview = undefined;
+}
+const supportsFieldSizing =
+  typeof CSS !== "undefined" &&
+  typeof CSS.supports === "function" &&
+  CSS.supports("field-sizing", "content");
+export function syncDraftHeight() {
+  const draft = $("draft");
+  if (!draft) return;
+  if (supportsFieldSizing) {
+    draft.style.removeProperty("height");
+    return;
+  }
+  draft.style.height = "auto";
+  if (!draft.value) {
+    draft.style.removeProperty("height");
+    return;
+  }
+  const cap = Math.max(120, Math.round((window.visualViewport?.height ?? window.innerHeight) * 0.25));
+  draft.style.height = Math.min(cap, Math.max(44, draft.scrollHeight)) + "px";
 }
 function readFile(file) {
   return new Promise((resolve, reject) => {
@@ -260,6 +312,14 @@ export function updateExtras(state, caps, link, id) {
     $("attached-images").replaceChildren(
       ...(images ?? []).map((file, i) => {
         const b = element("button", "Remove " + file.file);
+        b.className = "attached-chip";
+        const src = file.image?.clipboard?.[1];
+        if (typeof src === "string" && src.startsWith("data:image/")) {
+          const img = document.createElement("img");
+          img.src = src;
+          img.alt = "";
+          b.prepend(img);
+        }
         b.type = "button";
         b.onclick = () => {
           drafts.set(
@@ -285,7 +345,13 @@ export function updateExtras(state, caps, link, id) {
       ...(match ? mention.paths : []).slice(0, 12).map((path) => {
         const b = element("button", path);
         b.type = "button";
+        const keepFocus = (event) => {
+          if (document.activeElement === $("draft")) event.preventDefault();
+        };
+        b.onpointerdown = keepFocus;
+        b.onmousedown = keepFocus;
         b.onclick = () => {
+          if (!query) return;
           const draft = $("draft");
           draft.setRangeText("@" + path + " ", query.start, query.end, "end");
           draft.focus();
