@@ -194,6 +194,17 @@ pub fn apply(home: &Path, id: &str) -> Result<Fix, RelayError> {
                 .iter()
                 .find(|vendor| vendor.key == *provider)
                 .ok_or_else(|| format!("codeox.toml has no providers.{provider} table"))?;
+            // Advice can outlive the provider entry it was recorded for. Moving
+            // a credential to OpenRouter after the entry was repointed would
+            // send the wrong service's key there.
+            if vendor.base_url.host_str() != Some("openrouter.ai")
+                || !crate::provider::is_openrouter_url(&vendor.base_url)
+            {
+                return Err(format!(
+                    "providers.{provider} no longer points at the global OpenRouter route; discard this advice"
+                )
+                .into());
+            }
             let old_base = vendor.base_url.as_str().to_owned();
             let env_key = vendor.env_key.clone();
             let shared = before.vendors.iter().any(|vendor| {
@@ -438,6 +449,37 @@ reasoning_efforts = ["low", "high"]
         assert!(apply(&home, "effort").is_err());
         let config = std::fs::read_to_string(home.join("codeox.toml")).unwrap();
         assert!(config.contains("https://openrouter.ai/api/v1"), "{config}");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_stale_regional_fix_is_refused_after_the_provider_changed() {
+        let home = temp_home("stale-region");
+        std::fs::write(
+            home.join("codeox.toml"),
+            "[providers.openrouter]\nbase_url = \"https://other.example/v1\"\nenv_key = \"OTHER_API_KEY\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("ox-api-keys.json"),
+            r#"{"OTHER_API_KEY":{"scope":"https://other.example/v1","value":"sk-other"}}"#,
+        )
+        .unwrap();
+        record(
+            &home,
+            advice(
+                "region",
+                Fix::UseRegionalHost {
+                    provider: "openrouter".to_owned(),
+                    region: "eu".to_owned(),
+                },
+            ),
+        );
+        assert!(apply(&home, "region").is_err());
+        let config = std::fs::read_to_string(home.join("codeox.toml")).unwrap();
+        assert!(config.contains("https://other.example/v1"), "{config}");
+        let keys = std::fs::read_to_string(home.join("ox-api-keys.json")).unwrap();
+        assert!(keys.contains("https://other.example/v1"), "{keys}");
         let _ = std::fs::remove_dir_all(home);
     }
 
