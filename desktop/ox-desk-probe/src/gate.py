@@ -375,15 +375,24 @@ if len(sys.argv) == 2 and "Tailscale" in sys.argv[1]:
 
     def agent(self, query):
         """Switch the active window's route with the sidebar AGENT picker: open it and press the
-        model row whose probe label (display name · id, e.g. "@plan:codex") contains `query`.
-        Rows are ordered by the picker, so pressing by label is stable where Enter is not."""
+        model row whose probe label (display name · id) names `query`. Picker ids are namespaced:
+        an API alias is "@api:<alias>" and a subscription plan "@plan:<name>", and a runtime's own
+        model can share a bare id with an API alias, so an API query prefers the "@api:" row and
+        a plan query the "@plan:" row; a runtime-model row matches only when neither exists."""
         self.press("billing-route")
         needle = query.casefold()
+        preferred = (f"@api:{needle}", f"@plan:{needle}")
 
         def row():
-            for c in self.stats().get("layout", []):
-                if c["id"].startswith("model-row") and needle in c["label"].casefold():
-                    return c["id"]
+            rows = [
+                (c["id"], c["label"].casefold())
+                for c in self.stats().get("layout", [])
+                if c["id"].startswith("model-row")
+            ]
+            for want in preferred:
+                for ident, label in rows:
+                    if want in label:
+                        return ident
             return None
 
         self.press(self.wait_for(f"a model picker row matching {query!r}", row))

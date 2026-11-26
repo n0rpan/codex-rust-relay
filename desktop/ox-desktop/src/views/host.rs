@@ -458,7 +458,9 @@ impl Host {
                 ModelPickerEvent::Choose(alias) => {
                     s.model_picker = None;
                     let project = s.panes[s.active].read(cx).project.clone();
-                    let route = s.model_runtime.route(Some(alias.clone()));
+                    let route = s
+                        .model_runtime
+                        .route(Some(model_picker::bare(alias).to_owned()));
                     s.open(project, route, window, cx);
                 }
                 ModelPickerEvent::Starred(favorites) => s.favorite_models = favorites.clone(),

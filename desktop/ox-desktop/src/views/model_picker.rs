@@ -37,6 +37,14 @@ pub(super) struct Entry {
 
 /// Id prefix of a subscription-route row (`@plan:codex`, `@plan:claude`); not a catalog alias.
 pub(super) const PLAN_PREFIX: &str = "@plan:";
+/// Id prefix of an API catalog row (`@api:openai/gpt-6`). A runtime's own model id can equal an
+/// API alias, so the two kinds of row never share an id; stars still store the bare alias.
+pub(super) const API_PREFIX: &str = "@api:";
+
+/// The bare catalog alias of an API row id; any other id is returned unchanged.
+pub(super) fn bare(id: &str) -> &str {
+    id.strip_prefix(API_PREFIX).unwrap_or(id)
+}
 
 impl Entry {
     /// A catalog alias with no separate display name.
@@ -50,6 +58,10 @@ impl Entry {
     }
     fn is_plan(&self) -> bool {
         self.id.starts_with(PLAN_PREFIX)
+    }
+    /// What favourites store for this row: the bare alias.
+    fn star_key(&self) -> &str {
+        bare(&self.id)
     }
 }
 
@@ -70,11 +82,14 @@ pub(super) enum Row {
 
 /// The provider is the part of an alias before the first `/`.
 fn provider(id: &str) -> &str {
-    id.split_once('/').map_or("Other", |(provider, _)| provider)
+    bare(id)
+        .split_once('/')
+        .map_or("Other", |(provider, _)| provider)
 }
 
 /// A model name split into its family (the words) and version (the numbers).
 fn family_version(id: &str) -> (String, Vec<u32>) {
+    let id = bare(id);
     let name = id.rsplit('/').next().unwrap_or(id).to_lowercase();
     let mut words = Vec::new();
     let mut version: Vec<u32> = Vec::new();
@@ -190,12 +205,25 @@ pub(super) fn arrange(
                 .is_some_and(|s| s.to_lowercase().contains(&needle))
     };
     let show_older = show_older || !needle.is_empty();
+    // A runtime row is starred only when no API row shares its bare id.
+    let is_starred = |index: usize| {
+        let key = entries[index].star_key();
+        favorites.iter().any(|f| f == key)
+            && (entries[index].section.is_none()
+                || !entries
+                    .iter()
+                    .any(|e| e.section.is_none() && !e.is_plan() && e.star_key() == key))
+    };
     let mut seen = HashSet::new();
     let mut rows = Vec::new();
     let starred: Vec<usize> = favorites
         .iter()
         .filter_map(|id| {
-            let index = entries.iter().position(|entry| &entry.id == id)?;
+            // An API row is the starred one when a runtime row shares its bare id.
+            let index = entries
+                .iter()
+                .position(|entry| entry.star_key() == id && entry.section.is_none())
+                .or_else(|| entries.iter().position(|entry| entry.star_key() == id))?;
             (!entries[index].is_plan() && matches(&entries[index]) && seen.insert(index))
                 .then_some(index)
         })
@@ -256,7 +284,7 @@ pub(super) fn arrange(
         for index in shown {
             rows.push(Row::Model {
                 entry: index,
-                starred: favorites.contains(&entries[index].id),
+                starred: is_starred(index),
             });
         }
         if !older.is_empty() {
@@ -268,7 +296,7 @@ pub(super) fn arrange(
                 for index in older {
                     rows.push(Row::Model {
                         entry: index,
-                        starred: favorites.contains(&entries[index].id),
+                        starred: is_starred(index),
                     });
                 }
             }
@@ -462,6 +490,7 @@ impl ModelPicker {
     /// List API aliases the catalog lacks, so every configured model can be chosen.
     fn add_aliases(&mut self, aliases: impl IntoIterator<Item = String>) {
         let known: HashSet<String> = self.entries.iter().map(|e| e.id.clone()).collect();
+        let aliases = aliases.into_iter().map(|id| format!("{API_PREFIX}{id}"));
         let new_session = self.discovered_new_session;
         self.entries.extend(
             aliases
@@ -526,6 +555,7 @@ impl ModelPicker {
         }
         // The click is a delta against what the row shows now, which already includes the
         // clicks still being written, so a fast double click on one row is add then remove.
+        let id = bare(id);
         let add = !self.favorites.iter().any(|f| f == id);
         self.favorites = apply_delta(&self.favorites, id, add);
         self.pending_stars += 1;
@@ -699,8 +729,9 @@ fn tag(p: Palette, text: &'static str, color: u32) -> Div {
 
 /// A bare catalog alias as an API row: the value first, the provider in its section.
 pub(super) fn api_entry(id: &str) -> Entry {
+    let id = bare(id);
     Entry {
-        id: id.to_owned(),
+        id: format!("{API_PREFIX}{id}"),
         label: ox_desk_core::slash::readable_model(id),
         note: provider_note(id),
         ..Entry::default()
@@ -1183,6 +1214,31 @@ mod tests {
         let entries = dedup(vec![entry("x/1"), entry("x/1"), entry("y/2")]);
         assert_eq!(entries.len(), 2);
         let rows = arrange(&entries, &["x/1".into(), "x/1".into()], "", false);
+        assert_eq!(model_rows(&rows).len(), 3);
+    }
+
+    #[test]
+    fn stars_store_the_bare_alias_and_pick_the_api_row() {
+        let runtime = Entry {
+            id: "shared".into(),
+            label: "Shared".into(),
+            section: Some("CODEX MODELS".into()),
+            ..Entry::default()
+        };
+        let entries = vec![runtime, api_entry("shared")];
+        assert_eq!(entries[1].id, "@api:shared");
+        let rows = arrange(&entries, &["shared".into()], "", false);
+        assert_eq!(
+            ids(&entries, &rows),
+            [
+                "#STARRED",
+                "@api:shared*",
+                "#CODEX MODELS",
+                "shared",
+                "#API MODELS",
+                "@api:shared*"
+            ]
+        );
         assert_eq!(model_rows(&rows).len(), 3);
     }
 

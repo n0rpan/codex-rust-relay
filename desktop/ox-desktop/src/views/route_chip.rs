@@ -69,6 +69,8 @@ pub(super) fn composer_entries(store: &Store, owner: Option<&str>) -> Vec<model_
                 ..model_picker::api_entry(id)
             };
             if subscription {
+                // The session's own model: its bare id, never the API row of the same alias.
+                entry.id.clone_from(id);
                 entry.label = caps.model_display(id);
                 entry.note = format!("{} subscription", route.runtime.account());
                 entry.section = Some(format!("{} MODELS", route.runtime.name().to_uppercase()));
@@ -122,6 +124,37 @@ fn choices(caps: &Capabilities, settings: &Options, kind: Kind) -> Vec<(String, 
             .collect(),
     }
 }
+/// What choosing a picker row does: the route to open a new session on (none when the current
+/// session takes the change), and the id the in-place option change names. Plan rows open their
+/// plan route unless it is the current one. An `@api:` alias always runs on its API route; only
+/// an API session already on that provider takes it in place. A bare id is the session's own
+/// model and changes in place when the session lists it.
+pub(super) fn model_choice(
+    store: &Store,
+    owner: Option<&str>,
+    id: &str,
+    runtime: Runtime,
+) -> (Option<Route>, String) {
+    let current = &store.profile().route;
+    if let Some(name) = id.strip_prefix(model_picker::PLAN_PREFIX) {
+        let plan = if name == Runtime::Claude.executable() {
+            Runtime::Claude
+        } else {
+            Runtime::Codex
+        }
+        .route(None);
+        return ((&plan != current).then_some(plan), id.to_owned());
+    }
+    let alias = model_picker::bare(id).to_owned();
+    let listed = store.command_caps(owner).models.contains_key(&alias);
+    let in_place = if id.starts_with(model_picker::API_PREFIX) {
+        matches!(current.billing, Billing::Api(_)) && listed && store.same_model_route(&alias)
+    } else {
+        listed && store.same_model_route(&alias)
+    };
+    let route = (!in_place).then(|| runtime.route(Some(alias.clone())));
+    (route, alias)
+}
 pub(super) struct NewModelRoute(pub Route);
 impl EventEmitter<NewModelRoute> for Workbench {}
 /// The model picker asks for Settings → Providers & models.
@@ -139,28 +172,21 @@ impl Workbench {
         runtime: Option<Runtime>,
         cx: &mut Context<Self>,
     ) {
-        let plan = id.strip_prefix(model_picker::PLAN_PREFIX).map(|name| {
-            if name == Runtime::Claude.executable() {
-                Runtime::Claude
-            } else {
-                Runtime::Codex
-            }
-            .route(None)
-        });
         let current = self.store.as_ref().map(|s| s.profile().route.clone());
         let runtime =
             runtime.unwrap_or_else(|| current.as_ref().map_or(self.route.runtime, |r| r.runtime));
-        let in_session = self.store.as_ref().is_some_and(|store| {
-            store
-                .command_caps(owner.as_deref())
-                .models
-                .contains_key(&id)
-                && store.same_model_route(&id)
-        });
-        let new_route = match plan {
-            Some(route) => (Some(&route) != current.as_ref()).then_some(route),
-            None if id.starts_with(model_picker::PLAN_PREFIX) => None,
-            None => (!in_session).then(|| runtime.route(Some(id.clone()))),
+        let (new_route, id) = match self.store.as_ref() {
+            Some(store) => model_choice(store, owner.as_deref(), &id, runtime),
+            None => {
+                let route = match id.strip_prefix(model_picker::PLAN_PREFIX) {
+                    Some(name) if name == Runtime::Claude.executable() => {
+                        Runtime::Claude.route(None)
+                    }
+                    Some(_) => Runtime::Codex.route(None),
+                    None => runtime.route(Some(model_picker::bare(&id).to_owned())),
+                };
+                (Some(route), id)
+            }
         };
         let unchanged_plan = id.starts_with(model_picker::PLAN_PREFIX) && new_route.is_none();
         if !unchanged_plan && self.store.as_ref().and_then(|s| s.selected()) == owner.as_deref() {
@@ -187,7 +213,10 @@ impl Workbench {
         let (runtime, model) = match id.strip_prefix(model_picker::PLAN_PREFIX) {
             Some(name) if name == Runtime::Claude.executable() => (Runtime::Claude, None),
             Some(_) => (Runtime::Codex, None),
-            None => (runtime.unwrap_or(self.route.runtime), Some(id.to_owned())),
+            None => (
+                runtime.unwrap_or(self.route.runtime),
+                Some(model_picker::bare(id).to_owned()),
+            ),
         };
         self.model_picker = None;
         self.open_launch(super::worker_sheet::LaunchKind::Handoff, window, cx);
@@ -461,4 +490,96 @@ fn capitalised(value: &str) -> String {
         .next()
         .map(|c| c.to_uppercase().chain(chars).collect())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{model_choice, model_picker};
+    use ox_desk_core::{
+        links::codex::{Launch, Link},
+        runtime::{Route, Runtime},
+        slash::Capabilities,
+        store::{Profile, Store},
+    };
+
+    /// A store on `route` whose session lists `models`.
+    fn store(route: Route, models: &[&str]) -> Store {
+        let directory = std::env::temp_dir();
+        let link = Link::spawn(
+            Launch {
+                executable: "/bin/cat".into(),
+                arguments: vec![],
+                directory: directory.clone(),
+                path: "/usr/bin:/bin".into(),
+            },
+            |_| {},
+        )
+        .unwrap();
+        let mut store = Store::open(
+            Profile {
+                project: directory,
+                route,
+                provider: "openai".into(),
+            },
+            link,
+        )
+        .unwrap();
+        let mut caps = Capabilities::default();
+        for id in models {
+            caps.add_model(
+                serde_json::from_value(serde_json::json!({"id": id, "isDefault": false})).unwrap(),
+            );
+        }
+        store.install_command_schema(caps).unwrap();
+        store
+    }
+
+    #[test]
+    fn an_id_in_both_lists_is_two_rows_and_each_keeps_its_billing() {
+        let store = store(Route::CODEX_SUBSCRIPTION, &["fixture-model"]);
+        let entries = super::composer_entries(&store, None);
+        // The picker also lists discovered API aliases, which carry the namespaced id.
+        let mut all = entries.clone();
+        all.push(model_picker::api_entry("fixture-model"));
+        let rows: Vec<_> = all
+            .iter()
+            .filter(|e| model_picker::bare(&e.id) == "fixture-model")
+            .collect();
+        assert_eq!(rows.len(), 2);
+        let subscription = rows.iter().find(|e| e.id == "fixture-model").unwrap();
+        let api = rows.iter().find(|e| e.id == "@api:fixture-model").unwrap();
+        assert!(
+            subscription.note.ends_with("subscription"),
+            "{subscription:?}"
+        );
+        assert_eq!(api.note, "API");
+        let rows = model_picker::arrange(&all, &[], "", false);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r, model_picker::Row::Model { entry, .. }
+                    if model_picker::bare(&all[*entry].id) == "fixture-model"))
+                .count(),
+            2
+        );
+
+        // The API row opens its API route, never an in-place change of the subscription session.
+        let (route, _) = model_choice(&store, None, "@api:fixture-model", Runtime::Codex);
+        assert_eq!(
+            route,
+            Some(Runtime::Codex.route(Some("fixture-model".into())))
+        );
+        // The subscription row changes the model in place.
+        let (route, id) = model_choice(&store, None, "fixture-model", Runtime::Codex);
+        assert_eq!((route, id.as_str()), (None, "fixture-model"));
+    }
+
+    #[test]
+    fn an_api_session_takes_its_own_alias_in_place() {
+        let route = Route::codex_api("fixture-model".into());
+        let store = store(route, &["fixture-model"]);
+        let (new, id) = model_choice(&store, None, "@api:fixture-model", Runtime::Codex);
+        assert_eq!((new, id.as_str()), (None, "fixture-model"));
+        let entries = super::composer_entries(&store, None);
+        assert_eq!(entries[0].id, "@api:fixture-model");
+    }
 }
