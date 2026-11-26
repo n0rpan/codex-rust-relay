@@ -796,6 +796,9 @@ impl App {
                 })
                 .collect();
             let mut requests = futures_util::stream::iter(requests).buffer_unordered(4);
+            // Probes run after every discovery has answered, so a slow 403
+            // probe cannot starve a healthy provider that shares the deadline.
+            let mut probes: Vec<(usize, SecretKey)> = Vec::new();
 
             while let Some((index, result)) = requests.next().await {
                 match result {
@@ -813,35 +816,40 @@ impl App {
                             "ox: provider {:?}: model discovery failed: {reason}",
                             vendors[index].key
                         );
-                        if let Some(key) = auths[index].as_ref()
-                            && vendors[index].is_openrouter()
+                        if vendors[index].is_openrouter()
                             && reason.contains("403")
-                            && let Some(region) =
-                                regional_host_for(client, &vendors[index], key, deadline).await
+                            && let Some(key) = auths[index].as_ref()
                         {
-                            eprintln!(
-                                "ox: provider {:?}: the key may use {region}.openrouter.ai\n  fix: set base_url = \"https://{region}.openrouter.ai/api/v1\"",
-                                vendors[index].key
-                            );
-                            if let Some(home) = advice_home {
-                                crate::advice::record(
-                                    home,
-                                    crate::advice::Advice {
-                                        id: format!("region:{}", vendors[index].key),
-                                        provider: vendors[index].key.clone(),
-                                        model: None,
-                                        message: format!(
-                                            "model discovery was rejected from the global host; this key may use {region}.openrouter.ai"
-                                        ),
-                                        fix: crate::advice::Fix::UseRegionalHost {
-                                            provider: vendors[index].key.clone(),
-                                            region: region.to_owned(),
-                                        },
-                                    },
-                                );
-                            }
+                            probes.push((index, key.clone()));
                         }
                     }
+                }
+            }
+            for (index, key) in probes {
+                let Some(region) = regional_host_for(client, &vendors[index], &key, deadline).await
+                else {
+                    continue;
+                };
+                eprintln!(
+                    "ox: provider {:?}: the key may use {region}.openrouter.ai\n  fix: set base_url = \"https://{region}.openrouter.ai/api/v1\"",
+                    vendors[index].key
+                );
+                if let Some(home) = advice_home {
+                    crate::advice::record(
+                        home,
+                        crate::advice::Advice {
+                            id: format!("region:{}", vendors[index].key),
+                            provider: vendors[index].key.clone(),
+                            model: None,
+                            message: format!(
+                                "model discovery was rejected from the global host; this key may use {region}.openrouter.ai"
+                            ),
+                            fix: crate::advice::Fix::UseRegionalHost {
+                                provider: vendors[index].key.clone(),
+                                region: region.to_owned(),
+                            },
+                        },
+                    );
                 }
             }
             Ok::<(), RelayError>(())
