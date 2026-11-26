@@ -53,6 +53,7 @@ jobs:
       native: ${{ steps.scope.outputs.native }}
       packages: ${{ steps.scope.outputs.packages }}
       mac_package: ${{ steps.scope.outputs.mac_package }}
+      focused: ${{ steps.scope.outputs.focused }}
     env:
       GH_TOKEN: ${{ github.token }}
       REF: ${{ github.ref }}
@@ -600,7 +601,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - id: native-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: desktop/target/debug
           key: ox-native-v1-${{ matrix.runner }}-rust1.100-${{ hashFiles('desktop/Cargo.lock', 'Cargo.lock') }}
@@ -611,6 +613,73 @@ jobs:
           cargo +1.100.0 test --locked --manifest-path desktop/Cargo.toml \
             -p ox-desk-core -p ox-host -p ox-host-service -p ox-pty
           cargo +1.100.0 test --locked --bin ox
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.ref == 'refs/heads/main' && steps.native-cache.outputs.cache-hit != 'true'
+        with:
+          path: desktop/target/debug
+          key: ${{ steps.native-cache.outputs.cache-primary-key }}
+
+  focused:
+    name: Desktop application tests (${{ matrix.runner }})
+    needs: version
+    if: github.event_name == 'pull_request' && needs.version.outputs.focused != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(needs.version.outputs.focused || '[]') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: desktop/target
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '3'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Match the package cache paths so both jobs restore main's compiled dependencies.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+            desktop/target/release
+            !desktop/target/release/incremental
+            !desktop/target/release/ox
+            !desktop/target/release/ox-desktop
+            !desktop/target/release/ox-host
+          key: ox-desktop-v1-${{ matrix.runner }}-rust1.100-${{ hashFiles('desktop/Cargo.lock', 'Cargo.lock') }}
+          restore-keys: ox-desktop-v1-${{ matrix.runner }}-rust1.100-
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.100.0 --profile minimal --no-self-update
+          rustup default 1.100.0
+      - name: Compile and exercise the native desktop on macOS
+        if: runner.os == 'macOS'
+        run: |
+          if ! xcrun -sdk macosx metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun -sdk macosx metal --version
+          fi
+          cargo test --release --locked --manifest-path desktop/Cargo.toml -p ox-desktop
+      - name: Prepare matching Chromium and ChromeDriver
+        if: runner.os == 'Linux'
+        run: |
+          if ! command -v convert && ! command -v magick; then
+            sudo apt-get update -o Acquire::Retries=3
+            sudo apt-get install -y -o Acquire::Retries=3 imagemagick
+          fi
+          desktop/ci/browser-runtime.sh
+      - name: Exercise the browser, server and CLI together
+        if: runner.os == 'Linux'
+        env:
+          OX_TEST_CARGO_PROFILE: release
+          OX_TEST_OX_BIN: ${{ github.workspace }}/desktop/target/release/ox
+        run: |
+          cargo build --locked --release --bin ox
+          desktop/ox-host-web/tests/check.sh
 
   desktop-release:
     name: Build matching desktop packages
@@ -627,7 +696,7 @@ jobs:
   merge:
     name: OX merge check
     if: ${{ always() && github.event_name == 'pull_request' }}
-    needs: [version, fast, verify, release, native, desktop-release]
+    needs: [version, fast, verify, release, native, focused, desktop-release]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
@@ -643,6 +712,8 @@ jobs:
           for job, flag in [("native", "native"), ("desktop-release", "packages")]:
               if scope[flag] == "true":
                   selected.add(job)
+          if json.loads(scope["focused"]):
+              selected.add("focused")
           for name, job in jobs.items():
               expected = "success" if name in selected else "skipped"
               print(f"{name}: {job['result']} (expected {expected})")
