@@ -192,6 +192,12 @@ async fn infer_native(
             .openrouter_session_id(context.key, context.incoming, &payload);
         let version = headers[ANTHROPIC_VERSION].to_str().unwrap_or_default();
         payload = prepare_native_body(payload, context.vendor, context.upstream_model, version);
+        if let Some(notice) = context.reasoning.normalize_anthropic(&mut payload) {
+            eprintln!(
+                "ox: provider {:?}: model {:?}: {notice}",
+                context.vendor.key, context.upstream_model
+            );
+        }
         // OpenRouter's Messages schema accepts the same routing preferences and
         // sticky session as its other wires.
         context
@@ -322,6 +328,17 @@ async fn infer_translated(
     context
         .vendor
         .prepare_openrouter_request(&mut canonical, openrouter_session.as_deref());
+    if let Some(notice) = context.reasoning.normalize_responses(&mut canonical) {
+        eprintln!(
+            "ox: provider {:?}: model {:?}: {notice}",
+            context.vendor.key, context.upstream_model
+        );
+    }
+    context.adapt.apply_known(
+        context.vendor.key.as_str(),
+        context.upstream_model,
+        &mut canonical,
+    );
 
     let upstream = match context.vendor.wire {
         Wire::Responses => {
@@ -339,6 +356,7 @@ async fn infer_translated(
                     requested_model: context.requested_model,
                     secrets: Arc::clone(&context.secrets),
                     adapt: context.adapt,
+                    reasoning: context.reasoning,
                 },
                 canonical,
             )
@@ -385,25 +403,71 @@ async fn responses_upstream(
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
 
-    let upstream = client
-        .post(context.vendor.responses_url("/responses", None))
-        .headers(headers)
-        .body(payload.to_string())
-        .send()
-        .await;
-    let upstream = match upstream {
-        Ok(response) => response,
-        Err(_) => {
-            return messages_error(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                "the upstream request failed",
-            );
+    let mut payload = payload;
+    context.adapt.apply_known(
+        context.vendor.key.as_str(),
+        context.upstream_model,
+        &mut payload,
+    );
+    let mut attempt = 0;
+    let upstream = loop {
+        attempt += 1;
+        let upstream = client
+            .post(context.vendor.responses_url("/responses", None))
+            .headers(headers.clone())
+            .body(payload.to_string())
+            .send()
+            .await;
+        let upstream = match upstream {
+            Ok(response) => response,
+            Err(_) => {
+                return messages_error(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    "the upstream request failed",
+                );
+            }
+        };
+        if !upstream::is_http_failure(&upstream) {
+            break upstream;
         }
-    };
-    if upstream::is_http_failure(&upstream) {
+        let status = upstream.status();
+        if matches!(status.as_u16(), 400 | 422) && attempt < crate::adapt::MAX_ATTEMPTS {
+            let retry_after = upstream
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u32>().ok());
+            let body = read_upstream_error(upstream).await;
+            let action = body
+                .as_ref()
+                .and_then(upstream::extract_error_message)
+                .and_then(|message| crate::adapt::classify(status.as_u16(), message, &payload));
+            if let Some(action) = action
+                && crate::adapt::apply(action, &mut payload)
+            {
+                if context
+                    .adapt
+                    .learn(context.vendor.key.as_str(), context.upstream_model, action)
+                {
+                    eprintln!(
+                        "ox: provider {:?}: model {:?}: {} because the provider rejected it\n  fix: {}",
+                        context.vendor.key,
+                        context.upstream_model,
+                        action.label(),
+                        action.advice()
+                    );
+                }
+                continue;
+            }
+            let message =
+                upstream::upstream_error(status.as_u16(), body.as_ref(), &context.secrets);
+            let mut response = messages_error(status, kind_for_status(status), &message);
+            copy_retry_after(&mut response, status, retry_after, &context.secrets);
+            return response;
+        }
         return messages_http_failure(upstream, &context.secrets, false).await;
-    }
+    };
     if !is_event_stream(upstream.headers()) {
         let detail = read_upstream_detail(upstream, &context.secrets).await;
         return messages_error(
@@ -1234,6 +1298,12 @@ mod tests {
         ADAPT.get_or_init(crate::adapt::Memory::default)
     }
 
+    fn reasoning() -> &'static crate::provider::ReasoningPolicy {
+        static POLICY: std::sync::OnceLock<crate::provider::ReasoningPolicy> =
+            std::sync::OnceLock::new();
+        POLICY.get_or_init(crate::provider::ReasoningPolicy::default)
+    }
+
     fn context<'a>(
         vendor: &'a Vendor,
         key: &'a SecretKey,
@@ -1247,6 +1317,7 @@ mod tests {
             requested_model: "vendor/upstream-model",
             secrets: Arc::clone(secrets),
             adapt: adapt(),
+            reasoning: reasoning(),
         }
     }
 
@@ -1686,6 +1757,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn translated_responses_applies_the_mandatory_reasoning_policy() {
+        const REPLY: &str = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_abc\",\"object\":\"response\",\"model\":\"m\",\"status\":\"in_progress\",\"output\":[]}}\n\n",
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_0\",\"type\":\"message\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_0\",\"output_index\":0,\"content_index\":0,\"delta\":\"ok\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_abc\",\"object\":\"response\",\"model\":\"m\",\"status\":\"completed\",\"output\":[{\"id\":\"msg_0\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+        );
+        let mock = MockUpstream::spawn(200, "text/event-stream", REPLY);
+        let vendor = vendor_at(&mock.base, Wire::Responses);
+        let key = SecretKey::new("sk-vendor-key".to_owned());
+        let secrets = Arc::new(vec!["sk-vendor-key".to_owned()]);
+        let policy = crate::provider::ReasoningPolicy {
+            supported: vec!["low".to_owned(), "high".to_owned()],
+            default: Some("high".to_owned()),
+            mandatory: true,
+        };
+        let payload = json!({
+            "model": "vendor/upstream-model",
+            "max_tokens": 64,
+            "stream": true,
+            "output_config": {"effort": "none"},
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let response = infer(
+            &Client::new(),
+            Translation {
+                vendor: &vendor,
+                key: &key,
+                incoming: None,
+                upstream_model: "real-model",
+                requested_model: "vendor/upstream-model",
+                secrets: Arc::clone(&secrets),
+                adapt: adapt(),
+                reasoning: &policy,
+            },
+            payload,
+            false,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let hits = mock.hits.lock().unwrap().clone();
+        assert_eq!(hits[0].body["reasoning"]["effort"], "high");
+    }
+
+    #[tokio::test]
+    async fn native_messages_applies_the_mandatory_reasoning_policy() {
+        let mock = MockUpstream::spawn(200, "text/event-stream", "data: {}\n\n");
+        let vendor = vendor_at(&mock.base, Wire::AnthropicMessages);
+        let key = SecretKey::new("sk-vendor-key".to_owned());
+        let secrets = Arc::new(vec!["sk-vendor-key".to_owned()]);
+        let policy = crate::provider::ReasoningPolicy {
+            supported: vec!["low".to_owned(), "high".to_owned()],
+            default: Some("high".to_owned()),
+            mandatory: true,
+        };
+        let payload = json!({
+            "model": "vendor/upstream-model",
+            "max_tokens": 64,
+            "stream": true,
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let response = infer(
+            &Client::new(),
+            Translation {
+                vendor: &vendor,
+                key: &key,
+                incoming: None,
+                upstream_model: "real-model",
+                requested_model: "vendor/upstream-model",
+                secrets: Arc::clone(&secrets),
+                adapt: adapt(),
+                reasoning: &policy,
+            },
+            payload,
+            false,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let hits = mock.hits.lock().unwrap().clone();
+        assert!(hits[0].body.get("thinking").is_none(), "{:?}", hits[0].body);
+    }
+
+    #[tokio::test]
     async fn non_streaming_translation_reuses_the_terminal_message() {
         let response = collect_message(fake_stream(&responses_stream()), "vendor/x", &[]).await;
         let (status, body) = response_json(response).await;
@@ -1818,6 +1973,7 @@ mod tests {
                 requested_model: "vendor/upstream-model",
                 secrets: Arc::clone(&secrets),
                 adapt: adapt(),
+                reasoning: reasoning(),
             },
             payload,
             false,
@@ -1868,6 +2024,7 @@ mod tests {
                 requested_model: "vendor/upstream-model",
                 secrets,
                 adapt: adapt(),
+                reasoning: reasoning(),
             },
             json!({
                 "model": "vendor/upstream-model",
@@ -1920,6 +2077,7 @@ mod tests {
                 requested_model: "vendor/upstream-model",
                 secrets: Arc::new(vec!["sk-vendor-key".to_owned()]),
                 adapt: adapt(),
+                reasoning: reasoning(),
             },
             json!({"model": "vendor/upstream-model", "max_tokens": 10, "messages": []}),
             false,
@@ -1962,6 +2120,7 @@ mod tests {
                 requested_model: "vendor/upstream-model",
                 secrets,
                 adapt: adapt(),
+                reasoning: reasoning(),
             },
             json!({"model": "vendor/upstream-model", "max_tokens": 10, "messages": []}),
             false,

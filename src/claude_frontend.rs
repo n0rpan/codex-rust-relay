@@ -234,6 +234,7 @@ impl App {
             requested_model: &requested,
             secrets: Arc::clone(&self.secrets),
             adapt: &self.adapt,
+            reasoning: &route.reasoning,
         };
         let beta = parts
             .uri

@@ -1571,8 +1571,15 @@ impl Route {
     ///
     /// Returns a short description of the change for the one-line notice.
     pub fn normalize_reasoning(&self, payload: &mut serde_json::Value) -> Option<String> {
-        let supported = self.reasoning.supported.clone();
-        let mandatory = self.reasoning.mandatory;
+        self.reasoning.normalize_responses(payload)
+    }
+}
+
+impl ReasoningPolicy {
+    /// Removes a reasoning setting a Responses request cannot use.
+    pub fn normalize_responses(&self, payload: &mut serde_json::Value) -> Option<String> {
+        let supported = self.supported.clone();
+        let mandatory = self.mandatory;
         let reasoning = payload.get_mut("reasoning")?.as_object_mut()?;
         let requested = reasoning
             .get("effort")
@@ -1608,7 +1615,6 @@ impl Route {
             }
         }
         let replacement = self
-            .reasoning
             .default
             .clone()
             .filter(|default| supported.is_empty() || supported.contains(default))
@@ -1648,6 +1654,55 @@ impl Route {
         }
         payload.as_object_mut()?.remove("reasoning");
         Some("reasoning cannot be disabled on this model; using its default".to_owned())
+    }
+
+    /// Removes a reasoning setting a native Anthropic Messages request cannot
+    /// use (`thinking` disabled, or an unsupported `output_config.effort`).
+    pub fn normalize_anthropic(&self, payload: &mut serde_json::Value) -> Option<String> {
+        let object = payload.as_object_mut()?;
+        let mut notice = None;
+        if object
+            .get("thinking")
+            .and_then(|thinking| thinking.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("disabled")
+        {
+            let supports_none = self.supported.iter().any(|level| level == "none");
+            if self.mandatory || (!self.supported.is_empty() && !supports_none) {
+                object.remove("thinking");
+                notice = Some(
+                    "reasoning cannot be disabled on this model; using its default".to_owned(),
+                );
+            }
+        }
+        let replacement = object
+            .get("output_config")
+            .and_then(|config| config.get("effort"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|effort| {
+                if self.supported.is_empty() {
+                    return None;
+                }
+                crate::catalog::clamp_reasoning_effort(
+                    effort,
+                    &self.supported,
+                    self.default.as_deref(),
+                )
+            });
+        if let Some(replacement) = replacement
+            && let Some(output) = object
+                .get_mut("output_config")
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            output.insert(
+                "effort".to_owned(),
+                serde_json::Value::String(replacement.clone()),
+            );
+            notice = Some(format!(
+                "reasoning effort is not supported; using {replacement:?}"
+            ));
+        }
+        notice
     }
 }
 
@@ -2284,6 +2339,30 @@ sort = "price"
         assert!(route.normalize_reasoning(&mut payload).is_some());
         // The closest supported level to "none" is the lowest one.
         assert_eq!(payload["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn native_messages_reasoning_follows_the_same_policy() {
+        let route = reasoning_route(&["low", "high"], Some("high"), true);
+        let mut payload = serde_json::json!({"thinking": {"type": "disabled"}});
+        assert!(route.reasoning.normalize_anthropic(&mut payload).is_some());
+        assert!(payload.get("thinking").is_none());
+
+        let mut payload = serde_json::json!({
+            "output_config": {"effort": "none"},
+            "messages": [],
+        });
+        assert!(route.reasoning.normalize_anthropic(&mut payload).is_some());
+        assert_eq!(payload["output_config"]["effort"], "high");
+
+        // An unknown list and no policy leaves the caller's choice alone.
+        let route = reasoning_route(&[], None, false);
+        let mut payload = serde_json::json!({
+            "thinking": {"type": "disabled"},
+            "output_config": {"effort": "none"},
+        });
+        assert!(route.reasoning.normalize_anthropic(&mut payload).is_none());
+        assert_eq!(payload["thinking"]["type"], "disabled");
     }
 
     #[test]

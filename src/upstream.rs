@@ -55,6 +55,7 @@ pub struct Translation<'a> {
     pub requested_model: &'a str,
     pub secrets: Arc<Vec<String>>,
     pub adapt: &'a crate::adapt::Memory,
+    pub reasoning: &'a crate::provider::ReasoningPolicy,
 }
 
 /// Translate, send, and stream one request to a translated vendor.
@@ -592,7 +593,7 @@ pub(crate) async fn read_error_body(response: reqwest::Response) -> Option<Value
     serde_json::from_slice(&buffer).ok()
 }
 
-fn upstream_error(status: u16, body: Option<&Value>, secrets: &[String]) -> String {
+pub(crate) fn upstream_error(status: u16, body: Option<&Value>, secrets: &[String]) -> String {
     let detail = body
         .and_then(extract_error_message)
         .map(|message| format!(": {}", truncate(&redact(message, secrets))))
