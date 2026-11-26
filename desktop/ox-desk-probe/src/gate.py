@@ -970,12 +970,18 @@ def claude_gate(f):
         / seconds
     )
     for name, ident in f.claude_ids.items():
-        f.click(wait(lambda: f.words().get(name)))
-        wait(lambda: f.stats()["selected_thread"] == "claude:api:" + ident)
+        f.click(f.wait_for(f"the Claude thread {name!r} in the list", lambda: f.words().get(name)))
+        f.wait_for(
+            f"Claude thread {name!r} to be selected",
+            lambda: f.stats()["selected_thread"] == "claude:api:" + ident,
+        )
         f.x("key", "ctrl+l")
         f.x("type", "Generate a measured Claude stream")
         f.x("key", "ctrl+Return")
-        wait(lambda: any(e["id"] == ident for e in f.events("claude-user")))
+        f.wait_for(
+            f"the Claude fixture to receive the user turn for {name!r}",
+            lambda: any(e["id"] == ident for e in f.events("claude-user")),
+        )
     first = f.stats(reset=True)
     for ident in f.claude_ids.values():
         f.client.sendto(b"stream", str(Path(f.control_socket).with_name("c-" + ident)))

@@ -496,7 +496,6 @@ fn capitalised(value: &str) -> String {
 mod tests {
     use super::{model_choice, model_picker};
     use ox_desk_core::{
-        links::codex::{Launch, Link},
         runtime::{Route, Runtime},
         slash::Capabilities,
         store::{Profile, Store},
@@ -504,25 +503,11 @@ mod tests {
 
     /// A store on `route` whose session lists `models`.
     fn store(route: Route, models: &[&str]) -> Store {
-        let directory = std::env::temp_dir();
-        let link = Link::spawn(
-            Launch {
-                executable: "/bin/cat".into(),
-                arguments: vec![],
-                directory: directory.clone(),
-                path: "/usr/bin:/bin".into(),
-            },
-            |_| {},
-        )
-        .unwrap();
-        let mut store = Store::open(
-            Profile {
-                project: directory,
-                route,
-                provider: "openai".into(),
-            },
-            link,
-        )
+        let mut store = Store::inert(Profile {
+            project: std::env::temp_dir(),
+            route,
+            provider: "openai".into(),
+        })
         .unwrap();
         let mut caps = Capabilities::default();
         for id in models {

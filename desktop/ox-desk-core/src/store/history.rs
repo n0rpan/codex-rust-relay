@@ -341,6 +341,21 @@ impl Store {
 
     /// Fixture for host tests: the selected thread is held by another Codex client, its
     /// probe is overdue, and the read it sent is still waiting for the runtime.
+    /// A store over an inert runtime process, for view tests that must stay
+    /// runtime-neutral (they cannot name a runtime's link module).
+    #[doc(hidden)]
+    pub fn inert(profile: super::Profile) -> std::io::Result<Self> {
+        let link = crate::links::codex::Link::spawn(
+            crate::links::codex::Launch {
+                executable: "/bin/cat".into(),
+                arguments: vec![],
+                directory: profile.project.clone(),
+                path: "/usr/bin:/bin".into(),
+            },
+            |_| {},
+        )?;
+        Self::open(profile, link)
+    }
     #[doc(hidden)]
     pub fn hold_native_read_for_test(&mut self, id: &str) {
         let t = self.transcripts.entry(id.into()).or_default();
