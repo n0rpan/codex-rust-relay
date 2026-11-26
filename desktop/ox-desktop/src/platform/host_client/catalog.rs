@@ -3,6 +3,7 @@ use ox_desk_core::host_protocol::{Change, SessionView};
 use std::sync::Mutex;
 
 pub(crate) enum CatalogEvent {
+    Host(ox_desk_core::host_protocol::HostInfo),
     Reset,
     Disconnected(io::ErrorKind),
     Waiting(Scope, HashSet<String>),
@@ -27,6 +28,7 @@ impl Drop for CatalogWatch {
 impl HostLink {
     pub(crate) fn watch_catalog(
         &self,
+        resources: bool,
     ) -> io::Result<(CatalogWatch, flume::Receiver<CatalogEvent>)> {
         let link = self.clone();
         let (tx, rx) = flume::bounded(32);
@@ -56,9 +58,13 @@ impl HostLink {
                         }
                     };
                     write_frame(&mut stream, &request)?;
+                    if resources && caps.iter().any(|cap| cap == "host_status") {
+                        write_frame(&mut stream, &Client::WatchHost)?;
+                    }
                     let emit = |event| tx.send(event).map_err(io::Error::other);
                     loop {
                         match read_frame(&mut input)? {
+                            Server::HostStatus { host } => emit(CatalogEvent::Host(host))?,
                             Server::Snapshot { scopes, .. } => {
                                 emit(CatalogEvent::Reset)?;
                                 for s in scopes {

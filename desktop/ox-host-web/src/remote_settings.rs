@@ -25,6 +25,9 @@ pub(super) struct Envelope {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum DeviceAction {
+    HostProfile {
+        edit: Option<crate::host_profile::Edit>,
+    },
     Devices,
     PairDevice,
     HostUpdate {
@@ -62,6 +65,15 @@ pub(super) async fn settings(
         if let Some(op) = &device_action {
             let data = match op {
                 DeviceAction::HostUpdate { .. } => None,
+                DeviceAction::HostProfile { edit } => {
+                    Some(json!(state.host_profile(edit.clone()).map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::AlreadyExists {
+                            StatusCode::CONFLICT
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        }
+                    })?))
+                }
                 DeviceAction::Devices => {
                     let reply = state.reply(None);
                     let devices = reply

@@ -88,6 +88,32 @@ fn native_desktop() {
     drop(stream);
     assert_eq!(handshake().0, id);
     let settings = |action| rt.block_on(client.settings(action)).unwrap();
+    let before = settings(json!({"action":"host_profile"}));
+    let edit = json!({"action":"host_profile","edit":{
+        "before":before, "after":{"name":"Studio","labels":["big","linux","big"]}
+    }});
+    let profile = settings(edit.clone());
+    assert_eq!(profile["labels"], json!(["big", "linux"]));
+    assert!(
+        rt.block_on(client.settings(edit)).is_err(),
+        "stale host edit"
+    );
+    let (_, mut catalog) = handshake();
+    writeln!(
+        catalog.get_mut(),
+        "{}",
+        serde_json::to_string(&Frame::WatchHost).unwrap()
+    )
+    .unwrap();
+    let Server::HostStatus { host } = read(&mut catalog) else {
+        panic!("expected host details");
+    };
+    assert_eq!(host.name.as_deref(), Some("Studio"));
+    assert_eq!(host.labels, ["big", "linux"]);
+    let metrics = host.resources.unwrap();
+    assert!(metrics.total_memory > 0 && metrics.available_memory <= metrics.total_memory);
+    assert_eq!(metrics.os, std::env::consts::OS);
+    drop(catalog);
     let devices = settings(json!({"action":"devices"}));
     assert_eq!(devices["devices"][0]["class"], "desktop");
     let snapshot = settings(json!({"action":"read_rows"}));

@@ -219,6 +219,9 @@ Checks and next steps
   ox doctor --fix         Repair what ox can repair; files are backed up first.
   ox host pair            Pair a desktop or phone over your tailnet.
   ox host pair --terminal Include terminal access for the device that pairs.
+  ox host name [NAME]     Show or change the name shown on paired devices.
+  ox host labels set big  Set placement labels used to identify this host.
+  ox host update dev      Follow development builds. Use stable for releases.
   ox host devices         List device IDs for ox host revoke <device-id>.
   ox host doctor          Check the host, Tailscale Serve and paired devices.
   ox help share           Serve one gateway to another device.

@@ -272,7 +272,10 @@ impl Render for Workspace {
                 bar = bar.child(kit::button(
                     p,
                     format!("select-host-{}", host.id),
-                    host.name.clone(),
+                    self.inventory
+                        .get(&Some(host.id.clone()))
+                        .map(|v| v.read(cx).display_name().to_owned())
+                        .unwrap_or_else(|| host.name.clone()),
                     self.active.as_ref() == Some(&host.id)
                         && self.settings.is_none()
                         && self.page.is_none(),

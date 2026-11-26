@@ -20,10 +20,13 @@ impl Store {
     /// Loaded threads with a turn in progress, whether or not the catalog
     /// page lists them (workers, search results, later pages).
     pub fn active_turns(&self) -> usize {
+        self.active_thread_ids().count()
+    }
+
+    pub fn active_thread_ids(&self) -> impl Iterator<Item = &str> {
         self.transcripts
-            .values()
-            .filter(|t| t.active_turn().is_some())
-            .count()
+            .iter()
+            .filter_map(|(id, thread)| thread.active_turn().map(|_| id.as_str()))
     }
 
     pub fn take_remeasure(&mut self, id: &str) -> Vec<usize> {

@@ -9,6 +9,7 @@ mod pairing;
 mod policy;
 mod receipts;
 mod replay;
+mod resources;
 mod runtime;
 mod transport;
 mod updates;
@@ -158,6 +159,8 @@ const USAGE: &str = "Usage: ox-host COMMAND [--socket PATH] [--state-dir PATH] [
   restart [--timeout SECS]  finish running turns (default bound 600s), then start the installed host
   pair [--terminal]         print a private Serve invitation, optionally granting a terminal
   update [setting]          install when idle or set automatic, download, manual, stable or dev
+  name [NAME]               show or set the name shown to clients
+  labels [set LABEL…]       show or replace placement labels
   devices                   list paired devices and their IDs
   terminal <device> on|off  change a paired device’s terminal grant
   revoke <device-id>        disconnect a paired device
@@ -208,6 +211,7 @@ fn entry() -> io::Result<()> {
         (Some("stop"), []) => control::stop(&paths),
         (Some("restart-if-updated"), []) => control::restart_if_updated(&paths),
         (Some("restart"), rest) => control::restart(&paths, control::timeout(rest)?),
+        (Some(kind @ ("name" | "labels")), rest) => pairing::profile(&paths, kind, rest),
         (Some("update"), rest) => updates::cli(&paths, rest),
         (Some("pair"), []) => pairing::pair(&paths, false).map_err(io::Error::other),
         (Some("pair"), [flag]) if flag == "--terminal" => {

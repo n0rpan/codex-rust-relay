@@ -142,10 +142,10 @@ async fn serve(dir: PathBuf, socket: PathBuf) -> io::Result<()> {
 }
 async fn read_request(stream: &mut UnixStream) -> io::Result<Request> {
     let mut bytes = Vec::new();
-    BufReader::new(stream.take(4097))
+    BufReader::new(stream.take(16 * 1024 + 1))
         .read_until(b'\n', &mut bytes)
         .await?;
-    if bytes.len() > 4096 || !bytes.ends_with(b"\n") {
+    if bytes.len() > 16 * 1024 || !bytes.ends_with(b"\n") {
         return Err(io::Error::other("Invalid request"));
     }
     Ok(serde_json::from_slice(&bytes)?)
@@ -194,6 +194,12 @@ async fn administer(
     }
     match req {
         Request::Update { .. } => unreachable!("handled before Serve administration"),
+        Request::HostProfile { edit } => {
+            let state = app.state.lock().unwrap();
+            let mut reply = state.reply(None);
+            reply.profile = Some(state.host_profile(edit)?);
+            return Ok(reply);
+        }
         Request::Status => {}
         Request::Pair { login, terminal } => {
             if listener.is_none() || staged.is_some() {

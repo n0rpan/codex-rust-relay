@@ -229,6 +229,7 @@ impl Access {
                 self.discovery = Some(id.clone());
                 true
             }
+            Client::WatchHost if self.ready => true,
             Client::WatchCatalog if self.ready => {
                 self.selected = None;
                 true

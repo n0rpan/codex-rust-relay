@@ -461,6 +461,7 @@ impl Service {
                         }
                     }
                 }
+                Some("list_ox_hosts") => tool_result(self.list_hosts(thread).await),
                 Some("list_ox_workers") => tool_result(self.list_jobs(thread).await),
                 Some("read_ox_thread") => {
                     match serde_json::from_value::<ReadThread>(
@@ -703,6 +704,15 @@ impl Service {
             thread,
         )
         .await
+    }
+
+    async fn list_hosts(&self, thread: Option<&str>) -> Result<Value, String> {
+        if crate::host_lifetime::HostLink::find(&self.cwd, self.host_policy)?.is_none() {
+            return Ok(
+                json!({"hosts": [], "message": "This launch is running without an OX session host."}),
+            );
+        }
+        self.host_call(json!({"op":"list_hosts"}), thread).await
     }
 
     async fn list_jobs(&self, thread: Option<&str>) -> Result<Value, String> {
@@ -950,6 +960,12 @@ fn tools() -> Value {
                     "after":{"type":"string","description":"Start after this item ID. Use next_after from the previous page."},
                     "limit":{"type":"integer","minimum":1,"maximum":100,"default":20}
                 },"additionalProperties":false},
+                "annotations":{"readOnlyHint":true,"openWorldHint":false}
+            },
+            {
+                "name":"list_ox_hosts",
+                "description":"List execution hosts available to this session, their resources, labels, installed runtimes and configured billing routes.",
+                "inputSchema":{"type":"object","properties":{},"additionalProperties":false},
                 "annotations":{"readOnlyHint":true,"openWorldHint":false}
             },
             {

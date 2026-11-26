@@ -31,6 +31,9 @@ pub fn socket_path(state_dir: &Path) -> PathBuf {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    HostProfile {
+        edit: Option<crate::host_profile::Edit>,
+    },
     Update {
         command: crate::host_updates::Command,
     },
@@ -96,6 +99,8 @@ pub struct Pairing {
 
 #[derive(Serialize, Deserialize)]
 pub struct Reply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<crate::host_profile::HostProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<crate::host_updates::Status>,
     pub enabled: bool,

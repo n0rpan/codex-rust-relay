@@ -123,3 +123,48 @@ pub fn revoke(paths: &Paths, id: &str) -> Result<(), String> {
     println!("Revoked {}.", device.label);
     Ok(())
 }
+
+pub fn profile(paths: &Paths, kind: &str, args: &[String]) -> io::Result<()> {
+    use ox_host_web::host_profile::Edit;
+    access::status(paths).map_err(io::Error::other)?;
+    let request = |edit| {
+        admin::request(&paths.state_dir, &Request::HostProfile { edit })?
+            .profile
+            .ok_or_else(|| {
+                io::Error::other("Update the running OX host to edit its name and labels.")
+            })
+    };
+    let before = request(None)?;
+    let mut after = before.clone();
+    match (kind, args) {
+        ("name", [name]) => after.name = name.clone(),
+        ("name", []) | ("labels", []) => (),
+        ("labels", [set, labels @ ..]) if set == "set" => after.labels = labels.to_vec(),
+        _ => {
+            return Err(io::Error::other(
+                "Usage: ox host name [NAME] or ox host labels [set LABEL…]",
+            ));
+        }
+    }
+    let profile = if after == before {
+        before
+    } else {
+        request(Some(Edit {
+            before,
+            after: after.normalized()?,
+        }))?
+    };
+    if kind == "name" {
+        println!(
+            "{}",
+            if profile.name.is_empty() {
+                sysinfo::System::host_name().unwrap_or_default()
+            } else {
+                profile.name
+            }
+        );
+    } else {
+        println!("{}", profile.labels.join(", "));
+    }
+    Ok(())
+}

@@ -5,11 +5,13 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::input::{Input, InputState};
+use ox_host_web::host_profile::{Edit, HostProfile};
 use ox_host_web::host_updates::{Channel, Command, Mode, Status};
 use std::io;
 
 pub(crate) struct Hosts {
     address: Entity<InputState>,
+    profile_fields: Option<(HostProfile, Entity<InputState>, Entity<InputState>)>,
     code: Entity<InputState>,
     hosts: Vec<SavedHost>,
     selected: Option<SavedHost>,
@@ -22,6 +24,7 @@ impl Hosts {
     pub fn new(w: &mut Window, cx: &mut Context<Self>) -> Self {
         let loaded = hosts::list();
         Self {
+            profile_fields: None,
             address: field(
                 "",
                 "Invitation link or https://host.tailnet.ts.net:8443",
@@ -70,6 +73,7 @@ impl Hosts {
     }
     fn select(&mut self, host: Option<SavedHost>, cx: &mut Context<Self>) {
         self.selected = host;
+        self.profile_fields = None;
         self.status = None;
         self.review = None;
         self.update(Command::Status, cx);
@@ -96,6 +100,91 @@ impl Hosts {
             |s, status, _| s.status = Some(status),
         )
     }
+    fn profile(host: Option<SavedHost>, edit: Option<Edit>) -> io::Result<HostProfile> {
+        match host {
+            Some(h) => Ok(serde_json::from_value(h.settings(
+                serde_json::json!({"action":"host_profile","edit":edit}),
+            )?)?),
+            None => {
+                let paths = ox_host_service::Paths::discover()?;
+                ox_host_web::access::status(&paths).map_err(io::Error::other)?;
+                ox_host_web::admin::request(
+                    &paths.state_dir,
+                    &ox_host_web::admin::Request::HostProfile { edit },
+                )?
+                .profile
+                .ok_or_else(|| io::Error::other("Update this host to edit its details."))
+            }
+        }
+    }
+    fn edit_profile(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        let host = self.selected.clone();
+        let task = cx.background_spawn(async move { Self::profile(host, None) });
+        self.busy = true;
+        self.notice.clear();
+        cx.notify();
+        cx.spawn_in(w, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |s, w, cx| {
+                s.busy = false;
+                match result {
+                    Ok(p) => {
+                        let name =
+                            field(&p.name, "Host name (defaults to system name)", false, w, cx);
+                        let labels = field(
+                            &p.labels.join(", "),
+                            "Labels, separated by commas",
+                            false,
+                            w,
+                            cx,
+                        );
+                        s.profile_fields = Some((p, name, labels));
+                    }
+                    Err(e) => s.notice = e.to_string(),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+    fn save_profile(&mut self, cx: &mut Context<Self>) {
+        let Some((before, name, labels)) = &self.profile_fields else {
+            return;
+        };
+        let after = HostProfile {
+            name: name.read(cx).value().to_string(),
+            labels: labels
+                .read(cx)
+                .value()
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        }
+        .normalized();
+        let after = match after {
+            Ok(after) => after,
+            Err(e) => {
+                self.notice = e.to_string();
+                cx.notify();
+                return;
+            }
+        };
+        let edit = Edit {
+            before: before.clone(),
+            after,
+        };
+        let host = self.selected.clone();
+        self.work(
+            cx,
+            move || Self::profile(host, Some(edit)),
+            |s, _, _| {
+                s.profile_fields = None;
+                s.notice = "Host details saved.".into();
+            },
+        );
+    }
     fn remove(&mut self, host: SavedHost, revoke: bool, cx: &mut Context<Self>) {
         self.work(
             cx,
@@ -110,6 +199,7 @@ impl Hosts {
             move |s, rows, cx| {
                 s.hosts = rows;
                 s.selected = None;
+                s.profile_fields = None;
                 s.review = None;
                 s.status = None;
                 cx.set_global(HostDirectory(s.hosts.clone()));
@@ -228,6 +318,48 @@ impl Render for Hosts {
                         cx.listener(move |s, _, _, cx| s.remove(forget.clone(), false, cx)),
                     )),
             );
+        }
+        if self.selected.is_some() || !cx.global::<crate::app::ClientOnly>().0 {
+            if let Some((_, name, labels)) = &self.profile_fields {
+                list = list
+                    .child("Host name")
+                    .child(Input::new(name))
+                    .child("Labels")
+                    .child(Input::new(labels))
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(button(
+                                p,
+                                "save-host-details",
+                                "Save",
+                                true,
+                                !self.busy,
+                                cx.listener(|s, _, _, cx| s.save_profile(cx)),
+                            ))
+                            .child(button(
+                                p,
+                                "cancel-host-details",
+                                "Cancel",
+                                false,
+                                !self.busy,
+                                cx.listener(|s, _, _, cx| {
+                                    s.profile_fields = None;
+                                    cx.notify();
+                                }),
+                            )),
+                    );
+            } else {
+                list = list.child(button(
+                    p,
+                    "edit-host-details",
+                    "Edit host name and labels…",
+                    false,
+                    !self.busy,
+                    cx.listener(|s, _, w, cx| s.edit_profile(w, cx)),
+                ));
+            }
         }
         if let Some(review) = &self.review {
             list=list.child(div().text_color(rgb(p.warning)).child(format!("Send selected API keys to {} ({}). Anyone with access to that host’s OX key store can use the keys and incur charges. Revoking this desktop later leaves the copies on the host.",review.host.name,review.host.origin)));

@@ -141,6 +141,13 @@ fn host(paths: &Paths, report: &mut Report) -> bool {
                         probe.version,
                         probe.capabilities.join(", ")
                     ));
+                    if !info.labels.is_empty() {
+                        report.info(format!("host labels: {}", info.labels.join(", ")));
+                    }
+                    if let Some(r) = &info.resources {
+                        report.info(format!("host resources: {} {}, {:.1} GiB available of {:.1} GiB, load {:.1}, {} active workers",
+                            r.os, r.arch, r.available_memory as f64 / 1_073_741_824., r.total_memory as f64 / 1_073_741_824., r.load_one_minute, r.running_workers));
+                    }
                     if info.version != handover::version() {
                         report.add(
                             Level::Warn,

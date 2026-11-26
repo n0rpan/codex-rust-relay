@@ -203,6 +203,15 @@ impl State {
     fn signal(&self) {
         self.changed.send_modify(|n| *n = n.wrapping_add(1))
     }
+    pub fn host_profile(
+        &self,
+        edit: Option<crate::host_profile::Edit>,
+    ) -> io::Result<crate::host_profile::HostProfile> {
+        match edit {
+            Some(edit) => edit.save(&self.dir),
+            None => crate::host_profile::HostProfile::read(&self.dir),
+        }
+    }
     pub fn reply(&self, pairing: Option<Pairing>) -> Reply {
         let mut devices: Vec<_> = self
             .disk
@@ -214,6 +223,7 @@ impl State {
         devices.sort_by(|a, b| b.last_used.cmp(&a.last_used).then(a.id.cmp(&b.id)));
         Reply {
             update: None,
+            profile: None,
             enabled: self.disk.origin.is_some(),
             origin: self.disk.origin.clone(),
             port: self.disk.port,

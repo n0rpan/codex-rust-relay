@@ -1011,6 +1011,20 @@
         },
         {
           "additionalProperties": false,
+          "description": "Opt in to host-wide samples, including when no projects are open.",
+          "properties": {
+            "type": {
+              "const": "watch_host",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "properties": {
             "id": {
               "type": "string"
@@ -1308,10 +1322,26 @@
             "null"
           ]
         },
+        "labels": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "name": {
           "type": [
             "string",
             "null"
+          ]
+        },
+        "resources": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostResources"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "version": {
@@ -1321,6 +1351,60 @@
       "required": [
         "version",
         "epoch"
+      ],
+      "type": "object"
+    },
+    "HostResources": {
+      "properties": {
+        "arch": {
+          "type": "string"
+        },
+        "available_memory": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cpus": {
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "gpus": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "load_one_minute": {
+          "format": "double",
+          "type": "number"
+        },
+        "os": {
+          "type": "string"
+        },
+        "running_workers": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_memory": {
+          "description": "Memory sizes in bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "os",
+        "arch",
+        "total_memory",
+        "available_memory",
+        "load_one_minute",
+        "running_workers"
       ],
       "type": "object"
     },
@@ -1421,6 +1505,19 @@
     "ParentCall": {
       "description": "The only operations a parent agent has on its workers. Approvals, questions and\npermission changes belong to the human operator and have no variant here.",
       "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "list_hosts",
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
         {
           "additionalProperties": false,
           "properties": {
@@ -1754,6 +1851,22 @@
     },
     "Server": {
       "oneOf": [
+        {
+          "properties": {
+            "host": {
+              "$ref": "#/$defs/HostInfo"
+            },
+            "type": {
+              "const": "host_status",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "host"
+          ],
+          "type": "object"
+        },
         {
           "properties": {
             "ready": {

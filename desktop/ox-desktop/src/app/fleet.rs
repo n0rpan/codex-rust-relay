@@ -19,6 +19,7 @@ pub(super) struct Inventory {
     pub link: HostLink,
     projects: HashMap<Scope, Project>,
     online: bool,
+    info: Option<ox_desk_core::host_protocol::HostInfo>,
     error: Option<io::ErrorKind>,
     last_seen: Option<chrono::DateTime<chrono::Local>>,
     _watch: Option<CatalogWatch>,
@@ -30,7 +31,7 @@ impl Inventory {
             link,
             ..Default::default()
         };
-        match catalog.link.watch_catalog() {
+        match catalog.link.watch_catalog(true) {
             Ok((watch, events)) => {
                 catalog._watch = Some(watch);
                 cx.spawn(async move |this, cx| {
@@ -67,7 +68,11 @@ impl Inventory {
         self.online = true;
         self.error = None;
         match event {
-            CatalogEvent::Reset => self.projects.clear(),
+            CatalogEvent::Host(h) => self.info = Some(h),
+            CatalogEvent::Reset => {
+                self.info = None;
+                self.projects.clear();
+            }
             CatalogEvent::Archived(scope, ids) => {
                 self.projects.entry(scope).or_default().archived = ids
             }
@@ -89,9 +94,35 @@ impl Inventory {
         }
     }
 
+    pub fn display_name(&self) -> &str {
+        self.info
+            .as_ref()
+            .and_then(|h| h.name.as_deref())
+            .unwrap_or_else(|| {
+                self.link
+                    .remote()
+                    .map_or("This computer", |h| h.name.as_str())
+            })
+    }
     pub fn status(&self) -> String {
         if self.online {
-            return "Connected".into();
+            return self
+                .info
+                .as_ref()
+                .and_then(|h| h.resources.as_ref())
+                .map_or_else(
+                    || "Connected".into(),
+                    |r| {
+                        format!(
+                            "{} {} · {:.1} GiB available · load {:.1} · {} active workers",
+                            r.os,
+                            r.arch,
+                            r.available_memory as f64 / 1_073_741_824.,
+                            r.load_one_minute,
+                            r.running_workers
+                        )
+                    },
+                );
         }
         match self.error {
             Some(io::ErrorKind::Unsupported) => "Needs update".into(),
@@ -224,11 +255,7 @@ impl super::Workspace {
             .iter()
             .map(|(id, e)| {
                 let catalog = e.read(cx);
-                let name = catalog
-                    .link
-                    .remote()
-                    .map_or("This computer", |h| h.name.as_str())
-                    .to_string();
+                let name = catalog.display_name().to_owned();
                 (name, id, catalog)
             })
             .collect();
@@ -239,10 +266,18 @@ impl super::Workspace {
             let mut show_header = true;
             for (scope, thread, title) in items {
                 let path = scope.project.to_string_lossy();
-                let text = format!("{name} {path} {title}").to_lowercase();
+                let labels = inventory
+                    .info
+                    .as_ref()
+                    .map(|h| h.labels.as_slice())
+                    .unwrap_or_default();
+                let text = format!("{name} {path} {title} {}", labels.join(" ")).to_lowercase();
                 if !words.iter().all(|q| match q.strip_prefix('@') {
                     Some(host) => name.to_lowercase().contains(host),
-                    None => text.contains(q),
+                    None => q.strip_prefix("label:").map_or_else(
+                        || text.contains(q),
+                        |label| labels.iter().any(|l| l.eq_ignore_ascii_case(label)),
+                    ),
                 }) {
                     continue;
                 }

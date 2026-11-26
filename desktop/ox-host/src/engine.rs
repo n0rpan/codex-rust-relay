@@ -200,6 +200,7 @@ struct ClientState {
     prepared: Option<crate::runtime::Prepared>,
     subscription: Option<Option<Scope>>,
     catalog: bool,
+    watch_resources: bool,
     /// A desktop window that may take a terminal handoff held for its scope.
     terminal: bool,
     /// The interface this connection declared after its hello. None for an older
@@ -305,6 +306,8 @@ pub(crate) struct Engine {
     config: RuntimeConfig,
     schema_reader: std::sync::Arc<ox_desk_core::codex::installed::SchemaReader>,
     host_id: uuid::Uuid,
+    resources: crate::resources::Resources,
+    next_resources: Instant,
     host_name: String,
     ledger: Ledger,
     replay: Replay,
@@ -380,6 +383,8 @@ impl Engine {
         Ok(Self {
             replacement: None,
             host_id,
+            resources: Default::default(),
+            next_resources: Instant::now(),
             host_name: sysinfo::System::host_name().unwrap_or_else(|| host_id.to_string()),
             config,
             ledger,
@@ -438,6 +443,12 @@ impl Engine {
                 )
                 .chain(self.reading.iter().map(|r| r.deadline))
                 .chain(self.draining)
+                .chain(
+                    self.clients
+                        .values()
+                        .any(|c| c.watch_resources)
+                        .then_some(self.next_resources),
+                )
                 .chain(Some(self.next_reap))
                 .min();
             let msg = if deadline.is_some_and(|at| at <= Instant::now()) {
@@ -489,6 +500,17 @@ impl Engine {
                         if self.running.contains_key(&scope) {
                             self.process(&scope, vec![], false)?;
                         }
+                    }
+                    if now >= self.next_resources
+                        && self.clients.values().any(|c| c.watch_resources)
+                    {
+                        self.next_resources = now + crate::resources::INTERVAL;
+                        let frame = encode(&Server::HostStatus {
+                            host: self.host_info(),
+                        })?;
+                        self.clients.retain(|_, c| {
+                            !c.watch_resources || c.peer.send_for(frame.clone(), "host resources")
+                        });
                     }
                     if now >= self.next_reap {
                         self.next_reap = now + REAP_EVERY;
@@ -552,6 +574,7 @@ impl Engine {
                             prepared: None,
                             subscription: None,
                             catalog: false,
+                            watch_resources: false,
                             terminal: false,
                             surface: None,
                         },
@@ -676,6 +699,7 @@ impl Engine {
                 );
                 projects.sort();
                 projects.dedup();
+                let host = Some(self.host_info());
                 self.reply(
                     id,
                     Server::Hello {
@@ -687,6 +711,7 @@ impl Engine {
                             "approvals",
                             "workers",
                             "live_catalog",
+                            "host_status",
                             "end",
                             "processes",
                             wire::IDLE_UPDATE,
@@ -696,12 +721,7 @@ impl Engine {
                         .into(),
                         routes,
                         projects,
-                        host: Some(wire::HostInfo {
-                            id: Some(self.host_id.to_string()),
-                            name: Some(self.host_name.clone()),
-                            version: crate::handover::version().into(),
-                            epoch: self.replay.cursor.epoch.clone(),
-                        }),
+                        host,
                     },
                 )
             }
@@ -754,6 +774,17 @@ impl Engine {
             Client::ListProcesses { id: key } => {
                 let processes = self.processes();
                 self.reply(id, Server::Processes { id: key, processes })
+            }
+            Client::WatchHost => {
+                if !self.clients.values().any(|c| c.watch_resources) {
+                    self.next_resources = Instant::now() + crate::resources::INTERVAL;
+                }
+                self.clients
+                    .get_mut(&id)
+                    .expect("connected")
+                    .watch_resources = true;
+                let host = self.host_info();
+                self.reply(id, Server::HostStatus { host })
             }
             Client::WatchCatalog => {
                 let client = self.clients.get_mut(&id).expect("connected");
@@ -1833,6 +1864,39 @@ impl Engine {
             .any(|client| client.update_lease.is_some())
     }
 
+    fn host_info(&mut self) -> wire::HostInfo {
+        let profile =
+            ox_host_web::host_profile::HostProfile::read(&self.state_dir).unwrap_or_default();
+        wire::HostInfo {
+            id: Some(self.host_id.to_string()),
+            name: Some(if profile.name.is_empty() {
+                self.host_name.clone()
+            } else {
+                profile.name
+            }),
+            labels: profile.labels,
+            resources: Some(self.host_resources()),
+            version: crate::handover::version().into(),
+            epoch: self.replay.cursor.epoch.clone(),
+        }
+    }
+    fn host_resources(&mut self) -> wire::HostResources {
+        let workers = self
+            .running
+            .iter()
+            .map(|(scope, live)| {
+                live.store
+                    .active_thread_ids()
+                    .filter(|id| {
+                        self.workers.get(scope, id).is_some_and(|e| {
+                            e.origin.relation == ox_desk_core::origin::Relation::Worker
+                        })
+                    })
+                    .count()
+            })
+            .sum();
+        self.resources.sample(workers)
+    }
     /// Work a drain waits for: turns in progress in any loaded thread, worker
     /// launches and handoff targets not yet confirmed, and handoffs still
     /// preparing or reading their source.
@@ -2127,6 +2191,25 @@ impl Engine {
                 }
                 return Ok(json!({ "bound": bound }));
             }
+            ParentCall::ListHosts => {
+                use ox_desk_core::runtime::Runtime;
+                use std::os::unix::fs::PermissionsExt;
+                let runtimes: Vec<_> = [Runtime::Codex, Runtime::Claude]
+                    .into_iter()
+                    .filter(|r| {
+                        std::env::split_paths(&self.config.path).any(|p| {
+                            p.join(r.executable())
+                                .metadata()
+                                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                        })
+                    })
+                    .collect();
+                let mut routes = self.config.prepare().map_err(|e| e.to_string())?.routes;
+                routes.retain(|r| runtimes.contains(&r.runtime));
+                return Ok(json!({ "hosts": [{
+                    "host": self.host_info(), "parent_host": true, "runtimes": runtimes, "routes": routes,
+                }] }));
+            }
             ParentCall::List => {
                 let mut jobs: Vec<u64> = self
                     .workers
@@ -2188,6 +2271,7 @@ impl Engine {
             .ok_or("Unknown worker job for this parent session.")?;
         match call {
             ParentCall::List
+            | ParentCall::ListHosts
             | ParentCall::Bind { .. }
             | ParentCall::Status { .. }
             | ParentCall::ReadThread { .. } => self.job_status(job_id),
@@ -3154,6 +3238,7 @@ mod tests {
                 prepared: None,
                 subscription: None,
                 catalog: false,
+                watch_resources: false,
                 terminal: false,
                 surface: None,
             },
@@ -3251,6 +3336,7 @@ mod tests {
                 prepared: None,
                 subscription: Some(Some(scope.clone())),
                 catalog: false,
+                watch_resources: false,
                 terminal: false,
                 surface: None,
             },
@@ -3298,6 +3384,7 @@ mod tests {
                     prepared: None,
                     subscription: None,
                     catalog: false,
+                    watch_resources: false,
                     terminal: false,
                     surface: None,
                 },
@@ -3404,6 +3491,7 @@ mod tests {
                     prepared: None,
                     subscription,
                     catalog,
+                    watch_resources: false,
                     terminal: false,
                     surface: None,
                 },
@@ -3946,6 +4034,7 @@ mod tests {
                         prepared: None,
                         subscription: Some(Some(worker.clone())),
                         catalog: false,
+                        watch_resources: false,
                         terminal: false,
                         surface: None,
                     },
@@ -6576,6 +6665,7 @@ mod tests {
                     prepared: None,
                     subscription: Some(Some(scope.clone())),
                     catalog: false,
+                    watch_resources: false,
                     terminal: false,
                     surface: None,
                 },
@@ -6855,6 +6945,7 @@ mod tests {
                         prepared: None,
                         subscription: None,
                         catalog: false,
+                        watch_resources: false,
                         terminal,
                         surface: None,
                     },
@@ -6916,6 +7007,7 @@ mod tests {
                     prepared: None,
                     subscription: None,
                     catalog: false,
+                    watch_resources: false,
                     terminal: false,
                     surface: None,
                 },

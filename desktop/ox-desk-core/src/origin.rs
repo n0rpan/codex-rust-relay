@@ -311,6 +311,7 @@ pub fn model_line(report: &serde_json::Value) -> Option<String> {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ParentCall {
+    ListHosts,
     List,
     Status {
         job_id: u64,

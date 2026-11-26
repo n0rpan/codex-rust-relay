@@ -5,6 +5,7 @@ pub mod admin;
 mod bridge;
 #[cfg(feature = "client")]
 pub mod client;
+pub mod host_profile;
 pub mod host_updates;
 #[cfg(feature = "server")]
 mod push;

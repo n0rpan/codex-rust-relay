@@ -51,6 +51,8 @@ pub enum Client {
     /// Reserve a quiescent host until this same-user connection closes.
     ReserveIdleUpdate,
     WatchCatalog,
+    /// Opt in to host-wide samples, including when no projects are open.
+    WatchHost,
     TerminalPreview {
         id: String,
         scope: Scope,
@@ -91,9 +93,27 @@ pub enum Client {
         call: crate::origin::ParentCall,
     },
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct HostResources {
+    pub os: String,
+    pub arch: String,
+    #[serde(default)]
+    pub gpus: Vec<String>,
+    pub cpus: Option<usize>,
+    /// Memory sizes in bytes.
+    pub total_memory: u64,
+    pub available_memory: u64,
+    pub load_one_minute: f64,
+    pub running_workers: usize,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HostInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<HostResources>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
     /// Stable across host restarts. Legacy hosts supply only version and epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -120,6 +140,9 @@ pub fn version_mismatch(host: u32, client: u32) -> String {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Server {
+    HostStatus {
+        host: HostInfo,
+    },
     IdleUpdate {
         ready: bool,
     },

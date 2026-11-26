@@ -279,7 +279,9 @@ impl Discovery {
             Some(format!("Worker #{job} {status}"))
         };
         match event {
-            CatalogEvent::Waiting(..) | CatalogEvent::Disconnected(_) => false,
+            CatalogEvent::Host(_) | CatalogEvent::Waiting(..) | CatalogEvent::Disconnected(_) => {
+                false
+            }
             CatalogEvent::Reset => {
                 let changed = !self.hosted.is_empty()
                     || !self.archived.is_empty()
@@ -435,7 +437,7 @@ impl Discovery {
 
 impl Host {
     pub(super) fn watch_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (watch, events) = match self.link.watch_catalog() {
+        let (watch, events) = match self.link.watch_catalog(false) {
             Ok(pair) => pair,
             Err(error) => {
                 self.message = Some(error.to_string());
