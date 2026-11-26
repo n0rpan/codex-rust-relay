@@ -168,10 +168,11 @@ impl Store {
         if let Some(remote) = self.remote() {
             return remote.await_new.is_some();
         }
-        self.pending.values().any(|(_, p)| {
-            matches!(p, Pending::Compose(compose::Operation::New(_)))
-                || matches!(p,Pending::ThreadOp(op) if op.is_fork())
-        })
+        self.opening_claude_command()
+            || self.pending.values().any(|(_, p)| {
+                matches!(p, Pending::Compose(compose::Operation::New(_)))
+                    || matches!(p,Pending::ThreadOp(op) if op.is_fork())
+            })
     }
 
     pub fn open(profile: Profile, link: impl Into<Link>) -> io::Result<Self> {

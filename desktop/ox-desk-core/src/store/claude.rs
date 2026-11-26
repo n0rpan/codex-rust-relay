@@ -70,12 +70,17 @@ struct Process {
     mode: Option<Access>,
     controls: HashMap<String, Control>,
     first: Option<(String, String)>,
+    deferred_command: Option<DeferredCommand>,
     /// The permission mode this process was launched with.
     launch_mode: String,
     launch_model: Option<String>,
     started_new: bool,
     /// Reading a saved journal, optionally following a live external client.
     viewer: Option<native::Viewer>,
+}
+struct DeferredCommand {
+    new_thread: bool,
+    terminal_allowed: bool,
 }
 enum Control {
     Mode(Access),
@@ -440,7 +445,12 @@ impl Store {
             })
     }
     pub(super) fn handing_off_claude(&self) -> bool {
-        self.is_session_scoped() && self.claude().sessions.values().any(|p| p.handoff.is_some())
+        matches!(&self.link, links::Link::Claude(project) if project.sessions.values().any(|p|
+            p.handoff.is_some() || p.deferred_command.as_ref().is_some_and(|c| c.terminal_allowed)))
+    }
+    pub(super) fn opening_claude_command(&self) -> bool {
+        matches!(&self.link, links::Link::Claude(project) if project.sessions.values().any(|p|
+            p.deferred_command.as_ref().is_some_and(|c| c.new_thread)))
     }
     pub(super) fn release_claude(
         &mut self,
@@ -850,6 +860,102 @@ impl Store {
         }
         Ok(())
     }
+    pub(crate) fn defer_claude_command(
+        &mut self,
+        id: Option<&str>,
+        command: &str,
+        terminal_allowed: bool,
+    ) -> io::Result<()> {
+        let owner = if let Some(id) = id {
+            if !self.can_resume_send(id) {
+                return Err(io::Error::other("Wait for this Claude session to be ready"));
+            }
+            self.claude_resume_send(id, Some(command))?;
+            id.to_owned()
+        } else {
+            if !self.can_send(None) || self.opening_claude_command() {
+                return Err(io::Error::other("Wait for the opening Claude session"));
+            }
+            self.spawn_claude(
+                Session::New(new_id()?),
+                Some((new_id()?, command.into())),
+                false,
+            )?
+        };
+        self.claude_mut()
+            .sessions
+            .get_mut(&owner)
+            .unwrap()
+            .deferred_command = Some(DeferredCommand {
+            new_thread: id.is_none(),
+            terminal_allowed,
+        });
+        Ok(())
+    }
+
+    fn publish_command_thread(&mut self, owner: &str, command: &str) {
+        self.remember_claude(row(
+            &self.profile,
+            owner.into(),
+            command.chars().take(120).collect(),
+            now_secs(),
+        ));
+        self.selected = Some(owner.into());
+        self.selection += 1;
+        self.host_opened = Some(owner.into());
+    }
+
+    /// Return whether the verified process should receive the buffered input.
+    fn resolve_claude_command(
+        &mut self,
+        owner: &str,
+        deferred: DeferredCommand,
+    ) -> io::Result<bool> {
+        let (_, text) = self.claude().sessions[owner]
+            .first
+            .as_ref()
+            .expect("deferred command input");
+        let text = text.clone();
+        if matches!(
+            self.parse_command(Some(owner), &text),
+            Some(crate::slash::Action::SessionCommand)
+        ) {
+            if deferred.new_thread {
+                self.publish_command_thread(owner, &text);
+            }
+            return Ok(true);
+        }
+        if deferred.terminal_allowed {
+            let thread = (!deferred.new_thread).then(|| owner.to_owned());
+            let handoff = super::commands::Handoff {
+                argv: self.handoff_argv(thread.as_deref())?,
+                thread: thread.clone(),
+                command: text,
+            };
+            if let Some(thread) = thread {
+                self.terminal_threads.insert(thread);
+            }
+            self.claude_mut()
+                .sessions
+                .get_mut(owner)
+                .unwrap()
+                .first
+                .take();
+            self.release_claude(owner, handoff)?;
+        } else {
+            if deferred.new_thread {
+                self.publish_command_thread(owner, &text);
+            }
+            self.claude_end(owner)?;
+            self.notice = Some(format!(
+                "{} is not available on this model route.",
+                text.split_whitespace().next().unwrap_or("Command")
+            ));
+            self.changed.mark(Changed::NOTICE);
+        }
+        Ok(false)
+    }
+
     fn flush_claude(&mut self, owner: &str) -> io::Result<()> {
         let Some(process) = self.claude_mut().sessions.get_mut(owner) else {
             return Ok(());
@@ -857,6 +963,11 @@ impl Store {
         let (Some(_), true) = (&process.link, process.initialized) else {
             return Ok(());
         };
+        if let Some(command) = process.deferred_command.take()
+            && !self.resolve_claude_command(owner, command)?
+        {
+            return Ok(());
+        }
         let transcript = self.transcripts.entry(owner.into()).or_default();
         transcript.loading = false;
         transcript.ready = true;

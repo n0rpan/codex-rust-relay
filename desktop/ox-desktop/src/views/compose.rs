@@ -194,7 +194,7 @@ impl Workbench {
         let discovering = is_command && (!store.has_command_schema() || store.commands_loading());
         let term = is_command
             && matches!(
-                ox_desk_core::slash::parse(draft, &caps),
+                store.parse_command(key, draft),
                 Some(ox_desk_core::slash::Action::Terminal)
             );
         let enabled = enabled && !discovering;

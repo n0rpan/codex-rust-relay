@@ -185,6 +185,30 @@ impl Store {
         }
         caps
     }
+    /// An unknown command on a cold Claude route can be an installed project skill.
+    /// Only its submission asks the runtime which commands this session supports.
+    pub fn parse_command(&self, id: Option<&str>, text: &str) -> Option<crate::slash::Action> {
+        let caps = self.command_caps(id);
+        let action = crate::slash::parse(text, &caps)?;
+        if action == Action::Terminal
+            && self.is_session_scoped()
+            && caps.session_commands.is_none()
+            && text
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.strip_prefix('/'))
+                .is_some_and(|name| {
+                    // Account commands must reach the interactive client even before sign-in.
+                    !matches!(name, "login" | "logout")
+                        && crate::slash::possible_claude_command(name)
+                })
+        {
+            Some(Action::DiscoverClaudeCommand)
+        } else {
+            Some(action)
+        }
+    }
+
     pub fn command_notice(&self) -> Option<&str> {
         self.selected()
             .and_then(|id| self.transcript(id))
@@ -218,7 +242,8 @@ impl Store {
         }
         let caps = self.command_caps(id);
         let text = palette_text.unwrap_or_else(|| self.draft(id)).trim();
-        let action = crate::slash::parse(text, &caps)
+        let action = self
+            .parse_command(id, text)
             .ok_or_else(|| io::Error::other("Enter a slash command"))?;
         if !matches!(
             action,
@@ -245,6 +270,14 @@ impl Store {
             }
             Action::Terminal => {
                 self.handoff_text(id.map(str::to_owned), text.to_owned())?;
+                return Ok(Effect::Applied);
+            }
+            Action::DiscoverClaudeCommand => {
+                let command = text.to_owned();
+                self.defer_claude_command(id, &command, true)?;
+                if palette_text.is_none() {
+                    self.edit(id, String::new());
+                }
                 return Ok(Effect::Applied);
             }
             Action::SessionCommand => {

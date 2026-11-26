@@ -293,6 +293,153 @@ fn recording_store(
     (store, rx)
 }
 
+#[test]
+fn first_slash_input_uses_the_advertised_command_or_the_original_terminal_destination() {
+    for (text, native_only, saved) in [
+        ("/project:lint this", false, false),
+        ("/project:lint this", false, true),
+        ("/only-in-terminal", false, false),
+        ("/only-in-terminal", false, true),
+        ("/only-in-terminal", true, false),
+    ] {
+        let root = TempDir::new().unwrap();
+        let project = root.path().canonicalize().unwrap();
+        let exe = fixture(
+            &project,
+            minimum(),
+            json!({"apiProvider":"firstParty","subscriptionType":"Claude Max"}),
+        );
+        let init = project.join("initialize.response");
+        let mut reply: Value = serde_json::from_slice(&fs::read(&init).unwrap()).unwrap();
+        reply["response"]["response"]["commands"] =
+            json!([{"name":"project:lint","description":"Lint this project"}]);
+        fs::write(init, format!("{reply}\n")).unwrap();
+        let profiles = Profiles {
+            subscription: project.join("stock"),
+            api: project.join("api"),
+        };
+        let thread = saved.then(|| format!("claude:subscription:{FIRST}"));
+        if saved {
+            let journals = profiles.subscription.join("projects").join(
+                project
+                    .to_string_lossy()
+                    .replace(|c: char| !c.is_ascii_alphanumeric(), "-"),
+            );
+            fs::create_dir_all(&journals).unwrap();
+            fs::write(journals.join(format!("{FIRST}.jsonl")), format!("{}\n", json!({"uuid":SECOND, "type":"user","cwd":project,"sessionId":FIRST,"entrypoint":"sdk-cli","message":{"role":"user","content":"History"}}))).unwrap();
+        }
+        let (mut store, events) = recording_store(&project, &exe, &profiles);
+        if let Some(id) = &thread {
+            store.select(id).unwrap();
+            while !store.transcript(id).is_some_and(|t| t.is_ready()) {
+                store.apply(events.recv_timeout(Duration::from_secs(5)).unwrap());
+            }
+        }
+        assert_eq!(
+            store.parse_command(thread.as_deref(), "/login"),
+            Some(ox_desk_core::slash::Action::Terminal)
+        );
+        store.edit(thread.as_deref(), text.to_owned());
+        assert_eq!(
+            store.parse_command(thread.as_deref(), text),
+            Some(ox_desk_core::slash::Action::DiscoverClaudeCommand)
+        );
+        assert!(!project.join("launches").exists());
+        let action = if native_only {
+            Action::NativeCommand(thread.clone(), text.into())
+        } else {
+            // Desktop talks to its host through a replica. It must forward the unresolved
+            // input and leave the terminal decision to the authenticated process.
+            let (tx, rx) = mpsc::channel();
+            let mut desktop = Store::remote_client(store.profile().clone(), move |action, _| {
+                tx.send(action).unwrap();
+                Ok("run-command".to_string())
+            });
+            desktop.edit(thread.as_deref(), text.to_owned());
+            desktop
+                .dispatch(Action::ExecuteCommand(thread.clone()))
+                .unwrap();
+            assert_eq!(desktop.opening_thread(), !saved);
+            let forwarded = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(
+                matches!(&forwarded, Action::PaletteCommand(id, value) if id == &thread && value == text)
+            );
+            forwarded
+        };
+        store.dispatch(action).unwrap();
+        assert!(store.take_handoff().is_none());
+        assert!(store.take_opened().is_none());
+        if text.starts_with("/project:lint") {
+            loop {
+                store.apply(events.recv_timeout(Duration::from_secs(5)).unwrap());
+                if store
+                    .selected()
+                    .and_then(|id| store.transcript(id))
+                    .is_some_and(|t| t.active_turn().is_some())
+                {
+                    break;
+                }
+            }
+            assert_eq!(store.take_opened().is_some(), !saved);
+            assert!(store.take_handoff().is_none());
+            let wire = wait_lines(&project.join("wire"), 2);
+            assert_eq!(wire[1]["message"]["content"][0]["text"], text);
+            assert_eq!(wire.len(), 2);
+        } else if native_only {
+            while store.notice().is_none() {
+                store.apply(events.recv_timeout(Duration::from_secs(5)).unwrap());
+            }
+            assert!(!store.opening_terminal());
+            assert!(store.process_threads().is_empty());
+            assert!(store.take_handoff().is_none());
+            assert_eq!(wait_lines(&project.join("wire"), 1).len(), 1);
+        } else {
+            let handoff = loop {
+                store.apply(events.recv_timeout(Duration::from_secs(5)).unwrap());
+                if let Some(h) = store.take_handoff() {
+                    break h;
+                }
+            };
+            assert_eq!(handoff.thread, thread);
+            assert_eq!(handoff.command, text);
+            assert!(store.take_opened().is_none());
+            assert_eq!(wait_lines(&project.join("wire"), 1).len(), 1);
+        }
+        assert_eq!(
+            fs::read_to_string(project.join("launches"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn refused_initialization_keeps_the_first_slash_input_without_sending_or_opening_a_terminal() {
+    let root = TempDir::new().unwrap();
+    let project = root.path().canonicalize().unwrap();
+    let exe = fixture(
+        &project,
+        minimum(),
+        json!({"apiProvider":"firstParty","subscriptionType":null}),
+    );
+    let profiles = Profiles {
+        subscription: project.join("stock"),
+        api: project.join("api"),
+    };
+    let (mut store, events) = recording_store(&project, &exe, &profiles);
+    store.edit(None, "/project:lint".into());
+    store.dispatch(Action::ExecuteCommand(None)).unwrap();
+    while store.state() == &Connection::Ready {
+        store.apply(events.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    let owner = store.take_opened().expect("the recoverable draft");
+    assert_eq!(store.draft(Some(&owner)), "/project:lint");
+    assert!(store.take_handoff().is_none());
+    assert_eq!(wait_lines(&project.join("wire"), 1).len(), 1);
+}
+
 /// Start and recover actual stores with a stock executable that records every invocation
 /// and input. A saved Claude route opens at login, and history selection is a disk read.
 #[test]

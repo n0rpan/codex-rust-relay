@@ -138,6 +138,11 @@ impl Store {
         let Some(mut p) = self.claude_mut().sessions.remove(owner) else {
             return;
         };
+        if p.deferred_command.as_ref().is_some_and(|c| c.new_thread)
+            && let Some((_, command)) = &p.first
+        {
+            self.publish_command_thread(owner, command);
+        }
         self.restore_claude_input(owner, &mut p);
         let removed: HashSet<_> = self
             .claude()
@@ -757,23 +762,7 @@ pub(super) fn rebase_agents(
 }
 
 fn headless_command(name: &str, builtin: bool) -> bool {
-    if name.is_empty()
-        || name.starts_with('_')
-        || name.chars().any(|c| c.is_whitespace() || c.is_control())
-        || matches!(
-            name,
-            "model"
-                | "effort"
-                | "fast"
-                | "goal"
-                | "speed"
-                | "clear"
-                | "terminal"
-                | "new"
-                | "resume"
-                | "status"
-        )
-    {
+    if !crate::slash::possible_claude_command(name) {
         return false;
     }
     // The initialize list includes terminal menus and internal commands. These shipped

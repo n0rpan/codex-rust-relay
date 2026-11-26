@@ -1209,35 +1209,43 @@ impl Engine {
             action => action,
         };
         crate::policy::check(&live.store, &action, origin.as_ref(), active_workers)?;
+        let parsed = match &action {
+            Action::PaletteCommand(owner, text) | Action::NativeCommand(owner, text) => {
+                live.store.parse_command(owner.as_deref(), text)
+            }
+            Action::ExecuteCommand(owner) => live
+                .store
+                .parse_command(owner.as_deref(), live.store.draft(owner.as_deref())),
+            _ => None,
+        };
         let opens = matches!(
             action,
             Action::SendText(None, _)
                 | Action::SendImages(None, _, _)
                 | Action::Submit(None)
                 | Action::ForkThread(_)
-        );
-        let opens = opens
-            || matches!(&action,Action::PaletteCommand(None,text) | Action::NativeCommand(None,text) if ox_desk_core::slash::parse(text,&live.store.command_caps(None)).is_some_and(|c|c.starts_thread()));
+        ) || (matches!(
+            action,
+            Action::PaletteCommand(None, _)
+                | Action::NativeCommand(None, _)
+                | Action::ExecuteCommand(None)
+        ) && parsed
+            .as_ref()
+            .is_some_and(|command| command.starts_thread()));
         if opens && (live.opening.is_some() || live.launching.is_some()) {
             return Err(io::Error::other(
                 "Another session is opening on this route.",
             ));
         }
-        let terminal = match &action {
-            Action::Terminal(_) | Action::TerminalText(..) => true,
-            Action::PaletteCommand(owner, text) => matches!(
-                ox_desk_core::slash::parse(text, &live.store.command_caps(owner.as_deref())),
-                Some(ox_desk_core::slash::Action::Terminal)
-            ),
-            Action::ExecuteCommand(owner) => matches!(
-                ox_desk_core::slash::parse(
-                    live.store.draft(owner.as_deref()),
-                    &live.store.command_caps(owner.as_deref())
-                ),
-                Some(ox_desk_core::slash::Action::Terminal)
-            ),
-            _ => false,
-        };
+        let terminal = matches!(action, Action::Terminal(_) | Action::TerminalText(..))
+            || (!matches!(action, Action::NativeCommand(..))
+                && matches!(
+                    parsed,
+                    Some(
+                        ox_desk_core::slash::Action::Terminal
+                            | ox_desk_core::slash::Action::DiscoverClaudeCommand
+                    )
+                ));
         if terminal && live.terminal.is_some() {
             return Err(io::Error::other(
                 "Another device is opening the terminal on this route.",
