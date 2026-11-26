@@ -5292,7 +5292,10 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let (scope, lead, mut engine, rx) = warm_claude(root.path());
             assert!(engine.running[&scope].store.can_send(None));
-            assert_eq!(engine.running[&scope].store.live_threads(), [lead.clone()]);
+            assert_eq!(
+                engine.running[&scope].store.live_threads(),
+                std::slice::from_ref(&lead)
+            );
             let mut sessions = Vec::new();
             for _ in 0..2 {
                 let done = launch_on_warm_claude(&mut engine, &scope, &lead, &rx)
@@ -5475,7 +5478,7 @@ mod tests {
             let rows = engine.processes();
             assert_eq!(rows.len(), 1);
             assert!(!rows[0].draft);
-            assert_eq!(rows[0].threads, [lead.clone()]);
+            assert_eq!(rows[0].threads, std::slice::from_ref(&lead));
             assert_eq!(engine.running[&scope].store.live_threads(), [lead]);
         }
 
