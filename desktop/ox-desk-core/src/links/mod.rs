@@ -49,6 +49,35 @@ pub enum LinkEvent {
     },
 }
 
+/// Why a link closed, for the UI. A process that just ended its output says
+/// nothing on its own, so use what it printed on stderr instead, with the
+/// launcher's `ox:` prefix removed. A Codex below the floor then surfaces as
+/// "Codex X is older than the required Y.", which onboarding offers to update.
+pub fn close_reason(reason: &str, stderr_tail: &[String]) -> String {
+    if !reason.ends_with("closed its output") {
+        return reason.to_owned();
+    }
+    let lines: Vec<&str> = stderr_tail
+        .iter()
+        .map(|line| {
+            let line = line.trim();
+            line.strip_prefix("ox: ").unwrap_or(line)
+        })
+        .filter(|line| !line.is_empty())
+        .collect();
+    if let Some(old) = lines
+        .iter()
+        .find(|line| line.contains("older than the required"))
+    {
+        return (*old).to_owned();
+    }
+    if lines.is_empty() {
+        reason.to_owned()
+    } else {
+        lines.join("\n")
+    }
+}
+
 impl LinkEvent {
     /// Responses and permission requests unblock an interaction. Streaming activity
     /// still waits for the next display frame and retains its original wire order.
@@ -66,5 +95,41 @@ impl LinkEvent {
                 | Self::Closed { .. }
                 | Self::SignInRequired
         )
+    }
+}
+
+#[cfg(test)]
+mod close_reason_tests {
+    use super::close_reason;
+
+    fn tail(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|line| (*line).to_owned()).collect()
+    }
+
+    #[test]
+    fn an_early_exit_shows_the_launcher_error_and_an_old_codex_is_named() {
+        let old = tail(&[
+            "ox: Codex 0.98.0 is older than the required 0.171.0.",
+            "  why: could not read the bundled Codex model catalog; exit status 2",
+            "  fix: brew upgrade --cask codex",
+        ]);
+        assert_eq!(
+            close_reason("Codex closed its output", &old),
+            "Codex 0.98.0 is older than the required 0.171.0."
+        );
+        let other = tail(&[
+            "ox: could not read the bundled Codex model catalog",
+            "",
+            "  why: x",
+        ]);
+        assert_eq!(
+            close_reason("Codex closed its output", &other),
+            "could not read the bundled Codex model catalog\nwhy: x"
+        );
+        assert_eq!(
+            close_reason("Codex closed its output", &[]),
+            "Codex closed its output"
+        );
+        assert_eq!(close_reason("Broken pipe", &old), "Broken pipe");
     }
 }

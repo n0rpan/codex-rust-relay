@@ -2145,10 +2145,338 @@ impl DoctorReport {
 
 /// Finds an executable named `name` in the directories of `path`.
 pub(crate) fn find_on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
-    std::env::split_paths(path?)
+    find_all_on_path(name, path).into_iter().next()
+}
+
+/// Every executable named `name` in `path`, in lookup order. Entries that
+/// resolve to the same file (a symlinked bin directory, say) appear once.
+pub(crate) fn find_all_on_path(name: &str, path: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    let mut seen = BTreeSet::new();
+    std::env::split_paths(path)
         .filter(|directory| !directory.as_os_str().is_empty())
         .map(|directory| directory.join(name))
-        .find(|candidate| candidate.is_file())
+        .filter(|candidate| candidate.is_file())
+        .filter(|candidate| {
+            seen.insert(
+                candidate
+                    .canonicalize()
+                    .unwrap_or_else(|_| candidate.clone()),
+            )
+        })
+        .collect()
+}
+
+/// The minimum stock Codex that ox supports. OX Desktop enforces the same
+/// floor, so both read it from the desktop gate.
+pub(crate) fn min_codex() -> &'static str {
+    let mut section = "";
+    for line in include_str!("../desktop/gate.toml").lines() {
+        let line = line.trim();
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            section = name;
+        } else if section == "codex"
+            && let Some(value) = line.strip_prefix("minimum_version")
+        {
+            return value
+                .trim_start_matches([' ', '='])
+                .trim()
+                .trim_matches('"');
+        }
+    }
+    panic!("desktop/gate.toml has no [codex] minimum_version")
+}
+
+/// The first `x.y.z` in `codex --version` output, such as `codex-cli 0.171.0`.
+fn semver(text: &str) -> Option<(u64, u64, u64)> {
+    text.split_whitespace().find_map(|word| {
+        let mut parts = word.trim_start_matches('v').split(['.', '-', '+']);
+        Some((
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+        ))
+    })
+}
+
+/// The desktop's wording for a Codex below the floor, so OX Desktop offers
+/// its Update button for this failure too.
+pub(crate) fn codex_too_old(version_output: &str) -> Option<String> {
+    let (major, minor, patch) = semver(version_output)?;
+    ((major, minor, patch) < semver(min_codex())?).then(|| {
+        format!(
+            "Codex {major}.{minor}.{patch} is older than the required {}.",
+            min_codex()
+        )
+    })
+}
+
+/// How to upgrade the Codex at `path`. `brew install` leaves an installed
+/// cask alone, so a Homebrew install needs `brew upgrade` instead.
+pub(crate) fn codex_upgrade_command(path: Option<&Path>) -> &'static str {
+    match path.and_then(codex_channel) {
+        Some(channel) => channel.command,
+        None if cfg!(target_os = "macos") => {
+            "brew upgrade --cask codex, or npm install -g @openai/codex@latest if npm installed it"
+        }
+        None => "npm install -g @openai/codex@latest",
+    }
+}
+
+/// The package manager that owns an installed Codex.
+pub(crate) struct CodexChannel {
+    pub(crate) tool: &'static str,
+    pub(crate) args: &'static [&'static str],
+    pub(crate) command: &'static str,
+}
+
+/// Every channel ships the same native Rust binary (npm wraps it in a small
+/// Node launcher), so the right update is the one for the channel that owns
+/// this install. Unknown layouts, such as a manual download, return None.
+pub(crate) fn codex_channel(path: &Path) -> Option<CodexChannel> {
+    let real = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let has = |name: &str| real.components().any(|c| c.as_os_str() == name);
+    if has("mise") {
+        Some(CodexChannel {
+            tool: "mise",
+            args: &["use", "--global", "codex@latest"],
+            command: "mise use --global codex@latest",
+        })
+    } else if has("Caskroom") || has("Cellar") {
+        Some(CodexChannel {
+            tool: "brew",
+            args: &["upgrade", "--cask", "codex"],
+            command: "brew upgrade --cask codex",
+        })
+    } else if has("node_modules") {
+        Some(CodexChannel {
+            tool: "npm",
+            args: &["install", "-g", "@openai/codex@latest"],
+            command: "npm install -g @openai/codex@latest",
+        })
+    } else {
+        None
+    }
+}
+
+/// The update for this Codex as a runnable command line, when its channel is
+/// known and that package manager is on `path`.
+pub(crate) fn codex_update_argv(
+    codex: &Path,
+    path: Option<&std::ffi::OsStr>,
+) -> Option<(PathBuf, &'static [&'static str], &'static str)> {
+    let channel = codex_channel(codex)?;
+    let tool = find_on_path(channel.tool, path)?;
+    Some((tool, channel.args, channel.command))
+}
+
+/// The last few lines of a child's stderr, safe to print: control characters
+/// are dropped and the text is capped, so a chatty failure stays readable.
+pub(crate) fn stderr_tail(stderr: &[u8]) -> Option<String> {
+    const LINES: usize = 5;
+    const BYTES: usize = 500;
+    let text = String::from_utf8_lossy(stderr);
+    let lines = text
+        .lines()
+        .map(|line| {
+            line.chars()
+                .map(|c| if c == '\t' { ' ' } else { c })
+                .filter(|c| !c.is_control())
+                .collect::<String>()
+        })
+        .map(|line| line.trim().to_owned())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let tail = lines[lines.len().saturating_sub(LINES)..].join("\n         ");
+    if tail.is_empty() {
+        return None;
+    }
+    if tail.len() <= BYTES {
+        return Some(tail);
+    }
+    let mut start = tail.len() - BYTES;
+    while !tail.is_char_boundary(start) {
+        start += 1;
+    }
+    Some(format!("…{}", &tail[start..]))
+}
+
+/// The launch error for `codex debug models --bundled`. Keeps the historical
+/// first line and adds `why:`/`fix:` so an old Codex and a config that Codex
+/// rejects can be told apart.
+pub(crate) fn codex_catalog_failure(
+    why: &str,
+    stderr: &[u8],
+    codex: Option<&Path>,
+    codex_home: &Path,
+    version_output: Option<&str>,
+) -> String {
+    if let Some(old) = version_output.and_then(codex_too_old) {
+        let mut message =
+            format!("{old}\n  why: could not read the bundled Codex model catalog; {why}");
+        if let Some(codex) = codex {
+            message.push_str(&format!("\n       codex: {}", codex.display()));
+        }
+        if let Some(tail) = stderr_tail(stderr) {
+            message.push_str(&format!("\n       stderr: {tail}"));
+        }
+        message.push_str(&format!("\n  fix: {}", codex_upgrade_command(codex)));
+        return message;
+    }
+    let mut message = format!("could not read the bundled Codex model catalog\n  why: {why}");
+    if let Some(codex) = codex {
+        message.push_str(&format!("\n       codex: {}", codex.display()));
+    }
+    if let Some(tail) = stderr_tail(stderr) {
+        message.push_str(&format!("\n       stderr: {tail}"));
+    }
+    message.push_str(&format!(
+        "\n  fix: run `codex --version`; ox needs Codex {} or later. Upgrade with: {}\n       If Codex reports a config error, check {}",
+        min_codex(),
+        codex_upgrade_command(codex),
+        codex_home.join("config.toml").display()
+    ));
+    message
+}
+
+/// Runs the same `codex debug models --bundled` call a launch makes and
+/// returns the failure message, if any.
+pub(crate) fn probe_codex_catalog(codex: &Path, codex_home: &Path) -> Result<(), String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const TIMEOUT: Duration = Duration::from_secs(20);
+    let failure = |why: &str, stderr: &[u8]| {
+        codex_catalog_failure(
+            why,
+            stderr,
+            Some(codex),
+            codex_home,
+            codex_version_blocking(codex).as_deref(),
+        )
+    };
+    let mut child = Command::new(codex)
+        .env("CODEX_HOME", codex_home)
+        .env_remove("CODEX_SQLITE_HOME")
+        .args(["debug", "models", "--bundled"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| failure(&format!("could not start codex ({error})"), b""))?;
+    // Drain both pipes while waiting: the catalog is larger than a pipe buffer.
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let out = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let err = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = Instant::now() + TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(failure(
+                    &format!(
+                        "`codex debug models --bundled` did not finish within {}s",
+                        TIMEOUT.as_secs()
+                    ),
+                    b"",
+                ));
+            }
+            Err(error) => return Err(failure(&format!("could not wait for codex ({error})"), b"")),
+        }
+    };
+    let stdout = out.join().unwrap_or_default();
+    let stderr = err.join().unwrap_or_default();
+    if !status.success() {
+        return Err(failure(&exit_description(status), &stderr));
+    }
+    serde_json::from_slice::<crate::catalog::BundledModels>(&stdout)
+        .map(|_| ())
+        .map_err(|error| {
+            failure(
+                &format!("Codex printed a model catalog ox could not parse ({error})"),
+                &stderr,
+            )
+        })
+}
+
+/// `codex --version` output, or None when it fails or takes over 5 seconds.
+fn codex_version_blocking(codex: &Path) -> Option<String> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(codex)
+        .arg("--version")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut text).ok()?;
+    Some(text.trim().to_owned())
+}
+
+/// "`codex debug models --bundled` exited with status 2", or the signal case.
+pub(crate) fn exit_description(status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("`codex debug models --bundled` exited with status {code}"),
+        None => "`codex debug models --bundled` was stopped by a signal".to_owned(),
+    }
+}
+
+/// The Codex home a launch reads its catalog with: the relay profile once ox
+/// has created it, otherwise the native home it is copied from.
+fn launch_codex_home(home: &Path) -> PathBuf {
+    let relay = home.join("ox-clients").join("codex");
+    if relay.is_dir() {
+        relay
+    } else {
+        home.to_path_buf()
+    }
+}
+
+fn doctor_codex_catalog(report: &mut DoctorReport, home: &Path) {
+    let Some(codex) = find_on_path("codex", std::env::var_os("PATH").as_deref()) else {
+        return;
+    };
+    let scope = Some("clients".to_owned());
+    match probe_codex_catalog(&codex, &launch_codex_home(home)) {
+        Ok(()) => report.pass(scope, "codex loads its bundled model catalog"),
+        Err(message) => {
+            if message.contains("older than the required") {
+                report.suggest(codex_upgrade_command(Some(&codex)));
+            }
+            report.error(scope, message)
+        }
+    }
 }
 
 fn doctor_clients(report: &mut DoctorReport) {
@@ -2156,10 +2484,25 @@ fn doctor_clients(report: &mut DoctorReport) {
     let mut found = [false, false];
     for (index, client) in ["codex", "claude"].into_iter().enumerate() {
         let scope = Some("clients".to_owned());
-        match find_on_path(client, path.as_deref()) {
+        let all = find_all_on_path(client, path.as_deref());
+        match all.first() {
             Some(location) => {
                 found[index] = true;
-                report.pass(scope, format!("{client} found at {}", location.display()));
+                report.pass(
+                    scope.clone(),
+                    format!("{client} found at {}", location.display()),
+                );
+                if all.len() > 1 {
+                    let list = all
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    report.warning(
+                        scope,
+                        format!("{client} is installed more than once on PATH ({list}); the first one runs"),
+                    );
+                }
             }
             None => report.info(
                 scope,
@@ -2187,6 +2530,9 @@ fn doctor_saved_keys(report: &mut DoctorReport, home: &Path) {
 fn doctor_report(home: &Path, env: &crate::provider::Env<'_>) -> DoctorReport {
     let mut report = DoctorReport::new(home);
     doctor_clients(&mut report);
+    if report.clients.0 {
+        doctor_codex_catalog(&mut report, home);
+    }
     doctor_saved_keys(&mut report, home);
     let codeox_path = CodeoxConfig::path(home);
     if codeox_path.exists() {

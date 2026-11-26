@@ -327,6 +327,20 @@ pub(crate) fn below(version: &str, floor: &str) -> bool {
     }
 }
 
+/// The update command for the channel that owns this Codex. All of them ship
+/// the same native binary; `brew install` would leave an old cask in place.
+pub(crate) fn codex_update(bin: &std::path::Path) -> &'static str {
+    let real = bin.canonicalize().unwrap_or_else(|_| bin.to_path_buf());
+    let has = |name: &str| real.components().any(|c| c.as_os_str() == name);
+    if has("mise") {
+        "mise use --global codex@latest"
+    } else if has("Caskroom") || has("Cellar") {
+        "brew upgrade --cask codex"
+    } else {
+        "npm install -g @openai/codex@latest"
+    }
+}
+
 fn stock_clients(report: &mut Report, path: &[PathBuf]) {
     let mut found = 0;
     for (client, binary, install) in [
@@ -342,6 +356,11 @@ fn stock_clients(report: &mut Report, path: &[PathBuf]) {
             continue;
         };
         found += 1;
+        let install = if client == "codex" {
+            codex_update(&bin)
+        } else {
+            install
+        };
         let version = Command::new(&bin)
             .arg("--version")
             .env("NO_COLOR", "1")
@@ -406,6 +425,24 @@ fn recent_errors(paths: &Paths, report: &mut Report, n: usize) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn codex_updates_through_the_channel_that_installed_it() {
+        use std::path::Path;
+        let update = |p: &str| codex_update(Path::new(p));
+        assert_eq!(
+            update("/opt/homebrew/Caskroom/codex/0.170.0/codex"),
+            "brew upgrade --cask codex"
+        );
+        assert_eq!(
+            update("/home/a/.local/share/mise/installs/codex/0.170.0/codex"),
+            "mise use --global codex@latest"
+        );
+        assert_eq!(
+            update("/usr/lib/node_modules/@openai/codex/bin/codex.js"),
+            "npm install -g @openai/codex@latest"
+        );
+    }
 
     #[test]
     fn floors_come_from_the_gate_and_versions_compare_numerically() {
