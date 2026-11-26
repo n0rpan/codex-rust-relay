@@ -7,6 +7,8 @@
 
 #![allow(dead_code)]
 
+#[path = "../src/advice.rs"]
+mod advice;
 #[path = "../src/catalog.rs"]
 mod catalog;
 #[path = "../src/provider.rs"]
@@ -828,6 +830,43 @@ fn dispatch_only_claims_its_own_commands() {
 // ---------------------------------------------------------------------------
 // doctor
 // ---------------------------------------------------------------------------
+
+#[test]
+fn doctor_reports_and_fixes_recorded_provider_advice() {
+    let home = TempHome::new();
+    home.write(
+        "codeox.toml",
+        "[providers.openrouter]\nbase_url = \"https://openrouter.ai/api/v1\"\n",
+    );
+    fs::create_dir_all(home.path().join("ox-clients/codex")).unwrap();
+    fs::write(
+        home.path().join("ox-clients/codex/config.toml"),
+        "model = \"openrouter/openai/gpt-6.1-sol\"\nmodel_reasoning_effort = \"none\"\n",
+    )
+    .unwrap();
+    advice::record(
+        home.path(),
+        advice::Advice {
+            id: "model-reasoning:openrouter:openai/gpt-6.1-sol".to_owned(),
+            provider: "openrouter".to_owned(),
+            model: Some("openai/gpt-6.1-sol".to_owned()),
+            message: "reasoning cannot be disabled on this model; using \"high\"".to_owned(),
+            fix: advice::Fix::ClearRelayReasoningEffort,
+        },
+    );
+
+    let (code, output) = run_doctor(home.path(), &["--strict"], &[]);
+    assert_eq!(code, 1, "{output}");
+    assert!(output.contains("advice"), "{output}");
+    assert!(output.contains("openai/gpt-6.1-sol"), "{output}");
+    assert!(output.contains("ox doctor --fix"), "{output}");
+
+    let (_, output) = run_doctor(home.path(), &["--fix"], &[]);
+    assert!(output.contains("applied:"), "{output}");
+    let profile = fs::read_to_string(home.path().join("ox-clients/codex/config.toml")).unwrap();
+    assert!(!profile.contains("model_reasoning_effort"), "{profile}");
+    assert!(advice::read(home.path()).is_empty(), "the fix is forgotten");
+}
 
 #[test]
 fn doctor_reports_each_provider_without_secret_values() {

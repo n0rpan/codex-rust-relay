@@ -69,6 +69,8 @@ pub struct Preferences {
     favorites: Vec<String>,
     alias: Entity<InputState>,
     keys: Vec<KeyField>,
+    /// Recorded provider workarounds, shown next to the provider they touch.
+    advice: Vec<settings::protocol::ProviderAdvice>,
     busy: bool,
     /// A starred-models autosave arrived while another save was running.
     resave: bool,
@@ -106,6 +108,7 @@ impl Preferences {
             favorites: vec![],
             alias,
             keys: vec![],
+            advice: vec![],
             busy: false,
             resave: false,
             message: String::new(),
@@ -159,12 +162,13 @@ impl Preferences {
         self.busy = true;
         cx.notify();
         cx.spawn_in(w, async move |view, cx| {
-            let result = cx
+            let (result, advice) = cx
                 .background_executor()
-                .spawn(async { settings::load() })
+                .spawn(async { (settings::load(), settings::advice()) })
                 .await;
             let _ = view.update_in(cx, |s, w, cx| {
                 s.busy = false;
+                s.advice = advice;
                 match result {
                     Ok(data) => {
                         s.conflict = None;
@@ -509,6 +513,30 @@ impl Preferences {
         })
         .detach();
     }
+    fn apply_advice(&mut self, id: String, w: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        cx.notify();
+        cx.spawn_in(w, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { settings::apply_advice(&id) })
+                .await;
+            let _ = view.update_in(cx, |s, w, cx| {
+                s.busy = false;
+                match result {
+                    Ok(()) => {
+                        s.report(Ok(()), "Provider fix applied.", cx);
+                        s.reload(w, cx);
+                    }
+                    Err(e) => s.report(Err(e), "", cx),
+                }
+            });
+        })
+        .detach();
+    }
     fn fetch_models(&mut self, cx: &mut Context<Self>) {
         if self.loading_models {
             return;
@@ -683,6 +711,38 @@ impl Preferences {
                     true,
                     cx.listener(move |s, _, _, cx| s.test_provider(i, cx)),
                 )));
+            let provider_key = provider.original.clone();
+            let mut advice_rows = div().flex().flex_col().gap_2();
+            for record in self
+                .advice
+                .iter()
+                .filter(|record| provider_key.as_deref() == Some(record.provider.as_str()))
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                let id = record.id.clone();
+                advice_rows = advice_rows.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(p.text(Step::Ui))
+                                .child(format!("{} {}", record.message, record.fix)),
+                        )
+                        .child(crate::kit::button(
+                            p,
+                            format!("fix-advice-{}", record.id),
+                            "Fix",
+                            true,
+                            true,
+                            cx.listener(move |s, _, w, cx| s.apply_advice(id.clone(), w, cx)),
+                        )),
+                );
+            }
+            view = view.child(advice_rows);
             match self.section {
                 Section::Connection => {
                     view = view

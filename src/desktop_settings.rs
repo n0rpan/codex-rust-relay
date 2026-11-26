@@ -98,6 +98,22 @@ async fn handle(home: &Path, request: Request) -> Result<Value, RelayError> {
             .map_err(|_| "Invalid previous desktop workspace")?;
             Ok(serde_json::to_value(layout)?)
         }
+        Request::Advice => Ok(serde_json::to_value(
+            crate::advice::read(home)
+                .into_iter()
+                .map(|record| crate::settings_protocol::ProviderAdvice {
+                    id: record.id,
+                    provider: record.provider,
+                    model: record.model,
+                    message: record.message,
+                    fix: record.fix.label(),
+                })
+                .collect::<Vec<_>>(),
+        )?),
+        Request::ApplyAdvice { id } => {
+            crate::advice::apply(home, &id)?;
+            Ok(json!(true))
+        }
         Request::Models => {
             if !home.join(REGISTRY).try_exists()? {
                 return legacy::models(home).await;
@@ -113,6 +129,7 @@ async fn handle(home: &Path, request: Request) -> Result<Value, RelayError> {
                 &|name| keys.get(name),
                 None,
                 crate::clients::ClientKind::Codex,
+                Some(home),
             )
             .await?;
             let mut models: Vec<_> = app
@@ -138,6 +155,7 @@ async fn handle(home: &Path, request: Request) -> Result<Value, RelayError> {
                 &|name| keys.get(name),
                 None,
                 crate::clients::ClientKind::Codex,
+                Some(home),
             )
             .await?;
             Ok(json!(

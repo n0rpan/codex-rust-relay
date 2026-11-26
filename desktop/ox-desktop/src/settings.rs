@@ -60,6 +60,14 @@ pub fn load() -> Result<Settings, String> {
 pub fn discover_models() -> Result<Vec<String>, String> {
     request(Request::Models)
 }
+/// Provider workarounds the relay recorded, with the fix each one accepts.
+/// An older `ox` helper does not know the request; that is simply no advice.
+pub fn advice() -> Vec<protocol::ProviderAdvice> {
+    request::<Vec<protocol::ProviderAdvice>>(Request::Advice).unwrap_or_default()
+}
+pub fn apply_advice(id: &str) -> Result<(), String> {
+    request::<bool>(Request::ApplyAdvice { id: id.to_owned() }).map(|_| ())
+}
 pub fn previous_workspace() -> Result<Option<protocol::ProjectRoute>, String> {
     request(Request::LegacyWorkspace)
 }

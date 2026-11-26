@@ -318,6 +318,7 @@ impl Service {
                         &|name| keys.get(name),
                         None,
                         crate::clients::ClientKind::Codex,
+                        None,
                     )
                     .await
                 }

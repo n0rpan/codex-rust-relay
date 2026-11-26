@@ -337,7 +337,8 @@ missing client is information, with the install command for your platform,
 because a host that only runs `ox serve` needs neither.
 
 A plain `ox doctor` never changes a file. `ox doctor --fix` first repairs what
-ox can safely repair, lists each repair under `repairs`, then runs the check:
+ox can safely repair, applies any recorded provider advice, lists each change
+under `repairs`, then runs the check:
 
 | Situation | What `ox doctor --fix` does |
 | --- | --- |
@@ -345,6 +346,7 @@ ox can safely repair, lists each repair under `repairs`, then runs the check:
 | `ox-api-keys.json` cannot be parsed | Moves it to `ox-api-keys.json.broken-<time>`. Paste your keys again in `ox setup`. |
 | `ox-favorites.json` cannot be parsed | Moves it to `ox-favorites.json.broken-<time>`. Star your models again in the picker. |
 | Temporary files left by an interrupted save | Removes them once they are at least 10 minutes old. |
+| A provider workaround was recorded | Applies the safe fix (for example clearing a stale global reasoning effort, or recording a model's reasoning default). |
 
 `<time>` is the Unix time of the repair. Unreadable files are renamed, never
 deleted, so every repair can be undone by renaming the file back. Running
@@ -470,7 +472,10 @@ only = ["anthropic"]
 ```
 
 These are the documented OpenRouter routing preferences; an unknown key or a wrong
-type stops the launch instead of being ignored. On the Responses and Chat wires OX
+type stops the launch instead of being ignored. If the relay has to work around a
+provider quirk, it records the safe fix. `ox doctor` lists it under `advice` and
+`ox doctor --fix` applies it; OX Desktop shows the same entry on the provider page
+with a **Fix** button, so the terminal is optional. On the Responses and Chat wires OX
 also adds a top-level `cache_control` hint, a hashed `session_id` from the client
 session (openrouter sticky routing keeps each conversation on one backend), and the
 optional `HTTP-Referer`/`X-OpenRouter-Title` attribution headers. The Responses API

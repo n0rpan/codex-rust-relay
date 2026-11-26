@@ -6,6 +6,7 @@
 
 mod adapt;
 mod adapters;
+mod advice;
 mod catalog;
 mod claude_frontend;
 mod claude_gateway;
@@ -98,6 +99,8 @@ struct App {
     /// One line per provider/model adaptation, so a corrected default is
     /// explained once instead of on every turn.
     notices: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Where to record provider advice for `ox doctor` and OX Desktop.
+    advice_home: Option<std::path::PathBuf>,
     /// Request-shape rules learned from providers that rejected a field.
     adapt: adapt::Memory,
     /// One pooled Brave client, present only when live search is opted in and
@@ -359,6 +362,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
                 env,
                 search,
                 client_kind,
+                Some(&codex_home),
             )
             .await?
         }
@@ -703,6 +707,7 @@ impl App {
             max_request_bytes: MAX_REQUEST_BYTES,
             secrets: Arc::new(secrets),
             notices: std::sync::Mutex::default(),
+            advice_home: None,
             adapt: adapt::Memory::default(),
             search: None,
         })
@@ -720,6 +725,7 @@ impl App {
         env: &Env<'_>,
         search: Option<BraveSearch>,
         client_kind: ClientKind,
+        advice_home: Option<&std::path::Path>,
     ) -> Result<Self, RelayError> {
         Self::codeox_with(
             config,
@@ -730,6 +736,7 @@ impl App {
             env,
             search,
             client_kind,
+            advice_home,
         )
         .await
     }
@@ -747,6 +754,7 @@ impl App {
         env: &Env<'_>,
         search: Option<BraveSearch>,
         client_kind: ClientKind,
+        advice_home: Option<&std::path::Path>,
     ) -> Result<Self, RelayError> {
         let vendors = config.vendors;
         let mut secrets = Vec::new();
@@ -800,10 +808,40 @@ impl App {
                         }
                         discovered[index] = Some(models);
                     }
-                    Err(reason) => eprintln!(
-                        "ox: provider {:?}: model discovery failed: {reason}",
-                        vendors[index].key
-                    ),
+                    Err(reason) => {
+                        eprintln!(
+                            "ox: provider {:?}: model discovery failed: {reason}",
+                            vendors[index].key
+                        );
+                        if let Some(key) = auths[index].as_ref()
+                            && vendors[index].is_openrouter()
+                            && reason.contains("403")
+                            && let Some(region) =
+                                regional_host_for(client, &vendors[index], key, deadline).await
+                        {
+                            eprintln!(
+                                "ox: provider {:?}: the key may use {region}.openrouter.ai\n  fix: set base_url = \"https://{region}.openrouter.ai/api/v1\"",
+                                vendors[index].key
+                            );
+                            if let Some(home) = advice_home {
+                                crate::advice::record(
+                                    home,
+                                    crate::advice::Advice {
+                                        id: format!("region:{}", vendors[index].key),
+                                        provider: vendors[index].key.clone(),
+                                        model: None,
+                                        message: format!(
+                                            "model discovery was rejected from the global host; this key may use {region}.openrouter.ai"
+                                        ),
+                                        fix: crate::advice::Fix::UseRegionalHost {
+                                            provider: vendors[index].key.clone(),
+                                            region: region.to_owned(),
+                                        },
+                                    },
+                                );
+                            }
+                        }
+                    }
                 }
             }
             Ok::<(), RelayError>(())
@@ -907,6 +945,7 @@ impl App {
             max_request_bytes,
             secrets: Arc::new(secrets),
             notices: std::sync::Mutex::default(),
+            advice_home: advice_home.map(std::path::Path::to_path_buf),
             adapt: adapt::Memory::default(),
             search,
         })
@@ -922,6 +961,13 @@ impl App {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if notices.insert(key.to_string()) {
             eprintln!("{message}");
+        }
+    }
+
+    /// Records a fixable provider condition for `ox doctor` and OX Desktop.
+    fn record_advice(&self, advice: crate::advice::Advice) {
+        if let Some(home) = &self.advice_home {
+            crate::advice::record(home, advice);
         }
     }
 
@@ -1231,6 +1277,16 @@ impl App {
                             state.vendor.key, route.upstream_model
                         ),
                     );
+                    self.record_advice(crate::advice::Advice {
+                        id: format!(
+                            "model-reasoning:{}:{}",
+                            state.vendor.key, route.upstream_model
+                        ),
+                        provider: state.vendor.key.clone(),
+                        model: Some(route.upstream_model.clone()),
+                        message: notice,
+                        fix: crate::advice::Fix::ClearRelayReasoningEffort,
+                    });
                 }
                 if translate::sanitize_replayed_history(&mut payload, route.wire) {
                     eprintln!(
@@ -1524,6 +1580,32 @@ fn discovery_url(vendor: &provider::Vendor, client_kind: ClientKind) -> reqwest:
     url.set_query(None);
     url.query_pairs_mut().extend_pairs(&query);
     url
+}
+
+/// After a 403 from the global host, find the in-region host this key may use.
+/// Only two small GETs, only on failure, and both inside the launch deadline.
+async fn regional_host_for(
+    client: &Client,
+    vendor: &provider::Vendor,
+    key: &SecretKey,
+    deadline: tokio::time::Instant,
+) -> Option<&'static str> {
+    let headers = vendor.discovery_headers(key).ok()?;
+    for region in ["eu", "us"] {
+        let mut url = vendor.models_url.clone();
+        url.set_host(Some(&format!("{region}.openrouter.ai")))
+            .ok()?;
+        let Ok(Ok(response)) =
+            tokio::time::timeout_at(deadline, client.get(url).headers(headers.clone()).send())
+                .await
+        else {
+            continue;
+        };
+        if response.status().is_success() {
+            return Some(region);
+        }
+    }
+    None
 }
 
 async fn collect_model_pages(
@@ -2481,6 +2563,7 @@ id = "fast-coder"
             &environment,
             None,
             ClientKind::Codex,
+            None,
         )
         .await
         .unwrap();
@@ -2525,6 +2608,7 @@ id = "fast-coder"
             &|_| None,
             None,
             ClientKind::Codex,
+            None,
         )
         .await
         .unwrap();
@@ -2578,6 +2662,7 @@ alias = "together-llama"
             &|_| None,
             None,
             ClientKind::Codex,
+            None,
         )
         .await
         .unwrap();
@@ -2650,6 +2735,7 @@ alias = "together-llama"
             &environment,
             search,
             client_kind,
+            None,
         )
         .await
         .unwrap();
@@ -2877,6 +2963,7 @@ env_key = "ALPHA_KEY"
                 &environment,
                 None,
                 ClientKind::Codex,
+                None,
             ),
         )
         .await
@@ -2912,6 +2999,7 @@ env_key = "ALPHA_KEY"
                 &environment,
                 None,
                 ClientKind::Codex,
+                None,
             ),
         )
         .await
