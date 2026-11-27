@@ -80,6 +80,8 @@ pub(in crate::views) enum DeferredRowAction {
 }
 
 pub struct Workbench {
+    pub(super) workspace: Option<WeakEntity<crate::app::Workspace>>,
+    pub(super) handoff_pending: bool,
     pub(super) link: HostLink,
     workers: Entity<super::host::WorkerIndex>,
     pub(super) pending_local_command: Option<super::terminal_review::Pending>,
@@ -260,6 +262,8 @@ impl Workbench {
             (wake, Task::ready(()))
         };
         Self {
+            workspace: None,
+            handoff_pending: false,
             link,
             workers,
             enter_sends: cx
@@ -768,6 +772,21 @@ impl Workbench {
             })
     }
     pub(super) fn action(&mut self, cx: &mut Context<Self>, action: DeskAction) {
+        if let DeskAction::StartHandoff(start) = &action
+            && let Some(selector) = &start.host
+        {
+            let mut start = start.clone();
+            start.host = None;
+            match self.select_handoff_destination(selector, cx) {
+                Ok(Some(to)) => self.send_handoff(start, to, cx),
+                Ok(None) => self.action(cx, DeskAction::StartHandoff(start)),
+                Err(e) => {
+                    self.launch_error = Some(e);
+                    cx.notify();
+                }
+            }
+            return;
+        }
         if let Some(host) = self.link.remote()
             && let Some(store) = &mut self.store
         {

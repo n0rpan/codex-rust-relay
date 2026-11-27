@@ -1000,6 +1000,32 @@ impl Host {
         cx.subscribe_in(
             pane,
             window,
+            |s, pane, ready: &super::handoff_sheet::HandoffReady, window, cx| {
+                if *pane != s.panes[s.active] {
+                    return;
+                }
+                let source = s.link.remote().map(|h| h.id.clone());
+                if let Some(workspace) = s.workspace.as_ref().and_then(|w| w.upgrade()) {
+                    workspace.update(cx, |app, cx| {
+                        if !app.handoff_still_visible(&source, &ready.host, ready.registration) {
+                            return;
+                        }
+                        app.open_confirmed_result(
+                            ready.host.clone(),
+                            ready.scope.clone(),
+                            ready.session.clone(),
+                            true,
+                            window,
+                            cx,
+                        )
+                    });
+                }
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            pane,
+            window,
             |s, _, _: &super::workbench::FocusSearch, window, cx| {
                 s.reveal_sidebar(window, cx);
                 s.filter.read(cx).focus_handle(cx).focus(window, cx);
@@ -3085,6 +3111,13 @@ impl Host {
                 ws.read(cx)
                     .session_host_name(&self.link.remote().map(|h| h.id.clone()), cx)
             });
+        if let Some(workspace) = &self.workspace {
+            for pane in &self.panes {
+                if pane.read(cx).workspace.is_none() {
+                    pane.update(cx, |p, _| p.workspace = Some(workspace.clone()));
+                }
+            }
+        }
         let pane = self.panes[self.active].read(cx);
         if pane.pane_width != pane_width || pane.host_caption != host_caption {
             self.panes[self.active].update(cx, |pane, cx| {

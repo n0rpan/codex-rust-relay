@@ -56,6 +56,22 @@ pub enum Client {
         id: String,
         project: PathBuf,
     },
+    InspectHandoffTarget {
+        id: String,
+        scope: Scope,
+    },
+    PrepareRemoteHandoff {
+        id: String,
+        scope: Scope,
+        start: crate::handoff::HandoffStart,
+        target_host: String,
+        window: Option<u64>,
+    },
+    ReceiveRemoteHandoff {
+        id: String,
+        scope: Scope,
+        packet: Box<crate::handoff::HandoffTransfer>,
+    },
     /// Opt in to host-wide samples, including when no projects are open.
     WatchHost,
     TerminalPreview {

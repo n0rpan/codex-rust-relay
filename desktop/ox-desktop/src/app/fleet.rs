@@ -377,6 +377,17 @@ impl Inventory {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct HandoffDestination {
+    pub registration: EntityId,
+    pub repository: String,
+    pub link: HostLink,
+    pub id: String,
+    pub name: String,
+    pub project: std::path::PathBuf,
+    pub routes: Vec<ox_desk_core::store::Route>,
+}
+
 pub(crate) struct EnsureInventory {
     pub query: String,
 }
@@ -615,6 +626,65 @@ impl super::Workspace {
         });
         rows
     }
+    pub(crate) fn handoff_destinations(
+        &self,
+        link: &HostLink,
+        path: &std::path::Path,
+        cx: &App,
+    ) -> Vec<HandoffDestination> {
+        let current = link.remote().map(|h| h.id.clone());
+        let Some(repo) = self
+            .inventory
+            .get(&current)
+            .and_then(|e| e.read(cx).directory.as_ref())
+            .and_then(|dir| dir.checkouts.iter().find(|p| p.path == path))
+            .and_then(|p| p.repository.as_ref())
+        else {
+            return Vec::new();
+        };
+        let mut matches = Vec::new();
+        for (id, e) in &self.inventory {
+            let host = e.read(cx);
+            if id == &current || !host.online() {
+                continue;
+            }
+            let Some(dir) = &host.directory else { continue };
+            let Some(uuid) = host.info.as_ref().and_then(|i| i.id.as_ref()) else {
+                continue;
+            };
+            for p in dir
+                .checkouts
+                .iter()
+                .filter(|p| p.repository.as_ref() == Some(repo))
+            {
+                matches.push(HandoffDestination {
+                    registration: e.entity_id(),
+                    repository: repo.clone(),
+                    link: host.link.clone(),
+                    id: uuid.clone(),
+                    name: host.display_name().to_owned(),
+                    project: p.path.clone(),
+                    routes: dir.routes.clone(),
+                });
+            }
+        }
+        matches.sort_by(|a, b| (&a.name, &a.id, &a.project).cmp(&(&b.name, &b.id, &b.project)));
+        matches
+    }
+    pub(crate) fn handoff_still_visible(
+        &self,
+        source: &Option<String>,
+        target: &Option<String>,
+        registration: EntityId,
+    ) -> bool {
+        self.settings.is_none()
+            && self.page.is_none()
+            && (&self.active == source || &self.active == target)
+            && self
+                .inventory
+                .get(target)
+                .is_some_and(|e| e.entity_id() == registration)
+    }
     pub(crate) fn reachable(&self, target: &Destination, cx: &App) -> bool {
         self.inventory.get(&target.host).is_some_and(|i| {
             i.entity_id() == target.registration
@@ -663,10 +733,23 @@ impl super::Workspace {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_confirmed_result(id, scope, thread, false, w, cx)
+    }
+    pub(crate) fn open_confirmed_result(
+        &mut self,
+        id: Option<String>,
+        scope: Scope,
+        thread: Option<String>,
+        confirmed: bool,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(entry) = self.inventory.get(&id) else {
             return;
         };
-        if !entry.read(cx).can_open(Some(&scope), thread.as_deref()) {
+        if !entry.read(cx).online()
+            || (!confirmed && !entry.read(cx).can_open(Some(&scope), thread.as_deref()))
+        {
             return;
         }
         let row = thread

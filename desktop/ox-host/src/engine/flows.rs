@@ -1,5 +1,6 @@
 //! Host flows of the mode model: YOLO acceptance and grants, cross-runtime
 //! handoffs, and `read_ox_thread`.
+mod remote_handoff;
 use super::*;
 use crate::durable::{Grant, HandoffRecord, Outcome};
 use crate::workers::{Entry, Marks, Resolved};
@@ -15,6 +16,18 @@ const LOAD_WAIT: Duration = Duration::from_secs(40);
 const WINDOW_WAIT: Duration = Duration::from_secs(12);
 /// Bytes of item text one read_ox_thread page returns at most.
 const PAGE_BYTES: usize = 256 * 1024;
+
+struct HandoffLaunch {
+    source: HandoffSource,
+    selection: handoff::Selection,
+    start: HandoffStart,
+    resolved: modes::Resolved,
+    yolo: Option<YoloAllowance>,
+    target: Scope,
+    surface: Option<ox_desk_core::surface::Surface>,
+    record: String,
+    owner: String,
+}
 
 impl Engine {
     /// The grant covering a YOLO child of this session: one stored with the
@@ -496,6 +509,11 @@ impl Engine {
         start: HandoffStart,
         mode_approval: Option<YoloAllowance>,
     ) -> io::Result<()> {
+        if start.host.is_some() {
+            return Err(io::Error::other(
+                "Choose this handoff’s destination in OX Desktop.",
+            ));
+        }
         start.validate().map_err(io::Error::other)?;
         if let Some(reason) = self.handoff_blocker(scope, &start.source) {
             return Err(io::Error::other(reason));
@@ -560,6 +578,7 @@ impl Engine {
             }
         }
         self.preparing.push(Preparing {
+            export_to: None,
             source: scope.clone(),
             start,
             reply: Replier::Client(client, key.to_owned()),
@@ -576,6 +595,7 @@ impl Engine {
     /// Resolve, select and open the target. Nothing starts on an error.
     fn launch_handoff(&mut self, prep: Preparing) -> Result<(), (Replier, String)> {
         let Preparing {
+            export_to,
             source: src,
             start,
             reply,
@@ -619,6 +639,57 @@ impl Engine {
             .get(&src, &start.source)
             .map(|e| e.origin.clone());
         let level = crate::workers::source_level(ceiling, src_origin.as_ref());
+        // A source that was itself handed off carries only its own messages;
+        // the earlier chain stays readable through read_ox_thread.
+        let earlier = self
+            .handoff_chain(&src, &start.source)
+            .into_iter()
+            .map(|h| handoff::Earlier {
+                host: h.host,
+                session: h.session,
+                title: h.title,
+                runtime: h.runtime,
+                route: h.route,
+            })
+            .collect();
+        let selection = match handoff::select_chained(items, &start.request, window, earlier) {
+            Ok(s) => s,
+            Err(e) => fail!(e),
+        };
+        let mut source = HandoffSource {
+            host: Some(self.handoff_host()),
+            scope: src.clone(),
+            session: start.source.clone(),
+            native,
+            title,
+            runtime: src.route.runtime,
+            route: src.route.clone(),
+            source_access: access,
+            source_level: level,
+            decision: Decision::Inherited,
+            selection: selection.refs.clone(),
+        };
+        if let Some((target_host, transfer)) = export_to {
+            let Some(repository) = ox_host_service::checkout::repository_id(&src.project) else {
+                fail!(
+                    "The source project needs a Git origin to match its destination checkout."
+                        .into()
+                );
+            };
+            let packet = handoff::HandoffTransfer {
+                id: transfer.to_string(),
+                target_host,
+                repository,
+                start,
+                source,
+                carried: selection.carried,
+                child_ceiling: src_origin.as_ref().and_then(Origin::limits_children),
+            };
+            if let Err(e) = self.answer(reply, Ok(json!(packet))) {
+                tracing_error(&e);
+            }
+            return Ok(());
+        }
         let policy = match HostPolicy::read(&self.state_dir) {
             Ok(policy) => policy,
             Err(error) => fail!(format!("Could not read the host mode policy: {error}")),
@@ -675,36 +746,48 @@ impl Engine {
             Ok(t) => t,
             Err(e) => fail!(e.to_string()),
         };
-        // A source that was itself handed off carries only its own messages;
-        // the earlier chain stays readable through read_ox_thread.
-        let earlier = self
-            .handoff_chain(&src, &start.source)
-            .into_iter()
-            .map(|h| handoff::Earlier {
-                host: h.host,
-                session: h.session,
-                title: h.title,
-                runtime: h.runtime,
-                route: h.route,
-            })
-            .collect();
-        let selection = match handoff::select_chained(items, &start.request, window, earlier) {
-            Ok(s) => s,
-            Err(e) => fail!(e),
+        source.decision = resolved.decision;
+        let record = match nonce() {
+            Ok(n) => n,
+            Err(e) => fail!(e.to_string()),
         };
-        let source = HandoffSource {
-            host: Some(self.handoff_host()),
-            scope: src.clone(),
-            session: start.source.clone(),
-            native,
-            title,
-            runtime: src.route.runtime,
-            route: src.route.clone(),
-            source_access: access,
-            source_level: level,
-            decision: resolved.decision,
-            selection: selection.refs.clone(),
-        };
+        self.begin_handoff(
+            reply,
+            HandoffLaunch {
+                source,
+                selection,
+                start,
+                resolved,
+                yolo,
+                target,
+                surface,
+                record,
+                owner: format!("operator:{device}"),
+            },
+        )
+    }
+
+    fn begin_handoff(
+        &mut self,
+        reply: Replier,
+        launch: HandoffLaunch,
+    ) -> Result<(), (Replier, String)> {
+        let HandoffLaunch {
+            source,
+            selection,
+            start,
+            resolved,
+            yolo,
+            target,
+            surface,
+            record,
+            owner,
+        } = launch;
+        macro_rules! fail {
+            ($e:expr) => {
+                return Err((reply, $e))
+            };
+        }
         let (text, carried) = match start.runtime {
             ox_desk_core::runtime::Runtime::Codex => (
                 start.request.clone(),
@@ -719,12 +802,12 @@ impl Engine {
             linked: None,
             relation: Relation::Handoff,
             parent: ParentRef {
-                project: src.project.clone(),
-                scope: Some(src.clone()),
+                project: source.scope.project.clone(),
+                scope: Some(source.scope.clone()),
                 session: Some(start.source.clone()),
-                runtime: Some(src.route.runtime),
+                runtime: Some(source.scope.route.runtime),
             },
-            launch: format!("operator:{device}"),
+            launch: owner,
             by_operator: true,
             runtime: start.runtime,
             route: target.route.clone(),
@@ -739,10 +822,6 @@ impl Engine {
             handoff: Some(Box::new(source)),
             requested_model: None,
             pinned_model: None,
-        };
-        let record = match nonce() {
-            Ok(n) => n,
-            Err(e) => fail!(e.to_string()),
         };
         let payload = Payload::Handoff {
             text,

@@ -4802,10 +4802,12 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "shlex",
  "socket2",
  "tempfile",
  "toml_edit 0.25.20+spec-1.1.0",
+ "uuid",
  "vt100",
 ]
 

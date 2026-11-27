@@ -113,7 +113,11 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
         key("k", "ctrl")
         wait_for("the command palette", lambda: "command palette" in screen())
         type_in_focused_field(text)
-        wait_for("the destination row", lambda: expected in screen())
+        try:
+            wait_for("the destination row", lambda: expected in screen())
+        except AssertionError:
+            print("Palette for", text, screen(), flush=True)
+            raise
         key("Return")
 
     requests = itertools.count()
@@ -217,11 +221,70 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
     Path(env["OX_DESK_STATS_SOCKET"]).unlink(missing_ok=True)
     app = launch(harness, "--exact", "paired_fleet_window", "--ignored", "--nocapture")
     wait_for("the restored workbench", lambda: "manage hosts" in screen())
-    choose("@studio " + str(remote_project), "inspect the remote navigation fixture")
+    choose("@studio inspect the remote navigation fixture", "inspect the remote navigation fixture")
     wait_for("the session header on Studio with its runtime and billing",
              lambda: control("session-host-route", "Studio · Codex · API · fixture/demo", False))
-    choose("@local", "this computer")
-    wait_for("the explicit local selection", lambda: json.loads(selected.read_text()) is None)
+    peer.open(scope)
+    source_state = peer.until(lambda f: f["type"] == "snapshot")["scopes"][0]
+    pending = next(request for request in source_state["asks"] if request["thread"] == remote_id)
+    peer.act(scope, "finish-seed", {"answer_ask": [pending["id"], 0]}, pending["token"])
+    peer.until(lambda f: (event := change(f, "notification")) and event["event"] == "finished" and event["thread"] == remote_id)
+    peer.act(scope, "name-source", {"rename_thread": [remote_id, "Inspect the remote navigation fixture"]})
+    peer.until(lambda f: f["type"] == "ack" and f["id"] == "name-source")
+    choose("@studio inspect the remote navigation fixture", "inspect the remote navigation fixture")
+    wait_for("the source thread on its read route", lambda: control("session-host-route", "Studio · Codex · API · fixture/demo", False))
+    # Continue the real Studio conversation in the local clone through the paired
+    # desktop. The source and target have deliberately different checkout paths.
+    subprocess.run([root / "bin/ox", "host", "policy", "set", "yolo_asks_every_time"],
+                   env=env, check=True, stdout=log)
+    choose("/handoff @local codex:fixture/demo --mode yolo Continue locally from Studio", "run from")
+    wait_for("the receiving host's approval in the desktop", lambda: "incoming handoff" in screen())
+    key("2", "ctrl", "alt")
+    def handoff_row():
+        ownership = Path(env["OX_HOST_STATE_DIR"]) / "ownership-v1.json"
+        if not ownership.exists():
+            return None
+        for saved in json.loads(ownership.read_text()).get("scopes", []):
+            if saved["scope"]["project"] != str(project):
+                continue
+            for session in saved.get("sessions", []):
+                source = (session.get("origin") or {}).get("handoff") or {}
+                if source.get("session") == remote_id and (source.get("host") or {}).get("id") == host_id:
+                    assert session["origin"]["ceiling"] != "yolo"
+                    assert source["scope"]["project"] == str(remote_project)
+                    return session["id"]
+    try:
+        moved = wait_for("the cross-host handoff and source stamp", handoff_row, seconds=45)
+    except AssertionError:
+        print("Last window:", screen(), flush=True)
+        ownership = Path(env["OX_HOST_STATE_DIR"]) / "ownership-v1.json"
+        if ownership.exists():
+            print("Handoff records:", json.loads(ownership.read_text()).get("handoffs"), flush=True)
+        raise
+    wait_for("the confirmed local thread to open", lambda: json.loads(selected.read_text()) is None
+             and any(moved in path.read_text() for path in selected.parent.rglob("*layout*.json")))
+    print("PASS paired desktop handed a stock conversation from Studio to the other checkout and applied the receiving host’s mode decision.", flush=True)
+    # A lost reply after import must resolve to the very same native session.
+    local = Client(env["OX_HOST_SOCKET"])
+    stack.callback(local.close)
+    local_id = (Path(env["OX_HOST_STATE_DIR"]) / "host-id").read_text().strip()
+    start = dict(source=remote_id, runtime="codex", model="fixture/demo", mode="read",
+                 request="Handoff retry fixture")
+    peer.send(type="prepare_remote_handoff", id="prepare-retry", scope=scope, start=start,
+              target_host=local_id, window=36_000)
+    packet = peer.until(lambda f: f["type"] == "worker_reply" and f["id"] == "prepare-retry")["result"]
+    assert packet["source"]["selection"]["window"] == 36_000
+    assert any("Inspect the remote" in item["text"] for item in packet["carried"])
+    to_scope = dict(project=str(project), route=scope["route"])
+    def receive(key, transfer):
+        local.send(type="receive_remote_handoff", id=key, scope=to_scope, packet=transfer)
+        return local.until(lambda f: f["type"] == "worker_reply" and f["id"] == key)
+    refused = receive("wrong-repository", dict(packet, repository="wrong"))
+    assert "origin" in refused["error"], refused
+    placed = receive("first-delivery", packet)
+    assert placed["result"], placed
+    replay = receive("repeated-delivery", packet)["result"]
+    assert replay["recovered"] and replay["session"] == placed["result"]["session"]
     press_tree("tree-host", "Studio · collapsed")
     promised = wait_for("the named checkout's advertised billing route",
                         lambda: control("tree-project", "New session on Studio · " + str(remote_project)))

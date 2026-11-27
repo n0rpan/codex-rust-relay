@@ -710,6 +710,34 @@
         }
       ]
     },
+    "Carried": {
+      "description": "A carried item, possibly cut.",
+      "properties": {
+        "cut": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/Kind"
+        },
+        "text": {
+          "type": "string"
+        },
+        "turn": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "turn",
+        "kind",
+        "text",
+        "cut"
+      ],
+      "type": "object"
+    },
     "Change": {
       "oneOf": [
         {
@@ -1033,6 +1061,89 @@
         },
         {
           "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "scope": {
+              "$ref": "#/$defs/Scope"
+            },
+            "type": {
+              "const": "inspect_handoff_target",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "scope"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "scope": {
+              "$ref": "#/$defs/Scope"
+            },
+            "start": {
+              "$ref": "#/$defs/HandoffStart"
+            },
+            "target_host": {
+              "type": "string"
+            },
+            "type": {
+              "const": "prepare_remote_handoff",
+              "type": "string"
+            },
+            "window": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "scope",
+            "start",
+            "target_host"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "packet": {
+              "$ref": "#/$defs/HandoffTransfer"
+            },
+            "scope": {
+              "$ref": "#/$defs/Scope"
+            },
+            "type": {
+              "const": "receive_remote_handoff",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "scope",
+            "packet"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "Opt in to host-wide samples, including when no projects are open.",
           "properties": {
             "type": {
@@ -1279,6 +1390,70 @@
       ],
       "type": "object"
     },
+    "Decision": {
+      "description": "How a child's starting mode was decided. Recorded in its origin stamp.",
+      "oneOf": [
+        {
+          "const": "host_policy",
+          "description": "The receiving host set the starting level within the caller’s ceiling.",
+          "type": "string"
+        },
+        {
+          "const": "inherited",
+          "description": "The source's level, mapped to the target runtime.",
+          "type": "string"
+        },
+        {
+          "const": "lowered",
+          "description": "The launcher asked for a lower level.",
+          "type": "string"
+        },
+        {
+          "const": "operator",
+          "description": "An operator chose this level in a client sheet.",
+          "type": "string"
+        },
+        {
+          "const": "capped",
+          "description": "The operator answered a YOLO acceptance with the highest non-YOLO level.",
+          "type": "string"
+        }
+      ]
+    },
+    "Earlier": {
+      "description": "An earlier session in a handoff chain, readable through read_ox_thread.",
+      "properties": {
+        "host": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceHost"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "route": {
+          "$ref": "#/$defs/Route"
+        },
+        "runtime": {
+          "$ref": "#/$defs/Runtime"
+        },
+        "session": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "title",
+        "runtime",
+        "route"
+      ],
+      "type": "object"
+    },
     "ExternalCaller": {
       "additionalProperties": false,
       "description": "A worker gateway the host does not run, such as `ox claude` in a terminal.\nThe host can verify only the OS user. `launch` is a random token private to\nthat gateway; the host keeps only its digest. `session` is the native session\nthe gateway has observed, from its resume arguments or the stock client's own\nMCP request metadata.",
@@ -1306,10 +1481,90 @@
       ],
       "type": "object"
     },
+    "HandoffSource": {
+      "description": "Where a handoff came from. Stored in the target's origin stamp.",
+      "properties": {
+        "decision": {
+          "$ref": "#/$defs/Decision"
+        },
+        "host": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceHost"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "native": {
+          "description": "The source's native session ID, when it differs from the host ID.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "route": {
+          "$ref": "#/$defs/Route"
+        },
+        "runtime": {
+          "$ref": "#/$defs/Runtime"
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        },
+        "selection": {
+          "$ref": "#/$defs/SelectionRefs"
+        },
+        "session": {
+          "type": "string"
+        },
+        "source_access": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Access"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The source's confirmed mode when the handoff started."
+        },
+        "source_level": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Level"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "scope",
+        "session",
+        "title",
+        "runtime",
+        "route",
+        "decision",
+        "selection"
+      ],
+      "type": "object"
+    },
     "HandoffStart": {
       "additionalProperties": false,
       "description": "An operator's request to continue a session elsewhere.",
       "properties": {
+        "host": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "mode": {
           "$ref": "#/$defs/ModeRequest",
           "default": "inherit"
@@ -1340,6 +1595,51 @@
         "source",
         "runtime",
         "request"
+      ],
+      "type": "object"
+    },
+    "HandoffTransfer": {
+      "description": "Selected, attributed context for an operator moving a conversation between\ntwo paired hosts. Project paths in the source stamp are source-local.",
+      "properties": {
+        "carried": {
+          "items": {
+            "$ref": "#/$defs/Carried"
+          },
+          "type": "array"
+        },
+        "child_ceiling": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Level"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/HandoffSource"
+        },
+        "start": {
+          "$ref": "#/$defs/HandoffStart"
+        },
+        "target_host": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "target_host",
+        "repository",
+        "start",
+        "source",
+        "carried"
       ],
       "type": "object"
     },
@@ -1500,6 +1800,47 @@
         }
       ]
     },
+    "Kind": {
+      "oneOf": [
+        {
+          "enum": [
+            "user",
+            "assistant"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "outcome",
+          "description": "A command or tool result as short attributed text.",
+          "type": "string"
+        }
+      ]
+    },
+    "Level": {
+      "description": "Ordered permission levels. `Ord` is \"more permissive than\".",
+      "oneOf": [
+        {
+          "const": "read",
+          "description": "Reads the project. Anything else asks a person.",
+          "type": "string"
+        },
+        {
+          "const": "write",
+          "description": "Edits the workspace without asking about each edit.",
+          "type": "string"
+        },
+        {
+          "const": "classifier",
+          "description": "A classifier reviews actions instead of a person.",
+          "type": "string"
+        },
+        {
+          "const": "yolo",
+          "description": "Nothing reviews actions.",
+          "type": "string"
+        }
+      ]
+    },
     "ModeRequest": {
       "description": "What a launcher asks for. `Inherit` is the default. On the wire it is a\nstring: `inherit`, a level name or a native preset name.",
       "type": "string"
@@ -1555,6 +1896,28 @@
         "question"
       ],
       "type": "string"
+    },
+    "Omitted": {
+      "description": "A run of consecutive source items that were not carried.",
+      "properties": {
+        "count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "first": {
+          "type": "string"
+        },
+        "last": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "first",
+        "last",
+        "count"
+      ],
+      "type": "object"
     },
     "ParentCall": {
       "description": "The only operations a parent agent has on its workers. Permission changes\nbelong to the human operator and have no variant here. A parent answers a\nworker's approval or question only where the host's policy lets it stand in\nfor the operator.",
@@ -2014,6 +2377,86 @@
       ],
       "type": "object"
     },
+    "SelectionRefs": {
+      "description": "References to a selection. This, never message text, is what the stamp keeps.",
+      "properties": {
+        "attachments": {
+          "description": "Attachments in the source items (carried or omitted). They are never\ncarried as content, only named by path in the message text.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "carried": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cut": {
+          "description": "Carried items that were cut. Their full text is in the source.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "earlier": {
+          "description": "When the source itself was a handoff target: its own sources, nearest\nfirst. read_ox_thread reads them; their messages are not carried again.",
+          "items": {
+            "$ref": "#/$defs/Earlier"
+          },
+          "type": "array"
+        },
+        "items": {
+          "description": "Carried item IDs in order.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "omitted": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ranges": {
+          "items": {
+            "$ref": "#/$defs/Omitted"
+          },
+          "type": "array"
+        },
+        "stripped": {
+          "description": "The source's first user item, whose carried context block was stripped\nto its request.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total": {
+          "description": "Source items considered (after dropping reasoning and internals).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "window": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "window_known": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "total",
+        "carried",
+        "omitted",
+        "items",
+        "cut",
+        "ranges",
+        "window",
+        "window_known"
+      ],
+      "type": "object"
+    },
     "Server": {
       "oneOf": [
         {
@@ -2424,6 +2867,22 @@
         "updated_at",
         "capabilities",
         "detail"
+      ],
+      "type": "object"
+    },
+    "SourceHost": {
+      "description": "A host-local session or path is meaningful only on its owning machine.",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
       ],
       "type": "object"
     },

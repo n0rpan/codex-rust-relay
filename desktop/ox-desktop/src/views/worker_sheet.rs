@@ -59,7 +59,7 @@ pub(super) struct WorkerDraft {
 
 pub(super) enum Launch {
     Worker(Box<WorkerDraft>),
-    Handoff(HandoffDraft),
+    Handoff(Box<HandoffDraft>),
 }
 
 impl Launch {
@@ -253,7 +253,11 @@ impl Workbench {
                         .placeholder("What should the new session do?")
                 });
                 request.read(cx).focus_handle(cx).focus(window, cx);
-                Launch::Handoff(HandoffDraft { choice, request })
+                Launch::Handoff(Box::new(HandoffDraft {
+                    choice,
+                    request,
+                    destination: None,
+                }))
             }
         };
         self.launch = Some(launch);
@@ -336,10 +340,24 @@ impl Workbench {
         // chosen, starred or not: the picker lists settings and the discovered catalog.
         let aliases = match launch {
             Launch::Worker(draft) => draft.hosts.aliases(draft.choice.runtime),
-            _ => None,
+            Launch::Handoff(draft) => draft.destination.as_ref().map(|h| {
+                h.routes
+                    .iter()
+                    .filter(|r| r.runtime == draft.choice.runtime)
+                    .filter_map(|r| match &r.billing {
+                        Billing::Api(alias) => Some(alias.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            }),
         };
+        let link = match launch {
+            Launch::Handoff(d) => d.destination.as_ref().map(|h| h.link.clone()),
+            Launch::Worker(_) => None,
+        }
+        .unwrap_or_else(|| self.link.clone());
         let picker = cx.new(|cx| {
-            let picker = ModelPicker::new(self.link.clone(), vec![], window, cx);
+            let picker = ModelPicker::new(link, vec![], window, cx);
             match aliases {
                 Some(aliases) => picker.with_target_aliases(aliases),
                 None => picker.with_catalog(cx),
@@ -389,6 +407,13 @@ impl Workbench {
             }
             None => return,
         };
+        if let (Ok(DeskAction::StartHandoff(start)), Some(Launch::Handoff(draft))) =
+            (&result, &self.launch)
+            && let Some(target) = draft.destination.clone()
+        {
+            self.send_handoff(start.clone(), target, cx);
+            return;
+        }
         match result {
             Ok(action) => {
                 self.close_launch(cx);
@@ -607,7 +632,55 @@ impl Workbench {
                     .child(self.mode_row(p, draft, cx))
                     .child(self.model_row(p, kind, &choice, cx));
             }
-            Launch::Handoff(_) => {
+            Launch::Handoff(draft) => {
+                let targets = self.handoff_destinations(cx);
+                if !targets.is_empty() || draft.destination.is_some() {
+                    let mut chips = row().flex_wrap().gap_1().child(button(
+                        p,
+                        "handoff-same-host",
+                        "This host",
+                        draft.destination.is_none(),
+                        true,
+                        cx.listener(|s, _, _, cx| {
+                            if let Some(Launch::Handoff(d)) = &mut s.launch {
+                                d.destination = None;
+                                d.choice.model = None;
+                                d.choice.error = None;
+                            }
+                            cx.notify();
+                        }),
+                    ));
+                    for (index, target) in targets.into_iter().enumerate() {
+                        let chosen = draft
+                            .destination
+                            .as_ref()
+                            .is_some_and(|d| d.id == target.id && d.project == target.project);
+                        let label = format!("{} · {}", target.name, target.project.display());
+                        chips = chips.child(button(
+                            p,
+                            ("handoff-host", index),
+                            label,
+                            chosen,
+                            true,
+                            cx.listener(move |s, _, _, cx| {
+                                if let Some(Launch::Handoff(d)) = &mut s.launch {
+                                    if let Some(model) = &d.choice.model
+                                        && !target
+                                            .routes
+                                            .contains(&d.choice.runtime.route(Some(model.clone())))
+                                    {
+                                        d.choice.model = None;
+                                    }
+                                    d.choice.error = None;
+                                    d.destination = Some(target.clone());
+                                }
+                                s.launch_picker = None;
+                                cx.notify();
+                            }),
+                        ));
+                    }
+                    body = body.child(field(p, "Host", chips));
+                }
                 body = body.child(self.model_row(p, kind, &choice, cx));
             }
         }
@@ -651,9 +724,13 @@ impl Workbench {
             .child(button(
                 p,
                 "launch-submit",
-                submit,
+                if self.handoff_pending && kind == LaunchKind::Handoff {
+                    "Starting…"
+                } else {
+                    submit
+                },
                 true,
-                true,
+                !self.handoff_pending || kind != LaunchKind::Handoff,
                 cx.listener(|s, _, _, cx| s.submit_launch(cx)),
             ));
         let frame = col()

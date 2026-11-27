@@ -160,6 +160,17 @@ impl Access {
     /// one, and the reason. Those are answered with an error frame. Protocol and auth violations
     /// return `None` and still close the socket.
     fn invalid(&self, app: &App, req: &Client) -> Option<(Option<String>, String)> {
+        if let Client::InspectHandoffTarget { id, scope }
+        | Client::PrepareRemoteHandoff { id, scope, .. }
+        | Client::ReceiveRemoteHandoff { id, scope, .. } = req
+            && self.ready
+            && !self.reachable(app, scope)
+        {
+            return Some((
+                Some(id.clone()),
+                "This checkout or route is no longer available on this host.".into(),
+            ));
+        }
         if let Client::Subscribe {
             scope: Some(scope), ..
         } = req
@@ -238,6 +249,25 @@ impl Access {
             Client::WatchCatalog if self.ready => {
                 self.selected = None;
                 true
+            }
+            Client::InspectHandoffTarget { id, scope } => {
+                self.ready && !id.is_empty() && id.len() <= 96 && self.reachable(app, scope)
+            }
+            Client::PrepareRemoteHandoff {
+                id, scope, start, ..
+            } => {
+                self.ready
+                    && !id.is_empty()
+                    && id.len() <= 96
+                    && self.reachable(app, scope)
+                    && start.validate().is_ok()
+            }
+            Client::ReceiveRemoteHandoff { id, scope, packet } => {
+                self.ready
+                    && !id.is_empty()
+                    && id.len() <= 96
+                    && self.reachable(app, scope)
+                    && packet.start.validate().is_ok()
             }
             Client::WorkerHosts { id, project }
                 if self.ready && !id.is_empty() && id.len() <= 96 =>
@@ -718,6 +748,7 @@ mod tests {
             id: "handoff-1".into(),
             scope: scope.clone(),
             action: Action::StartHandoff(ox_desk_core::handoff::HandoffStart {
+                host: None,
                 source: "thread".into(),
                 runtime: route.runtime,
                 model: None,

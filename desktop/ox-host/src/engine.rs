@@ -38,6 +38,7 @@ pub(crate) enum Message {
     Schema(Scope, u64, Box<ox_desk_core::slash::Capabilities>),
     Discovered(u64, Box<Server>),
     ProjectDirectory(wire::ProjectDirectory),
+    HandoffTarget(u64, String, Result<Value, String>),
     HostsListed(PathBuf, Result<Value, String>),
     Outbound(Box<forwarding::Event>),
     WorkerResult(u64, Box<Result<ox_host_web::worker_result::Report, String>>),
@@ -171,6 +172,7 @@ pub(crate) struct Asking {
 }
 /// A handoff waiting for its source's older history to load.
 struct Preparing {
+    export_to: Option<(String, uuid::Uuid)>,
     source: Scope,
     start: HandoffStart,
     reply: Replier,
@@ -629,6 +631,9 @@ impl Engine {
                 }
                 Some(Message::Disconnect(id)) => {
                     self.clients.remove(&id);
+                    self.withdraw_activations(|request| matches!(
+                        &request.activation, mode_requests::Activation::RemoteHandoff { client, .. } if *client == id
+                    ), "The desktop disconnected before approving the handoff.")?;
                 }
                 Some(Message::Request(id, request)) => {
                     if let Err(e) = self.request(id, *request) {
@@ -651,6 +656,9 @@ impl Engine {
                         let batch = s.inbox.take();
                         self.process(&scope, batch, false)?;
                     }
+                }
+                Some(Message::HandoffTarget(id, key, result)) => {
+                    self.answer(Replier::Client(id, key), result)?
                 }
                 Some(Message::ProjectDirectory(directory)) => {
                     for (client, key) in std::mem::take(&mut self.project_queries) {
@@ -767,6 +775,7 @@ impl Engine {
                 .into();
                 capabilities.push("worker_inventory".into());
                 capabilities.push("worker_placement".into());
+                capabilities.push("remote_handoff".into());
                 capabilities.push("linked_read_workers".into());
                 capabilities.push("linked_write_workers".into());
                 if prepared.is_some() {
@@ -898,6 +907,28 @@ impl Engine {
                 }
                 self.subscribe(id, scope, after)
             }
+            Client::InspectHandoffTarget { id: key, scope } => {
+                self.inspect_handoff_target(id, key, scope);
+                Ok(())
+            }
+            Client::PrepareRemoteHandoff {
+                id: key,
+                scope,
+                start,
+                target_host,
+                window,
+            } => {
+                let result = self.export_handoff(id, &key, scope, start, target_host, window);
+                if let Err(error) = result {
+                    self.answer(Replier::Client(id, key), Err(error.to_string()))?;
+                }
+                Ok(())
+            }
+            Client::ReceiveRemoteHandoff {
+                id: key,
+                scope,
+                packet,
+            } => self.receive_handoff(id, key, scope, packet, None),
             Client::WorkerLaunch {
                 id: key,
                 mut caller,
@@ -2158,7 +2189,8 @@ impl Engine {
                     }
                 }
             })?;
-            if let Some(source) = f.origin.parent.scope.clone()
+            if !f.origin.launch.starts_with("handoff:")
+                && let Some(source) = f.origin.parent.scope.clone()
                 && self.running.contains_key(&source)
                 && &source != scope
             {
@@ -6074,6 +6106,7 @@ mod tests {
             let source = claude_source(root.path());
             let handoff = |request: &str| {
                 Action::StartHandoff(HandoffStart {
+                    host: None,
                     source: "s".into(),
                     runtime: Runtime::Codex,
                     model: Some("fixture".into()),
@@ -6179,6 +6212,7 @@ mod tests {
                         "h1",
                         &source,
                         Action::StartHandoff(HandoffStart {
+                            host: None,
                             source: "s".into(),
                             runtime: Runtime::Codex,
                             model: Some("fixture".into()),
@@ -6311,6 +6345,7 @@ mod tests {
                     "h1",
                     &source,
                     Action::StartHandoff(HandoffStart {
+                        host: None,
                         source: "s".into(),
                         runtime: Runtime::Claude,
                         model: None,

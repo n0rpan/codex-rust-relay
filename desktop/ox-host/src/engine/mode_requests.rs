@@ -12,6 +12,11 @@ pub(super) enum Activation {
         sender: Sender,
         source: Option<String>,
     },
+    RemoteHandoff {
+        client: u64,
+        key: String,
+        packet: Box<ox_desk_core::handoff::HandoffTransfer>,
+    },
     Handoff {
         client: u64,
         key: String,
@@ -101,7 +106,8 @@ impl Engine {
         for job in jobs {
             let request = self.mode_requests.remove(&job).unwrap();
             match request.activation {
-                Activation::Handoff { client, key, .. } => {
+                Activation::Handoff { client, key, .. }
+                | Activation::RemoteHandoff { client, key, .. } => {
                     self.answer(Replier::Client(client, key), Err(reason.to_owned()))?
                 }
                 Activation::Open { client, key, .. } => {
@@ -161,6 +167,23 @@ impl Engine {
                 scope.route.runtime,
                 "Open this session in YOLO?",
                 scope.project.display().to_string(),
+            ),
+            Activation::RemoteHandoff { packet, .. } => (
+                None,
+                packet.start.runtime,
+                "Start the incoming handoff in YOLO?",
+                format!(
+                    "From {} · {}\nTo {} · {}\n{}",
+                    packet
+                        .source
+                        .host
+                        .as_ref()
+                        .map_or("Source host", |h| h.name.as_str()),
+                    packet.source.title,
+                    scope.project.display(),
+                    scope.route.label(),
+                    packet.start.request.chars().take(600).collect::<String>()
+                ),
             ),
             Activation::Handoff { start, .. } => (
                 Some(start.source.clone()),
@@ -224,6 +247,9 @@ impl Engine {
         match (request.activation, answer) {
             (
                 Activation::Handoff {
+                    client: owner, key, ..
+                }
+                | Activation::RemoteHandoff {
                     client: owner, key, ..
                 },
                 crate::yolo::Answer::Decline,
@@ -323,6 +349,24 @@ impl Engine {
                     result.as_ref().err().map(ToString::to_string),
                 )?;
                 result
+            }
+            (
+                Activation::RemoteHandoff {
+                    client: owner,
+                    key,
+                    mut packet,
+                },
+                answer,
+            ) => {
+                packet.start.mode = ox_desk_core::modes::ModeRequest::Level(match answer {
+                    crate::yolo::Answer::Accept => Level::Yolo,
+                    _ => Level::Yolo.below_yolo(),
+                });
+                let approval = YoloAllowance::Accepted {
+                    request: format!("{}{job}", crate::yolo::PREFIX),
+                    device: format!("client-{client}"),
+                };
+                self.receive_handoff(owner, key, scope.clone(), packet, Some(approval))
             }
             (
                 Activation::Handoff {

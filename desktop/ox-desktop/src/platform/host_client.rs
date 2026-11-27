@@ -119,6 +119,108 @@ impl HostLink {
             )),
         }
     }
+    pub(crate) fn handoff(
+        &self,
+        source: Scope,
+        start: ox_desk_core::handoff::HandoffStart,
+        to: &crate::app::fleet::HandoffDestination,
+        on_approval: impl FnMut(),
+    ) -> io::Result<(Scope, String)> {
+        let target = Scope {
+            project: to.project.clone(),
+            route: start.route(),
+        };
+        let mut target_connection = to.link.handoff_connection()?;
+        let target_info = handoff_call(
+            &mut target_connection,
+            Client::InspectHandoffTarget {
+                id: "inspect-handoff".into(),
+                scope: target.clone(),
+            },
+            "inspect-handoff",
+            || {},
+        )?;
+        if target_info["host"].as_str() != Some(to.id.as_str())
+            || target_info["repository"].as_str() != Some(to.repository.as_str())
+        {
+            return Err(io::Error::other(
+                "The selected host or checkout changed. Choose the destination again.",
+            ));
+        }
+        let key = serde_json::to_string(&(
+            self.remote().map(|h| &h.id),
+            &source,
+            &start,
+            &to.id,
+            &target,
+        ))?;
+        let pending = PendingTransfer::reserve(&key)?;
+        let mut source_connection = self.handoff_connection()?;
+        let request = Client::PrepareRemoteHandoff {
+            id: pending.id.clone(),
+            scope: source,
+            start,
+            target_host: to.id.clone(),
+            window: target_info["window"].as_u64(),
+        };
+        let packet: ox_desk_core::handoff::HandoffTransfer = serde_json::from_value(handoff_call(
+            &mut source_connection,
+            request,
+            &pending.id,
+            || {},
+        )?)?;
+        if packet.id != pending.id
+            || packet.target_host != to.id
+            || packet.start.route() != target.route
+            || packet.repository != to.repository
+        {
+            return Err(io::Error::other(
+                "The source or destination checkout changed. Choose the destination again.",
+            ));
+        }
+        let request = Client::ReceiveRemoteHandoff {
+            id: "receive-handoff".into(),
+            scope: target.clone(),
+            packet: Box::new(packet),
+        };
+        let result = handoff_call(
+            &mut target_connection,
+            request,
+            "receive-handoff",
+            on_approval,
+        );
+        let result = match result {
+            Ok(result) => result,
+            Err(e) if e.kind() == io::ErrorKind::Other => {
+                pending.finish()?;
+                return Err(e);
+            }
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "{} may already have started the handoff. Retry the same request to reconnect. {e}",
+                        to.name
+                    ),
+                ));
+            }
+        };
+        let session = result["session"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| io::Error::other("The receiving host did not confirm a session."))?;
+        pending.finish()?;
+        Ok((target, session.to_owned()))
+    }
+    fn handoff_connection(&self) -> io::Result<StreamHello> {
+        let (reader, socket, caps) = self.handshake()?;
+        if !caps.iter().any(|c| c == "remote_handoff") {
+            return Err(io::Error::other(
+                "Update this host to use cross-host handoffs.",
+            ));
+        }
+        Ok((reader, socket, caps))
+    }
     fn handshake(&self) -> io::Result<StreamHello> {
         match self {
             Self::Local => {
@@ -127,6 +229,89 @@ impl HostLink {
                 open_handshake(&paths)
             }
             Self::Remote(host) => handshake_stream(host.connect()?, Some(&host.id)),
+        }
+    }
+}
+/// Keep only the id of an unacknowledged request across window and process restarts.
+struct PendingTransfer {
+    path: PathBuf,
+    id: String,
+    _lock: std::fs::File,
+}
+impl PendingTransfer {
+    fn reserve(key: &str) -> io::Result<Self> {
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Seek};
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = ox_desk_core::desktop_behavior::directory()
+            .ok_or_else(|| io::Error::other("Desktop state directory unavailable"))?
+            .join("pending-handoffs");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{:x}", Sha256::digest(key.as_bytes())));
+        let mut file = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)?;
+        match file.try_lock() {
+            Ok(()) => (),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::other("This handoff is already starting."));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+        let mut id = String::new();
+        file.read_to_string(&mut id)?;
+        if uuid::Uuid::parse_str(&id).is_err() {
+            id = uuid::Uuid::new_v4().to_string();
+            file.rewind()?;
+            file.set_len(0)?;
+            file.write_all(id.as_bytes())?;
+            file.sync_all()?;
+        }
+        Ok(Self {
+            path,
+            id,
+            _lock: file,
+        })
+    }
+    fn finish(self) -> io::Result<()> {
+        std::fs::remove_file(&self.path)
+    }
+}
+fn handoff_call(
+    (reader, socket, _): &mut StreamHello,
+    request: Client,
+    key: &str,
+    mut on_approval: impl FnMut(),
+) -> io::Result<serde_json::Value> {
+    socket.set_read_timeout(Some(Duration::from_secs(300)))?;
+    write_frame(socket, &request)?;
+    loop {
+        match read_frame(reader)? {
+            Server::WorkerReply {
+                id,
+                result: Some(result),
+                ..
+            } if id == key => {
+                if result["awaiting_approval"] == true {
+                    socket.set_read_timeout(None)?;
+                    on_approval();
+                } else {
+                    return Ok(result);
+                }
+            }
+            Server::WorkerReply {
+                id,
+                error: Some(error),
+                ..
+            } if id == key => return Err(io::Error::other(error)),
+            Server::Error { id, message } if id.as_deref().is_none_or(|id| id == key) => {
+                return Err(io::Error::other(message));
+            }
+            _ => (),
         }
     }
 }

@@ -47,8 +47,12 @@ impl Workbench {
         if let Some(result) = owner.and_then(|id| typed_launch(id, store.draft(owner))) {
             match result {
                 Ok(action) => {
+                    let remote =
+                        matches!(&action, DeskAction::StartHandoff(start) if start.host.is_some());
                     self.action(cx, action);
-                    self.action(cx, DeskAction::DraftEdit(id, String::new()));
+                    if !remote {
+                        self.action(cx, DeskAction::DraftEdit(id, String::new()));
+                    }
                 }
                 Err(message) => {
                     self.launch_error = Some(message);
