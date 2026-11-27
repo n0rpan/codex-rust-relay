@@ -128,9 +128,12 @@ class AutoQueue(unittest.TestCase):
                  "body": summary(HEAD, "completed")}],
             "a format this script cannot read": [{"user": BOT_USER, "body": "codex-review-state:v2 ???"}],
         }
+        # The security review was already asked for, so that is not the hold.
+        asked = {"user": {"login": "maintainer", "type": "User"},
+                 "body": f"@codex security review\n\nAsked for by the `full-ci` label, for commit {HEAD}."}
         for name, comments in cases.items():
             with self.subTest(name):
-                out, calls = self.decide(comments=comments)
+                out, calls = self.decide(comments=comments + [asked])
                 self.assertIn("hold: no finished review", out)
                 self.assertIn("--disable-auto", calls)
 
@@ -161,12 +164,22 @@ class AutoQueue(unittest.TestCase):
             asked = {"user": {"login": "maintainer", "type": "User"},
                      "body": f"@codex security review\n\nAsked for by the `full-ci` label, for commit {HEAD}."}
             out, calls = self.decide(comments=comments + [asked])
-            self.assertIn("hold:", out)
             self.assertNotIn("pr comment", calls)
         # Someone else's comment is not the maintainer's request.
         asked["user"] = {"login": "someone", "type": "User"}
         out, calls = self.decide(comments=comments + [asked])
         self.assertIn("pr comment", calls)
+
+    def test_once_asked_a_finished_review_of_the_head_commit_queues(self):
+        # Codex answers the request with a review of the head commit and may
+        # leave its security entry at an earlier commit (seen on #39).
+        asked = {"user": {"login": "maintainer", "type": "User"},
+                 "body": f"@codex security review\n\nAsked for by the `full-ci` label, for commit {HEAD}."}
+        for state, expected in (("running", "hold:"), ("completed", "queue:")):
+            answer = {"user": BOT_USER, "body": summary(HEAD, state, security="completed", security_sha="0" * 40)}
+            out, calls = self.decide(comments=[asked, answer])
+            self.assertIn(expected, out)
+            self.assertNotIn("pr comment", calls)
 
     def test_a_running_or_unresolved_security_review_holds_without_a_new_request(self):
         for state in ({"security": "running"}, {"security": "completed", "unresolved": True}):

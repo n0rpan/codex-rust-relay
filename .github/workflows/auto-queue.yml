@@ -3,12 +3,13 @@ name: Auto queue
 # The full-ci label on a pull request from the maintainer's account means
 # "merge this when it is green and reviewed". desktop/ci/auto-queue.sh turns
 # auto-merge on when the pull request is labelled, not a draft, and Codex has
-# finished a code review and a security review of its current head commit
-# with no unresolved P0 or P1 finding and no open security finding; it turns
-# auto-merge off otherwise. The security review runs by itself only when a
-# pull request opens, so for a labelled pull request the script asks for one
-# per head commit, in a comment from the maintainer's account. With auto-merge on, GitHub moves
-# the pull request into the merge queue as soon as `OX merge check` passes.
+# finished a review of its current head commit with no unresolved P0 or P1
+# finding and no open security finding; it turns auto-merge off otherwise.
+# The security review runs by itself only when a pull request opens, so for a
+# labelled pull request the script asks for one per head commit, in a comment
+# from the maintainer's account, and waits for Codex's answer. With auto-merge
+# on, GitHub moves the pull request into the merge queue as soon as
+# `OX merge check` passes.
 #
 # A push makes the head commit unreviewed, so it takes the pull request out of
 # line until the review of the new commit is in. Resolving a finding raises no

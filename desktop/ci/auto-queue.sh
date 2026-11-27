@@ -10,13 +10,17 @@
 #   - it is open, not a draft, from this repository and from the maintainer;
 #   - it carries the full-ci label;
 #   - Codex has finished a code review of its current head commit;
-#   - Codex has finished a security review of that commit with nothing open;
+#   - a security review of that commit was asked for, and Codex's state shows
+#     none of that commit still running or with findings open;
 #   - no unresolved Codex review thread is marked P0 or P1, or carries a
 #     security review marker.
-# Otherwise auto-merge is turned off. A labelled pull request whose head
-# commit has no security review gets one requested, once per commit, by a
-# comment from the maintainer's token: the security review runs by itself
-# only when a pull request opens. Anything this script cannot read counts
+# Otherwise auto-merge is turned off. The security review runs by itself only
+# when a pull request opens, so a labelled pull request gets one asked for,
+# once per head commit, in a comment from the maintainer's token. Codex
+# answers such a request by reviewing the head commit again, and its state
+# comment may keep the security review at an earlier commit; so the answer
+# is awaited as a finished review of the head commit after the request, not
+# as a security entry for it. Anything this script cannot read counts
 # as "not reviewed": a failed lookup or a change in the reviewer's comment
 # format stops automatic merges; it never lets one through.
 set -euo pipefail
@@ -68,15 +72,15 @@ decide() {
         'any(.[]; .login == $who and (.body | startswith("@codex security review")) and (.body | contains($head)))' \
         <<< "${comments}" > /dev/null; then
         request=yes
+        decision="hold: asking for a security review of ${head:0:7}"; return
     fi
     reviewed="$(jq -r --arg head "${head}" \
         'select(.code_review.commit_sha == $head and .code_review.status == "completed") | "yes"' \
         <<< "${summary:-null}" 2>/dev/null || true)"
     if [ "${reviewed}" != yes ]; then decision="hold: no finished review of ${head:0:7}"; return; fi
     case "${security}" in
-        clean) ;;
         open) decision="hold: the security review of ${head:0:7} has unresolved findings"; return ;;
-        *) decision="hold: no finished security review of ${head:0:7}"; return ;;
+        running) decision="hold: the security review of ${head:0:7} is running"; return ;;
     esac
 
     # One page of threads. With more than a page this holds: an unread thread
