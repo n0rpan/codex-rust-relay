@@ -11,6 +11,14 @@ struct Host {
     id: String,
     name: String,
     resources: Option<HostResources>,
+    #[serde(default)]
+    labels: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "ox_desk_core::usage::reported::deserialize_windows"
+    )]
+    subscription_limits:
+        std::collections::BTreeMap<String, Vec<ox_desk_core::usage::reported::ReportedWindow>>,
 }
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -39,6 +47,97 @@ struct Inventory {
 struct ProjectRule {
     host: Option<String>,
     os: Option<String>,
+}
+
+fn limit_lines(inventory: &Inventory, target: &str, route: &Route, now: i64) -> Vec<String> {
+    if route.is_api() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let rule = (target == "project")
+        .then_some(inventory.project_placement.as_ref())
+        .flatten();
+    let selector = rule
+        .and_then(|r| r.host.as_deref())
+        .unwrap_or(if target == "project" { "auto" } else { target });
+    for entry in &inventory.hosts {
+        let name = entry.paired_name.as_ref().unwrap_or(&entry.host.name);
+        let selected = selector == "auto"
+            || if let Some(label) = selector.strip_prefix("label:") {
+                entry
+                    .host
+                    .labels
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(label))
+            } else if selector == "parent" {
+                entry.parent_host
+            } else {
+                selector == entry.host.id
+                    || selector.eq_ignore_ascii_case(name)
+                    || selector.eq_ignore_ascii_case(&entry.host.name)
+            };
+        if !selected
+            || entry.status != "online"
+            || rule.and_then(|r| r.os.as_ref()).is_some_and(|os| {
+                entry
+                    .host
+                    .resources
+                    .as_ref()
+                    .is_none_or(|r| !os.eq_ignore_ascii_case(&r.os))
+            })
+            || !entry
+                .routes
+                .iter()
+                .any(|r| matches!(r, OfferedRoute::Known(offered) if offered == route))
+        {
+            continue;
+        }
+        let Some(windows) = entry
+            .host
+            .subscription_limits
+            .get(route.runtime.executable())
+        else {
+            continue;
+        };
+        for w in windows
+            .iter()
+            .filter(|w| w.resets_at.is_none_or(|t| t > now))
+        {
+            let mut parts = vec![format!(
+                "{name} · {} · {}",
+                route.runtime.account(),
+                w.label
+            )];
+            if let Some(pct) = w.used_percent {
+                parts.push(format!("{pct}% used"));
+            }
+            if let Some(status) = &w.status
+                && (status != "allowed" || w.used_percent.is_none())
+            {
+                parts.push(status.clone());
+            }
+            for (label, value) in [
+                (
+                    if now.saturating_sub(w.observed_at) > 3600 {
+                        "last reported"
+                    } else {
+                        "reported"
+                    },
+                    Some(w.observed_at),
+                ),
+                ("resets", w.resets_at),
+            ] {
+                if let Some(t) = value.and_then(chrono::DateTime::from_timestamp_secs) {
+                    parts.push(format!(
+                        "{label} {}",
+                        t.with_timezone(&chrono::Local).format("%b %e %H:%M")
+                    ));
+                }
+            }
+            lines.push(parts.join(" · "));
+        }
+    }
+    lines
 }
 
 pub(super) struct Picker {
@@ -236,6 +335,17 @@ impl Workbench {
         if let Some(status) = status {
             content = content.child(small(p, status.to_owned()));
         }
+        if let Some(inventory) = inventory {
+            let route = draft.choice.runtime.route(draft.choice.model.clone());
+            for line in limit_lines(
+                inventory,
+                &picker.target,
+                &route,
+                chrono::Utc::now().timestamp(),
+            ) {
+                content = content.child(small(p, line));
+            }
+        }
         if picker.target == "auto" {
             let mut inputs = row().gap_2().flex_wrap();
             for (name, input) in [
@@ -260,5 +370,43 @@ impl Workbench {
             ));
         }
         field(p, "Worker host", content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Inventory, Runtime, limit_lines};
+    use serde_json::json;
+    #[test]
+    fn limits_follow_the_selected_host_billing_and_project_rule() {
+        let row = |name: &str, pct| {
+            json!({
+                "host":{"id":name, "name":name, "resources":null, "labels":[name], "subscription_limits":{
+                    "claude":[{"label":"five hour","used_percent":pct,"status":"allowed","resets_at":300,"observed_at":100},
+                              {"new_format":true}]}},
+                "routes":[{"runtime":"claude","billing":"subscription"}],"status":"online","parent_host":name=="laptop"
+            })
+        };
+        let inventory: Inventory = serde_json::from_value(json!({
+            "hosts":[row("laptop",10),row("studio",90)], "project_placement":{"host":"label:studio"}
+        }))
+        .unwrap();
+        let route = Runtime::Claude.route(None);
+        for (target, pct) in [("parent", 10), ("studio", 90), ("project", 90)] {
+            let lines = limit_lines(&inventory, target, &route, 200);
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].contains(&format!("{pct}% used")));
+        }
+        assert_eq!(limit_lines(&inventory, "auto", &route, 200).len(), 2);
+        assert!(limit_lines(&inventory, "auto", &route, 300).is_empty());
+        assert!(
+            limit_lines(
+                &inventory,
+                "studio",
+                &Runtime::Claude.route(Some("api".into())),
+                200
+            )
+            .is_empty()
+        );
     }
 }

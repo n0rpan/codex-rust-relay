@@ -65,6 +65,7 @@ struct Process {
     handoff: Option<super::commands::Handoff>,
     link: Option<pipe::Link>,
     initialized: bool,
+    limit_reporter: Option<crate::usage::reported::Reporter>,
     /// The first `system/init` matched the project. Later ones report the Bash
     /// tool's current directory, which follows `cd`, so only the first is checked.
     project_checked: bool,

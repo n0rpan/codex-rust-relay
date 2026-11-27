@@ -312,22 +312,19 @@ impl Store {
             {
                 let signed_in =
                     matches!(auth_mode.as_deref(), Some("chatgpt" | "chatgptAuthTokens"));
-                let transition = match self.state {
-                    Connection::SignInRequired => signed_in,
-                    Connection::Ready => !signed_in,
-                    _ => false,
+                let request = match self.state {
+                    Connection::Ready if signed_in => Some(super::Pending::RefreshAccount),
+                    Connection::Ready => Some(super::Pending::Account),
+                    Connection::SignInRequired if signed_in => Some(super::Pending::Account),
+                    _ => None,
                 };
-                if transition
-                    && !self
-                        .pending
-                        .values()
-                        .any(|(_, p)| matches!(p, super::Pending::Account))
+                if let Some(request) = request
+                    && !self.pending.values().any(|(_, p)| {
+                        matches!(p, super::Pending::Account | super::Pending::RefreshAccount)
+                    })
                 {
                     // A notification is a hint. Only account/read can authorize subscription usage.
-                    self.request(
-                        crate::codex::request::Call::Account,
-                        super::Pending::Account,
-                    )?;
+                    self.request(crate::codex::request::Call::Account, request)?;
                 }
             }
             Notification::Error {
@@ -404,7 +401,21 @@ mod tests {
             assert_eq!(store.state() == &Connection::Ready, ready);
         }
         store.notification(notification()).unwrap();
-        assert!(pending(&store).is_empty());
+        let id = store
+            .pending
+            .iter()
+            .find_map(|(id, (_, p))| matches!(p, Pending::RefreshAccount).then_some(*id))
+            .unwrap();
+        store.apply(LinkEvent::Frame(Frame::Reply {
+            id: RequestId::Number(id),
+            result: Ok(Reply::Account(
+                serde_json::from_value(
+                    json!({"account":{"type":"chatgpt","email":"second@example.invalid"}}),
+                )
+                .unwrap(),
+            )),
+        }));
+        assert_eq!(store.state(), &Connection::Ready);
         store.profile.route = Route::codex_api("vendor/model".into());
         store.state = Connection::SignInRequired;
         store.notification(notification()).unwrap();

@@ -162,8 +162,11 @@ class Host(socketserver.StreamRequestHandler):
                     assert frame["project"] == f.scope["project"]
                     send({"type":"worker_reply","id":frame["id"],"result":{"hosts":[
                         {"host":{"id":"laptop","name":"laptop"},"status":"online","parent_host":True,"routes":[f.scope["route"]]},
-                        {"host":{"id":"build-id","name":"Build","resources":{"load_one_minute":0.4,"available_memory":64_000_000_000}},
-                         "status":"online","parent_host":False,"routes":[{"runtime":"claude","billing":{"api":"build/only"}}]}]}})
+                        {"host":{"id":"build-id","name":"Build","subscription_limits":{"claude":[
+                            {"label":"five hour","used_percent":72,"status":"allowed","observed_at":1700000000,"resets_at":None},
+                            {"label":"old week","used_percent":99,"status":"allowed warning","observed_at":1,"resets_at":2}]},
+                            "resources":{"load_one_minute":0.4,"available_memory":64_000_000_000}},
+                         "status":"online","parent_host":False,"routes":[{"runtime":"claude","billing":"subscription"},{"runtime":"claude","billing":{"api":"build/only"}}]}]}})
                 elif frame["type"] == "discover":
                     send(
                         {
@@ -1055,7 +1058,14 @@ def run(harness, screenshot=None):
         wait(lambda: js("return [...document.getElementById('worker-host').options].some(o=>o.value==='build-id' && o.text.includes('64.0 GB free'))"))
         choose("worker-runtime","claude")
         choose("worker-host","build-id")
+        choose("worker-model","")
+        wait(lambda: js("return document.getElementById('worker-subscription-limits').innerText.includes('Build · Claude · five hour · 72% used')"))
+        assert not js("return document.getElementById('worker-subscription-limits').innerText.includes('old week')")
+        choose("worker-host","parent")
+        assert js("return document.getElementById('worker-subscription-limits').hidden")
+        choose("worker-host","build-id")
         choose("worker-model","build/only")
+        assert js("return document.getElementById('worker-subscription-limits').hidden")
         js("document.getElementById('worker-task').value='Remote-only model'; document.getElementById('worker-form').requestSubmit()")
         wait(lambda: any(a.get("start_worker",{}).get("host")=="build-id" and a["start_worker"]["model"]=="build/only" for a in host.actions if isinstance(a,dict)))
         wait(lambda: js("return document.getElementById('worker-form').hidden"))

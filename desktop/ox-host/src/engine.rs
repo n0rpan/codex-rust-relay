@@ -319,6 +319,7 @@ pub(crate) struct Engine {
     resources: crate::resources::Resources,
     next_resources: Instant,
     host_name: String,
+    subscription_limits: ox_desk_core::usage::reported::ReportedLimits,
     ledger: Ledger,
     replay: Replay,
     tx: SyncSender<Message>,
@@ -410,6 +411,7 @@ impl Engine {
             host_id,
             resources: Default::default(),
             next_resources: Instant::now(),
+            subscription_limits: Default::default(),
             host_name: sysinfo::System::host_name().unwrap_or_else(|| host_id.to_string()),
             config,
             ledger,
@@ -1794,6 +1796,9 @@ impl Engine {
         for event in events {
             let previous = live.store.asks().len();
             live.store.apply(event);
+            if let Some(report) = live.store.usage.worker_report.take() {
+                self.subscription_limits.record(&scope.route, report);
+            }
             if !live.tokens.is_empty() && live.store.asks().len() < previous {
                 live.tokens
                     .retain(|id, _| live.store.asks().iter().any(|a| &a.id == id));
@@ -2292,6 +2297,7 @@ impl Engine {
         let profile =
             ox_host_web::host_profile::HostProfile::read(&self.state_dir).unwrap_or_default();
         wire::HostInfo {
+            subscription_limits: self.subscription_limits.current(now_unix()),
             mode_policy: HostPolicy::read(&self.state_dir).ok(),
             id: Some(self.host_id.to_string()),
             name: Some(if profile.name.is_empty() {

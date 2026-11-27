@@ -46,7 +46,7 @@ pub use crate::codex::history::ThreadRow;
 #[derive(Debug)]
 enum Pending {
     Options(String, routes_thread::Options),
-    Limits(u64),
+    Limits(u64, u64, Option<crate::usage::reported::Reporter>),
     Discover(commands::Discovery),
     LeaveForTerminal(commands::Handoff),
     /// Best-effort release of a thread this client ended.
@@ -60,6 +60,7 @@ enum Pending {
     Compose(compose::Operation),
     Initialize,
     Account,
+    RefreshAccount,
     List {
         generation: u64,
         cursor: Option<String>,
@@ -294,7 +295,14 @@ impl Store {
         {
             return Ok(());
         }
-        self.request(Call::Limits, Pending::Limits(self.usage.version()))?;
+        self.request(
+            Call::Limits,
+            Pending::Limits(
+                self.usage.version(),
+                crate::usage::reported::next_sequence(),
+                self.usage.reporter,
+            ),
+        )?;
         self.usage.requested = true;
         self.usage.loading = true;
         Ok(())
@@ -546,7 +554,7 @@ impl Store {
                 }
                 transcript.error = Some(message);
             }
-            Pending::Limits(_) => {
+            Pending::Limits(..) => {
                 self.usage.loading = false;
                 self.usage.error = Some(message);
             }
@@ -570,6 +578,7 @@ impl Store {
             Pending::Unsubscribe => (),
             Pending::Discover(stage) => self.discovery_failed(stage, message),
             Pending::Compose(op) => self.compose_failed(op, message),
+            Pending::RefreshAccount => (),
             Pending::Initialize | Pending::Account => self.state = Connection::Closed(message),
             Pending::Access(id) => {
                 if let Some(announced) = self.held_yolo_resumes.get_mut(&id) {
@@ -604,7 +613,7 @@ impl Store {
             Pending::Mention(_)
             | Pending::LeaveForTerminal(_)
             | Pending::Discover(_)
-            | Pending::Limits(_) => self.changed.mark(Changed::NOTICE),
+            | Pending::Limits(..) => self.changed.mark(Changed::NOTICE),
             Pending::Compose(op) => {
                 self.changed.mark(Changed::THREADS);
                 if let Some(id) = op.thread() {
@@ -613,7 +622,9 @@ impl Store {
             }
             Pending::ThreadOp(_) => self.changed.mark(Changed::THREADS),
             Pending::Unsubscribe => (),
-            Pending::Initialize | Pending::Account => self.changed.mark(Changed::CONNECTION),
+            Pending::Initialize | Pending::Account | Pending::RefreshAccount => {
+                self.changed.mark(Changed::CONNECTION)
+            }
             Pending::PaletteSearch(_)
             | Pending::ChildIdentity(_)
             | Pending::List { .. }
@@ -713,6 +724,11 @@ impl Store {
                         return Ok(());
                     }
                 };
+                if self.profile.route == Route::CODEX_SUBSCRIPTION
+                    && let Reply::Account(account) = &value
+                {
+                    self.usage.codex_account(account);
+                }
                 match (pending, value) {
                     (Pending::LeaveForTerminal(handoff), Reply::Unsubscribed(_)) => {
                         self.handoff_ready = Some(handoff);
@@ -742,14 +758,20 @@ impl Store {
                             self.connected()?;
                         }
                     }
-                    (Pending::Limits(version), Reply::Limits(limits)) => {
-                        self.usage.read(*limits, version)
+                    (Pending::Limits(version, started, account), Reply::Limits(limits)) => {
+                        self.usage.loading = false;
+                        if account == self.usage.reporter {
+                            self.usage.read(*limits, version, started)
+                        }
                     }
-                    (Pending::Account, Reply::Account(account)) if !account.chatgpt() => {
+                    (Pending::Account | Pending::RefreshAccount, Reply::Account(account))
+                        if !account.chatgpt() =>
+                    {
                         self.state = Connection::SignInRequired;
                         self.list_more()?;
                     }
                     (Pending::Account, Reply::Account(_)) => self.connected()?,
+                    (Pending::RefreshAccount, Reply::Account(_)) => (),
                     (Pending::Read(id), Reply::Read(read, _)) => self.checked_read(&id, read),
                     (Pending::Resume(id), Reply::Resume(reply, _)) => {
                         self.checked_resume(&id, *reply)

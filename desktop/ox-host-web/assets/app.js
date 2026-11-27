@@ -2047,6 +2047,7 @@ function addCatalogRoutes() {
 let workerSeed = null;
 let workerSubmission = null;
 let workerHosts = [];
+let workerProjectRule = null;
 function requestWorkerHosts() {
   if (!detailLink?.ready || !detailLink.placement || detailLink.inventoryRequest || $("worker-form").hidden) return;
   detailLink.inventoryRequest = crypto.randomUUID();
@@ -2054,8 +2055,13 @@ function requestWorkerHosts() {
 }
 function showWorkerHosts(result, error) {
   $("worker-inventory-note").textContent = error || result?.warning || result?.placement_error || "";
-  if (!result?.hosts) return;
+  if (!result?.hosts) {
+    workerHosts = [];
+    showWorkerLimits();
+    return;
+  }
   workerHosts = result.hosts;
+  workerProjectRule = result.project_placement;
   const select = $("worker-host"), previous = select.value;
   const options = workerHosts.map(row => {
     const name = row.parent_host ? "Same as parent" : row.paired_name || row.host.name;
@@ -2091,7 +2097,41 @@ $("worker-host").onchange = () => {
   workerSeed = null;
   fillWorkerModels();
 };
-$("worker-model").onchange = () => { workerSeed = null; };
+$("worker-model").onchange = () => { workerSeed = null; showWorkerLimits(); };
+$("worker-model-free").oninput = showWorkerLimits;
+function showWorkerLimits() {
+  const panel = $("worker-subscription-limits");
+  panel.replaceChildren();
+  const target = $("worker-host").value, runtime = $("worker-runtime").value;
+  if (!workerModelValue()) {
+    const rule = target === "project" ? workerProjectRule : null;
+    const selector = (target === "project" ? rule?.host || "auto" : target).toLowerCase();
+    const now = Date.now() / 1000;
+    const stamp = (n) => new Date(n * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    for (const row of workerHosts) {
+      const selected = selector === "auto" || (selector === "parent" ? row.parent_host
+        : selector.startsWith("label:") ? row.host.labels?.some(s => s.toLowerCase() === selector.slice(6))
+        : [row.host.id, row.host.name, row.paired_name].some(s => s?.toLowerCase() === selector));
+      if (!selected || row.status !== "online" || (rule?.os && rule.os.toLowerCase() !== row.host.resources?.os?.toLowerCase())) continue;
+      if (!row.routes?.some(r => r.runtime === runtime && r.billing === "subscription")) continue;
+      const windows = row.host.subscription_limits?.[runtime];
+      if (!Array.isArray(windows)) continue;
+      for (const w of windows) {
+        if (!w || typeof w.label !== "string" || !Number.isFinite(w.observed_at)) continue;
+        if (w.resets_at != null && w.resets_at <= now) continue;
+        const parts = [row.paired_name || row.host.name, runtime === "claude" ? "Claude" : "ChatGPT", w.label];
+        if (w.used_percent != null) parts.push(w.used_percent + "% used");
+        if (w.status && (w.status !== "allowed" || w.used_percent == null)) parts.push(w.status);
+        parts.push((now - w.observed_at > 3600 ? "last reported " : "reported ") + stamp(w.observed_at));
+        if (w.resets_at != null) parts.push("resets " + stamp(w.resets_at));
+        const line = document.createElement("div");
+        line.textContent = parts.join(" · ");
+        panel.append(line);
+      }
+    }
+  }
+  panel.hidden = !panel.childElementCount;
+}
 setInterval(() => { if (!document.hidden) requestWorkerHosts(); }, 30_000);
 function fillWorkerModels() {
   const select = $("worker-model"),
@@ -2122,11 +2162,13 @@ function fillWorkerModels() {
   const free = !aliases.length;
   select.hidden = free;
   $("worker-model-free").hidden = !free;
+  showWorkerLimits();
 }
-const workerModelValue = () =>
-  ($("worker-model-free").hidden
+function workerModelValue() {
+  return ($("worker-model-free").hidden
     ? $("worker-model").value
     : $("worker-model-free").value.trim()) || null;
+}
 // Labels and one-line notes are the desktop's (worker_sheet.rs mode_label / mode_note).
 const workerModes = {
   session: "Session",

@@ -111,7 +111,10 @@ impl Inventory {
                 || chrono::Local::now().timestamp_millis(),
                 |t| t.timestamp_millis(),
             ),
-            info: self.info.clone(),
+            info: self.info.clone().map(|mut info| {
+                info.subscription_limits.clear();
+                info
+            }),
             directory: self.directory.clone(),
             rows,
         };

@@ -151,6 +151,19 @@ pub struct HostResources {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HostInfo {
+    #[serde(
+        default,
+        deserialize_with = "crate::usage::reported::deserialize_windows",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(
+            with = "std::collections::BTreeMap<String, Vec<crate::usage::reported::ReportedWindow>>"
+        )
+    )]
+    pub subscription_limits:
+        std::collections::BTreeMap<String, Vec<crate::usage::reported::ReportedWindow>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode_policy: Option<crate::host_policy::HostPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

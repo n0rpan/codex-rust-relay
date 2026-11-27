@@ -1826,6 +1826,15 @@
             }
           ]
         },
+        "subscription_limits": {
+          "additionalProperties": {
+            "items": {
+              "$ref": "#/$defs/ReportedWindow"
+            },
+            "type": "array"
+          },
+          "type": "object"
+        },
         "version": {
           "type": "string"
         }
@@ -2420,6 +2429,42 @@
         "id",
         "question",
         "header"
+      ],
+      "type": "object"
+    },
+    "ReportedWindow": {
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "observed_at": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "resets_at": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "used_percent": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "label",
+        "observed_at"
       ],
       "type": "object"
     },

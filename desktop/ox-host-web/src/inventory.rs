@@ -158,7 +158,10 @@ async fn sample(app: &App) -> io::Result<(Inventory, HashSet<String>)> {
         projects,
     ))
 }
-pub(crate) fn report(inventory: Inventory, grant: WorkerGrant) -> io::Result<Value> {
+pub(crate) fn report(mut inventory: Inventory, grant: WorkerGrant) -> io::Result<Value> {
+    if !grant.may_launch {
+        inventory.host.subscription_limits.clear();
+    }
     Ok(serde_json::to_value(Peer { inventory, grant })?)
 }
 async fn query_peer(
