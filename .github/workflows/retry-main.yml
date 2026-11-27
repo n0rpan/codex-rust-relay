@@ -1,0 +1,30 @@
+name: Retry main
+
+# One failed leg on main blocks the dev release for every platform, and most
+# such failures are runner or network faults (an artifact upload, a runner
+# that never started). Re-run the failed jobs of a main build once. A second
+# failure stays red. The dev publisher already refuses to replace a newer
+# build, so a late re-run cannot move the release backwards.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  actions: write
+
+jobs:
+  rerun:
+    name: Re-run failed jobs once
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: gh run rerun "${RUN_ID}" --repo "${GITHUB_REPOSITORY}" --failed
