@@ -291,7 +291,7 @@ jobs:
             if ! install_bwrap; then
               installed=false
               for attempt in 1 2 3; do
-                if sudo apt-get update -o Acquire::Retries=3 -o APT::Update::Error-Mode=any &&
+                if desktop/ci/apt-update.sh -o APT::Update::Error-Mode=any &&
                   install_bwrap; then
                   installed=true
                   break
@@ -768,7 +768,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           if ! command -v convert && ! command -v magick; then
-            sudo apt-get update -o Acquire::Retries=3
+            desktop/ci/apt-update.sh
             sudo apt-get install -y -o Acquire::Retries=3 imagemagick
           fi
           desktop/ci/browser-runtime.sh
