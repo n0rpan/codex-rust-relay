@@ -185,6 +185,7 @@ impl Engine {
             }
             Operation::Start {
                 results,
+                memory_brief,
                 parent,
                 level,
                 start,
@@ -253,7 +254,18 @@ impl Engine {
                     project: job.project.clone(),
                     job: r.job,
                 };
-                let accepted = self.accept_launch(&caller, *start.clone())?;
+                let mut accepted = self.accept_launch(&caller, *start.clone())?;
+                if let Some(brief) = memory_brief
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let capped: String =
+                        brief.chars().take(ox_memory::DEFAULT_BRIEF_CHARS).collect();
+                    if let Accepted::Launch(_, l) = &mut accepted {
+                        l.memory_brief = Some(capped);
+                    }
+                }
                 let origin = match &accepted {
                     Accepted::Launch(_, l) => &l.origin,
                     Accepted::Ask(a) => &a.origin,

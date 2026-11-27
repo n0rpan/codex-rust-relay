@@ -159,6 +159,8 @@ pub(crate) struct Launching {
     /// The launcher already has its answer (a YOLO request the operator accepted).
     /// A failure is recorded as the job's outcome instead.
     detached: bool,
+    /// Optional pre-filtered Tier-1 memory brief delivered with a cross-host worker start.
+    pub(crate) memory_brief: Option<String>,
     /// The parent was force-ended after the first message was already sent, so the
     /// launch cannot be recalled. The session it opens is retired on arrival.
     abandoned: bool,
@@ -2580,6 +2582,7 @@ impl Engine {
             deadline: Instant::now() + Duration::from_secs(60),
             detached: false,
             abandoned: false,
+            memory_brief: None,
         })
     }
     fn job_status(&self, job_id: u64) -> Result<Value, String> {
@@ -3544,11 +3547,14 @@ fn advance_launch(live: &mut Live) -> Option<String> {
                     Action::InjectHandoff(std::mem::take(text), std::mem::take(items))
                 }
             };
-            return live
+            live.store.set_memory_brief_override(l.memory_brief.clone());
+            let result = live
                 .store
                 .send_on_worker_blank(action, sender)
                 .err()
                 .map(|e| e.to_string());
+            live.store.set_memory_brief_override(None);
+            return result;
         }
     }
     let goal = matches!(&l.payload, Payload::Worker(w) if w.mode == WorkerMode::Goal);
@@ -3584,10 +3590,14 @@ fn advance_launch(live: &mut Live) -> Option<String> {
                     Action::InjectHandoff(std::mem::take(text), std::mem::take(items))
                 }
             };
-            live.store
+            live.store.set_memory_brief_override(l.memory_brief.clone());
+            let result = live
+                .store
                 .dispatch_as(action, sender)
                 .err()
-                .map(|e| e.to_string())
+                .map(|e| e.to_string());
+            live.store.set_memory_brief_override(None);
+            result
         }
         _ => None,
     }
@@ -7317,6 +7327,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(60),
                 detached: false,
                 abandoned: false,
+                memory_brief: None,
             });
             let until = Instant::now() + Duration::from_secs(20);
             let result = loop {
@@ -7854,6 +7865,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(60),
                 detached: false,
                 abandoned: false,
+                memory_brief: None,
             });
             engine.running.insert(worker.clone(), starting);
             engine.end_children(&parent, "a").unwrap();
@@ -8147,6 +8159,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(60),
                 detached: false,
                 abandoned: false,
+                memory_brief: None,
             });
             engine.running.insert(worker.clone(), starting);
             let status = engine
@@ -8189,6 +8202,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(60),
                 detached: false,
                 abandoned: false,
+                memory_brief: None,
             });
             engine.running.insert(worker.clone(), sent);
             assert!(engine.abort_launch(41).unwrap().is_none());

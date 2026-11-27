@@ -301,13 +301,27 @@ impl Engine {
                 destination,
                 max_age_days,
             }),
-            project,
             operation: Operation::Start {
                 results: None,
+                memory_brief: {
+                    let ceiling = ox_desk_core::memory::route_sensitivity_ceiling(&start.route())
+                        .min(ox_memory::Sensitivity::Private);
+                    let project_id = ox_memory::canonical_project_id(&project);
+                    ox_memory::MemoryStore::open(self.state_dir.join("memory.json"))
+                        .tier1_brief(
+                            Some(&project_id),
+                            None,
+                            ceiling,
+                            ox_memory::DEFAULT_BRIEF_CHARS,
+                        )
+                        .ok()
+                        .flatten()
+                },
                 parent: parent_ref,
                 level,
                 start: Box::new(start),
             },
+            project,
         }
         .save(&queue)
         .map_err(|e| e.to_string())?;

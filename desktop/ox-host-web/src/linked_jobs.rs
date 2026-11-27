@@ -30,6 +30,8 @@ pub enum Operation {
     Start {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         results: Option<crate::worker_result::Policy>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory_brief: Option<String>,
         parent: ParentRef,
         level: Level,
         start: Box<WorkerStart>,
@@ -202,6 +204,7 @@ mod tests {
         };
         let start = request(Operation::Start {
             results: None,
+            memory_brief: None,
             parent,
             level: Level::Yolo,
             start: Box::new(start),

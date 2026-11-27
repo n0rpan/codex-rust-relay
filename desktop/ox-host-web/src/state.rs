@@ -352,6 +352,9 @@ impl State {
     pub fn worker_links_path(&self) -> PathBuf {
         self.dir.join("worker-links.json")
     }
+    pub fn memory_path(&self) -> PathBuf {
+        self.dir.join("memory.json")
+    }
     fn create_invite(
         &mut self,
         login: String,
