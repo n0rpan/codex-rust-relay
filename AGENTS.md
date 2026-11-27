@@ -133,6 +133,26 @@ So, before you call work finished:
   resolved with your side.
 - Say in the description which commit of `main` you checked against.
 
+## Stacked pull requests
+
+Splitting a large change into pull requests that build on each other is fine,
+and each one gets its own review. Only the bottom one can merge.
+
+- **Base each pull request on the one below it**, so its diff shows only its
+  own change. Say in the description what it is stacked on.
+- **Label only the one based on `main`.** `full-ci` on a pull request based
+  on another branch does nothing: automatic merging holds it, because that
+  branch has no required checks.
+- **When the one below has merged**, bring the next one down to `main`:
+  1. Change its base to `main` (`gh pr edit <number> --base main`).
+  2. Merge `main` into its branch. The squash rewrote the commits it was
+     built on, so git reports conflicts; check that `main` holds what you
+     built on (`git diff <old base tip> origin/main -- <paths>`) and resolve
+     with your side.
+  3. Push, wait for the review of that commit, then add `full-ci`.
+- **One at a time.** Do not retarget the whole stack at once: every pull
+  request above the bottom would show the changes below it as its own.
+
 ## What a pull request cannot test
 
 These run for the first time on `main` or a tag. A green pull request says
@@ -168,7 +188,7 @@ you call it done.
   `main` has moved, unless a newer commit is already released.
 - **Automatic merging is for pull requests into `main`.** Another branch has
   no required checks: a stacked pull request with auto-merge on would merge
-  into its base at once and reach nobody. Set its base to `main` first.
+  into its base at once and reach nobody. See "Stacked pull requests".
 - **A platform a pull request skips is a platform it can break.** Linux ARM
   and macOS Intel only run with `full-ci` or on `main`.
 - **Any failed job on `main` loses the release for every platform.**
