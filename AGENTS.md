@@ -157,6 +157,9 @@ and each one gets its own review. Only the bottom one can merge.
      built on (`git diff <old base tip> origin/main -- <paths>`) and resolve
      with your side.
   3. Push, wait for the review of that commit, then add `full-ci`.
+- **Before deleting a branch by hand**, check that no open pull request is
+  based on it: `gh pr list --base <branch>`. If one is, change that pull
+  request's base to `main` first.
 - **One at a time.** Do not retarget the whole stack at once: every pull
   request above the bottom would show the changes below it as its own.
 
