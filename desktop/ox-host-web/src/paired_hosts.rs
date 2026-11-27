@@ -225,6 +225,12 @@ pub(crate) fn window_origin(address: &str) -> io::Result<String> {
         io::Error::other("Enter the HTTPS .ts.net address of a host that is waiting.")
     })
 }
+/// True when an address alone names a host that is waiting, with no invitation
+/// fragment and no typed code. An invitation link carries its code in
+/// `#pair=` and is redeemed as one.
+pub(crate) fn window_address(address: &str, code: &str) -> bool {
+    code.trim().is_empty() && !address.contains("#pair=")
+}
 pub(crate) fn enroll(
     invite: Invitation,
     label: &str,
@@ -497,5 +503,38 @@ impl KeyReview {
                 "The server’s keys changed. Review the transfer again.",
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{window_address, window_origin};
+    #[test]
+    fn an_invitation_link_is_never_mistaken_for_a_waiting_host() {
+        // A pasted invitation carries its code in the fragment.
+        assert!(!window_address(
+            "https://lab.tail1234.ts.net:7443/#pair=abc",
+            ""
+        ));
+        assert!(window_address("https://lab.tail1234.ts.net:7443", ""));
+        assert!(window_address("lab.tail1234.ts.net", "  "));
+        // A typed code, or a short one, is redeemed as an invitation.
+        assert!(!window_address(
+            "https://lab.tail1234.ts.net:7443",
+            "Y02Z-1NET-TDH8"
+        ));
+    }
+    #[test]
+    fn a_waiting_host_needs_only_an_address() {
+        assert_eq!(
+            window_origin("lab.tail1234.ts.net").unwrap(),
+            "https://lab.tail1234.ts.net:8443"
+        );
+        assert_eq!(
+            window_origin("https://lab.tail1234.ts.net:7443/").unwrap(),
+            "https://lab.tail1234.ts.net:7443"
+        );
+        assert!(window_origin("https://example.com").is_err());
+        assert!(window_origin("").is_err());
     }
 }

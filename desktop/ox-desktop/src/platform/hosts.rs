@@ -1,7 +1,11 @@
 pub(crate) use ox_host_web::paired_hosts::{
     Folders, KeyReview, SavedHost, device_label, list, pair,
 };
-pub(crate) use ox_host_web::{client::OpenHost, discovery::open_hosts, paired_hosts::pair_window};
+pub(crate) use ox_host_web::{
+    client::OpenHost,
+    discovery::open_hosts,
+    paired_hosts::{pair_window, window_address},
+};
 
 /// Hosts on this tailnet waiting for a device. This machine's own Serve port is
 /// tried first, because a tailnet usually shares one.

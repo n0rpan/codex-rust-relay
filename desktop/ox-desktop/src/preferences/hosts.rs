@@ -260,10 +260,10 @@ impl Hosts {
     fn add(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let address = self.address.read(cx).value().to_string();
         let code = self.code.read(cx).value().to_string();
-        // An address with no code means the other machine is waiting in a
-        // pairing window, so there is nothing to redeem.
+        // An address with no code and no invitation fragment means the other
+        // machine is waiting in a pairing window, so nothing is redeemed.
         let paired = move || {
-            if code.trim().is_empty() {
+            if hosts::window_address(&address, &code) {
                 hosts::pair_window(&address, &hosts::device_label())
             } else {
                 hosts::pair(&address, &code, &hosts::device_label())

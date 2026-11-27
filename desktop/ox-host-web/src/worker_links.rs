@@ -150,9 +150,9 @@ pub(super) fn execute(app: &App, device: Option<&str>, action: Action) -> io::Re
         }
         Action::AddWorkerLink { address, code } => {
             super::background_keychain().map_err(io::Error::other)?;
-            if code.trim().is_empty() {
-                // An address with no code means the host is waiting in a
-                // pairing window, so there is nothing to redeem.
+            if paired_hosts::window_address(&address, &code) {
+                // An address with no code and no invitation fragment means the
+                // host is waiting in a pairing window, so nothing is redeemed.
                 let target = paired_hosts::window_origin(&address).map_err(|_| {
                     io::Error::other(
                         "Enter the host's HTTPS .ts.net address, or paste its invitation link.",
