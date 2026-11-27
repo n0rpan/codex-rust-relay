@@ -790,6 +790,7 @@ impl Engine {
                 capabilities.push("handoff_history".into());
                 capabilities.push("linked_read_workers".into());
                 capabilities.push("linked_write_workers".into());
+                capabilities.push("worker_memory_brief".into());
                 if prepared.is_some() {
                     capabilities.push("worker_routes_known".into());
                 }

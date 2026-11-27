@@ -34,6 +34,10 @@ pub(crate) struct Inventory {
     linked_read: bool,
     #[serde(default)]
     linked_write: bool,
+    /// The target accepts the optional `memory_brief` launch fields. Older
+    /// hosts reject unknown fields, so the parent must not send them blindly.
+    #[serde(default)]
+    memory_brief: bool,
     has_project: Option<bool>,
 }
 // A newer host may also run an agent or billing route this client cannot launch.
@@ -157,6 +161,7 @@ async fn sample(app: &App) -> io::Result<(Inventory, HashSet<String>)> {
             codex_subscription_workers: supports("worker_codex_subscription"),
             linked_read: supports("linked_read_workers"),
             linked_write: supports("linked_write_workers"),
+            memory_brief: supports("worker_memory_brief"),
         },
         projects,
     ))
@@ -197,6 +202,13 @@ async fn query_peer(
     }
     Ok(peer)
 }
+/// Target capabilities that decide how the parent builds a launch envelope.
+pub struct Launch {
+    /// The target accepts write results from linked workers.
+    pub linked_write: bool,
+    /// The target understands `memory_brief`. Older hosts deny unknown fields.
+    pub memory_brief: bool,
+}
 /// Check this job against a current target sample before building its checkout.
 pub fn check_launch(
     host: &paired_hosts::SavedHost,
@@ -204,12 +216,15 @@ pub fn check_launch(
     project: &Path,
     start: &ox_desk_core::origin::WorkerStart,
     parent: ox_desk_core::modes::Level,
-) -> io::Result<bool> {
+) -> io::Result<Launch> {
     let repo = repository_id(project)
         .ok_or_else(|| io::Error::other("Remote workers need a shared Git origin."))?;
     let peer = client::runtime()?.block_on(query_peer(host, source, Some(&repo), true))?;
     check_peer(&peer, &host.name, start, parent)?;
-    Ok(peer.inventory.linked_write)
+    Ok(Launch {
+        linked_write: peer.inventory.linked_write,
+        memory_brief: peer.inventory.memory_brief,
+    })
 }
 fn check_peer(
     peer: &Peer,

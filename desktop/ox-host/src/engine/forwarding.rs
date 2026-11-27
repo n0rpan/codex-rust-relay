@@ -357,15 +357,24 @@ impl Engine {
                     start,
                     level,
                     results,
+                    memory_brief,
+                    memory_brief_sensitivity,
                     ..
                 } = &mut p.operation
                 else {
                     return Err(io::Error::other("Invalid queued worker request."));
                 };
                 if !queue.join("snapshot").is_dir() {
-                    if ox_host_web::inventory::check_launch(
+                    let launch = ox_host_web::inventory::check_launch(
                         &host, &source, &p.project, start, *level,
-                    )? {
+                    )?;
+                    // A receiver from before the brief existed rejects the
+                    // optional fields, so omit them instead of failing the launch.
+                    if !launch.memory_brief {
+                        *memory_brief = None;
+                        *memory_brief_sensitivity = None;
+                    }
+                    if launch.linked_write {
                         *results = Some(p.policy.clone().unwrap_or_default());
                     }
                     ox_desk_core::state_file::write_json(&queue.join("start.json"), &p)?;
