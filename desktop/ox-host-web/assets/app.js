@@ -1550,6 +1550,52 @@ new IntersectionObserver(([entry]) => {
   $("nav-title").hidden = $("conversation").hidden || entry.boundingClientRect.bottom >= 0;
 }).observe($("title"));
 
+// An absolute path such as /home/oscar/project is still an ordinary message.
+function composerCommand(content) {
+  const text = content.trim();
+  const name = text.split(/\s/, 1)[0];
+  if (name.startsWith("/") && Object.hasOwn(controls.schema.session_commands ?? {}, name)) return text;
+  return /^\/[^\s/]*(?:\s|$)/.test(text) ? text : null;
+}
+const localCommands = new Set(["/new", "/clear", "/resume", "/terminal", "/model"]);
+function commandSuggestions(command) {
+  const menu = $("slash-choices"), schema = controls.schema;
+  const name = command?.split(/\s/, 1)[0];
+  let rows = [];
+  if (command && controls.enabled("native_commands")) {
+    rows = (schema.choices ?? []).filter(([name]) => name.startsWith(command));
+    if (name === "/goal" && schema.goal_choices)
+      rows = schema.goal_choices.filter(([name]) => name.startsWith(command));
+    if (name === "/speed" && schema.speed) {
+      const model = $("composer-model")?.value || schema.model;
+      rows = ["default", ...(schema.catalog?.[model] ?? []).map((tier) => tier.id)]
+        .map((tier) => "/speed " + tier).filter((name) => name.startsWith(command))
+        .map((name) => [name, "Service tier"]);
+    }
+  }
+  const terminal = !!command && !$("operator-session").hidden && (
+    command === "/" || (!rows.length && !schema.choices?.some(([known]) => known === name)) ||
+    Object.hasOwn(schema.session_commands ?? {}, name)
+  );
+  const stamp = JSON.stringify([rows, terminal, command === "/"]);
+  if (menu.dataset.choices === stamp) return;
+  menu.dataset.choices = stamp;
+  menu.hidden = !rows.length && !terminal;
+  menu.replaceChildren(...rows.map(([name, hint]) => {
+    const choice = button(name, () => {
+      $("draft").value = name + " ";
+      $("draft").oninput();
+      if (name === "/model") $("composer").requestSubmit();
+      else $("draft").focus();
+    });
+    choice.title = hint;
+    return choice;
+  }));
+  if (terminal) menu.append(button(command === "/" ? "All commands in native terminal" : "Open in native terminal", () => {
+    if (selected?.id)
+      openPhoneTerminal("native-session", null, { scope: selected.scope, thread: selected.id }, $("draft").value.trim());
+  }));
+}
 function updateComposerState() {
   if (!selected) return;
   const { scope, id } = selected,
@@ -1574,12 +1620,17 @@ function updateComposerState() {
   const canSend = id
     ? caps.some((c) => c === "send" || c === "steer")
     : s?.capabilities.includes("start");
-  $("send").textContent = caps.includes("steer") ? "Steer" : "Send";
+  const command = composerCommand($("draft").value);
+  commandSuggestions(command);
+  const canRun = localCommands.has(command) || inputCaps.includes("native_commands");
+  $("send").textContent = command
+    ? (canRun ? "Run command" : "Commands unavailable")
+    : (caps.includes("steer") ? "Steer" : "Send");
   $("send").disabled =
-    !canSend ||
+    (command ? !canRun || command === "/" : !canSend) ||
     !detailLink?.ready ||
     (!$("draft").value.trim() && !imagesFor(keyOf(scope, id)).length) ||
-    (imagesFor(keyOf(scope, id)).length > 0 &&
+    (!command && imagesFor(keyOf(scope, id)).length > 0 &&
       !inputCaps.includes("attach_image")) ||
     Boolean(pendingNew);
   const running = Boolean(detailLink?.ready && caps.includes("stop"));
@@ -1729,7 +1780,6 @@ function conversation() {
       }
     }
   }
-  updateComposerState();
   // A running turn that waits on an approval still gets the session terminal, so the
   // person can review the command there (the desktop offers the same path).
   const awaitingApproval =
@@ -1739,6 +1789,7 @@ function conversation() {
     !!row?.parent ||
     !!origin ||
     !(caps.includes("send") || awaitingApproval);
+  updateComposerState();
   $("menu-session").hidden = !id;
   $("menu-workers").hidden = !id || !caps.includes("open");
   $("menu-settings").hidden = $("session-controls").hidden;
@@ -2500,20 +2551,51 @@ $("composer").onsubmit = (e) => {
   e.preventDefault();
   if ($("send").disabled || !selected) return;
   const { scope, id } = selected,
-    link = detailLink,
-    s = link.model.scopes.get(scopeKey(scope)),
-    row = s?.sessions.find((x) => x.id === id);
+    link = detailLink;
   const content = $("draft").value;
   const owner = keyOf(scope, id);
-  const images = imagesFor(owner);
-  const action = images.length
+  const command = composerCommand(content);
+  if (localCommands.has(command)) {
+    if (command === "/model" && (!$("composer-model") || $("composer-models").hidden || $("composer-model").disabled)) {
+      controls.error = scope.route.runtime === "claude" && !Object.keys(controls.schema.models ?? {}).length
+        ? "Type /model followed by a model name, such as /model sonnet."
+        : "Model selection is unavailable for this session right now.";
+      controls.render();
+      return;
+    }
+    if (command === "/terminal" && $("operator-session").hidden) {
+      controls.error = "Open an idle session to use its native terminal.";
+      controls.render();
+      return;
+    }
+    controls.error = "";
+    controls.render();
+    $("draft").value = "";
+    $("draft").oninput();
+    if (command === "/new" || command === "/clear") open(scope, null);
+    if (command === "/resume") { home(); $("find-sessions").focus(); }
+    if (command === "/terminal") $("operator-session").click();
+    if (command === "/model") {
+      const picker = $("composer-model");
+      picker.focus();
+      // Browsers without showPicker still expose the focused native select.
+      try { picker.showPicker?.(); } catch {}
+    }
+    return;
+  }
+  const images = command ? [] : imagesFor(owner);
+  const action = command
+      ? { native_command: [id, command] }
+      : images.length
       ? { send_images: [id, content, images.map((v) => v.image)] }
       : { send_text: [id, content] };
   pendingNew = { owner };
   const sentNow = { content, images };
   unacked.set(owner, sentNow);
   if (
-    !link.act(action, null, (ok) => {
+    !link.act(action, null, (ok, message) => {
+      if (command && selected?.id === id && detailLink === link)
+        controls.error = ok ? "" : message || "Disconnected before confirmation.";
       if (unacked.get(owner) === sentNow) unacked.delete(owner);
       pendingNew = null;
       if (ok && !sentNow.restored) {
@@ -2526,7 +2608,7 @@ $("composer").onsubmit = (e) => {
           $("draft").value = "";
           syncDraftHeight();
         }
-        notice(id ? "" : "Message sent. Your new session is in Sessions.");
+        notice(id || command ? "" : "Message sent. Your new session is in Sessions.");
       }
       repaint();
     })

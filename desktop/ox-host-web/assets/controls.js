@@ -165,6 +165,10 @@ export class SessionControls {
   }
   reset() {
     this.ctx = null;
+    this.caps = [];
+    this.schema = {};
+    $("composer-models").hidden = true;
+    $("composer-status").hidden = true;
     this.pending = new Set();
     this.error = "";
     this.actionStamp = null;
@@ -181,7 +185,7 @@ export class SessionControls {
     $("session-settings").hidden = !open;
     $("open-settings").setAttribute("aria-expanded", String(open));
     $("access-mode").setAttribute("aria-expanded", String(open));
-    if (open) this.render();
+    this.render();
   }
   enabled(cap) {
     return !!this.ctx?.ready && this.caps.includes(cap);
@@ -219,7 +223,13 @@ export class SessionControls {
       own = row?.detail ?? {};
     const present = !!state && (draft || !!row);
     $("session-controls").hidden = !present;
-    if (!present) return;
+    if (!present) {
+      $("composer-models").hidden = true;
+      $("composer-status").hidden = true;
+      this.schema = {};
+      this.caps = [];
+      return;
+    }
     this.caps = (draft ? state.capabilities : row.capabilities) ?? [];
     const confirmed = draft ? detail.applied_draft_access : own.access;
     const planned = draft ? detail.next_access : null;
@@ -270,6 +280,54 @@ export class SessionControls {
     );
     // Thread actions live in the conversation menu, so they render whether or not settings are open.
     this.threadActions();
+    const settings = (draft ? detail.default_options : own.options) ?? {};
+    const schema = (draft ? null : own.command_caps) ?? detail.commands ?? {};
+    this.schema = schema;
+    const model = settings.model || schema.model || "";
+    const models = schema.models ?? {};
+    const route = own.route ?? scope.route,
+      billing = route.billing;
+    const compatible = (id) =>
+      typeof billing === "string" ||
+      billing.api === id ||
+      (scope.route.runtime === "codex" && detail.provider !== "codeox") ||
+      (id.includes("/") && billing.api.includes("/") && id.split("/")[0] === billing.api.split("/")[0]);
+    const modelRows = Object.entries(models)
+      .filter(([k]) => compatible(k))
+      .sort(([a, x], [b, y]) => (x.rank ?? Infinity) - (y.rank ?? Infinity) || a.localeCompare(b))
+      .map(([k, v]) => [
+        k,
+        // The default entry's label already names the model it resolves to.
+        v.label && v.label !== k
+          ? k === "default"
+            ? v.label
+            : v.label + " · " + k
+          : k,
+      ]);
+    const edit =
+      modelRows.length > 0 &&
+      this.enabled("model_options") &&
+      !own.changing &&
+      !this.pending.has("options");
+    const change = (choice) =>
+      this.apply({ model_options: [id, choice] }, "options");
+    $("composer-models").hidden = !modelRows.length && !model;
+    // Keep the confirmed model visible even if discovery hasn't returned its row yet.
+    if ((model || modelRows.length) && !modelRows.some(([id]) => id === model))
+      modelRows.unshift([model, model || "Choose model"]);
+    const selectModel = (v) => { if (v) change({ model: v }); };
+    field($("composer-models"), "composer-model", "Model", modelRows, model, edit, selectModel);
+    const timeline = state.transcripts[id];
+    const status =
+      this.error ||
+      timeline?.detail?.command_notice ||
+      detail.notice ||
+      detail.error;
+    $("control-status").hidden = !status;
+    $("control-status").textContent = typeof status === "string" ? status : "";
+    $("composer-status").hidden = !status || !$("session-settings").hidden;
+    if ($("composer-status").textContent !== (status || ""))
+      $("composer-status").textContent = status || "";
     if ($("session-settings").hidden) return;
     const options = this.allowed.map((v) => [v, modes[v]]);
     if (!this.allowed.includes(current))
@@ -284,41 +342,9 @@ export class SessionControls {
       $("permission").disabled ||
       !this.allowed.includes($("permission").value) ||
       $("permission").value === current;
-    const settings = (draft ? detail.default_options : own.options) ?? {};
-    const schema = (draft ? null : own.command_caps) ?? detail.commands ?? {};
-    const model = settings.model || schema.model || "";
-    const models = schema.models ?? {};
-    const route = own.route ?? scope.route,
-      billing = route.billing;
-    const compatible = (id) =>
-      typeof billing === "string" ||
-      billing.api === id ||
-      (scope.route.runtime === "codex" &&
-        (detail.provider !== "codeox" ||
-          (id.includes("/") &&
-            id.split("/")[0] === billing.api.split("/")[0])));
-    const modelRows = Object.entries(models)
-      .filter(([k]) => compatible(k))
-      .map(([k, v]) => [
-        k,
-        // The default entry's label already names the model it resolves to.
-        v.label && v.label !== k
-          ? k === "default"
-            ? v.label
-            : v.label + " · " + k
-          : k,
-      ]);
-    const edit =
-      this.enabled("model_options") &&
-      !own.changing &&
-      !this.pending.has("options");
-    const change = (choice) =>
-      this.apply({ model_options: [id, choice] }, "options");
     const parent = $("model-fields"),
       activeModel = models[model];
-    field(parent, "session-model", "Model", modelRows, model, edit, (v) =>
-      change({ model: v }),
-    );
+    field(parent, "session-model", "Model", modelRows, model, edit, selectModel);
     const efforts = (activeModel?.efforts ?? []).map((v) => [
       v.reasoningEffort,
       v.reasoningEffort,
@@ -362,7 +388,6 @@ export class SessionControls {
     $("command-args").hidden = custom;
     $("native-command-form").querySelector("button").disabled =
       !ready || this.pending.has("command");
-    const timeline = state.transcripts[id];
     const readLimits =
       scope.route.runtime === "codex" &&
       billing === "subscription" &&
@@ -373,13 +398,6 @@ export class SessionControls {
       (action) => this.apply(action, "usage"),
       !!readLimits && ready,
     );
-    const status =
-      this.error ||
-      timeline?.detail?.command_notice ||
-      detail.notice ||
-      detail.error;
-    $("control-status").hidden = !status;
-    $("control-status").textContent = typeof status === "string" ? status : "";
   }
   threadActions() {
     const { id, ready, archived, pinned, color, togglePin, cycleColor } =

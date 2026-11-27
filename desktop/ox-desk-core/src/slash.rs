@@ -213,11 +213,24 @@ impl Capabilities {
     pub fn choices(&self) -> Vec<(String, String)> {
         let mut rows = vec![
             ("/new", "Start a new session"),
+            ("/clear", "Start a new session with empty context"),
             ("/resume", "Choose a saved session"),
             ("/status", "Show this session’s billing route and model"),
         ];
         if self.supports_goal() {
             rows.push(("/goal", "View or change this session’s goal"));
+        }
+        if self.session_commands.is_none()
+            && matches!(
+                self.provider.as_str(),
+                crate::store::claude::SUBSCRIPTION_PROVIDER | crate::store::claude::API_PROVIDER
+            )
+        {
+            // Submitting these cold discovers and verifies them with this session's client.
+            rows.extend([
+                ("/goal", "View or set the Claude session goal"),
+                ("/effort", "View or change Claude’s effort"),
+            ]);
         }
         if self.speed {
             rows.push(("/speed", "Choose the model’s service tier"));
@@ -249,13 +262,17 @@ pub enum NativeCommand {
     Goal(Goal),
     Speed(Option<String>),
     Status,
+    Model(String),
     Compact,
     Rename(String),
 }
 
 impl NativeCommand {
     pub fn allowed_during_turn(&self) -> bool {
-        matches!(self, Self::Status | Self::Speed(_) | Self::Goal(_))
+        matches!(
+            self,
+            Self::Status | Self::Model(_) | Self::Speed(_) | Self::Goal(_)
+        )
     }
 }
 
@@ -296,9 +313,7 @@ pub(crate) fn possible_claude_command(name: &str) -> bool {
         || matches!(
             name,
             "model"
-                | "effort"
-                | "fast"
-                | "goal"
+                | "workflow-launch-exec"
                 | "speed"
                 | "clear"
                 | "terminal"
@@ -324,7 +339,10 @@ pub fn parse(text: &str, caps: &Capabilities) -> Option<Action> {
             Action::SessionCommand
         }
         ("/", "") => Action::Hint("Choose a command below.".into()),
-        ("/new", "") => Action::New,
+        ("/model", model) if !model.is_empty() => {
+            Action::Native(NativeCommand::Model(model.into()))
+        }
+        ("/new" | "/clear", "") => Action::New,
         ("/resume", "") => Action::Resume,
         ("/status", "") => Action::Native(NativeCommand::Status),
         ("/compact", "") if caps.methods.contains("thread/compact/start") => {
@@ -399,13 +417,19 @@ pub fn completions(text: &str, caps: &Capabilities) -> Vec<(String, String)> {
     }
     caps.choices()
         .into_iter()
+        .chain(std::iter::once((
+            "/model".into(),
+            "Choose the session model".into(),
+        )))
         .filter(|(name, _)| name.starts_with(word))
         .map(|(name, hint)| {
             let method = match name.as_str() {
-                "/goal" => "thread/goal/get",
-                "/rename" => "thread/name/set",
+                "/goal" if caps.supports_goal() => "thread/goal/get",
+                "/rename" if caps.methods.contains("thread/name/set") => "thread/name/set",
                 "/speed" => "thread/settings/update",
-                "/compact" => "thread/compact/start",
+                "/compact" if caps.methods.contains("thread/compact/start") => {
+                    "thread/compact/start"
+                }
                 "/resume" => "thread/list",
                 _ => &hint,
             };

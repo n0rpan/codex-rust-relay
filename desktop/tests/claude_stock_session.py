@@ -528,15 +528,18 @@ def run(root, ox, claude, api_only=False):
             alternate.expected_auth = "fixture-other-only"
             threading.Thread(target=alternate.serve_forever, daemon=True).start()
             stack.callback(alternate.shutdown)
+            vendor.models = {"demo", "alternate"}
             with (root / "codex" / "codeox.toml").open("a") as config:
                 config.write(
-                    '\n[providers.other]\nname="Other"\nwire_api="anthropic_messages"\n'
+                    '\n[[providers.fixture.models]]\nid="alternate"\ncontext_window=131072\n'
+                    '[providers.other]\nname="Other"\nwire_api="anthropic_messages"\n'
                     f'base_url="http://127.0.0.1:{alternate.server_port}/v1"\n'
                     'discovery=false\nenv_key="OX_CLAUDE_OTHER_FIXTURE_KEY"\n'
                     '[[providers.other.models]]\nid="demo"\ncontext_window=131072\n'
                 )
             env["OX_CLAUDE_OTHER_FIXTURE_KEY"] = alternate.expected_auth
             workbench(root, ox, env, "api")
+            assert any(r["model"] == "alternate" and "Use the alternate model in this session" in json.dumps(r["messages"]) for r in vendor.requests)
             assert alternate.requests and not alternate.errors and not vendor.errors
             assert all("ONLY THE SECOND ALIAS" not in json.dumps(r["messages"]) for r in vendor.requests)
             assert any("ONLY THE SECOND ALIAS" in json.dumps(r["messages"]) for r in alternate.requests)

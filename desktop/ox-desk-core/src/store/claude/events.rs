@@ -296,7 +296,11 @@ impl Store {
                     return Err(io::Error::other("Claude opened a different project"));
                 }
                 if let Billing::Api(alias) = &self.profile.route.billing
-                    && *alias != init.model
+                    && self.claude().sessions[owner]
+                        .selected_model
+                        .as_ref()
+                        .unwrap_or(alias)
+                        != &init.model
                 {
                     return Err(io::Error::other(
                         "Claude opened a different API model alias",
@@ -307,7 +311,10 @@ impl Store {
                 p.mode = mode;
                 if let Some(caps) = &mut p.capabilities {
                     // The stream reports the concrete model the symbolic default resolves to.
-                    if caps.model == "default" && init.model != "default" {
+                    if p.selected_model.is_none()
+                        && caps.model == "default"
+                        && init.model != "default"
+                    {
                         if let Some(info) = Arc::make_mut(&mut caps.models).get_mut("default") {
                             info.resolved = Some(init.model.clone());
                         }
@@ -316,7 +323,15 @@ impl Store {
                             info.label = name;
                         }
                     }
-                    caps.model = init.model.clone();
+                    caps.model = p
+                        .selected_model
+                        .clone()
+                        .filter(|m| {
+                            m == &init.model
+                                || caps.models.get(m).and_then(|info| info.resolved.as_deref())
+                                    == Some(&init.model)
+                        })
+                        .unwrap_or_else(|| init.model.clone());
                     let offered: HashSet<_> = init
                         .slash_commands
                         .iter()
@@ -327,14 +342,23 @@ impl Store {
                             .retain(|name, _| offered.contains(name.trim_start_matches('/')));
                     }
                 }
+                let displayed_model = p
+                    .capabilities
+                    .as_ref()
+                    .map_or(&init.model, |c| &c.model)
+                    .clone();
                 let t = self.transcripts.entry(owner.into()).or_default();
-                t.model = Some(init.model.clone());
+                t.model = Some(displayed_model);
                 t.access = mode;
+                let route_model = match &self.profile.route.billing {
+                    Billing::Api(alias) => alias.clone(),
+                    Billing::Subscription => init.model,
+                };
                 if let Some(row) = self.claude_mut().catalog.get_mut(owner) {
-                    row.model = Some(init.model.clone());
+                    row.model = Some(route_model.clone());
                 }
                 if let Some(row) = self.catalog.get_mut(owner) {
-                    row.model = Some(init.model);
+                    row.model = Some(route_model);
                 }
                 self.changed.transcript(owner);
                 self.changed.mark(Changed::THREADS);
@@ -612,7 +636,7 @@ impl Store {
                     continue;
                 }
                 let name = cmd.name.trim_start_matches('/');
-                if headless_command(name, cmd.builtin) {
+                if crate::slash::possible_claude_command(name) {
                     commands.insert(format!("/{name}"), cmd.description);
                 }
             }
@@ -620,7 +644,10 @@ impl Store {
             let models = Arc::make_mut(&mut caps.models);
             match &self.profile.route.billing {
                 Billing::Api(alias) => {
-                    caps.model = alias.clone();
+                    caps.model = self.claude().sessions[owner]
+                        .selected_model
+                        .clone()
+                        .unwrap_or_else(|| alias.clone());
                     for alias in &self.claude().launcher.aliases {
                         models.insert(
                             alias.clone(),
@@ -719,18 +746,31 @@ impl Store {
                 self.claude_mut().sessions.get_mut(owner).unwrap().mode = Some(mode);
                 self.transcripts.entry(owner.into()).or_default().access = Some(mode);
             }
-            Control::Model(model) if result["model"] == model => {
+            Control::Model(model)
+                if result["model"] == model
+                    || self.claude().sessions[owner]
+                        .capabilities
+                        .as_ref()
+                        .and_then(|caps| caps.models.get(&model))
+                        .and_then(|info| info.resolved.as_deref())
+                        .is_some_and(|resolved| result["model"] == resolved) =>
+            {
+                self.record_claude_model(owner, &model)?;
                 let p = self.claude_mut().sessions.get_mut(owner).unwrap();
                 p.selected_model = Some(model.clone());
                 if let Some(c) = &mut p.capabilities {
                     c.model = model.clone();
                 }
                 self.transcripts.entry(owner.into()).or_default().model = Some(model.clone());
+                let route_model = match &self.profile.route.billing {
+                    Billing::Api(alias) => alias.clone(),
+                    Billing::Subscription => model,
+                };
                 if let Some(row) = self.catalog.get_mut(owner) {
-                    row.model = Some(model.clone());
+                    row.model = Some(route_model.clone());
                 }
                 if let Some(row) = self.claude_mut().catalog.get_mut(owner) {
-                    row.model = Some(model);
+                    row.model = Some(route_model);
                 }
             }
             // The interrupt acknowledgment does not complete the turn. Claude's result does.
@@ -802,46 +842,6 @@ pub(super) fn rebase_agents(
             *raw = key;
         }
     }
-}
-
-fn headless_command(name: &str, builtin: bool) -> bool {
-    if !crate::slash::possible_claude_command(name) {
-        return false;
-    }
-    // The initialize list includes terminal menus and internal commands. These shipped
-    // skills and text commands have headless handling in stock 2.1.331. Custom project,
-    // user and MCP commands have no builtin marker and come from this session's inventory.
-    !builtin
-        || matches!(
-            name,
-            "deep-research"
-                | "dataviz"
-                | "update-config"
-                | "verify"
-                | "debug"
-                | "code-review"
-                | "simplify"
-                | "batch"
-                | "fewer-permission-prompts"
-                | "doctor"
-                | "loop"
-                | "claude-api"
-                | "workflow-authoring"
-                | "run"
-                | "run-skill-generator"
-                | "plugin-authoring"
-                | "init"
-                | "security-review"
-                | "recap"
-                | "insights"
-                | "list-agents"
-                | "reload-plugins"
-                | "reload-skills"
-                | "compact"
-                | "context"
-                | "usage"
-                | "rename"
-        )
 }
 
 #[cfg(test)]
@@ -1151,12 +1151,18 @@ mod tests {
         assert!(update(&mut s, &b, 2, Data::Stock(pipe::Event::Frame(elsewhere))).is_err());
     }
     #[test]
-    fn palette_shows_only_headless_builtins_and_advertised_custom_skills() {
-        assert!(headless_command("context", true));
-        assert!(headless_command("project:lint", false));
-        assert!(!headless_command("new-terminal-wizard", true));
-        assert!(!headless_command("model", false));
-        assert!(!headless_command("goal", true));
+    fn the_installed_stream_inventory_owns_claude_commands() {
+        for name in ["goal", "effort", "mcp", "project:lint", "future-command"] {
+            assert!(crate::slash::possible_claude_command(name));
+        }
+        for name in [
+            "model",
+            "clear",
+            "__remote-workflow",
+            "workflow-launch-exec",
+        ] {
+            assert!(!crate::slash::possible_claude_command(name));
+        }
     }
     #[test]
     fn failure_retires_its_generation_only_and_restores_unsent_drafts() {

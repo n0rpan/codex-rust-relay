@@ -1188,6 +1188,55 @@ mod tests {
     }
 
     #[test]
+    fn discovery_updates_the_open_composer_during_a_turn() {
+        let mut store = ready();
+        let row = serde_json::from_value(serde_json::json!({
+            "id": "active", "cwd": store.profile.project, "modelProvider": "openai"
+        }))
+        .unwrap();
+        store.catalog.insert(row);
+        let t = store.transcripts.entry("active".into()).or_default();
+        t.ready = true;
+        t.verified = true;
+        t.active_turn = Some("turn".into());
+        let scope = crate::host_protocol::Scope {
+            project: store.profile.project.clone(),
+            route: store.profile.route.clone(),
+        };
+        let mut state = store.host_snapshot(&scope);
+        assert!(
+            !state.sessions[0]
+                .capabilities
+                .iter()
+                .any(|cap| cap == "model_options")
+        );
+        store.changed = Changed::default();
+        let mut caps = crate::slash::Capabilities {
+            goals: true,
+            ..Default::default()
+        };
+        std::sync::Arc::make_mut(&mut caps.methods).extend(
+            [
+                "thread/settings/update",
+                "thread/goal/get",
+                "thread/goal/set",
+                "thread/goal/clear",
+            ]
+            .map(str::to_owned),
+        );
+        store.install_command_schema(caps).unwrap();
+        store.host_project(&scope, &store.changed, &mut state);
+        let row = &state.sessions[0];
+        for cap in ["model_options", "native_commands", "steer"] {
+            assert!(row.capabilities.iter().any(|c| c == cap), "{cap}");
+        }
+        let commands = state.detail["commands"]["choices"].as_array().unwrap();
+        for name in ["/goal", "/model"] {
+            assert!(commands.iter().any(|row| row[0] == name), "{name}");
+        }
+    }
+
+    #[test]
     fn sending_to_an_ended_codex_thread_reopens_it_then_delivers_the_message() {
         let mut store = ready();
         let id = "thread-ended".to_owned();

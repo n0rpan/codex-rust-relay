@@ -289,8 +289,10 @@ class Host(socketserver.StreamRequestHandler):
                         if command == "/only-in-terminal":
                             send({"type":"error", "id":frame["id"], "message":"Command requires the terminal."})
                             continue
-                        assert command in ("/status", "/project:lint src/mobile.rs")
+                        assert command in ("/status", "/project:lint src/mobile.rs", "/goal Check mobile")
                         f.detail["notice"] = "Native status received" if command == "/status" else "Native lint received"
+                        if command == "/goal Check mobile":
+                            f.detail["notice"] = "Goal (active): Check mobile"
                         changes.append({"kind":"state","connection":"ready","capabilities":f.caps,"detail":f.detail})
                     if "start_worker" in action:
                         refused = action["start_worker"]["task"] == "Unmet hardware"
@@ -300,17 +302,18 @@ class Host(socketserver.StreamRequestHandler):
                         sequence += 1
                         send({"type":"delta", "scope":f.scope, "cursor":{"epoch":"fixture","seq":sequence}, "changes":changes})
                     late = None
-                    if "send_text" in action and action["send_text"][0] is None:
-                        said = action["send_text"][1]
+                    goal_start = action.get("native_command") == [None, "/goal Check mobile"]
+                    if goal_start or ("send_text" in action and action["send_text"][0] is None):
+                        said = "/goal" if goal_start else action["send_text"][1]
                         # "Ack first" and "Opened first" hold the other reply until the
                         # test releases it, so the phone can be edited in between.
                         late = {"Ack first": "opened", "Opened first": "ack"}.get(said)
-                        ident = {"Ack first": "new-ack", "Opened first": "new-opened"}.get(said, "new")
+                        ident = {"Ack first": "new-ack", "Opened first": "new-opened", "/goal": "new-goal"}.get(said, "new")
                         f.sessions.append(
                             dict(
                                 f.sessions[0],
                                 id=ident,
-                                title=ident if late else "Newly created phone session",
+                                title=ident if late or goal_start else "Newly created phone session",
                                 parent=None,
                             )
                         )
@@ -773,7 +776,9 @@ def run(harness, screenshot=None):
         host.confirm_mode, host.mode_requested = threading.Event(), threading.Event()
         host.detail = {
             "selected":"parent", "applied_draft_access":"default", "access_choices":["default","plan","bypass_permissions"],
-            "commands":{"model":"demo","methods":[],"models":{"demo":{"label":"Demo","efforts":[{"reasoningEffort":"low"},{"reasoningEffort":"high"}]}}}
+            "commands":{"model":"demo","methods":[],"choices":[["/goal","Session goal"],["/model","Choose model"]],
+                        "goal_choices":[["/goal","thread/goal/get"],["/goal pause","thread/goal/set"]],
+                        "models":{"other":{"label":"Other","efforts":[]}, "demo":{"label":"Demo","efforts":[{"reasoningEffort":"low"},{"reasoningEffort":"high"}]}}}
         }
         host.sessions = [
             {
@@ -991,6 +996,31 @@ def run(harness, screenshot=None):
         def mode(value):
             choose("permission", value)
             js("document.getElementById('apply-permission').click()")
+        def type_draft(text):
+            js("const d=document.getElementById('draft');d.value=arguments[0];d.dispatchEvent(new Event('input'))", text)
+        type_draft("/go")
+        wait(lambda: js("return document.querySelector('#slash-choices button')?.textContent==='/goal'"))
+        js("document.querySelector('#slash-choices button').click()")
+        assert js("return document.activeElement.id==='draft' && document.activeElement.value==='/goal '")
+        assert js("return document.getElementById('slash-choices').innerText.includes('/goal pause')")
+        type_draft("/goal Check mobile")
+        js("document.getElementById('send').click()")
+        wait(lambda: {"native_command":["parent", "/goal Check mobile"]} in host.actions)
+        wait(lambda: js("return !document.getElementById('composer-status').hidden && document.getElementById('composer-status').textContent==='Goal (active): Check mobile' && !document.getElementById('draft').value"))
+        assert {"send_text":["parent", "/goal Check mobile"]} not in host.actions
+        type_draft("/only-in-terminal")
+        js("document.getElementById('send').click()")
+        wait(lambda: js("return document.getElementById('composer-status').innerText.includes('requires the terminal')"))
+        assert js("return document.getElementById('draft').value==='/only-in-terminal' && document.getElementById('slash-choices').innerText.includes('Open in native terminal')")
+        type_draft("/model")
+        js("document.getElementById('send').click()")
+        assert js("return document.activeElement.id==='composer-model' && document.getElementById('session-settings').hidden")
+        keypress("\ue00c")
+        choose("composer-model", "other")
+        wait(lambda: {"model_options":["parent", {"model":"other"}]} in host.actions)
+        wait(lambda: js("return document.getElementById('composer-model').value==='other' && !document.getElementById('composer-model').disabled"))
+        choose("composer-model", "demo")
+        wait(lambda: js("return document.getElementById('composer-model').value==='demo'"))
         js("document.getElementById('access-mode').click()")
         mode("plan")
         wait(lambda: js("return document.getElementById('control-status').textContent.includes('Claude subscription · Mode disabled')"))
@@ -1168,8 +1198,6 @@ def run(harness, screenshot=None):
         )
         # The first message of a new thread is followed at once by more typing; the
         # real thread's Opened must keep it, whichever of Ack and Opened comes first.
-        def type_draft(text):
-            js("const d=document.getElementById('draft');d.value=arguments[0];d.dispatchEvent(new Event('input'))", text)
         def new_thread(first):
             host.release.clear()
             js("document.getElementById('home').click();document.getElementById('new').click();document.getElementById('new-form').requestSubmit()")
@@ -1177,6 +1205,13 @@ def run(harness, screenshot=None):
             type_draft(first)
             js("document.getElementById('composer').requestSubmit()")
             wait(lambda: {"send_text": [None, first]} in host.actions)
+        type_draft("/new")
+        js("document.getElementById('send').click()")
+        wait(lambda: js("return document.getElementById('network').innerText==='Connected' && document.getElementById('title').innerText==='New session'"))
+        type_draft("/goal Check mobile")
+        js("document.getElementById('send').click()")
+        wait(lambda: {"native_command":[None, "/goal Check mobile"]} in host.actions)
+        wait(lambda: js("return document.getElementById('title').innerText==='new-goal' && !document.getElementById('draft').value"))
         new_thread("Ack first")
         wait(lambda: js("return document.getElementById('draft').value===''"))  # the Ack cleared it
         type_draft("follow-up one")

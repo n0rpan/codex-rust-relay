@@ -926,6 +926,31 @@ fn claude_workbench_session() {
         let id = a.store.selected().unwrap().to_owned();
         a.idle(&id);
         assert!(a.store.transcript(&id).unwrap().len() >= 2);
+        a.act(Action::NativeCommand(
+            Some(id.clone()),
+            "/model sonnet".into(),
+        ));
+        a.wait("Claude confirmed Sonnet on this session", |s| {
+            s.options(Some(&id)).model == "sonnet"
+        });
+        if a.store
+            .command_caps(Some(&id))
+            .session_commands
+            .as_deref()
+            .is_some_and(|commands| commands.contains_key("/goal"))
+        {
+            a.act(Action::NativeCommand(Some(id.clone()), "/goal".into()));
+            a.wait("Claude returned its native goal status", |s| {
+                use ox_desk_core::transcript::{Row, item::Item};
+                let t = s.transcript(&id).unwrap();
+                t.active_turn().is_none() && (0..t.len()).any(|i| matches!(t.row(i),
+                    Some(Row::Message(k)) if matches!(&t.entry(k).unwrap().item, Item::AgentMessage { text, .. } if text.contains("/goal"))))
+            });
+        }
+        a.send("After same-session Sonnet switch");
+        a.idle(&id);
+        assert_eq!(a.store.selected(), Some(id.as_str()));
+        assert!(a.store.transcript(&id).unwrap().error().is_none());
         return;
     }
     let beta = root.with_file_name("WorkbenchBeta");
@@ -982,6 +1007,20 @@ fn claude_workbench_session() {
         });
         assert_eq!(b.store.applied_access(Some(&beta_id)), Some(initial));
     }
+    a.act(Action::ModelOptions(
+        Some(id.clone()),
+        ox_desk_core::store::routes_thread::Choice::Model("fixture/alternate".into()),
+    ));
+    a.wait("same-provider model change", |s| {
+        s.options(Some(&id)).model == "fixture/alternate"
+    });
+    a.send("Use the alternate model in this session");
+    a.idle(&id);
+    assert_eq!(a.store.selected(), Some(id.as_str()));
+    assert_eq!(
+        a.store.catalog_row(&id).unwrap().model.as_deref(),
+        Some("fixture/demo")
+    );
     a.send("QUESTION-FORM for this session");
     a.wait("native question form", |s| {
         s.asks().iter().any(|a| !a.questions.is_empty())
