@@ -21,7 +21,7 @@ maintainer=${MAINTAINER:?}
 reviewer='chatgpt-codex-connector'
 
 decide() {
-    local pr head state summary reviewed blocking
+    local pr head summary reviewed threads blocking
     pr="$(gh api "repos/${repo}/pulls/${number}")"
     if [ "$(jq -r '.state' <<< "${pr}")" != open ]; then echo "skip: not open"; return; fi
     if [ "$(jq -r '.draft' <<< "${pr}")" != false ]; then echo "hold: draft"; return; fi
@@ -40,15 +40,21 @@ decide() {
         <<< "${summary:-null}" 2>/dev/null || true)"
     if [ "${reviewed}" != yes ]; then echo "hold: no finished review of ${head:0:7}"; return; fi
 
-    blocking="$(gh api graphql -f owner="${repo%/*}" -f name="${repo#*/}" -F number="${number}" -f query='
+    # One page of threads. With more than a page this holds: an unread thread
+    # could be the blocking one.
+    threads="$(gh api graphql -f owner="${repo%/*}" -f name="${repo#*/}" -F number="${number}" -f query='
         query($owner: String!, $name: String!, $number: Int!) {
           repository(owner: $owner, name: $name) { pullRequest(number: $number) {
-            reviewThreads(first: 100) { nodes { isResolved
+            reviewThreads(first: 100) { pageInfo { hasNextPage } nodes { isResolved
               comments(first: 1) { nodes { author { login } body } } } } } } }' \
-        --jq "[.data.repository.pullRequest.reviewThreads.nodes[]
-               | select(.isResolved | not) | .comments.nodes[0]
-               | select(.author.login | startswith(\"${reviewer}\"))
-               | select(.body | test(\"P[01] Badge\"))] | length")"
+        --jq '.data.repository.pullRequest.reviewThreads')"
+    if [ "$(jq -r '.pageInfo.hasNextPage' <<< "${threads}")" != false ]; then
+        echo "hold: more than 100 review threads, not all read"; return
+    fi
+    blocking="$(jq -r --arg reviewer "${reviewer}" '[.nodes[]
+        | select(.isResolved | not) | .comments.nodes[0]
+        | select(.author.login | startswith($reviewer))
+        | select(.body | test("P[01] Badge"))] | length' <<< "${threads}")"
     if [ "${blocking}" != 0 ]; then echo "hold: ${blocking} unresolved P0/P1 finding(s)"; return; fi
     echo "queue: reviewed ${head:0:7}, nothing blocking"
 }

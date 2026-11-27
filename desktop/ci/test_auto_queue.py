@@ -41,7 +41,7 @@ def thread(body, resolved=False, author="chatgpt-codex-connector"):
 
 
 class AutoQueue(unittest.TestCase):
-    def decide(self, *, pull=None, comments=None, threads=None, dry_run=False):
+    def decide(self, *, pull=None, comments=None, threads=None, more_threads=False, dry_run=False):
         base = {"state": "open", "draft": False, "user": {"login": "maintainer"},
                 "head": {"sha": HEAD, "repo": {"full_name": "o/r"}}, "labels": [{"name": "full-ci"}]}
         base.update(pull or {})
@@ -52,7 +52,8 @@ class AutoQueue(unittest.TestCase):
             (tmp / "pull.json").write_text(json.dumps(base))
             (tmp / "comments.json").write_text(json.dumps(comments))
             (tmp / "threads.json").write_text(json.dumps(
-                {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": threads or []}}}}}))
+                {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                    "pageInfo": {"hasNextPage": more_threads}, "nodes": threads or []}}}}}))
             gh = tmp / "gh"
             gh.write_text(FAKE_GH)
             gh.chmod(gh.stat().st_mode | stat.S_IXUSR)
@@ -85,6 +86,11 @@ class AutoQueue(unittest.TestCase):
                 self.assertIn("hold: 1 unresolved", out)
                 self.assertIn("--disable-auto", calls)
                 self.assertNotIn("--auto\n", calls)
+
+    def test_threads_beyond_the_page_read_hold(self):
+        out, calls = self.decide(more_threads=True)
+        self.assertIn("hold: more than 100 review threads", out)
+        self.assertIn("--disable-auto", calls)
 
     def test_no_finished_review_of_the_head_commit_holds(self):
         cases = {
