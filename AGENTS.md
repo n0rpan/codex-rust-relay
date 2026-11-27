@@ -100,6 +100,40 @@ you call it done.
 - Which refs may enter the environment is a repository setting (`main` and
   `v*` tags), not something the workflow files enforce.
 
+## Review guidelines
+
+For anyone reviewing a pull request, human or automated. Security review has
+its own rules in `SECURITY.md` and `docs/threat-model.md`.
+
+Blocking:
+
+- A test that is skipped, ignored, quarantined, retried or has a weakened
+  assertion, without a root cause written down.
+- A timeout made longer without a measurement showing the wait is slow.
+- A secret referenced in a job that compiles or installs third-party code, or
+  reachable from a pull request that does not come from this repository.
+- A change to a path only `main` or a tag runs (signing, publishing, the
+  release asset list) with no statement of how it was exercised.
+- A new prompt, confirmation, block or limit on what the user or the agent may
+  do, without a setting to turn it off and a named irreversible harm.
+- A default that is stricter than stock Claude Code or Codex.
+- A claim in the description that the diff or a run does not support.
+
+Not worth a comment:
+
+- Style the formatter and clippy already accept.
+- A missing guard against the model or the user doing what they asked for.
+- A request for more abstraction, more configuration or more comments.
+
+Say plainly when a finding is a guess. Give the file, the line and the input
+that goes wrong.
+
+## Before asking for a merge
+
+- Ask for a review of the final commit (`@codex review`) and answer or fix
+  every finding. A review of an earlier commit does not cover a later push.
+- Then add `full-ci`.
+
 ## Local checks before you push
 
 ```sh
