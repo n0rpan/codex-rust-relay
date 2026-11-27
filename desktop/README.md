@@ -100,7 +100,7 @@ OX stores its desktop state under `$XDG_STATE_HOME/ox/desktop` when that variabl
 
 Download the artifact for your OS and architecture from the [OX Desktop workflow](https://github.com/oxstack/ox/actions/workflows/desktop.yml). Each archive includes the matching desktop app, session host and CLI. Use the artifact from the branch and commit you intend to test.
 
-- On macOS, extract the ZIP and open **OX Desktop.app**. These builds are ad-hoc signed. If Gatekeeper requests confirmation, use System Settings → Privacy & Security → Open Anyway for the downloaded app. Terminal may request Automation permission for native sign-in or a terminal handoff.
+- On macOS, extract the ZIP and open **OX Desktop.app**. Workflow artifacts named `ox-desktop-macos-*` are ad-hoc signed: if Gatekeeper requests confirmation, use System Settings → Privacy & Security → Open Anyway for the downloaded app. Released builds, and the `ox-desktop-signed-macos-*` artifacts of a release run, are signed with Developer ID and notarized by Apple. Terminal may request Automation permission for native sign-in or a terminal handoff.
 - On Linux, extract the tarball and run `./ox-desktop/ox-desktop`. Keep all three executables in the extracted directory. Linux builds target glibc 2.39 or later and use Wayland or X11 with a Vulkan-capable driver. The tarball contains its shared library requirements in `shared-libraries.txt`.
 
 Install stock Codex or Claude Code for each route you intend to use. A desktop launch searches your PATH, user-local binaries and the standard Homebrew locations. If you use a different installation directory, start the desktop executable from a shell with the CLI on PATH.
