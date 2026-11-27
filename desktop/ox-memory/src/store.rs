@@ -108,28 +108,69 @@ impl MemoryStore {
         let now = now_ms();
 
         if let Some(id) = input.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            let seq = file.alloc_seq();
-            let entry = file
+            let idx = file
                 .entries
-                .iter_mut()
-                .find(|e| e.id == id)
+                .iter()
+                .position(|e| e.id == id)
                 .ok_or_else(|| MemoryError::NotFound(format!("No memory found with id '{id}'.")))?;
-            if entry.deleted {
+            if file.entries[idx].deleted {
                 return Err(MemoryError::InvalidInput(format!(
                     "Memory '{id}' was removed; create a new memory instead of resurrecting it."
                 )));
             }
-            if entry.scope != input.scope {
+            if file.entries[idx].scope != input.scope {
                 return Err(MemoryError::InvalidInput(format!(
                     "Cannot change scope of memory '{id}' in place; forget it and create a new memory."
                 )));
             }
-            if input.sensitivity < entry.sensitivity {
+            if input.sensitivity < file.entries[idx].sensitivity {
                 return Err(MemoryError::InvalidInput(format!(
                     "Cannot lower sensitivity of memory '{id}' from {} to {} in place.",
-                    entry.sensitivity, input.sensitivity
+                    file.entries[idx].sensitivity, input.sensitivity
                 )));
             }
+            // Promoting a previously shareable entry to LocalOnly withdraws the old shared ID
+            // via a payload-free exportable tombstone and stores the local-only copy under a new ID.
+            if file.entries[idx].sensitivity != Sensitivity::LocalOnly
+                && input.sensitivity == Sensitivity::LocalOnly
+            {
+                let created_at_ms = file.entries[idx].created_at_ms;
+                let tomb_seq = file.alloc_seq();
+                let old = &mut file.entries[idx];
+                old.deleted = true;
+                old.pin = false;
+                old.text.clear();
+                old.tags.clear();
+                old.updated_at_ms = now.max(old.updated_at_ms.saturating_add(1));
+                old.source_host = input.source_host.clone();
+                old.seq = tomb_seq;
+
+                let mut new_id = generate_id();
+                while file.entries.iter().any(|e| e.id == new_id) {
+                    new_id = generate_id();
+                }
+                let new_seq = file.alloc_seq();
+                let promoted = MemoryEntry {
+                    id: new_id,
+                    scope: input.scope,
+                    kind: input.kind,
+                    sensitivity: Sensitivity::LocalOnly,
+                    text,
+                    tags,
+                    pin: input.pin,
+                    created_at_ms,
+                    updated_at_ms: now,
+                    source_host: input.source_host,
+                    seq: new_seq,
+                    deleted: false,
+                };
+                file.entries.push(promoted.clone());
+                self.write_unlocked(&file)?;
+                return Ok(UpsertOutcome::Updated(promoted));
+            }
+
+            let seq = file.alloc_seq();
+            let entry = &mut file.entries[idx];
             entry.kind = input.kind;
             entry.sensitivity = input.sensitivity;
             entry.text = text;
@@ -361,14 +402,22 @@ impl MemoryStore {
                     stats.rejected_local_only += 1;
                     continue;
                 }
+                let merged_sensitivity = file.entries[idx].sensitivity.max(sanitized.sensitivity);
                 let remote_key = (sanitized.updated_at_ms, sanitized.source_host.as_str());
                 let local_key = (
                     file.entries[idx].updated_at_ms,
                     file.entries[idx].source_host.as_str(),
                 );
                 if remote_key > local_key {
+                    sanitized.sensitivity = merged_sensitivity;
                     sanitized.seq = file.alloc_seq();
                     file.entries[idx] = sanitized;
+                    stats.updated += 1;
+                    dirty = true;
+                } else if merged_sensitivity > file.entries[idx].sensitivity {
+                    let seq = file.alloc_seq();
+                    file.entries[idx].sensitivity = merged_sensitivity;
+                    file.entries[idx].seq = seq;
                     stats.updated += 1;
                     dirty = true;
                 } else {
@@ -696,5 +745,122 @@ mod tests {
         let store = MemoryStore::open(path);
         let items = store.list(None, None, Sensitivity::LocalOnly).unwrap();
         assert_eq!(items.len(), 40);
+    }
+
+    #[test]
+    fn merge_remote_preserves_monotonic_sensitivity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_a = MemoryStore::open(dir.path().join("a.json"));
+        let store_b = MemoryStore::open(dir.path().join("b.json"));
+
+        let base = store_a
+            .upsert(new_mem(
+                "Shared public note.",
+                Scope::Global,
+                Kind::Fact,
+                Sensitivity::Public,
+                false,
+            ))
+            .unwrap()
+            .entry()
+            .clone();
+        store_b.merge_remote(std::slice::from_ref(&base)).unwrap();
+
+        // Store A promotes to Private
+        let promoted = store_a
+            .upsert(NewMemory {
+                id: Some(base.id.clone()),
+                ..new_mem(
+                    "Shared public note.",
+                    Scope::Global,
+                    Kind::Fact,
+                    Sensitivity::Private,
+                    false,
+                )
+            })
+            .unwrap()
+            .entry()
+            .clone();
+
+        // Store B concurrently edits still-Public copy with a higher timestamp
+        let mut concurrent_public = base;
+        concurrent_public.text = "Edited public copy.".to_string();
+        concurrent_public.updated_at_ms = promoted.updated_at_ms + 100;
+        concurrent_public.source_host = "host-b".to_string();
+
+        // Merging B into A updates text, but NEVER downgrades sensitivity back to Public
+        let stats = store_a.merge_remote(&[concurrent_public]).unwrap();
+        assert_eq!(stats.updated, 1);
+        let listed = store_a.list(None, None, Sensitivity::LocalOnly).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].text, "Edited public copy.");
+        assert_eq!(listed[0].sensitivity, Sensitivity::Private);
+    }
+
+    #[test]
+    fn promoting_shared_entry_to_local_only_withdraws_peer_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_a = MemoryStore::open(dir.path().join("a.json"));
+        let store_b = MemoryStore::open(dir.path().join("b.json"));
+
+        let shared = store_a
+            .upsert(new_mem(
+                "Originally shared note.",
+                Scope::Global,
+                Kind::Fact,
+                Sensitivity::Private,
+                true,
+            ))
+            .unwrap()
+            .entry()
+            .clone();
+        let (batch1, cursor1) = store_a.export_peer_since(0).unwrap();
+        store_b.merge_remote(&batch1).unwrap();
+        assert_eq!(
+            store_b
+                .list(None, None, Sensitivity::LocalOnly)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Promote to LocalOnly on store A
+        let promoted = store_a
+            .upsert(NewMemory {
+                id: Some(shared.id.clone()),
+                ..new_mem(
+                    "Now strictly local note.",
+                    Scope::Global,
+                    Kind::Fact,
+                    Sensitivity::LocalOnly,
+                    true,
+                )
+            })
+            .unwrap()
+            .entry()
+            .clone();
+        assert_ne!(promoted.id, shared.id);
+        assert_eq!(promoted.sensitivity, Sensitivity::LocalOnly);
+
+        // Export delta from store A: only payload-free tombstone for old shared ID is exported
+        let (batch2, _cursor2) = store_a.export_peer_since(cursor1).unwrap();
+        assert_eq!(batch2.len(), 1);
+        assert_eq!(batch2[0].id, shared.id);
+        assert!(batch2[0].deleted);
+        assert!(batch2[0].text.is_empty());
+
+        // Merging delta into store B removes the old copy completely
+        store_b.merge_remote(&batch2).unwrap();
+        assert!(
+            store_b
+                .list(None, None, Sensitivity::LocalOnly)
+                .unwrap()
+                .is_empty()
+        );
+        // Store A still keeps the promoted LocalOnly entry
+        let local_items = store_a.list(None, None, Sensitivity::LocalOnly).unwrap();
+        assert_eq!(local_items.len(), 1);
+        assert_eq!(local_items[0].id, promoted.id);
+        assert_eq!(local_items[0].text, "Now strictly local note.");
     }
 }
