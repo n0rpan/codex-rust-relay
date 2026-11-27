@@ -294,7 +294,8 @@ impl Discovery {
             })
         };
         match event {
-            CatalogEvent::Host(_)
+            CatalogEvent::Projects(_)
+            | CatalogEvent::Host(_)
             | CatalogEvent::DraftWaiting(..)
             | CatalogEvent::Waiting(..)
             | CatalogEvent::Disconnected(_) => false,

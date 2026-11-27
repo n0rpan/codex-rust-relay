@@ -37,6 +37,7 @@ pub(crate) enum Message {
     Runtime(Scope, u64),
     Schema(Scope, u64, Box<ox_desk_core::slash::Capabilities>),
     Discovered(u64, Box<Server>),
+    ProjectDirectory(wire::ProjectDirectory),
     HostsListed(PathBuf, Result<Value, String>),
     Outbound(Box<forwarding::Event>),
     LinkedJob(Box<ox_host_web::linked_jobs::VerifiedJob>, Replier),
@@ -331,6 +332,7 @@ pub(crate) struct Engine {
     yolo_announced: HashSet<PathBuf>,
     /// Launch cautions by job number, recorded on the worker when it is stamped.
     launch_warnings: HashMap<u64, String>,
+    project_queries: Vec<(u64, String)>,
     discovered: HashMap<(Scope, String), ox_desk_core::store::ThreadRow>,
     asking: BTreeMap<u64, Asking>,
     mode_requests: BTreeMap<u64, mode_requests::ModeRequest>,
@@ -417,6 +419,7 @@ impl Engine {
             yolo_projects: Vec::new(),
             yolo_announced: HashSet::new(),
             launch_warnings: HashMap::new(),
+            project_queries: Vec::new(),
             discovered: Default::default(),
             asking: Default::default(),
             mode_requests: Default::default(),
@@ -631,6 +634,18 @@ impl Engine {
                         self.process(&scope, batch, false)?;
                     }
                 }
+                Some(Message::ProjectDirectory(directory)) => {
+                    for (client, key) in std::mem::take(&mut self.project_queries) {
+                        self.reply(
+                            client,
+                            Server::DiscoveredEnd {
+                                id: key,
+                                errors: Vec::new(),
+                                directory: Some(directory.clone()),
+                            },
+                        )?;
+                    }
+                }
                 Some(Message::Discovered(id, frame)) => {
                     if let Server::Discovered { scope, rows, .. } = frame.as_ref() {
                         for entry in rows {
@@ -722,6 +737,7 @@ impl Engine {
                     "approvals",
                     "workers",
                     "live_catalog",
+                    "project_directory",
                     "host_status",
                     "host_mode_policy",
                     "end",
@@ -749,21 +765,8 @@ impl Engine {
                 let client = self.clients.get_mut(&id).unwrap();
                 client.hello = true;
                 client.prepared = prepared;
-                let mut projects = self.config.projects();
-                projects.extend(
-                    crate::projects::registered(&self.state_dir)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|p| p.is_dir()),
-                );
-                projects.extend(
-                    self.running
-                        .keys()
-                        .chain(self.cold.keys())
-                        .map(|s| s.project.clone()),
-                );
-                projects.sort();
-                projects.dedup();
+                let projects =
+                    crate::projects::known(&self.config, &self.state_dir, self.scope_projects());
                 let host = Some(self.host_info());
                 self.reply(
                     id,
@@ -1049,7 +1052,56 @@ impl Engine {
                 }
                 self.reply(id, result)
             }
-            Client::Discover { id: key } => {
+            Client::Discover {
+                id: key,
+                projects: Some(query),
+            } => {
+                let checkout = match query {
+                    wire::ProjectQuery::List => {
+                        self.project_queries.push((id, key.clone()));
+                        if self.project_queries.len() > 1 {
+                            return Ok(());
+                        }
+                        None
+                    }
+                    wire::ProjectQuery::Checkout(path) => Some(path),
+                };
+                let mut scopes = self.scope_projects();
+                scopes.extend(
+                    self.discovered
+                        .keys()
+                        .map(|(scope, _)| scope.project.clone()),
+                );
+                let config = self.config.clone();
+                let state_dir = self.state_dir.clone();
+                let tx = self.tx.clone();
+                thread::spawn(move || {
+                    let directory = crate::projects::directory(
+                        &config,
+                        &state_dir,
+                        scopes,
+                        checkout.as_deref(),
+                    );
+                    let message = if checkout.is_some() {
+                        Message::Discovered(
+                            id,
+                            Box::new(Server::DiscoveredEnd {
+                                id: key,
+                                errors: Vec::new(),
+                                directory: Some(directory),
+                            }),
+                        )
+                    } else {
+                        Message::ProjectDirectory(directory)
+                    };
+                    let _ = tx.send(message);
+                });
+                Ok(())
+            }
+            Client::Discover {
+                id: key,
+                projects: None,
+            } => {
                 let cfg = self.config.clone();
                 let tx = self.tx.clone();
                 thread::spawn(move || {
@@ -1072,7 +1124,11 @@ impl Engine {
                     );
                     let _ = tx.send(Message::Discovered(
                         id,
-                        Box::new(Server::DiscoveredEnd { id: key, errors }),
+                        Box::new(Server::DiscoveredEnd {
+                            id: key,
+                            errors,
+                            directory: None,
+                        }),
                     ));
                 });
                 Ok(())
@@ -2108,6 +2164,13 @@ impl Engine {
             .any(|client| client.update_lease.is_some())
     }
 
+    fn scope_projects(&self) -> std::collections::BTreeSet<PathBuf> {
+        self.running
+            .keys()
+            .chain(self.cold.keys())
+            .map(|s| s.project.clone())
+            .collect()
+    }
     fn host_info(&mut self) -> wire::HostInfo {
         let profile =
             ox_host_web::host_profile::HostProfile::read(&self.state_dir).unwrap_or_default();

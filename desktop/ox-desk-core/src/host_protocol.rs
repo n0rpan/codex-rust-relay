@@ -65,6 +65,9 @@ pub enum Client {
     },
     Discover {
         id: String,
+        /// Request the project directory without scanning session history. Requires project_directory.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        projects: Option<ProjectQuery>,
     },
     Subscribe {
         scope: Option<Scope>,
@@ -143,6 +146,29 @@ pub fn version_mismatch(host: u32, client: u32) -> String {
     }
 }
 
+/// A checkout query revalidates a specific known path after a user selects it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectQuery {
+    List,
+    Checkout(PathBuf),
+}
+
+/// Operator-visible checkouts. The path belongs to the reporting host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProjectCheckout {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProjectDirectory {
+    pub checkouts: Vec<ProjectCheckout>,
+    pub routes: Vec<Route>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -175,6 +201,8 @@ pub enum Server {
     DiscoveredEnd {
         id: String,
         errors: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        directory: Option<ProjectDirectory>,
     },
     Snapshot {
         cursor: Cursor,
@@ -381,4 +409,26 @@ pub fn read_frame(input: &mut impl std::io::BufRead) -> io::Result<Server> {
         ));
     }
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(test)]
+mod project_discovery_tests {
+    use super::*;
+    #[test]
+    fn ordinary_discovery_preserves_the_v1_wire_format() {
+        let frame = serde_json::json!({"type":"discover","id":"sessions"});
+        let client: Client = serde_json::from_value(frame.clone()).unwrap();
+        assert!(matches!(client, Client::Discover { projects: None, .. }));
+        assert_eq!(serde_json::to_value(client).unwrap(), frame);
+        let end = serde_json::json!({"type":"discovered_end","id":"sessions","errors":[]});
+        let reply: Server = serde_json::from_value(end.clone()).unwrap();
+        assert!(matches!(
+            reply,
+            Server::DiscoveredEnd {
+                directory: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(reply).unwrap(), end);
+    }
 }

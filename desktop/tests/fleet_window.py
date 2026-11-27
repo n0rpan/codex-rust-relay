@@ -29,9 +29,34 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
     state = Path(target["OX_HOST_STATE_DIR"])
     wait_for("the receiving host admin socket", lambda: (state / "remote-admin.sock").exists())
     subprocess.run([root / "bin/ox", "host", "name", "Studio"], env=target, check=True, stdout=log)
-    scope = {"project": str(project), "route": {"runtime": "codex", "billing": {"api": "fixture/demo"}}}
+    remote_project = studio / "alternate-checkout"
+    duplicate = studio / "duplicate"
+    for path in (remote_project, duplicate):
+        subprocess.run(["git", "init", "-q", str(path)], env=target, check=True)
+    for path, origin in [(project, "git@code.fixture.test:team/ox.git"),
+                         (remote_project, "https://code.fixture.test/team/ox"),
+                         (duplicate, "https://code.fixture.test/team/ox")]:
+        subprocess.run(["git", "-C", str(path), "remote", "add", "origin", origin], env=target, check=True)
+    for path, host_env in [(project, env), (remote_project, target), (duplicate, target)]:
+        subprocess.run([root / "bin/ox", "host", "project", "add", path], env=host_env, check=True, stdout=log)
+    scope = {"project": str(remote_project), "route": {"runtime": "codex", "billing": {"api": "fixture/demo"}}}
     peer = Client(target["OX_HOST_SOCKET"])
     stack.callback(peer.close)
+    def directory(query):
+        peer.send(type="discover", id="check-projects", projects=query)
+        frame = peer.until(lambda f: f["type"] == "discovered_end" and f["id"] == "check-projects")
+        return frame["directory"]
+
+    # A catalog socket outlives settings edits. Keep it open through both edits.
+    config = codex / "codeox.toml"
+    original = config.read_text()
+    extra_route = {"runtime": "codex", "billing": {"api": "fixture/extra"}}
+    assert extra_route not in directory("list")["routes"]
+    config.write_text(original + '\n[[providers.fixture.models]]\nid="extra"\n')
+    assert extra_route in directory("list")["routes"]
+    config.write_text(original)
+    assert extra_route not in directory({"checkout": str(remote_project)})["routes"]
+    assert directory({"checkout": str(root / "unknown")})["checkouts"] == []
     peer.open(scope)
     snapshot = peer.until(lambda f: f["type"] == "snapshot")["scopes"][0]
     if "start" not in snapshot["capabilities"]:
@@ -79,13 +104,43 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
 
     selected = root / "home/.local/state/ox/desktop/selected-host.json"
     host_id = (state / "host-id").read_text().strip()
-    choose("@studio " + str(project), "inspect the remote navigation fixture")
+    choose("@studio " + str(remote_project), "inspect the remote navigation fixture")
     wait_for("selection of the paired host", lambda: selected.exists() and json.loads(selected.read_text()) == host_id)
     # Its private workspace layout records the actual selected native thread.
     wait_for("the remote thread on its own workbench", lambda: any(remote_id in f.read_text()
              for f in selected.parent.rglob("*layout*.json")), seconds=30)
     choose("@local", "this computer")
     wait_for("keyboard navigation back to the original host", lambda: json.loads(selected.read_text()) is None)
+    # The last session opened in this repository was on Studio. Its checkout
+    # has a different name and directory, and the local workbench is visible.
+    key("n", "ctrl")
+    wait_for("the shared checkout selector", lambda: "duplicate" in screen())
+    key("Return")
+    wait_for("the default checkout to be the most recently used host", lambda: json.loads(selected.read_text()) == host_id)
+    key("l", "ctrl")
+    type_in_focused_field("Fresh alternate checkout session")
+    key("Return")
+    def has_fresh_thread():
+        peer.open(scope)
+        snap = peer.until(lambda frame: frame["type"] == "snapshot")["scopes"][0]
+        return any(row["id"] != remote_id and "fresh alternate" in row["title"].casefold()
+                   for row in snap["sessions"])
+    wait_for("a second stock thread on the selected checkout and route", has_fresh_thread)
+    history = selected.with_name("project-hosts.json")
+    wait_for("the exact remembered checkout", lambda: history.exists() and
+             {"host": host_id, "path": str(remote_project)} in json.loads(history.read_text()).values())
+    choose("@local", "this computer")
+    wait_for("the local workbench", lambda: json.loads(selected.read_text()) is None)
+    key("n", "ctrl")
+    wait_for("both checkouts before changing the remote origin", lambda: "duplicate" in screen())
+    subprocess.run(["git", "-C", remote_project, "remote", "set-url", "origin",
+                    "https://code.fixture.test/team/different"], env=target, check=True)
+    key("Return")
+    wait_for("the stale checkout to be rejected", lambda: "changed" in screen() or "unavailable" in screen())
+    assert json.loads(selected.read_text()) is None
+    key("Escape")
+    subprocess.run(["git", "-C", remote_project, "remote", "set-url", "origin",
+                    "https://code.fixture.test/team/ox"], env=target, check=True)
     app.terminate()
     app.wait(timeout=5)
 
@@ -99,10 +154,10 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
     wait_for("Escape to restore the client-only workspace", lambda: "choose a host" in screen())
     key("k", "ctrl")
     wait_for("the workspace filter to reopen", lambda: "filter by title" in screen())
-    type_in_focused_field("@studio " + str(project))
+    type_in_focused_field("@studio " + str(remote_project))
     wait_for("the remote thread in the workspace filter", lambda: "inspect the remote" in screen())
     key("Return")
     wait_for("the client-only window to open the remote workbench", lambda: json.loads(selected.read_text()) == host_id)
     type_in_focused_field("Fleet selection keyboard focus")
     assert app.poll() is None
-    print("PASS signed fleet palette navigation, client-only search, and typing in the selected remote stock Codex session.", flush=True)
+    print("PASS signed navigation, live billing routes, alternate and duplicate checkouts, remembered host, changed origin, and client-only search.", flush=True)

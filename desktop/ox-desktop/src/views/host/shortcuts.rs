@@ -17,6 +17,7 @@ impl Host {
         match key {
             Command::Palette => unreachable!("handled in the key interceptor"),
             Command::Settings => self.show_settings(window, cx),
+            Command::New if self.preferences.is_none() => self.request_active_draft(window, cx),
             Command::Sidebar => self.toggle_sidebar(window, cx),
             _ if self.preferences.is_some() => return false,
             Command::Previous | Command::Next => {
@@ -52,9 +53,6 @@ impl Host {
                 };
                 let owner = store.selected().map(str::to_owned);
                 match key {
-                    Command::New if store.state() == &Connection::Ready => {
-                        pane.action(cx, DeskAction::NewDraft)
-                    }
                     Command::Find => pane.find_in_transcript(window, cx),
                     Command::Composer => {
                         if let Some(editor) = pane.editors.get(&owner) {

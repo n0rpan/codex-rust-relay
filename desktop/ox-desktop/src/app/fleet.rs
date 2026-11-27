@@ -41,6 +41,9 @@ type Library = HashMap<Scope, HashMap<String, CatalogRow>>;
 #[derive(Default)]
 pub(super) struct Inventory {
     pub link: HostLink,
+    pub(super) legacy_projects: bool,
+    pub(super) recent: crate::workspace_state::LastWorkspace,
+    pub(super) directory: Option<ox_desk_core::host_protocol::ProjectDirectory>,
     projects: HashMap<Scope, Project>,
     saved: Library,
     scan_requested: bool,
@@ -58,6 +61,8 @@ pub(super) struct Inventory {
 impl Inventory {
     pub fn start(link: HostLink, cx: &mut Context<Self>) -> Self {
         let mut catalog = Self {
+            recent: crate::workspace_state::read_preference(&link.state_file("workspace.json"))
+                .unwrap_or_default(),
             saved_sidebar: crate::sidebar_state::SidebarState::load(
                 &link.state_file("sidebar.json"),
             ),
@@ -108,6 +113,10 @@ impl Inventory {
         self.online = true;
         self.error = None;
         match event {
+            CatalogEvent::Projects(dir) => {
+                self.legacy_projects = dir.is_none();
+                self.directory = dir;
+            }
             CatalogEvent::Host(h) => self.info = Some(h),
             CatalogEvent::Reset => {
                 self.projects.clear();
@@ -403,6 +412,7 @@ impl<'a> Query<'a> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Page {
+    Projects,
     Sessions,
     Inbox,
 }
@@ -444,7 +454,7 @@ impl super::Workspace {
         self.inventory.retain(|_, entry| {
             let current = &entry.read(cx).link;
             links.iter().any(|l| match (current.remote(), l.remote()) {
-                (Some(a), Some(b)) => a.same_pairing(b),
+                (Some(a), Some(b)) => a.same_pairing(b) && a.origin == b.origin,
                 (None, None) => true,
                 _ => false,
             })

@@ -1,5 +1,6 @@
 //! Release the session tree if a desktop view fails while building a frame.
 pub(crate) mod fleet;
+pub(crate) mod projects;
 use crate::{appearance::Palette, kit, views::host::Host};
 use gpui::*;
 use std::{
@@ -68,6 +69,8 @@ pub struct Workspace {
     error: Option<String>,
     inventory: std::collections::HashMap<Option<String>, Entity<fleet::Inventory>>,
     page: Option<fleet::Page>,
+    chooser: Option<projects::Chooser>,
+    project_request: u64,
     navigation_revision: u64,
     scoped_search: bool,
     searching: bool,
@@ -84,6 +87,11 @@ impl Workspace {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        if !cx.has_global::<projects::Recent>() {
+            cx.set_global(projects::Recent(
+                crate::workspace_state::read_preference("project-hosts.json").unwrap_or_default(),
+            ));
+        }
         let failure = cx.observe_global::<FailedView>(|s, cx| {
             s.local.take();
             s.hosts.clear();
@@ -128,6 +136,17 @@ impl Workspace {
                 return;
             }
             let key = &event.keystroke;
+            if owner
+                .read_with(cx, |s, _| s.chooser.is_some())
+                .unwrap_or(false)
+            {
+                if key.modifiers == Modifiers::default() || key.modifiers == Modifiers::shift() {
+                    let _ = owner.update(cx, |s, cx| {
+                        s.chooser_key(&key.key, key.modifiers.shift, w, cx)
+                    });
+                }
+                return;
+            }
             let toggle = bindings.iter().any(|(binding, cmd)| {
                 *cmd == ox_desk_core::keys::Command::Palette
                     && binding.key == key.key
@@ -166,6 +185,8 @@ impl Workspace {
         .detach();
         let mut workspace = Self {
             inventory: Default::default(),
+            chooser: None,
+            project_request: 0,
             navigation_revision: 0,
             scoped_search: false,
             searching: false,
@@ -230,13 +251,33 @@ impl Workspace {
             s.ensure_library(Some(&fleet::Query::parse(&request.query)), cx);
         })
         .detach();
+        cx.subscribe_in(
+            view,
+            w,
+            |s, host, request: &projects::NewProjectSession, w, cx| {
+                if s.visible_host() == Some(host) {
+                    s.pick_for_workbench(request, w, cx);
+                }
+            },
+        )
+        .detach();
+        cx.subscribe(view, |s, host, used: &projects::UsedProject, cx| {
+            if s.visible_host() == Some(&host) {
+                s.remember_project(&used.0, cx);
+            }
+        })
+        .detach();
         cx.subscribe_in(view, w, |s, _, target: &fleet::Destination, w, cx| {
             s.open_destination(target, w, cx)
         })
         .detach();
     }
     pub(crate) fn visible_host(&self) -> Option<&Entity<Host>> {
-        if self.searching || self.settings.is_some() || self.page.is_some() {
+        if self.chooser.is_some()
+            || self.searching
+            || self.settings.is_some()
+            || self.page.is_some()
+        {
             return None;
         }
         match &self.active {
@@ -255,6 +296,7 @@ impl Workspace {
         cx.notify();
     }
     fn set_active(&mut self, id: Option<String>) {
+        self.chooser = None;
         self.searching = false;
         self.search_return = None;
         if self.active != id {
@@ -269,6 +311,7 @@ impl Workspace {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.chooser = None;
         self.searching = false;
         self.search_return = None;
         self.settings = None;
@@ -319,7 +362,7 @@ impl Workspace {
             .global::<crate::preferences::HostDirectory>()
             .0
             .iter()
-            .any(|h| h.id == host.id)
+            .any(|h| h.same_pairing(&host))
         {
             return;
         }
@@ -348,6 +391,7 @@ impl Render for Workspace {
                 .or(self.local.as_ref());
             if saved.is_empty()
                 && self.settings.is_none()
+                && self.chooser.is_none()
                 && !self.searching
                 && self.page.is_none()
                 && let Some(host) = active
@@ -361,6 +405,7 @@ impl Render for Workspace {
             }
             if saved.is_empty()
                 && self.settings.is_none()
+                && self.chooser.is_none()
                 && !self.searching
                 && self.page.is_none()
                 && let Some(host) = active
@@ -402,6 +447,7 @@ impl Render for Workspace {
             if !saved.is_empty() {
                 let waiting: usize = self.inventory.values().map(|e| e.read(cx).waiting()).sum();
                 for (page, label) in [
+                    (fleet::Page::Projects, "Projects".to_owned()),
                     (fleet::Page::Sessions, "All sessions".to_owned()),
                     (fleet::Page::Inbox, format!("Inbox ({waiting})")),
                 ] {
@@ -412,6 +458,7 @@ impl Render for Workspace {
                         self.page == Some(page),
                         true,
                         cx.listener(move |s, _, _, cx| {
+                            s.chooser = None;
                             s.searching = false;
                             s.search_return = None;
                             s.page = if s.page == Some(page) {
@@ -419,8 +466,10 @@ impl Render for Workspace {
                             } else {
                                 Some(page)
                             };
-                            for host in s.inventory.values() {
-                                host.update(cx, |h, cx| h.load_saved(cx));
+                            if page != fleet::Page::Projects {
+                                for host in s.inventory.values() {
+                                    host.update(cx, |h, cx| h.load_saved(cx));
+                                }
                             }
                             s.settings = None;
                             cx.notify();
@@ -437,6 +486,7 @@ impl Render for Workspace {
                 cx.listener(|s, _, w, cx| {
                     s.searching = false;
                     s.search_return = None;
+                    s.chooser = None;
                     s.page = None;
                     s.settings = if s.settings.is_some() {
                         None
@@ -454,7 +504,9 @@ impl Render for Workspace {
             if let Some(error) = &self.error {
                 view = view.child(kit::small(p, error.clone()));
             }
-            if self.searching {
+            if self.chooser.is_some() {
+                view = view.child(self.project_chooser(cx));
+            } else if self.searching {
                 view = view.child(self.fleet_view(fleet::Page::Sessions, cx));
             } else if let Some(settings) = &self.settings {
                 view = view.child(
@@ -465,6 +517,8 @@ impl Render for Workspace {
                         .p_4()
                         .child(settings.clone()),
                 );
+            } else if self.page == Some(fleet::Page::Projects) {
+                view = view.child(self.projects_page(cx));
             } else if let Some(page) = self.page {
                 view = view.child(self.fleet_view(page, cx));
             } else if let Some(host) = active {

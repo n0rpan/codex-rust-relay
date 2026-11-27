@@ -363,6 +363,37 @@ impl HostLink {
 }
 pub(crate) type CatalogResult = (Vec<(Scope, ThreadRow)>, Vec<String>);
 impl HostLink {
+    /// Re-read the target's checkouts and routes when choosing a shared project.
+    pub(crate) fn check_project(
+        &self,
+        path: &std::path::Path,
+    ) -> io::Result<ox_desk_core::host_protocol::ProjectDirectory> {
+        let (mut input, mut stream, caps) = self.handshake()?;
+        if !caps.iter().any(|c| c == "project_directory") {
+            return Err(io::Error::other("Update the host to use shared projects."));
+        }
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+        write_frame(
+            &mut stream,
+            &Client::Discover {
+                id: "projects".into(),
+                projects: Some(ox_desk_core::host_protocol::ProjectQuery::Checkout(
+                    path.into(),
+                )),
+            },
+        )?;
+        match read_frame(&mut input)? {
+            Server::DiscoveredEnd {
+                id,
+                directory: Some(dir),
+                ..
+            } if id == "projects" => Ok(dir),
+            Server::Error { message, .. } => Err(io::Error::other(message)),
+            _ => Err(io::Error::other(
+                "The host did not return its project directory.",
+            )),
+        }
+    }
     pub(crate) fn discover(&self) -> io::Result<CatalogResult> {
         self.discover_rows(false)
     }
@@ -372,6 +403,7 @@ impl HostLink {
             &mut socket,
             &Client::Discover {
                 id: "catalog".into(),
+                projects: None,
             },
         )?;
         let mut rows = Vec::new();
@@ -391,7 +423,7 @@ impl HostLink {
                             .map(|row| (scope.clone(), row)),
                     );
                 }
-                Server::DiscoveredEnd { id, errors } if id == "catalog" => {
+                Server::DiscoveredEnd { id, errors, .. } if id == "catalog" => {
                     return Ok((rows, errors));
                 }
                 Server::Error { message, .. } => return Err(io::Error::other(message)),

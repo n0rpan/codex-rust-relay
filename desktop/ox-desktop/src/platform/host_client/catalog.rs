@@ -4,6 +4,7 @@ use std::sync::Mutex;
 
 pub(crate) enum CatalogEvent {
     Host(ox_desk_core::host_protocol::HostInfo),
+    Projects(Option<ox_desk_core::host_protocol::ProjectDirectory>),
     Reset,
     Disconnected(io::ErrorKind),
     Waiting(Scope, HashSet<String>),
@@ -63,9 +64,42 @@ impl HostLink {
                         write_frame(&mut stream, &Client::WatchHost)?;
                     }
                     let emit = |event| tx.send(event).map_err(io::Error::other);
+                    let has_projects = resources && caps.iter().any(|c| c == "project_directory");
+                    let request_projects = |stream: &mut UnixStream| {
+                        write_frame(
+                            stream,
+                            &Client::Discover {
+                                id: "projects".into(),
+                                projects: Some(ox_desk_core::host_protocol::ProjectQuery::List),
+                            },
+                        )
+                    };
+                    let mut pending_projects = has_projects;
+                    let mut project_refresh = std::time::Instant::now();
+                    if has_projects {
+                        request_projects(&mut stream)?;
+                    } else if resources {
+                        emit(CatalogEvent::Projects(None))?;
+                    }
                     loop {
                         match read_frame(&mut input)? {
-                            Server::HostStatus { host } => emit(CatalogEvent::Host(host))?,
+                            Server::HostStatus { host } => {
+                                emit(CatalogEvent::Host(host))?;
+                                if has_projects
+                                    && !pending_projects
+                                    && project_refresh.elapsed() >= Duration::from_secs(25)
+                                {
+                                    request_projects(&mut stream)?;
+                                    pending_projects = true;
+                                    project_refresh = std::time::Instant::now();
+                                }
+                            }
+                            Server::DiscoveredEnd { id, directory, .. }
+                                if pending_projects && id == "projects" =>
+                            {
+                                pending_projects = false;
+                                emit(CatalogEvent::Projects(directory))?;
+                            }
                             Server::Snapshot { scopes, .. } => {
                                 emit(CatalogEvent::Reset)?;
                                 for s in scopes {

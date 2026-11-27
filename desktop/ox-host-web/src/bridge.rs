@@ -228,7 +228,7 @@ impl Access {
                 self.hello = Some(*version);
                 true
             }
-            Client::Discover { id }
+            Client::Discover { id, .. }
                 if self.ready && self.discovery.is_none() && id.len() <= 96 && !id.is_empty() =>
             {
                 self.discovery = Some(id.clone());

@@ -104,6 +104,7 @@ pub struct Workbench {
     pub(super) route: Route,
     pub(super) front: bool,
     pub(super) query: String,
+    pending_new: bool,
     pending_selection: Option<(ox_desk_core::store::ThreadRow, bool)>,
     pending_row_action: Option<(String, DeferredRowAction)>,
     pending_draft: Option<(String, Vec<ox_desk_core::mentions::ImageInput>)>,
@@ -276,6 +277,7 @@ impl Workbench {
             launch_picker: None,
             front,
             query: String::new(),
+            pending_new: false,
             pending_selection: None,
             pending_row_action: None,
             pending_draft: None,
@@ -336,7 +338,8 @@ impl Workbench {
                     match result {
                         Ok(mut store) => {
                             if let Some(previous) = &mut s.store {
-                                if s.pending_selection.is_none()
+                                if !s.pending_new
+                                    && s.pending_selection.is_none()
                                     && store.profile().project == previous.profile().project
                                     && store.profile().route == previous.profile().route
                                     && let Some(row) =
@@ -371,6 +374,7 @@ impl Workbench {
                             }
                         }
                         Err(error) => {
+                            s.pending_new = false;
                             let message = error.to_string();
                             // Retrying cannot repair a folder's permissions.
                             let fixable = ox_host_service::unsafe_folder(&message).is_some();
@@ -475,6 +479,18 @@ impl Workbench {
                                 && !store.usage.requested
                             {
                                 let _ = store.read_limits();
+                            }
+                            if matches!(
+                                store.state(),
+                                Connection::Closed(_) | Connection::SignInRequired
+                            ) {
+                                s.pending_new = false;
+                            }
+                            if store.state() == &Connection::Ready
+                                && std::mem::take(&mut s.pending_new)
+                                && let Err(e) = store.dispatch(DeskAction::NewDraft)
+                            {
+                                s.launch_error = Some(e.to_string());
                             }
                             if store.state() == &Connection::Ready
                                 && let Some((row, confirmed)) = s.pending_selection.take()
@@ -662,12 +678,27 @@ impl Workbench {
         }
     }
 
+    pub(super) fn start_project_draft(&mut self, cx: &mut Context<Self>) {
+        self.pending_selection = None;
+        self.focus_editor_for = Some(None);
+        if self
+            .store
+            .as_ref()
+            .is_some_and(|s| s.state() == &Connection::Ready)
+        {
+            self.action(cx, DeskAction::NewDraft);
+        } else {
+            self.pending_new = true;
+            cx.notify();
+        }
+    }
     pub(super) fn select_catalog(
         &mut self,
         row: ox_desk_core::store::ThreadRow,
         confirmed: bool,
         cx: &mut Context<Self>,
     ) {
+        self.pending_new = false;
         if self
             .store
             .as_ref()

@@ -36,6 +36,7 @@ enum WriteTask {
     Layout(String, crate::views::host::layout::Layout),
     Save(Option<String>, PathBuf, Route),
     Host(Option<String>),
+    Checkout(String, Checkout),
     Sidebar(String, crate::sidebar_state::SidebarState),
     Flush(flume::Sender<()>),
 }
@@ -54,6 +55,20 @@ fn writer() -> &'static std::sync::mpsc::Sender<WriteTask> {
                             )
                         {
                             eprintln!("Could not save desktop layout: {e}")
+                        }
+                    }
+                    WriteTask::Checkout(repo, checkout) => {
+                        if let Some(path) = path()
+                            && let Err(e) = update_preference_at(
+                                &path.with_file_name("project-hosts.json"),
+                                ProjectHosts::new,
+                                |mut hosts| {
+                                    hosts.insert(repo, checkout);
+                                    hosts
+                                },
+                            )
+                        {
+                            eprintln!("Could not remember project host: {e}");
                         }
                     }
                     WriteTask::Host(id) => {
@@ -102,6 +117,15 @@ fn writer() -> &'static std::sync::mpsc::Sender<WriteTask> {
         });
         tx
     })
+}
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct Checkout {
+    pub host: Option<String>,
+    pub path: PathBuf,
+}
+pub(crate) type ProjectHosts = std::collections::BTreeMap<String, Checkout>;
+pub(crate) fn remember_checkout(repo: String, checkout: Checkout) {
+    let _ = writer().send(WriteTask::Checkout(repo, checkout));
 }
 pub fn remember_host(id: Option<String>) {
     let _ = writer().send(WriteTask::Host(id));

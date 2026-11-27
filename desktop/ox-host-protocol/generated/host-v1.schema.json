@@ -1076,6 +1076,17 @@
             "id": {
               "type": "string"
             },
+            "projects": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ProjectQuery"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Request the project directory without scanning session history. Requires project_directory."
+            },
             "type": {
               "const": "discover",
               "type": "string"
@@ -1802,6 +1813,68 @@
       ],
       "type": "object"
     },
+    "ProjectCheckout": {
+      "description": "Operator-visible checkouts. The path belongs to the reporting host.",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "repository": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "ProjectDirectory": {
+      "properties": {
+        "checkouts": {
+          "items": {
+            "$ref": "#/$defs/ProjectCheckout"
+          },
+          "type": "array"
+        },
+        "routes": {
+          "items": {
+            "$ref": "#/$defs/Route"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "checkouts",
+        "routes"
+      ],
+      "type": "object"
+    },
+    "ProjectQuery": {
+      "description": "A checkout query revalidates a specific known path after a user selects it.",
+      "oneOf": [
+        {
+          "enum": [
+            "list"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "checkout": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "checkout"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "Question": {
       "properties": {
         "header": {
@@ -2072,6 +2145,16 @@
         },
         {
           "properties": {
+            "directory": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ProjectDirectory"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "errors": {
               "items": {
                 "type": "string"

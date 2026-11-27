@@ -136,6 +136,8 @@ fn new_route_gate(
 }
 
 impl EventEmitter<crate::app::fleet::EnsureInventory> for Host {}
+impl EventEmitter<crate::app::projects::NewProjectSession> for Host {}
+impl EventEmitter<crate::app::projects::UsedProject> for Host {}
 impl EventEmitter<crate::app::fleet::Destination> for Host {}
 pub struct Host {
     pub(crate) workspace: Option<WeakEntity<crate::app::Workspace>>,
@@ -1170,6 +1172,7 @@ impl Host {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        cx.emit(crate::app::projects::UsedProject(project.clone()));
         self.restore_project(&project, window, cx);
         let i = self
             .panes
@@ -1540,6 +1543,9 @@ impl Host {
         }
         cx.notify();
     }
+    pub(crate) fn project_route(&self, path: &std::path::Path) -> Option<Route> {
+        self.recent.saved_route(path)
+    }
     pub(crate) fn sidebar_state(&self) -> &SidebarState {
         &self.sidebar
     }
@@ -1558,6 +1564,45 @@ impl Host {
             );
             cx.notify();
         });
+    }
+    pub(crate) fn new_project_draft(
+        &mut self,
+        project: PathBuf,
+        route: Route,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open(project, route, w, cx);
+        self.panes[self.active].update(cx, |p, cx| p.start_project_draft(cx));
+    }
+    fn request_project_draft(
+        &mut self,
+        project: PathBuf,
+        route: Route,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.is_some()
+            && !cx
+                .global::<crate::preferences::HostDirectory>()
+                .0
+                .is_empty()
+        {
+            cx.emit(crate::app::projects::NewProjectSession { project, route });
+        } else {
+            self.new_project_draft(project, route, w, cx);
+        }
+    }
+    fn request_active_draft(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.panes[self.active].read(cx);
+        if !pane
+            .store
+            .as_ref()
+            .is_some_and(|store| store.state() == &Connection::Ready)
+        {
+            return;
+        }
+        self.request_project_draft(pane.project.clone(), pane.route.clone(), w, cx);
     }
     pub(crate) fn show_thread(
         &mut self,
@@ -2490,6 +2535,21 @@ impl Host {
                         .map(|n| n.to_string_lossy().into_owned())
                         .filter(|n| !n.is_empty())
                         .unwrap_or_else(|| proj_path.display().to_string());
+                    let proj_name = self
+                        .workspace
+                        .as_ref()
+                        .and_then(WeakEntity::upgrade)
+                        .and_then(|ws| {
+                            ws.read(cx).shared_caption(
+                                self.link.remote().map(|h| h.id.as_str()),
+                                &proj_path,
+                                cx,
+                            )
+                        })
+                        .map_or_else(
+                            || proj_name.clone(),
+                            |hosts| format!("{proj_name} · {hosts}"),
+                        );
                     let host = cx.weak_entity();
                     let menu_proj = proj_path.clone();
                     let menu: crate::kit::RowMenuBuilder =
@@ -2501,10 +2561,12 @@ impl Host {
                                     move |_, window, cx| {
                                         let _ = host_new.update(cx, |s, cx| {
                                             let route = s.recent.route(&p_new);
-                                            s.open(p_new.clone(), route, window, cx);
-                                            s.panes[s.active].update(cx, |pane, cx| {
-                                                pane.action(cx, DeskAction::NewDraft);
-                                            });
+                                            s.request_project_draft(
+                                                p_new.clone(),
+                                                route,
+                                                window,
+                                                cx,
+                                            );
                                         });
                                     },
                                 ),
@@ -3127,8 +3189,7 @@ impl Host {
                         pane_ready,
                         cx.listener(|s, _, window, cx| {
                             s.close_drawer(window, cx);
-                            s.panes[s.active]
-                                .update(cx, |p, cx| p.action(cx, DeskAction::NewDraft));
+                            s.request_active_draft(window, cx);
                             cx.notify();
                         }),
                     )
