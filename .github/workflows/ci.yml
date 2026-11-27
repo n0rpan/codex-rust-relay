@@ -58,6 +58,8 @@ jobs:
       packages: ${{ steps.scope.outputs.packages }}
       mac_package: ${{ steps.scope.outputs.mac_package }}
       focused: ${{ steps.scope.outputs.focused }}
+      full: ${{ steps.scope.outputs.full }}
+      docs_only: ${{ steps.docs.outputs.docs_only }}
     env:
       GH_TOKEN: ${{ github.token }}
       REF: ${{ github.ref }}
@@ -79,6 +81,23 @@ jobs:
         run: |
           if [ -n "${SCOPE_BASE}" ]; then git fetch --no-tags --depth=1 origin "${SCOPE_BASE}"; fi
           python3 desktop/ci/pr_scope.py
+      # A merge that changes only documentation builds the same binaries as
+      # the commit before it, so it builds and publishes nothing.
+      - name: Detect a documentation-only push to main
+        id: docs
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          docs_only=false
+          if files="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BEFORE}...${GITHUB_SHA}" \
+              --jq '.files[].filename')" && [ -n "${files}" ] && [ "$(wc -l <<< "${files}")" -lt 300 ] &&
+              ! grep -qvE '^(docs/.*|[^/]*\.md|desktop/README\.md)$' <<< "${files}"; then
+            docs_only=true
+            echo "::notice::documentation-only push: no build and no dev release"
+          fi
+          echo "docs_only=${docs_only}" >> "${GITHUB_OUTPUT}"
       # A guard against a mistaken tag, not a security boundary: who may create
       # v* tags is set by the repository's tag ruleset.
       - name: Require a release tag to point at a commit on main
@@ -129,14 +148,16 @@ jobs:
         id: platforms
         env:
           EVENT: ${{ github.event_name }}
+          FULL: ${{ steps.scope.outputs.full }}
         run: |
-          # Pull requests build Linux x86_64 only. GitHub's macOS arm64 pool
+          # Pull requests build Linux x86_64 only, unless they carry the full-ci
+          # label, which asks for main's four platforms. GitHub's macOS arm64 pool
           # is capacity-limited: twice in one day a PR job was never given a
           # runner and was cancelled after 15 minutes ("not acquired by Runner
           # of type hosted"), which turned the PR red for nothing. macOS builds
           # run for main, tags and manual runs, and the nightly OX Desktop run
           # builds the same ox binary on macos-26 inside its package.
-          if [ "${EVENT}" = pull_request ] || [ "${EVENT}" = merge_group ]; then
+          if { [ "${EVENT}" = pull_request ] || [ "${EVENT}" = merge_group ]; } && [ "${FULL}" != true ]; then
             echo 'platforms=[{"platform":"linux-x86_64","runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","file_type":"x86-64","macos_deployment_target":""}]' >> "${GITHUB_OUTPUT}"
           else
             echo 'platforms=[{"platform":"linux-x86_64","runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","file_type":"x86-64","macos_deployment_target":""},{"platform":"linux-aarch64","runner":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","file_type":"aarch64","macos_deployment_target":""},{"platform":"macos-x86_64","runner":"macos-26-intel","target":"x86_64-apple-darwin","file_type":"x86_64","macos_deployment_target":"11.0"},{"platform":"macos-aarch64","runner":"macos-26","target":"aarch64-apple-darwin","file_type":"arm64","macos_deployment_target":"11.0"}]' >> "${GITHUB_OUTPUT}"
@@ -410,7 +431,7 @@ jobs:
           cargo test --locked --offline --test shared_gateway -- --ignored --nocapture
 
   release:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && needs.version.outputs.docs_only != 'true'
     needs: version
     name: Release binaries (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
@@ -665,7 +686,9 @@ jobs:
   native:
     name: Native process and host tests (${{ matrix.runner }})
     needs: version
-    if: needs.version.outputs.native == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: >-
+      needs.version.outputs.docs_only != 'true' &&
+      (needs.version.outputs.native == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     strategy:
       fail-fast: false
       matrix:
@@ -762,9 +785,10 @@ jobs:
     name: Build matching desktop packages
     needs: version
     if: >-
+      needs.version.outputs.docs_only != 'true' && (
       (github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) ||
       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
-      needs.version.outputs.packages == 'true'
+      needs.version.outputs.packages == 'true')
     uses: ./.github/workflows/desktop.yml
     # A called workflow sees no secrets unless the caller hands them over, and
     # that includes the secrets of an environment one of its jobs enters.
@@ -774,6 +798,7 @@ jobs:
     with:
       build_version: ${{ needs.version.outputs.version }}
       pr_macos: ${{ needs.version.outputs.mac_package == 'true' }}
+      full: ${{ needs.version.outputs.full == 'true' }}
 
   merge:
     name: OX merge check

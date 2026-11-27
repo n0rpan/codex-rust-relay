@@ -52,6 +52,10 @@ on:
         description: Also exercise macOS packaging on this pull request
         type: boolean
         default: false
+      full:
+        description: Build and test the four platforms main does (the full-ci label)
+        type: boolean
+        default: false
       build_version:
         required: true
         type: string
@@ -75,7 +79,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: >-
-          ${{ fromJSON(contains(fromJSON('["pull_request","merge_group"]'), github.event_name) && (inputs.pr_macos && '["ubuntu-24.04","macos-26"]' || '["ubuntu-24.04"]') ||
+          ${{ fromJSON(contains(fromJSON('["pull_request","merge_group"]'), github.event_name) && !inputs.full && (inputs.pr_macos && '["ubuntu-24.04","macos-26"]' || '["ubuntu-24.04"]') ||
           (inputs.build_version || inputs.intel) && '["ubuntu-24.04","ubuntu-24.04-arm","macos-26","macos-26-intel"]' ||
           '["ubuntu-24.04","ubuntu-24.04-arm","macos-26"]') }}
     runs-on: ${{ matrix.runner }}
@@ -396,7 +400,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(contains(fromJSON('["pull_request","merge_group"]'), github.event_name) && (inputs.pr_macos && '["ubuntu-24.04","macos-26"]' || '["ubuntu-24.04"]') || '["ubuntu-24.04","macos-26"]') }}
+        runner: ${{ fromJSON(contains(fromJSON('["pull_request","merge_group"]'), github.event_name) && !inputs.full && (inputs.pr_macos && '["ubuntu-24.04","macos-26"]' || '["ubuntu-24.04"]') || '["ubuntu-24.04","macos-26"]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
