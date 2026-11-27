@@ -24,7 +24,7 @@ Used by both root `ox` (CLI + `ox_workers` MCP server) and `desktop/` (`ox-host`
   - `created_at_ms`, `updated_at_ms`, `source_host`, `deleted` (tombstone for LWW sync)
 - **Retrieval**: Pure-Rust BM25 over `text` + `tags` + `kind` combined with scope affinity (`project` > `host` > `global`), `pin` boost, `routing_policy` boost for provider/model/data queries, and recency tie-break. Filters tombstones and entries above `max_sensitivity`.
 - **Tier-1 Brief**: Deterministic, sensitivity-filtered summary capped at `max_chars` (default 900 chars ≈ 220 tokens). Ordered: pinned `routing_policy` -> pinned `preference` -> pinned `fact` (project before global).
-- **Sync primitives**: `export_since(since_ms, include_local_only=false)` and conflict-free LWW `merge_remote` ordered by `(updated_at_ms, source_host, id)`. `local_only` entries are never exported or overwritten by remote sync.
+- **Sync primitives**: `export_since(since_ms, include_local_only=false)` and conflict-free LWW `merge_remote` ordered by `(updated_at_ms, source_host, id)`. `local_only` entries are never exported or overwritten by remote sync. `/api/memory/sync` also requires the receiving host's per-link `may_sync_memory` grant; a worker link alone never permits memory exchange.
 
 ## Rollout Phases (Separate PRs)
 1. **PR 1 — Core engine + CLI + MCP**: `desktop/ox-memory`, `ox memory` CLI (`add`, `list`, `search`, `pin`, `unpin`, `rm`, `brief`), and `recall_ox_memory` / `save_ox_memory` on `ox_workers` MCP (with secret scrubbing).

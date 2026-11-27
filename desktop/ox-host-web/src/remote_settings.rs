@@ -39,6 +39,9 @@ enum DeviceAction {
         before: crate::admin::WorkerGrant,
         may_launch: bool,
         ceiling: ox_desk_core::modes::Level,
+        /// `None` leaves the link's memory-sync grant unchanged.
+        #[serde(default)]
+        may_sync_memory: Option<bool>,
     },
     HostUpdate {
         command: crate::host_updates::Command,
@@ -117,12 +120,19 @@ pub(super) async fn settings(
                     before,
                     may_launch,
                     ceiling,
+                    may_sync_memory,
                 } => {
                     if !state.belongs_to_login(target, identity) {
                         return Err(DENY);
                     }
                     Some(
-                        match state.edit_worker(target, before, *may_launch, *ceiling) {
+                        match state.edit_worker(
+                            target,
+                            before,
+                            *may_launch,
+                            *ceiling,
+                            *may_sync_memory,
+                        ) {
                             Ok(()) => json!({"status":"applied"}),
                             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                                 json!({"error": e.to_string()})

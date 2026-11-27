@@ -241,11 +241,14 @@ async fn administer(
             before,
             may_launch,
             ceiling,
-        } => app
-            .state
-            .lock()
-            .unwrap()
-            .edit_worker(&id, &before, may_launch, ceiling)?,
+            may_sync_memory,
+        } => app.state.lock().unwrap().edit_worker(
+            &id,
+            &before,
+            may_launch,
+            ceiling,
+            may_sync_memory,
+        )?,
         Request::Update { .. } | Request::WorkerLinks { .. } => {
             unreachable!("handled before Serve administration")
         }

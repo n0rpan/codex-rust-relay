@@ -1121,9 +1121,11 @@ export function setupSettings({ request, open, close, notifications, login }) {
         ceiling.append(new Option(label, value));
       ceiling.value = device.worker.ceiling;
       const limit = node("label", "Maximum worker mode"); limit.append(ceiling);
-      card.append(allowed, limit);
+      const sync = node("input"); sync.type = "checkbox"; sync.checked = device.worker.may_sync_memory === true;
+      const synced = node("label"); synced.append(sync, document.createTextNode(" Allow memory sync"));
+      card.append(allowed, limit, synced);
       submit(card, "Save worker access", async () => {
-        await request({action: "edit_worker_link", id: device.id, before: device.worker, may_launch: allow.checked, ceiling: ceiling.value});
+        await request({action: "edit_worker_link", id: device.id, before: device.worker, may_launch: allow.checked, ceiling: ceiling.value, may_sync_memory: sync.checked});
         if (pageId === id && !panel.hidden) { await workerLinks(); status.textContent = "Saved on this host."; }
       });
       body.append(card, action("Revoke " + device.label, async () => {

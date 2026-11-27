@@ -294,6 +294,13 @@ def worker_links(js, wait, state, source, restart, harness, source_env):
         assert upload.wait(timeout=12) == 0
     wait(lambda: not any(job.parent.glob(".incoming-*")))
     assert not (job.parent / "44").exists()
+    current = next(r["worker"] for r in admin(state, {"type": "status"})["worker_hosts"] if r["id"] == link["id"])
+    granted = admin(state, {"type": "worker_access", "id": link["id"], "before": current,
+                            "may_launch": current["may_launch"], "ceiling": current["ceiling"], "may_sync_memory": True})
+    assert granted["worker_hosts"][0]["worker"]["may_sync_memory"] is True
+    ungranted = admin(state, {"type": "worker_access", "id": link["id"], "before": granted["worker_hosts"][0]["worker"],
+                              "may_launch": current["may_launch"], "ceiling": current["ceiling"], "may_sync_memory": False})
+    assert "may_sync_memory" not in ungranted["worker_hosts"][0]["worker"]
     print("PASS signed checkout transfer, shared-base negotiation, dirty and untracked inputs, retry and link admission", flush=True)
     click("Remove outgoing link")
     wait(lambda: not admin(state, {"type":"status"}).get("worker_hosts"))

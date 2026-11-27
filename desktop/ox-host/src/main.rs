@@ -182,6 +182,8 @@ const USAGE: &str = "Usage: ox-host COMMAND [--socket PATH] [--state-dir PATH] [
   labels [set LABEL…]       show or replace placement labels
   devices                   list paired devices and their IDs
   terminal <device> on|off  change a paired device’s terminal grant
+  memory-sync [<device> on|off]
+                            sync non-local memories with workers, or change a worker link’s memory-sync grant
   revoke <device-id>        disconnect a paired device
   doctor [--errors N]       check the host, Tailscale Serve, paired devices and stock clients
   uninstall [--purge]       remove the login service; --purge also deletes OX host state
@@ -280,6 +282,9 @@ fn entry() -> io::Result<()> {
                 }
             }
             Ok(())
+        }
+        (Some("memory-sync"), [id, setting]) if matches!(setting.as_str(), "on" | "off") => {
+            pairing::memory_sync(&paths, id, setting == "on").map_err(io::Error::other)
         }
         _ => Err(io::Error::other(USAGE)),
     }

@@ -892,6 +892,9 @@ model. If a mode fails, check the job status. You can also run it directly in
 
 Open **Start worker** on desktop or in the web UI. **Same as parent** is the default. Choose a linked host by name, or choose **Auto** and optionally enter minimum memory in GB, CPU count, GPU and OS. The model picker includes API routes configured on the target. Pair worker hosts under **Settings → Hosts → Worker host links** and register the repository on the receiver with `ox host project add DIR`.
 
+Worker links do not grant memory sync. A receiving host opts in per link with **Allow memory sync** (or `ox host memory-sync <device> on`), and
+`ox host memory-sync` then exchanges non-`local_only` memories with links that granted it. Pairing a worker host keeps the grant off.
+
 Agents can use `list_ox_hosts` to inspect the links available to their parent. Pass `host: "build"`, a stable host ID or `host: "label:big"` to `start_ox_worker`. For automatic selection, pass `host: "auto"` or a requirement such as `needs: {"memory_gb":64,"cpus":8,"os":"linux","gpu":true}`. On desktop, `/worker @build claude --mode read review the parser` also selects a destination.
 
 Auto filters by repository, runtime, billing route, permissions and requested hardware. It ranks eligible hosts by CPU load and available memory, measured against each machine’s capacity. A busy host can still win. Memory requirements use the host’s reported total RAM in decimal GB.

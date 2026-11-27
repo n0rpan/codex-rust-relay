@@ -1,7 +1,9 @@
 //! Authenticated Tailscale peer memory synchronization (`/api/memory/sync`).
 //!
-//! Uses the same Ed25519 device proof and worker-link authorization as `linked_jobs`.
-//! `Sensitivity::LocalOnly` records are never exported or accepted across hosts.
+//! Uses the same Ed25519 device proof as `linked_jobs`, plus a separate
+//! receiver-side `may_sync_memory` grant: a worker link is consent to launch
+//! workers, not consent to read this host's memories. `Sensitivity::LocalOnly`
+//! records are never exported or accepted across hosts.
 
 use crate::{
     paired_hosts::valid_id,
@@ -65,14 +67,15 @@ pub(crate) async fn handle(
 
     let memory_path = {
         let mut state = app.state.lock().unwrap();
+        // The explicit `may_sync_memory` grant and the source binding are both
+        // checked while holding the state lock, so a concurrent revoke or grant
+        // edit is serialized with authorization.
         if !state.prove_worker(
             &device,
             &body.proof.nonce,
             &body.proof.signature,
             &body.request,
-        ) || !state
-            .worker_grant(&device)
-            .is_some_and(|g| g.source == request.source)
+        ) || !sync_granted(state.worker_grant(&device), &request.source)
             || state
                 .host_id()
                 .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
@@ -97,6 +100,13 @@ pub(crate) async fn handle(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(response))
+}
+
+/// A worker link is consent to launch workers, not consent to exchange
+/// memories. The receiving host must have granted memory sync for this exact
+/// source host; links paired before the grant existed read as `false`.
+fn sync_granted(grant: Option<&crate::admin::WorkerGrant>, source: &str) -> bool {
+    grant.is_some_and(|g| g.may_sync_memory && g.source == source)
 }
 
 /// Apply an incoming sync request against `memory_path` and return the peer delta.
@@ -303,6 +313,23 @@ fn new_request_id() -> io::Result<String> {
 mod tests {
     use super::*;
     use ox_memory::{Kind, NewMemory, Scope, Sensitivity};
+
+    #[test]
+    fn sync_requires_an_explicit_receiver_grant_for_the_source_host() {
+        let grant = |may_sync_memory| crate::admin::WorkerGrant {
+            source: "host-a".into(),
+            may_launch: true,
+            may_sync_memory,
+            ceiling: ox_desk_core::modes::Level::Yolo,
+        };
+        assert!(!sync_granted(None, "host-a"));
+        assert!(!sync_granted(Some(&grant(false)), "host-a"));
+        assert!(
+            !sync_granted(Some(&grant(true)), "host-b"),
+            "the grant is bound to the source host"
+        );
+        assert!(sync_granted(Some(&grant(true)), "host-a"));
+    }
 
     #[test]
     fn apply_sync_exchanges_deltas_and_never_leaks_local_only() {
