@@ -92,6 +92,9 @@ you call it done.
 - **Tests that share a binary share a process.** A test that depends on a
   file descriptor being closed can be broken by a sibling test that spawns a
   child at the same moment.
+- **A test that writes a script and runs it can get "Text file busy".** The
+  sibling's child holds the script's write descriptor until its exec. Write
+  it with `executable::write` from `tests/common/executable.rs`.
 
 ## Secrets
 

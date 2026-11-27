@@ -14,6 +14,9 @@ pub mod changed;
 pub mod claude;
 pub mod codex;
 pub mod desktop_behavior;
+#[cfg(test)]
+#[path = "../../../tests/common/executable.rs"]
+mod executable;
 pub mod host_policy;
 pub mod host_protocol;
 pub mod inbox;

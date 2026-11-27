@@ -358,15 +358,11 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let terminal = dir.join("xdg-terminal-exec");
         let ox = dir.join("my ox");
-        std::fs::write(&terminal, "#!/bin/sh\nexec \"$@\"\n").unwrap();
-        std::fs::write(
+        crate::executable::write(&terminal, "#!/bin/sh\nexec \"$@\"\n");
+        crate::executable::write(
             &ox,
             "#!/bin/sh\nprintf '%s\\n' \"$1\" \"$2\" > launch.txt\n",
-        )
-        .unwrap();
-        for file in [&ox, &terminal] {
-            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        );
         open_terminal(
             &project,
             &[ox.into(), "claude".into(), "--subscription".into()],

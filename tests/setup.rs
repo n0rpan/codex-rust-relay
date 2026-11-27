@@ -9,6 +9,8 @@
 
 #[path = "../src/catalog.rs"]
 mod catalog;
+#[path = "common/executable.rs"]
+mod executable;
 #[path = "../src/provider.rs"]
 mod provider;
 #[path = "../src/setup.rs"]
@@ -1483,13 +1485,10 @@ fn stderr_tail_keeps_the_last_lines_and_caps_the_size() {
 #[cfg(unix)]
 #[test]
 fn doctor_probe_reports_a_codex_without_the_bundled_catalog() {
-    use std::os::unix::fs::PermissionsExt;
-
     let home = TempHome::new();
     let fake = |name: &str, body: &str| {
         let path = home.path().join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        executable::write(&path, &format!("#!/bin/sh\n{body}\n"));
         path
     };
 
