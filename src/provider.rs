@@ -655,7 +655,7 @@ impl Vendor {
         if !self.is_openrouter() {
             return None;
         }
-        let session = incoming
+        let session: std::borrow::Cow<'_, str> = match incoming
             .and_then(openrouter_session_hint)
             .or_else(|| {
                 payload
@@ -668,7 +668,14 @@ impl Vendor {
                     .pointer("/client_metadata/session_id")
                     .and_then(serde_json::Value::as_str)
                     .filter(|value| hint_ok(value))
-            })?;
+            }) {
+            Some(session) => session.into(),
+            // A Claude Messages request without a session header names its
+            // session only inside the JSON-encoded `metadata.user_id`. The
+            // Chat Completions translation drops `prompt_cache_key`, so this
+            // is the only sticky-routing hint that route gets.
+            None => payload.get("metadata").and_then(claude_session_id)?.into(),
+        };
         let hmac = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key.expose().as_bytes());
         let mut context = ring::hmac::Context::with_key(&hmac);
         context.update(b"ox-openrouter-session-v1\0");
@@ -851,6 +858,18 @@ fn opencode_session_hint(headers: &HeaderMap) -> Option<&str> {
 
 fn openrouter_session_hint(headers: &HeaderMap) -> Option<&str> {
     opencode_session_hint(headers)
+}
+
+/// Claude Code's session ID from Messages `metadata`, when it names a valid one.
+pub(crate) fn claude_session_id(metadata: &serde_json::Value) -> Option<String> {
+    let encoded = metadata.get("user_id")?.as_str()?;
+    let user: serde_json::Value = serde_json::from_str(encoded).ok()?;
+    let session = user.get("session_id")?.as_str()?;
+    let valid = (1..=64).contains(&session.len())
+        && session
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+    valid.then(|| session.to_owned())
 }
 
 fn hint_ok(id: &str) -> bool {
@@ -2260,6 +2279,27 @@ sort = "price"
         .unwrap_err()
         .to_string();
         assert!(error.contains("OpenRouter"), "{error}");
+    }
+
+    #[test]
+    fn a_claude_session_in_metadata_is_an_openrouter_session_hint() {
+        let vendor = openrouter_vendor("https://openrouter.ai/api/v1", Wire::ChatCompletions);
+        let key = SecretKey::new("sk-openrouter-test".to_owned());
+        let user_id = serde_json::json!({"session_id": "claude-session-1"}).to_string();
+        let claude = serde_json::json!({"metadata": {"user_id": user_id}});
+        let session = vendor
+            .openrouter_session_id(&key, Some(&HeaderMap::new()), &claude)
+            .expect("Claude's metadata names the session");
+        // The same conversation keyed through Codex's field lands on the same
+        // backend, so the two paths agree on one sticky session.
+        let codex = serde_json::json!({"prompt_cache_key": "claude-session-1"});
+        assert_eq!(
+            Some(session),
+            vendor.openrouter_session_id(&key, None, &codex)
+        );
+        // Metadata without a valid session ID gives no hint.
+        let bad = serde_json::json!({"metadata": {"user_id": "not json"}});
+        assert_eq!(vendor.openrouter_session_id(&key, None, &bad), None);
     }
 
     #[test]
