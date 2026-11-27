@@ -55,6 +55,8 @@ class AutoQueue(unittest.TestCase):
         base.update(pull or {})
         if comments is None:
             comments = [{"user": BOT_USER, "body": summary(HEAD, "completed")}]
+        comments = [dict({"created_at": "2026-11-27T12:00:00Z", "updated_at": "2026-11-27T12:00:00Z"}, **c)
+                    for c in comments]
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             (tmp / "pull.json").write_text(json.dumps(base))
@@ -175,8 +177,15 @@ class AutoQueue(unittest.TestCase):
         # leave its security entry at an earlier commit (seen on #39).
         asked = {"user": {"login": "maintainer", "type": "User"},
                  "body": f"@codex security review\n\nAsked for by the `full-ci` label, for commit {HEAD}."}
-        for state, expected in (("running", "hold:"), ("completed", "queue:")):
-            answer = {"user": BOT_USER, "body": summary(HEAD, state, security="completed", security_sha="0" * 40)}
+        asked["created_at"] = "2026-11-27T17:00:18Z"
+        for state, updated, expected in (
+                ("running", "2026-11-27T17:00:33Z", "hold: no finished review"),
+                ("completed", "2026-11-27T17:01:40Z", "queue:"),
+                # A review that was finished before the request is not its answer.
+                ("completed", "2026-11-27T16:59:00Z", "hold: no answer yet"),
+                ("completed", "2026-11-27T17:00:18Z", "hold: no answer yet")):
+            answer = {"user": BOT_USER, "updated_at": updated,
+                      "body": summary(HEAD, state, security="completed", security_sha="0" * 40)}
             out, calls = self.decide(comments=[asked, answer])
             self.assertIn(expected, out)
             self.assertNotIn("pr comment", calls)

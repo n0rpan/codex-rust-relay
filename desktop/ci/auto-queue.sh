@@ -41,7 +41,7 @@ decision=''
 head=''
 request=''
 decide() {
-    local pr comments summary reviewed security threads blocking
+    local pr comments summary stated reviewed security asked threads blocking
     if ! pr="$(gh api "repos/${repo}/pulls/${number}")" || [ -z "${pr}" ]; then
         decision="hold: could not read the pull request"; return
     fi
@@ -54,13 +54,16 @@ decide() {
 
     # The reviewer keeps one summary comment with its state as escaped JSON.
     if ! comments="$(gh api --paginate "repos/${repo}/issues/${number}/comments" \
-        --jq '.[] | {login: .user.login, type: .user.type, body: .body}' | jq -s .)"; then
+        --jq '.[] | {login: .user.login, type: .user.type, body: .body, created: .created_at, updated: .updated_at}' |
+        jq -s .)"; then
         decision="hold: could not read the comments"; return
     fi
     summary="$(jq -r --arg bot "${reviewer}[bot]" \
         '.[] | select(.login == $bot and .type == "Bot") | .body' <<< "${comments}" |
         grep -o 'codex-review-state:v1 [^>]*' | tail -n 1 |
         sed -e 's/^codex-review-state:v1 //' -e 's/ *--$//' -e 's/&#123;/{/g' -e 's/&#125;/}/g' || true)"
+    stated="$(jq -r --arg bot "${reviewer}[bot]" '[.[] | select(.login == $bot and .type == "Bot")
+        | select(.body | contains("codex-review-state:v1")) | .updated] | last // ""' <<< "${comments}")"
     # Before any hold below, so the two reviews run side by side. A security
     # review that finished with nothing to report leaves both findings fields
     # null, so only an explicit `true` counts as open.
@@ -68,9 +71,10 @@ decide() {
         | if .status != "completed" then "running"
           elif .has_unresolved_findings == true then "open" else "clean" end' \
         <<< "${summary:-null}" 2>/dev/null || true)"
-    if [ -z "${security}" ] && ! jq -e --arg who "${maintainer}" --arg head "${head}" \
-        'any(.[]; .login == $who and (.body | startswith("@codex security review")) and (.body | contains($head)))' \
-        <<< "${comments}" > /dev/null; then
+    asked="$(jq -r --arg who "${maintainer}" --arg head "${head}" '[.[] | select(.login == $who
+        and (.body | startswith("@codex security review")) and (.body | contains($head))) | .created] | last // ""' \
+        <<< "${comments}")"
+    if [ -z "${security}" ] && [ -z "${asked}" ]; then
         request=yes
         decision="hold: asking for a security review of ${head:0:7}"; return
     fi
@@ -78,6 +82,11 @@ decide() {
         'select(.code_review.commit_sha == $head and .code_review.status == "completed") | "yes"' \
         <<< "${summary:-null}" 2>/dev/null || true)"
     if [ "${reviewed}" != yes ]; then decision="hold: no finished review of ${head:0:7}"; return; fi
+    # The reviewer's state has to have changed since the request. A review
+    # that was already finished when the request went out is not its answer.
+    if [ -z "${security}" ] && [[ ! "${stated}" > "${asked}" ]]; then
+        decision="hold: no answer yet to the security review request for ${head:0:7}"; return
+    fi
     case "${security}" in
         open) decision="hold: the security review of ${head:0:7} has unresolved findings"; return ;;
         running) decision="hold: the security review of ${head:0:7} is running"; return ;;
