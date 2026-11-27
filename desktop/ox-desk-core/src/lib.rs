@@ -14,6 +14,7 @@ pub mod changed;
 pub mod claude;
 pub mod codex;
 pub mod desktop_behavior;
+pub mod host_policy;
 pub mod host_protocol;
 pub mod inbox;
 pub mod links;
@@ -38,3 +39,5 @@ pub mod runtime;
 pub mod titles;
 
 pub mod cartridge;
+
+pub mod state_file;

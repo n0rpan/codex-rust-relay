@@ -10,8 +10,7 @@ pub struct ProjectRoute {
 use ox_desk_core::store::Route;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
-    io::{self, Write},
+    fs, io,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
@@ -31,43 +30,14 @@ pub fn read_preference<T: serde::de::DeserializeOwned>(name: &str) -> io::Result
         .with_file_name(name);
     serde_json::from_reader(fs::File::open(path)?).map_err(io::Error::from)
 }
-fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
-    let dir = path.parent().unwrap();
-    fs::create_dir_all(dir)?;
-    let mut temp = tempfile::Builder::new()
-        .prefix(".desktop-")
-        .tempfile_in(dir)?;
-    serde_json::to_writer(&mut temp, value)?;
-    temp.flush()?;
-    temp.persist(path)?;
-    Ok(())
-}
-
-pub(crate) fn update_preference_at<T: serde::de::DeserializeOwned + Serialize>(
-    path: &Path,
-    initial: impl FnOnce() -> T,
-    edit: impl FnOnce(T) -> T,
-) -> io::Result<()> {
-    fs::create_dir_all(path.parent().unwrap())?;
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path.with_extension("lock"))?;
-    lock.lock()?;
-    let current = match fs::File::open(path) {
-        Ok(file) => serde_json::from_reader(file)?,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => initial(),
-        Err(err) => return Err(err),
-    };
-    write_json(path, &edit(current))
-}
+pub(crate) use ox_desk_core::state_file::{update_preference_at, write_json};
 
 enum WriteTask {
-    Layout(crate::views::host::layout::Layout),
-    Sidebar(crate::sidebar_state::SidebarState),
-    Save(PathBuf, Route),
+    Layout(String, crate::views::host::layout::Layout),
+    Save(Option<String>, PathBuf, Route),
+    Host(Option<String>),
+    Checkout(String, Checkout),
+    Sidebar(String, crate::sidebar_state::SidebarState),
     Flush(flume::Sender<()>),
 }
 fn writer() -> &'static std::sync::mpsc::Sender<WriteTask> {
@@ -77,20 +47,42 @@ fn writer() -> &'static std::sync::mpsc::Sender<WriteTask> {
         std::thread::spawn(move || {
             for task in rx {
                 match task {
-                    WriteTask::Layout(layout) => {
+                    WriteTask::Layout(name, layout) => {
                         if let Some(path) = path()
                             && let Err(e) = crate::views::host::layout::SavedLayouts::save_at(
-                                &path.with_file_name("layout.json"),
+                                &path.with_file_name(name),
                                 layout,
                             )
                         {
                             eprintln!("Could not save desktop layout: {e}")
                         }
                     }
-                    WriteTask::Sidebar(state) => {
+                    WriteTask::Checkout(repo, checkout) => {
+                        if let Some(path) = path()
+                            && let Err(e) = update_preference_at(
+                                &path.with_file_name("project-hosts.json"),
+                                ProjectHosts::new,
+                                |mut hosts| {
+                                    hosts.insert(repo, checkout);
+                                    hosts
+                                },
+                            )
+                        {
+                            eprintln!("Could not remember project host: {e}");
+                        }
+                    }
+                    WriteTask::Host(id) => {
+                        if let Some(path) = path()
+                            && let Err(e) =
+                                write_json(&path.with_file_name("selected-host.json"), &id)
+                        {
+                            eprintln!("Could not remember selected host: {e}");
+                        }
+                    }
+                    WriteTask::Sidebar(name, state) => {
                         if let Some(path) = path()
                             && let Err(e) = crate::sidebar_state::SidebarState::save_at(
-                                &path.with_file_name("sidebar.json"),
+                                &path.with_file_name(name),
                                 state,
                             )
                         {
@@ -100,13 +92,21 @@ fn writer() -> &'static std::sync::mpsc::Sender<WriteTask> {
                     WriteTask::Flush(done) => {
                         let _ = done.try_send(());
                     }
-                    WriteTask::Save(project, route) => {
+                    WriteTask::Save(name, project, route) => {
                         if let Some(path) = path()
                             && let Err(err) = LastWorkspace::save_at(
-                                &path,
+                                &name
+                                    .as_ref()
+                                    .map_or(path.clone(), |name| path.with_file_name(name)),
                                 &project,
                                 &route,
-                                LastWorkspace::previous,
+                                || {
+                                    if name.is_some() {
+                                        LastWorkspace::default()
+                                    } else {
+                                        LastWorkspace::previous()
+                                    }
+                                },
                             )
                         {
                             eprintln!("Could not remember workspace selection: {err}");
@@ -118,11 +118,24 @@ fn writer() -> &'static std::sync::mpsc::Sender<WriteTask> {
         tx
     })
 }
-pub fn remember_layout(layout: crate::views::host::layout::Layout) {
-    let _ = writer().send(WriteTask::Layout(layout));
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct Checkout {
+    pub host: Option<String>,
+    pub path: PathBuf,
 }
-pub fn remember_sidebar(state: crate::sidebar_state::SidebarState) {
-    let _ = writer().send(WriteTask::Sidebar(state));
+pub(crate) type ProjectHosts = std::collections::BTreeMap<String, Checkout>;
+pub(crate) fn remember_checkout(repo: String, checkout: Checkout) {
+    let _ = writer().send(WriteTask::Checkout(repo, checkout));
+}
+pub fn remember_host(id: Option<String>) {
+    let _ = writer().send(WriteTask::Host(id));
+}
+
+pub fn remember_layout(name: String, layout: crate::views::host::layout::Layout) {
+    let _ = writer().send(WriteTask::Layout(name, layout));
+}
+pub fn remember_sidebar(name: String, state: crate::sidebar_state::SidebarState) {
+    let _ = writer().send(WriteTask::Sidebar(name, state));
 }
 pub fn finish_writes(cx: &gpui::App) {
     cx.on_app_quit(|_| {
@@ -193,9 +206,9 @@ impl LastWorkspace {
             },
         );
     }
-    pub fn save(project: &Path, route: &Route) -> io::Result<()> {
+    pub fn save(name: Option<String>, project: &Path, route: &Route) -> io::Result<()> {
         writer()
-            .send(WriteTask::Save(project.into(), route.clone()))
+            .send(WriteTask::Save(name, project.into(), route.clone()))
             .map_err(|_| io::Error::other("Workspace writer closed"))
     }
     fn save_at(

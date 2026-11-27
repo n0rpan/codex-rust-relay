@@ -71,3 +71,16 @@ test("manual navigation, a newer tap, and a reconnect invalidate an unfinished d
   await target.resolve([first, second], { complete: true }, show);
   assert.deepEqual(shown, [first]);
 });
+
+test("a draft notification opens only its still-live request on the owning route", async () => {
+  const request = "ox-yolo-17", target = new NotificationTarget();
+  const draft = {scope: second.scope, request};
+  const ref = link({scope: second.scope, session: {id: "ask:" + request}});
+  for (const [rows, expected] of [
+    [[{scope: first.scope, request}, draft], draft],
+    [[{scope: second.scope, request: "ox-yolo-18"}], "missing"],
+  ]) {
+    target.request(ref);
+    await target.resolve(rows, {complete: true}, (result) => assert.deepEqual(result, expected));
+  }
+});

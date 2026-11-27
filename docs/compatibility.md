@@ -137,6 +137,10 @@ and point `headersHelper` at an executable that returns a JSON header map with
 The example allows search in Chat and Cowork and asks before Web Fetch. Code sessions
 apply their own tool permissions and shell sandbox rules. [Claude Desktop web tools](https://claude.com/docs/third-party/claude-desktop/web-tools)
 
+## Worker host selection
+
+The session host advertises `worker_placement` in its hello. Clients use it to request a project's worker hosts, select Auto, pass hardware requirements and apply named project rules. A newer desktop can launch a same-host worker on an older host. An advanced placement request through the gateway reports when the parent host needs an update. The selected receiving host validates the billing route, mode and pinned subscription model before the first inference.
+
 ## Runtime limits and credentials
 
 - The relay binds only to `127.0.0.1`. Local launches use a new 256-bit token.

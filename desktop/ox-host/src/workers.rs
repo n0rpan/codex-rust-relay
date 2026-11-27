@@ -155,6 +155,11 @@ pub(crate) struct Entry {
 /// identified through its private lifetime endpoint.
 #[derive(Clone, Debug)]
 pub(crate) enum Caller {
+    Linked {
+        stamp: Box<ox_desk_core::origin::LinkedParent>,
+        project: std::path::PathBuf,
+        job: u64,
+    },
     Hosted {
         scope: Scope,
         hint: Option<String>,
@@ -413,6 +418,11 @@ pub(crate) fn request_view(ask: &ox_desk_core::asks::Ask, may: Result<(), &str>)
 /// operation is looser than another.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Resolved {
+    Linked {
+        source: String,
+        device: String,
+        request: String,
+    },
     /// Exactly one hosted session, verified as active on the helper's route.
     Hosted { scope: Scope, session: String },
     /// A terminal launch: its private launch digest and any session it observed.
@@ -428,8 +438,12 @@ pub(crate) enum Resolved {
 /// recorded at launch or bound later by that launch. Nothing else matches: when
 /// a launch ends without a known session, only operators control its workers.
 pub(crate) fn owns(caller: &Resolved, entry: &Entry) -> bool {
+    if let Some(link) = &entry.origin.linked {
+        return matches!(caller, Resolved::Linked { source, device, request } if *source == link.host && *device == link.device && *request == link.request_id);
+    }
     let p = &entry.origin.parent;
     match caller {
+        Resolved::Linked { .. } => false,
         Resolved::Hosted { scope, session } => {
             p.scope.as_ref() == Some(scope) && p.session.as_deref() == Some(session)
         }
@@ -475,6 +489,12 @@ pub(crate) fn parent_ref(caller: &Caller, session: Option<String>) -> ParentRef 
             session,
             runtime: Some(scope.route.runtime),
         },
+        Caller::Linked { project, stamp, .. } => ParentRef {
+            project: project.clone(),
+            scope: None,
+            session: None,
+            runtime: stamp.parent.runtime,
+        },
         Caller::External(c) => ParentRef {
             project: c.project.clone(),
             scope: None,
@@ -487,6 +507,7 @@ pub(crate) fn parent_ref(caller: &Caller, session: Option<String>) -> ParentRef 
 pub(crate) fn launch_identity(caller: &Caller) -> String {
     match caller {
         Caller::Hosted { launch, .. } => launch_digest("helper", launch),
+        Caller::Linked { stamp, .. } => format!("link:{}", stamp.device),
         Caller::External(c) => launch_digest("terminal", &c.launch),
         Caller::Operator { device, .. } => format!("operator:{device}"),
     }
@@ -500,6 +521,10 @@ pub(crate) fn origin(
     resolved: modes::Resolved,
 ) -> Origin {
     Origin {
+        linked: match caller {
+            Caller::Linked { stamp, .. } => Some(stamp.clone()),
+            _ => None,
+        },
         relation: Relation::Worker,
         parent: parent_ref(caller, parent),
         launch: launch_identity(caller),
@@ -721,6 +746,7 @@ mod tests {
     }
     fn worker(ceiling: Level, runtime: Runtime) -> Origin {
         Origin {
+            linked: None,
             relation: Relation::Worker,
             parent: ParentRef {
                 project: "/p".into(),

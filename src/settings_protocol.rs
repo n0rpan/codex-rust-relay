@@ -38,6 +38,19 @@ pub struct Settings {
     pub presets: Vec<(String, String)>,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+pub struct KeySelection {
+    pub name: String,
+    pub scope: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct TransferredKey {
+    #[serde(flatten)]
+    pub selection: KeySelection,
+    pub value: model::Secret,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Request {
@@ -65,6 +78,16 @@ pub enum Request {
         name: String,
         scope: String,
         value: Option<model::Secret>,
+    },
+    /// Local helper only. The remote settings service never exposes key values.
+    ExportKeys {
+        revision: String,
+        selected: Vec<KeySelection>,
+    },
+    /// Commit the reviewed set together under the destination configuration lock.
+    ImportKeys {
+        revision: String,
+        keys: Vec<TransferredKey>,
     },
     LegacyWorkspace,
     Save {

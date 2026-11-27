@@ -86,6 +86,7 @@ pub(crate) fn view(a: &Asking) -> AskView {
 /// tokens already issued, and announce new ones with an approval notification.
 pub(crate) fn merge(
     asking: &BTreeMap<u64, Asking>,
+    activations: impl Iterator<Item = AskView>,
     scope: &Scope,
     previous: Vec<AskView>,
     asks: &mut Vec<AskView>,
@@ -94,8 +95,9 @@ pub(crate) fn merge(
     let mut wanted: Vec<AskView> = asking
         .values()
         .filter(|a| a.origin.parent.scope.as_ref() == Some(scope))
-        .map(|a| {
-            let mut v = view(a);
+        .map(view)
+        .chain(activations)
+        .map(|mut v| {
             if let Some(old) = previous.iter().find(|p| p.id == v.id) {
                 v.token.clone_from(&old.token);
             }

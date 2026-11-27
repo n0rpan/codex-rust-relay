@@ -52,9 +52,23 @@ pub struct ParentRef {
     pub runtime: Option<Runtime>,
 }
 
+/// A parent on another host. Its paths and session identifiers are meaningful only there.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct LinkedParent {
+    pub host: String,
+    pub device: String,
+    pub request_id: String,
+    pub parent: ParentRef,
+    pub verified_level: Ceiling,
+    pub link_ceiling: Ceiling,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Origin {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked: Option<Box<LinkedParent>>,
     pub relation: Relation,
     pub parent: ParentRef,
     /// Non-secret identity of the launching OX helper or operator device.
@@ -128,11 +142,45 @@ impl Origin {
     }
 }
 
+/// Minimum installed hardware. Available memory and load rank eligible machines.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkerNeeds {
+    pub memory_gb: Option<u32>,
+    pub cpus: Option<u32>,
+    pub gpu: bool,
+    pub os: Option<String>,
+}
+
+impl WorkerNeeds {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.memory_gb == Some(0) || self.cpus == Some(0) {
+            return Err("Memory and CPU requirements must be positive.".into());
+        }
+        if self
+            .os
+            .as_ref()
+            .is_some_and(|s| s.trim().is_empty() || s.len() > 128)
+        {
+            return Err("Provide an operating system such as linux or macos.".into());
+        }
+        Ok(())
+    }
+}
+
 /// An operator's request to start a worker attached to a session in the subscribed scope.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct WorkerStart {
+    /// A paired worker host name or stable ID. Omit to run on the parent's host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs: Option<WorkerNeeds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<String>,
     pub parent: String,
     pub runtime: Runtime,
     pub model: Option<String>,
@@ -165,7 +213,7 @@ impl WorkerStart {
     pub fn mode_request(&self) -> ModeRequest {
         self.permission.unwrap_or(ModeRequest::legacy(self.write))
     }
-    /// The composer form: `/worker <codex|claude>[:<api model>] [--write]
+    /// The composer form: `/worker [@host] <codex|claude>[:<api model>] [--write]
     /// [--mode <mode>] [--goal|--workflow] <task>`. A Claude worker without a model uses the
     /// Claude subscription. Returns None when the text is not a worker command.
     pub fn parse_command(parent: &str, text: &str) -> Option<Result<Self, String>> {
@@ -173,8 +221,18 @@ impl WorkerStart {
         if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
             return None;
         }
-        let usage = "Use /worker codex:<model> [--mode <mode>] [--goal] <task> or /worker claude[:<model>] [--mode <mode>] [--workflow] <task>.";
-        let mut words = rest.trim_start().splitn(2, char::is_whitespace);
+        let usage = "Use /worker [@host] codex[:<model>] [--mode <mode>] [--goal] <task> or /worker [@host] claude[:<model>] [--mode <mode>] [--workflow] <task>.";
+        let rest = rest.trim_start();
+        let (host, rest) = match rest.strip_prefix('@') {
+            Some(named) => {
+                let Some((host, rest)) = named.split_once(char::is_whitespace) else {
+                    return Some(Err(usage.into()));
+                };
+                (Some(host.to_owned()), rest.trim_start())
+            }
+            None => (None, rest),
+        };
+        let mut words = rest.splitn(2, char::is_whitespace);
         let target = words.next().filter(|w| !w.is_empty());
         let Some(target) = target else {
             return Some(Err(usage.into()));
@@ -211,6 +269,9 @@ impl WorkerStart {
             task = after.trim_start();
         }
         let start = Self {
+            host,
+            needs: None,
+            placement: None,
             parent: parent.to_owned(),
             runtime,
             model,
@@ -227,6 +288,23 @@ impl WorkerStart {
     }
     /// The checks the standalone OX gateway applies, shared by every launcher.
     pub fn validate(&self) -> Result<(), String> {
+        if self
+            .host
+            .as_ref()
+            .is_some_and(|h| h.trim().is_empty() || h.len() > 256)
+        {
+            return Err("Provide a worker host name or ID.".into());
+        }
+        if let Some(needs) = &self.needs {
+            needs.validate()?;
+        }
+        if self
+            .placement
+            .as_deref()
+            .is_some_and(|s| s.trim().is_empty() || s.len() > 128 || s == "os")
+        {
+            return Err("Provide a named project placement rule.".into());
+        }
         if self.max_minutes.is_some_and(|m| m == 0 || m > 7 * 24 * 60) {
             return Err("max_minutes must be between 1 and 10080.".into());
         }
@@ -243,9 +321,6 @@ impl WorkerStart {
         if self.mode == WorkerMode::Workflow && self.runtime != Runtime::Claude {
             return Err("Workflow mode requires Claude Code.".into());
         }
-        if self.runtime == Runtime::Codex && self.model.is_none() {
-            return Err("Choose an ox API model for a Codex worker.".into());
-        }
         if self.model.as_ref().is_some_and(|model| {
             model.trim().is_empty() || model.len() > 256 || model.starts_with('-')
         }) {
@@ -253,7 +328,7 @@ impl WorkerStart {
         }
         if let Some(pinned) = &self.subscription_model {
             if self.runtime != Runtime::Claude {
-                return Err("subscription_model pins a Claude subscription worker. Codex workers use an ox API model alias.".into());
+                return Err("subscription_model pins a Claude subscription model. Leave it out to use the ChatGPT subscription with Codex.".into());
             }
             if self.model.is_some() {
                 return Err("Choose either an ox API model alias (billed by its provider) or a subscription_model (billed to the Claude subscription), not both.".into());
@@ -313,6 +388,7 @@ pub fn model_line(report: &serde_json::Value) -> Option<String> {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ParentCall {
+    ListHosts,
     List,
     Status {
         job_id: u64,
@@ -338,6 +414,8 @@ pub enum ParentCall {
     /// source in the caller's chain; absent means the nearest one. Pages by item
     /// ID: `after` starts after that item, `item` returns one item in full.
     ReadThread {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
         #[serde(default)]
         session: Option<String>,
         #[serde(default)]
@@ -403,13 +481,23 @@ mod tests {
         assert_eq!(claude.route(), Runtime::Claude.route(None));
         assert_eq!(claude.mode, WorkerMode::Workflow);
         assert_eq!(claude.mode_request(), ModeRequest::Inherit);
+        let native = WorkerStart::parse_command("p", "/worker codex task")
+            .unwrap()
+            .unwrap();
+        assert_eq!(native.route(), Route::CODEX_SUBSCRIPTION);
         assert!(
-            WorkerStart::parse_command("p", "/worker codex task")
+            WorkerStart::parse_command("p", "/worker claude --goal x")
                 .unwrap()
                 .is_err()
         );
+        let named =
+            WorkerStart::parse_command("p", "/worker @build claude --mode read inspect my changes")
+                .unwrap()
+                .unwrap();
+        assert_eq!(named.host.as_deref(), Some("build"));
+        assert_eq!(named.task, "inspect my changes");
         assert!(
-            WorkerStart::parse_command("p", "/worker claude --goal x")
+            WorkerStart::parse_command("p", "/worker @ claude review")
                 .unwrap()
                 .is_err()
         );

@@ -247,7 +247,13 @@ export function setupSettings({ request, open, close, notifications, login }) {
       button(
         back === close
           ? "← Sessions"
-          : back === providers
+          : back === remote
+            ? "← Remote access"
+          : back === credentials
+            ? "← Credentials"
+            : back === keyDestinations
+              ? "← Destinations"
+            : back === providers
             ? "← Providers"
             : "← Settings",
         back,
@@ -373,6 +379,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
       choices.splice(5, 0, ["Legacy Codex provider", legacy]);
     choices.push(
       ["Remote access", remote],
+      ["Host updates", hostUpdates],
       ["Install & notifications", phone],
       ["Phone appearance & input", () => behaviorForm(true)],
       ["Desktop appearance & input", () => behaviorForm(false)],
@@ -687,8 +694,126 @@ export function setupSettings({ request, open, close, notifications, login }) {
         ),
       );
   }
+  async function keyDestinations() {
+    const id = screen("Copy API keys", credentials);
+    const data = await readPage(id, { action: "key_destinations" });
+    if (!data) return;
+    if (data.hosts.length) {
+      body.append(node("h2", "Destination host"));
+      for (const host of data.hosts)
+        body.append(
+          action(host.name + " · " + host.origin, () =>
+            reviewTransfer(host.id),
+          ),
+        );
+    }
+    const form = node("form", undefined, "phone-settings-card");
+    form.autocomplete = "off";
+    form.append(
+      node("h2", "Pair a destination"),
+      node(
+        "p",
+        "On the receiving host, run ox host pair or create an invitation in Remote access. This host will remember the destination for future transfers.",
+      ),
+    );
+    const address = textField(
+      form,
+      "Invitation link or host URL",
+      "destination",
+    );
+    const code = textField(
+      form,
+      "Pairing code (for a host URL)",
+      "code",
+      "password",
+    );
+    address.required = true;
+    address.spellcheck = false;
+    address.setAttribute("autocapitalize", "none");
+    code.autocomplete = "off";
+    submit(form, "Pair destination", async () => {
+      const host = await request({
+        action: "pair_key_destination",
+        address: address.value.trim(),
+        code: code.value.trim(),
+      });
+      address.value = code.value = "";
+      if (id === pageId && !panel.hidden) await reviewTransfer(host.id);
+    });
+    body.append(form);
+  }
+  async function reviewTransfer(host) {
+    const id = screen("Review API keys", keyDestinations);
+    const review = await readPage(id, { action: "review_key_transfer", host });
+    if (!review) return;
+    body.append(node("h2", review.host.name), node("p", review.host.origin));
+    if (!review.rows.length) {
+      body.append(node("p", "This host has no configured API keys to copy."));
+      return;
+    }
+    body.append(
+      node(
+        "p",
+        "Anyone with access to the destination’s OX key store can use these keys and incur charges. The originals stay on this host. Revoking the pairing later leaves the copies on the destination.",
+        "warning",
+      ),
+    );
+    const inputs = [];
+    const form = node("form", undefined, "phone-settings-card");
+    for (const row of review.rows) {
+      const label = node("label");
+      const box = node("input");
+      box.type = "checkbox";
+      box.checked = row.selected;
+      box.disabled = !row.available;
+      const name =
+        row.key.scope === "https://api.search.brave.com/"
+          ? "Brave Search · " + row.key.name
+          : row.key.name;
+      label.append(
+        box,
+        document.createTextNode(name),
+        node("small", row.key.scope + " · " + row.status),
+      );
+      form.append(label);
+      inputs.push([box, row.key]);
+    }
+    const chosen = () =>
+      inputs
+        .filter(([box]) => !box.disabled && box.checked)
+        .map(([, key]) => key);
+    submit(form, "Send selected keys", async () => {
+      const result = await request({
+        action: "send_key_transfer",
+        host,
+        pairing: review.pairing,
+        source: review.source,
+        target: review.target,
+        selected: chosen(),
+      });
+      if (id !== pageId || panel.hidden) return;
+      credentials();
+      status.textContent =
+        "Sent " +
+        result.sent +
+        (result.sent === 1 ? " key to " : " keys to ") +
+        review.host.name +
+        ".";
+    });
+    const send = form.querySelector('button[type="submit"]');
+    const selection = () => {
+      send.disabled = !chosen().length;
+    };
+    form.addEventListener("change", selection);
+    selection();
+    body.append(
+      form,
+      action("Refresh review", () => reviewTransfer(host), "quiet"),
+    );
+  }
   function credentials() {
     screen("Credentials");
+    body.append(action("Copy keys to another host…", keyDestinations));
     if (!snapshot.credentials.length)
       body.append(
         node("p", "Configure a provider or Brave Search to add a credential."),
@@ -874,11 +999,148 @@ export function setupSettings({ request, open, close, notifications, login }) {
       body.append(details(doc.title, form));
     }
   }
+  async function hostModePolicy() {
+    const id = screen("Host mode policy", remote);
+    const current = await readPage(id, { action: "host_mode_policy" });
+    if (!current) return;
+    const form = node("form", undefined, "phone-settings-card");
+    const label = node("label", "Starting mode on this host");
+    const select = node("select");
+    select.name = "host_mode_policy";
+    for (const [value, name] of [
+      ["follow_interface", "Follow interface"],
+      ["always_read", "Always read"],
+      ["always_write", "Always write"],
+      ["always_classifier", "Always auto-review"],
+      ["always_yolo", "Always YOLO"],
+      ["yolo_asks_every_time", "YOLO asks every time"],
+    ]) select.append(new Option(name, value));
+    select.value = current.policy;
+    label.append(select);
+    form.append(label, node("p",
+      "Applies to sessions opened from any paired device. Always YOLO starts sessions without permission prompts. YOLO asks every time lets any paired device approve each new entry into YOLO.",
+    ));
+    submit(form, "Save host policy", async () => {
+      await request({ action: "host_mode_policy", set: select.value });
+      if (id === pageId && !panel.hidden) status.textContent = "Saved on the host.";
+    });
+    body.append(form);
+  }
+  async function hostUpdates() {
+    const id = screen("Host updates");
+    const initial = await readPage(id, {action: "host_update", command: {type: "status"}});
+    if (!initial) return;
+    function show(state) {
+      body.replaceChildren(node("p", "Installed on this host: " + state.installed), node("p", state.message));
+      if (!state.managed) return;
+      const card = node("div", undefined, "phone-settings-card");
+      async function change(command) {
+        for (const control of card.querySelectorAll("select,button")) control.disabled = true;
+        try {
+          const next = await request({action: "host_update", command});
+          if (pageId === id && !panel.hidden) show(next);
+        } catch (err) {
+          if (pageId === id && !panel.hidden) {
+            show(state);
+            status.textContent = err.message;
+          }
+        }
+      }
+      function choice(name, legend, options, selected) {
+        const label = node("label", legend);
+        const select = node("select");
+        select.name = name;
+        for (const [value, title] of options) select.append(new Option(title, value));
+        select.value = selected;
+        select.onchange = () => change({type: "set_" + name, [name]: select.value});
+        label.append(select);
+        card.append(label);
+      }
+      choice("mode", "Update mode", [["automatic","Automatic when idle"], ["download","Download only"], ["manual","Manual"]], state.mode);
+      choice("channel", "Release channel", [["stable","Stable"], ["dev","Dev"]], state.channel);
+      card.append(
+        action(state.scheduled ? "Cancel scheduled update" : "Update when idle", () => change({type: state.scheduled ? "cancel" : "update_when_idle"})),
+        action("Refresh status", () => change({type: "status"})),
+      );
+      body.append(card);
+    }
+    show(initial);
+  }
+  async function workerLinks() {
+    const id = screen("Worker host links", remote);
+    const outbound = await readPage(id, {action: "worker_links"});
+    if (!outbound) return;
+    const form = node("form", undefined, "phone-settings-card");
+    form.autocomplete = "off";
+    form.append(node("h2", "Send workers to another host"));
+    for (const host of outbound.available || []) {
+      form.append(action("Link " + host.name, async () => {
+        await request({action: "link_paired_host", host: host.id});
+        if (pageId === id && !panel.hidden) await workerLinks();
+      }));
+    }
+    const address = textField(form, "Worker invitation or host URL", "worker_address");
+    const code = textField(form, "Code (for a host URL)", "worker_code", "password");
+    address.required = true;
+    address.spellcheck = false;
+    address.setAttribute("autocapitalize", "none");
+    submit(form, "Link worker host", async () => {
+      await request({action: "add_worker_link", address: address.value.trim(), code: code.value.trim()});
+      address.value = code.value = "";
+      if (pageId === id && !panel.hidden) await workerLinks();
+    });
+    body.append(form);
+    for (const host of outbound.hosts) {
+      const card = node("div", undefined, "phone-settings-card");
+      card.append(node("h2", host.name), node("p", host.origin), action("Remove outgoing link", async () => {
+        const result = await request({action: "remove_worker_link", host: host.id});
+        if (pageId !== id || panel.hidden) return;
+        await workerLinks();
+        if (!result.revoked) status.textContent = "Removed here. Revoke the incoming link on the other host when it is reachable.";
+      }));
+      body.append(card);
+    }
+    const receive = node("div", undefined, "phone-settings-card");
+    receive.append(node("h2", "Accept workers on this host"), node("p", "A new link allows launches up to YOLO, subject to this host’s mode policy. Paste the invitation in Worker host links on the sending host."));
+    const invitation = node("div");
+    receive.append(action("Create worker invitation", async () => {
+      const pair = await readPage(id, {action: "invite_worker_host"});
+      if (!pair) return;
+      clearTimeout(inviteTimer);
+      invitation.replaceChildren(node("p", location.origin), node("p", pair.short_code), action("Copy worker invitation", () => navigator.clipboard.writeText(pair.url)));
+      inviteTimer = setTimeout(() => invitation.replaceChildren(node("p", "Invitation expired.")), Math.max(0, pair.expires_at * 1000 - Date.now()));
+    }), invitation);
+    body.append(receive);
+    for (const device of outbound.incoming) {
+      const card = node("form", undefined, "phone-settings-card");
+      card.append(node("h2", device.label));
+      const allow = node("input"); allow.type = "checkbox"; allow.checked = device.worker.may_launch;
+      const allowed = node("label"); allowed.append(allow, document.createTextNode(" Allow worker launches"));
+      const ceiling = node("select");
+      for (const [value, label] of [["read","Read"], ["write","Write"], ["classifier","Auto-review"], ["yolo","YOLO"]])
+        ceiling.append(new Option(label, value));
+      ceiling.value = device.worker.ceiling;
+      const limit = node("label", "Maximum worker mode"); limit.append(ceiling);
+      card.append(allowed, limit);
+      submit(card, "Save worker access", async () => {
+        await request({action: "edit_worker_link", id: device.id, before: device.worker, may_launch: allow.checked, ceiling: ceiling.value});
+        if (pageId === id && !panel.hidden) { await workerLinks(); status.textContent = "Saved on this host."; }
+      });
+      body.append(card, action("Revoke " + device.label, async () => {
+        await request({action: "revoke_device", id: device.id});
+        if (pageId === id && !panel.hidden) await workerLinks();
+      }));
+    }
+  }
   async function remote() {
     const id = screen("Remote access");
     const result = await readPage(id, { action: "devices" });
     if (!result) return;
-    body.append(node("p", result.origin || location.origin));
+    body.append(
+      node("p", result.origin || location.origin),
+      action("Host mode policy", hostModePolicy),
+      action("Worker host links", workerLinks),
+    );
     const invite = node("div", undefined, "phone-settings-invite");
     body.append(
       action(
@@ -939,7 +1201,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
         ),
       ),
     );
-    for (const device of result.devices) {
+    for (const device of result.devices.filter(d => d.class !== "host")) {
       const card = node("div", undefined, "phone-settings-card");
       card.append(
         node("h2", device.label),

@@ -18,7 +18,7 @@ const sessionKey = (scope, id) => scopeKey(scope) + " " + id;
 async function notificationMatch(ref, rows, complete) {
   const cut = ref.lastIndexOf("~");
   const id = cut < 0 ? ref : ref.slice(0, cut);
-  const candidates = rows.filter(({ session }) => session.id === id);
+  const candidates = rows.filter(({ session, request }) => session ? session.id === id : cut >= 0 && id === `ask:${request}`);
   if (cut < 0) {
     if (candidates.length > 1) return "ambiguous";
     if (!complete) return "incomplete";

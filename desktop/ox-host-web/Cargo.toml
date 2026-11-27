@@ -6,12 +6,17 @@ publish = false
 
 [features]
 default = []
-server = ["dep:ox-pty", "dep:flume", "dep:httpdate", "dep:axum", "dep:base64", "dep:ox-desk-core", "dep:p256", "dep:qrcode", "dep:reqwest", "dep:ring", "dep:tempfile", "dep:tokio", "dep:url", "dep:web-push-native"]
+fixture-transport = ["client", "dep:rustls"]
+client = ["dep:tempfile", "dep:getrandom", "dep:secret-service", "dep:zbus", "dep:ox-desk-core", "dep:flume", "dep:security-framework", "dep:base64", "dep:p256", "dep:reqwest", "dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:sha2", "reqwest/json", "tokio/rt-multi-thread"]
+server = ["client", "tokio/fs", "dep:flume", "dep:httpdate", "dep:axum", "dep:base64", "dep:ox-desk-core", "dep:p256", "dep:qrcode", "dep:reqwest", "dep:ring", "dep:tempfile", "dep:tokio", "dep:web-push-native"]
 
 [dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+getrandom = {version="0.3", optional=true}
 httpdate = { version = "1", optional = true }
 flume = { version="0.12", optional=true, default-features=false, features=["async"] }
-ox-pty = { path = "../ox-pty", optional = true }
+ox-pty = { path = "../ox-pty" }
+ox-host-service = { path = "../ox-host-service" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
@@ -24,8 +29,19 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 ring = { version = "0.17", optional = true }
 tempfile = { version = "3", optional = true }
 tokio = { version = "1", features = ["io-util", "net", "rt", "sync", "time", "macros"], optional = true }
-url = { version = "2", optional = true }
+url = "2"
+sha2 = { version = "0.10", optional = true }
+futures-util = { version = "0.3", features = ["sink"], optional = true }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"], optional = true }
 web-push-native = { version = "0.5", default-features = false, optional = true }
 
 [dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1", features = ["test-util"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3", features = ["OSX_10_15"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "5.1", features = ["rt-async-io-crypto-rust"], optional = true }
+zbus = { version = "5", default-features = false, optional = true }

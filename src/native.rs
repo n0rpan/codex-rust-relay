@@ -464,7 +464,7 @@ pub(crate) fn claude_account_command(home: &Path) -> Result<Command, RelayError>
     Ok(command)
 }
 
-fn codex_command(home: &Path) -> Result<Command, RelayError> {
+pub(crate) fn codex_command(home: &Path) -> Result<Command, RelayError> {
     let mut command = command("codex", home)?;
     command
         .env("CODEX_HOME", home)

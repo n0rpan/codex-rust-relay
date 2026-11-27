@@ -9,6 +9,8 @@ use std::{
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 pub(crate) struct Owned {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) forwarded: std::collections::BTreeMap<u64, crate::engine::forwarding::Job>,
     pub(crate) scopes: Vec<SavedScope>,
     #[serde(default)]
     pub(crate) worker_notices: crate::worker_notices::Notices,

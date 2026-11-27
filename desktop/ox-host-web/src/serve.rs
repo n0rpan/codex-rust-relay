@@ -53,3 +53,18 @@ pub fn configuration(v: &Value, authority: &str, https: &str, proxy: &str) -> Co
         _ => Config::Conflict,
     }
 }
+
+pub fn origin(input: &str) -> Option<String> {
+    let u = url::Url::parse(input).ok()?;
+    let host = u.host_str()?;
+    (u.scheme() == "https"
+        && host.ends_with(".ts.net")
+        && host.len() > 7
+        && u.username().is_empty()
+        && u.password().is_none()
+        && u.path() == "/"
+        && u.query().is_none()
+        && u.fragment().is_none()
+        && input.trim_end_matches('/') == u.origin().ascii_serialization())
+    .then(|| u.origin().ascii_serialization())
+}

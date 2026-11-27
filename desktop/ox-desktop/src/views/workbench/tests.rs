@@ -899,6 +899,7 @@ fn claude_workbench_session() {
     let root = std::env::current_dir().unwrap();
     let api = (mode == "api").then_some("fixture/demo");
     let mut a = Pane::open(&root, api);
+    a.store.set_start_mode(|_| None);
     a.wait("cold Claude route", |s| {
         s.state() == &Connection::Ready && s.can_send(None)
     });

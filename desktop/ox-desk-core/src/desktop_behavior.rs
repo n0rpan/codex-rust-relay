@@ -61,12 +61,12 @@ impl Default for Behavior {
         }
     }
 }
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 pub struct Snapshot {
     pub revision: String,
     pub behavior: Behavior,
 }
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Outcome {
     Applied,

@@ -112,6 +112,7 @@ pub struct Running {
     confirm: Option<Target>,
     /// Set by the sidebar each time it draws. Polling stops while the panel is hidden.
     shown: bool,
+    link: platform::HostLink,
     monitor: Arc<platform::ProcessMonitor>,
     /// The list is expanded above the sidebar footer.
     pub(super) open: bool,
@@ -119,6 +120,12 @@ pub struct Running {
 }
 
 impl Running {
+    pub(super) fn new(link: platform::HostLink) -> Self {
+        Self {
+            link,
+            ..Self::default()
+        }
+    }
     /// The one count for the footer's "● n running": every live host process, busy or idle.
     pub fn process_count(&self) -> usize {
         self.processes.len()
@@ -166,7 +173,8 @@ impl Running {
         self.poll = None;
         self.loading = true;
         let monitor = self.monitor.clone();
-        let task = cx.background_spawn(async move { monitor.list() });
+        let link = self.link.clone();
+        let task = cx.background_spawn(async move { monitor.list(&link) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |s, cx| {
@@ -208,6 +216,7 @@ impl Running {
         if self.ending {
             return;
         }
+        let link = self.link.clone();
         self.ending = true;
         self.end_error = None;
         let task = cx.background_spawn(async move {
@@ -217,7 +226,7 @@ impl Running {
             };
             let mut failure = None;
             for (scope, threads) in groups {
-                if let Err(e) = platform::end_threads(scope, threads, force) {
+                if let Err(e) = link.end_threads(scope, threads, force) {
                     failure.get_or_insert(e.to_string());
                 }
             }
@@ -257,7 +266,9 @@ impl Running {
         let monitor = self.monitor.clone();
         self.end(
             move || {
-                let fresh = monitor.list().map_err(|e| e.to_string())?;
+                let fresh = monitor
+                    .list(&platform::HostLink::Local)
+                    .map_err(|e| e.to_string())?;
                 Ok(still_idle(&seen, &fresh))
             },
             false,

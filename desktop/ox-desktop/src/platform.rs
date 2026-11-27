@@ -1,7 +1,11 @@
+pub(crate) mod attachments;
 mod host_client;
+pub(crate) mod hosts;
+#[cfg(test)]
+pub(crate) use host_client::open_store;
 pub(crate) use host_client::{
-    CatalogEvent, CatalogWatch, HOST_NOT_RUNNING, IdleReservation, ProcessMonitor, discover,
-    end_threads, open_store, reserve_idle_update, watch_catalog,
+    CatalogEvent, CatalogWatch, HOST_NOT_RUNNING, HostLink, IdleReservation, ProcessMonitor,
+    clean_handoff_pairings, reserve_idle_update,
 };
 pub mod onboarding;
 pub(crate) mod remote;

@@ -13,3 +13,5 @@ mod running;
 mod worker_sheet;
 
 mod mention_menu;
+
+pub(crate) mod remote_project;

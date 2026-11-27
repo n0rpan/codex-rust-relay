@@ -267,6 +267,9 @@ impl Workbench {
         let Some(store) = self.store.as_ref() else {
             return;
         };
+        if self.link.remote().is_some() {
+            return;
+        }
         let result = review.valid_directory().and_then(|()| match source {
             Source::Failed { thread, item } => {
                 let valid = store

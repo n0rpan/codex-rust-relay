@@ -1,6 +1,7 @@
 //! The "Start worker" and "Continue in…" sheets. They dispatch the same `StartWorker` and
 //! `StartHandoff` actions as the `/worker` and `/handoff` commands. The commands stay as
 //! shortcuts; these sheets show the same choices as fields.
+mod hosts;
 use super::handoff_sheet::{self, HandoffDraft};
 use super::model_picker::{ModelPicker, ModelPickerEvent};
 use super::workbench::Workbench;
@@ -53,11 +54,12 @@ pub(super) struct WorkerDraft {
     pub choice: Choice,
     pub mode: WorkerMode,
     pub task: Entity<TextareaState>,
+    hosts: hosts::Picker,
 }
 
 pub(super) enum Launch {
-    Worker(WorkerDraft),
-    Handoff(HandoffDraft),
+    Worker(Box<WorkerDraft>),
+    Handoff(Box<HandoffDraft>),
 }
 
 impl Launch {
@@ -149,6 +151,9 @@ pub(super) fn worker_start(
     }
     let yolo = yolo_confirmed(permission);
     let start = WorkerStart {
+        host: None,
+        needs: None,
+        placement: None,
         parent: owner.to_owned(),
         runtime,
         model: model_or_none(model),
@@ -233,11 +238,13 @@ impl Workbench {
                         .placeholder("What should the worker do?")
                 });
                 task.read(cx).focus_handle(cx).focus(window, cx);
-                Launch::Worker(WorkerDraft {
+                let hosts = hosts::Picker::new(self.link.clone(), self.project.clone(), window, cx);
+                Launch::Worker(Box::new(WorkerDraft {
+                    hosts,
                     choice,
                     mode: WorkerMode::Session,
                     task,
-                })
+                }))
             }
             LaunchKind::Handoff => {
                 let request = cx.new(|cx| {
@@ -246,7 +253,11 @@ impl Workbench {
                         .placeholder("What should the new session do?")
                 });
                 request.read(cx).focus_handle(cx).focus(window, cx);
-                Launch::Handoff(HandoffDraft { choice, request })
+                Launch::Handoff(Box::new(HandoffDraft {
+                    choice,
+                    request,
+                    destination: None,
+                }))
             }
         };
         self.launch = Some(launch);
@@ -282,6 +293,7 @@ impl Workbench {
     }
 
     pub(super) fn set_launch_runtime(&mut self, runtime: Runtime, cx: &mut Context<Self>) {
+        self.launch_picker = None;
         self.set_launch_choice(|c| c.runtime = runtime, cx);
         if let Some(Launch::Worker(draft)) = self.launch.as_mut()
             && !mode_allowed(runtime, draft.mode)
@@ -326,12 +338,38 @@ impl Workbench {
         // The target is an OX API alias, so the source session's own native command models
         // (subscription names like "default") are not candidates. Any catalog model may be
         // chosen, starred or not: the picker lists settings and the discovered catalog.
-        let picker = cx.new(|cx| ModelPicker::new(vec![], window, cx).with_catalog(cx));
+        let aliases = match launch {
+            Launch::Worker(draft) => draft.hosts.aliases(draft.choice.runtime),
+            Launch::Handoff(draft) => draft.destination.as_ref().map(|h| {
+                h.routes
+                    .iter()
+                    .filter(|r| r.runtime == draft.choice.runtime)
+                    .filter_map(|r| match &r.billing {
+                        Billing::Api(alias) => Some(alias.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            }),
+        };
+        let link = match launch {
+            Launch::Handoff(d) => d.destination.as_ref().map(|h| h.link.clone()),
+            Launch::Worker(_) => None,
+        }
+        .unwrap_or_else(|| self.link.clone());
+        let picker = cx.new(|cx| {
+            let picker = ModelPicker::new(link, vec![], window, cx);
+            match aliases {
+                Some(aliases) => picker.with_target_aliases(aliases),
+                None => picker.with_catalog(cx),
+            }
+        });
         let subscription = cx.subscribe_in(
             &picker,
             window,
             |s: &mut Workbench, _, event: &ModelPickerEvent, _, cx| match event {
-                ModelPickerEvent::Choose(id) => s.choose_launch_model(Some(id.clone()), cx),
+                ModelPickerEvent::Choose(id) => {
+                    s.choose_launch_model(Some(super::model_picker::bare(id).to_owned()), cx)
+                }
                 ModelPickerEvent::Close => {
                     s.launch_picker = None;
                     cx.notify();
@@ -358,7 +396,10 @@ impl Workbench {
                     c.model.as_deref(),
                     &task,
                 )
-                .map(DeskAction::StartWorker)
+                .and_then(|mut start| {
+                    draft.hosts.apply(&mut start, cx)?;
+                    Ok(DeskAction::StartWorker(start))
+                })
             }
             Some(Launch::Handoff(draft)) => {
                 let request = draft.request.read(cx).value().to_string();
@@ -366,6 +407,13 @@ impl Workbench {
             }
             None => return,
         };
+        if let (Ok(DeskAction::StartHandoff(start)), Some(Launch::Handoff(draft))) =
+            (&result, &self.launch)
+            && let Some(target) = draft.destination.clone()
+        {
+            self.send_handoff(start.clone(), target, cx);
+            return;
+        }
         match result {
             Ok(action) => {
                 self.close_launch(cx);
@@ -398,15 +446,8 @@ impl Workbench {
         field(p, "Runtime", chips)
     }
 
-    fn model_row(
-        &self,
-        p: Palette,
-        kind: LaunchKind,
-        choice: &Choice,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        // A Codex worker needs an OX API model; a handoff may use either subscription.
-        let subscription_ok = kind == LaunchKind::Handoff || choice.runtime == Runtime::Claude;
+    fn model_row(&self, p: Palette, choice: &Choice, cx: &mut Context<Self>) -> Div {
+        let subscription_ok = !matches!(&self.launch, Some(Launch::Worker(d)) if !d.hosts.offers_subscription(choice.runtime));
         let model_label = match &choice.model {
             Some(model) => format!(
                 "{} · {}",
@@ -418,7 +459,10 @@ impl Workbench {
         let default = self
             .store
             .as_ref()
-            .filter(|s| s.profile().route.runtime == choice.runtime)
+            .filter(|s| {
+                s.profile().route.runtime == choice.runtime
+                    && !matches!(&self.launch, Some(Launch::Worker(d)) if !d.hosts.same_as_parent())
+            })
             .and_then(|store| {
                 let caps = store.command_caps(Some(&choice.owner));
                 let id = caps.default_model()?.to_owned();
@@ -443,11 +487,7 @@ impl Workbench {
                 true,
                 cx.listener(|s, _, window, cx| s.toggle_launch_picker(window, cx)),
             ));
-        let mut control = col().gap_1().child(chips);
-        if !subscription_ok {
-            control = control.child(small(p, "Codex workers need an OX API model."));
-        }
-        field(p, "Model", control)
+        field(p, "Model", chips)
     }
 
     fn permission_row(&self, p: Palette, choice: &Choice, cx: &mut Context<Self>) -> Div {
@@ -577,11 +617,62 @@ impl Workbench {
         match launch {
             Launch::Worker(draft) => {
                 body = body
+                    .child(self.host_row(p, draft, cx))
                     .child(self.mode_row(p, draft, cx))
-                    .child(self.model_row(p, kind, &choice, cx));
+                    .child(self.model_row(p, &choice, cx));
             }
-            Launch::Handoff(_) => {
-                body = body.child(self.model_row(p, kind, &choice, cx));
+            Launch::Handoff(draft) => {
+                let targets = self.handoff_destinations(cx);
+                if !targets.is_empty() || draft.destination.is_some() {
+                    let mut chips = row().flex_wrap().gap_1().child(button(
+                        p,
+                        "handoff-same-host",
+                        "This host",
+                        draft.destination.is_none(),
+                        true,
+                        cx.listener(|s, _, _, cx| {
+                            if let Some(Launch::Handoff(d)) = &mut s.launch
+                                && d.destination.is_some()
+                            {
+                                d.destination = None;
+                                d.choice.model = None;
+                                d.choice.error = None;
+                            }
+                            cx.notify();
+                        }),
+                    ));
+                    for (index, target) in targets.into_iter().enumerate() {
+                        let chosen = draft
+                            .destination
+                            .as_ref()
+                            .is_some_and(|d| d.id == target.id && d.project == target.project);
+                        let label = format!("{} · {}", target.name, target.project.display());
+                        chips = chips.child(button(
+                            p,
+                            ("handoff-host", index),
+                            label,
+                            chosen,
+                            true,
+                            cx.listener(move |s, _, _, cx| {
+                                if let Some(Launch::Handoff(d)) = &mut s.launch {
+                                    if let Some(model) = &d.choice.model
+                                        && !target
+                                            .routes
+                                            .contains(&d.choice.runtime.route(Some(model.clone())))
+                                    {
+                                        d.choice.model = None;
+                                    }
+                                    d.choice.error = None;
+                                    d.destination = Some(target.clone());
+                                }
+                                s.launch_picker = None;
+                                cx.notify();
+                            }),
+                        ));
+                    }
+                    body = body.child(field(p, "Host", chips));
+                }
+                body = body.child(self.model_row(p, &choice, cx));
             }
         }
         if let Some(picker) = picker {
@@ -624,9 +715,13 @@ impl Workbench {
             .child(button(
                 p,
                 "launch-submit",
-                submit,
+                if self.handoff_pending.is_some() && kind == LaunchKind::Handoff {
+                    "Starting…"
+                } else {
+                    submit
+                },
                 true,
-                true,
+                self.handoff_pending.is_none() || kind != LaunchKind::Handoff,
                 cx.listener(|s, _, _, cx| s.submit_launch(cx)),
             ));
         let frame = col()
@@ -733,8 +828,8 @@ mod tests {
     }
 
     #[test]
-    fn codex_worker_needs_a_model_and_goal_needs_codex() {
-        let needs_model = worker_start(
+    fn codex_worker_accepts_its_subscription_and_goal_needs_codex() {
+        let subscription = worker_start(
             "s1",
             Runtime::Codex,
             WorkerMode::Session,
@@ -742,7 +837,7 @@ mod tests {
             None,
             "task",
         );
-        assert!(needs_model.is_err());
+        assert_eq!(subscription.unwrap().route(), Runtime::Codex.route(None));
         let goal_on_claude = worker_start(
             "s1",
             Runtime::Claude,

@@ -201,9 +201,8 @@ impl Default for SidebarState {
 }
 
 impl SidebarState {
-    pub fn load() -> Self {
-        let mut state: Self =
-            crate::workspace_state::read_preference("sidebar.json").unwrap_or_default();
+    pub fn load(name: &str) -> Self {
+        let mut state: Self = crate::workspace_state::read_preference(name).unwrap_or_default();
         state.migrate();
         state
     }

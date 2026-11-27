@@ -316,7 +316,7 @@ impl Workbench {
                 .unwrap_or_default();
             let runtime = self.route.runtime;
             let picker = cx.new(|cx| {
-                ModelPicker::new(entries, window, cx)
+                ModelPicker::new(self.link.clone(), entries, window, cx)
                     .with_runtime(runtime)
                     .with_handoff()
                     .with_route_catalog(&self.route_models, cx)

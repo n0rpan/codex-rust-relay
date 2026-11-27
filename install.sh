@@ -69,8 +69,9 @@ usage() {
     cat <<'EOF'
 Install ox on macOS or Linux.
 
-Usage: install.sh [--stable|--dev] [--desktop]
+Usage: install.sh [--stable|--dev] [--desktop|--host]
 
+  --host     Install the headless session host and CLI, with automatic idle updates
   --desktop  Include the native desktop application, session host and matching CLI
   --stable   Install the latest stable release (default)
   --dev      Install the rolling development pre-release
@@ -270,6 +271,7 @@ prepare_desktop() {
     for existing in "$packages/$actual".*; do
         if [ -f "$existing/.ready" ] && [ -x "$existing/$binary_subdir/ox-host" ] && [ -x "$existing/$binary_subdir/ox-desktop" ]; then
             desktop_binary_dir="$existing/$binary_subdir"
+            if [ "$host_only" = 0 ]; then "$desktop_binary_dir/ox-desktop" --version >/dev/null || die_missing_libraries "$desktop_binary_dir/ox-desktop"; fi
             return
         fi
     done
@@ -282,8 +284,10 @@ prepare_desktop() {
     fi
     desktop_binary_dir="$desktop_stage/$binary_subdir"
     helper_version="$("$desktop_binary_dir/ox" --version)" || die "the packaged ox could not start."
-    desktop_version="$("$desktop_binary_dir/ox-desktop" --version)" || die_missing_libraries "$desktop_binary_dir/ox-desktop"
-    [ "${desktop_version#ox-desktop }" = "${helper_version#ox }" ] || die "the packaged desktop and CLI versions differ."
+    if [ "$host_only" = 0 ]; then
+        desktop_version="$("$desktop_binary_dir/ox-desktop" --version)" || die_missing_libraries "$desktop_binary_dir/ox-desktop"
+        [ "${desktop_version#ox-desktop }" = "${helper_version#ox }" ] || die "the packaged desktop and CLI versions differ."
+    fi
     [ "$("$desktop_binary_dir/ox-host" --version)" = "ox-host ${helper_version#ox }" ] || die "the packaged host and CLI versions differ."
     touch "$desktop_stage/.in-use"
     touch "$desktop_stage/.ready"
@@ -326,8 +330,14 @@ install_desktop_entry() {
         cp "$desktop_binary_dir/ox" "$install_dir/.ox-install.$$"
         mv -f "$install_dir/.ox-install.$$" "$install_dir/ox"
     fi
-    replace_link "$desktop_binary_dir/ox-desktop" "$install_dir/ox-desktop"
     if [ -x "$desktop_binary_dir/ox-host" ]; then replace_link "$desktop_binary_dir/ox-host" "$install_dir/ox-host"; fi
+    if [ "$host_only" = 1 ]; then
+        touch "$packages/headless"
+        info "Installed OX session host at $install_dir/ox-host"
+        return
+    fi
+    rm -f "$packages/headless"
+    replace_link "$desktop_binary_dir/ox-desktop" "$install_dir/ox-desktop"
     if [ "$os" = Darwin ]; then
         bundle="${desktop_binary_dir%/Contents/MacOS}"
         mkdir -p "$HOME/Applications"
@@ -369,10 +379,13 @@ install_desktop_entry() {
 main() {
     setup_colours
     desktop=0
+    host_only=0
+    explicit_kind=0
     channel="${OX_CHANNEL:-}"
     for argument in "$@"; do
         case "$argument" in
-            --desktop) desktop=1 ;;
+            --desktop) desktop=1; explicit_kind=1; host_only=0 ;;
+            --host) desktop=1; explicit_kind=1; host_only=1 ;;
             --dev) channel="dev" ;;
             --stable) channel="stable" ;;
             -h | --help)
@@ -400,6 +413,7 @@ main() {
     esac
 
     if [ -L "$install_dir/.ox-desktop/current" ]; then desktop=1; fi
+    if [ "$explicit_kind" = 0 ] && [ -f "$install_dir/.ox-desktop/headless" ]; then host_only=1; fi
     detect_target
     check_glibc
     pick_tools
@@ -508,7 +522,8 @@ main() {
     info ""
     info "Next step:"
     info ""
-    if [ "$desktop" = 1 ]; then info "  ${bold}ox desktop .${reset}"; else info "  ${bold}ox setup${reset}"; fi
+    if [ "$host_only" = 1 ]; then info "  ${bold}ox host install${reset}"; info "  ${bold}ox host pair${reset}";
+    elif [ "$desktop" = 1 ]; then info "  ${bold}ox desktop .${reset}"; else info "  ${bold}ox setup${reset}"; fi
     info ""
     if [ "$channel" = "dev" ] && [ -z "${OX_INSTALL_BASE_URL:-}" ]; then
         if [ "$desktop" = 1 ]; then

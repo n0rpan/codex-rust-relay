@@ -4,7 +4,7 @@
 use super::{OpenThread, Workbench};
 use crate::appearance::Palette;
 use crate::appearance::Step;
-use crate::views::host::{ParentIndex, ParentLink, TreeIndex};
+use crate::views::host::ParentLink;
 use crate::{activity, row};
 use gpui::{prelude::FluentBuilder, *};
 
@@ -35,8 +35,11 @@ impl Workbench {
             title: from_store,
         };
         Some(
-            cx.try_global::<ParentIndex>()
-                .and_then(|index| index.0.get(&(self.project.clone(), id.to_owned())).cloned())
+            self.workers
+                .read(cx)
+                .parents
+                .get(&(self.project.clone(), id.to_owned()))
+                .cloned()
                 .unwrap_or(fallback),
         )
     }
@@ -115,16 +118,19 @@ impl Workbench {
     /// "2 workers running" under the parent's activity line, linking to the first one.
     /// Workers running under a thread, at any depth.
     pub(super) fn running_workers(&self, id: &str, cx: &App) -> usize {
-        cx.try_global::<TreeIndex>()
-            .and_then(|index| index.0.get(&(self.project.clone(), id.to_owned())))
+        self.workers
+            .read(cx)
+            .trees
+            .get(&(self.project.clone(), id.to_owned()))
             .map_or(0, |tree| tree.running)
     }
     pub(super) fn workers_line(&self, p: Palette, cx: &mut Context<Self>) -> Option<AnyElement> {
         let store = self.store.as_ref()?;
         let id = store.selected()?;
-        let tree = cx
-            .try_global::<TreeIndex>()?
-            .0
+        let tree = self
+            .workers
+            .read(cx)
+            .trees
             .get(&(self.project.clone(), id.to_owned()))?;
         if tree.running == 0 {
             return None;

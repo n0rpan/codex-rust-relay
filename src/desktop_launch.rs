@@ -10,9 +10,11 @@ use std::{
 };
 
 pub(crate) fn run(args: &[OsString]) -> Result<u8, RelayError> {
-    let usage = "Usage: ox desktop [--] [directory]";
+    let usage = "Usage: ox desktop [--] [directory] | ox desktop --client-only";
+    let client_only = matches!(args,[flag] if flag=="--client-only");
     let project = match args {
         [] => env::current_dir()?,
+        [_] if client_only => env::current_dir()?,
         [flag] if flag == "-h" || flag == "--help" => {
             println!(
                 "{usage}\nOpen the project in OX Desktop. With no directory, use the current directory."
@@ -30,8 +32,13 @@ pub(crate) fn run(args: &[OsString]) -> Result<u8, RelayError> {
         return Err(format!("{} is not a directory", directory.display()).into());
     }
     let binary = companion("ox-desktop")?;
-    Command::new(&binary)
-        .arg(&directory)
+    let mut command = Command::new(&binary);
+    if client_only {
+        command.arg("--client-only");
+    } else {
+        command.arg(&directory);
+    }
+    command
         .current_dir(&directory)
         .process_group(0)
         .stdin(Stdio::null())
@@ -80,6 +87,16 @@ fn companion(program: &str) -> Result<PathBuf, RelayError> {
 const HOST_USAGE: &str = "Usage: ox host COMMAND
   install                   start the session host at login
   status                    show whether the host and its login service run
+  pair [--terminal]         enable private Serve access and print a device invitation
+  pair --worker-host        invite another OX host to launch workers here
+  update [setting]          install when idle or set automatic, download, manual, stable or dev
+  name [NAME]               show or change this host’s display name
+  project [list | add DIR | remove DIR]  manage registered checkouts
+  labels [set LABEL…]       show or replace placement labels
+  policy [set POLICY]       show or change the host mode policy
+  devices                   list paired devices and their IDs
+  terminal <device> on|off  change a paired device’s terminal grant
+  revoke <device-id>        disconnect a paired device
   doctor [--errors N]       check the host, Tailscale Serve, paired devices and stock clients
   restart [--timeout SECS]  let running turns finish, then start the installed host (after an update)
   stop                      stop the host now; running turns are interrupted
@@ -87,10 +104,19 @@ const HOST_USAGE: &str = "Usage: ox host COMMAND
                             Codex and Claude Code sessions and sign-ins are never touched.";
 
 pub(crate) fn host(args: &[OsString]) -> Result<u8, RelayError> {
-    const COMMANDS: [&str; 6] = [
+    const COMMANDS: &[&str] = &[
         "install",
         "status",
         "doctor",
+        "pair",
+        "devices",
+        "policy",
+        "name",
+        "labels",
+        "project",
+        "update",
+        "revoke",
+        "terminal",
         "restart",
         "stop",
         "uninstall",

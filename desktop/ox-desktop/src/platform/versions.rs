@@ -84,7 +84,7 @@ pub fn apply_if_idle(
         super::IdleReservation::Running(socket) => Stdio::from(std::os::fd::OwnedFd::from(socket)),
         super::IdleReservation::Stopped(lock) => {
             args.push("--host-stopped");
-            Stdio::from(lock)
+            Stdio::from(lock.into_file())
         }
     };
     let reply = output_with_stdin(&args, stdin)?;

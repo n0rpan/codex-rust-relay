@@ -2,7 +2,7 @@
 use super::workbench::Workbench;
 use crate::appearance::Step;
 use crate::{activity, appearance::Palette, col, kit::button, platform, row, small};
-use gpui::*;
+use gpui::{prelude::FluentBuilder, *};
 use ox_desk_core::runtime::Runtime;
 use ox_desk_core::store::Route;
 use std::time::{Duration, Instant};
@@ -93,7 +93,7 @@ impl Workbench {
                 return Some(Issue::Provider);
             }
         }
-        if platform::onboarding::missing(self.route.runtime) {
+        if self.link.remote().is_none() && platform::onboarding::missing(self.route.runtime) {
             return Some(Issue::Missing);
         }
         matches!(state, Some(ox_desk_core::store::Connection::SignInRequired))
@@ -103,6 +103,52 @@ impl Workbench {
         let p = Palette::get(cx);
         let runtime = self.route.runtime;
         let name = runtime.name();
+        if let Some(host) = self.link.remote().cloned() {
+            let login = matches!(issue, Issue::SignIn);
+            let notice = match issue {
+                Issue::Old(e) => e,
+                Issue::Provider => format!("Configure this provider on {}.", host.name),
+                Issue::Missing => format!("Install {name} on {}.", host.name),
+                Issue::SignIn => format!("Sign in to {name} on {}.", host.name),
+            };
+            return col()
+                .items_center()
+                .justify_center()
+                .size_full()
+                .gap_2()
+                .child(small(p, notice))
+                .when(login, |d| {
+                    d.child(button(
+                        p,
+                        "remote-login",
+                        "Sign in on host",
+                        true,
+                        true,
+                        cx.listener(move |s, _, _, cx| {
+                            s.awaiting_login = true;
+                            s.launch_error = crate::terminal::open_remote(
+                                host.clone(),
+                                if runtime == Runtime::Codex {
+                                    ox_host_web::terminal_protocol::OpenTerminal::CodexLogin
+                                } else {
+                                    ox_host_web::terminal_protocol::OpenTerminal::ClaudeLogin
+                                },
+                                cx,
+                            )
+                            .err();
+                            cx.notify()
+                        }),
+                    ))
+                })
+                .child(button(
+                    p,
+                    "remote-reconnect",
+                    "Reconnect",
+                    false,
+                    true,
+                    cx.listener(|s, _, w, cx| s.reconnect(w, cx)),
+                ));
+        }
         let (title, note) = match &issue {
             Issue::Missing => (
                 format!("Install {name}"),

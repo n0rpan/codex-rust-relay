@@ -1,7 +1,9 @@
 //! A user-operated local PTY. No host protocol, conversation or telemetry uses its input/output.
 use crate::appearance::Step;
 mod display;
+mod remote;
 use ox_pty as pty;
+pub(crate) use remote::open as open_remote;
 
 use crate::{
     appearance::Palette,

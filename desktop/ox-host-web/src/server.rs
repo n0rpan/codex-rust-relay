@@ -35,9 +35,13 @@ use tokio::{
 pub(crate) struct App {
     pub state: Arc<Mutex<State>>,
     pub host: Arc<PathBuf>,
+    pub inventory: Arc<crate::inventory::Cache>,
     pub slots: Arc<Semaphore>,
+    pub jobs: Option<crate::linked_jobs::Dispatch>,
     pub discovered: Arc<Mutex<std::collections::HashSet<ox_desk_core::host_protocol::Scope>>>,
 }
+#[path = "key_transfer.rs"]
+mod key_transfer;
 #[path = "operator.rs"]
 mod operator;
 #[path = "operator_handoff.rs"]
@@ -46,20 +50,52 @@ mod operator_handoff;
 mod remote_settings;
 #[path = "weather.rs"]
 mod weather;
+#[path = "worker_links.rs"]
+mod worker_links;
+pub(crate) fn background_keychain() -> Result<(), &'static str> {
+    // This runs inside ox-host, which has no window to answer Keychain prompts.
+    #[cfg(target_os = "macos")]
+    {
+        use security_framework::os::macos::keychain::{KeychainUserInteractionLock, SecKeychain};
+        static NONINTERACTIVE: std::sync::OnceLock<Option<KeychainUserInteractionLock>> =
+            std::sync::OnceLock::new();
+        if NONINTERACTIVE
+            .get_or_init(|| SecKeychain::disable_user_interaction().ok())
+            .is_none()
+        {
+            return Err("The background host could not open Keychain without a prompt.");
+        }
+    }
+    Ok(())
+}
 type ErrCode = StatusCode;
 const DENY: StatusCode = StatusCode::FORBIDDEN;
 pub fn run(state_dir: PathBuf, host_socket: PathBuf) -> io::Result<()> {
+    run_with_jobs(state_dir, host_socket, None)
+}
+pub fn run_with_jobs(
+    state_dir: PathBuf,
+    host_socket: PathBuf,
+    jobs: Option<crate::linked_jobs::Dispatch>,
+) -> io::Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(serve(state_dir, host_socket))
+        .block_on(serve(state_dir, host_socket, jobs))
 }
-async fn serve(dir: PathBuf, socket: PathBuf) -> io::Result<()> {
+async fn serve(
+    dir: PathBuf,
+    socket: PathBuf,
+    jobs: Option<crate::linked_jobs::Dispatch>,
+) -> io::Result<()> {
     let store = State::load(&dir)?;
+    crate::worker_checkout::receiver::recover(&store.worker_directory())?;
     let app = App {
+        jobs,
         state: Arc::new(Mutex::new(store)),
         host: Arc::new(socket),
         slots: Arc::new(Semaphore::new(64)),
+        inventory: Default::default(),
         discovered: Default::default(),
     };
     let local = crate::admin::socket_path(&dir);
@@ -102,6 +138,34 @@ async fn serve(dir: PathBuf, socket: PathBuf) -> io::Result<()> {
         else {
             continue;
         };
+        if matches!(req, Request::Update { .. } | Request::WorkerLinks { .. }) {
+            let active = app.clone();
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(move || -> io::Result<Reply> {
+                    let mut reply = active.state.lock().unwrap().reply(None);
+                    match req {
+                        Request::Update { command } => {
+                            reply.update = Some(crate::host_updates::control(command)?)
+                        }
+                        Request::WorkerLinks { command } => {
+                            reply.worker_links =
+                                Some(worker_links::execute(&active, None, command)?)
+                        }
+                        _ => unreachable!(),
+                    }
+                    Ok(reply)
+                })
+                .await
+                .map_err(|_| "Host settings service stopped".to_owned())
+                .and_then(|s| s.map_err(|e| e.to_string()));
+                if let Ok(mut bytes) = serde_json::to_vec(&result) {
+                    bytes.push(b'\n');
+                    let _ = tokio::time::timeout(Duration::from_secs(2), stream.write_all(&bytes))
+                        .await;
+                }
+            });
+            continue;
+        }
         let result = administer(&app, &mut listener, &mut staged, req)
             .await
             .map_err(|e| e.to_string());
@@ -121,10 +185,10 @@ async fn serve(dir: PathBuf, socket: PathBuf) -> io::Result<()> {
 }
 async fn read_request(stream: &mut UnixStream) -> io::Result<Request> {
     let mut bytes = Vec::new();
-    BufReader::new(stream.take(4097))
+    BufReader::new(stream.take(16 * 1024 + 1))
         .read_until(b'\n', &mut bytes)
         .await?;
-    if bytes.len() > 4096 || !bytes.ends_with(b"\n") {
+    if bytes.len() > 16 * 1024 || !bytes.ends_with(b"\n") {
         return Err(io::Error::other("Invalid request"));
     }
     Ok(serde_json::from_slice(&bytes)?)
@@ -172,14 +236,41 @@ async fn administer(
         ));
     }
     match req {
+        Request::WorkerAccess {
+            id,
+            before,
+            may_launch,
+            ceiling,
+        } => app
+            .state
+            .lock()
+            .unwrap()
+            .edit_worker(&id, &before, may_launch, ceiling)?,
+        Request::Update { .. } | Request::WorkerLinks { .. } => {
+            unreachable!("handled before Serve administration")
+        }
+        Request::HostProfile { edit } => {
+            let state = app.state.lock().unwrap();
+            let mut reply = state.reply(None);
+            reply.profile = Some(state.host_profile(edit)?);
+            return Ok(reply);
+        }
         Request::Status => {}
-        Request::Pair { login } => {
+        Request::WorkerInvitation { login } => {
+            if listener.is_none() || staged.is_some() {
+                return Err(io::Error::other(
+                    "Enable remote access before inviting a worker host",
+                ));
+            }
+            pairing = Some(app.state.lock().unwrap().local_worker_invite(login)?);
+        }
+        Request::Pair { login, terminal } => {
             if listener.is_none() || staged.is_some() {
                 return Err(io::Error::other(
                     "Enable the local remote access listener first",
                 ));
             }
-            pairing = Some(app.state.lock().unwrap().invite(login)?);
+            pairing = Some(app.state.lock().unwrap().invite(login, terminal)?);
         }
         Request::TerminalGrant { id, enabled } => {
             app.state.lock().unwrap().terminal_grant(&id, enabled)?
@@ -429,6 +520,19 @@ fn start_listener(app: App, origin: String, listener: TcpListener) -> Listener {
         )
         .route("/api/pair", post(pair))
         .route("/api/challenge", post(challenge))
+        .route("/api/worker-link", post(worker_link))
+        .route(
+            "/api/worker-job",
+            post(crate::linked_jobs::handle).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route(
+            "/api/worker-checkout",
+            get(crate::worker_checkout::receiver::upgrade),
+        )
+        .route(
+            "/api/worker-result",
+            get(crate::worker_result::transport::upgrade),
+        )
         .route("/api/push", post(subscribe))
         .route("/api/weather", post(weather::weather))
         .route("/api/operator", get(operator::upgrade))
@@ -529,6 +633,13 @@ fn token(h: &HeaderMap) -> Result<&str, ErrCode> {
     Ok(token)
 }
 fn device(app: &App, h: &HeaderMap) -> Result<String, ErrCode> {
+    let id = paired_identity(app, h)?;
+    if app.state.lock().unwrap().device_class(&id) == Some(crate::admin::DeviceClass::Host) {
+        return Err(DENY);
+    }
+    Ok(id)
+}
+pub(crate) fn paired_identity(app: &App, h: &HeaderMap) -> Result<String, ErrCode> {
     let token = token(h)?;
     app.state
         .lock()
@@ -539,6 +650,9 @@ fn device(app: &App, h: &HeaderMap) -> Result<String, ErrCode> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Pair {
+    #[serde(default)]
+    class: crate::admin::DeviceClass,
+    source: Option<String>,
     code: String,
     key: String,
     signature: String,
@@ -559,6 +673,10 @@ async fn pair(
             &p.key,
             &p.signature,
             &p.label,
+            state::Enrollment {
+                class: p.class,
+                source: p.source.as_deref(),
+            },
         )
         .ok_or(DENY)?;
     Ok((
@@ -583,8 +701,13 @@ async fn challenge(
     h: HeaderMap,
     Json(c): Json<Challenge>,
 ) -> Result<Response, ErrCode> {
-    let id = device(&app, &h)?;
+    let id = paired_identity(&app, &h)?;
     let mut s = app.state.lock().unwrap();
+    if (s.device_class(&id) == Some(crate::admin::DeviceClass::Host))
+        != (c.purpose == Purpose::Worker)
+    {
+        return Err(DENY);
+    }
     let terminal = s.terminal_generation(&id).is_some();
     if c.purpose == Purpose::Terminal && !terminal {
         return Err(DENY);
@@ -616,6 +739,89 @@ async fn challenge(
 pub(crate) struct Proof {
     pub nonce: String,
     pub signature: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerEnvelope {
+    proof: Proof,
+    request: String,
+}
+
+async fn worker_link(
+    Extract(app): Extract<App>,
+    headers: HeaderMap,
+    Json(body): Json<WorkerEnvelope>,
+) -> Result<Json<serde_json::Value>, ErrCode> {
+    let id = paired_identity(&app, &headers)?;
+    #[derive(Deserialize)]
+    #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+    enum Call {
+        Info,
+        Inventory {
+            project: Option<String>,
+            #[serde(default)]
+            fresh: bool,
+        },
+        RevokeSelf,
+    }
+    let call = serde_json::from_str(&body.request).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let (project, fresh) = {
+        let mut state = app.state.lock().unwrap();
+        if !state.prove_worker(&id, &body.proof.nonce, &body.proof.signature, &body.request) {
+            return Err(DENY);
+        }
+        match call {
+            Call::Inventory { project, fresh } => (project, fresh),
+            Call::Info => {
+                let profile = state
+                    .host_profile(None)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                return Ok(Json(
+                    json!({"id":state.host_id().map_err(|_|StatusCode::INTERNAL_SERVER_ERROR)?, "name":profile.name, "labels":profile.labels,
+                "policy":state.mode_policy(None).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?, "grant":state.worker_grant(&id)}),
+                ));
+            }
+            Call::RevokeSelf => {
+                state
+                    .revoke(&id)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                return Ok(Json(json!({"revoked":true})));
+            }
+        }
+    };
+    if project.as_ref().is_some_and(|id| {
+        id.len() != 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let _slot = app
+        .slots
+        .try_acquire()
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+    let inventory = crate::inventory::local(&app, project, fresh)
+        .await
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::Unsupported => StatusCode::UNPROCESSABLE_ENTITY,
+            _ => StatusCode::SERVICE_UNAVAILABLE,
+        })?;
+    let state = app.state.lock().unwrap();
+    let grant = state.worker_grant(&id).ok_or(DENY)?;
+    if inventory.host.id.as_deref()
+        != Some(
+            &state
+                .host_id()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        )
+    {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(Json(
+        crate::inventory::report(inventory, grant.clone())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    ))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -748,10 +954,17 @@ mod tests {
             state.set_origin(Some(ORIGIN.into()), 0).unwrap();
             let key = SigningKey::random(&mut OsRng);
             let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
-            let invite = state.invite(LOGIN.into()).unwrap();
+            let invite = state.invite(LOGIN.into(), false).unwrap();
             let code = invite.url.split_once("#pair=").unwrap().1;
             let cookie = state
-                .pair(LOGIN, code, &public, &sign(&key, code), "Phone")
+                .pair(
+                    LOGIN,
+                    code,
+                    &public,
+                    &sign(&key, code),
+                    "Phone",
+                    crate::admin::DeviceClass::Phone,
+                )
                 .unwrap();
             let id = state.identity(LOGIN, &cookie).unwrap();
             let socket = dir.path().join("host.sock");
@@ -765,9 +978,11 @@ mod tests {
                 }
             });
             let app = App {
+                jobs: None,
                 state: Arc::new(Mutex::new(state)),
                 host: Arc::new(socket),
                 slots: Arc::new(Semaphore::new(4)),
+                inventory: Default::default(),
                 discovered: Default::default(),
             };
             let tcp = bind(0).await.unwrap();

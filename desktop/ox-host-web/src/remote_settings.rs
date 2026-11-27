@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use tokio::sync::Semaphore;
-static HELPERS: Semaphore = Semaphore::const_new(3);
+pub(super) static HELPERS: Semaphore = Semaphore::const_new(3);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,9 +25,27 @@ pub(super) struct Envelope {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum DeviceAction {
+    HostModePolicy {
+        set: Option<ox_desk_core::host_policy::HostPolicy>,
+    },
+    HostProfile {
+        edit: Option<crate::host_profile::Edit>,
+    },
     Devices,
     PairDevice,
-    RevokeDevice { id: String },
+    InviteWorkerHost,
+    EditWorkerLink {
+        id: String,
+        before: crate::admin::WorkerGrant,
+        may_launch: bool,
+        ceiling: ox_desk_core::modes::Level,
+    },
+    HostUpdate {
+        command: crate::host_updates::Command,
+    },
+    RevokeDevice {
+        id: String,
+    },
 }
 
 #[derive(Deserialize)]
@@ -48,13 +66,27 @@ pub(super) async fn settings(
     let Json(body) = body.map_err(|_| StatusCode::BAD_REQUEST)?;
     let text = body.request.expose();
     let identity = login(&headers).ok_or(DENY)?;
+    let device_action = serde_json::from_str::<DeviceAction>(text).ok();
     {
         let mut state = app.state.lock().unwrap();
         if !state.prove_settings(&id, &body.proof.nonce, &body.proof.signature, text) {
             return Err(DENY);
         }
-        if let Ok(op) = serde_json::from_str::<DeviceAction>(text) {
+        if let Some(op) = &device_action {
             let data = match op {
+                DeviceAction::HostUpdate { .. } => None,
+                DeviceAction::HostModePolicy { set } => Some(
+                    json!({"policy":state.mode_policy(*set).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?}),
+                ),
+                DeviceAction::HostProfile { edit } => {
+                    Some(json!(state.host_profile(edit.clone()).map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::AlreadyExists {
+                            StatusCode::CONFLICT
+                        } else {
+                            StatusCode::BAD_REQUEST
+                        }
+                    })?))
+                }
                 DeviceAction::Devices => {
                     let reply = state.reply(None);
                     let devices = reply
@@ -62,29 +94,77 @@ pub(super) async fn settings(
                         .into_iter()
                         .filter(|d| d.login == identity)
                         .collect::<Vec<_>>();
-                    json!({"devices":devices,"self":id,"origin":reply.origin})
+                    let worker_hosts: Vec<_> = reply
+                        .worker_hosts
+                        .into_iter()
+                        .filter(|d| d.login == identity)
+                        .collect();
+                    Some(
+                        json!({"devices":devices,"worker_hosts":worker_hosts,"self":id,"origin":reply.origin}),
+                    )
                 }
-                DeviceAction::PairDevice => serde_json::to_value(
-                    state.device_invite(&id).map_err(|_| StatusCode::CONFLICT)?,
-                )
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                DeviceAction::PairDevice => Some(
+                    serde_json::to_value(
+                        state.device_invite(&id).map_err(|_| StatusCode::CONFLICT)?,
+                    )
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                ),
+                DeviceAction::InviteWorkerHost => Some(json!(
+                    state.worker_invite(&id).map_err(|_| StatusCode::CONFLICT)?
+                )),
+                DeviceAction::EditWorkerLink {
+                    id: target,
+                    before,
+                    may_launch,
+                    ceiling,
+                } => {
+                    if !state.belongs_to_login(target, identity) {
+                        return Err(DENY);
+                    }
+                    Some(
+                        match state.edit_worker(target, before, *may_launch, *ceiling) {
+                            Ok(()) => json!({"status":"applied"}),
+                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                                json!({"error": e.to_string()})
+                            }
+                            Err(_) => return Err(StatusCode::CONFLICT),
+                        },
+                    )
+                }
                 DeviceAction::RevokeDevice { id: target } => {
-                    if !state
-                        .reply(None)
-                        .devices
-                        .iter()
-                        .any(|d| d.id == target && d.login == identity)
-                    {
+                    if !state.belongs_to_login(target, identity) {
                         return Err(DENY);
                     }
                     state
-                        .revoke(&target)
+                        .revoke(target)
                         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                    json!({"status":"applied"})
+                    Some(json!({"status":"applied"}))
                 }
             };
-            return Ok(Json(data));
+            if let Some(data) = data {
+                return Ok(Json(data));
+            }
         }
+    }
+    if let Ok(action) = serde_json::from_str::<super::worker_links::Action>(text) {
+        return super::worker_links::apply(app, id, action).await;
+    }
+    if let Ok(action) = serde_json::from_str::<super::key_transfer::KeyAction>(text) {
+        return super::key_transfer::apply(app, id, identity.to_owned(), action).await;
+    }
+    if let Some(DeviceAction::HostUpdate { command }) = device_action {
+        let active = app.state.clone();
+        return tokio::task::spawn_blocking(move || {
+            if !active.lock().unwrap().alive(&id) {
+                return Err(DENY);
+            }
+            let status = crate::host_updates::control(command).map_err(|_| StatusCode::CONFLICT)?;
+            Ok(Json(
+                serde_json::to_value(status).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            ))
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
     // Type-check and allowlist before a helper can open files. In particular raw v1 Read/Save/Key
     // and profile-directory requests are unavailable through the phone.
@@ -106,6 +186,7 @@ pub(super) async fn settings(
                 | Request::SaveAdvanced { .. }
                 | Request::Edit { .. }
                 | Request::EditKey { .. }
+                | Request::ImportKeys { .. }
                 | Request::Models
                 | Request::TestProvider { .. }
         ) {
@@ -174,7 +255,10 @@ fn helper(request: Request) -> Result<Value, String> {
             });
             encode(serde_json::to_value(docs))
         }
-        Request::Edit { .. } | Request::EditKey { .. } | Request::SaveAdvanced { .. } => {
+        Request::Edit { .. }
+        | Request::EditKey { .. }
+        | Request::ImportKeys { .. }
+        | Request::SaveAdvanced { .. } => {
             let result: protocol::model::Outcome = ox::request(&companion, &path, request)?;
             encode(serde_json::to_value(result))
         }

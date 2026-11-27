@@ -31,6 +31,12 @@ pub fn socket_path(state_dir: &Path) -> PathBuf {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    HostProfile {
+        edit: Option<crate::host_profile::Edit>,
+    },
+    Update {
+        command: crate::host_updates::Command,
+    },
     Status,
     Enable {
         origin: String,
@@ -50,6 +56,21 @@ pub enum Request {
     Disable,
     Pair {
         login: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        terminal: bool,
+    },
+    WorkerLinks {
+        command: WorkerLinkAction,
+    },
+    #[cfg(feature = "client")]
+    WorkerAccess {
+        id: String,
+        before: WorkerGrant,
+        may_launch: bool,
+        ceiling: ox_desk_core::modes::Level,
+    },
+    WorkerInvitation {
+        login: String,
     },
     Revoke {
         id: String,
@@ -60,8 +81,31 @@ pub enum Request {
     },
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceClass {
+    #[default]
+    Phone,
+    Desktop,
+    Host,
+}
+
+#[cfg(feature = "client")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerGrant {
+    /// Stable ID of the OX host that redeemed this invitation.
+    pub source: String,
+    pub may_launch: bool,
+    pub ceiling: ox_desk_core::modes::Level,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Device {
+    #[serde(default)]
+    pub class: DeviceClass,
+    #[cfg(feature = "client")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerGrant>,
     #[serde(default)]
     pub terminal: bool,
     pub id: String,
@@ -72,6 +116,8 @@ pub struct Device {
 
 #[derive(Serialize, Deserialize)]
 pub struct Pairing {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_code: Option<String>,
     pub url: String,
     pub qr_svg: String,
     pub expires_at: i64,
@@ -79,15 +125,31 @@ pub struct Pairing {
 
 #[derive(Serialize, Deserialize)]
 pub struct Reply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<crate::host_profile::HostProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<crate::host_updates::Status>,
     pub enabled: bool,
     pub origin: Option<String>,
     pub port: u16,
     pub devices: Vec<Device>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_hosts: Vec<Device>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_links: Option<serde_json::Value>,
     pub pairing: Option<Pairing>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reservation: Option<String>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerLinkAction {
+    WorkerLinks,
+    AddWorkerLink { address: String, code: String },
+    LinkPairedHost { host: String },
+    RemoveWorkerLink { host: String },
+}
 // Listener configuration and terminal grants have a private, same-user administration socket.
 pub fn request(state_dir: &Path, req: &Request) -> io::Result<Reply> {
     exchange(state_dir, req).map(|(_, reply)| reply)
@@ -152,7 +214,14 @@ fn exchange(state_dir: &Path, req: &Request) -> io::Result<(UnixStream, Reply)> 
         ));
     }
     let mut stream = UnixStream::connect(path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(8)))?;
+    // Pairing can include several bounded HTTPS exchanges on the remote host.
+    stream.set_read_timeout(Some(Duration::from_secs(
+        if matches!(req, Request::WorkerLinks { .. }) {
+            75
+        } else {
+            8
+        },
+    )))?;
     stream.set_write_timeout(Some(Duration::from_secs(4)))?;
     serde_json::to_writer(&mut stream, req)?;
     stream.write_all(b"\n")?;
@@ -163,4 +232,19 @@ fn exchange(state_dir: &Path, req: &Request) -> io::Result<(UnixStream, Reply)> 
     }
     let reply: Result<Reply, String> = serde_json::from_slice(&line)?;
     Ok((stream, reply.map_err(io::Error::other)?))
+}
+
+/// Accept the usual Crockford base32 substitutions when typing an invitation.
+pub fn manual_code(input: &str) -> Option<String> {
+    let text: String = input
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'-')
+        .map(|b| match b.to_ascii_uppercase() {
+            b'O' => '0',
+            b'I' | b'L' => '1',
+            b => char::from(b),
+        })
+        .collect();
+    (text.len() == 12 && text.bytes().all(|b| b.is_ascii_alphanumeric() && b != b'U'))
+        .then_some(text)
 }

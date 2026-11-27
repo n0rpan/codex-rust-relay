@@ -1,4 +1,7 @@
 //! Provider-reported thread usage and account limit windows.
+pub mod reported;
+use reported::next_sequence;
+use reported::{Observation, Reporter, WorkerReport};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -57,10 +60,28 @@ pub struct Usage {
     pub requested: bool,
     pub loading: bool,
     pub error: Option<String>,
+    #[serde(skip)]
+    pub worker_report: Option<WorkerReport>,
+    #[serde(skip)]
+    pub(crate) reporter: Option<Reporter>,
     revision: u64,
     updated: BTreeMap<String, u64>,
 }
 impl Usage {
+    pub(crate) fn codex_account(&mut self, reply: &crate::codex::reply::AccountReply) {
+        let next = reply
+            .chatgpt()
+            .then(|| Reporter::verified(reply.email(), None, self.reporter));
+        if next != self.reporter {
+            self.requested = false;
+            self.limits.clear();
+            self.updated.clear();
+            self.worker_report = next
+                .map(WorkerReport::select)
+                .or_else(|| self.reporter.map(WorkerReport::leave));
+            self.reporter = next;
+        }
+    }
     pub(crate) fn version(&self) -> u64 {
         self.revision
     }
@@ -68,10 +89,16 @@ impl Usage {
         self.revision += 1;
         self.error = None;
         let key = limits.limit_id.clone().unwrap_or_else(|| "codex".into());
+        self.worker_report = self.reporter.map(|id| {
+            WorkerReport::windows(
+                id,
+                Observation::codex(next_sequence(), false, std::iter::once((&key, &limits))),
+            )
+        });
         self.updated.insert(key.clone(), self.revision);
         self.limits.insert(key, limits);
     }
-    pub(crate) fn read(&mut self, data: AccountLimits, requested_at: u64) {
+    pub(crate) fn read(&mut self, data: AccountLimits, requested_at: u64, started: u64) {
         self.loading = false;
         self.error = None;
         let mut buckets = data.rate_limits_by_limit_id.unwrap_or_default();
@@ -83,6 +110,9 @@ impl Usage {
                     .unwrap_or_else(|| "codex".into()),
             )
             .or_insert(data.rate_limits);
+        self.worker_report = self
+            .reporter
+            .map(|id| WorkerReport::windows(id, Observation::codex(started, true, buckets.iter())));
         self.limits
             .retain(|key, _| self.updated.get(key).is_some_and(|v| *v > requested_at));
         self.updated.retain(|_, v| *v > requested_at);
@@ -123,6 +153,7 @@ mod tests {
                 )])),
             },
             0,
+            next_sequence(),
         );
         assert_eq!(usage.limits.len(), 2);
         assert_eq!(usage.closest_limit(199).unwrap().1.used_percent, 91);

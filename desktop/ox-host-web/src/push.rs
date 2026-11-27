@@ -460,7 +460,12 @@ impl ActiveAsks {
         let mut current = HashMap::new();
         let mut added = Vec::new();
         for ask in asks {
-            let Some(thread) = ask.thread else { continue };
+            let Some(thread) = ask.thread.or_else(|| {
+                let id = ask.id.as_ref()?.as_str()?;
+                id.starts_with("ox-yolo-").then(|| format!("ask:{id}"))
+            }) else {
+                continue;
+            };
             let token: [u8; 32] = ring::digest::digest(&ring::digest::SHA256, ask.token.as_bytes())
                 .as_ref()
                 .try_into()
@@ -513,15 +518,21 @@ fn notices(bytes: &[u8], cursor: Option<&Cursor>, asks: &mut ActiveAsks) -> io::
         .find(|change| change.kind == "asks")
         .map(|change| asks.replace(&scope, std::mem::take(&mut change.asks)))
         .unwrap_or_default();
+    let mut notifications: Vec<_> = changes
+        .into_iter()
+        .filter(|change| change.kind == "notification")
+        .filter_map(|c| Some((c.thread?, c.title?, c.event?)))
+        .collect();
+    // A draft has no native thread yet. Address its live ask so a stale tap
+    // cannot select a later draft on the same project and route.
+    notifications.extend(
+        new_asks
+            .iter()
+            .filter(|(id, _, _)| id.starts_with("ask:ox-yolo-"))
+            .map(|(id, kind, _)| (id.clone(), "New OX session".into(), *kind)),
+    );
     let mut payloads = Vec::new();
-    for change in changes {
-        if change.kind != "notification" {
-            continue;
-        }
-        let (Some(thread), Some(title), Some(kind)) = (change.thread, change.title, change.event)
-        else {
-            continue;
-        };
+    for (thread, title, kind) in notifications {
         let ask = if matches!(
             kind,
             NotificationKind::Approval | NotificationKind::Question
@@ -582,6 +593,7 @@ struct NoticeScope {
 }
 #[derive(Deserialize)]
 struct NoticeAsk {
+    id: Option<serde_json::Value>,
     thread: Option<String>,
     token: String,
     #[serde(default)]

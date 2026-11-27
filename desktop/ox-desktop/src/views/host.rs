@@ -4,7 +4,7 @@ use crate::appearance::{AccentColor, Step};
 use crate::sidebar_state::{GroupingMode, SidebarState, ThreadMetaKey};
 mod discovery;
 use discovery::{Discovery, Location, Scope};
-pub(super) use discovery::{ParentIndex, ParentLink, TreeIndex};
+pub(super) use discovery::{ParentLink, WorkerIndex};
 pub(crate) mod layout;
 mod palette;
 mod shortcuts;
@@ -135,7 +135,13 @@ fn new_route_gate(
     }
 }
 
+impl EventEmitter<crate::app::fleet::EnsureInventory> for Host {}
+impl EventEmitter<crate::app::projects::NewProjectSession> for Host {}
+impl EventEmitter<crate::app::projects::UsedProject> for Host {}
+impl EventEmitter<crate::app::fleet::Destination> for Host {}
 pub struct Host {
+    pub(crate) workspace: Option<WeakEntity<crate::app::Workspace>>,
+    link: platform::HostLink,
     palette: Option<palette::State>,
     _palette_keys: Subscription,
     /// The searchable all-models picker, opened from the route menu.
@@ -159,6 +165,7 @@ pub struct Host {
     recent: LastWorkspace,
     preferences: Option<Entity<crate::preferences::Preferences>>,
     before_settings: Option<FocusHandle>,
+    workers: Entity<WorkerIndex>,
     panes: Vec<Entity<Workbench>>,
     active: usize,
     models: Entity<Vec<String>>,
@@ -169,6 +176,7 @@ pub struct Host {
     favorite_models: Vec<String>,
     catalog_versions: Vec<(usize, u64)>,
     catalog: Vec<CatalogEntry>,
+    fleet_tree: crate::app::fleet::tree::Tree,
     discovery: Discovery,
     running: Entity<Running>,
     list_focus: FocusHandle,
@@ -192,7 +200,10 @@ fn needs_drawer(viewport: Pixels, sidebar_width: u32) -> bool {
 }
 
 impl Host {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        link: platform::HostLink,
+        initial_route: Option<Route>,
         project: PathBuf,
         saved_layouts: layout::SavedLayouts,
         first_frame: Option<Instant>,
@@ -201,18 +212,30 @@ impl Host {
         cx: &mut Context<Self>,
     ) -> Self {
         let probe = if stats { Self::probe(window, cx) } else { None };
-        let mut recent = LastWorkspace::load();
+        let mut recent = if link.remote().is_some() {
+            crate::workspace_state::read_preference(&link.state_file("workspace.json"))
+                .unwrap_or_default()
+        } else {
+            LastWorkspace::load()
+        };
         let layout = saved_layouts.for_project(&project);
-        let route = layout
-            .active_route(&project)
+        let route = initial_route
+            .or_else(|| layout.active_route(&project))
             .or_else(|| recent.saved_route(&project))
             .unwrap_or_else(super::onboarding::first_launch_route);
         recent.remember(&project, &route);
-        let message = LastWorkspace::save(&project, &route)
-            .err()
-            .map(|e| e.to_string());
+        let message = LastWorkspace::save(
+            link.remote().map(|_| link.state_file("workspace.json")),
+            &project,
+            &route,
+        )
+        .err()
+        .map(|e| e.to_string());
         let models = cx.new(|_| Vec::new());
+        let workers = cx.new(|_| WorkerIndex::default());
         let pane = Self::pane(
+            link.clone(),
+            workers.clone(),
             project,
             route,
             first_frame,
@@ -221,7 +244,7 @@ impl Host {
             window,
             cx,
         );
-        let route_refresh = Self::refresh_routes(window, cx);
+        let route_refresh = Self::refresh_routes(link.clone(), window, cx);
         cx.observe_window_visibility(window, |s, _, w, cx| {
             if w.is_visible() {
                 crate::sky::wake(cx);
@@ -255,6 +278,8 @@ impl Host {
         .detach();
 
         let mut host = Self {
+            workspace: None,
+            link: link.clone(),
             palette: None,
             sidebar_visible: !layout.sidebar_hidden,
             drawer_open: false,
@@ -263,7 +288,7 @@ impl Host {
             sidebar_width: layout.side_width(),
             resizing_sidebar: false,
             saved_layouts,
-            sidebar: SidebarState::load(),
+            sidebar: SidebarState::load(&link.state_file("sidebar.json")),
             sidebar_edit: None,
             _palette_keys: Self::palette_keys(window, cx),
             model_picker: None,
@@ -279,6 +304,7 @@ impl Host {
             recent,
             preferences: None,
             before_settings: None,
+            workers,
             panes: vec![pane],
             active: 0,
             models,
@@ -288,8 +314,9 @@ impl Host {
             favorite_models: vec![],
             catalog_versions: vec![],
             catalog: vec![],
+            fleet_tree: Default::default(),
             discovery: Discovery::default(),
-            running: cx.new(|_| Running::default()),
+            running: cx.new(|_| Running::new(link)),
             list_focus: cx.focus_handle().tab_stop(true),
             list_scroll: Default::default(),
             choose_route: None,
@@ -521,7 +548,7 @@ impl Host {
             .iter()
             .map(|id| model_picker::api_entry(id))
             .collect();
-        let picker = cx.new(|cx| ModelPicker::new(entries, window, cx));
+        let picker = cx.new(|cx| ModelPicker::new(self.link.clone(), entries, window, cx));
         let subscription = cx.subscribe_in(
             &picker,
             window,
@@ -547,7 +574,11 @@ impl Host {
         self.agent_picker = false;
         self.model_picker = Some((picker.clone(), subscription));
         picker.update(cx, |p, cx| p.set_loading(true, cx));
-        let task = cx.background_spawn(async { settings::discover_models() });
+        let link = self.link.clone();
+        let task = cx.background_spawn(async move {
+            link.remote()
+                .map_or_else(settings::discover_models, |h| h.models())
+        });
         cx.spawn_in(window, async move |_, cx| {
             let result = task.await;
             picker.update(cx, |p, cx| {
@@ -585,7 +616,7 @@ impl Host {
             )
         };
         let picker = cx.new(|cx| {
-            ModelPicker::new(entries, window, cx)
+            ModelPicker::new(self.link.clone(), entries, window, cx)
                 .with_runtime(runtime)
                 .with_route_catalog(&self.models, cx)
         });
@@ -679,9 +710,14 @@ impl Host {
                 ),
         )
     }
-    fn refresh_routes(window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
-        let snapshot = cx.background_spawn(async {
-            settings::load().map(|s| {
+    fn refresh_routes(
+        link: platform::HostLink,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let host = link.remote().cloned();
+        let snapshot = cx.background_spawn(async move {
+            host.map_or_else(settings::load, |h| h.snapshot()).map(|s| {
                 (
                     s.models,
                     s.api_provider,
@@ -692,7 +728,10 @@ impl Host {
         });
         // Start both reads immediately, but publish the local settings first: a slow
         // snapshot must never overwrite the discovered aliases from this refresh.
-        let discovered = cx.background_spawn(async { settings::discover_models() });
+        let discovered = cx.background_spawn(async move {
+            link.remote()
+                .map_or_else(settings::discover_models, |h| h.models())
+        });
         cx.spawn_in(window, async move |this, cx| {
             let result = snapshot.await;
             let _ = this.update_in(cx, |s, window, cx| {
@@ -793,12 +832,13 @@ impl Host {
             if let Some(previous) = self.before_settings.take() {
                 window.focus(&previous, cx);
             }
-            self.route_refresh = Self::refresh_routes(window, cx);
+            self.route_refresh = Self::refresh_routes(self.link.clone(), window, cx);
         } else {
             let project = self.panes[self.active].read(cx).project.clone();
             self.before_settings = window.focused(cx);
-            self.preferences =
-                Some(cx.new(|cx| crate::preferences::Preferences::new(project, window, cx)));
+            self.preferences = Some(cx.new(|cx| {
+                crate::preferences::Preferences::new(self.link.clone(), project, window, cx)
+            }));
         }
         let front = self.preferences.is_none();
         self.panes[self.active].update(cx, |p, cx| p.set_front_in(front, window, cx));
@@ -909,7 +949,10 @@ impl Host {
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pane(
+        link: platform::HostLink,
+        workers: Entity<WorkerIndex>,
         project: PathBuf,
         route: Route,
         first_frame: Option<Instant>,
@@ -918,13 +961,27 @@ impl Host {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<Workbench> {
-        let pane =
-            cx.new(|cx| Workbench::new(project, route, first_frame, stats, models, window, cx));
+        let pane = cx.new(|cx| {
+            Workbench::new(
+                link,
+                workers,
+                project,
+                route,
+                first_frame,
+                stats,
+                models,
+                window,
+                cx,
+            )
+        });
         Self::subscribe_pane(&pane, window, cx);
         pane
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lazy_pane(
+        link: platform::HostLink,
+        workers: Entity<WorkerIndex>,
         project: PathBuf,
         route: Route,
         stats: bool,
@@ -932,12 +989,47 @@ impl Host {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<Workbench> {
-        let pane = cx.new(|cx| Workbench::new_lazy(project, route, stats, models, window, cx));
+        let pane = cx.new(|cx| {
+            Workbench::new_lazy(link, workers, project, route, stats, models, window, cx)
+        });
         Self::subscribe_pane(&pane, window, cx);
         pane
     }
 
     fn subscribe_pane(pane: &Entity<Workbench>, window: &mut Window, cx: &mut Context<Self>) {
+        cx.subscribe_in(
+            pane,
+            window,
+            |s, pane, ready: &super::handoff_sheet::HandoffReady, window, cx| {
+                if *pane != s.panes[s.active]
+                    || pane
+                        .read(cx)
+                        .store
+                        .as_ref()
+                        .and_then(|store| store.selected())
+                        != Some(ready.source_session.as_str())
+                {
+                    return;
+                }
+                let source = s.link.remote().map(|h| h.id.clone());
+                if let Some(workspace) = s.workspace.as_ref().and_then(|w| w.upgrade()) {
+                    workspace.update(cx, |app, cx| {
+                        if !app.handoff_still_visible(&source, &ready.host, ready.registration) {
+                            return;
+                        }
+                        app.open_confirmed_result(
+                            ready.host.clone(),
+                            ready.scope.clone(),
+                            ready.session.clone(),
+                            true,
+                            window,
+                            cx,
+                        )
+                    });
+                }
+            },
+        )
+        .detach();
         cx.subscribe_in(
             pane,
             window,
@@ -1075,8 +1167,9 @@ impl Host {
     ) {
         let project = owner.read(cx).project.clone();
         owner.update(cx, |p, cx| p.set_front(false, cx));
-        self.preferences =
-            Some(cx.new(|cx| crate::preferences::Preferences::providers(project, window, cx)));
+        self.preferences = Some(cx.new(|cx| {
+            crate::preferences::Preferences::providers(self.link.clone(), project, window, cx)
+        }));
         cx.notify();
     }
     fn switch(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1096,7 +1189,13 @@ impl Host {
         self.panes[index].update(cx, |p, cx| p.set_front_in(true, window, cx));
         let p = self.panes[index].read(cx);
         self.recent.remember(&p.project, &p.route);
-        if let Err(err) = LastWorkspace::save(&p.project, &p.route) {
+        if let Err(err) = LastWorkspace::save(
+            self.link
+                .remote()
+                .map(|_| self.link.state_file("workspace.json")),
+            &p.project,
+            &p.route,
+        ) {
             self.message = Some(err.to_string());
         }
         cx.notify();
@@ -1108,6 +1207,7 @@ impl Host {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        cx.emit(crate::app::projects::UsedProject(project.clone()));
         self.restore_project(&project, window, cx);
         let i = self
             .panes
@@ -1118,6 +1218,8 @@ impl Host {
             })
             .unwrap_or_else(|| {
                 self.panes.push(Self::pane(
+                    self.link.clone(),
+                    self.workers.clone(),
                     project,
                     route,
                     None,
@@ -1131,6 +1233,23 @@ impl Host {
         self.switch(i, window, cx);
     }
     fn pick_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(host) = self.link.remote().cloned() {
+            let target = cx.weak_entity();
+            let handle = window.window_handle();
+            let route = self.panes[self.active].read(cx).route.clone();
+            self.message = super::remote_project::open(
+                host,
+                Some(route),
+                move |path, route, cx| {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        target.update(cx, |s, cx| s.open(path, route, window, cx))
+                    });
+                },
+                cx,
+            )
+            .err();
+            return;
+        }
         let choice = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -1167,6 +1286,12 @@ impl Host {
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut Self, PathBuf, &mut Window, &mut Context<Self>) + 'static,
     ) {
+        if self.link.remote().is_some() {
+            if path.is_absolute() {
+                then(self, path, window, cx);
+            }
+            return;
+        }
         let probe = path.clone();
         let task = cx.background_spawn(async move {
             let resolved = if canonical {
@@ -1275,7 +1400,11 @@ impl Host {
     }
     pub(super) fn save_sidebar(&mut self, cx: &mut Context<Self>) {
         self.discovery.revision += 1;
-        crate::workspace_state::remember_sidebar(self.sidebar.clone());
+        self.fleet_tree.revision = u64::MAX;
+        crate::workspace_state::remember_sidebar(
+            self.link.state_file("sidebar.json"),
+            self.sidebar.clone(),
+        );
         cx.notify();
     }
 
@@ -1450,6 +1579,118 @@ impl Host {
         }
         cx.notify();
     }
+    pub(crate) fn project_route(&self, path: &std::path::Path) -> Option<Route> {
+        self.recent.saved_route(path)
+    }
+    pub(crate) fn sidebar_state(&self) -> &SidebarState {
+        &self.sidebar
+    }
+    pub(crate) fn paired_with(&self, host: &crate::platform::hosts::SavedHost) -> bool {
+        self.link
+            .remote()
+            .is_some_and(|other| host.same_pairing(other))
+    }
+    pub(crate) fn focus_selection(&mut self, cx: &mut Context<Self>) {
+        self.panes[self.active].update(cx, |pane, cx| {
+            pane.focus_editor_for = Some(
+                pane.store
+                    .as_ref()
+                    .and_then(|s| s.selected())
+                    .map(str::to_owned),
+            );
+            cx.notify();
+        });
+    }
+    pub(crate) fn new_project_draft(
+        &mut self,
+        project: PathBuf,
+        route: Route,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open(project, route, w, cx);
+        self.panes[self.active].update(cx, |p, cx| p.start_project_draft(cx));
+    }
+    fn request_project_draft(
+        &mut self,
+        project: PathBuf,
+        route: Route,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace.is_some()
+            && !cx
+                .global::<crate::preferences::HostDirectory>()
+                .0
+                .is_empty()
+        {
+            cx.emit(crate::app::projects::NewProjectSession { project, route });
+        } else {
+            self.new_project_draft(project, route, w, cx);
+        }
+    }
+    fn request_active_draft(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.panes[self.active].read(cx);
+        if !pane
+            .store
+            .as_ref()
+            .is_some_and(|store| store.state() == &Connection::Ready)
+        {
+            return;
+        }
+        self.request_project_draft(pane.project.clone(), pane.route.clone(), w, cx);
+    }
+    pub(crate) fn show_thread(
+        &mut self,
+        scope: ox_desk_core::host_protocol::Scope,
+        id: Option<String>,
+        row: Option<ThreadRow>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = id else {
+            self.open(scope.project, scope.route, window, cx);
+            self.panes[self.active].update(cx, |pane, cx| {
+                pane.focus_editor_for = Some(None);
+                pane.action(cx, DeskAction::NewDraft)
+            });
+            return;
+        };
+        self.with_project_dir(
+            scope.project,
+            false,
+            window,
+            cx,
+            move |s, project, w, cx| {
+                let row = row.unwrap_or_else(|| ThreadRow {
+                    id: id.clone(),
+                    cwd: project.clone(),
+                    model_provider: String::new(),
+                    worker: false,
+                    parent_thread_id: None,
+                    agent_nickname: None,
+                    model: None,
+                    name: None,
+                    preview: String::new(),
+                    generated_title: None,
+                    updated_at: 0,
+                    status: None,
+                    unread: false,
+                    activity_order: 0,
+                });
+                s.clear_row_unread(
+                    &ThreadMetaKey::new(project.clone(), scope.route.runtime, id),
+                    cx,
+                );
+                let selected = row.id.clone();
+                s.open_catalog(project, row, scope.route, w, cx);
+                s.panes[s.active].update(cx, |pane, cx| {
+                    pane.focus_editor_for = Some(Some(selected));
+                    cx.notify();
+                });
+            },
+        );
+    }
     fn open_catalog(
         &mut self,
         project: PathBuf,
@@ -1562,6 +1803,17 @@ impl Host {
         });
     }
 
+    fn clear_row_unread(&mut self, key: &ThreadMetaKey, cx: &mut Context<Self>) {
+        if self
+            .sidebar
+            .thread(key)
+            .and_then(|m| m.unread_override)
+            .is_some()
+        {
+            self.sidebar.set_unread_override(key, None);
+            self.save_sidebar(cx);
+        }
+    }
     fn activate_row_then(
         &mut self,
         project: PathBuf,
@@ -1573,15 +1825,7 @@ impl Host {
     ) {
         let id = row.id.clone();
         let mkey = ThreadMetaKey::new(project.clone(), scope.runtime, id.clone());
-        if self
-            .sidebar
-            .thread(&mkey)
-            .and_then(|m| m.unread_override)
-            .is_some()
-        {
-            self.sidebar.set_unread_override(&mkey, None);
-            self.save_sidebar(cx);
-        }
+        self.clear_row_unread(&mkey, cx);
         let (route, _) = self.project_row_state(&project, &row, scope, cx);
         if let Some(route) = route {
             self.open_catalog(project, row, route, window, cx);
@@ -1608,6 +1852,9 @@ impl Host {
 
     fn navigate(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if event.keystroke.modifiers != Modifiers::default() {
+            return;
+        }
+        if !self.fleet_tree.native {
             return;
         }
         let selected = self.panes[self.active]
@@ -1696,7 +1943,12 @@ impl Host {
         if let Some((index, (row, project, scope))) = target {
             self.activate_row(project.to_owned(), scope, row.clone(), window, cx);
             self.list_scroll
-                .scroll_to_item(index, ScrollStrategy::Nearest);
+                .scroll_to_item(self.fleet_tree.rows.len() + index, ScrollStrategy::Nearest);
+        } else if matches!(event.keystroke.key.as_str(), "up" | "k")
+            && let Some(last) = self.fleet_tree.rows.len().checked_sub(1)
+            && let (Some(keys), Some(ws)) = (&self.fleet_tree.keyboard, &self.workspace)
+        {
+            keys.select(last, ws, window, cx);
         }
         cx.stop_propagation();
     }
@@ -2137,6 +2389,40 @@ impl Host {
         )
     }
 
+    fn navigation_rows(
+        &mut self,
+        range: Range<usize>,
+        width: Pixels,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let offset = self.fleet_tree.rows.len();
+        let mut rows = Vec::with_capacity(range.len());
+        if let Some(ws) = self.workspace.as_ref().and_then(WeakEntity::upgrade)
+            && let Some(keys) = &self.fleet_tree.keyboard
+        {
+            let p = Palette::get(cx);
+            let cursor = ws.read(cx).tree_cursor.as_deref();
+            for (i, row) in self
+                .fleet_tree
+                .rows
+                .iter()
+                .enumerate()
+                .take(range.end)
+                .skip(range.start)
+            {
+                rows.push(row.render(&ws.downgrade(), width, p, keys, i, cursor));
+            }
+        }
+        if self.fleet_tree.native && range.end > offset {
+            rows.extend(self.rows(
+                range.start.saturating_sub(offset)..range.end - offset,
+                width,
+                cx,
+            ));
+        }
+        rows
+    }
+
     fn rows(
         &mut self,
         range: Range<usize>,
@@ -2327,6 +2613,21 @@ impl Host {
                         .map(|n| n.to_string_lossy().into_owned())
                         .filter(|n| !n.is_empty())
                         .unwrap_or_else(|| proj_path.display().to_string());
+                    let proj_name = self
+                        .workspace
+                        .as_ref()
+                        .and_then(WeakEntity::upgrade)
+                        .and_then(|ws| {
+                            ws.read(cx).shared_caption(
+                                self.link.remote().map(|h| h.id.as_str()),
+                                &proj_path,
+                                cx,
+                            )
+                        })
+                        .map_or_else(
+                            || proj_name.clone(),
+                            |hosts| format!("{proj_name} · {hosts}"),
+                        );
                     let host = cx.weak_entity();
                     let menu_proj = proj_path.clone();
                     let menu: crate::kit::RowMenuBuilder =
@@ -2338,10 +2639,12 @@ impl Host {
                                     move |_, window, cx| {
                                         let _ = host_new.update(cx, |s, cx| {
                                             let route = s.recent.route(&p_new);
-                                            s.open(p_new.clone(), route, window, cx);
-                                            s.panes[s.active].update(cx, |pane, cx| {
-                                                pane.action(cx, DeskAction::NewDraft);
-                                            });
+                                            s.request_project_draft(
+                                                p_new.clone(),
+                                                route,
+                                                window,
+                                                cx,
+                                            );
                                         });
                                     },
                                 ),
@@ -2468,15 +2771,19 @@ impl Host {
                 Some(model) => format!("{badge} · {model}"),
                 None => badge,
             };
-            let tree = cx
-                .try_global::<TreeIndex>()
-                .and_then(|index| index.0.get(&(project.to_path_buf(), t.id.clone())))
+            let tree = self
+                .workers
+                .read(cx)
+                .trees
+                .get(&(project.to_path_buf(), t.id.clone()))
                 .cloned();
             // A worker whose parent is hidden by the current filter keeps a
             // readable return reference; opening it shows the full parent link.
-            let parent_hint = cx
-                .try_global::<ParentIndex>()
-                .and_then(|index| index.0.get(&(project.to_path_buf(), t.id.clone())))
+            let parent_hint = self
+                .workers
+                .read(cx)
+                .parents
+                .get(&(project.to_path_buf(), t.id.clone()))
                 .map(|link| {
                     link.title.clone().unwrap_or_else(|| {
                         link.project
@@ -2740,6 +3047,55 @@ impl Host {
             eprintln!("desk-stats {}", self.snapshot(window, cx));
         }
         self.index_catalog(cx);
+        if let Some(ws) = self.workspace.as_ref().and_then(WeakEntity::upgrade) {
+            let ws = ws.read(cx);
+            let filter = self.filter.read(cx).value();
+            if self.fleet_tree.palette != Some(p)
+                || self.fleet_tree.revision != ws.navigation_revision()
+                || self.fleet_tree.filter != filter.as_str()
+            {
+                let active = self.link.remote().map(|h| h.id.clone());
+                let pane = self.panes[self.active].read(cx);
+                let native_projects = self
+                    .catalog
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        CatalogEntry::Project { project, .. } => Some(project.as_path()),
+                        _ => self.located_entry(entry, cx).map(|(_, project, _)| project),
+                    })
+                    .collect();
+                let current = crate::app::fleet::tree::Current {
+                    native_projects,
+                    sidebar: &self.sidebar,
+                    project: &pane.project,
+                    route: &pane.route,
+                    thread: pane.store.as_ref().and_then(|s| s.selected()),
+                };
+                let (rows, native) = ws.tree_rows(&active, &filter, Some(current), cx);
+                let keyboard = crate::app::fleet::tree::Keyboard::new(
+                    &rows,
+                    self.list_scroll.clone(),
+                    ws.tree_focus.clone(),
+                    (native && !self.catalog.is_empty()).then(|| self.list_focus.clone()),
+                );
+                if let Some(owner) = self.workspace.clone() {
+                    keyboard.recover(
+                        ws.tree_cursor.as_deref(),
+                        owner,
+                        Some(self.list_focus.clone()),
+                        window,
+                    );
+                }
+                self.fleet_tree = crate::app::fleet::tree::Tree {
+                    keyboard: Some(keyboard),
+                    palette: Some(p),
+                    revision: ws.navigation_revision(),
+                    filter: filter.to_string(),
+                    rows,
+                    native,
+                };
+            }
+        }
         let compact = self.compact(window);
         if !compact {
             self.close_drawer(window, cx);
@@ -2754,9 +3110,26 @@ impl Host {
             } else {
                 px(0.)
             };
-        if self.panes[self.active].read(cx).pane_width != pane_width {
+        let host_caption = self
+            .workspace
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .and_then(|ws| {
+                ws.read(cx)
+                    .session_host_name(&self.link.remote().map(|h| h.id.clone()), cx)
+            });
+        if let Some(workspace) = &self.workspace {
+            for pane in &self.panes {
+                if pane.read(cx).workspace.is_none() {
+                    pane.update(cx, |p, _| p.workspace = Some(workspace.clone()));
+                }
+            }
+        }
+        let pane = self.panes[self.active].read(cx);
+        if pane.pane_width != pane_width || pane.host_caption != host_caption {
             self.panes[self.active].update(cx, |pane, cx| {
                 pane.pane_width = pane_width;
+                pane.host_caption = host_caption;
                 cx.notify();
             });
         }
@@ -2774,7 +3147,12 @@ impl Host {
             .store
             .as_ref()
             .is_some_and(|s| s.state() == &Connection::Ready);
-        let count = self.catalog.len();
+        let count = self.fleet_tree.rows.len()
+            + if self.fleet_tree.native {
+                self.catalog.len()
+            } else {
+                0
+            };
         let (running_count, running_open) = {
             let running = self.running.read(cx);
             (running.process_count(), running.open)
@@ -2960,8 +3338,7 @@ impl Host {
                         pane_ready,
                         cx.listener(|s, _, window, cx| {
                             s.close_drawer(window, cx);
-                            s.panes[s.active]
-                                .update(cx, |p, cx| p.action(cx, DeskAction::NewDraft));
+                            s.request_active_draft(window, cx);
                             cx.notify();
                         }),
                     )
@@ -3115,8 +3492,10 @@ impl Host {
                             "project-threads",
                             count,
                             cx.processor(move |s, range, _, cx| {
-                                crate::app::try_draw(cx, |cx| s.rows(range, sidebar_width, cx))
-                                    .unwrap_or_default()
+                                crate::app::try_draw(cx, |cx| {
+                                    s.navigation_rows(range, sidebar_width, cx)
+                                })
+                                .unwrap_or_default()
                             }),
                         )
                         .track_scroll(&self.list_scroll)

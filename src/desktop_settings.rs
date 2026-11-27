@@ -2,6 +2,7 @@
 mod advanced;
 mod legacy;
 mod rows;
+mod transfer;
 use crate::provider::{
     CodeoxConfig, MAX_CONFIG_BYTES, RelayError, SavedKeys, alias_for, process_env,
 };
@@ -86,6 +87,18 @@ async fn handle(home: &Path, request: Request) -> Result<Value, RelayError> {
                 crate::settings_protocol::model::Outcome::ChangedOnDisk { revision: current }
             };
             Ok(serde_json::to_value(outcome)?)
+        }
+        Request::ExportKeys { revision, selected } => {
+            let _lock = setup::lock_config(home)?;
+            Ok(serde_json::to_value(transfer::export(
+                home, &revision, selected,
+            )?)?)
+        }
+        Request::ImportKeys { revision, keys } => {
+            let _lock = setup::lock_config(home)?;
+            Ok(serde_json::to_value(transfer::import(
+                home, &revision, keys,
+            )?)?)
         }
         Request::Read => Ok(serde_json::to_value(snapshot(home)?.0)?),
         Request::LegacyWorkspace => {

@@ -331,6 +331,8 @@ class Link {
         routes = msg.routes;
         projects = msg.projects;
       }
+      this.placement = msg.capabilities.includes("worker_placement");
+      this.codexSubscriptionWorkers = msg.capabilities.includes("worker_codex_subscription");
       const liveCatalog =
         !this.scope && msg.capabilities.includes("live_catalog");
       this.send(
@@ -390,11 +392,28 @@ class Link {
       return;
     }
     if (msg.type === "worker_reply") {
+      if (this.inventoryRequest === msg.id) {
+        this.inventoryRequest = null;
+        if (this === detailLink && !$("worker-form").hidden) showWorkerHosts(msg.result, msg.error);
+        return;
+      }
+      if (workerSubmission === msg.id) {
+        workerSubmission = null;
+        $("worker-submit").disabled = false;
+        if (!msg.error) {
+          $("worker-form").hidden = true;
+          $("worker-task").value = "";
+        }
+      }
       if (!msg.error && msg.result?.relation === "handoff") {
         notice(`Continued in ${routesLabel(msg.result.scope.route)}.`);
         if (pendingGrant?.key === msg.id)
           pendingGrant = { scope: msg.result.scope, id: msg.result.session };
         open(msg.result.scope, msg.result.session);
+        return;
+      }
+      if (!msg.error && msg.result?.status === "preparing") {
+        notice(`Preparing worker ${msg.result.job_id} on ${msg.result.worker_host?.name || "the linked host"}.`);
         return;
       }
       notice(
@@ -449,6 +468,8 @@ class Link {
   lost() {
     if (this.closed) return;
     this.ready = false;
+    this.inventoryRequest = null;
+    if (this === detailLink) { workerSubmission = null; $("worker-submit").disabled = false; }
     if (!this.scope) {
       this.discoveryResult = null;
       notificationTarget.reconnect();
@@ -513,6 +534,8 @@ class Link {
   close() {
     this.closed = true;
     this.ready = false;
+    this.inventoryRequest = null;
+    if (this === detailLink) { workerSubmission = null; $("worker-submit").disabled = false; }
     if (!this.scope) notificationTarget.reconnect();
     clearTimeout(this.timer);
     this.socket?.close();
@@ -725,6 +748,7 @@ function home() {
   repaint();
 }
 function open(scope, id) {
+  $("worker-form").hidden = true;
   controls.reset();
   detailLink?.close();
   selected = { scope, id, revealLatest: Boolean(id) };
@@ -761,6 +785,11 @@ function entries() {
 }
 function catalog() {
   const rows = entries();
+  const drafts = [];
+  for (const state of global.scopes.values()) {
+    const requests = state.detail?.draft_requests ?? state.asks.filter((a) => a.thread == null).map((a) => a.id);
+    for (const id of requests) drafts.push({ scope: state.scope, request: id });
+  }
   const nowSec = Date.now() / 1000;
   const counts = { all: 0, active: 0, requests: 0, finished: 0 };
   const filterLabels = {
@@ -770,14 +799,14 @@ function catalog() {
     finished: "Finished",
   };
   if (globalLink?.ready) {
-    void notificationTarget.resolve(rows, globalLink.discoveryResult, (match) => {
+    void notificationTarget.resolve([...rows, ...drafts], globalLink.discoveryResult, (match) => {
       if (match === "ambiguous")
         notice("This notification matches more than one session. Choose the session from the list.");
       else if (match === "missing")
         notice("This notification’s session is no longer in the list.");
       else if (match === "incomplete")
         notice("OX couldn’t load the full session list for this notification. Reconnect and look for the session.");
-      else open(match.scope, match.session.id);
+      else open(match.scope, match.session?.id ?? null);
     });
   }
   const needle = $("find-sessions").value.trim().toLocaleLowerCase();
@@ -815,6 +844,7 @@ function catalog() {
       continue;
     visible.push({ ...row, needsInput });
   }
+  counts.requests += drafts.length;
   for (const b of $("filters").children) {
     const kind = b.dataset.filter;
     const base = filterLabels[kind] ?? b.textContent;
@@ -846,6 +876,16 @@ function catalog() {
     byProject.set(entry.scope.project, list);
   }
   const frag = document.createDocumentFragment();
+  if (filter === "all" || filter === "requests") {
+    for (const {scope} of drafts) {
+      const title = `New session approval · ${leaf(scope.project)} · ${routesLabel(scope.route)}`;
+      if (needle && !title.toLocaleLowerCase().includes(needle)) continue;
+      const entry = button(title, () => open(scope, null));
+      entry.className = "session";
+      entry.dataset.needsInput = "true";
+      frag.append(entry);
+    }
+  }
   const names = new Map();
   for (const project of byProject.keys())
     names.set(leaf(project), (names.get(leaf(project)) || 0) + 1);
@@ -898,7 +938,7 @@ function catalog() {
         el(
           "div",
           "worker-outcome",
-          `Worker #${worker.job_id} · ${worker.status.replaceAll("_", " ")}`,
+          `Worker #${worker.job_id} · ${worker.status.replaceAll("_", " ")}${worker.host ? " on " + worker.host : ""}`,
         ),
       );
     frag.append(b);
@@ -986,7 +1026,7 @@ function showAsks(asks) {
     // A child that would run in YOLO waits here for the operator (ox-host yolo.rs).
     if (String(a.id).startsWith("ox-yolo-")) {
       card.classList.add("yolo");
-      card.append(el("p", "ask-kicker", "Worker waits for YOLO"));
+      card.append(el("p", "ask-kicker", "YOLO approval"));
     }
     card.append(el("h2", "", a.title));
     if (a.detail) card.append(el("p", "", a.detail));
@@ -1769,6 +1809,7 @@ function handoffMarks(row) {
         inherited: "inherited",
         lowered: "lowered",
         operator: "chosen by you",
+        host_policy: "set by the host policy",
         capped: "capped below YOLO",
       }[origin.decided] ?? "unknown";
     nodes.push(
@@ -1922,20 +1963,6 @@ $("handoff-form").onsubmit = (e) => {
     notice("Write the request for the new session.");
     return;
   }
-  const row = detailLink?.model.scopes
-    .get(scopeKey(selected.scope))
-    ?.sessions.find((x) => x.id === selected.id);
-  const inheritsYolo =
-    mode === "inherit" &&
-    bypassMode(row?.detail?.access) &&
-    row?.detail?.yolo_grant !== true;
-  if (inheritsYolo) {
-    // Inheriting YOLO is still a YOLO start: choose it explicitly or lower it.
-    notice(
-      "This session runs in YOLO. Choose YOLO to confirm it for the new session, or a lower mode.",
-    );
-    return;
-  }
   const confirmed = mode === "yolo";
   const start = {
     source: selected.id,
@@ -2019,19 +2046,113 @@ function addCatalogRoutes() {
 // The model the worker sheet should start from: the parent session's route, set when
 // the sheet opens (desktop worker_sheet.rs Choice::new). Cleared when the runtime changes.
 let workerSeed = null;
+let workerSubmission = null;
+let workerHosts = [];
+let workerProjectRule = null;
+function requestWorkerHosts() {
+  if (!detailLink?.ready || !detailLink.placement || detailLink.inventoryRequest || $("worker-form").hidden) return;
+  detailLink.inventoryRequest = crypto.randomUUID();
+  detailLink.send({type:"worker_hosts", id:detailLink.inventoryRequest, project:detailLink.scope.project});
+}
+function showWorkerHosts(result, error) {
+  $("worker-inventory-note").textContent = error || result?.warning || result?.placement_error || "";
+  if (!result?.hosts) {
+    workerHosts = [];
+    showWorkerLimits();
+    return;
+  }
+  workerHosts = result.hosts;
+  workerProjectRule = result.project_placement;
+  const select = $("worker-host"), previous = select.value;
+  const options = workerHosts.map(row => {
+    const name = row.parent_host ? "Same as parent" : row.paired_name || row.host.name;
+    const r = row.host.resources;
+    const info = r ? `load ${r.load_one_minute.toFixed(1)} · ${(r.available_memory / 1e9).toFixed(1)} GB free` : row.status;
+    const opt = new Option(name + " · " + info, row.parent_host ? "parent" : row.host.id);
+    opt.disabled = row.status !== "online";
+    return opt;
+  });
+  if (result.project_placement) {
+    const rule = result.project_placement;
+    options.push(new Option(["Project rule", rule.host || "Prefer parent", rule.os].filter(Boolean).join(" · "), "project"));
+  }
+  options.push(new Option("Auto", "auto"));
+  // Keep an explicit choice visible if the link was removed while the sheet was open.
+  if (previous && !options.some(o => o.value === previous)) {
+    const gone = new Option(select.selectedOptions[0].text + " · unavailable", previous);
+    gone.disabled = true;
+    options.push(gone);
+  }
+  select.replaceChildren(...options);
+  select.value = previous || "parent";
+  fillWorkerModels();
+}
+function workerRoutes() {
+  const host = $("worker-host").value;
+  if (!detailLink?.placement || host === "parent") return null;
+  return workerHosts.filter(r => r.status === "online" && (host === "auto" || host === "project" || r.host.id === host)).flatMap(r => r.routes || []);
+}
+$("worker-host").onchange = () => {
+  const auto = $("worker-host").value === "auto";
+  $("worker-needs").hidden = $("worker-needs").disabled = !auto;
+  workerSeed = null;
+  fillWorkerModels();
+};
+$("worker-model").onchange = () => { workerSeed = null; showWorkerLimits(); };
+$("worker-model-free").oninput = showWorkerLimits;
+function showWorkerLimits() {
+  const panel = $("worker-subscription-limits");
+  panel.replaceChildren();
+  const target = $("worker-host").value, runtime = $("worker-runtime").value;
+  if (!workerModelValue()) {
+    const rule = target === "project" ? workerProjectRule : null;
+    const selector = (target === "project" ? rule?.host || "auto" : target).toLowerCase();
+    const now = Date.now() / 1000;
+    const stamp = (n) => new Date(n * 1000).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    for (const row of workerHosts) {
+      const selected = selector === "auto" || (selector === "parent" ? row.parent_host
+        : selector.startsWith("label:") ? row.host.labels?.some(s => s.toLowerCase() === selector.slice(6))
+        : [row.host.id, row.host.name, row.paired_name].some(s => s?.toLowerCase() === selector));
+      if (!selected || row.status !== "online" || (rule?.os && rule.os.toLowerCase() !== row.host.resources?.os?.toLowerCase())) continue;
+      if (!row.routes?.some(r => r.runtime === runtime && r.billing === "subscription")) continue;
+      const windows = row.host.subscription_limits?.[runtime];
+      if (!Array.isArray(windows)) continue;
+      for (const w of windows) {
+        if (!w || typeof w.label !== "string" || !Number.isFinite(w.observed_at)) continue;
+        if (w.resets_at != null && w.resets_at <= now) continue;
+        const parts = [row.paired_name || row.host.name, runtime === "claude" ? "Claude" : "ChatGPT", w.label];
+        if (w.used_percent != null) parts.push(w.used_percent + "% used");
+        if (w.status && (w.status !== "allowed" || w.used_percent == null)) parts.push(w.status);
+        parts.push((now - w.observed_at > 3600 ? "last reported " : "reported ") + stamp(w.observed_at));
+        if (w.resets_at != null) parts.push("resets " + stamp(w.resets_at));
+        const line = document.createElement("div");
+        line.textContent = parts.join(" · ");
+        panel.append(line);
+      }
+    }
+  }
+  panel.hidden = !panel.childElementCount;
+}
+setInterval(() => { if (!document.hidden) requestWorkerHosts(); }, 30_000);
 function fillWorkerModels() {
   const select = $("worker-model"),
     runtime = $("worker-runtime").value,
     current = workerSeed ? workerSeed.model : select.value,
-    starred = modelChoices.starred,
-    rest = modelChoices.all.filter((m) => !starred.includes(m));
+    eligible = workerRoutes(),
+    aliases = eligible ? [...new Set(eligible.filter(r => r.runtime === runtime && r.billing?.api).map(r => r.billing.api))] : modelChoices.all,
+    starred = modelChoices.starred.filter(m => aliases.includes(m)),
+    rest = aliases.filter((m) => !starred.includes(m));
   const option = (m) => new Option(m, m);
-  // A Codex worker needs an OX API model (desktop worker_sheet.rs subscription_ok).
   const subscription = new Option(
     runtime === "codex" ? "ChatGPT subscription" : "Claude subscription",
     "",
   );
-  subscription.disabled = runtime === "codex";
+  const host = $("worker-host").value;
+  const hostOffers = workerHosts.filter(row => row.status === "online" && (host === "auto" || host === "project" ||
+    (host === "parent" && row.parent_host) || host === row.host.id));
+  subscription.disabled = workerHosts.length ? !hostOffers.some(row =>
+    (runtime !== "codex" || row.codex_subscription_workers) && row.routes?.some(r => r.runtime === runtime && r.billing === "subscription"))
+    : runtime === "codex" && !detailLink?.codexSubscriptionWorkers;
   select.replaceChildren(
     subscription,
     ...(starred.length ? [optgroup("Starred", starred.map(option))] : []),
@@ -2040,17 +2161,17 @@ function fillWorkerModels() {
   select.value = [...select.options].some((o) => o.value === current)
     ? current
     : "";
-  if (runtime === "codex" && !select.value && select.options.length > 1)
-    select.value = select.options[1].value;
   // Free text is the fallback only when the phone has no model list at all.
-  const free = !modelChoices.all.length;
+  const free = !aliases.length;
   select.hidden = free;
   $("worker-model-free").hidden = !free;
+  showWorkerLimits();
 }
-const workerModelValue = () =>
-  ($("worker-model-free").hidden
+function workerModelValue() {
+  return ($("worker-model-free").hidden
     ? $("worker-model").value
     : $("worker-model-free").value.trim()) || null;
+}
 // Labels and one-line notes are the desktop's (worker_sheet.rs mode_label / mode_note).
 const workerModes = {
   session: "Session",
@@ -2123,6 +2244,16 @@ $("worker-runtime").onchange = () => {
 $("worker-permission").onchange = renderWorkerPermission;
 $("start-worker").onclick = () => {
   // Start from the parent session's route, as the desktop sheet does.
+  workerSubmission = null;
+  $("worker-model-free").value = "";
+  $("worker-submit").disabled = false;
+  workerHosts = [];
+  $("worker-placement").hidden = !detailLink?.placement;
+  $("worker-host").replaceChildren(new Option("Same as parent","parent"));
+  $("worker-needs").hidden = $("worker-needs").disabled = true;
+  for (const id of ["worker-memory","worker-cpus","worker-os"]) $(id).value = "";
+  $("worker-gpu").checked = false;
+  $("worker-inventory-note").textContent = detailLink?.placement ? "Loading worker hosts…" : "";
   const route = selected?.scope?.route;
   if (route) {
     $("worker-runtime").value = route.runtime;
@@ -2132,6 +2263,7 @@ $("start-worker").onclick = () => {
   renderWorkerMode();
   renderWorkerPermission();
   $("worker-form").hidden = false;
+  requestWorkerHosts();
   $("worker-task").focus();
   loadModelChoices();
 };
@@ -2148,8 +2280,14 @@ $("worker-form").onsubmit = (e) => {
     permission = $("worker-permission").value;
   // No model chosen means the runtime's subscription, which must be configured.
   if (
+    !workerModelValue() && $("worker-model").options[0]?.disabled
+  ) {
+    notice("The selected host does not offer this subscription for workers. Check its sign-in and OX version, or choose an API model.");
+    return;
+  }
+  if (
     !workerModelValue() &&
-    !routes.some((r) => r.runtime === runtime && r.billing === "subscription")
+    !(workerRoutes() || routes).some((r) => r.runtime === runtime && r.billing === "subscription")
   ) {
     notice(
       `${runtimeName(runtime)} has no subscription configured on this host. Choose an OX API model or sign in on the host.`,
@@ -2168,13 +2306,24 @@ $("worker-form").onsubmit = (e) => {
     // Choosing YOLO in the sheet is the confirmation, as for any YOLO change.
     yolo_confirmed: permission === "yolo",
   };
-  detailLink?.act({ start_worker: start }, null, (ok, message) => {
-    if (!ok) notice(message || "The host refused this worker.");
-    else {
-      $("worker-form").hidden = true;
-      $("worker-task").value = "";
+  if (detailLink?.placement) {
+    if ($("worker-host").value !== "project") start.host = $("worker-host").value;
+    if (start.host === "auto") {
+      start.needs = {gpu:$("worker-gpu").checked};
+      if ($("worker-memory").value) start.needs.memory_gb = $("worker-memory").valueAsNumber;
+      if ($("worker-cpus").value) start.needs.cpus = $("worker-cpus").valueAsNumber;
+      if ($("worker-os").value.trim()) start.needs.os = $("worker-os").value.trim();
+    }
+  }
+  if (workerSubmission) return;
+  workerSubmission = detailLink?.act({ start_worker: start }, null, (ok, message, id) => {
+    if (!ok && id === workerSubmission) {
+      workerSubmission = null;
+      $("worker-submit").disabled = false;
+      notice(message || "The host refused this worker.");
     }
   });
+  $("worker-submit").disabled = Boolean(workerSubmission);
 };
 $("draft").oninput = () => {
   mentionInput();

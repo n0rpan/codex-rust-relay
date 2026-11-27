@@ -148,6 +148,8 @@ impl ModeRequest {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
+    /// The receiving host set the starting level within the caller’s ceiling.
+    HostPolicy,
     /// The source's level, mapped to the target runtime.
     Inherited,
     /// The launcher asked for a lower level.
@@ -163,6 +165,8 @@ pub enum Decision {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "by", rename_all = "snake_case")]
 pub enum YoloAllowance {
+    /// The host owner selected Always YOLO.
+    HostPolicy,
     /// The worker inherited the verified active parent’s existing bypass mode.
     Inherited { session: String },
     /// The operator accepted this child's YOLO request on a device.
