@@ -169,12 +169,23 @@ class AutoQueue(unittest.TestCase):
         self.assertIn("pr comment", calls)
 
     def test_a_running_or_unresolved_security_review_holds_without_a_new_request(self):
-        for state in ({"security": "running"}, {"security": "completed", "unresolved": True},
-                      {"security": "completed", "unresolved": None}):
+        for state in ({"security": "running"}, {"security": "completed", "unresolved": True}):
             out, calls = self.decide(comments=[{"user": BOT_USER, "body": summary(HEAD, "completed", **state)}])
             self.assertIn("security review", out)
             self.assertNotIn("pr comment", calls)
             self.assertNotIn("--auto", calls)
+
+    def test_a_finished_security_review_with_nothing_reported_is_clean(self):
+        # What Codex wrote for a finished review with no findings on #39.
+        out, calls = self.decide(comments=[{"user": BOT_USER, "body": summary(HEAD, "completed", unresolved=None)}])
+        self.assertIn("queue:", out)
+        self.assertNotIn("pr comment", calls)
+
+    def test_an_unresolved_security_thread_holds_at_any_severity(self):
+        finding = thread("**P2 Badge** leak\n<!-- codex-security-review-finding:v1 -->")
+        out, calls = self.decide(threads=[finding])
+        self.assertIn("hold:", out)
+        self.assertNotIn("--auto ", calls)
 
     def test_no_security_review_is_requested_without_the_label_or_for_a_draft(self):
         bare = [{"user": BOT_USER, "body": summary(HEAD, "completed", security=None)}]

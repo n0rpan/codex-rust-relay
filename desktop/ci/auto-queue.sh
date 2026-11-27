@@ -11,7 +11,8 @@
 #   - it carries the full-ci label;
 #   - Codex has finished a code review of its current head commit;
 #   - Codex has finished a security review of that commit with nothing open;
-#   - no unresolved Codex review thread is marked P0 or P1.
+#   - no unresolved Codex review thread is marked P0 or P1, or carries a
+#     security review marker.
 # Otherwise auto-merge is turned off. A labelled pull request whose head
 # commit has no security review gets one requested, once per commit, by a
 # comment from the maintainer's token: the security review runs by itself
@@ -56,10 +57,12 @@ decide() {
         '.[] | select(.login == $bot and .type == "Bot") | .body' <<< "${comments}" |
         grep -o 'codex-review-state:v1 [^>]*' | tail -n 1 |
         sed -e 's/^codex-review-state:v1 //' -e 's/ *--$//' -e 's/&#123;/{/g' -e 's/&#125;/}/g' || true)"
-    # Before any hold below, so the two reviews run side by side.
+    # Before any hold below, so the two reviews run side by side. A security
+    # review that finished with nothing to report leaves both findings fields
+    # null, so only an explicit `true` counts as open.
     security="$(jq -r --arg head "${head}" '.security_review | select(.commit_sha == $head)
         | if .status != "completed" then "running"
-          elif .has_unresolved_findings == false then "clean" else "open" end' \
+          elif .has_unresolved_findings == true then "open" else "clean" end' \
         <<< "${summary:-null}" 2>/dev/null || true)"
     if [ -z "${security}" ] && ! jq -e --arg who "${maintainer}" --arg head "${head}" \
         'any(.[]; .login == $who and (.body | startswith("@codex security review")) and (.body | contains($head)))' \
@@ -92,8 +95,8 @@ decide() {
     blocking="$(jq -r --arg reviewer "${reviewer}" '[.nodes[]
         | select(.isResolved | not) | .comments.nodes[0]
         | select(.author.__typename == "Bot" and .author.login == $reviewer)
-        | select(.body | test("P[01] Badge"))] | length' <<< "${threads}")"
-    if [ "${blocking}" != 0 ]; then decision="hold: ${blocking} unresolved P0/P1 finding(s)"; return; fi
+        | select(.body | test("P[01] Badge|codex-security"))] | length' <<< "${threads}")"
+    if [ "${blocking}" != 0 ]; then decision="hold: ${blocking} unresolved P0/P1 or security finding(s)"; return; fi
     decision="queue: reviewed ${head:0:7}, nothing blocking"
 }
 
