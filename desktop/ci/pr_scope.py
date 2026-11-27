@@ -26,7 +26,7 @@ def lanes(paths, full_ci):
         "desktop/ox-*/Cargo.toml", "desktop/ox-*/build.rs",
     )
     # ox-desktop and the browser's real server share these local build inputs.
-    shared = (*build_inputs, "desktop/ox-desk-core/src/*", "desktop/ox-pty/src/*",
+    shared = (*build_inputs, "desktop/ox-desk-core/src/*", "desktop/ox-pty/src/*", "desktop/ox-memory/src/*",
               "src/claude_worker_contract.rs", "src/settings_protocol*",
               ".github/workflows/ci.yml", "desktop/ci/pr_scope.py")
     mac_desktop = (*shared, "desktop/ox-desktop/*", "desktop/ox-host-service/src/*",

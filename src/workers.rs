@@ -281,6 +281,188 @@ struct ListModels {
     offset: usize,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RecallMemory {
+    #[serde(default)]
+    query: String,
+    scope: Option<String>,
+    kind: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaveMemory {
+    text: Option<String>,
+    id: Option<String>,
+    #[serde(default)]
+    forget: bool,
+    scope: Option<String>,
+    kind: Option<String>,
+    sensitivity: Option<String>,
+    #[serde(default)]
+    pin: bool,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+fn memory_sensitivity_ceiling() -> ox_memory::Sensitivity {
+    std::env::var("OX_MEMORY_MAX_SENSITIVITY")
+        .ok()
+        .and_then(|v| ox_memory::Sensitivity::parse(&v).ok())
+        .unwrap_or(ox_memory::Sensitivity::LocalOnly)
+}
+
+impl Service {
+    async fn recall_memory(&self, req: RecallMemory) -> Result<Value, String> {
+        let cwd = self.cwd.clone();
+        let ceiling = memory_sensitivity_ceiling();
+        tokio::task::spawn_blocking(move || {
+            let store = ox_memory::MemoryStore::open_default().map_err(|e| e.to_string())?;
+            let project = ox_memory::canonical_project_id(&cwd);
+            let host = ox_memory::default_host_id();
+            let include_all_scopes = req.scope.as_deref() == Some("all");
+            let scope = match req.scope.as_deref() {
+                None | Some("all") => None,
+                Some("global") => Some(ox_memory::Scope::Global),
+                Some("project") => Some(ox_memory::Scope::Project(project.clone())),
+                Some("host") => Some(ox_memory::Scope::Host(host.clone())),
+                Some(other) => {
+                    return Err(format!(
+                        "Invalid scope '{other}'. Expected all, global, project, or host."
+                    ));
+                }
+            };
+            let kind = req
+                .kind
+                .as_deref()
+                .map(ox_memory::Kind::parse)
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            let limit = req.limit.unwrap_or(6).clamp(1, 20);
+            let hits = store
+                .recall(&ox_memory::RecallQuery {
+                    text: req.query,
+                    project: Some(project.clone()),
+                    host: Some(host),
+                    scope,
+                    include_all_scopes,
+                    kind,
+                    max_sensitivity: ceiling,
+                    limit,
+                })
+                .map_err(|e| e.to_string())?;
+            let memories: Vec<Value> = hits
+                .into_iter()
+                .map(|h| {
+                    let e = h.entry;
+                    json!({
+                        "id": e.id,
+                        "scope": e.scope.short_label(),
+                        "kind": e.kind.as_str(),
+                        "sensitivity": e.sensitivity.as_str(),
+                        "pin": e.pin,
+                        "tags": e.tags,
+                        "text": e.text,
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "project": project,
+                "memories": memories,
+            }))
+        })
+        .await
+        .map_err(|_| "Memory recall task failed.".to_string())?
+    }
+
+    async fn save_memory(&self, req: SaveMemory) -> Result<Value, String> {
+        let secrets = self.app().await.ok().map(|app| Arc::clone(&app.secrets));
+        let cwd = self.cwd.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = ox_memory::MemoryStore::open_default().map_err(|e| e.to_string())?;
+            let host = ox_memory::default_host_id();
+            if req.forget {
+                let id = req
+                    .id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "Provide id when forget is true.".to_string())?;
+                let removed = store.forget(id, &host).map_err(|e| e.to_string())?;
+                return Ok(json!({
+                    "action": "forgotten",
+                    "id": removed.id,
+                }));
+            }
+            let raw_text = req
+                .text
+                .as_deref()
+                .ok_or_else(|| "Provide text to save a memory.".to_string())?;
+            let (text, tags) = if let Some(secrets) = secrets.as_deref() {
+                let text = crate::upstream::redact(raw_text, secrets).into_owned();
+                let tags = req
+                    .tags
+                    .iter()
+                    .map(|t| crate::upstream::redact(t, secrets).into_owned())
+                    .collect();
+                (text, tags)
+            } else {
+                (raw_text.to_string(), req.tags)
+            };
+            let project = ox_memory::canonical_project_id(&cwd);
+            let scope = match req.scope.as_deref().unwrap_or("project") {
+                "global" => ox_memory::Scope::Global,
+                "project" => ox_memory::Scope::Project(project),
+                "host" => ox_memory::Scope::Host(host.clone()),
+                other => {
+                    return Err(format!(
+                        "Invalid scope '{other}'. Expected global, project, or host."
+                    ));
+                }
+            };
+            let kind = req
+                .kind
+                .as_deref()
+                .map(ox_memory::Kind::parse)
+                .transpose()
+                .map_err(|e| e.to_string())?
+                .unwrap_or(ox_memory::Kind::Fact);
+            let sensitivity = req
+                .sensitivity
+                .as_deref()
+                .map(ox_memory::Sensitivity::parse)
+                .transpose()
+                .map_err(|e| e.to_string())?
+                .unwrap_or(ox_memory::Sensitivity::Private);
+            let outcome = store
+                .upsert(ox_memory::NewMemory {
+                    id: req.id,
+                    scope,
+                    kind,
+                    sensitivity,
+                    text,
+                    tags,
+                    pin: req.pin,
+                    source_host: host,
+                })
+                .map_err(|e| e.to_string())?;
+            let e = outcome.entry();
+            Ok(json!({
+                "action": outcome.action(),
+                "id": e.id,
+                "scope": e.scope.short_label(),
+                "kind": e.kind.as_str(),
+                "sensitivity": e.sensitivity.as_str(),
+                "pin": e.pin,
+            }))
+        })
+        .await
+        .map_err(|_| "Memory save task failed.".to_string())?
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadThread {
@@ -560,6 +742,33 @@ impl Service {
                         }
                         Err(_) => {
                             return rpc_error(id.clone(), -32602, "Provide the worker job ID");
+                        }
+                    }
+                }
+                Some("recall_ox_memory") => match serde_json::from_value::<RecallMemory>(
+                    params
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
+                ) {
+                    Ok(req) => tool_result(self.recall_memory(req).await),
+                    Err(_) => {
+                        return rpc_error(
+                            id.clone(),
+                            -32602,
+                            "Use query, scope, kind, and limit to recall OX memories",
+                        );
+                    }
+                },
+                Some("save_ox_memory") => {
+                    match serde_json::from_value::<SaveMemory>(params["arguments"].clone()) {
+                        Ok(req) => tool_result(self.save_memory(req).await),
+                        Err(_) => {
+                            return rpc_error(
+                                id.clone(),
+                                -32602,
+                                "Provide text (or id with forget: true) to save or remove an OX memory",
+                            );
                         }
                     }
                 }
@@ -955,7 +1164,7 @@ fn initialize(params: &Value) -> Value {
         "protocolVersion": version,
         "serverInfo": {"name": SERVER, "version": crate::VERSION},
         "capabilities": {"tools": {}},
-        "instructions": "For an ordinary implementation worker, omit permission_mode to inherit the verified hosted parent mode and pass checkout for a separate workspace. Without a host, inherit is read; request write for edits. Answer requests for your own assessment directly. Suggest a second reviewer when it would resolve a concrete uncertainty. A request for a second opinion authorizes one read-only review. Use the established model and billing preference or clarify if the choice changes who pays. Consult list_ox_models, pass subscription_model for a named Claude subscription model or model for an API alias, and report unavailability before choosing another. A how-to question calls for an explanation. Hosted parent sessions receive worker outcomes and open worker requests at a turn boundary. Answer a request marked parent_may_answer with answer_ox_worker when it serves the task; leave the rest to the user. Use ox_worker_status for full results or to check a job from a terminal session. Summarize the results. Use delegate_to_ox_model for a short text-only API request. For handoffs use read_ox_thread to recover omitted source messages.",
+        "instructions": "For an ordinary implementation worker, omit permission_mode to inherit the verified hosted parent mode and pass checkout for a separate workspace. Without a host, inherit is read; request write for edits. Answer requests for your own assessment directly. Suggest a second reviewer when it would resolve a concrete uncertainty. A request for a second opinion authorizes one read-only review. Use the established model and billing preference or clarify if the choice changes who pays. Consult list_ox_models, pass subscription_model for a named Claude subscription model or model for an API alias, and report unavailability before choosing another. A how-to question calls for an explanation. Hosted parent sessions receive worker outcomes and open worker requests at a turn boundary. Answer a request marked parent_may_answer with answer_ox_worker when it serves the task; leave the rest to the user. Use ox_worker_status for full results or to check a job from a terminal session. Summarize the results. Use delegate_to_ox_model for a short text-only API request. For handoffs use read_ox_thread to recover omitted source messages. Use recall_ox_memory for saved user/project preferences or provider routing rules, and save_ox_memory to store durable preferences or facts.",
     })
 }
 
@@ -1066,6 +1275,32 @@ fn tools() -> Value {
                 "description": "Stop a running worker in this ox launch. Work already written by the worker stays in the project.",
                 "inputSchema": {"type":"object","properties":{"job_id":{"type":"integer","minimum":1}},"required":["job_id"],"additionalProperties":false},
                 "annotations": {"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false},
+            },
+            {
+                "name": "recall_ox_memory",
+                "description": "Search persistent OX memories (provider routing policies, user preferences, project facts). Omit query to list pinned/top memories for this workspace.",
+                "inputSchema": {"type":"object","properties":{
+                    "query":{"type":"string"},
+                    "scope":{"enum":["all","global","project","host"]},
+                    "kind":{"enum":["routing_policy","preference","fact"]},
+                    "limit":{"type":"integer","minimum":1,"maximum":20,"default":6}
+                },"additionalProperties":false},
+                "annotations": {"readOnlyHint":true,"openWorldHint":false},
+            },
+            {
+                "name": "save_ox_memory",
+                "description": "Save, update (by id), or forget (id + forget:true) a concise atomic OX memory (max 500 chars). Never store secrets or credentials.",
+                "inputSchema": {"type":"object","properties":{
+                    "text":{"type":"string"},
+                    "id":{"type":"string"},
+                    "forget":{"type":"boolean"},
+                    "scope":{"enum":["global","project","host"],"default":"project"},
+                    "kind":{"enum":["routing_policy","preference","fact"],"default":"fact"},
+                    "sensitivity":{"enum":["public","private","local_only"],"default":"private"},
+                    "pin":{"type":"boolean","default":false},
+                    "tags":{"type":"array","items":{"type":"string"},"maxItems":12}
+                },"additionalProperties":false},
+                "annotations": {"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":false},
             },
         ]
     })
@@ -1400,5 +1635,113 @@ mod tests {
             None
         );
         assert_eq!(session_hint(&args(&[]), ClientKind::Codex), None);
+    }
+
+    #[tokio::test]
+    async fn memory_mcp_tools_save_recall_and_forget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("memory.json");
+        let _guard = EnvGuard::set("OX_MEMORY_PATH", store_path.to_str().unwrap());
+
+        let service = Service {
+            home: dir.path().to_path_buf(),
+            cwd: dir.path().to_path_buf(),
+            app: OnceCell::new(),
+            token: "secret".to_owned(),
+            local_auth: HeaderValue::from_static("Bearer secret"),
+            origin: "http://127.0.0.1:1".to_owned(),
+            session: None,
+            observed: Mutex::new(None),
+            unbound: std::sync::atomic::AtomicBool::new(false),
+            host_policy: Default::default(),
+            launch: "launch".to_owned(),
+            client: ClientKind::Codex,
+            slots: Semaphore::new(1),
+            jobs: Mutex::new(jobs::Jobs::default()),
+            tools: Tools::All,
+        };
+
+        let listed = tools();
+        let names: Vec<&str> = listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(names.contains(&"recall_ox_memory"));
+        assert!(names.contains(&"save_ox_memory"));
+
+        let saved = service
+            .save_memory(SaveMemory {
+                text: Some("Use Claude subscription for confidential banking work.".to_owned()),
+                id: None,
+                forget: false,
+                scope: Some("global".to_owned()),
+                kind: Some("routing_policy".to_owned()),
+                sensitivity: Some("private".to_owned()),
+                pin: true,
+                tags: vec!["routing".to_owned(), "claude".to_owned()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(saved["action"], "created");
+        let id = saved["id"].as_str().unwrap().to_owned();
+
+        let recalled = service
+            .recall_memory(RecallMemory {
+                query: "which provider for confidential banking".to_owned(),
+                scope: None,
+                kind: None,
+                limit: Some(5),
+            })
+            .await
+            .unwrap();
+        let memories = recalled["memories"].as_array().unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0]["id"], id);
+        assert_eq!(memories[0]["kind"], "routing_policy");
+
+        let forgotten = service
+            .save_memory(SaveMemory {
+                text: None,
+                id: Some(id),
+                forget: true,
+                scope: None,
+                kind: None,
+                sensitivity: None,
+                pin: false,
+                tags: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(forgotten["action"], "forgotten");
+
+        let after = service
+            .recall_memory(RecallMemory::default())
+            .await
+            .unwrap();
+        assert!(after["memories"].as_array().unwrap().is_empty());
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, val: &str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, val) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
     }
 }
