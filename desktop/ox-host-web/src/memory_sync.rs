@@ -190,26 +190,18 @@ pub fn sync_all_peers(
         let mut cursor = cursors.peers.get(&host.id).copied().unwrap_or_default();
         let outcome = (|| -> Result<MergeStats, String> {
             let mut total = MergeStats::default();
-            let (mut outbound, store_local_seq) = store
-                .export_peer_since(cursor.local_seq)
-                .map_err(|e| e.to_string())?;
-            let outbound_truncated = outbound.len() > MAX_SYNC_ENTRIES;
-            if outbound_truncated {
-                outbound.truncate(MAX_SYNC_ENTRIES);
-            }
-            let next_local_seq = if outbound_truncated {
-                outbound.last().map_or(cursor.local_seq, |e| e.seq)
-            } else {
-                store_local_seq
-            };
-            let mut sent_outbound = false;
+            let mut outbound_cursor = cursor.local_seq;
             loop {
-                let batch = if !sent_outbound {
-                    sent_outbound = true;
-                    std::mem::take(&mut outbound)
-                } else {
-                    Vec::new()
-                };
+                let (all_outbound, store_local_seq) = store
+                    .export_peer_since(outbound_cursor)
+                    .map_err(|e| e.to_string())?;
+                let (batch, next_local_seq, outbound_has_more) = take_outbound_batch(
+                    all_outbound,
+                    outbound_cursor,
+                    store_local_seq,
+                    MAX_SYNC_ENTRIES,
+                    MAX_OUTBOUND_BATCH_BYTES,
+                );
                 let req = SyncRequest {
                     source: local_host_id.to_string(),
                     target: host.id.clone(),
@@ -226,8 +218,9 @@ pub fn sync_all_peers(
                 total.ignored += merged.ignored;
                 total.rejected_local_only += merged.rejected_local_only;
                 cursor.remote_seq = resp.latest_seq;
-                cursor.local_seq = next_local_seq;
-                if !resp.has_more {
+                outbound_cursor = next_local_seq;
+                cursor.local_seq = outbound_cursor;
+                if !outbound_has_more && !resp.has_more {
                     break;
                 }
             }
@@ -241,6 +234,43 @@ pub fn sync_all_peers(
         let _ = std::fs::write(&cursors_path, payload);
     }
     Ok(outcomes)
+}
+
+/// Conservative serialized JSON byte budget for an outbound `entries` array so the
+/// signed `Envelope` (JSON-escaped request + proof) stays well below `MAX_SYNC_BODY_BYTES`.
+const MAX_OUTBOUND_BATCH_BYTES: usize = 200 * 1024;
+
+fn take_outbound_batch(
+    all_outbound: Vec<MemoryEntry>,
+    current_cursor: u64,
+    store_seq: u64,
+    max_entries: usize,
+    max_bytes: usize,
+) -> (Vec<MemoryEntry>, u64, bool) {
+    if all_outbound.is_empty() {
+        return (Vec::new(), store_seq, false);
+    }
+    let total = all_outbound.len();
+    let mut batch = Vec::new();
+    let mut used_bytes = 2usize; // "[]"
+    for entry in all_outbound {
+        if batch.len() >= max_entries {
+            break;
+        }
+        let item_bytes = serde_json::to_vec(&entry).map_or(0, |v| v.len()) + 1;
+        if !batch.is_empty() && used_bytes + item_bytes > max_bytes {
+            break;
+        }
+        used_bytes += item_bytes;
+        batch.push(entry);
+    }
+    let has_more = batch.len() < total;
+    let next_cursor = if has_more {
+        batch.last().map_or(current_cursor, |e| e.seq)
+    } else {
+        store_seq
+    };
+    (batch, next_cursor, has_more)
 }
 
 fn new_request_id() -> io::Result<String> {
@@ -347,5 +377,44 @@ mod tests {
                 .iter()
                 .all(|e| e.sensitivity != Sensitivity::LocalOnly)
         );
+    }
+
+    #[test]
+    fn take_outbound_batch_splits_oversized_multibyte_entries_without_skipping() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(dir.path().join("big.json"));
+        for i in 0..5 {
+            store
+                .upsert(NewMemory {
+                    id: None,
+                    scope: Scope::Global,
+                    kind: Kind::Fact,
+                    sensitivity: Sensitivity::Private,
+                    text: format!("{i}:{}", "あ".repeat(300)),
+                    tags: vec![],
+                    pin: false,
+                    source_host: "host-a".into(),
+                })
+                .unwrap();
+        }
+        let mut cursor = 0u64;
+        let mut drained = Vec::new();
+        let mut pages = 0usize;
+        loop {
+            let (all, store_seq) = store.export_peer_since(cursor).unwrap();
+            let (batch, next_cursor, has_more) =
+                take_outbound_batch(all, cursor, store_seq, 500, 2500);
+            pages += 1;
+            drained.extend(batch);
+            cursor = next_cursor;
+            if !has_more {
+                break;
+            }
+        }
+        assert!(
+            pages >= 2,
+            "expected multibyte entries to split into multiple pages"
+        );
+        assert_eq!(drained.len(), 5);
     }
 }
