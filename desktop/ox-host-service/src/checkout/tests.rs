@@ -316,7 +316,11 @@ fn target_mirrors_use_the_targets_origin_and_survive_an_offline_refresh() {
     );
     assert_eq!(
         line(run(git(&worker).args(["remote", "get-url", "origin"])).unwrap()).unwrap(),
-        target.join("../upstream.git").into_os_string()
+        target
+            .canonicalize()
+            .unwrap()
+            .join("../upstream.git")
+            .into_os_string()
     );
 }
 
