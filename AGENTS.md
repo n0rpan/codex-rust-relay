@@ -26,7 +26,8 @@ decides.
 2. **The `full-ci` label** runs the legs `main` builds: four release binaries,
    three native test legs, four desktop packages. About 40 minutes.
 3. **The merge queue** tests the pull request on top of current `main` and
-   merges it. Never update a branch from `main` by hand.
+   merges it. A branch does not have to be current with `main`, so do not
+   update one just to catch up.
 4. **`main`** builds, signs with Developer ID, notarizes and publishes the
    rolling `dev` release. A push builds and publishes nothing when everything
    since the released commit is documentation.
@@ -56,6 +57,28 @@ decides.
   for a reason, or it is removed with that reason written down.
 - **Say what you did not verify.** A workflow change is unverified until the
   path it changes has actually run.
+
+## While `main` moves under you
+
+Branches are not kept current, and several agents work at once. The queue
+builds and tests your change on top of whatever `main` is at that moment. That
+catches a broken build or a failing test. It does not catch two changes that
+each work and do not belong together, because git merges them cleanly:
+
+- the same feature built twice, in two places;
+- the same setting, flag, protocol field or file format added with two
+  meanings, or one side changing what the other relies on;
+- two changes to the same screen or the same flow that were each designed as
+  if the other did not exist;
+- a rule or a doc that now contradicts one that landed meanwhile.
+
+So, before you call work finished:
+
+- Fetch `main` and read what landed since you branched in the areas you
+  touched: `git fetch origin main && git log --oneline HEAD..origin/main -- <paths>`.
+- If something there overlaps, merge `main` into your branch and reconcile it
+  on purpose. That is the one reason to bring `main` in by hand.
+- Say in the description which commit of `main` you checked against.
 
 ## What a pull request cannot test
 
@@ -128,6 +151,10 @@ Blocking:
   do, without a setting to turn it off and a named irreversible harm.
 - A default that is stricter than stock Claude Code or Codex.
 - A claim in the description that the diff or a run does not support.
+- A change that duplicates or contradicts something on `main` today: the same
+  feature built a second time, or a setting, flag, protocol field or format
+  given a different meaning. Review against current `main`, not against the
+  commit the branch started from; a clean merge does not show this.
 
 Not worth a comment:
 
@@ -143,11 +170,13 @@ that goes wrong.
 - Open a pull request ready for review, not as a draft: reviews run when it is
   opened, marked ready and on every push. A draft is only for holding a
   `full-ci` pull request back from merging by itself.
-- Ask for a review of the final commit (`@codex review`) and answer or fix
-  every finding. A review of an earlier commit does not cover a later push.
-- Resolve a P0 or P1 thread only when it is fixed or shown to be wrong, then
-  ask for a review again: resolving alone does not put the pull request back
-  in line.
+- Codex reviews a ready pull request by itself, when it is opened and on
+  every push. Wait for the review of the head commit and answer or fix every
+  finding. A review of an earlier commit does not cover a later push.
+- Ask by hand (`@codex review`) in two cases only: no review of the head
+  commit has appeared, or you resolved a P0 or P1 thread. Resolving alone
+  does not put the pull request back in line.
+- Resolve a P0 or P1 thread only when it is fixed or shown to be wrong.
 - Then add `full-ci`.
 
 ## Local checks before you push
