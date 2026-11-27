@@ -66,19 +66,31 @@ decides.
 
 ## Waiting for CI and reviews
 
-Waiting costs nothing; looking costs tokens every time. Do not list checks or
-read the pull request every minute.
+Waiting costs nothing; looking costs tokens every time. A `full-ci` run takes
+about 40 minutes, so a look every two minutes is twenty turns that each say
+"still running".
+
+Not this, repeated:
+
+```sh
+gh pr checks 40; sleep 120 && gh pr view 40 --json state,mergeStateStatus
+```
+
+This, once, in the background, and then start the next piece of work:
+
+```sh
+gh pr checks 40 --watch --fail-fast --interval 60
+```
 
 - **Wait with one blocking command.** It returns when the run ends and fails
-  if the run failed:
-  `gh pr checks <number> --watch --fail-fast --interval 60`, or for one run
+  if the run failed. For a single run, use
   `gh run watch <run-id> --exit-status --interval 60`. Start it in the
   background, or with a timeout longer than the run: 5 minutes scoped, 20 with
   desktop packages, 45 for `full-ci`, the same again for `main`'s release.
 - **If your harness delivers pull request events, end your turn.** A failed
   check, a review or a comment wakes you. Do not also poll.
-- **While you wait, do not push.** Work on something that is not this branch,
-  or stop.
+- **While you wait, do not push to that branch.** Start the next task on its
+  own branch, or stop. The command or the event tells you when to come back.
 - **A red `OX merge check` on a commit that is no longer the head is the run
   your push or label cancelled.** Confirm with
   `gh run view <run-id> --json conclusion` (`cancelled`) and move on. Only a
