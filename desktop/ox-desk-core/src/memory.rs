@@ -1,6 +1,7 @@
 //! Budgeted Tier-1 memory injection for first turns of Codex and Claude sessions/workers.
 
-use crate::runtime::{Billing, Route};
+use crate::runtime::Route;
+pub use ox_memory::store_path_for;
 use ox_memory::{DEFAULT_BRIEF_CHARS, MemoryStore, Sensitivity, canonical_project_id};
 use std::path::{Path, PathBuf};
 
@@ -15,14 +16,17 @@ pub struct MemoryConfig {
 
 /// Safe sensitivity ceiling for a resolved runtime/billing route.
 ///
-/// `LocalOnly` memories are only eligible when inference itself stays local
-/// (`ollama/`, `lmstudio/`, or `local/` API aliases). Cloud subscriptions and
-/// external API providers are capped at `Private`. If `OX_MEMORY_MAX_SENSITIVITY`
-/// is set, it can only tighten (never raise) this ceiling.
-pub fn route_sensitivity_ceiling(route: &Route) -> Sensitivity {
-    let base = match &route.billing {
-        Billing::Api(alias) if is_local_inference_alias(alias) => Sensitivity::LocalOnly,
-        Billing::Api(_) | Billing::Subscription => Sensitivity::Private,
+/// Defaults to `Private` (never trusts a provider alias prefix to prove local inference).
+/// Set `OX_MEMORY_ALLOW_LOCAL_ONLY=1` on a truly local inference host to include `LocalOnly`
+/// memories. If `OX_MEMORY_MAX_SENSITIVITY` is set, it can only tighten (never raise) the ceiling.
+pub fn route_sensitivity_ceiling(_route: &Route) -> Sensitivity {
+    let base = if std::env::var("OX_MEMORY_ALLOW_LOCAL_ONLY")
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
+    {
+        Sensitivity::LocalOnly
+    } else {
+        Sensitivity::Private
     };
     match std::env::var("OX_MEMORY_MAX_SENSITIVITY")
         .ok()
@@ -33,17 +37,6 @@ pub fn route_sensitivity_ceiling(route: &Route) -> Sensitivity {
     }
 }
 
-fn is_local_inference_alias(alias: &str) -> bool {
-    let lower = alias.trim().to_ascii_lowercase();
-    lower.starts_with("ollama/")
-        || lower.starts_with("lmstudio/")
-        || lower.starts_with("local/")
-        || lower.starts_with("llama.cpp/")
-}
-
-/// Build the Tier-1 pinned memory brief to attach once on the first turn of a session or worker.
-///
-/// Returns `None` if no eligible pinned memories exist or if the store cannot be read.
 /// Maximum UTF-8 bytes for the rendered Tier-1 brief body so that
 /// `sender_context + brief + recall hint` always fits inside Claude's 2048-byte context limit,
 /// even for multibyte CJK/emoji text.
@@ -52,26 +45,10 @@ pub const MAX_BRIEF_BYTES: usize = 1400;
 const RECALL_HINT: &str =
     "(Use recall_ox_memory for additional saved preferences or project facts.)";
 
-fn fit_utf8_bytes(text: &str, max_bytes: usize) -> String {
+fn truncate_utf8_with_ellipsis(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_string();
     }
-    let mut out = String::new();
-    for line in text.lines() {
-        let sep = if out.is_empty() { 0 } else { 1 };
-        if out.len() + sep + line.len() <= max_bytes {
-            if sep == 1 {
-                out.push('\n');
-            }
-            out.push_str(line);
-        } else {
-            break;
-        }
-    }
-    if !out.is_empty() {
-        return out;
-    }
-    // Single line exceeded max_bytes: truncate cleanly on a UTF-8 char boundary.
     let budget = max_bytes.saturating_sub('…'.len_utf8());
     let mut end = 0;
     for (idx, ch) in text.char_indices() {
@@ -85,6 +62,49 @@ fn fit_utf8_bytes(text: &str, max_bytes: usize) -> String {
     truncated
 }
 
+fn fit_utf8_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut lines = text.lines();
+    let Some(first_line) = lines.next() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let mut has_body = false;
+
+    if first_line.len() <= max_bytes {
+        out.push_str(first_line);
+        let mut saw_any_body_line = false;
+        for line in lines {
+            saw_any_body_line = true;
+            if out.len() + 1 + line.len() <= max_bytes {
+                out.push('\n');
+                out.push_str(line);
+                has_body = true;
+            } else if !has_body {
+                // First body line alone exceeded remaining budget: truncate it instead of returning header-only.
+                let remaining = max_bytes.saturating_sub(out.len() + 1);
+                if remaining >= 8 {
+                    out.push('\n');
+                    out.push_str(&truncate_utf8_with_ellipsis(line, remaining));
+                    has_body = true;
+                }
+                break;
+            } else {
+                break;
+            }
+        }
+        if !saw_any_body_line || has_body {
+            return out;
+        }
+    }
+    truncate_utf8_with_ellipsis(text, max_bytes)
+}
+
+/// Build the Tier-1 pinned memory brief to attach once on the first turn of a session or worker.
+///
+/// Returns `None` if no eligible pinned memories exist or if the store cannot be read.
 pub fn first_turn_brief(config: &MemoryConfig, project: &Path, route: &Route) -> Option<String> {
     if let Some(override_brief) = config
         .brief_override
@@ -119,7 +139,7 @@ mod tests {
     use ox_memory::{Kind, NewMemory, Scope};
 
     #[test]
-    fn route_ceiling_restricts_local_only_to_local_inference() {
+    fn route_ceiling_never_trusts_alias_prefix_for_local_only() {
         assert_eq!(
             route_sensitivity_ceiling(&Route::CODEX_SUBSCRIPTION),
             Sensitivity::Private
@@ -129,16 +149,12 @@ mod tests {
             Sensitivity::Private
         );
         assert_eq!(
-            route_sensitivity_ceiling(&Route::codex_api("openrouter/openai/gpt-6.2-astra".into())),
+            route_sensitivity_ceiling(&Route::codex_api("ollama/qwen3".into())),
             Sensitivity::Private
         );
         assert_eq!(
-            route_sensitivity_ceiling(&Route::codex_api("ollama/qwen3".into())),
-            Sensitivity::LocalOnly
-        );
-        assert_eq!(
             route_sensitivity_ceiling(&Route::codex_api("local/llama".into())),
-            Sensitivity::LocalOnly
+            Sensitivity::Private
         );
     }
 
@@ -178,16 +194,11 @@ mod tests {
             brief_override: None,
         };
 
-        // Cloud route gets Private policy but NOT LocalOnly fact
-        let cloud_brief = first_turn_brief(&cfg, dir.path(), &Route::CODEX_SUBSCRIPTION).unwrap();
-        assert!(cloud_brief.contains("Use Claude subscription for private work."));
-        assert!(!cloud_brief.contains("Local-only GPU calibration note."));
-
-        // Local inference route gets both
-        let local_brief =
+        // Default ceiling gets Private policy but NOT LocalOnly fact (even for ollama/ alias)
+        let brief =
             first_turn_brief(&cfg, dir.path(), &Route::codex_api("ollama/qwen3".into())).unwrap();
-        assert!(local_brief.contains("Use Claude subscription for private work."));
-        assert!(local_brief.contains("Local-only GPU calibration note."));
+        assert!(brief.contains("Use Claude subscription for private work."));
+        assert!(!brief.contains("Local-only GPU calibration note."));
 
         // Brief override takes precedence (used by remote worker jobs)
         let override_cfg = MemoryConfig {
@@ -200,32 +211,18 @@ mod tests {
     }
 
     #[test]
-    fn multibyte_brief_fits_within_claude_context_byte_budget() {
+    fn single_large_multibyte_memory_truncates_content_instead_of_returning_header_only() {
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("memory.json");
         let store = MemoryStore::open(&store_path);
-        // Two ~400-char CJK entries (~2400 bytes total) would exceed 2048 bytes without byte capping
-        let cjk1 = "あ".repeat(380);
-        let cjk2 = "い".repeat(380);
+        let cjk = "あ".repeat(480); // 1440 bytes > MAX_BRIEF_BYTES
         store
             .upsert(NewMemory {
                 id: None,
                 scope: Scope::Global,
                 kind: Kind::RoutingPolicy,
                 sensitivity: Sensitivity::Private,
-                text: cjk1,
-                tags: vec![],
-                pin: true,
-                source_host: "host-a".into(),
-            })
-            .unwrap();
-        store
-            .upsert(NewMemory {
-                id: None,
-                scope: Scope::Global,
-                kind: Kind::Preference,
-                sensitivity: Sensitivity::Private,
-                text: cjk2,
+                text: cjk,
                 tags: vec![],
                 pin: true,
                 source_host: "host-a".into(),
@@ -239,6 +236,8 @@ mod tests {
         };
         let rendered = first_turn_brief(&cfg, dir.path(), &Runtime::Claude.route(None)).unwrap();
         assert!(rendered.len() <= MAX_BRIEF_BYTES + RECALL_HINT.len() + 1);
+        assert!(rendered.contains("- [policy/global] あ"));
+        assert!(rendered.contains("…"));
         assert!(rendered.ends_with(RECALL_HINT));
     }
 }

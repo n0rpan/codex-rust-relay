@@ -315,6 +315,11 @@ pub fn default_store_path() -> Result<PathBuf, MemoryError> {
     Ok(base.join("ox/host/memory.json"))
 }
 
+/// Resolve the memory store path for a given host state directory, honoring `OX_MEMORY_PATH`.
+pub fn store_path_for(state_dir: &Path) -> PathBuf {
+    non_empty_env_path("OX_MEMORY_PATH").unwrap_or_else(|| state_dir.join("memory.json"))
+}
+
 fn non_empty_env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key)
         .filter(|v| !v.is_empty())
