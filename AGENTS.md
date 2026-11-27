@@ -38,7 +38,9 @@ decides.
   it.
 - **Add `full-ci` last, and only when you would merge the change yourself.**
   On a pull request from the maintainer's account that is not a draft, the
-  label also queues it for merge when green (`auto-queue.yml`). Keep the pull
+  label also queues it for merge once it is green and Codex has reviewed the
+  head commit with no unresolved P0 or P1 finding (`auto-queue.yml`). A push
+  takes it out of line until the new commit is reviewed. Keep the pull
   request a draft if you want the full run without the merge. It costs about
   40 minutes of runners on every later push. Use it when code, packaging or
   workflows changed; documentation does not need it.
@@ -132,6 +134,9 @@ that goes wrong.
 
 - Ask for a review of the final commit (`@codex review`) and answer or fix
   every finding. A review of an earlier commit does not cover a later push.
+- Resolve a P0 or P1 thread only when it is fixed or shown to be wrong, then
+  ask for a review again: resolving alone does not put the pull request back
+  in line.
 - Then add `full-ci`.
 
 ## Local checks before you push

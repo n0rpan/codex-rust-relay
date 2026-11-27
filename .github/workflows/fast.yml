@@ -95,6 +95,7 @@ jobs:
           tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$HOME/.cargo/bin" cargo-nextest
       - run: cargo fmt --manifest-path desktop/Cargo.toml --all -- --check
       - run: python3 -m unittest discover -s desktop/ci -p test_pr_scope.py
+      - run: python3 -m unittest discover -s desktop/ci -p test_auto_queue.py
       - run: python3 desktop/ci/contract.py --final
       - run: python3 desktop/ci/quarantine.py --self-test && python3 desktop/ci/quarantine.py --check
       - run: cargo clippy --manifest-path desktop/Cargo.toml --locked --workspace --all-targets -- -D warnings

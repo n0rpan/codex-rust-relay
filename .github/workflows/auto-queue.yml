@@ -1,47 +1,59 @@
 name: Auto queue
 
 # The full-ci label on a pull request from the maintainer's account means
-# "merge this when it is green": CI then runs the legs main builds, and this
-# workflow turns on auto-merge, which moves the pull request into the merge
-# queue as soon as `OX merge check` passes. Removing the label withdraws it.
-# A draft is never queued, so a draft with the label only gets the full run.
+# "merge this when it is green and reviewed". desktop/ci/auto-queue.sh turns
+# auto-merge on when the pull request is labelled, not a draft, and Codex has
+# finished a review of its current head commit with no unresolved P0 or P1
+# finding; it turns auto-merge off otherwise. With auto-merge on, GitHub moves
+# the pull request into the merge queue as soon as `OX merge check` passes.
+#
+# A push makes the head commit unreviewed, so it takes the pull request out of
+# line until the review of the new commit is in. Resolving a finding raises no
+# event: ask for a review again (`@codex review`) to have it counted.
 #
 # It uses AUTO_QUEUE_TOKEN, a token of the maintainer, not the workflow's own
 # token: GitHub starts no workflow for an event caused by the built-in token,
 # so a merge it started could land on main without a release build.
 #
-# pull_request_target runs this file as it is on main, never the pull
-# request's copy, and nothing here checks out or runs pull request code. A
-# branch therefore cannot rewrite the steps that hold the token.
+# Both triggers run this file and the script as they are on main, never the
+# pull request's copy, and nothing here runs pull request code. A branch
+# therefore cannot rewrite the steps that hold the token.
 on:
   pull_request_target:
-    types: [labeled, unlabeled, ready_for_review, converted_to_draft]
+    types: [labeled, unlabeled, ready_for_review, converted_to_draft, synchronize]
+  issue_comment:
+    types: [created, edited]
 
-permissions: {}
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-queue-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
 
 jobs:
   queue:
-    name: Queue when green
+    name: Queue when green and reviewed
+    # Comments matter only on a pull request and only from the reviewer, whose
+    # summary comment changes when a review starts and when it finishes.
     if: >-
-      github.event.pull_request.user.login == 'n0rpan' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.state == 'open'
+      github.event_name == 'pull_request_target' ||
+      (github.event.issue.pull_request && startsWith(github.event.comment.user.login, 'chatgpt-codex-connector'))
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    env:
-      GH_TOKEN: ${{ secrets.AUTO_QUEUE_TOKEN }}
-      PR: ${{ github.event.pull_request.html_url }}
-      WANTED: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') && !github.event.pull_request.draft }}
     steps:
-      - run: |
+      # The default ref for both triggers is the base branch, not the pull request.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - env:
+          GH_TOKEN: ${{ secrets.AUTO_QUEUE_TOKEN }}
+          MAINTAINER: n0rpan
+          NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
+        run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN}" ]; then
             echo "::error::AUTO_QUEUE_TOKEN is not set as a repository secret"
             exit 1
           fi
-          if [ "${WANTED}" = true ]; then
-            # With a merge queue on the base branch the queue's own method applies.
-            gh pr merge "${PR}" --auto
-          else
-            gh pr merge "${PR}" --disable-auto || true
-          fi
+          desktop/ci/auto-queue.sh "${NUMBER}"
