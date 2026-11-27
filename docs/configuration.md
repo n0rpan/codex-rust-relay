@@ -439,7 +439,10 @@ public `/models` list, that endpoint applies workspace, member and API-key guard
 (model and provider allowlists, privacy settings, Managed Machines model lists) and,
 for a regional host, in-region eligibility. OX asks for `output_modalities=text` and
 the harness matching the client being launched (`client=codex` or `client=claude_code`),
-so Codex and Claude Code are each offered only the models they may call. A 401 means
+so Codex and Claude Code are each offered only the models they may call. `ox serve`,
+the OX Desktop model list and ox workers serve both clients, so they omit `client` and
+list every model the key may use; OpenRouter still enforces harness rules on each
+request. A 401 means
 the key is unusable; a 403 means a guardrail or data-region policy rejected the host.
 
 `eu.openrouter.ai` and `us.openrouter.ai` keep prompts and completions in-region.

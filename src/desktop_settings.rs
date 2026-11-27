@@ -132,7 +132,7 @@ async fn handle(home: &Path, request: Request) -> Result<Value, RelayError> {
                 MAX_REQUEST_BYTES,
                 &|name| keys.get(name),
                 None,
-                crate::clients::ClientKind::Codex,
+                crate::Catalog::Shared,
                 Some(home),
             )
             .await?;
@@ -158,7 +158,7 @@ async fn handle(home: &Path, request: Request) -> Result<Value, RelayError> {
                 MAX_REQUEST_BYTES,
                 &|name| keys.get(name),
                 None,
-                crate::clients::ClientKind::Codex,
+                crate::Catalog::Shared,
                 Some(home),
             )
             .await?;

@@ -119,7 +119,7 @@ async fn start_relay(config: &str, read_timeout: Duration) -> Relay {
         crate::MAX_REQUEST_BYTES,
         &environment,
         None,
-        crate::clients::ClientKind::Codex,
+        crate::Catalog::For(crate::clients::ClientKind::Codex),
         None,
     )
     .await

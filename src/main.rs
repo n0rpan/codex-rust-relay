@@ -361,7 +361,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
                 MAX_REQUEST_BYTES,
                 env,
                 search,
-                client_kind,
+                Catalog::For(client_kind),
                 Some(&codex_home),
             )
             .await?
@@ -724,7 +724,7 @@ impl App {
         max_request_bytes: usize,
         env: &Env<'_>,
         search: Option<BraveSearch>,
-        client_kind: ClientKind,
+        catalog: Catalog,
         advice_home: Option<&std::path::Path>,
     ) -> Result<Self, RelayError> {
         Self::codeox_with(
@@ -735,7 +735,7 @@ impl App {
             max_request_bytes,
             env,
             search,
-            client_kind,
+            catalog,
             advice_home,
         )
         .await
@@ -753,9 +753,11 @@ impl App {
         max_request_bytes: usize,
         env: &Env<'_>,
         search: Option<BraveSearch>,
-        client_kind: ClientKind,
+        catalog: Catalog,
         advice_home: Option<&std::path::Path>,
     ) -> Result<Self, RelayError> {
+        let client_kind = catalog.client_kind();
+        let harness = catalog.harness();
         let vendors = config.vendors;
         let mut secrets = Vec::new();
         let auths: Vec<_> = vendors
@@ -790,7 +792,7 @@ impl App {
                     Some(async move {
                         (
                             index,
-                            discover(client, vendor, key, deadline, client_kind).await,
+                            discover(client, vendor, key, deadline, harness).await,
                         )
                     })
                 })
@@ -1561,12 +1563,12 @@ async fn discover(
     vendor: &provider::Vendor,
     key: &SecretKey,
     deadline: tokio::time::Instant,
-    client_kind: ClientKind,
+    harness: Option<ClientKind>,
 ) -> Result<ProviderModels, String> {
     let headers = vendor
         .discovery_headers(key)
         .map_err(|_| "could not build discovery headers".to_owned())?;
-    let url = discovery_url(vendor, client_kind);
+    let url = discovery_url(vendor, harness);
     let response = tokio::time::timeout_at(
         deadline,
         client.get(url.clone()).headers(headers.clone()).send(),
@@ -1577,19 +1579,49 @@ async fn discover(
     collect_model_pages(client, &url, &headers, response, deadline).await
 }
 
+/// Which harness a provider catalog is discovered for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Catalog {
+    /// A launch for one client: OpenRouter is asked for that harness's models.
+    For(ClientKind),
+    /// A gateway or listing that serves both Codex and Claude clients
+    /// (`ox serve`, OX Desktop's model list, ox workers). Filtering by one
+    /// harness would hide the other's models, so OpenRouter is asked for every
+    /// model the account may use and enforces its harness rules per request.
+    Shared,
+}
+
+impl Catalog {
+    /// The client the app answers by default. A shared gateway routes Claude
+    /// paths by URL, so it keeps the Codex default it always had.
+    fn client_kind(self) -> ClientKind {
+        match self {
+            Self::For(kind) => kind,
+            Self::Shared => ClientKind::Codex,
+        }
+    }
+
+    fn harness(self) -> Option<ClientKind> {
+        match self {
+            Self::For(kind) => Some(kind),
+            Self::Shared => None,
+        }
+    }
+}
+
 /// OpenRouter's keyed catalog answers with the models this account, its
-/// guardrails and the launched harness may actually use. Ask it for the right
-/// harness and for text output only; every other provider keeps its configured
-/// URL untouched.
-fn discovery_url(vendor: &provider::Vendor, client_kind: ClientKind) -> reqwest::Url {
+/// guardrails and the launched harness may actually use. Ask it for text output
+/// only, and for the launched harness when there is one; every other provider
+/// keeps its configured URL untouched.
+fn discovery_url(vendor: &provider::Vendor, harness: Option<ClientKind>) -> reqwest::Url {
     let mut url = vendor.models_url.clone();
     if !vendor.is_openrouter() || !url.path().ends_with("/models/user") {
         return url;
     }
-    let client = match client_kind {
+    let client = harness.map(|kind| match kind {
         ClientKind::Codex => "codex",
         ClientKind::Claude => "claude_code",
-    };
+    });
     let mut query: Vec<(String, String)> = url
         .query_pairs()
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
@@ -1597,7 +1629,9 @@ fn discovery_url(vendor: &provider::Vendor, client_kind: ClientKind) -> reqwest:
     if !query.iter().any(|(key, _)| key == "output_modalities") {
         query.push(("output_modalities".to_owned(), "text".to_owned()));
     }
-    if !query.iter().any(|(key, _)| key == "client") {
+    if let Some(client) = client
+        && !query.iter().any(|(key, _)| key == "client")
+    {
         query.push(("client".to_owned(), client.to_owned()));
     }
     url.set_query(None);
@@ -2585,7 +2619,7 @@ id = "fast-coder"
             1 << 20,
             &environment,
             None,
-            ClientKind::Codex,
+            Catalog::For(ClientKind::Codex),
             None,
         )
         .await
@@ -2630,7 +2664,7 @@ id = "fast-coder"
             MAX_REQUEST_BYTES,
             &|_| None,
             None,
-            ClientKind::Codex,
+            Catalog::For(ClientKind::Codex),
             None,
         )
         .await
@@ -2684,7 +2718,7 @@ alias = "together-llama"
             MAX_REQUEST_BYTES,
             &|_| None,
             None,
-            ClientKind::Codex,
+            Catalog::For(ClientKind::Codex),
             None,
         )
         .await
@@ -2757,7 +2791,7 @@ alias = "together-llama"
             max_request_bytes,
             &environment,
             search,
-            client_kind,
+            Catalog::For(client_kind),
             None,
         )
         .await
@@ -2985,7 +3019,7 @@ env_key = "ALPHA_KEY"
                 1 << 20,
                 &environment,
                 None,
-                ClientKind::Codex,
+                Catalog::For(ClientKind::Codex),
                 None,
             ),
         )
@@ -3021,7 +3055,7 @@ env_key = "ALPHA_KEY"
                 1 << 20,
                 &environment,
                 None,
-                ClientKind::Codex,
+                Catalog::For(ClientKind::Codex),
                 None,
             ),
         )
@@ -3133,17 +3167,22 @@ env_key = "ALPHA_KEY"
             "https://eu.openrouter.ai/api/v1/models/user?scope=team",
         );
         assert_eq!(
-            discovery_url(&vendor, ClientKind::Codex).as_str(),
+            discovery_url(&vendor, Some(ClientKind::Codex)).as_str(),
             "https://eu.openrouter.ai/api/v1/models/user?scope=team&output_modalities=text&client=codex"
         );
         assert_eq!(
-            discovery_url(&vendor, ClientKind::Claude).as_str(),
+            discovery_url(&vendor, Some(ClientKind::Claude)).as_str(),
             "https://eu.openrouter.ai/api/v1/models/user?scope=team&output_modalities=text&client=claude_code"
+        );
+        // A gateway that serves both clients asks for every usable model.
+        assert_eq!(
+            discovery_url(&vendor, None).as_str(),
+            "https://eu.openrouter.ai/api/v1/models/user?scope=team&output_modalities=text"
         );
         // Every other provider keeps exactly the URL it configured.
         let vendor = discovery_vendor("http://127.0.0.1:9/v1", "http://127.0.0.1:9/v1/models");
         assert_eq!(
-            discovery_url(&vendor, ClientKind::Codex).as_str(),
+            discovery_url(&vendor, Some(ClientKind::Codex)).as_str(),
             "http://127.0.0.1:9/v1/models"
         );
     }
@@ -3161,7 +3200,7 @@ env_key = "ALPHA_KEY"
             &vendor,
             &key,
             tokio::time::Instant::now() + Duration::from_secs(5),
-            ClientKind::Claude,
+            Some(ClientKind::Claude),
         )
         .await
         .expect("the keyed catalog");

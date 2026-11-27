@@ -390,7 +390,8 @@ pub(super) async fn test_provider(
         vendor,
         &key,
         deadline,
-        crate::clients::ClientKind::Codex,
+        // The provider page lists models for both Codex and Claude sessions.
+        None,
     )
     .await?;
     Ok(crate::catalog::merge_models(Some(list), &[]).len())

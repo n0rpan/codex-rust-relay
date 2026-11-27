@@ -69,7 +69,7 @@ pub(crate) async fn run(args: &[OsString], home: &Path) -> Result<u8, RelayError
         MAX_REQUEST_BYTES,
         &env,
         search,
-        crate::clients::ClientKind::Codex,
+        crate::Catalog::Shared,
         Some(home),
     )
     .await?;
