@@ -260,14 +260,23 @@ fn entry() -> io::Result<()> {
             if results.is_empty() {
                 println!("No paired worker hosts configured.");
             } else {
+                let mut failures = 0usize;
                 for (name, res) in results {
                     match res {
                         Ok(stats) => println!(
                             "{name}: synced (+{} inserted, ~{} updated, {} ignored)",
                             stats.inserted, stats.updated, stats.ignored
                         ),
-                        Err(err) => eprintln!("{name}: sync failed: {err}"),
+                        Err(err) => {
+                            failures += 1;
+                            eprintln!("{name}: sync failed: {err}");
+                        }
                     }
+                }
+                if failures > 0 {
+                    return Err(io::Error::other(format!(
+                        "{failures} peer(s) failed to synchronize."
+                    )));
                 }
             }
             Ok(())
