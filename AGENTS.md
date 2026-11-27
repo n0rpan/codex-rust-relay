@@ -247,7 +247,13 @@ that goes wrong.
 - Ask by hand (`@codex review`) in two cases only: no review of the head
   commit has appeared, or you resolved a P0 or P1 thread. Resolving alone
   does not put the pull request back in line.
-- Resolve a P0 or P1 thread only when it is fixed or shown to be wrong.
+- **Close every finding you act on.** Reply on its thread with the commit
+  that fixes it, or with why it is wrong, and then resolve the thread. A fix
+  that is pushed with the thread left open still counts as an open finding:
+  an unresolved P0 or P1 thread holds the merge, and nobody reading the pull
+  request can tell it was dealt with.
+- Resolve a P0 or P1 thread only when it is fixed or shown to be wrong, never
+  to get the pull request moving.
 - Then add `full-ci`.
 
 ## Local checks before you push
