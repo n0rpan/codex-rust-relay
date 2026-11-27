@@ -159,6 +159,116 @@ pub fn send(
     })
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SyncCursors {
+    #[serde(default)]
+    peers: std::collections::BTreeMap<String, PeerCursor>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+struct PeerCursor {
+    remote_seq: u64,
+    local_seq: u64,
+}
+
+/// Bidirectionally sync non-`LocalOnly` memories with every paired Tailscale worker host.
+pub fn sync_all_peers(
+    state_dir: &Path,
+    local_host_id: &str,
+) -> io::Result<Vec<(String, Result<MergeStats, String>)>> {
+    let links = crate::paired_hosts::worker_links(&state_dir.join("worker-links.json"))?;
+    let memory_path = state_dir.join("memory.json");
+    let cursors_path = state_dir.join("memory-sync-cursors.json");
+    let mut cursors: SyncCursors = std::fs::read_to_string(&cursors_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let store = MemoryStore::open(&memory_path);
+    let mut outcomes = Vec::with_capacity(links.len());
+
+    for host in &links {
+        let mut cursor = cursors.peers.get(&host.id).copied().unwrap_or_default();
+        let outcome = (|| -> Result<MergeStats, String> {
+            let mut total = MergeStats::default();
+            let (mut outbound, store_local_seq) = store
+                .export_peer_since(cursor.local_seq)
+                .map_err(|e| e.to_string())?;
+            let outbound_truncated = outbound.len() > MAX_SYNC_ENTRIES;
+            if outbound_truncated {
+                outbound.truncate(MAX_SYNC_ENTRIES);
+            }
+            let next_local_seq = if outbound_truncated {
+                outbound.last().map_or(cursor.local_seq, |e| e.seq)
+            } else {
+                store_local_seq
+            };
+            let mut sent_outbound = false;
+            loop {
+                let batch = if !sent_outbound {
+                    sent_outbound = true;
+                    std::mem::take(&mut outbound)
+                } else {
+                    Vec::new()
+                };
+                let req = SyncRequest {
+                    source: local_host_id.to_string(),
+                    target: host.id.clone(),
+                    request_id: new_request_id().map_err(|e| e.to_string())?,
+                    since_seq: cursor.remote_seq,
+                    entries: batch,
+                };
+                let resp = send(host, &req).map_err(|e| e.to_string())?;
+                let merged = store
+                    .merge_remote(&resp.entries)
+                    .map_err(|e| e.to_string())?;
+                total.inserted += merged.inserted;
+                total.updated += merged.updated;
+                total.ignored += merged.ignored;
+                total.rejected_local_only += merged.rejected_local_only;
+                cursor.remote_seq = resp.latest_seq;
+                cursor.local_seq = next_local_seq;
+                if !resp.has_more {
+                    break;
+                }
+            }
+            cursors.peers.insert(host.id.clone(), cursor);
+            Ok(total)
+        })();
+        outcomes.push((host.name.clone(), outcome));
+    }
+
+    if let Ok(payload) = serde_json::to_vec_pretty(&cursors) {
+        let _ = std::fs::write(&cursors_path, payload);
+    }
+    Ok(outcomes)
+}
+
+fn new_request_id() -> io::Result<String> {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).map_err(io::Error::other)?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        b[4],
+        b[5],
+        b[6],
+        b[7],
+        b[8],
+        b[9],
+        b[10],
+        b[11],
+        b[12],
+        b[13],
+        b[14],
+        b[15]
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

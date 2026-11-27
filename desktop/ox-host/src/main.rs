@@ -254,6 +254,24 @@ fn entry() -> io::Result<()> {
         }
         (Some("revoke"), [id]) => pairing::revoke(&paths, id).map_err(io::Error::other),
         (Some("doctor"), rest) => doctor::run(&paths, rest),
+        (Some("memory-sync"), []) => {
+            let host_id = identity::load(&paths.state_dir)?.to_string();
+            let results = ox_host_web::memory_sync::sync_all_peers(&paths.state_dir, &host_id)?;
+            if results.is_empty() {
+                println!("No paired worker hosts configured.");
+            } else {
+                for (name, res) in results {
+                    match res {
+                        Ok(stats) => println!(
+                            "{name}: synced (+{} inserted, ~{} updated, {} ignored)",
+                            stats.inserted, stats.updated, stats.ignored
+                        ),
+                        Err(err) => eprintln!("{name}: sync failed: {err}"),
+                    }
+                }
+            }
+            Ok(())
+        }
         _ => Err(io::Error::other(USAGE)),
     }
 }
