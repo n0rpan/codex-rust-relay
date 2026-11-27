@@ -32,10 +32,10 @@ export async function deviceKey(value) {
     };
   });
 }
-async function post(path, body) {
+async function post(path, body, timeout = 10000) {
   const reply = await fetch("/api/" + path, {
     method: "POST",
-    signal: AbortSignal.timeout(10000),
+    signal: AbortSignal.timeout(timeout),
     credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -81,7 +81,19 @@ export async function proof(key, purpose) {
 export async function settingsRequest(key, operation) {
   const request = JSON.stringify(operation);
   const proof = await signedOperation(key, "settings", request);
-  const reply = await post("settings", { request, proof });
+  const transfer = [
+    "add_worker_link",
+    "link_paired_host",
+    "remove_worker_link",
+    "pair_key_destination",
+    "review_key_transfer",
+    "send_key_transfer",
+  ].includes(operation.action);
+  const reply = await post(
+    "settings",
+    { request, proof },
+    transfer ? 60000 : 10000,
+  );
   if (reply?.error) throw new Error(reply.error);
   return reply;
 }

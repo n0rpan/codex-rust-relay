@@ -64,6 +64,16 @@ impl Decoder {
                 events.push(Event::Init(init));
             }
             "system" => self.task(&row, &mut events),
+            "rate_limit_event" => {
+                if let (Some(session_id), Ok(info)) =
+                    (row["session_id"].as_str(), parsed(&row["rate_limit_info"]))
+                {
+                    events.push(Event::SubscriptionLimit {
+                        session_id: session_id.into(),
+                        info,
+                    });
+                }
+            }
             "control_response" => {
                 let r = &row["response"];
                 let payload = match r["subtype"].as_str() {

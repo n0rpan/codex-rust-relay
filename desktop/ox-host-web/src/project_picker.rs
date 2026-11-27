@@ -94,18 +94,24 @@ pub(super) async fn apply(
     let ProjectAction::ChooseProject { route, .. } = action else {
         return Err(StatusCode::BAD_REQUEST);
     };
-    let routes = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut conn = bridge::connect(&app.host).await?;
-        bridge::write(&mut conn, &Client::Hello { version: VERSION }).await?;
-        let bytes = bridge::line(&mut BufReader::new(conn), &mut Vec::new()).await?;
-        Ok::<_, std::io::Error>(serde_json::from_slice::<Server>(&bytes)?)
-    })
-    .await
-    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    if !matches!(routes,Server::Hello{routes,..} if routes.contains(&route))
-        || !active.lock().unwrap().alive(&id)
-    {
+    // Desktop can open a project before sign-in and configure its first route there.
+    // The session host checks the selected route when starting a runtime.
+    let class = active.lock().unwrap().device_class(&id).ok_or(DENY)?;
+    if class == crate::admin::DeviceClass::Phone {
+        let hello = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut conn = bridge::connect(&app.host).await?;
+            bridge::write(&mut conn, &Client::Hello { version: VERSION }).await?;
+            let bytes = bridge::line(&mut BufReader::new(conn), &mut Vec::new()).await?;
+            Ok::<_, std::io::Error>(serde_json::from_slice::<Server>(&bytes)?)
+        })
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        if !matches!(hello, Server::Hello { routes, .. } if routes.contains(&route)) {
+            return Err(DENY);
+        }
+    }
+    if !active.lock().unwrap().alive(&id) {
         return Err(DENY);
     }
     let mut known = app.discovered.lock().unwrap();

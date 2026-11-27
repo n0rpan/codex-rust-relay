@@ -14,8 +14,12 @@ pub struct AccountReply {
 struct Account {
     #[serde(rename = "type")]
     kind: String,
+    email: Option<String>,
 }
 impl AccountReply {
+    pub(crate) fn email(&self) -> Option<&str> {
+        self.account.as_ref()?.email.as_deref()
+    }
     pub fn chatgpt(&self) -> bool {
         self.account
             .as_ref()

@@ -1,5 +1,6 @@
+pub(crate) use crate::serve::origin;
 use crate::{
-    admin::{Device, Pairing, Reply},
+    admin::{Device, DeviceClass, Pairing, Reply},
     push::Subscription,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
@@ -22,7 +23,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::watch;
-use url::Url;
 
 /// A paired device that is not used for this long is forgotten.
 pub(crate) const INACTIVE: i64 = 30 * 24 * 3600;
@@ -53,20 +53,6 @@ pub(crate) fn random() -> String {
 fn digest(s: &str) -> String {
     B64.encode(digest::digest(&digest::SHA256, s.as_bytes()).as_ref())
 }
-pub(crate) fn origin(input: &str) -> Option<String> {
-    let u = Url::parse(input).ok()?;
-    let host = u.host_str()?;
-    (u.scheme() == "https"
-        && host.ends_with(".ts.net")
-        && host.len() > 7
-        && u.username().is_empty()
-        && u.password().is_none()
-        && u.path() == "/"
-        && u.query().is_none()
-        && u.fragment().is_none()
-        && input.trim_end_matches('/') == u.origin().ascii_serialization())
-    .then(|| u.origin().ascii_serialization())
-}
 pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
     fs::DirBuilder::new()
         .recursive(true)
@@ -81,7 +67,7 @@ pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Registered {
     #[serde(default)]
     terminal_generation: u64,
@@ -90,7 +76,20 @@ pub(crate) struct Registered {
     key: String,
     pub push: Option<Subscription>,
 }
-#[derive(Clone, Default, Serialize, Deserialize)]
+impl Registered {
+    fn current(&self) -> bool {
+        self.device.class == DeviceClass::Host
+            || self.device.last_used.saturating_add(INACTIVE) > now()
+    }
+}
+// Older releases only read the operator registry. Keeping worker credentials
+// separate also preserves them when an older host edits a phone registration.
+#[derive(Default, PartialEq, Serialize, Deserialize)]
+struct WorkerDisk {
+    origin: Option<String>,
+    devices: HashMap<String, Registered>,
+}
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 struct Disk {
     origin: Option<String>,
     #[serde(default)]
@@ -99,8 +98,49 @@ struct Disk {
     devices: HashMap<String, Registered>,
     vapid: Option<String>,
 }
+impl Disk {
+    fn split(mut self) -> (Self, WorkerDisk) {
+        let (hosts, devices) = self
+            .devices
+            .into_iter()
+            .partition(|(_, r)| r.device.class == DeviceClass::Host);
+        self.devices = devices;
+        let workers = WorkerDisk {
+            origin: self.last_origin.clone().or_else(|| self.origin.clone()),
+            devices: hosts,
+        };
+        (self, workers)
+    }
+}
+fn read_registry<T: serde::de::DeserializeOwned + Default>(path: &Path) -> io::Result<T> {
+    match fs::symlink_metadata(path) {
+        Ok(meta)
+            if meta.is_file()
+                && meta.uid() == unsafe { libc::geteuid() }
+                && meta.mode() & 0o077 == 0
+                && meta.len() < 1024 * 1024 =>
+        {
+            Ok(serde_json::from_slice(&fs::read(path)?)?)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(T::default()),
+        _ => Err(io::Error::other(
+            "Remote state has invalid permissions or size",
+        )),
+    }
+}
+fn write_registry(dir: &Path, name: &str, data: &impl Serialize) -> io::Result<()> {
+    let mut file = tempfile::NamedTempFile::new_in(dir)?;
+    serde_json::to_writer(&mut file, data)?;
+    file.flush()?;
+    file.as_file().sync_all()?;
+    file.persist(dir.join(name)).map_err(|e| e.error)?;
+    fs::File::open(dir)?.sync_all()
+}
 #[derive(Clone)]
 struct Invite {
+    worker: bool,
+    terminal: bool,
+    short_hash: String,
     login: String,
     issuer: Option<String>,
     expires: i64,
@@ -112,7 +152,21 @@ pub(crate) enum Purpose {
     Push,
     Settings,
     Terminal,
+    Worker,
 }
+pub(crate) struct Enrollment<'a> {
+    pub class: DeviceClass,
+    pub source: Option<&'a str>,
+}
+impl From<DeviceClass> for Enrollment<'_> {
+    fn from(class: DeviceClass) -> Self {
+        Self {
+            class,
+            source: None,
+        }
+    }
+}
+
 struct Challenge {
     id: String,
     purpose: Purpose,
@@ -129,23 +183,22 @@ pub(crate) struct State {
 impl State {
     pub fn load(dir: &Path) -> io::Result<Self> {
         private_dir(dir)?;
-        let path = dir.join("remote.json");
-        let disk = match fs::symlink_metadata(&path) {
-            Ok(meta)
-                if meta.is_file()
-                    && meta.uid() == unsafe { libc::geteuid() }
-                    && meta.mode() & 0o077 == 0
-                    && meta.len() < 1024 * 1024 =>
-            {
-                serde_json::from_slice(&fs::read(path)?)?
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Disk::default(),
-            _ => {
-                return Err(io::Error::other(
-                    "Remote state has invalid permissions or size",
-                ));
-            }
-        };
+        let mut disk: Disk = read_registry(&dir.join("remote.json"))?;
+        disk.devices
+            .retain(|_, r| r.device.class != DeviceClass::Host && r.device.worker.is_none());
+        let workers: WorkerDisk = read_registry(&dir.join("incoming-worker-hosts.json"))?;
+        if workers.origin.as_ref() == disk.last_origin.as_ref().or(disk.origin.as_ref())
+            && workers.origin.is_some()
+        {
+            disk.devices
+                .extend(workers.devices.into_iter().filter(|(_, r)| {
+                    r.device.class == DeviceClass::Host
+                        && r.device.worker.is_some()
+                        && !r.device.terminal
+                }));
+        } else if !workers.devices.is_empty() {
+            write_registry(dir, "incoming-worker-hosts.json", &WorkerDisk::default())?;
+        }
         if disk
             .origin
             .as_deref()
@@ -162,28 +215,25 @@ impl State {
             challenges: HashMap::new(),
             changed: watch::channel(0).0,
         };
-        if state
-            .disk
-            .devices
-            .values()
-            .any(|r| r.device.last_used + INACTIVE <= now())
-        {
-            state.update(|d| {
-                d.devices
-                    .retain(|_, r| r.device.last_used + INACTIVE > now())
-            })?;
+        if state.disk.devices.values().any(|r| !r.current()) {
+            state.update(|d| d.devices.retain(|_, r| r.current()))?;
         }
         Ok(state)
     }
     fn update(&mut self, change: impl FnOnce(&mut Disk)) -> io::Result<()> {
         let mut disk = self.disk.clone();
         change(&mut disk);
-        let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
-        serde_json::to_writer(&mut file, &disk)?;
-        file.flush()?;
-        file.as_file().sync_all()?;
-        file.persist(self.dir.join("remote.json"))
-            .map_err(|e| e.error)?;
+        let (operators, workers) = disk.clone().split();
+        let (old_operators, old_workers) = self.disk.clone().split();
+        // A listener-origin change can clear both groups. Invalidate the old
+        // worker grant first. Loading also binds it to the recorded origin.
+        if workers != old_workers && !(workers.devices.is_empty() && old_workers.devices.is_empty())
+        {
+            write_registry(&self.dir, "incoming-worker-hosts.json", &workers)?;
+        }
+        if operators != old_operators {
+            write_registry(&self.dir, "remote.json", &operators)?;
+        }
         self.disk = disk;
         Ok(())
     }
@@ -215,16 +265,45 @@ impl State {
     fn signal(&self) {
         self.changed.send_modify(|n| *n = n.wrapping_add(1))
     }
+    pub fn key_destinations_path(&self) -> std::path::PathBuf {
+        self.dir.join("key-destinations.json")
+    }
+    pub fn mode_policy(
+        &self,
+        set: Option<ox_desk_core::host_policy::HostPolicy>,
+    ) -> io::Result<ox_desk_core::host_policy::HostPolicy> {
+        if let Some(policy) = set {
+            policy.save(&self.dir)?;
+            return Ok(policy);
+        }
+        ox_desk_core::host_policy::HostPolicy::read(&self.dir)
+    }
+    pub fn host_profile(
+        &self,
+        edit: Option<crate::host_profile::Edit>,
+    ) -> io::Result<crate::host_profile::HostProfile> {
+        match edit {
+            Some(edit) => edit.save(&self.dir),
+            None => crate::host_profile::HostProfile::read(&self.dir),
+        }
+    }
     pub fn reply(&self, pairing: Option<Pairing>) -> Reply {
         let mut devices: Vec<_> = self
             .disk
             .devices
             .values()
-            .filter(|r| r.device.last_used + INACTIVE > now())
+            .filter(|r| r.current())
             .map(|r| r.device.clone())
             .collect();
         devices.sort_by(|a, b| b.last_used.cmp(&a.last_used).then(a.id.cmp(&b.id)));
+        let (worker_hosts, devices) = devices
+            .into_iter()
+            .partition(|d| d.class == DeviceClass::Host);
         Reply {
+            worker_links: None,
+            worker_hosts,
+            update: None,
+            profile: None,
             enabled: self.disk.origin.is_some(),
             origin: self.disk.origin.clone(),
             port: self.disk.port,
@@ -233,17 +312,53 @@ impl State {
             reservation: None,
         }
     }
-    pub fn invite(&mut self, login: String) -> io::Result<Pairing> {
-        self.create_invite(login, None)
+    pub fn invite(&mut self, login: String, terminal: bool) -> io::Result<Pairing> {
+        self.create_invite(login, None, terminal, false)
     }
     pub fn device_invite(&mut self, id: &str) -> io::Result<Pairing> {
         if !self.alive(id) {
             return Err(io::Error::other("Device is no longer paired"));
         }
         let login = self.disk.devices[id].device.login.clone();
-        self.create_invite(login, Some(id.to_owned()))
+        self.create_invite(login, Some(id.to_owned()), false, false)
     }
-    fn create_invite(&mut self, login: String, issuer: Option<String>) -> io::Result<Pairing> {
+    pub fn local_worker_invite(&mut self, login: String) -> io::Result<Pairing> {
+        self.create_invite(login, None, false, true)
+    }
+    pub fn worker_invite(&mut self, id: &str) -> io::Result<Pairing> {
+        if !self.alive(id) || self.device_class(id) == Some(DeviceClass::Host) {
+            return Err(io::Error::other(
+                "Pair an operator device to invite a worker host",
+            ));
+        }
+        self.create_invite(
+            self.disk.devices[id].device.login.clone(),
+            Some(id.into()),
+            false,
+            true,
+        )
+    }
+    pub fn host_id(&self) -> io::Result<String> {
+        let raw = fs::read_to_string(self.dir.join("host-id"))?;
+        let id = raw.trim();
+        if !crate::paired_hosts::valid_id(id) {
+            return Err(io::Error::other("Invalid OX host identity"));
+        }
+        Ok(id.to_owned())
+    }
+    pub fn worker_directory(&self) -> PathBuf {
+        self.dir.join("linked-work")
+    }
+    pub fn worker_links_path(&self) -> PathBuf {
+        self.dir.join("worker-links.json")
+    }
+    fn create_invite(
+        &mut self,
+        login: String,
+        issuer: Option<String>,
+        terminal: bool,
+        worker: bool,
+    ) -> io::Result<Pairing> {
         let origin = self
             .disk
             .origin
@@ -257,6 +372,16 @@ impl State {
             return Err(io::Error::other("Invalid Tailscale login"));
         }
         let code = random();
+        // Twelve independent base32 symbols (60 bits), with ambiguous letters omitted.
+        const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+        let mut bytes = [0u8; 12];
+        SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| io::Error::other("Pairing needs OS randomness"))?;
+        let short: String = bytes
+            .iter()
+            .map(|b| char::from(ALPHABET[usize::from(b & 31)]))
+            .collect();
         let expires_at = now() + PAIR_TTL;
         self.invites.retain(|_, v| v.expires > now());
         if self.invites.len() >= 16 {
@@ -271,41 +396,90 @@ impl State {
         self.invites.insert(
             digest(&code),
             Invite {
+                worker,
+                terminal,
+                short_hash: digest(&short),
                 issuer,
                 login,
                 expires: expires_at,
             },
         );
         Ok(Pairing {
+            short_code: Some(format!("{}-{}-{}", &short[..4], &short[4..8], &short[8..])),
             url,
             qr_svg,
             expires_at,
         })
     }
-    pub fn pair(
+    pub fn pair<'a>(
         &mut self,
         login: &str,
         code: &str,
         key: &str,
         signature: &str,
         label: &str,
+        registration: impl Into<Enrollment<'a>>,
     ) -> Option<String> {
-        if code.len() != 43
+        let Enrollment { class, source } = registration.into();
+        if code.len() > 43
             || label.trim().is_empty()
             || label.chars().count() > 64
             || label.chars().any(char::is_control)
         {
             return None;
         }
-        let h = digest(code);
+        let h = if code.len() == 43 {
+            digest(code)
+        } else {
+            let normalized = crate::admin::manual_code(code)?;
+            let short_hash = digest(&normalized);
+            self.invites
+                .iter()
+                .find(|(_, invite)| invite.short_hash == short_hash)?
+                .0
+                .clone()
+        };
         let invitation = self.invites.get(&h)?;
+        if invitation.worker != (class == DeviceClass::Host)
+            || source.is_some() != invitation.worker
+        {
+            return None;
+        }
+        let (message, worker) = if let Some(source) = source {
+            if !crate::paired_hosts::valid_id(source)
+                || self.host_id().ok()?.eq_ignore_ascii_case(source)
+            {
+                return None;
+            }
+            let mut grant = crate::admin::WorkerGrant {
+                source: source.to_ascii_lowercase(),
+                may_launch: true,
+                ceiling: ox_desk_core::modes::Level::Yolo,
+            };
+            // A replacement key keeps restrictions the receiver already set for
+            // this source, even while the new key is still being persisted.
+            for prior in self
+                .disk
+                .devices
+                .values()
+                .filter(|r| r.device.login == login)
+                .filter_map(|r| r.device.worker.as_ref())
+                .filter(|w| w.source == grant.source)
+            {
+                grant.may_launch &= prior.may_launch;
+                grant.ceiling = grant.ceiling.min(prior.ceiling);
+            }
+            (format!("{code}.host.{source}"), Some(grant))
+        } else {
+            (code.to_owned(), None)
+        };
         if invitation.login != login
             || invitation.expires <= now()
             || invitation
                 .issuer
                 .as_deref()
                 .is_some_and(|id| !self.alive(id))
-            || !verify(key, code, signature)
+            || !verify(key, &message, signature)
         {
             return None;
         }
@@ -314,7 +488,9 @@ impl State {
         let registered = Registered {
             terminal_generation: 0,
             device: Device {
-                terminal: false,
+                class,
+                worker,
+                terminal: invitation.terminal,
                 id: id.clone(),
                 login: login.into(),
                 label: label.trim().into(),
@@ -324,12 +500,18 @@ impl State {
             key: key.into(),
             push: None,
         };
-        if self.reply(None).devices.len() >= 64 {
+        if self
+            .disk
+            .devices
+            .values()
+            .filter(|r| self.alive(&r.device.id))
+            .count()
+            >= 64
+        {
             return None;
         }
         self.update(|d| {
-            d.devices
-                .retain(|_, r| r.device.last_used + INACTIVE > now());
+            d.devices.retain(|_, r| r.current());
             d.devices.insert(id, registered);
         })
         .ok()?;
@@ -344,20 +526,51 @@ impl State {
         self.disk
             .devices
             .values()
-            .find(|r| {
-                r.token_hash == hash
-                    && r.device.login == login
-                    && r.device.last_used + INACTIVE > now()
-            })
+            .find(|r| r.token_hash == hash && r.device.login == login && r.current())
             .map(|r| r.device.id.clone())
     }
     pub fn alive(&self, id: &str) -> bool {
-        self.disk.origin.is_some()
+        self.disk.origin.is_some() && self.disk.devices.get(id).is_some_and(|r| r.current())
+    }
+    pub fn device_class(&self, id: &str) -> Option<DeviceClass> {
+        Some(self.disk.devices.get(id)?.device.class)
+    }
+    pub fn belongs_to_login(&self, id: &str, login: &str) -> bool {
+        self.alive(id)
             && self
                 .disk
                 .devices
                 .get(id)
-                .is_some_and(|r| r.device.last_used + INACTIVE > now())
+                .is_some_and(|r| r.device.login == login)
+    }
+    pub fn worker_grant(&self, id: &str) -> Option<&crate::admin::WorkerGrant> {
+        if !self.alive(id) || self.device_class(id)? != DeviceClass::Host {
+            return None;
+        }
+        self.disk.devices.get(id)?.device.worker.as_ref()
+    }
+    pub fn edit_worker(
+        &mut self,
+        id: &str,
+        before: &crate::admin::WorkerGrant,
+        may_launch: bool,
+        ceiling: ox_desk_core::modes::Level,
+    ) -> io::Result<()> {
+        let mut grant = self
+            .worker_grant(id)
+            .ok_or_else(|| io::Error::other("Unknown worker link"))?
+            .clone();
+        if &grant != before {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Worker access changed. Refresh this link before saving.",
+            ));
+        }
+        grant.may_launch = may_launch;
+        grant.ceiling = ceiling;
+        self.update(|disk| disk.devices.get_mut(id).unwrap().device.worker = Some(grant))?;
+        self.signal();
+        Ok(())
     }
     pub fn active_device(&mut self, id: &str) -> bool {
         if !self.alive(id) {
@@ -378,6 +591,11 @@ impl State {
             .devices
             .get(id)
             .ok_or_else(|| io::Error::other("Unknown paired device"))?;
+        if r.device.class == DeviceClass::Host {
+            return Err(io::Error::other(
+                "Pair an operator device for terminal access",
+            ));
+        }
         if r.device.terminal == enabled {
             return Ok(());
         }
@@ -408,6 +626,7 @@ impl State {
     pub fn challenge(&mut self, id: &str, purpose: Purpose) -> Option<String> {
         self.challenges.retain(|_, c| c.expires > now());
         if !self.alive(id)
+            || (self.device_class(id)? == DeviceClass::Host) != (purpose == Purpose::Worker)
             || self.challenges.len() >= 256
             || self.challenges.values().filter(|c| c.id == id).count() >= 8
         {
@@ -426,6 +645,16 @@ impl State {
     }
     pub fn prove(&mut self, id: &str, purpose: Purpose, nonce: &str, sig: &str) -> bool {
         self.prove_message(id, purpose, nonce, sig, nonce)
+    }
+    pub fn prove_worker(&mut self, id: &str, nonce: &str, sig: &str, request: &str) -> bool {
+        self.worker_grant(id).is_some()
+            && self.prove_message(
+                id,
+                Purpose::Worker,
+                nonce,
+                sig,
+                &format!("{nonce}.{}", digest(request)),
+            )
     }
     pub fn prove_settings(&mut self, id: &str, nonce: &str, sig: &str, request: &str) -> bool {
         let message = format!("{nonce}.{}", digest(request));
@@ -544,21 +773,42 @@ mod tests {
         let mut s = State::load(dir.path()).unwrap();
         s.set_origin(Some("https://machine.tail.ts.net".into()), 48162)
             .unwrap();
-        let invite = s.invite("a@example.test".into()).unwrap();
+        let invite = s.invite("a@example.test".into(), false).unwrap();
         assert!(invite.qr_svg.contains("<svg"));
         let code = invite.url.split_once("#pair=").unwrap().1;
         let key = SigningKey::random(&mut OsRng);
         let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
         assert!(
-            s.pair("b@example.test", code, &public, &sign(&key, code), "Phone")
-                .is_none()
+            s.pair(
+                "b@example.test",
+                code,
+                &public,
+                &sign(&key, code),
+                "Phone",
+                DeviceClass::Phone
+            )
+            .is_none()
         );
         let cookie = s
-            .pair("a@example.test", code, &public, &sign(&key, code), "Phone")
+            .pair(
+                "a@example.test",
+                code,
+                &public,
+                &sign(&key, code),
+                "Phone",
+                DeviceClass::Phone,
+            )
             .unwrap();
         assert!(
-            s.pair("a@example.test", code, &public, &sign(&key, code), "Replay")
-                .is_none()
+            s.pair(
+                "a@example.test",
+                code,
+                &public,
+                &sign(&key, code),
+                "Replay",
+                DeviceClass::Phone
+            )
+            .is_none()
         );
         let contents = fs::read_to_string(dir.path().join("remote.json")).unwrap();
         assert!(!contents.contains(&cookie) && !contents.contains(code));
@@ -589,13 +839,169 @@ mod tests {
                 pending_code,
                 &public,
                 &sign(&key, pending_code),
-                "Withdrawn invitation"
+                "Withdrawn invitation",
+                DeviceClass::Phone
             )
             .is_none()
         );
         assert!(!s.prove(&id, Purpose::Connect, &next, &sign(&key, &next)));
         assert!(s.identity("a@example.test", &cookie).is_none());
     }
+    #[test]
+    fn worker_links_keep_their_own_role_and_grant_through_restart_and_repair() {
+        use ox_desk_core::modes::Level;
+        let tmp = tempfile::tempdir().unwrap();
+        fs::set_permissions(
+            tmp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("host-id"),
+            "b302b350-a07d-435d-bb7b-b675156681db",
+        )
+        .unwrap();
+        let mut state = State::load(tmp.path()).unwrap();
+        state
+            .set_origin(Some("https://build.fixture.ts.net".into()), 8443)
+            .unwrap();
+        let source = "74b2c731-b9f0-4b05-8672-3c42062b190a";
+        let login = "owner@example.test";
+        let key = SigningKey::random(&mut OsRng);
+        let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
+        let redeem = |state: &mut State, code: &str, message: &str| {
+            state.pair(
+                login,
+                code,
+                &public,
+                &sign(&key, message),
+                "Studio",
+                Enrollment {
+                    class: DeviceClass::Host,
+                    source: Some(source),
+                },
+            )
+        };
+        let operator = state.invite(login.into(), true).unwrap();
+        let op = operator.short_code.unwrap();
+        assert!(redeem(&mut state, &op, &format!("{op}.host.{source}")).is_none());
+        let invite = state
+            .local_worker_invite(login.into())
+            .unwrap()
+            .short_code
+            .unwrap();
+        assert!(
+            state
+                .pair(
+                    login,
+                    &invite,
+                    &public,
+                    &sign(&key, &invite),
+                    "Operator",
+                    DeviceClass::Desktop
+                )
+                .is_none()
+        );
+        assert!(redeem(&mut state, &invite, &invite).is_none());
+        let token = redeem(&mut state, &invite, &format!("{invite}.host.{source}")).unwrap();
+        let id = state.identity(login, &token).unwrap();
+        for purpose in [
+            Purpose::Connect,
+            Purpose::Settings,
+            Purpose::Push,
+            Purpose::Terminal,
+        ] {
+            assert!(state.challenge(&id, purpose).is_none());
+        }
+        assert!(state.terminal_grant(&id, true).is_err());
+        let original = state.worker_grant(&id).unwrap().clone();
+        assert_eq!(original.ceiling, Level::Yolo);
+        state
+            .edit_worker(&id, &original, false, Level::Read)
+            .unwrap();
+        assert!(
+            state
+                .edit_worker(&id, &original, true, Level::Yolo)
+                .is_err()
+        );
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(tmp.path().join("remote.json")).unwrap()).unwrap();
+        assert!(stored["devices"].as_object().unwrap().is_empty());
+        assert!(stored.get("worker_hosts").is_none());
+        assert!(
+            fs::read_to_string(tmp.path().join("incoming-worker-hosts.json"))
+                .unwrap()
+                .contains(&id)
+        );
+        // Simulate an older release rewriting its operator-only settings.
+        write_registry(tmp.path(), "remote.json", &stored).unwrap();
+        state
+            .update(|disk| {
+                disk.devices.get_mut(&id).unwrap().device.last_used = now() - 2 * INACTIVE
+            })
+            .unwrap();
+        let mut restored = State::load(tmp.path()).unwrap();
+        assert_eq!(restored.identity(login, &token), Some(id.clone()));
+        let challenge = restored.challenge(&id, Purpose::Worker).unwrap();
+        let signature = sign(&key, &format!("{challenge}.{}", digest("info")));
+        assert!(!restored.prove_worker(&id, &challenge, &signature, "revoke_self"));
+        let challenge = restored.challenge(&id, Purpose::Worker).unwrap();
+        let signature = sign(&key, &format!("{challenge}.{}", digest("info")));
+        assert!(restored.prove_worker(&id, &challenge, &signature, "info"));
+        assert!(!restored.prove_worker(&id, &challenge, &signature, "info"));
+        let next = restored
+            .local_worker_invite(login.into())
+            .unwrap()
+            .short_code
+            .unwrap();
+        let fresh = redeem(&mut restored, &next, &format!("{next}.host.{source}")).unwrap();
+        let replacement = restored.identity(login, &fresh).unwrap();
+        assert_eq!(
+            restored.worker_grant(&replacement),
+            restored.worker_grant(&id)
+        );
+        restored.revoke(&id).unwrap();
+        assert!(restored.identity(login, &token).is_none());
+        assert!(restored.worker_grant(&replacement).is_some());
+    }
+
+    #[test]
+    fn manual_code_and_long_link_spend_one_desktop_invitation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let mut state = State::load(dir.path()).unwrap();
+        state
+            .set_origin(Some("https://machine.tail.ts.net".into()), 48162)
+            .unwrap();
+        let login = "operator@example.test";
+        let invite = state.invite(login.into(), false).unwrap();
+        let short = invite.short_code.unwrap().to_lowercase();
+        let long = invite.url.split_once("#pair=").unwrap().1;
+        let key = SigningKey::random(&mut OsRng);
+        let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
+        let pair = |state: &mut State, login: &str, code: &str| {
+            state.pair(
+                login,
+                code,
+                &public,
+                &sign(&key, code),
+                "Laptop",
+                DeviceClass::Desktop,
+            )
+        };
+        assert!(pair(&mut state, "other@example.test", &short).is_none());
+        let token = pair(&mut state, login, &short).unwrap();
+        assert!(pair(&mut state, login, long).is_none());
+        let restored = State::load(dir.path()).unwrap();
+        let id = restored.identity(login, &token).unwrap();
+        assert_eq!(restored.device_class(&id), Some(DeviceClass::Desktop));
+        assert!(restored.terminal_generation(&id).is_none());
+    }
+
     #[test]
     fn terminal_grants_reject_stale_challenges_and_do_not_transfer_to_repaired_devices() {
         let tmp = tempfile::tempdir().unwrap();
@@ -610,15 +1016,22 @@ mod tests {
             .unwrap();
         let key = SigningKey::random(&mut OsRng);
         let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
-        let register = |s: &mut State| {
-            let invitation = s.invite("tester".into()).unwrap();
+        let register = |s: &mut State, invitation: Pairing| {
             let secret = invitation.url.split_once("#pair=").unwrap().1;
             let cookie = s
-                .pair("tester", secret, &public, &sign(&key, secret), "Phone")
+                .pair(
+                    "tester",
+                    secret,
+                    &public,
+                    &sign(&key, secret),
+                    "Phone",
+                    DeviceClass::Phone,
+                )
                 .unwrap();
             s.identity("tester", &cookie).unwrap()
         };
-        let id = register(&mut state);
+        let invitation = state.invite("tester".into(), false).unwrap();
+        let id = register(&mut state, invitation);
         assert!(state.terminal_generation(&id).is_none());
         state.terminal_grant(&id, true).unwrap();
         let old = state.terminal_generation(&id).unwrap();
@@ -636,7 +1049,11 @@ mod tests {
                 .prove_terminal(&id, &nonce, &sig, r#"{"preset":"claude-login"}"#)
                 .is_none()
         );
-        let paired = register(&mut state);
+        let preauthorized = state.invite("tester".into(), true).unwrap();
+        let trusted = register(&mut state, preauthorized);
+        assert!(state.terminal_generation(&trusted).is_some());
+        let next = state.device_invite(&trusted).unwrap();
+        let paired = register(&mut state, next);
         assert_ne!(id, paired);
         assert!(state.terminal_generation(&paired).is_none());
         assert!(state.terminal_generation(&id).is_some());
@@ -656,18 +1073,32 @@ mod tests {
         state.set_origin(Some(origin.into()), 48162).unwrap();
         let key = SigningKey::random(&mut OsRng);
         let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
-        let invite = state.invite("me".into()).unwrap();
+        let invite = state.invite("me".into(), false).unwrap();
         let secret = invite.url.split_once("#pair=").unwrap().1;
         state.invites.get_mut(&digest(secret)).unwrap().expires = now() - 1;
         assert!(
             state
-                .pair("me", secret, &public, &sign(&key, secret), "Phone")
+                .pair(
+                    "me",
+                    secret,
+                    &public,
+                    &sign(&key, secret),
+                    "Phone",
+                    DeviceClass::Phone
+                )
                 .is_none()
         );
-        let invitation = state.invite("me".into()).unwrap();
+        let invitation = state.invite("me".into(), false).unwrap();
         let secret = invitation.url.split_once("#pair=").unwrap().1;
         let cookie = state
-            .pair("me", secret, &public, &sign(&key, secret), "Phone")
+            .pair(
+                "me",
+                secret,
+                &public,
+                &sign(&key, secret),
+                "Phone",
+                DeviceClass::Phone,
+            )
             .unwrap();
         let id = state.identity("me", &cookie).unwrap();
         state.set_origin(None, 0).unwrap();
@@ -710,11 +1141,18 @@ mod tests {
         let key = SigningKey::random(&mut OsRng);
         let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
         let pair = |s: &mut State, code: &str, label: &str| {
-            s.pair("me", code, &public, &sign(&key, code), label)
+            s.pair(
+                "me",
+                code,
+                &public,
+                &sign(&key, code),
+                label,
+                DeviceClass::Phone,
+            )
         };
 
         // An invitation expires exactly PAIR_TTL seconds after it is issued.
-        let stale = s.invite("me".into()).unwrap();
+        let stale = s.invite("me".into(), false).unwrap();
         assert_eq!(stale.expires_at, start + PAIR_TTL);
         let stale = stale.url.split_once("#pair=").unwrap().1.to_owned();
         at(start + PAIR_TTL);
@@ -722,7 +1160,7 @@ mod tests {
 
         // A fresh invitation works once, one second before its deadline, then never again.
         let issued = start + PAIR_TTL;
-        let fresh = s.invite("me".into()).unwrap();
+        let fresh = s.invite("me".into(), false).unwrap();
         let fresh = fresh.url.split_once("#pair=").unwrap().1.to_owned();
         at(issued + PAIR_TTL - 1);
         let cookie = pair(&mut s, &fresh, "Phone").unwrap();
@@ -740,7 +1178,7 @@ mod tests {
         assert!(State::load(dir.path()).unwrap().disk.devices.is_empty());
 
         // Use renews the window: a device used on day 29 survives past day 30.
-        let fresh = s.invite("me".into()).unwrap();
+        let fresh = s.invite("me".into(), false).unwrap();
         let fresh = fresh.url.split_once("#pair=").unwrap().1.to_owned();
         let cookie = pair(&mut s, &fresh, "Phone").unwrap();
         let id = s.identity("me", &cookie).unwrap();

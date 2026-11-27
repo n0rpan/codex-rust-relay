@@ -84,6 +84,8 @@ how `ox update --stable` returns a dev build to stable. From a stable or source
 build before the first stable release, `ox update` reports
 `no stable ox release has been published yet` and points to `ox update --dev`.
 
+A server installed with `install.sh --host` defaults to **Automatic when idle**. In its paired web UI, open **Settings → Host updates** to select the release channel and update mode, schedule an update, or cancel a scheduled installation. OX Desktop has the same controls under **Settings → Hosts**. On the server, `ox host update status` shows the current settings. For example, `ox host update dev` selects Dev and `ox host update manual` switches to manual updates. The host waits for active turns, approvals and remote terminal sessions before an idle installation.
+
 On a desktop installation, both OX Desktop and the headless session host can download the full package in the background. They share a cache and check GitHub at most every six hours after an up-to-date response. Failed background checks retry after one hour. A manual check bypasses that delay. Choose **Settings → Appearance & input → OX updates → Check manually**, or set `OX_NO_BACKGROUND_UPDATE=1` in the process environment, to turn off automatic checks. Manual checks still work. To enable background downloads on a pre-updater installation, rerun the installer once. Use `--desktop` for the full suite or omit it for a standalone CLI.
 
 OX checks the release archive against GitHub's SHA-256 digest, verifies the macOS signature where applicable, and checks the versions reported by all three executables. Choose **Restart to update** in Desktop, or run `ox update` in a terminal to apply a staged update even offline. A single package switch updates the CLI, desktop, host and phone interface. With **Restart to update**, a running host drains for up to ten minutes. For an update that waits as long as necessary, choose **Restart when idle** and keep Desktop open. You can keep starting work or cancel the scheduled restart while OX waits. Once every host-managed agent has finished its turn and pending sends, approvals and handoffs have cleared, OX reserves the idle host and restarts. Check its version with `ox host doctor`. If the package has already switched and the host restart fails, Desktop keeps **Retry restart** available until recovery finishes. Desktop resumes checking for subsequent releases after that restart.
@@ -772,6 +774,7 @@ Approve the tool call when your client prompts.
 | Ask for | What starts |
 | --- | --- |
 | Codex session on an API model | Stock Codex in the project with the selected ox alias |
+| Codex session or goal on your ChatGPT subscription | Stock Codex using the selected host’s ChatGPT sign-in. Omit the API alias. |
 | Codex goal on an API model | A stock Codex app-server thread with Goal mode |
 | Claude Code session or workflow on an API model | Stock Claude Code in the project with the selected ox alias |
 | Claude Code session or workflow on your subscription | Stock Claude Code on the host's saved Claude account. Ask for a subscription worker and omit the API alias. |
@@ -865,8 +868,8 @@ worker’s OS permissions. Codex read workers use the Read only sandbox.
 
 Give concurrent writers separate working directories by starting their parent
 sessions there. The main session and its built-in subagents use your subscription.
-The worker bills the API provider you picked or the Claude subscription you
-requested.
+A worker can use a configured API model or the target host’s subscription.
+Choose **ChatGPT subscription** for Codex or **Claude subscription** for Claude Code.
 
 For a second opinion on a piece of text, ask for `delegate_to_ox_model`.
 That tool makes one model request with a 90-second timeout. For development,
@@ -874,7 +877,8 @@ tests, and other multi-step tasks, ask for a background worker.
 
 In the client, `/model` shows the subscription's account-specific model choices.
 The worker catalog reports the detected subscription routes alongside the API
-models and identifies Claude as a supported subscription worker.
+models. In the worker sheet, a subscription route shows the host’s last reported
+limits and reset times when its native client has supplied them.
 [Codex subagent settings](https://learn.chatgpt.com/docs/agent-configuration/subagents) ·
 [Claude Code subagent model selection](https://code.claude.com/docs/en/sub-agents#choose-a-model)
 
@@ -883,6 +887,41 @@ model. If a mode fails, check the job status. You can also run it directly in
 `ox codex --model <alias>` or `ox claude --model <alias>`.
 [Codex Goal mode](https://learn.chatgpt.com/docs/long-running-work) ·
 [Claude Code workflows](https://code.claude.com/docs/en/workflows)
+
+### Choose a worker host
+
+Open **Start worker** on desktop or in the web UI. **Same as parent** is the default. Choose a linked host by name, or choose **Auto** and optionally enter minimum memory in GB, CPU count, GPU and OS. The model picker includes API routes configured on the target. Pair worker hosts under **Settings → Hosts → Worker host links** and register the repository on the receiver with `ox host project add DIR`.
+
+Agents can use `list_ox_hosts` to inspect the links available to their parent. Pass `host: "build"`, a stable host ID or `host: "label:big"` to `start_ox_worker`. For automatic selection, pass `host: "auto"` or a requirement such as `needs: {"memory_gb":64,"cpus":8,"os":"linux","gpu":true}`. On desktop, `/worker @build claude --mode read review the parser` also selects a destination.
+
+Auto filters by repository, runtime, billing route, permissions and requested hardware. It ranks eligible hosts by CPU load and available memory, measured against each machine’s capacity. A busy host can still win. Memory requirements use the host’s reported total RAM in decimal GB.
+
+Set project defaults in the parent project’s `codeox.toml`. Sessions opened in a Git subdirectory use the nearest configuration up to the worktree root.
+
+```toml
+[workers.placement]
+default = "parent"
+heavy = "label:big"
+os = "linux"
+```
+
+A worker with `placement: "heavy"` uses the named rule. A launch without an explicit host or hardware request uses the default rule, then falls back to the parent when the project has no rule. An OS-only rule prefers the parent if eligible. The sheet shows **Project rule** alongside the explicit choices when the project sets a default host or OS. A rule naming a remote host authorizes sending the tracked snapshot and non-ignored, untracked inputs to that paired host. An unmet choice reports why it failed. A writable remote job needs a target that supports write results. Its existing link grant and host policy determine the effective permission.
+
+Set the result destination in the project’s `codeox.toml`. Values you omit inherit your `$CODEX_HOME/codeox.toml` settings.
+
+```toml
+[workers]
+results = "branch"
+result_max_age_days = 30
+```
+
+* **branch** creates `ox/<job>` on the target checkout’s origin, so branch CI can run. This is the default.
+* **ref** creates `refs/ox/jobs/<job>/result` on that origin.
+* **tailnet** keeps the entire exchange on your two hosts.
+
+Branch and ref publication include the tracked snapshot you launched from, including local commits and uncommitted tracked edits. Stage or commit a new file in the worker to publish it. Other new, non-ignored files and transferred private inputs come back in an isolated checkout on the parent host. A refused push, a conflicting ref, or an unverified LFS or submodule dependency returns the result over the paired link. The job status gives the reason.
+
+When the parent reconnects, its job status shows the local result ref, commit, diff stat and private checkout path. Inspect the ref with `git show refs/ox/jobs/<job>/result`, then merge or cherry-pick when ready. OX retires its origin ref after a merge into the original source branch, archival of the worker on the target, or the configured age. A ref someone has moved remains theirs. Failed, interrupted and cancelled jobs return partial work privately. The published ref records the original job. If you continue its session on the target, those later edits stay in its checkout.
 
 ### Continue a session in another runtime, route or model
 

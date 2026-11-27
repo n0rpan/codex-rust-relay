@@ -5,7 +5,9 @@ edition = "2024"
 publish = false
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 libc = "0.2"
-
-[dev-dependencies]
+sha2 = "0.10"
+rustix = { version = "1", features = ["fs"] }
 tempfile = "3"
+url = "2"

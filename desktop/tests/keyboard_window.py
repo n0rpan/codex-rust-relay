@@ -38,7 +38,7 @@ def wait_for(description, predicate, seconds=15):
     raise AssertionError(f"Timed out waiting for {description}")
 
 
-def run(gui, codex, root, drop_probe=None):
+def run(gui, codex, root, drop_probe=None, fleet_harness=None):
     home, project, runtime, bin_dir = [root / key for key in ("home", "project", "runtime", "bin")]
     for directory in (home / ".codex", project, runtime, bin_dir):
         directory.mkdir(mode=0o700, parents=True)
@@ -134,7 +134,7 @@ def run(gui, codex, root, drop_probe=None):
             (p.name for p in runtime.glob("wayland-*") if p.is_socket()), None))
         env["SWAYSOCK"] = str(wait_for("the Sway IPC socket", lambda: next(runtime.glob("sway-ipc*.sock"), None)))
         # Keep the seat's keyboard capability between wtype invocations.
-        launch("wtype", "-s", "180000")
+        launch("wtype", "-k", "Shift_L", "-s", "180000")
         launch("dbus-daemon", "--session", "--nofork", "--address=" + env["DBUS_SESSION_BUS_ADDRESS"])
         wait_for("the private D-Bus session", lambda: (runtime / "bus").is_socket())
         launch("fcitx5", "--disable", "classicui,cloudpinyin,notificationitem,notifications")
@@ -144,6 +144,11 @@ def run(gui, codex, root, drop_probe=None):
             "NameHasOwner", "s", "org.fcitx.Fcitx5"))
         time.sleep(.7)
         stack.enter_context(session_host(gui.with_name("ox-host"),root,env,log))
+        if fleet_harness:
+            (home / ".codex/config.toml").write_text("[features]\ntool_search=false\n")
+            from fleet_window import check_fleet
+            check_fleet(fleet_harness, gui, root, project, env, stack, log, launch, command, key, server)
+            return
         launch(gui, "--desk-stats", project)
         probe = stack.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM))
         probe.bind(str(root / "probe"))
@@ -198,12 +203,12 @@ def run(gui, codex, root, drop_probe=None):
         assert selected_text() == "你好"
         print("Pinyin composed 你好 in the composer and 中国 in the palette, and Escape restored the draft.", flush=True)
 
-        # Hide the sidebar to traverse just the Settings control tree. The sixth
+        # Hide the sidebar to traverse just the Settings control tree. The seventh
         # page is Favorites. Its unsaved alias is an ordinary Settings text field.
         key("b", "ctrl")
         key("comma", "ctrl")
         time.sleep(.5)
-        for _ in range(6):
+        for _ in range(7):
             key("Tab")
         key("Return")
         time.sleep(.15)
@@ -258,6 +263,21 @@ def run(gui, codex, root, drop_probe=None):
         key("Down", "ctrl", "alt")
         wait_for("the previous session", lambda: stats().get("selected_thread") == thread)
         print("Keyboard approval, new draft, and session navigation reached the stock thread.", flush=True)
+        key("n", "ctrl")
+        wait_for("a new draft for host-scoped navigation", lambda: stats().get("selected_thread") is None)
+        key("k", "ctrl")
+        command("wl-copy", "--clear")
+        query = "@local " + str(project)
+        def type_host_query():
+            command("wtype", "-M", "ctrl", "-k", "a", "-m", "ctrl", "-s", "50", query)
+            return copy_selected() == query
+        wait_for("the palette to accept the host-scoped query", type_host_query)
+        key("End")
+        def open_scoped_session():
+            key("Return")
+            return stats().get("selected_thread") == thread
+        wait_for("the exact native session from the host-scoped command palette", open_scoped_session)
+        print("The @local palette opened the original stock session from a fresh draft.", flush=True)
 
         if drop_probe:
             from gtk_drop import drag_image
@@ -284,10 +304,11 @@ if __name__ == "__main__":
     parser.add_argument("stock_codex", type=Path)
     parser.add_argument("--gtk-drop", metavar="PROBE", nargs="?", const="",
                         help="Test an external GTK drop using ox-desk-probe beside the GUI or at PROBE")
+    parser.add_argument("--fleet-harness", type=Path, help="Exercise a paired TLS host with the ox-desktop test binary")
     args = parser.parse_args()
     gui = args.gui.resolve(strict=True)
     drop_probe = None
     if args.gtk_drop is not None:
         drop_probe = (Path(args.gtk_drop) if args.gtk_drop else gui.with_name("ox-desk-probe")).resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="ox-keyboard-") as fixture:
-        run(gui, args.stock_codex.resolve(strict=True), Path(fixture), drop_probe)
+        run(gui, args.stock_codex.resolve(strict=True), Path(fixture), drop_probe, args.fleet_harness.resolve(strict=True) if args.fleet_harness else None)

@@ -224,6 +224,16 @@ impl Store {
 
     fn claude_frame(&mut self, owner: &str, event: wire::Event) -> io::Result<()> {
         use wire::Event;
+        if let Event::SubscriptionLimit { info, session_id } = event {
+            if let Some(id) = self.claude().sessions[owner].limit_reporter
+                && session_id == stock_id(owner)?
+            {
+                use crate::usage::reported::{Observation, WorkerReport};
+                self.usage.worker_report =
+                    Some(WorkerReport::windows(id, Observation::claude(info)));
+            }
+            return Ok(());
+        }
         if !self.claude().sessions[owner].initialized
             && !matches!(&event,Event::ControlReply(reply) if reply.request_id=="ox-init")
         {
@@ -233,9 +243,8 @@ impl Store {
         }
         let session = match &event {
             Event::Init(i) => Some(&i.session_id),
-            Event::Title { session_id, .. } => Some(session_id),
+            Event::Title { session_id, .. } | Event::Model { session_id, .. } => Some(session_id),
             Event::Result(r) => Some(&r.session_id),
-            Event::Model { session_id, .. } => Some(session_id),
             Event::Item { scope, .. } | Event::Delta { scope, .. } => Some(&scope.session_id),
             _ => None,
         };
@@ -246,6 +255,7 @@ impl Store {
         }
         match event {
             Event::ControlReply(r) => self.claude_control(owner, r)?,
+            Event::SubscriptionLimit { .. } => unreachable!("handled above"),
             Event::Model { model, .. } => {
                 let p = self.claude_mut().sessions.get_mut(owner).unwrap();
                 // Each distinct model in the order it first answered, so a fallback
@@ -660,6 +670,23 @@ impl Store {
             p.capabilities = Some(caps);
             p.mode = mode;
             p.initialized = true;
+            if !self.profile.route.is_api() {
+                use crate::usage::reported::{Reporter, WorkerReport};
+                let id = Reporter::verified(
+                    native.account.email.as_deref(),
+                    r.payload
+                        .as_ref()
+                        .ok()
+                        .and_then(|v| v["account"]["organization"].as_str()),
+                    None,
+                );
+                self.claude_mut()
+                    .sessions
+                    .get_mut(owner)
+                    .unwrap()
+                    .limit_reporter = Some(id);
+                self.usage.worker_report = Some(WorkerReport::select(id));
+            }
             return self.claude_ready(owner);
         }
         let Some(control) = self

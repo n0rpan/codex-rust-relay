@@ -192,7 +192,8 @@ impl Budget {
 }
 
 /// A carried item, possibly cut.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Carried {
     pub id: String,
     pub turn: String,
@@ -243,10 +244,20 @@ fn is_zero(n: &u32) -> bool {
     *n == 0
 }
 
+/// A host-local session or path is meaningful only on its owning machine.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SourceHost {
+    pub id: String,
+    pub name: String,
+}
+
 /// An earlier session in a handoff chain, readable through read_ox_thread.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Earlier {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<SourceHost>,
     pub session: String,
     pub title: String,
     pub runtime: Runtime,
@@ -442,6 +453,11 @@ pub fn select(
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HandoffSource {
+    /// Digest of the desktop relay key for this destination pairing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_broker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<SourceHost>,
     pub scope: Scope,
     pub session: String,
     /// The source's native session ID, when it differs from the host ID.
@@ -487,18 +503,30 @@ impl HandoffSource {
                 " That session itself continued {}; the context carried into it is not repeated here. read_ox_thread with that session ID reads it.",
                 r.earlier
                     .iter()
-                    .map(|e| format!(
-                        "\"{}\" (session {}, {})",
-                        e.title.replace('"', "'"),
-                        e.session,
-                        e.route.label()
-                    ))
+                    .map(|e| {
+                        let host = e
+                            .host
+                            .as_ref()
+                            .map(|h| format!(", host {}", h.id))
+                            .unwrap_or_default();
+                        format!(
+                            "\"{}\" (session {}, {}{host})",
+                            e.title.replace('"', "'"),
+                            e.session,
+                            e.route.label()
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(", which continued ")
             )
         };
+        let host = self
+            .host
+            .as_ref()
+            .map(|h| format!(" Source host {} ({}).", h.name, h.id))
+            .unwrap_or_default();
         format!(
-            "OX handoff: this session continues \"{}\" (session {}, {}, {}). The messages that follow are real earlier messages from it, in order, not a summary: {} of {} carried. {omitted}{attachments}{chain} Use the read_ox_thread tool to read the source session's omitted or cut items by ID. Answer the request after them.",
+            "OX handoff: this session continues \"{}\" (session {}, {}, {}). The messages that follow are real earlier messages from it, in order, not a summary: {} of {} carried. {omitted}{attachments}{chain}{host} Use the read_ox_thread tool to read the source session's omitted or cut items by ID. Answer the request after them.",
             self.title.replace('"', "'"),
             self.session,
             self.runtime.name(),
@@ -606,6 +634,7 @@ pub fn marker(origin: &crate::origin::Origin) -> Option<String> {
         Some(Decision::Inherited) => "inherited",
         Some(Decision::Lowered) => "lowered",
         Some(Decision::Operator) => "chosen by the operator",
+        Some(Decision::HostPolicy) => "set by the host policy",
         Some(Decision::Capped) => "capped below YOLO",
         None => "unknown",
     };
@@ -657,6 +686,8 @@ pub fn fold<'a>(
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct HandoffStart {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub source: String,
     pub runtime: Runtime,
     /// An OX API alias, or none for the runtime's subscription.
@@ -669,17 +700,43 @@ pub struct HandoffStart {
     pub yolo_confirmed: bool,
 }
 
+/// Selected, attributed context for an operator moving a conversation between
+/// two paired hosts. Project paths in the source stamp are source-local.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct HandoffTransfer {
+    pub id: String,
+    pub target_host: String,
+    pub repository: String,
+    pub start: HandoffStart,
+    pub source: HandoffSource,
+    pub carried: Vec<Carried>,
+    pub child_ceiling: Option<crate::modes::Level>,
+}
+
 impl HandoffStart {
     pub fn route(&self) -> Route {
         self.runtime.route(self.model.clone())
     }
-    /// The composer form: `/handoff <codex|claude>[:<alias>] [--mode <mode>] <request>`.
+    /// The composer form: `/handoff [@host] <codex|claude>[:<alias>] [--mode <mode>] <request>`.
     pub fn parse_command(source: &str, text: &str) -> Option<Result<Self, String>> {
         let rest = text.trim_start().strip_prefix("/handoff")?;
         if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
             return None;
         }
-        let usage = "Use /handoff <codex|claude>[:<alias>] [--mode <mode>] <request>.";
+        let usage = "Use /handoff [@host] <codex|claude>[:<alias>] [--mode <mode>] <request>.";
+        let rest = rest.trim_start();
+        let (host, rest) = if let Some(named) = rest.strip_prefix('@') {
+            let Some((host, rest)) = named.split_once(char::is_whitespace) else {
+                return Some(Err(usage.into()));
+            };
+            if host.is_empty() {
+                return Some(Err(usage.into()));
+            }
+            (Some(host.to_owned()), rest)
+        } else {
+            (None, rest)
+        };
         let mut words = rest.trim_start().splitn(2, char::is_whitespace);
         let Some(target) = words.next().filter(|w| !w.is_empty()) else {
             return Some(Err(usage.into()));
@@ -706,6 +763,7 @@ impl HandoffStart {
             request = tail.trim_start();
         }
         let start = Self {
+            host,
             source: source.to_owned(),
             runtime,
             model,
@@ -937,7 +995,13 @@ mod tests {
         assert!(text.contains("1 attachment(s)"), "{text}");
         let plain = select(&history(1, 10), "next", Some(200_000)).unwrap();
         assert_eq!(plain.refs.attachments, 0);
-        assert!(!source(plain.refs).preamble().contains("attachment"));
+        let mut stamped = source(plain.refs);
+        assert!(!stamped.preamble().contains("attachment"));
+        stamped.host = Some(SourceHost {
+            id: "host-a".into(),
+            name: "studio".into(),
+        });
+        assert!(stamped.preamble().contains("Source host studio (host-a)"));
     }
 
     fn items_with_attachment() -> Vec<SourceItem> {
@@ -948,6 +1012,8 @@ mod tests {
 
     fn source(refs: SelectionRefs) -> HandoffSource {
         HandoffSource {
+            history_broker: None,
+            host: None,
             scope: Scope {
                 project: "/p".into(),
                 route: Runtime::Claude.route(None),
@@ -1014,6 +1080,8 @@ mod tests {
     ) -> (Vec<SourceItem>, Earlier, String) {
         let selection = select_chained(items, request, Some(200_000), earlier).unwrap();
         let source = HandoffSource {
+            history_broker: None,
+            host: None,
             scope: Scope {
                 project: "/p".into(),
                 route: from.2.clone(),
@@ -1053,6 +1121,7 @@ mod tests {
             ),
         ];
         let me = Earlier {
+            host: None,
             session: from.0.into(),
             title: format!("title {}", from.0),
             runtime: from.1,
@@ -1231,6 +1300,16 @@ mod tests {
         assert_eq!(h.route(), Runtime::Codex.route(Some("fixture/demo".into())));
         assert_eq!(h.mode, crate::modes::ModeRequest::Level(Level::Read));
         assert_eq!(h.request, "fix tests");
+        let remote = HandoffStart::parse_command(
+            "s",
+            "/handoff @studio codex:fixture/demo --mode read fix tests",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(remote.host.as_deref(), Some("studio"));
+        assert_eq!(remote.request, h.request);
+        assert_eq!(remote.route(), h.route());
+        assert!(h.host.is_none());
         let c = HandoffStart::parse_command("s", "/handoff claude continue")
             .unwrap()
             .unwrap();

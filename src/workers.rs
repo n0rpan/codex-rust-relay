@@ -157,12 +157,11 @@ impl Relay {
     }
 }
 
-/// Which tools a gateway offers. An API session the session host runs gets only
-/// read_ox_thread, so a handoff target on an API alias can read its source.
+/// Hosted API sessions can manage their own workers and read handoff history.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tools {
     All,
-    HandoffRead,
+    Hosted,
 }
 
 pub(crate) struct Gateway {
@@ -285,6 +284,8 @@ struct ListModels {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReadThread {
+    #[serde(default)]
+    host: Option<String>,
     #[serde(default)]
     session: Option<String>,
     #[serde(default)]
@@ -414,17 +415,17 @@ impl Service {
         let result = match method {
             "initialize" => initialize(params),
             "ping" => json!({}),
-            "tools/list" if self.tools == Tools::HandoffRead => {
+            "tools/list" if self.tools == Tools::Hosted => {
                 let mut all = tools();
                 if let Some(list) = all["tools"].as_array_mut() {
-                    list.retain(|t| t["name"] == "read_ox_thread");
+                    list.retain(|t| t["name"] != "delegate_to_ox_model");
                 }
                 all
             }
             "tools/list" => tools(),
             "tools/call"
-                if self.tools == Tools::HandoffRead
-                    && params["name"].as_str() != Some("read_ox_thread") =>
+                if self.tools == Tools::Hosted
+                    && params["name"].as_str() == Some("delegate_to_ox_model") =>
             {
                 return rpc_error(id.clone(), -32602, "Unknown worker tool");
             }
@@ -462,6 +463,7 @@ impl Service {
                         }
                     }
                 }
+                Some("list_ox_hosts") => tool_result(self.list_hosts(thread).await),
                 Some("list_ox_workers") => tool_result(self.list_jobs(thread).await),
                 Some("read_ox_thread") => {
                     match serde_json::from_value::<ReadThread>(
@@ -571,13 +573,41 @@ impl Service {
         )
     }
 
-    async fn start_job(&self, request: jobs::Start, thread: Option<&str>) -> Result<Value, String> {
+    async fn start_job(
+        &self,
+        mut request: jobs::Start,
+        thread: Option<&str>,
+    ) -> Result<Value, String> {
         request.validate()?;
-        if let Some(model) = &request.subscription_model {
+
+        let host = crate::host_lifetime::HostLink::find(&self.cwd, self.host_policy)?;
+        let rule = if request.host.is_none() && request.needs.is_none() {
+            crate::worker_placement::rule(&self.cwd, request.placement.as_deref())?
+        } else {
+            Default::default()
+        };
+        let target = request.host.as_deref().or(rule.host.as_deref());
+        let mut remote =
+            target.is_some_and(|h| h != "parent") || request.needs.is_some() || rule.os.is_some();
+        if host.is_none()
+            && request.needs.is_none()
+            && matches!(target, None | Some("auto" | "parent"))
+            && rule
+                .os
+                .as_ref()
+                .is_none_or(|os| os.eq_ignore_ascii_case(std::env::consts::OS))
+        {
+            remote = false;
+        }
+        if request.placement.is_none() && (rule.host.is_some() || rule.os.is_some()) && remote {
+            request.placement = Some("default".into());
+        }
+        if !remote && let Some(model) = &request.subscription_model {
             self.check_subscription_model(model).await?;
         }
         let app = self.app().await?;
-        if let Some(model) = &request.model
+        if !remote
+            && let Some(model) = &request.model
             && let Mode::Codeox {
                 vendors, routes, ..
             } = &app.mode
@@ -587,7 +617,7 @@ impl Service {
         }
         // A running session host owns the worker, so it outlives this helper and
         // its approvals reach the human clients. Without one, run it here as before.
-        if let Some(host) = crate::host_lifetime::HostLink::find(&self.cwd, self.host_policy)? {
+        if let Some(host) = host {
             let start = request.host_start(&app.secrets);
             let caller = self.caller(thread);
             let unbound = caller["session"].is_null();
@@ -610,6 +640,9 @@ impl Service {
                 "This worker is owned by the OX session host. Its approvals and questions appear in OX Desktop and on paired phones. When ox_worker_status lists requests with parent_may_answer, you may answer them with answer_ox_worker; otherwise tell the user where to answer."
             );
             return Ok(reply);
+        }
+        if remote {
+            return Err("Starting a worker on another host requires the parent's OX host. Start OX Desktop or run ox host install.".into());
         }
         self.jobs
             .lock()
@@ -719,18 +752,27 @@ impl Service {
             return Err("read_ox_thread needs the OX session host, which ran the handoff.".into());
         }
         if read.limit.is_some_and(|l| l == 0 || l > 100)
-            || [&read.session, &read.item, &read.after]
+            || [&read.host, &read.session, &read.item, &read.after]
                 .into_iter()
                 .flatten()
                 .any(|s| s.is_empty() || s.len() > 256)
         {
             return Err("Use a limit of 1 to 100 and IDs of up to 256 bytes.".into());
         }
-        self.host_call(
-            json!({"op":"read_thread","session":read.session,"item":read.item,"after":read.after,"limit":read.limit}),
-            thread,
-        )
-        .await
+        let mut call = json!({"op":"read_thread","session":read.session,"item":read.item,"after":read.after,"limit":read.limit});
+        if let Some(host) = read.host {
+            call["host"] = host.into();
+        }
+        self.host_call(call, thread).await
+    }
+
+    async fn list_hosts(&self, thread: Option<&str>) -> Result<Value, String> {
+        if crate::host_lifetime::HostLink::find(&self.cwd, self.host_policy)?.is_none() {
+            return Ok(
+                json!({"hosts": [], "message": "This launch is running without an OX session host."}),
+            );
+        }
+        self.host_call(json!({"op":"list_hosts"}), thread).await
     }
 
     async fn list_jobs(&self, thread: Option<&str>) -> Result<Value, String> {
@@ -777,11 +819,11 @@ impl Service {
         }
         let next = filters.offset.saturating_add(models.len());
         let subscriptions: Vec<_> = [
-            (ClientKind::Codex, "codex", "openai", "ChatGPT subscription", false),
-            (ClientKind::Claude, "claude", "anthropic", "Claude subscription", true),
+            (ClientKind::Codex, "codex", "openai", "ChatGPT subscription"),
+            (ClientKind::Claude, "claude", "anthropic", "Claude subscription"),
         ]
         .into_iter()
-        .filter_map(|(client, runtime, provider, name, worker)| {
+        .filter_map(|(client, runtime, provider, name)| {
             let account = crate::native::saved_subscription(client, &self.home)?;
             if !format!("{name} {runtime} {provider}").to_lowercase().contains(&query) {
                 return None;
@@ -793,7 +835,7 @@ impl Service {
                 "account": account,
                 "runtime": runtime,
                 "main_client": client == self.client,
-                "worker_available": worker,
+                "worker_available": true,
                 "model_picker": "Use /model in the stock subscription client to see account model choices",
             }))
         })
@@ -949,18 +991,21 @@ fn tools() -> Value {
             },
             {
                 "name": "start_ox_worker",
-                "description": "Start a background coding job in this project and return its job ID at once. Choose by fit: a Codex goal for one long objective with a checkable stop condition; a Claude workflow for work Claude Code splits into steps with its Workflow tool and subagents; a session for ordinary coding on either runtime. Task up to 32 KiB. There is no time or count limit by default; set max_minutes per job, or OX_WORKER_MAX_MINUTES and OX_WORKER_MAX_PER_PARENT, to add one. A write worker starting while another writes in the same project returns a warning: consider a separate git worktree. Without the OX session host they stop when this launch exits. Inherit uses your mode only with the session host; without it, inherit is read. Lower with permission_mode, never raise it. For ordinary work, omit permission_mode to inherit the hosted parent’s verified mode, including YOLO. Request read for a read-only review. Explicit YOLO requests can require operator acceptance. Pin a subscription model with subscription_model. Status reports the actual_model that answered.",
+                "description": "Start a background coding job in this project and return its job ID at once. Choose by fit: a Codex goal for one long objective with a checkable stop condition; a Claude workflow for work Claude Code splits into steps with its Workflow tool and subagents; a session for ordinary coding on either runtime. Task up to 32 KiB. There is no time or count limit by default; set max_minutes per job, or OX_WORKER_MAX_MINUTES and OX_WORKER_MAX_PER_PARENT, to add one. A write worker starting while another writes in the same project returns a warning: consider a separate git worktree. Without the OX session host they stop when this launch exits. Inherit uses your mode only with the session host; without it, inherit is read. Lower with permission_mode, never raise it. For ordinary work, omit permission_mode to inherit the hosted parent’s verified mode, including YOLO. Request read for a read-only review. Explicit YOLO requests can require operator acceptance. Pin a Claude subscription model with subscription_model. Status reports the actual_model that answered.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "runtime": {"enum": ["codex", "claude"]},
                         "mode": {"enum": ["session", "goal", "workflow"], "description": "session: background coding session on either runtime. goal: Codex only; task becomes the Codex goal objective, at most 4,000 characters. workflow: Claude Code only; the job fails if the Workflow tool is not used."},
-                        "model": {"type": "string", "description": "Exact ox API model alias, billed by its provider. Leave out for a Claude subscription worker."},
-                        "billing": {"enum": ["api", "subscription"], "description": "Who pays. api: the provider of model. subscription: the user's Claude subscription. Optional: a model means api, none means subscription. A conflicting model is refused."},
+                        "model": {"type": "string", "description": "Exact ox API model alias, billed by its provider. Leave out to use the selected runtime’s subscription."},
+                        "billing": {"enum": ["api", "subscription"], "description": "Who pays. api: the provider of model. subscription: the user's ChatGPT or Claude subscription for the selected runtime. Optional: a model means api, none means subscription. A conflicting model is refused."},
                         "subscription_model": {"type": "string", "description": "Exact Claude subscription model to pin, such as claude-fable-5-2, from list_ox_models subscription_models. Claude runtime only, without model. Checked against the account's model picker before the first turn: an unoffered model is refused and nothing runs or bills. Leave out for the subscription's default model."},
                         "task": {"type": "string", "description": "The job objective, desired validation, and stopping condition."},
                         "permission_mode": {"enum": ["inherit", "read", "write", "classifier", "yolo"], "default": "inherit", "description": "read: Codex Read only or Claude Plan. Standalone Claude read workers get only read tools. write: workspace edits and shell access. Codex uses its Workspace sandbox. Claude Code pre-approves Bash and uses its own sandbox when available. Without it, commands can run unsandboxed. classifier: Codex Auto-review / Claude Auto. yolo: Codex YOLO / Claude bypass. Above your mode is refused."},
                         "max_minutes": {"type": "integer", "minimum": 1, "maximum": 10080, "description": "Optional wall-clock limit for this worker in minutes. No limit by default (OX_WORKER_MAX_MINUTES sets one)."},
+                        "needs": {"type":"object","additionalProperties":false,"properties":{"memory_gb":{"type":"integer","minimum":1},"cpus":{"type":"integer","minimum":1},"gpu":{"type":"boolean"},"os":{"type":"string"}},"description":"Minimum installed hardware. Auto selects by current load and free memory among eligible hosts."},
+                        "placement":{"type":"string","description":"Select a named [workers.placement] project rule, such as heavy."},
+                        "host": {"type":"string","description":"Host name or ID, parent, label:LABEL, or auto. Explicit choices override project rules."},
                         "checkout": {"type":"string","description":"Existing execution directory, absolute or relative to the parent workspace. The current thread remains the worker’s parent."},
                         "workspace_write": {"type": "boolean", "description": "Deprecated: false means read, true means write. Use permission_mode."},
                     },
@@ -973,11 +1018,18 @@ fn tools() -> Value {
                 "name":"read_ox_thread",
                 "description":"Read the session this one was handed off from (and earlier sources in its chain), read-only and within this project. The handoff carried a budgeted selection of real messages; use this to read omitted or cut items in full. Pages by item ID: item returns one item, after continues after an item. Omit session for the nearest source.",
                 "inputSchema":{"type":"object","properties":{
+                    "host":{"type":"string","description":"Stable source host ID from the handoff note. Use with a session ID shared by multiple hosts."},
                     "session":{"type":"string","description":"A source session ID from the handoff note. Omit for the nearest source."},
                     "item":{"type":"string","description":"Return this item in full."},
                     "after":{"type":"string","description":"Start after this item ID. Use next_after from the previous page."},
                     "limit":{"type":"integer","minimum":1,"maximum":100,"default":20}
                 },"additionalProperties":false},
+                "annotations":{"readOnlyHint":true,"openWorldHint":false}
+            },
+            {
+                "name":"list_ox_hosts",
+                "description":"List the parent and its paired worker hosts with live resources, labels, installed runtimes, configured billing routes, link permissions and whether each host has this repository. Unreachable hosts remain listed.",
+                "inputSchema":{"type":"object","properties":{},"additionalProperties":false},
                 "annotations":{"readOnlyHint":true,"openWorldHint":false}
             },
             {

@@ -36,6 +36,10 @@ pub enum DeltaTarget {
 #[derive(Clone, Debug)]
 pub enum Event {
     Init(Init),
+    SubscriptionLimit {
+        session_id: String,
+        info: crate::usage::reported::ClaudeLimit,
+    },
     Title {
         session_id: String,
         name: String,

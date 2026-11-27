@@ -22,6 +22,7 @@ use std::{
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
+    WorkerPlacement,
     Lease {
         id: String,
         parent: Option<String>,
@@ -174,6 +175,7 @@ fn serve(
     let mut frame = vec![0; size];
     socket.read_exact(&mut frame)?;
     match serde_json::from_slice(&frame)? {
+        Request::WorkerPlacement => socket.write_all(&[1])?,
         Request::Lease { id, parent } => {
             groups.lock().unwrap().register(&id, parent, &socket)?;
             let result = (|| {
@@ -210,9 +212,12 @@ fn serve(
             };
             let request = crate::workers::parent_call(call).map(Gateway::Call);
             match request {
-                // A read may wait for the source transcript to load.
+                // Transcript loading and live peer discovery can outlast a local call.
                 Ok(
-                    request @ Gateway::Call(ox_desk_core::origin::ParentCall::ReadThread { .. }),
+                    request @ Gateway::Call(
+                        ox_desk_core::origin::ParentCall::ReadThread { .. }
+                        | ox_desk_core::origin::ParentCall::ListHosts,
+                    ),
                 ) => answer(&mut socket, &tx, caller, request, 45)?,
                 Ok(request) => answer(&mut socket, &tx, caller, request, 10)?,
                 Err(error) => reply(&mut socket, Err(error))?,

@@ -22,17 +22,24 @@ use std::path::PathBuf;
 use workspace_state::LastWorkspace;
 
 fn main() {
+    run(std::env::args_os().skip(1));
+}
+
+fn run(args: impl Iterator<Item = std::ffi::OsString>) {
     platform::init_companion();
     let _package = ox_host_service::managed_install::hold_generation();
     ox_host_service::configure_allocator();
     app::install_panic_hook();
     let started = std::time::Instant::now();
-    let mut args = std::env::args_os().skip(1).peekable();
+    let mut args = args.peekable();
+    let mut client_only = false;
     let mut smoke = false;
     let mut stats = false;
     while let Some(arg) = args.peek() {
         if arg == "--desk-smoke" || arg == "--desk-exit-after-first-frame" {
             smoke = true;
+        } else if arg == "--client-only" {
+            client_only = true;
         } else if arg == "--desk-stats" {
             stats = true;
         } else if arg == "--version" || arg == "-V" {
@@ -45,7 +52,13 @@ fn main() {
         }
         args.next();
     }
-    let project = match startup_project(args.next().map(PathBuf::from)) {
+    let explicit = args.next().map(PathBuf::from);
+    let restore_host = explicit.is_none() && !smoke && !stats;
+    let project = match if client_only {
+        Ok(PathBuf::new())
+    } else {
+        startup_project(explicit)
+    } {
         Ok(project) => project,
         Err(message) => {
             eprintln!("ox-desktop: {message}");
@@ -57,9 +70,15 @@ fn main() {
         .run(move |cx| {
             #[cfg(target_os = "macos")]
             platform::set_application_icon();
+            cx.set_app_identity("dev.ox.desktop", "OX Desktop");
+            app::notifications::init(cx);
             gpui_component::init(cx);
             appearance::init(cx);
             sky::start(cx);
+            cx.set_global(app::ClientOnly(client_only));
+            cx.set_global(preferences::HostDirectory(
+                platform::hosts::list().unwrap_or_default(),
+            ));
             updates::start(smoke, cx);
             workspace_state::finish_writes(cx);
             let layouts = views::host::layout::SavedLayouts::load();
@@ -79,17 +98,22 @@ fn main() {
                     },
                     |window, cx| {
                         appearance::observe_window(window);
-                        let view = cx.new(|cx| {
-                            views::host::Host::new(
-                                project,
-                                layouts,
-                                smoke.then_some(started),
-                                stats,
-                                window,
-                                cx,
-                            )
+                        let view = (!client_only).then(|| {
+                            cx.new(|cx| {
+                                views::host::Host::new(
+                                    platform::HostLink::Local,
+                                    None,
+                                    project,
+                                    layouts,
+                                    smoke.then_some(started),
+                                    stats,
+                                    window,
+                                    cx,
+                                )
+                            })
                         });
-                        let workspace = cx.new(|cx| app::Workspace::new(view, cx));
+                        let workspace =
+                            cx.new(|cx| app::Workspace::new(view, restore_host, window, cx));
                         cx.new(|cx| Root::new(workspace, window, cx))
                     },
                 )?;
@@ -158,4 +182,25 @@ mod startup_tests {
                 .contains("directory")
         );
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[::core::prelude::v1::test]
+#[ignore = "run by keyboard_window.py --fleet-harness with two disposable hosts"]
+fn paired_fleet_window() {
+    let root = PathBuf::from(std::env::var_os("OX_TEST_NATIVE_DIR").unwrap());
+    ox_host_web::client::enable_fixture_transport();
+    let mut args = vec!["--desk-stats".into()];
+    if std::env::var_os("OX_TEST_CLIENT_ONLY").is_some() {
+        args.push("--client-only".into());
+    } else if std::env::var_os("OX_TEST_SAVED_PAIRING").is_none() {
+        platform::hosts::pair(
+            &std::env::var("OX_TEST_ORIGIN").unwrap(),
+            &std::fs::read_to_string(root.join("code")).unwrap(),
+            "Fleet window fixture",
+        )
+        .unwrap();
+    }
+    args.push(std::env::var_os("OX_TEST_PROJECT").unwrap());
+    run(args.into_iter());
 }

@@ -293,6 +293,27 @@ fn optional_desktop_installs_launches_and_preserves_existing_profile() {
     assert!(!run().status.success());
     fs::write(&gui, "#!/bin/sh\necho ox-desktop 0.0.0-incompatible\n").unwrap();
     pack();
+    // A headless server needs only the CLI and host to run. The unusable GUI
+    // in this verified fixture must never execute or gain a public launcher.
+    let server = TempDir::new("headless-server");
+    let server_bin = server.0.join("bin");
+    for args in [&["--host"][..], &[][..]] {
+        let installed = install(&release, &server_bin, &server.0, args);
+        assert!(
+            installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        assert!(server_bin.join("ox-host").is_file());
+        assert!(server_bin.join(".ox-desktop/headless").is_file());
+        assert!(!server_bin.join("ox-desktop").exists());
+        assert!(
+            !server
+                .0
+                .join("share/applications/dev.ox.desktop.desktop")
+                .exists()
+        );
+    }
     let mismatch = run();
     assert!(!mismatch.status.success());
     assert!(String::from_utf8_lossy(&mismatch.stderr).contains("versions differ"));

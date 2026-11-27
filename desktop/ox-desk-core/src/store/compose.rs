@@ -55,6 +55,7 @@ impl SentInput {
 }
 #[derive(Debug)]
 pub(super) struct Submit {
+    opening_preset: Option<crate::runtime::Access>,
     options: Option<super::routes_thread::Options>,
     owner: Option<String>,
     expected_turn: Option<String>,
@@ -198,9 +199,11 @@ impl Store {
                 Some(id) => remote.can(id, "send") || remote.can(id, "steer"),
             };
         }
+        !self.sending(id) && self.ready_to_send(id)
+    }
+    pub(super) fn ready_to_send(&self, id: Option<&str>) -> bool {
         self.state == Connection::Ready
             && (!self.is_session_scoped() || self.claude_can_submit(id))
-            && !self.sending(id)
             && id.is_none_or(|thread| !self.changing_options(thread))
             && id.is_none_or(|id| {
                 !self.in_terminal(id)
@@ -285,12 +288,20 @@ impl Store {
         }
         let waiting: Vec<String> = self.resume_sends.iter().cloned().collect();
         for id in waiting {
+            if self.held_yolo_resumes.contains_key(&id) {
+                continue;
+            }
             self.resume_sends.remove(&id);
             if self.can_send(Some(&id)) {
                 // The message goes out with the stamp it was accepted with, not with
                 // whatever the host is dispatching when the thread becomes ready.
                 let previous = std::mem::replace(&mut self.sender, self.resume_senders.remove(&id));
-                let submitted = self.submit(Some(&id));
+                let submitted = match self.resume_commands.remove(&id) {
+                    Some((command, from_palette)) => {
+                        self.submit_operation(Some(&id), Some(command), from_palette)
+                    }
+                    None => self.submit(Some(&id)),
+                };
                 self.sender = previous;
                 if let Err(error) = submitted {
                     self.notice = Some(error.to_string());
@@ -305,6 +316,7 @@ impl Store {
                 self.resume_sends.insert(id);
             } else {
                 self.resume_senders.remove(&id);
+                self.resume_commands.remove(&id);
                 self.ended_threads.insert(id.clone());
                 self.notice = Some(
                     "The thread did not resume. Your message is still in the composer.".into(),
@@ -395,6 +407,21 @@ impl Store {
         if command.is_none() && draft.text.trim_start().starts_with('/') {
             return Err(io::Error::other("Open this command in stock Codex"));
         }
+        if let Some(id) = id
+            && self.held_yolo_resumes.contains_key(id)
+        {
+            self.resume_sends.insert(id.into());
+            if let Some(sender) = self.sender.clone() {
+                self.resume_senders.insert(id.into(), sender);
+            }
+            if let Some(command) = command {
+                self.resume_commands
+                    .insert(id.into(), (command, from_palette));
+            }
+            self.changed.transcript(id);
+            self.changed.mark(Changed::THREADS);
+            return Ok(());
+        }
         draft.sent = Some(if from_palette {
             SentInput::PaletteCommand
         } else {
@@ -408,6 +435,7 @@ impl Store {
             )
         });
         let submit = Submit {
+            opening_preset: self.next_preset,
             options: if let Some(id) = id {
                 self.transcripts[id]
                     .send_options
@@ -436,7 +464,8 @@ impl Store {
                     Billing::Api(alias) => Some(alias.clone()),
                     Billing::Subscription => None,
                 });
-            let preset = self.next_preset.or_else(|| self.start_mode());
+            let preset = self.next_access();
+            self.next_preset = None;
             self.request(
                 Call::New {
                     preset,
@@ -592,6 +621,10 @@ impl Store {
             // Ending a running turn: interrupt it; the unsubscribe follows anyway.
             let _ = self.stop(id);
         }
+        self.cancel_held_resume(id);
+        if let Some(access) = self.applied_access(Some(id)) {
+            self.resume_access.insert(id.into(), access);
+        }
         let t = self.transcripts.get_mut(id).expect("checked above");
         t.ready = false;
         t.verified = false;
@@ -728,6 +761,14 @@ impl Store {
     }
 
     pub(super) fn compose_failed(&mut self, op: Operation, reason: String) {
+        if let Operation::New(s) = &op
+            && s.selection == self.selection
+            && self.next_preset.is_none()
+        {
+            // A failed open leaves its input available for retry. Preserve the
+            // mode chosen for that same draft, including an explicitly lower one.
+            self.next_preset = s.opening_preset;
+        }
         let owner = match op {
             Operation::New(s)
             | Operation::Account(s)
@@ -886,7 +927,6 @@ impl Store {
         let mut draft = self.drafts.remove(&None).unwrap_or_default();
         if self.selection == s.selection && self.selected.is_none() {
             self.selected = Some(id.clone());
-            self.next_preset = None;
             self.next_options = None;
         } else {
             // The composer moved on. Its text and images stay together with the new chat.
@@ -1010,6 +1050,7 @@ mod tests {
         let mut store = ready();
         let project = store.profile.project.clone();
         let submit = Submit {
+            opening_preset: None,
             options: None,
             owner: None,
             expected_turn: None,
@@ -1240,6 +1281,93 @@ mod tests {
         store.edit(None, "hello".into());
         store.submit(None).unwrap();
         assert_eq!(submitted_context(&store, None), Some(None));
+    }
+
+    #[test]
+    fn fixed_host_start_honors_a_lower_draft_and_never_restores_a_broader_preset() {
+        use crate::{host_policy::HostPolicy, runtime::Access};
+        let mut store = ready();
+        store.set_start_mode(|_| Some(Access::Yolo));
+        assert_eq!(store.next_access(), Some(Access::Yolo));
+        store.use_host_policy(HostPolicy::AlwaysRead);
+        assert_eq!(store.next_access(), Some(Access::ReadOnly));
+        store.use_host_policy(HostPolicy::AlwaysWrite);
+        store.set_next_access(Access::Yolo);
+        assert_eq!(store.next_access(), Some(Access::Workspace));
+        store.set_next_access(Access::ReadOnly);
+        assert_eq!(store.next_access(), Some(Access::ReadOnly));
+        store.use_host_policy(HostPolicy::FollowInterface);
+        store.set_next_access(Access::Yolo);
+        assert_eq!(store.next_access(), Some(Access::Yolo));
+    }
+
+    #[test]
+    fn a_failed_new_session_restores_its_chosen_lower_mode_for_retry() {
+        use crate::{host_policy::HostPolicy, runtime::Access};
+        let mut store = ready();
+        store.use_host_policy(HostPolicy::AlwaysYolo);
+        store.set_next_access(Access::ReadOnly);
+        store.edit(None, "retry me".into());
+        store.submit(None).unwrap();
+        let seq = store.seq;
+        let (_, pending) = store.pending.remove(&seq).unwrap();
+        store.failed(pending, "fixture refused to open".into());
+        assert_eq!(store.next_access(), Some(Access::ReadOnly));
+        assert_eq!(store.draft(None), "retry me");
+    }
+
+    #[test]
+    fn a_resumed_codex_yolo_turn_waits_with_its_original_draft_until_approved() {
+        use crate::{
+            codex::history::{ResumedThread, TurnPage},
+            host_policy::HostPolicy,
+            modes::Level,
+        };
+        let mut store = ready();
+        store.use_host_policy(HostPolicy::YoloAsksEveryTime);
+        let id = "saved-bypass".to_owned();
+        let row: crate::codex::history::ThreadRow = serde_json::from_value(serde_json::json!({
+            "id": id, "cwd": store.profile.project, "modelProvider": "openai", "preview":"work"
+        }))
+        .unwrap();
+        store.catalog.insert(row.clone());
+        let t = store.transcripts.entry(id.clone()).or_default();
+        t.ready = true;
+        t.verified = true;
+        store.end_session(&id).unwrap();
+        store.edit(Some(&id), "continue this session".into());
+        store
+            .dispatch_as(crate::actions::Action::Submit(Some(id.clone())), phone())
+            .unwrap();
+        let reply = ResumedThread {
+            permissions: crate::codex::access::Permissions {
+                access: crate::runtime::Access::Yolo,
+                ceiling: Some(Level::Yolo),
+            },
+            thread: row,
+            model_provider: "openai".into(),
+            model: "test".into(),
+            service_tier: None,
+            reasoning_effort: None,
+            initial_turns_page: Some(TurnPage {
+                data: vec![],
+                next_cursor: None,
+            }),
+        };
+        store.checked_resume(&id, reply);
+        store.drain(vec![], std::time::Instant::now());
+        assert!(store.resume_sends.contains(&id));
+        assert_eq!(store.new_resume_reviews(), vec![id.clone()]);
+        assert!(store.new_resume_reviews().is_empty());
+        assert!(submitted_context(&store, Some(&id)).is_none());
+        store.accept_resume_review(&id);
+        store.drain(vec![], std::time::Instant::now());
+        assert!(
+            submitted_context(&store, Some(&id))
+                .unwrap()
+                .unwrap()
+                .contains("OX phone app")
+        );
     }
 
     #[test]

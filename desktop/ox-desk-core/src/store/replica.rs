@@ -419,6 +419,13 @@ impl Store {
                 }
                 self.notice = Some(match (result, error) {
                     (_, Some(error)) => error,
+                    (Some(status), None) if status["status"] == "preparing" => format!(
+                        "Preparing worker {} on {}.",
+                        status["job_id"],
+                        status["worker_host"]["name"]
+                            .as_str()
+                            .unwrap_or("the linked host")
+                    ),
                     (Some(status), None) if status["status"] == "waiting_for_operator" => format!(
                         "OX worker {} waits for you to accept YOLO on its parent session.",
                         status["job_id"]

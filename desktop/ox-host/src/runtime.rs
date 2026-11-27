@@ -32,6 +32,9 @@ pub(crate) struct Prepared {
     when: std::time::Instant,
 }
 impl Prepared {
+    pub(crate) fn has_api_provider(&self) -> bool {
+        self.provider.is_some()
+    }
     fn current(&self) -> bool {
         self.when.elapsed() < std::time::Duration::from_secs(5)
             && self.inputs.is_some()
@@ -127,6 +130,18 @@ impl RuntimeConfig {
             .map(PathBuf::from)
             .filter_map(|p| p.canonicalize().ok())
             .filter(|p| p.is_dir())
+            .collect()
+    }
+    pub(crate) fn installed_runtimes(&self) -> Vec<Runtime> {
+        [Runtime::Codex, Runtime::Claude]
+            .into_iter()
+            .filter(|r| {
+                env::split_paths(&self.path).any(|p| {
+                    p.join(r.executable())
+                        .metadata()
+                        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                })
+            })
             .collect()
     }
     pub(crate) fn prepare(&self) -> io::Result<Prepared> {

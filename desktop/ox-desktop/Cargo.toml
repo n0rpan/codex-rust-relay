@@ -8,7 +8,7 @@ description = "Native workspace for OX and Codex"
 [dependencies]
 ox-pty = { path = "../ox-pty" }
 ox-host-service = { path = "../ox-host-service" }
-ox-host-web = { path = "../ox-host-web", default-features = false }
+ox-host-web = { path = "../ox-host-web", features = ["client"] }
 base64 = "0.22"
 getrandom = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -25,6 +25,8 @@ shlex = "2"
 socket2 = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
 raw-window-handle = "0.6"
 libc = "0.2"
 vt100 = "0.16.2"
@@ -36,3 +38,9 @@ toml_edit = { version = "0.25", default-features = false, features = ["parse", "
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSImage", "NSResponder"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSData"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5.19"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+ox-host-web = { path = "../ox-host-web", features = ["fixture-transport"] }

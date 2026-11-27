@@ -10,6 +10,17 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 pub const IDLE_UPDATE: &str = "idle_update";
 pub const VERSION: u32 = 1;
+pub const MIN_VERSION: u32 = 1;
+
+/// The hello advertises a maximum. Clients check the selected version against
+/// their own floor before sending any actions. Features are capability gated.
+pub fn negotiate(client_max: u32) -> Option<u32> {
+    let selected = client_max.min(VERSION);
+    (selected >= MIN_VERSION).then_some(selected)
+}
+pub fn supported(selected: u32) -> bool {
+    (MIN_VERSION..=VERSION).contains(&selected)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -40,6 +51,46 @@ pub enum Client {
     /// Reserve a quiescent host until this same-user connection closes.
     ReserveIdleUpdate,
     WatchCatalog,
+    /// List the execution hosts linked to this host for a project. Answers WorkerReply.
+    WorkerHosts {
+        id: String,
+        project: PathBuf,
+    },
+    WatchHandoffReads {
+        proof: String,
+    },
+    ReadHandoffPage {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        broker: Option<String>,
+        source_host: String,
+        target_host: String,
+        scope: Scope,
+        transfer: String,
+        page: HandoffPage,
+    },
+    FinishHandoffRead {
+        token: String,
+        result: Result<Value, String>,
+    },
+    InspectHandoffTarget {
+        id: String,
+        scope: Scope,
+    },
+    PrepareRemoteHandoff {
+        id: String,
+        scope: Scope,
+        start: crate::handoff::HandoffStart,
+        target_host: String,
+        window: Option<u64>,
+    },
+    ReceiveRemoteHandoff {
+        id: String,
+        scope: Scope,
+        packet: Box<crate::handoff::HandoffTransfer>,
+    },
+    /// Opt in to host-wide samples, including when no projects are open.
+    WatchHost,
     TerminalPreview {
         id: String,
         scope: Scope,
@@ -47,6 +98,9 @@ pub enum Client {
     },
     Discover {
         id: String,
+        /// Request the project directory without scanning session history. Requires project_directory.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        projects: Option<ProjectQuery>,
     },
     Subscribe {
         scope: Option<Scope>,
@@ -80,9 +134,47 @@ pub enum Client {
         call: crate::origin::ParentCall,
     },
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct HostResources {
+    pub os: String,
+    pub arch: String,
+    #[serde(default)]
+    pub gpus: Vec<String>,
+    pub cpus: Option<usize>,
+    /// Memory sizes in bytes.
+    pub total_memory: u64,
+    pub available_memory: u64,
+    pub load_one_minute: f64,
+    pub running_workers: usize,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HostInfo {
+    #[serde(
+        default,
+        deserialize_with = "crate::usage::reported::deserialize_windows",
+        skip_serializing_if = "std::collections::BTreeMap::is_empty"
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(
+            with = "std::collections::BTreeMap<String, Vec<crate::usage::reported::ReportedWindow>>"
+        )
+    )]
+    pub subscription_limits:
+        std::collections::BTreeMap<String, Vec<crate::usage::reported::ReportedWindow>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_policy: Option<crate::host_policy::HostPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<HostResources>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+    /// Stable across host restarts. Legacy hosts supply only version and epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub version: String,
     pub epoch: String,
 }
@@ -100,10 +192,60 @@ pub fn version_mismatch(host: u32, client: u32) -> String {
     }
 }
 
+/// A position in the conversation selected by the operator for a handoff.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct HandoffPage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ancestor: Option<HistoryRef>,
+    pub item: Option<String>,
+    pub after: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct HistoryRef {
+    pub host: String,
+    pub session: String,
+}
+
+/// A checkout query revalidates a specific known path after a user selects it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectQuery {
+    List,
+    Checkout(PathBuf),
+}
+
+/// Operator-visible checkouts. The path belongs to the reporting host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProjectCheckout {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProjectDirectory {
+    pub checkouts: Vec<ProjectCheckout>,
+    pub routes: Vec<Route>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Server {
+    RelayHandoffRead {
+        token: String,
+        transfer: String,
+        target_host: String,
+        page: HandoffPage,
+    },
+    HostStatus {
+        host: HostInfo,
+    },
     IdleUpdate {
         ready: bool,
     },
@@ -129,6 +271,8 @@ pub enum Server {
     DiscoveredEnd {
         id: String,
         errors: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        directory: Option<ProjectDirectory>,
     },
     Snapshot {
         cursor: Cursor,
@@ -309,4 +453,52 @@ pub enum NotificationKind {
     Failed,
     Approval,
     Question,
+}
+
+use std::io::{self, BufRead as _};
+const MAX_FRAME: u64 = 64 * 1024 * 1024;
+
+pub fn write_frame(out: &mut impl std::io::Write, request: &Client) -> io::Result<()> {
+    serde_json::to_writer(&mut *out, request)?;
+    out.write_all(b"\n")?;
+    out.flush()
+}
+pub fn read_frame(input: &mut impl std::io::BufRead) -> io::Result<Server> {
+    let mut bytes = Vec::new();
+    let n = std::io::Read::take(input, MAX_FRAME).read_until(b'\n', &mut bytes)?;
+    if n == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Session host disconnected",
+        ));
+    }
+    if bytes.last() != Some(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Incomplete or oversized host frame",
+        ));
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(test)]
+mod project_discovery_tests {
+    use super::*;
+    #[test]
+    fn ordinary_discovery_preserves_the_v1_wire_format() {
+        let frame = serde_json::json!({"type":"discover","id":"sessions"});
+        let client: Client = serde_json::from_value(frame.clone()).unwrap();
+        assert!(matches!(client, Client::Discover { projects: None, .. }));
+        assert_eq!(serde_json::to_value(client).unwrap(), frame);
+        let end = serde_json::json!({"type":"discovered_end","id":"sessions","errors":[]});
+        let reply: Server = serde_json::from_value(end.clone()).unwrap();
+        assert!(matches!(
+            reply,
+            Server::DiscoveredEnd {
+                directory: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(reply).unwrap(), end);
+    }
 }

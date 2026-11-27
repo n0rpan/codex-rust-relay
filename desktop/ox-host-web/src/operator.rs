@@ -63,14 +63,7 @@ enum Preset {
     ClaudeLogin,
     NativeSession,
 }
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum Input {
-    Run,
-    Keys { text: String },
-    Resize { rows: u16, cols: u16 },
-    Cancel,
-}
+use crate::terminal_protocol::Input;
 async fn send(ws: &mut WebSocket, v: Value) -> bool {
     matches!(
         timeout(
@@ -134,6 +127,10 @@ async fn operator(app: App, id: String, mut ws: WebSocket) {
             return;
         };
         (g, state.changed.subscribe())
+    };
+    let Ok(_activity) = crate::host_updates::TERMINALS.try_read() else {
+        send(&mut ws,json!({"error":"The host is restarting to update. Reopen the terminal after it reconnects."})).await;
+        return;
     };
     let mut lease = None;
     let (cwd, mut cmd) = match request.preset {
@@ -203,9 +200,21 @@ async fn operator(app: App, id: String, mut ws: WebSocket) {
         }
     };
     if cmd.resolve().is_err() {
+        send(
+            &mut ws,
+            json!({"error":"The terminal program could not be found on this host."}),
+        )
+        .await;
         return;
     }
-    let Ok(preview) = cmd.preview() else { return };
+    let Ok(preview) = cmd.preview() else {
+        send(
+            &mut ws,
+            json!({"error":"The host could not prepare a terminal preview."}),
+        )
+        .await;
+        return;
+    };
     if !allowed(&app, &id, generation) || !send(&mut ws, json!({"review":preview,"cwd":cwd})).await
     {
         return;
@@ -218,7 +227,7 @@ async fn operator(app: App, id: String, mut ws: WebSocket) {
         }
         tokio::select! {biased;
             _=revoked.changed()=>continue,
-            _=&mut review_timeout=>return,
+            _=&mut review_timeout=>{send(&mut ws,json!({"error":"Terminal review expired. Open the terminal again."})).await;return;},
             msg=ws.recv()=>match msg{
                 Some(Ok(Message::Ping(_) | Message::Pong(_)))=>continue,
                 Some(Ok(Message::Text(s))) if matches!(serde_json::from_str::<Input>(&s),Ok(Input::Run))=>break,
@@ -263,6 +272,11 @@ async fn operator(app: App, id: String, mut ws: WebSocket) {
         }),
         (24, 80),
     ) else {
+        send(
+            &mut ws,
+            json!({"error":"The host could not start the terminal process."}),
+        )
+        .await;
         return;
     };
     pty.observe_echo();

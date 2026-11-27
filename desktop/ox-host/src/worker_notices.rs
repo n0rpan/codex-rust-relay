@@ -16,6 +16,9 @@ pub(crate) struct Notices {
     pub observed: BTreeMap<u64, String>,
     #[serde(default)]
     pub pending: Vec<Notice>,
+    /// Linked transitions awaiting a durable acknowledgement from their parent host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked: Vec<LinkedNotice>,
     /// The most recent event per parent for Desktop and phone catalog snapshots.
     #[serde(default)]
     pub latest: Vec<Summary>,
@@ -23,6 +26,13 @@ pub(crate) struct Notices {
     next: u64,
 }
 
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct LinkedNotice {
+    pub id: u64,
+    pub job: u64,
+    pub status: String,
+    pub preview: String,
+}
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Notice {
     pub id: u64,
@@ -37,6 +47,8 @@ pub(crate) struct Notice {
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Summary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub scope: Scope,
     pub session: String,
     pub job_id: u64,
@@ -45,7 +57,11 @@ pub(crate) struct Summary {
 
 impl Summary {
     pub fn detail(&self) -> serde_json::Value {
-        serde_json::json!({"job_id": self.job_id, "status": self.status})
+        let mut detail = serde_json::json!({"job_id": self.job_id, "status": self.status});
+        if let Some(host) = &self.host {
+            detail["host"] = host.clone().into();
+        }
+        detail
     }
 }
 impl Notices {
@@ -58,11 +74,11 @@ impl Notices {
     }
 
     pub fn observe(&mut self, origin: &Origin, status: &str, preview: &str) {
-        let (Some(scope), Some(session)) = (&origin.parent.scope, &origin.parent.session) else {
-            return;
-        };
+        self.observe_on(origin, status, preview, None);
+    }
+    pub fn observe_on(&mut self, origin: &Origin, status: &str, preview: &str, host: Option<&str>) {
         if origin.relation != Relation::Worker
-            || origin.by_operator
+            || (origin.by_operator && host.is_none())
             || self
                 .observed
                 .get(&origin.job_id)
@@ -70,6 +86,20 @@ impl Notices {
         {
             return;
         }
+        if origin.linked.is_some() {
+            self.observed.insert(origin.job_id, status.into());
+            self.next += 1;
+            self.linked.push(LinkedNotice {
+                id: self.next,
+                job: origin.job_id,
+                status: status.into(),
+                preview: excerpt(preview),
+            });
+            return;
+        }
+        let (Some(scope), Some(session)) = (&origin.parent.scope, &origin.parent.session) else {
+            return;
+        };
         self.observed.insert(origin.job_id, status.into());
         if status == "running" {
             return;
@@ -77,21 +107,14 @@ impl Notices {
         self.latest
             .retain(|s| &s.scope != scope || &s.session != session);
         self.latest.push(Summary {
+            host: host.map(str::to_owned),
             scope: scope.clone(),
             session: session.clone(),
             job_id: origin.job_id,
             status: status.into(),
         });
         self.next += 1;
-        let excerpt: String = preview
-            .trim()
-            .lines()
-            .take(3)
-            .collect::<Vec<_>>()
-            .join("\n")
-            .chars()
-            .take(480)
-            .collect();
+        let excerpt = excerpt(preview);
         let mut text = format!(
             "OX worker #{}: {status} (update {}).",
             origin.job_id, self.next
@@ -111,4 +134,16 @@ impl Notices {
             announced: false,
         });
     }
+}
+
+pub(crate) fn excerpt(preview: &str) -> String {
+    preview
+        .trim()
+        .lines()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .chars()
+        .take(480)
+        .collect()
 }

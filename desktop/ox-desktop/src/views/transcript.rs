@@ -492,13 +492,15 @@ impl Workbench {
                             key,
                             entry.revision,
                             text,
-                            t.active_turn().is_none().then(|| {
-                                store
-                                    .catalog_row(id)
-                                    .map(|r| &r.cwd)
-                                    .unwrap_or(&self.project)
-                                    .clone()
-                            }),
+                            (self.link.remote().is_none() && t.active_turn().is_none()).then(
+                                || {
+                                    store
+                                        .catalog_row(id)
+                                        .map(|r| &r.cwd)
+                                        .unwrap_or(&self.project)
+                                        .clone()
+                                },
+                            ),
                             cx,
                         )),
                     Item::Plan { text } => {
@@ -559,13 +561,10 @@ impl Workbench {
                 if expanded {
                     for (offset, item_key) in keys.iter().take(visible).enumerate() {
                         if let Some(entry) = t.entry(item_key) {
-                            let local_review = t
-                                .active_turn()
-                                .is_none()
-                                .then(|| {
-                                    super::terminal_review::Review::failed(entry, &self.project)
-                                })
-                                .flatten();
+                            let local_review = (self.link.remote().is_none()
+                                && t.active_turn().is_none())
+                            .then(|| super::terminal_review::Review::failed(entry, &self.project))
+                            .flatten();
                             let show_all = shown_all.contains(item_key);
                             let view = cx.weak_entity();
                             let (id, item) = (owner.clone(), item_key.clone());

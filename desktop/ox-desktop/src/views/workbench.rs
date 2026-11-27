@@ -1,6 +1,8 @@
 //! A workbench owns the visible state for one project and billing route.
 use crate::appearance::Step;
 use crate::kit::{SPACE_S, SPACE_XS};
+use crate::platform::HostLink;
+#[cfg(test)]
 use crate::platform::open_store;
 use crate::{activity, appearance::Palette, col, platform, row};
 use gpui::{prelude::FluentBuilder, *};
@@ -78,11 +80,16 @@ pub(in crate::views) enum DeferredRowAction {
 }
 
 pub struct Workbench {
+    pub(super) workspace: Option<WeakEntity<crate::app::Workspace>>,
+    pub(super) handoff_pending: Option<String>,
+    pub(super) link: HostLink,
+    workers: Entity<super::host::WorkerIndex>,
     pub(super) pending_local_command: Option<super::terminal_review::Pending>,
     pub(super) enter_sends: bool,
     review: review::ReviewPane,
     pub(super) review_width: u32,
     pub(super) pane_width: Pixels,
+    pub(super) host_caption: Option<String>,
     resizing_review: bool,
     pub(super) route_models: Entity<Vec<String>>,
     pub(super) model_picker: Option<super::route_chip::Picker>,
@@ -100,6 +107,7 @@ pub struct Workbench {
     pub(super) route: Route,
     pub(super) front: bool,
     pub(super) query: String,
+    pending_new: bool,
     pending_selection: Option<(ox_desk_core::store::ThreadRow, bool)>,
     pending_row_action: Option<(String, DeferredRowAction)>,
     pending_draft: Option<(String, Vec<ox_desk_core::mentions::ImageInput>)>,
@@ -117,6 +125,7 @@ pub struct Workbench {
     pub(super) stats: Option<Stats>,
     pub(super) wake: flume::Sender<()>,
     waiting_frame: Option<flume::Sender<()>>,
+    pub(super) focus_editor_for: Option<Option<String>>,
     pub(super) editors: HashMap<Option<String>, Entity<gpui_component::input::TextareaState>>,
     pub(super) focused_ask: Option<ox_desk_core::runtime::RequestId>,
     pub(super) answer_fields:
@@ -156,7 +165,10 @@ pub(super) struct Stats {
 }
 
 impl Workbench {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        link: HostLink,
+        workers: Entity<super::host::WorkerIndex>,
         project: PathBuf,
         route: Route,
         first_frame: Option<Instant>,
@@ -166,6 +178,8 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) -> Self {
         Self::build(
+            link,
+            workers,
             project,
             route,
             Some(first_frame),
@@ -178,7 +192,10 @@ impl Workbench {
 
     /// Create a background pane without connecting to `ox-host` or spawning a runtime yet.
     /// It connects on its first `set_front(true, window, cx)`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_lazy(
+        link: HostLink,
+        workers: Entity<super::host::WorkerIndex>,
         project: PathBuf,
         route: Route,
         stats: bool,
@@ -186,11 +203,24 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(project, route, None, stats, route_models, window, cx)
+        Self::build(
+            link,
+            workers,
+            project,
+            route,
+            None,
+            stats,
+            route_models,
+            window,
+            cx,
+        )
     }
 
     /// `active`: `Some(first_frame)` starts connected as the front pane; `None` starts lazy.
+    #[allow(clippy::too_many_arguments)]
     fn build(
+        link: HostLink,
+        workers: Entity<super::host::WorkerIndex>,
         project: PathBuf,
         route: Route,
         active: Option<Option<Instant>>,
@@ -226,12 +256,16 @@ impl Workbench {
         })
         .detach();
         let (wake, pump) = if front {
-            Self::connection(project.clone(), route.clone(), window, cx)
+            Self::connection(link.clone(), project.clone(), route.clone(), window, cx)
         } else {
             let (wake, _) = flume::bounded(1);
             (wake, Task::ready(()))
         };
         Self {
+            workspace: None,
+            handoff_pending: None,
+            link,
+            workers,
             enter_sends: cx
                 .global::<crate::preferences::behavior::Active>()
                 .enter_sends,
@@ -239,6 +273,7 @@ impl Workbench {
             review: Default::default(),
             review_width: 360,
             pane_width: window.viewport_size().width,
+            host_caption: None,
             resizing_review: false,
             model_picker: None,
             route_models,
@@ -248,6 +283,7 @@ impl Workbench {
             launch_picker: None,
             front,
             query: String::new(),
+            pending_new: false,
             pending_selection: None,
             pending_row_action: None,
             pending_draft: None,
@@ -275,6 +311,7 @@ impl Workbench {
             fire: None,
             focused_ask: None,
             mascot_frame: 0,
+            focus_editor_for: None,
             editors: HashMap::new(),
             answer_fields: HashMap::new(),
             transcript_views: HashMap::new(),
@@ -283,6 +320,7 @@ impl Workbench {
     }
 
     fn connection(
+        link: HostLink,
         directory: PathBuf,
         billing: Route,
         window: &mut Window,
@@ -295,7 +333,7 @@ impl Workbench {
         });
         let input = inbox.clone();
         let start = cx.background_spawn(async move {
-            open_store(directory, billing, move |event| input.push(event))
+            link.open_store(directory, billing, move |event| input.push(event))
         });
         let pump = cx.spawn_in(window, async move |view, cx| {
             let result = start.await;
@@ -306,7 +344,8 @@ impl Workbench {
                     match result {
                         Ok(mut store) => {
                             if let Some(previous) = &mut s.store {
-                                if s.pending_selection.is_none()
+                                if !s.pending_new
+                                    && s.pending_selection.is_none()
                                     && store.profile().project == previous.profile().project
                                     && store.profile().route == previous.profile().route
                                     && let Some(row) =
@@ -341,6 +380,7 @@ impl Workbench {
                             }
                         }
                         Err(error) => {
+                            s.pending_new = false;
                             let message = error.to_string();
                             // Retrying cannot repair a folder's permissions.
                             let fixable = ox_host_service::unsafe_folder(&message).is_some();
@@ -446,6 +486,18 @@ impl Workbench {
                             {
                                 let _ = store.read_limits();
                             }
+                            if matches!(
+                                store.state(),
+                                Connection::Closed(_) | Connection::SignInRequired
+                            ) {
+                                s.pending_new = false;
+                            }
+                            if store.state() == &Connection::Ready
+                                && std::mem::take(&mut s.pending_new)
+                                && let Err(e) = store.dispatch(DeskAction::NewDraft)
+                            {
+                                s.launch_error = Some(e.to_string());
+                            }
                             if store.state() == &Connection::Ready
                                 && let Some((row, confirmed)) = s.pending_selection.take()
                                 && (confirmed
@@ -518,8 +570,13 @@ impl Workbench {
         }
         self.connecting = true;
         self.launch_error = None;
-        (self.wake, self._pump) =
-            Self::connection(self.project.clone(), self.route.clone(), window, cx);
+        (self.wake, self._pump) = Self::connection(
+            self.link.clone(),
+            self.project.clone(),
+            self.route.clone(),
+            window,
+            cx,
+        );
         cx.notify();
     }
     fn retry_once(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -627,12 +684,27 @@ impl Workbench {
         }
     }
 
+    pub(super) fn start_project_draft(&mut self, cx: &mut Context<Self>) {
+        self.pending_selection = None;
+        self.focus_editor_for = Some(None);
+        if self
+            .store
+            .as_ref()
+            .is_some_and(|s| s.state() == &Connection::Ready)
+        {
+            self.action(cx, DeskAction::NewDraft);
+        } else {
+            self.pending_new = true;
+            cx.notify();
+        }
+    }
     pub(super) fn select_catalog(
         &mut self,
         row: ox_desk_core::store::ThreadRow,
         confirmed: bool,
         cx: &mut Context<Self>,
     ) {
+        self.pending_new = false;
         if self
             .store
             .as_ref()
@@ -700,6 +772,55 @@ impl Workbench {
             })
     }
     pub(super) fn action(&mut self, cx: &mut Context<Self>, action: DeskAction) {
+        if let DeskAction::StartHandoff(start) = &action
+            && let Some(selector) = &start.host
+        {
+            let mut start = start.clone();
+            start.host = None;
+            match self.select_handoff_destination(selector, cx) {
+                Ok(Some(to)) => self.send_handoff(start, to, cx),
+                Ok(None) => self.action(cx, DeskAction::StartHandoff(start)),
+                Err(e) => {
+                    self.launch_error = Some(e);
+                    cx.notify();
+                }
+            }
+            return;
+        }
+        if let Some(host) = self.link.remote()
+            && let Some(store) = &mut self.store
+        {
+            let command = match &action {
+                DeskAction::ExecuteCommand(id) => Some((id, store.draft(id.as_deref()))),
+                DeskAction::PaletteCommand(id, text) => Some((id, text.as_str())),
+                DeskAction::Terminal(id) => Some((id, "/terminal")),
+                _ => None,
+            };
+            if let Some((owner, text)) = command
+                && (text.trim() == "/terminal"
+                    || matches!(
+                        store.parse_command(owner.as_deref(), text),
+                        Some(ox_desk_core::slash::Action::Terminal)
+                    ))
+            {
+                use ox_host_web::terminal_protocol::OpenTerminal;
+                let req = match owner {
+                    Some(thread) => OpenTerminal::NativeSession {
+                        scope: ox_desk_core::host_protocol::Scope {
+                            project: store.profile().project.clone(),
+                            route: self.route.clone(),
+                        },
+                        thread: thread.clone(),
+                    },
+                    None => OpenTerminal::Shell {
+                        project: store.profile().project.clone(),
+                    },
+                };
+                self.launch_error = crate::terminal::open_remote(host.clone(), req, cx).err();
+                cx.notify();
+                return;
+            }
+        }
         if matches!(
             action,
             DeskAction::NewDraft | DeskAction::OpenCatalogRow(_) | DeskAction::SelectThread(_)
@@ -736,6 +857,10 @@ impl Workbench {
         let Some(handoff) = store.take_handoff() else {
             return;
         };
+        if self.link.remote().is_some() {
+            self.launch_error = Some("Open the terminal on the session host.".into());
+            return;
+        }
         let project = store.profile().project.clone();
         let task = cx.background_spawn(async move {
             platform::launch_runtime_terminal(&project, handoff.argv)
@@ -818,6 +943,9 @@ impl Workbench {
         current_activity(store).or(self.finale.as_ref().map(|(_, scene)| (*scene, 0)))
     }
     pub(super) fn set_front(&mut self, front: bool, cx: &mut Context<Self>) {
+        if !front {
+            self.focus_editor_for = None;
+        }
         self.front = front;
         if let Some(store) = &mut self.store {
             store.set_front(front);
@@ -836,6 +964,9 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !front {
+            self.focus_editor_for = None;
+        }
         self.front = front;
         if let Some(store) = &mut self.store {
             store.set_front(front);
@@ -882,17 +1013,21 @@ impl Workbench {
             });
         let connecting = format!("Connecting to {}…", self.route.runtime.name());
         let sign_in = format!("Sign in to {}", self.route.runtime.account());
-        let status = self.launch_error.as_deref().unwrap_or_else(|| {
-            if self.connecting {
-                return &connecting;
-            }
-            match self.store.as_ref().map(Store::state) {
-                None | Some(Connection::Connecting) => &connecting,
-                Some(Connection::Ready) => "Connected",
-                Some(Connection::SignInRequired) => &sign_in,
-                Some(Connection::Closed(message)) => message,
-            }
-        });
+        let status = self
+            .launch_error
+            .as_deref()
+            .or(self.handoff_pending.as_deref())
+            .unwrap_or_else(|| {
+                if self.connecting {
+                    return &connecting;
+                }
+                match self.store.as_ref().map(Store::state) {
+                    None | Some(Connection::Connecting) => &connecting,
+                    Some(Connection::Ready) => "Connected",
+                    Some(Connection::SignInRequired) => &sign_in,
+                    Some(Connection::Closed(message)) => message,
+                }
+            });
         let title = self
             .store
             .as_ref()
@@ -979,8 +1114,7 @@ impl Workbench {
                 "Open a terminal in this project",
                 true,
                 cx.listener(move |s, _, _, cx| {
-                    if let Err(error) = crate::terminal::open(project.clone(), None, |_, _| {}, cx)
-                    {
+                    if let Err(error) = s.link.open_shell(project.clone(), cx) {
                         s.launch_error = Some(error);
                         cx.notify();
                     }
@@ -1063,6 +1197,26 @@ impl Workbench {
                                                             .build(window, cx)
                                                         }),
                                                 )
+                                        })
+                                        .when_some(self.host_caption.as_ref(), |view, host| {
+                                            let route = match &self.route.billing {
+                                                ox_desk_core::runtime::Billing::Api(alias) => {
+                                                    format!("API · {alias}")
+                                                }
+                                                ox_desk_core::runtime::Billing::Subscription => {
+                                                    "subscription".into()
+                                                }
+                                            };
+                                            let label = SharedString::from(format!(
+                                                "{host} · {} · {route}",
+                                                self.route.runtime.name()
+                                            ));
+                                            view.child(crate::platform::layout_probe::mark_element(
+                                                crate::small(p, label.clone()).truncate(),
+                                                &"session-host-route".into(),
+                                                &label,
+                                                false,
+                                            ))
                                         })
                                         .when(status != "Connected", |view| {
                                             view.child(crate::small(p, status.clone()))

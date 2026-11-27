@@ -65,6 +65,7 @@ struct Process {
     handoff: Option<super::commands::Handoff>,
     link: Option<pipe::Link>,
     initialized: bool,
+    limit_reporter: Option<crate::usage::reported::Reporter>,
     /// The first `system/init` matched the project. Later ones report the Bash
     /// tool's current directory, which follows `cd`, so only the first is checked.
     project_checked: bool,
@@ -657,9 +658,15 @@ impl Store {
         let profile = self.profile.clone();
         // A draft preset belongs only to the new session it was chosen for.
         let preset = match &session {
-            Session::New(_) => self.next_preset.take().or_else(|| self.start_mode()),
-            Session::Resume(_) => resume_mode,
-            Session::Fork { .. } => None,
+            Session::New(_) => {
+                let chosen = self.next_access();
+                self.next_preset = None;
+                chosen
+            }
+            Session::Resume(_) => self.starting_access(self.host_start_access(&owner), resume_mode),
+            Session::Fork { source, .. } => {
+                self.host_start_access(&session_key(&self.profile.route.billing, source))
+            }
         };
         // A worker keeps its launch contract on every relaunch: a resume reuses its own,
         // a fork the contract of its source.

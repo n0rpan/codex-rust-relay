@@ -3,13 +3,20 @@ mod doctor;
 mod durable;
 mod engine;
 mod handover;
+mod identity;
 mod lease;
+mod pairing;
 mod policy;
+mod projects;
 mod receipts;
 mod replay;
+mod resources;
 mod runtime;
 mod transport;
+mod updates;
 mod worker_notices;
+#[path = "../../../src/worker_placement.rs"]
+mod worker_placement;
 mod workers;
 mod yolo;
 
@@ -38,33 +45,6 @@ extern "C" fn stop_signal(signal: libc::c_int) {
         );
     }
 }
-/// Stage releases for a headless install too. Activation belongs to the operator.
-fn stage_background_updates() {
-    use ox_host_service::managed_install::{active_binary, package_store};
-    use std::{
-        process::{Command, Stdio},
-        time::Duration,
-    };
-    if env::var_os("OX_NO_BACKGROUND_UPDATE").is_some() {
-        return;
-    }
-    let Some(store) = env::current_exe().ok().and_then(|p| package_store(&p)) else {
-        return;
-    };
-    thread::spawn(move || {
-        thread::sleep(Duration::from_secs(60));
-        loop {
-            let _ = Command::new(active_binary(&store, "ox"))
-                .args(["update", "--stage-desktop", "--background"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            thread::sleep(Duration::from_secs(1800));
-        }
-    });
-}
-
 fn report_staged_update() {
     use ox_host_service::managed_install::{active_binary, package_store};
     let Some(store) = env::current_exe().ok().and_then(|p| package_store(&p)) else {
@@ -133,8 +113,9 @@ fn run(paths: Paths) -> io::Result<()> {
             }
         }
     });
-    stage_background_updates();
+    updates::start(paths.clone(), tx.clone())?;
     lease.listen(tx.clone())?;
+    let jobs = tx.clone();
     let listener = guard.listener.try_clone()?;
     thread::spawn(move || {
         for (id, next) in listener.incoming().enumerate() {
@@ -147,8 +128,22 @@ fn run(paths: Paths) -> io::Result<()> {
             }
         }
     });
+    let web_paths = paths.clone();
     thread::spawn(move || {
-        if let Err(e) = ox_host_web::run(paths.state_dir, paths.socket) {
+        let dispatch = std::sync::Arc::new(move |job| {
+            let (reply, response) = mpsc::sync_channel(1);
+            jobs.send(Message::LinkedJob(
+                Box::new(job),
+                engine::Replier::Channel(reply),
+            ))
+            .map_err(|_| "The target host stopped.".to_owned())?;
+            response
+                .recv()
+                .map_err(|_| "The target worker engine stopped.".to_owned())?
+        });
+        if let Err(e) =
+            ox_host_web::run_with_jobs(web_paths.state_dir, web_paths.socket, Some(dispatch))
+        {
             ox_host_service::errlog::record(&format!("OX remote service: {e}"));
         }
     });
@@ -157,7 +152,21 @@ fn run(paths: Paths) -> io::Result<()> {
     if let Err(e) = &result {
         ox_host_service::errlog::record(&format!("stopped: {e}"));
     }
-    result
+    result?;
+    if let Some(binary) = engine.replacement.take() {
+        use std::os::unix::process::CommandExt;
+        drop(engine);
+        drop(lease);
+        drop(guard);
+        return Err(std::process::Command::new(binary)
+            .arg("run")
+            .arg("--state-dir")
+            .arg(paths.state_dir)
+            .arg("--socket")
+            .arg(paths.socket)
+            .exec());
+    }
+    Ok(())
 }
 const USAGE: &str = "Usage: ox-host COMMAND [--socket PATH] [--state-dir PATH] [ARGS]
   run                       serve sessions (what the login service runs)
@@ -165,6 +174,15 @@ const USAGE: &str = "Usage: ox-host COMMAND [--socket PATH] [--state-dir PATH] [
   status                    show whether the host and its login service run
   stop                      stop the host now; running turns are interrupted
   restart [--timeout SECS]  finish running turns (default bound 600s), then start the installed host
+  pair --worker-host        invite another OX host to launch workers here
+  pair [--terminal]         print a private Serve invitation, optionally granting a terminal
+  update [setting]          install when idle or set automatic, download, manual, stable or dev
+  name [NAME]               show or set the name shown to clients
+  policy [set POLICY]       show or set the starting mode for this host
+  labels [set LABEL…]       show or replace placement labels
+  devices                   list paired devices and their IDs
+  terminal <device> on|off  change a paired device’s terminal grant
+  revoke <device-id>        disconnect a paired device
   doctor [--errors N]       check the host, Tailscale Serve, paired devices and stock clients
   uninstall [--purge]       remove the login service; --purge also deletes OX host state
                             (session ledger, pairings, push keys). Codex and Claude Code data is never touched.";
@@ -212,6 +230,29 @@ fn entry() -> io::Result<()> {
         (Some("stop"), []) => control::stop(&paths),
         (Some("restart-if-updated"), []) => control::restart_if_updated(&paths),
         (Some("restart"), rest) => control::restart(&paths, control::timeout(rest)?),
+        (Some(kind @ ("name" | "labels")), rest) => pairing::profile(&paths, kind, rest),
+        (Some("project"), rest) => projects::cli(&paths.state_dir, rest),
+        (Some("policy"), rest) => pairing::mode_policy(&paths, rest),
+        (Some("update"), rest) => updates::cli(&paths, rest),
+        (Some("pair"), []) => pairing::pair(
+            &paths,
+            ox_host_web::access::Operation::Pair { terminal: false },
+        )
+        .map_err(io::Error::other),
+        (Some("pair"), [flag]) if flag == "--terminal" => pairing::pair(
+            &paths,
+            ox_host_web::access::Operation::Pair { terminal: true },
+        )
+        .map_err(io::Error::other),
+        (Some("pair"), [flag]) if flag == "--worker-host" => {
+            pairing::pair(&paths, ox_host_web::access::Operation::PairWorker)
+                .map_err(io::Error::other)
+        }
+        (Some("devices"), []) => pairing::devices(&paths).map_err(io::Error::other),
+        (Some("terminal"), [id, setting]) if matches!(setting.as_str(), "on" | "off") => {
+            pairing::terminal(&paths, id, setting == "on").map_err(io::Error::other)
+        }
+        (Some("revoke"), [id]) => pairing::revoke(&paths, id).map_err(io::Error::other),
         (Some("doctor"), rest) => doctor::run(&paths, rest),
         _ => Err(io::Error::other(USAGE)),
     }
@@ -225,4 +266,16 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "disposable two-host integration using its own TLS trust store"]
+fn linked_parent_fixture() {
+    ox_host_web::client::enable_fixture_transport();
+    run(Paths {
+        socket: env::var_os("OX_HOST_SOCKET").unwrap().into(),
+        state_dir: env::var_os("OX_HOST_STATE_DIR").unwrap().into(),
+    })
+    .unwrap();
 }

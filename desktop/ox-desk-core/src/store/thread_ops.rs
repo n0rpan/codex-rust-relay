@@ -71,6 +71,7 @@ impl Store {
             },
             ThreadOperation::Archive => Call::Archive(id.into()),
             ThreadOperation::Fork => Call::Fork {
+                preset: self.host_start_access(id),
                 thread: id.into(),
                 project: self
                     .catalog

@@ -132,11 +132,7 @@ fn switch_generation(store: &Path, generation: &Path) -> Result<(), RelayError> 
     Ok(())
 }
 
-fn activate(
-    store: &Path,
-    candidate: &Candidate,
-    stopped_host: Option<File>,
-) -> Result<(), RelayError> {
+fn select_verified(store: &Path, candidate: &Candidate) -> Result<PathBuf, RelayError> {
     let generation = candidate.generation(store)?;
     if fs::read_to_string(generation.join(".ready"))? != candidate.version {
         return Err("The staged OX release is incomplete.".into());
@@ -149,6 +145,15 @@ fn activate(
         verify_package(&generation, &candidate.version)?;
         switch_generation(store, &generation)?;
     }
+    Ok(generation)
+}
+
+fn activate(
+    store: &Path,
+    candidate: &Candidate,
+    stopped_host: Option<File>,
+) -> Result<(), RelayError> {
+    let generation = select_verified(store, candidate)?;
     // Keep the pending record on failure. A retry can finish an interrupted host drain.
     host_restart(store, &candidate.version, stopped_host)?;
     prune_unused(store, &generation);
@@ -279,7 +284,13 @@ fn verify_package(root: &Path, version: &str) -> Result<(), RelayError> {
     )
     .map_err(|_| format!("OX {version} failed macOS signature verification."))?;
     let bin = root.join(BIN_DIR);
+    let headless = root
+        .parent()
+        .is_some_and(|store| store.join("headless").is_file());
     for name in ["ox", "ox-desktop", "ox-host"] {
+        if name == "ox-desktop" && headless {
+            continue;
+        }
         let reported = checked(Process::new(bin.join(name)).arg("--version"))?;
         if reported.trim() != format!("{name} {version}") {
             return Err(format!("The packaged {name} does not match OX {version}.").into());
@@ -337,12 +348,26 @@ async fn prepare(store: &Path, channel: Channel) -> Result<Option<Candidate>, Re
     ))
 }
 
+fn preferred_channel(
+    store: &Path,
+    prefs: Option<&preferences::Preferences>,
+) -> Result<Channel, RelayError> {
+    if let Some(prefs) = prefs {
+        return Ok(preferences::effective_channel(prefs, store, CURRENT));
+    }
+    Ok(Channel::of(
+        parse_version(CURRENT).ok_or("Invalid installed OX version.")?,
+    ))
+}
+
 pub(super) async fn update(
     store: &Path,
-    channel: Channel,
+    requested: Option<Channel>,
     check_only: bool,
     json: bool,
 ) -> Result<u8, RelayError> {
+    let prefs = preferences::read(store).ok().flatten();
+    let channel = requested.unwrap_or(preferred_channel(store, prefs.as_ref())?);
     if check_only {
         let version = available(&release_client()?, channel)
             .await?
@@ -358,7 +383,10 @@ pub(super) async fn update(
                 channel.flag()
             );
         } else {
-            println!("OX {CURRENT} is up to date.");
+            println!(
+                "OX {CURRENT} is up to date on the {} channel.",
+                channel.name()
+            );
         }
         return Ok(0);
     }
@@ -379,6 +407,18 @@ pub(super) async fn update(
 }
 
 async fn stage_for_caller(store: &Path, background: bool) -> Result<Option<Candidate>, RelayError> {
+    let prefs = match preferences::read(store) {
+        Ok(prefs) => prefs,
+        Err(_) if background => return Ok(None),
+        Err(_) => None,
+    };
+    if background
+        && prefs
+            .as_ref()
+            .is_some_and(|p| p.mode == preferences::Mode::Manual)
+    {
+        return Ok(None);
+    }
     if !active_caller(store)? {
         // A terminal or another window already switched releases.
         let output = checked(Process::new(active_binary(store, "ox")).arg("--version"))?;
@@ -386,8 +426,10 @@ async fn stage_for_caller(store: &Path, background: bool) -> Result<Option<Candi
             .trim()
             .strip_prefix("ox ")
             .ok_or("Invalid installed OX version.")?;
-        if parse_version(version).ok_or("Invalid installed OX version.")?
-            <= parse_version(CURRENT).ok_or("Invalid running OX version.")?
+        let installed = parse_version(version).ok_or("Invalid installed OX version.")?;
+        let running = parse_version(CURRENT).ok_or("Invalid running OX version.")?;
+        if installed == running
+            || (installed < running && Channel::of(installed) == Channel::of(running))
         {
             return Ok(None);
         }
@@ -399,7 +441,7 @@ async fn stage_for_caller(store: &Path, background: bool) -> Result<Option<Candi
     if background && recent_check(store) && pending(store).is_none() {
         return Ok(None);
     }
-    let channel = Channel::of(parse_version(CURRENT).ok_or("Invalid installed OX version.")?);
+    let channel = preferred_channel(store, prefs.as_ref())?;
     if background && retry_later(store) && pending(store).is_none() {
         return Err("The last update check failed. OX will retry automatically.".into());
     }
@@ -412,7 +454,7 @@ pub(super) async fn command(
     args: &[OsString],
 ) -> Result<u8, RelayError> {
     let background = args.len() == 1 && args[0] == "--background";
-    let opportunistic = command == "--try-apply-desktop";
+    let opportunistic = command == "--try-apply-desktop" || command == "--try-select-host-update";
     let _lock = if opportunistic {
         let file = open_lock_file(store)?;
         match file.try_lock() {
@@ -440,7 +482,29 @@ pub(super) async fn command(
         println!("null");
         return Ok(0);
     }
-    if command == "--stage-desktop" && (args.is_empty() || background) {
+    if command == "--stage-host-update"
+        && let [track] = args
+    {
+        let channel = match track.to_str() {
+            Some("stable") => Channel::Stable,
+            Some("dev") => Channel::Dev,
+            _ => return Err(USAGE.into()),
+        };
+        let candidate = record_check(store, prepare(store, channel).await)?;
+        println!("{}", serde_json::to_string(&candidate)?);
+    } else if command == "--try-select-host-update"
+        && let [version, digest] = args
+    {
+        let candidate = Candidate {
+            version: version.to_string_lossy().into_owned(),
+            digest: digest.to_string_lossy().into_owned(),
+        };
+        let generation = select_verified(store, &candidate)?;
+        prune_unused(store, &generation);
+        if pending(store).as_ref() == Some(&candidate) {
+            fs::remove_file(store.join("pending.json"))?;
+        }
+    } else if command == "--stage-desktop" && (args.is_empty() || background) {
         println!(
             "{}",
             serde_json::to_string(&stage_for_caller(store, background).await?)?

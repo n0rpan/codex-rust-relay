@@ -1,4 +1,5 @@
 //! Per-user host discovery and lifecycle shared by the daemon and local desktop.
+pub mod checkout;
 pub mod errlog;
 #[path = "../../../src/managed_install.rs"]
 pub mod managed_install;
@@ -227,15 +228,36 @@ fn socket_meta(path: &Path) -> io::Result<Option<fs::Metadata>> {
         Err(e) => Err(e),
     }
 }
+/// Ownership of a state or socket lock. Explicit release prevents an unrelated
+/// child's short fork-to-exec window from extending host ownership.
+pub struct HostLock(Option<File>);
+impl HostLock {
+    fn acquire(path: &Path) -> io::Result<Self> {
+        let file = lock_file(path)?;
+        file.try_lock().map_err(io::Error::from)?;
+        Ok(Self(Some(file)))
+    }
+
+    /// Transfer lock ownership to the update installer through its stdin.
+    pub fn into_file(mut self) -> File {
+        self.0.take().expect("lock is owned")
+    }
+}
+impl Drop for HostLock {
+    fn drop(&mut self) {
+        if let Some(f) = &self.0 {
+            let _ = f.unlock();
+        }
+    }
+}
 /// Keep an absent host from binding while Desktop selects a package. If another
 /// process owns the lock it is already running, starting, or shutting down.
-pub fn reserve_stopped_host(paths: &Paths) -> io::Result<Option<File>> {
+pub fn reserve_stopped_host(paths: &Paths) -> io::Result<Option<HostLock>> {
     paths.prepare()?;
-    let lock = lock_file(&paths.state_dir.join("owner.lock"))?;
-    match lock.try_lock() {
-        Ok(()) => Ok(Some(lock)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    match HostLock::acquire(&paths.state_dir.join("owner.lock")) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -243,16 +265,14 @@ pub struct SocketGuard {
     pub listener: UnixListener,
     socket: PathBuf,
     identity: (u64, u64),
-    _state_lock: File,
-    _socket_lock: File,
+    _state_lock: HostLock,
+    _socket_lock: HostLock,
 }
 impl SocketGuard {
     pub fn bind(paths: &Paths) -> io::Result<Self> {
         paths.prepare()?;
-        let state_lock = lock_file(&paths.state_dir.join("owner.lock"))?;
-        state_lock.try_lock().map_err(io::Error::from)?;
-        let socket_lock = lock_file(&paths.socket.with_extension("owner.lock"))?;
-        socket_lock.try_lock().map_err(io::Error::from)?;
+        let state_lock = HostLock::acquire(&paths.state_dir.join("owner.lock"))?;
+        let socket_lock = HostLock::acquire(&paths.socket.with_extension("owner.lock"))?;
         if socket_meta(&paths.socket)?.is_some() {
             match UnixStream::connect(&paths.socket) {
                 Ok(_) => {

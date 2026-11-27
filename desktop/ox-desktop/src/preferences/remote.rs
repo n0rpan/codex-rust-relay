@@ -54,7 +54,7 @@ impl Remote {
         self.qr = None;
         self.expiry = None;
         if let Some(r) = &mut self.report {
-            r.host.pairing = None;
+            r.access.host.pairing = None;
         }
         let result = cx.background_spawn(async move { work() });
         cx.spawn(async move |this, cx| {
@@ -64,8 +64,8 @@ impl Remote {
                 s.finished += 1;
                 match result {
                     Ok(mut r) => {
-                        s.message = r.notice.take();
-                        if let Some(pair) = &r.host.pairing {
+                        s.message = r.access.notice.take();
+                        if let Some(pair) = &r.access.host.pairing {
                             s.qr = Some(Arc::new(Image::from_bytes(
                                 ImageFormat::Svg,
                                 pair.qr_svg.as_bytes().to_vec(),
@@ -82,7 +82,7 @@ impl Remote {
                                 let _ = this.update(cx, |s, cx| {
                                     s.qr = None;
                                     if let Some(r) = &mut s.report {
-                                        r.host.pairing = None;
+                                        r.access.host.pairing = None;
                                     }
                                     cx.notify();
                                 });
@@ -109,7 +109,10 @@ impl Remote {
         let before_run = help.clone();
         let result = crate::terminal::open_checked(
             self.project.clone(),
-            help.command(),
+            crate::terminal::TerminalCommand {
+                program: "/usr/bin/sudo".into(),
+                args: help.args(),
+            },
             move || {
                 *checked.lock().unwrap() = Some(before_run.prepare()?);
                 Ok(())
@@ -118,7 +121,7 @@ impl Remote {
                 let lease = lease.lock().unwrap().take();
                 owner.update(app, |s, cx| {
                     s.busy = false;
-                    s.perform(move || help.finish(status, lease), cx);
+                    s.perform(move || help.finish(status, lease).map(Report::from), cx);
                 });
             },
             cx,
@@ -132,14 +135,14 @@ impl Remote {
     /// What Settings → Remote access shows, for the desk stats probe.
     pub fn probe_state(&self) -> crate::platform::layout_probe::RemoteProbe {
         let report = self.report.as_ref();
-        let permission = report.and_then(|r| r.denied.as_ref());
+        let permission = report.and_then(|r| r.access.denied.as_ref());
         crate::platform::layout_probe::RemoteProbe {
             checking: self.busy,
             finished: self.finished,
             notice: self.message.clone().or(permission.map(|p| p.error.clone())),
             permission: permission.map(|p| p.suggested()),
-            enabled: report.is_some_and(|r| r.host.enabled),
-            origin: report.and_then(|r| r.host.origin.clone()),
+            enabled: report.is_some_and(|r| r.access.host.enabled),
+            origin: report.and_then(|r| r.access.host.origin.clone()),
         }
     }
     fn action(
@@ -168,7 +171,7 @@ impl Render for Remote {
             .flex_col()
             .gap_3()
             .child(div().text_size(p.text(Step::Title)).child("Remote access"));
-        let permission = self.report.as_ref().and_then(|r| r.denied.as_ref());
+        let permission = self.report.as_ref().and_then(|r| r.access.denied.as_ref());
         if let Some(msg) = self
             .message
             .as_ref()
@@ -228,21 +231,21 @@ impl Render for Remote {
         let mut buttons = div().flex().flex_wrap().gap_2();
         buttons = buttons.child(self.action(p, "remote-refresh", "Refresh", Operation::Status, cx));
         if let Some(report) = &self.report {
-            if let Ok(node) = &report.network {
+            if let Ok(node) = &report.access.network {
                 view = view.child(format!("Tailscale account · {}", node.login));
                 if let Some(reason) = node.reason() {
                     view = view.child(reason);
                 }
-                let ready = report.host.enabled
+                let ready = report.access.host.enabled
                     && node.ready()
-                    && report.host.origin.as_ref() == Some(&node.origin);
+                    && report.access.host.origin.as_ref() == Some(&node.origin);
                 if ready {
                     view = view.child(node.origin.clone());
                     buttons = buttons.child(self.action(
                         p,
                         "remote-pair",
                         "Pair a device",
-                        Operation::Pair,
+                        Operation::Pair { terminal: false },
                         cx,
                     ));
                 } else if node.available() {
@@ -254,7 +257,7 @@ impl Render for Remote {
                         cx,
                     ));
                 }
-            } else if let Err(msg) = &report.network {
+            } else if let Err(msg) = &report.access.network {
                 view = view.child(msg.clone());
                 let mut setup = div().flex().flex_wrap().gap_2().child(button(
                     p,
@@ -280,7 +283,8 @@ impl Render for Remote {
                 }
                 view = view.child(setup);
             }
-            if report.host.enabled || report.network.as_ref().is_ok_and(|n| n.ready()) {
+            if report.access.host.enabled || report.access.network.as_ref().is_ok_and(|n| n.ready())
+            {
                 buttons = buttons.child(self.action(
                     p,
                     "remote-disable",
@@ -289,10 +293,15 @@ impl Render for Remote {
                     cx,
                 ));
             }
-            if let (Some(image), Some(pair)) = (&self.qr, &report.host.pairing) {
+            if let (Some(image), Some(pair)) = (&self.qr, &report.access.host.pairing) {
                 let url = pair.url.clone();
+                if let Some(code) = &pair.short_code {
+                    view = view.child(format!("Desktop pairing code · {code}"));
+                }
                 view = view
-                    .child("Scan with your phone while connected to your tailnet.")
+                    .child(
+                        "Scan on your phone or paste the pairing link in Add host on your desktop.",
+                    )
                     .child(img(image.clone()).size(px(224.)).bg(white()))
                     .child(button(
                         p,
@@ -305,10 +314,10 @@ impl Render for Remote {
                         },
                     ));
             }
-            if !report.host.devices.is_empty() {
+            if !report.access.host.devices.is_empty() {
                 view = view.child(div().text_size(p.text(Step::Title)).child("Paired devices"));
             }
-            for device in &report.host.devices {
+            for device in &report.access.host.devices {
                 let id = device.id.clone();
                 let grant = id.clone();
                 let enable = !device.terminal;

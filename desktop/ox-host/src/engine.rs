@@ -10,6 +10,7 @@ use ox_desk_core::{
     actions::Action,
     changed::Changed,
     handoff::HandoffStart,
+    host_policy::HostPolicy,
     host_protocol::{self as wire, Change, Client, Cursor, ProcessView, Scope, ScopeState, Server},
     inbox::Inbox,
     links::LinkEvent,
@@ -36,12 +37,19 @@ pub(crate) enum Message {
     Runtime(Scope, u64),
     Schema(Scope, u64, Box<ox_desk_core::slash::Capabilities>),
     Discovered(u64, Box<Server>),
+    ProjectDirectory(wire::ProjectDirectory),
+    HandoffTarget(u64, String, Result<Value, String>),
+    HostsListed(PathBuf, Result<Value, String>),
+    Outbound(Box<forwarding::Event>),
+    WorkerResult(u64, Box<Result<ox_host_web::worker_result::Report, String>>),
+    LinkedJob(Box<ox_host_web::linked_jobs::VerifiedJob>, Replier),
     Gateway {
         caller: Caller,
         request: Box<Gateway>,
         reply: Replier,
     },
     Stop,
+    Replace(PathBuf, std::os::unix::net::UnixStream),
     /// Upgrade handover: refuse new turns, let running turns finish until the
     /// deadline, then stop. The next host reads why the previous one stopped.
     Drain(Duration),
@@ -164,6 +172,7 @@ pub(crate) struct Asking {
 }
 /// A handoff waiting for its source's older history to load.
 struct Preparing {
+    export_to: Option<(String, uuid::Uuid)>,
     source: Scope,
     start: HandoffStart,
     reply: Replier,
@@ -175,9 +184,11 @@ struct Preparing {
     /// None means the lookup is still running.
     window: std::sync::Arc<std::sync::Mutex<Option<Option<u64>>>>,
     window_deadline: Instant,
+    mode_approval: Option<YoloAllowance>,
 }
 /// A read_ox_thread call waiting for its source transcript to load.
 struct Reading {
+    frozen: bool,
     scope: Scope,
     session: String,
     source: Box<ox_desk_core::handoff::HandoffSource>,
@@ -193,11 +204,13 @@ struct ReadArgs {
     limit: usize,
 }
 struct ClientState {
+    update_lease: Option<tokio::sync::RwLockWriteGuard<'static, ()>>,
     peer: Peer,
     hello: bool,
     prepared: Option<crate::runtime::Prepared>,
     subscription: Option<Option<Scope>>,
     catalog: bool,
+    watch_resources: bool,
     /// A desktop window that may take a terminal handoff held for its scope.
     terminal: bool,
     /// The interface this connection declared after its hello. None for an older
@@ -299,8 +312,14 @@ const OVERDUE_MAILBOX_BURST: u32 = 32;
 const REAP_EVERY: Duration = Duration::from_secs(60);
 
 pub(crate) struct Engine {
+    pub(crate) replacement: Option<PathBuf>,
     config: RuntimeConfig,
     schema_reader: std::sync::Arc<ox_desk_core::codex::installed::SchemaReader>,
+    host_id: uuid::Uuid,
+    resources: crate::resources::Resources,
+    next_resources: Instant,
+    host_name: String,
+    subscription_limits: ox_desk_core::usage::reported::ReportedLimits,
     ledger: Ledger,
     replay: Replay,
     tx: SyncSender<Message>,
@@ -309,6 +328,8 @@ pub(crate) struct Engine {
     cold: HashMap<Scope, ScopeState>,
     launched: u64,
     workers: Registry,
+    result_maintenance: Option<thread::JoinHandle<()>>,
+    worker_results: HashMap<u64, linked::ResultState>,
     receipts: Receipts,
     notice_attempts: HashMap<u64, Instant>,
     notice_history: HashMap<u64, notices::HistoryPage>,
@@ -318,18 +339,29 @@ pub(crate) struct Engine {
     yolo_announced: HashSet<PathBuf>,
     /// Launch cautions by job number, recorded on the worker when it is stamped.
     launch_warnings: HashMap<u64, String>,
+    project_queries: Vec<(u64, String)>,
     discovered: HashMap<(Scope, String), ox_desk_core::store::ThreadRow>,
     asking: BTreeMap<u64, Asking>,
+    mode_requests: BTreeMap<u64, mode_requests::ModeRequest>,
     preparing: Vec<Preparing>,
     reading: Vec<Reading>,
+    relays: flows::history::Relays,
+    forward: forwarding::State,
+    host_queries: HashMap<PathBuf, Vec<HostQuery>>,
     in_flows: bool,
     draining: Option<Instant>,
-    idle_update_owner: Option<u64>,
     state_dir: PathBuf,
     idle: Duration,
     next_reap: Instant,
+    last_mode_policy: Option<HostPolicy>,
 }
 mod flows;
+mod forward_queue;
+pub(crate) mod forwarding;
+mod linked;
+mod placement;
+use placement::HostQuery;
+mod mode_requests;
 mod notices;
 
 impl Drop for Engine {
@@ -350,6 +382,7 @@ impl Engine {
         tx: SyncSender<Message>,
     ) -> io::Result<Self> {
         let mut ledger = Ledger::open(dir)?;
+        let host_id = crate::identity::load(dir)?;
         let seq = ledger.data.reserved;
         let mut workers = Registry::default();
         for saved in &ledger.data.scopes {
@@ -357,6 +390,7 @@ impl Engine {
                 workers.restore(&saved.scope, id, origin, marks);
             }
         }
+        forwarding::recover(&ledger, dir)?;
         notices::recover(&mut ledger, &workers)?;
         ledger.retire(&crate::handover::take(dir))?;
         let cold = ledger
@@ -373,6 +407,12 @@ impl Engine {
         // new epoch discards the previous runtime's tokens.
         ledger.begin(seq)?;
         Ok(Self {
+            replacement: None,
+            host_id,
+            resources: Default::default(),
+            next_resources: Instant::now(),
+            subscription_limits: Default::default(),
+            host_name: sysinfo::System::host_name().unwrap_or_else(|| host_id.to_string()),
             config,
             ledger,
             replay: Replay::new(seq, nonce()?),
@@ -382,26 +422,34 @@ impl Engine {
             cold,
             launched: 0,
             workers,
+            result_maintenance: None,
+            worker_results: Default::default(),
             receipts: Receipts::default(),
             notice_attempts: HashMap::new(),
             notice_history: HashMap::new(),
             yolo_projects: Vec::new(),
             yolo_announced: HashSet::new(),
             launch_warnings: HashMap::new(),
+            project_queries: Vec::new(),
             discovered: Default::default(),
             asking: Default::default(),
+            mode_requests: Default::default(),
             preparing: Default::default(),
             reading: Default::default(),
+            relays: Default::default(),
+            forward: Default::default(),
+            host_queries: Default::default(),
             in_flows: false,
             draining: None,
-            idle_update_owner: None,
             state_dir: dir.to_owned(),
             idle: idle_timeout(std::env::var("OX_HOST_IDLE_MINUTES").ok().as_deref()),
             next_reap: Instant::now() + REAP_EVERY,
+            last_mode_policy: HostPolicy::read(dir).ok(),
             schema_reader: Default::default(),
         })
     }
     pub(crate) fn serve(&mut self, rx: Receiver<Message>) -> io::Result<()> {
+        self.recover_worker_results();
         // Mailbox messages served in a row while a timer was already overdue.
         let mut overdue_streak = 0u32;
         loop {
@@ -430,7 +478,15 @@ impl Engine {
                         .filter(|at| *at > Instant::now()),
                 )
                 .chain(self.reading.iter().map(|r| r.deadline))
+                .chain(self.relays.deadline())
                 .chain(self.draining)
+                .chain(
+                    self.clients
+                        .values()
+                        .any(|c| c.watch_resources)
+                        .then_some(self.next_resources),
+                )
+                .chain(self.forward_deadline())
                 .chain(Some(self.next_reap))
                 .min();
             let msg = if deadline.is_some_and(|at| at <= Instant::now()) {
@@ -483,11 +539,31 @@ impl Engine {
                             self.process(&scope, vec![], false)?;
                         }
                     }
+                    if now >= self.next_resources
+                        && self.clients.values().any(|c| c.watch_resources)
+                    {
+                        self.next_resources = now + crate::resources::INTERVAL;
+                        let frame = encode(&Server::HostStatus {
+                            host: self.host_info(),
+                        })?;
+                        self.clients.retain(|_, c| {
+                            !c.watch_resources || c.peer.send_for(frame.clone(), "host resources")
+                        });
+                    }
                     if now >= self.next_reap {
                         self.next_reap = now + REAP_EVERY;
+                        self.refresh_mode_policy()?;
+                        self.recover_worker_results();
+                        self.maintain_worker_results();
                         self.reap_idle(now)?;
                     }
+                    self.poll_forwarded(now)?;
                     self.advance_flows()?;
+                }
+                Some(Message::Replace(binary, _reservation)) => {
+                    crate::handover::record(&self.state_dir, "upgrade", 0)?;
+                    self.replacement = Some(binary);
+                    break;
                 }
                 Some(Message::Stop) => {
                     crate::handover::record(&self.state_dir, "stop", self.running_turns())?;
@@ -513,6 +589,21 @@ impl Engine {
                         self.process(&scope, vec![], true)?;
                     }
                 }
+                Some(Message::HostsListed(project, result)) => {
+                    self.hosts_listed(project, result)?
+                }
+                Some(Message::Outbound(event)) => self.outbound(*event)?,
+                Some(Message::WorkerResult(id, result)) => {
+                    let state = match *result {
+                        Ok(report) => linked::ResultState::Ready(report),
+                        Err(error) => linked::ResultState::Retry {
+                            error,
+                            after: Instant::now() + Duration::from_secs(60),
+                        },
+                    };
+                    self.worker_results.insert(id, state);
+                }
+                Some(Message::LinkedJob(job, reply)) => self.linked_job(*job, reply)?,
                 Some(Message::Gateway {
                     caller,
                     request,
@@ -522,23 +613,23 @@ impl Engine {
                         self.answer(reply, Err(crate::handover::REFUSAL.into()))?
                     }
                     Gateway::Launch(start) => self.launch(caller, start, reply)?,
+                    Gateway::Call(ParentCall::ListHosts) => self.list_hosts(&caller, reply)?,
                     Gateway::Call(call @ ParentCall::ReadThread { .. }) => {
                         self.read_thread(&caller, call, reply)?
                     }
-                    Gateway::Call(call) => {
-                        let result = self.parent_call(&caller, call);
-                        self.answer(reply, result)?;
-                    }
+                    Gateway::Call(call) => self.dispatch_parent_call(&caller, call, reply)?,
                 },
                 Some(Message::Connect(id, peer)) => {
                     self.clients.insert(
                         id,
                         ClientState {
+                            update_lease: None,
                             peer,
                             hello: false,
                             prepared: None,
                             subscription: None,
                             catalog: false,
+                            watch_resources: false,
                             terminal: false,
                             surface: None,
                         },
@@ -546,9 +637,10 @@ impl Engine {
                 }
                 Some(Message::Disconnect(id)) => {
                     self.clients.remove(&id);
-                    if self.idle_update_owner == Some(id) {
-                        self.idle_update_owner = None;
-                    }
+                    self.drop_history_relay(id)?;
+                    self.withdraw_activations(|request| matches!(
+                        &request.activation, mode_requests::Activation::RemoteHandoff { client, .. } if *client == id
+                    ), "The desktop disconnected before approving the handoff.")?;
                 }
                 Some(Message::Request(id, request)) => {
                     if let Err(e) = self.request(id, *request) {
@@ -570,6 +662,21 @@ impl Engine {
                     {
                         let batch = s.inbox.take();
                         self.process(&scope, batch, false)?;
+                    }
+                }
+                Some(Message::HandoffTarget(id, key, result)) => {
+                    self.answer(Replier::Client(id, key), result)?
+                }
+                Some(Message::ProjectDirectory(directory)) => {
+                    for (client, key) in std::mem::take(&mut self.project_queries) {
+                        self.reply(
+                            client,
+                            Server::DiscoveredEnd {
+                                id: key,
+                                errors: Vec::new(),
+                                directory: Some(directory.clone()),
+                            },
+                        )?;
                     }
                 }
                 Some(Message::Discovered(id, frame)) => {
@@ -615,23 +722,32 @@ impl Engine {
         }
         match message {
             Client::ReserveIdleUpdate => {
+                self.refresh_mode_policy()?;
                 let ready = self.draining.is_none()
                     && !self.update_reserved()
                     && self.running_turns() == 0
                     && self.asking.is_empty()
+                    && self.mode_requests.is_empty()
                     && self.running.values().all(|live| {
                         !live.store.has_pending_turn()
                             && live.store.asks().is_empty()
                             && live.opening.is_none()
                             && live.terminal.is_none()
                     });
-                if ready {
-                    self.idle_update_owner = Some(id);
+                let lease = ready
+                    .then(|| ox_host_web::host_updates::TERMINALS.try_write().ok())
+                    .flatten();
+                let ready = lease.is_some();
+                if let Some(lease) = lease {
+                    self.clients
+                        .get_mut(&id)
+                        .expect("connected client")
+                        .update_lease = Some(lease);
                 }
                 self.reply(id, Server::IdleUpdate { ready })
             }
             Client::Hello { version } => {
-                if version != wire::VERSION {
+                let Some(version) = wire::negotiate(version) else {
                     let message = wire::version_mismatch(wire::VERSION, version);
                     let _ = self.reply(
                         id,
@@ -641,48 +757,62 @@ impl Engine {
                         },
                     );
                     return Err(io::Error::other(message));
-                }
+                };
                 let prepared = self.config.prepare().ok();
                 let routes = prepared
                     .as_ref()
                     .map(|s| s.routes.clone())
                     .unwrap_or_default();
+                let mut capabilities: Vec<String> = [
+                    "snapshot",
+                    "resume",
+                    "actions",
+                    "approvals",
+                    "workers",
+                    "live_catalog",
+                    "project_directory",
+                    "host_status",
+                    "host_mode_policy",
+                    "end",
+                    "processes",
+                    wire::IDLE_UPDATE,
+                    ox_desk_core::surface::CAPABILITY,
+                ]
+                .map(str::to_owned)
+                .into();
+                capabilities.push("worker_inventory".into());
+                capabilities.push("worker_codex_subscription".into());
+                capabilities.push("worker_placement".into());
+                capabilities.push("remote_handoff".into());
+                capabilities.push("handoff_history".into());
+                capabilities.push("linked_read_workers".into());
+                capabilities.push("linked_write_workers".into());
+                if prepared.is_some() {
+                    capabilities.push("worker_routes_known".into());
+                }
+                capabilities.extend(
+                    self.config
+                        .installed_runtimes()
+                        .iter()
+                        .map(|runtime| format!("worker_runtime_{}", runtime.executable())),
+                );
+                if prepared.as_ref().is_some_and(|s| s.has_api_provider()) {
+                    capabilities.push("worker_api_provider".into());
+                }
                 let client = self.clients.get_mut(&id).unwrap();
                 client.hello = true;
                 client.prepared = prepared;
-                let mut projects = self.config.projects();
-                projects.extend(
-                    self.running
-                        .keys()
-                        .chain(self.cold.keys())
-                        .map(|s| s.project.clone()),
-                );
-                projects.sort();
-                projects.dedup();
+                let projects =
+                    crate::projects::known(&self.config, &self.state_dir, self.scope_projects());
+                let host = Some(self.host_info());
                 self.reply(
                     id,
                     Server::Hello {
                         version,
-                        capabilities: [
-                            "snapshot",
-                            "resume",
-                            "actions",
-                            "approvals",
-                            "workers",
-                            "live_catalog",
-                            "end",
-                            "processes",
-                            wire::IDLE_UPDATE,
-                            ox_desk_core::surface::CAPABILITY,
-                        ]
-                        .map(str::to_owned)
-                        .into(),
+                        capabilities,
                         routes,
                         projects,
-                        host: Some(wire::HostInfo {
-                            version: crate::handover::version().into(),
-                            epoch: self.replay.cursor.epoch.clone(),
-                        }),
+                        host,
                     },
                 )
             }
@@ -732,9 +862,30 @@ impl Engine {
                     )),
                 }
             }
+            Client::WorkerHosts { id: key, project } => {
+                let reply = Replier::Client(id, key);
+                if !key_ok(&reply) {
+                    return self.answer(reply, Err("Invalid worker inventory request.".into()));
+                }
+                match project.canonicalize() {
+                    Ok(project) => self.query_hosts(project, HostQuery::List(reply)),
+                    Err(e) => self.answer(reply, Err(e.to_string())),
+                }
+            }
             Client::ListProcesses { id: key } => {
                 let processes = self.processes();
                 self.reply(id, Server::Processes { id: key, processes })
+            }
+            Client::WatchHost => {
+                if !self.clients.values().any(|c| c.watch_resources) {
+                    self.next_resources = Instant::now() + crate::resources::INTERVAL;
+                }
+                self.clients
+                    .get_mut(&id)
+                    .expect("connected")
+                    .watch_resources = true;
+                let host = self.host_info();
+                self.reply(id, Server::HostStatus { host })
             }
             Client::WatchCatalog => {
                 let client = self.clients.get_mut(&id).expect("connected");
@@ -765,6 +916,56 @@ impl Engine {
                 }
                 self.subscribe(id, scope, after)
             }
+            Client::WatchHandoffReads { proof } => {
+                if self
+                    .clients
+                    .get(&id)
+                    .is_some_and(|c| c.surface == Some(ox_desk_core::surface::Surface::Desktop))
+                {
+                    self.relays.watch(id, &proof);
+                }
+                Ok(())
+            }
+            Client::ReadHandoffPage {
+                id: key,
+                broker,
+                source_host,
+                target_host,
+                scope,
+                transfer,
+                page,
+            } => self.serve_history(
+                Replier::Client(id, key),
+                &source_host,
+                &target_host,
+                &scope,
+                &transfer,
+                page,
+                broker.as_deref(),
+            ),
+            Client::FinishHandoffRead { token, result } => self.finish_history(id, &token, result),
+            Client::InspectHandoffTarget { id: key, scope } => {
+                self.inspect_handoff_target(id, key, scope);
+                Ok(())
+            }
+            Client::PrepareRemoteHandoff {
+                id: key,
+                scope,
+                start,
+                target_host,
+                window,
+            } => {
+                let result = self.export_handoff(id, &key, scope, start, target_host, window);
+                if let Err(error) = result {
+                    self.answer(Replier::Client(id, key), Err(error.to_string()))?;
+                }
+                Ok(())
+            }
+            Client::ReceiveRemoteHandoff {
+                id: key,
+                scope,
+                packet,
+            } => self.receive_handoff(id, key, scope, packet, None),
             Client::WorkerLaunch {
                 id: key,
                 mut caller,
@@ -791,15 +992,15 @@ impl Engine {
                 if matches!(call, ParentCall::ReadThread { .. }) {
                     return self.read_thread(&Caller::External(caller), call, reply);
                 }
-                let result = caller
-                    .project
-                    .canonicalize()
-                    .map_err(|e| e.to_string())
-                    .and_then(|project| {
-                        caller.project = project;
-                        self.parent_call(&Caller::External(caller), call)
-                    });
-                self.answer(reply, result)
+                match caller.project.canonicalize() {
+                    Ok(project) => caller.project = project,
+                    Err(e) => return self.answer(reply, Err(e.to_string())),
+                }
+                let caller = Caller::External(caller);
+                if matches!(call, ParentCall::ListHosts) {
+                    return self.list_hosts(&caller, reply);
+                }
+                self.dispatch_parent_call(&caller, call, reply)
             }
             Client::Act {
                 id: key,
@@ -873,6 +1074,10 @@ impl Engine {
                 {
                     Err(e) => return self.reply(id, fail(e.to_string())),
                     Ok(Some(receipt)) => {
+                        if let Some(owner) = self.waiting_open_client(&scope, &key) {
+                            *owner = id;
+                            return Ok(());
+                        }
                         if let Some(thread) = receipt.opened {
                             self.reply(
                                 id,
@@ -918,6 +1123,7 @@ impl Engine {
                 let accepted = matches!(result, Server::Ack { .. });
                 // Only accepted actions are receipts. A refusal is often transient, so a corrected
                 // retry with the same key must run again rather than replay the refusal.
+                let waiting = accepted && self.waiting_open_client(&scope, &key).is_some();
                 if accepted {
                     self.receipts
                         .insert(scope.clone(), key, generation, hash, result.clone());
@@ -928,9 +1134,61 @@ impl Engine {
                         self.reap_empty(&scope)?;
                     }
                 }
+                if waiting {
+                    return Ok(());
+                }
                 self.reply(id, result)
             }
-            Client::Discover { id: key } => {
+            Client::Discover {
+                id: key,
+                projects: Some(query),
+            } => {
+                let checkout = match query {
+                    wire::ProjectQuery::List => {
+                        self.project_queries.push((id, key.clone()));
+                        if self.project_queries.len() > 1 {
+                            return Ok(());
+                        }
+                        None
+                    }
+                    wire::ProjectQuery::Checkout(path) => Some(path),
+                };
+                let mut scopes = self.scope_projects();
+                scopes.extend(
+                    self.discovered
+                        .keys()
+                        .map(|(scope, _)| scope.project.clone()),
+                );
+                let config = self.config.clone();
+                let state_dir = self.state_dir.clone();
+                let tx = self.tx.clone();
+                thread::spawn(move || {
+                    let directory = crate::projects::directory(
+                        &config,
+                        &state_dir,
+                        scopes,
+                        checkout.as_deref(),
+                    );
+                    let message = if checkout.is_some() {
+                        Message::Discovered(
+                            id,
+                            Box::new(Server::DiscoveredEnd {
+                                id: key,
+                                errors: Vec::new(),
+                                directory: Some(directory),
+                            }),
+                        )
+                    } else {
+                        Message::ProjectDirectory(directory)
+                    };
+                    let _ = tx.send(message);
+                });
+                Ok(())
+            }
+            Client::Discover {
+                id: key,
+                projects: None,
+            } => {
                 let cfg = self.config.clone();
                 let tx = self.tx.clone();
                 thread::spawn(move || {
@@ -953,7 +1211,11 @@ impl Engine {
                     );
                     let _ = tx.send(Message::Discovered(
                         id,
-                        Box::new(Server::DiscoveredEnd { id: key, errors }),
+                        Box::new(Server::DiscoveredEnd {
+                            id: key,
+                            errors,
+                            directory: None,
+                        }),
                     ));
                 });
                 Ok(())
@@ -1074,6 +1336,9 @@ impl Engine {
         let mut store = self
             .config
             .open(scope, prepared, move |event| into.push(event))?;
+        // Opening the route also subscribes it for stop, approval and recovery.
+        // Actual launches read the policy again and report an unreadable file.
+        store.use_host_policy(HostPolicy::read(&self.state_dir).unwrap_or(HostPolicy::AlwaysRead));
         let previous = self.running.get_mut(scope);
         let prior = previous
             .as_ref()
@@ -1085,7 +1350,13 @@ impl Engine {
         if let Some(previous) = previous {
             store.recover_from(&mut previous.store);
         }
-        annotate(&self.workers, &self.ledger.data, scope, &mut store);
+        annotate(
+            &self.host_id.to_string(),
+            &self.workers,
+            &self.ledger.data,
+            scope,
+            &mut store,
+        );
         let recovered = self
             .cold
             .remove(scope)
@@ -1131,6 +1402,7 @@ impl Engine {
                 }),
         );
         let _ = store.drain(vec![], Instant::now());
+        self.withdraw_activations(|r| &r.scope == scope, "The session host closed this route.")?;
         self.running.insert(
             scope.clone(),
             Live {
@@ -1161,6 +1433,18 @@ impl Engine {
         action: Action,
         approval: Option<String>,
     ) -> io::Result<()> {
+        self.refresh_mode_policy()?;
+        self.act_with_mode_approval(id, key, scope, action, approval, None)
+    }
+    fn act_with_mode_approval(
+        &mut self,
+        id: u64,
+        key: &str,
+        scope: &Scope,
+        action: Action,
+        approval: Option<String>,
+        approved_mode: Option<(ox_desk_core::modes::Level, Sender)>,
+    ) -> io::Result<()> {
         let live = self.running.get_mut(scope).expect("validated live scope");
         if let Action::AnswerAsk(ask, _) | Action::AnswerQuestions(ask, _) = &action
             && (approval.is_none() || live.tokens.get(ask) != approval.as_ref())
@@ -1172,6 +1456,13 @@ impl Engine {
         if let Action::AnswerAsk(ask, choice) = &action
             && let Some(job) = crate::yolo::job_of(ask)
         {
+            if self.mode_requests.contains_key(&job) {
+                let result = self.answer_activation(id, scope, job, *choice);
+                if result.is_err() {
+                    self.process(scope, vec![], true)?;
+                }
+                return result;
+            }
             return self.answer_yolo(id, scope, job, *choice);
         }
         if let Action::AnswerQuestions(ask, _) = &action
@@ -1306,7 +1597,10 @@ impl Engine {
         ) && parsed
             .as_ref()
             .is_some_and(|command| command.starts_thread()));
-        if opens && (live.opening.is_some() || live.launching.is_some()) {
+        let pending_open = self.mode_requests.values().any(|r| {
+            &r.scope == scope && matches!(&r.activation, mode_requests::Activation::Open {source, ..} if source == &target)
+        });
+        if opens && (live.opening.is_some() || live.launching.is_some() || pending_open) {
             return Err(io::Error::other(
                 "Another session is opening on this route.",
             ));
@@ -1337,6 +1631,15 @@ impl Engine {
                 | Action::SendImages(Some(_), _, _)
                 | Action::Submit(Some(_))
         );
+        // Stock Claude may start a saved process to execute a slash command, just as for a send.
+        let resume_command = matches!(
+            &action,
+            Action::PaletteCommand(Some(_), _)
+                | Action::NativeCommand(Some(_), _)
+                | Action::ExecuteCommand(Some(_))
+        ) && parsed
+            .as_ref()
+            .is_some_and(|command| command.starts_thread());
         let access = match &action {
             Action::SetAccess(_, mode) => Some(*mode),
             _ => None,
@@ -1354,9 +1657,91 @@ impl Engine {
         }
         // The stamp describes who sent this message. It is fixed here, at acceptance, and
         // travels with the message; it never enters the digest or an authorization check.
-        let sender = self.sender(id);
+        if let Action::SetAccess(owner, mode) = &action
+            && self.stage_mode_change(scope, owner, *mode, approved_mode.is_some())?
+        {
+            return Ok(());
+        }
+        let may_open = opens
+            || operator_turn
+            || matches!(
+                &action,
+                Action::SelectThread(_)
+                    | Action::OpenCatalogRow(_)
+                    | Action::ConfirmAliasAndResume(_)
+                    | Action::PaletteCommand(..)
+                    | Action::NativeCommand(..)
+                    | Action::ExecuteCommand(_)
+            );
+        let sender = approved_mode
+            .as_ref()
+            .map_or_else(|| self.sender(id), |(_, sender)| sender.clone());
         let live = self.running.get_mut(scope).expect("validated live scope");
-        live.store.dispatch_as(action, sender)?;
+        let mut fork_restore = None;
+        if may_open {
+            let policy = HostPolicy::read(&self.state_dir)?;
+            live.store.use_host_policy(policy);
+            let resume = target.as_deref().filter(|t| {
+                (operator_turn || resume_command)
+                    && live.store.is_session_scoped()
+                    && !live.store.has_live_session(t)
+            });
+            if (opens || resume.is_some()) && policy == HostPolicy::YoloAsksEveryTime {
+                let level = if let Some(t) = resume {
+                    live.store
+                        .claude_resume_access(t)
+                        .and_then(|mode| ox_desk_core::modes::Level::of(scope.route.runtime, mode))
+                } else if fork {
+                    (!live.store.is_session_scoped())
+                        .then(|| live.store.applied_ceiling(target.as_deref()))
+                        .flatten()
+                } else {
+                    live.store
+                        .next_access()
+                        .and_then(|mode| ox_desk_core::modes::Level::of(scope.route.runtime, mode))
+                };
+                if let Some((granted, _)) = approved_mode {
+                    if let Some(t) = resume {
+                        live.store
+                            .choose_resume_access(t, granted.preset(scope.route.runtime));
+                    } else if fork {
+                        live.store.set_host_start(Some(granted));
+                        fork_restore = Some(policy.starting_level());
+                    } else {
+                        live.store
+                            .set_next_access(granted.preset(scope.route.runtime));
+                    }
+                } else if level == Some(ox_desk_core::modes::Level::Yolo) {
+                    let action = match action {
+                        Action::Submit(owner) => Action::SendImages(
+                            owner.clone(),
+                            live.store.draft(owner.as_deref()).to_owned(),
+                            live.store.draft_images(owner.as_deref()).to_vec(),
+                        ),
+                        Action::ExecuteCommand(owner) => {
+                            let command = live.store.draft(owner.as_deref()).to_owned();
+                            Action::PaletteCommand(owner, command)
+                        }
+                        other => other,
+                    };
+                    return self.ask_activation(
+                        scope,
+                        mode_requests::Activation::Open {
+                            client: id,
+                            key: key.into(),
+                            action: Box::new(action),
+                            sender,
+                            source: target.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        let sent = live.store.dispatch_as(action, sender);
+        if let Some(before) = fork_restore {
+            live.store.set_host_start(before);
+        }
+        sent?;
         if fork && let (Some(origin), Some(source)) = (&origin, &target) {
             live.fork_origin = Some(origin.fork(source));
         }
@@ -1412,6 +1797,9 @@ impl Engine {
         for event in events {
             let previous = live.store.asks().len();
             live.store.apply(event);
+            if let Some(report) = live.store.usage.worker_report.take() {
+                self.subscription_limits.record(&scope.route, report);
+            }
             if !live.tokens.is_empty() && live.store.asks().len() < previous {
                 live.tokens
                     .retain(|id, _| live.store.asks().iter().any(|a| &a.id == id));
@@ -1461,6 +1849,54 @@ impl Engine {
         }
         let launch_failure = advance_launch(live);
         let mut dirty = live.store.drain(vec![], Instant::now());
+        self.mode_requests.retain(|_, request| {
+            &request.scope != scope || !matches!(&request.activation, mode_requests::Activation::Resume(id) if !live.store.resume_held(id))
+        });
+        // Record archival even if result preparation is still running. A restarted
+        // host can subsequently retire the published ref from this durable marker.
+        for (id, entry) in self.workers.in_scope(scope) {
+            if let Some(link) = &entry.origin.linked
+                && entry.origin.requested != Level::Read
+                && live.store.archived_threads().contains(id)
+            {
+                let job = self
+                    .state_dir
+                    .join("linked-work/jobs")
+                    .join(&link.host)
+                    .join(entry.origin.job_id.to_string());
+                if let Err(e) = ox_host_web::worker_result::archive(&job) {
+                    eprintln!(
+                        "ox host: could not record worker archival for job {}: {e}",
+                        entry.origin.job_id
+                    );
+                }
+            }
+        }
+        let archived: HashSet<_> = self
+            .mode_requests
+            .values()
+            .filter(|r| &r.scope == scope)
+            .filter_map(|r| r.view.thread.as_ref())
+            .filter(|t| live.store.archived_threads().contains(*t))
+            .cloned()
+            .collect();
+        let resumes = live.store.new_resume_reviews();
+        if !archived.is_empty() {
+            self.withdraw_activations(
+                |r| {
+                    &r.scope == scope
+                        && r.view
+                            .thread
+                            .as_ref()
+                            .is_some_and(|id| archived.contains(id))
+                },
+                "The session was archived.",
+            )?;
+        }
+        for session in resumes.into_iter().filter(|id| !archived.contains(id)) {
+            self.ask_activation(scope, mode_requests::Activation::Resume(session))?;
+        }
+        let live = self.running.get_mut(scope).expect("live scope");
         if from_action {
             dirty.mark(Changed::THREADS | Changed::ASK | Changed::NOTICE);
             if let Some(id) = live.store.selected() {
@@ -1593,7 +2029,13 @@ impl Engine {
             live.store.drop_claude_worker();
             launched = Some(Finished::new(l, Err(error), None));
         }
-        annotate(&self.workers, &self.ledger.data, scope, &mut live.store);
+        annotate(
+            &self.host_id.to_string(),
+            &self.workers,
+            &self.ledger.data,
+            scope,
+            &mut live.store,
+        );
         let previous_yolo: Vec<wire::AskView> = {
             let (yolo, native): (Vec<_>, Vec<_>) = std::mem::take(&mut live.state.asks)
                 .into_iter()
@@ -1615,6 +2057,10 @@ impl Engine {
         let mut changes = live.store.host_project(scope, &dirty, &mut live.state);
         crate::yolo::merge(
             &self.asking,
+            self.mode_requests
+                .values()
+                .filter(|r| &r.scope == scope)
+                .map(|r| r.view.clone()),
             scope,
             previous_yolo,
             &mut live.state.asks,
@@ -1783,7 +2229,8 @@ impl Engine {
                     }
                 }
             })?;
-            if let Some(source) = f.origin.parent.scope.clone()
+            if !f.origin.launch.starts_with("handoff:")
+                && let Some(source) = f.origin.parent.scope.clone()
                 && self.running.contains_key(&source)
                 && &source != scope
             {
@@ -1810,7 +2257,7 @@ impl Engine {
             }
             return self.answer(f.reply, Err(flows::ENDED_PARENT.into()));
         }
-        if f.detached
+        if (f.detached || f.origin.linked.is_some())
             && let Err(e) = &f.result
         {
             let origin = f.origin.clone();
@@ -1835,10 +2282,53 @@ impl Engine {
         self.answer(f.reply, result)
     }
     fn update_reserved(&self) -> bool {
-        self.idle_update_owner
-            .is_some_and(|owner| self.clients.contains_key(&owner))
+        self.clients
+            .values()
+            .any(|client| client.update_lease.is_some())
     }
 
+    fn scope_projects(&self) -> std::collections::BTreeSet<PathBuf> {
+        self.running
+            .keys()
+            .chain(self.cold.keys())
+            .map(|s| s.project.clone())
+            .collect()
+    }
+    fn host_info(&mut self) -> wire::HostInfo {
+        let profile =
+            ox_host_web::host_profile::HostProfile::read(&self.state_dir).unwrap_or_default();
+        wire::HostInfo {
+            subscription_limits: self.subscription_limits.current(now_unix()),
+            mode_policy: HostPolicy::read(&self.state_dir).ok(),
+            id: Some(self.host_id.to_string()),
+            name: Some(if profile.name.is_empty() {
+                self.host_name.clone()
+            } else {
+                profile.name
+            }),
+            labels: profile.labels,
+            resources: Some(self.host_resources()),
+            version: crate::handover::version().into(),
+            epoch: self.replay.cursor.epoch.clone(),
+        }
+    }
+    fn host_resources(&mut self) -> wire::HostResources {
+        let workers = self
+            .running
+            .iter()
+            .map(|(scope, live)| {
+                live.store
+                    .active_thread_ids()
+                    .filter(|id| {
+                        self.workers.get(scope, id).is_some_and(|e| {
+                            e.origin.relation == ox_desk_core::origin::Relation::Worker
+                        })
+                    })
+                    .count()
+            })
+            .sum();
+        self.resources.sample(workers)
+    }
     /// Work a drain waits for: turns in progress in any loaded thread, worker
     /// launches and handoff targets not yet confirmed, and handoffs still
     /// preparing or reading their source.
@@ -1853,16 +2343,20 @@ impl Engine {
             .sum::<usize>()
             + self.preparing.len()
             + self.reading.len()
+            + self
+                .ledger
+                .data
+                .forwarded
+                .values()
+                .filter(|j| j.preparing())
+                .count()
     }
-    /// Check policy, then hand the launch to the worker's own runtime. Nothing
-    /// starts unless every check passes. The reply waits for the native session,
-    /// or, for a YOLO child that needs the operator, returns at once with
-    /// `waiting_for_operator`.
-    fn launch(&mut self, caller: Caller, start: WorkerStart, reply: Replier) -> io::Result<()> {
-        if self.update_reserved() {
-            return self.answer(reply, Err(crate::handover::REFUSAL.into()));
-        }
-        match self.accept_launch(&caller, start) {
+    fn start_accepted(
+        &mut self,
+        accepted: Result<Accepted, String>,
+        reply: Replier,
+    ) -> io::Result<()> {
+        match accepted {
             Ok(Accepted::Launch(scope, launching)) => {
                 let live = self.running.get_mut(&scope).expect("ensured worker scope");
                 live.launching = Some(Launching { reply, ..launching });
@@ -1875,28 +2369,41 @@ impl Engine {
     fn new_job_id(&self) -> Result<u64, String> {
         loop {
             let candidate = getrandom::u64().map_err(|e| e.to_string())? & ((1u64 << 52) - 1);
-            if candidate > 0
-                && !self.workers.job_ids().any(|j| j == candidate)
-                && !self
-                    .ledger
-                    .data
-                    .worker_notices
-                    .observed
-                    .contains_key(&candidate)
-                && !self.asking.contains_key(&candidate)
-                && !self
-                    .ledger
-                    .data
-                    .outcomes
-                    .iter()
-                    .any(|o| o.origin.job_id == candidate)
-            {
+            if candidate > 0 && !self.job_in_use(candidate) {
                 return Ok(candidate);
             }
         }
     }
-    fn accept_launch(&mut self, caller: &Caller, start: WorkerStart) -> Result<Accepted, String> {
-        start.validate()?;
+    fn job_in_use(&self, candidate: u64) -> bool {
+        self.ledger.data.forwarded.contains_key(&candidate)
+            || self.workers.job_ids().any(|j| j == candidate)
+            || self
+                .ledger
+                .data
+                .worker_notices
+                .observed
+                .contains_key(&candidate)
+            || self.asking.contains_key(&candidate)
+            || self.mode_requests.contains_key(&candidate)
+            || self
+                .ledger
+                .data
+                .outcomes
+                .iter()
+                .any(|o| o.origin.job_id == candidate)
+            || self.running.values().any(|l| {
+                l.launching
+                    .as_ref()
+                    .is_some_and(|job| job.origin.job_id == candidate)
+                    || l.confirming
+                        .as_ref()
+                        .is_some_and(|c| c.launch.origin.job_id == candidate)
+            })
+    }
+    fn worker_source(
+        &self,
+        caller: &Caller,
+    ) -> Result<(PathBuf, Option<String>, Option<Level>, bool), String> {
         let (project, parent, ceiling, parent_origin, external, parent_scope) = match caller {
             Caller::Hosted { scope, hint, .. } => {
                 let live = self
@@ -1936,12 +2443,26 @@ impl Engine {
                     Some(scope),
                 )
             }
+            Caller::Linked { project, .. } => (project.clone(), None, None, None, false, None),
             Caller::External(c) => (c.project.clone(), None, None, None, true, None),
         };
-        let source = parent_scope
-            .and_then(|_| crate::workers::source_level(ceiling, parent_origin.as_ref()));
+        let source = match caller {
+            Caller::Linked { stamp, .. } => Some(stamp.verified_level.min(stamp.link_ceiling)),
+            _ => parent_scope
+                .and_then(|_| crate::workers::source_level(ceiling, parent_origin.as_ref())),
+        };
+        Ok((project, parent, source, external))
+    }
+    fn accept_launch(&mut self, caller: &Caller, start: WorkerStart) -> Result<Accepted, String> {
+        start.validate()?;
+        let (project, parent, source, external) = self.worker_source(caller)?;
         let resolved =
             crate::workers::grant(source, external, start.mode_request(), start.runtime)?;
+        let policy = HostPolicy::read(&self.state_dir)
+            .map_err(|e| format!("Could not read the host mode policy: {e}"))?;
+        let ceiling = source.unwrap_or(crate::workers::TERMINAL_CEILING);
+        let requested = resolved.level;
+        let resolved = policy.child_start(resolved, start.mode_request(), ceiling, start.runtime);
         let this_parent = crate::workers::parent_ref(caller, parent.clone());
         self.check_worker_cap(&this_parent)?;
         let project = ox_desk_core::worker_checkout::resolve(
@@ -1954,8 +2475,12 @@ impl Engine {
             route: start.route(),
         })
         .map_err(|e| e.to_string())?;
-        let job_id = self.new_job_id()?;
+        let job_id = match caller {
+            Caller::Linked { job, .. } => *job,
+            _ => self.new_job_id()?,
+        };
         let mut origin = crate::workers::origin(caller, parent.clone(), &start, job_id, resolved);
+        origin.ceiling = requested.max(resolved.level);
         if let Some(warning) = self.write_overlap(&scope, resolved.level) {
             self.launch_warnings.insert(job_id, warning.clone());
             if let Some(live) = caller_scope(caller).and_then(|s| self.running.get_mut(s)) {
@@ -1964,6 +2489,12 @@ impl Engine {
         }
         if resolved.level.needs_person() {
             match caller {
+                _ if policy == HostPolicy::AlwaysYolo => {
+                    origin.yolo = Some(YoloAllowance::HostPolicy)
+                }
+                _ if policy == HostPolicy::YoloAsksEveryTime => {
+                    return self.worker_ask(origin, start, scope);
+                }
                 Caller::Operator { device, .. } if start.yolo_confirmed => {
                     origin.yolo = Some(YoloAllowance::Operator {
                         device: device.clone(),
@@ -1983,20 +2514,13 @@ impl Engine {
                                 session: session.to_owned(),
                             });
                         }
-                        None => {
-                            let parent_title = self.running[ps]
-                                .store
-                                .catalog_row(session)
-                                .map(|r| r.title().to_owned())
-                                .unwrap_or_else(|| "OX session".into());
-                            return Ok(Accepted::Ask(Asking {
-                                origin,
-                                start,
-                                target: scope,
-                                parent_title,
-                            }));
-                        }
+                        None => return self.worker_ask(origin, start, scope),
                     }
+                }
+                Caller::Linked { .. } => {
+                    return Err(
+                        "Cross-host YOLO starts require a target-side operator request.".into(),
+                    );
                 }
                 Caller::External(_) => {
                     return Err("A terminal launch cannot start YOLO workers.".into());
@@ -2005,6 +2529,32 @@ impl Engine {
         }
         let launching = self.prepare_launch(&scope, origin, Payload::Worker(start))?;
         Ok(Accepted::Launch(scope, launching))
+    }
+    fn worker_ask(
+        &self,
+        origin: Origin,
+        start: WorkerStart,
+        target: Scope,
+    ) -> Result<Accepted, String> {
+        let session = origin
+            .parent
+            .session
+            .as_deref()
+            .ok_or("A YOLO request needs an open parent session.")?;
+        let parent_title = origin
+            .parent
+            .scope
+            .as_ref()
+            .and_then(|scope| self.running.get(scope))
+            .and_then(|live| live.store.catalog_row(session))
+            .map(|row| row.title().to_owned())
+            .unwrap_or_else(|| "OX session".to_owned());
+        Ok(Accepted::Ask(Asking {
+            origin,
+            start,
+            target,
+            parent_title,
+        }))
     }
     /// Open the child's route and check that nothing else is opening there.
     fn prepare_launch(
@@ -2045,6 +2595,10 @@ impl Engine {
             crate::workers::status(entry, id, native, view, timeline, ready, self.operators());
         status["checkout"] = json!(scope.project);
         status["parent"] = json!(entry.origin.parent);
+        if let Some(link) = &entry.origin.linked {
+            status["parent"] = json!(link.parent);
+            status["linked_parent"] = json!(link);
+        }
         let requests = self.worker_requests(scope, id, &entry.origin);
         if !requests.is_empty() {
             let answerable = requests.iter().any(|r| r["parent_may_answer"] == true);
@@ -2101,6 +2655,11 @@ impl Engine {
                     session,
                 })
             }
+            Caller::Linked { stamp, .. } => Ok(Resolved::Linked {
+                source: stamp.host.clone(),
+                device: stamp.device.clone(),
+                request: stamp.request_id.clone(),
+            }),
             Caller::External(c) => Ok(Resolved::Terminal {
                 project: c.project.clone(),
                 launch: crate::workers::launch_digest("terminal", &c.launch),
@@ -2139,12 +2698,15 @@ impl Engine {
     }
     /// The parent agent's four tools. Every answer comes from host session state.
     fn parent_call(&mut self, caller: &Caller, call: ParentCall) -> Result<Value, String> {
+        let me = self.resolve(caller)?;
+        self.call_as(me, call)
+    }
+    fn call_as(&mut self, me: crate::workers::Resolved, call: ParentCall) -> Result<Value, String> {
         if self.update_reserved()
             && matches!(call, ParentCall::Steer { .. } | ParentCall::Answer { .. })
         {
             return Err(crate::handover::REFUSAL.into());
         }
-        let me = self.resolve(caller)?;
         let owned = |e: &crate::workers::Entry| crate::workers::owns(&me, e);
         let job_id = match &call {
             ParentCall::Bind { session } => {
@@ -2165,7 +2727,18 @@ impl Engine {
                         scopes.push(scope.clone());
                     }
                 }
-                let bound = scopes.len();
+                let mut remote_bound = 0;
+                self.ledger
+                    .change(|d| {
+                        for j in d.forwarded.values_mut().filter(|j| {
+                            j.origin.launch == *launch && j.origin.parent.session.is_none()
+                        }) {
+                            j.origin.parent.session = Some(session.clone());
+                            remote_bound += 1;
+                        }
+                    })
+                    .map_err(|e| e.to_string())?;
+                let bound = scopes.len() + remote_bound;
                 scopes.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
                 scopes.dedup();
                 for scope in scopes {
@@ -2173,6 +2746,7 @@ impl Engine {
                 }
                 return Ok(json!({ "bound": bound }));
             }
+            ParentCall::ListHosts => unreachable!("host inventory is answered asynchronously"),
             ParentCall::List => {
                 let mut jobs: Vec<u64> = self
                     .workers
@@ -2194,6 +2768,14 @@ impl Engine {
                         v.as_object_mut().map(|o| o.remove("messages"));
                         v
                     })
+                    .chain(
+                        self.ledger
+                            .data
+                            .forwarded
+                            .values()
+                            .filter(|j| j.owned(&me))
+                            .map(|j| j.summary()),
+                    )
                     .collect::<Vec<_>>();
                 return Ok(json!({ "jobs": jobs }));
             }
@@ -2235,6 +2817,7 @@ impl Engine {
             .ok_or("Unknown worker job for this parent session.")?;
         match call {
             ParentCall::List
+            | ParentCall::ListHosts
             | ParentCall::Bind { .. }
             | ParentCall::Status { .. }
             | ParentCall::ReadThread { .. } => self.job_status(job_id),
@@ -2473,6 +3056,13 @@ impl Engine {
             }
             // A YOLO request held for the operator belongs to its parent: ending or
             // reaping the parent would silently drop a decision a person still owes.
+            if self
+                .mode_requests
+                .values()
+                .any(|r| r.scope == s && r.view.thread.as_deref() == Some(&t))
+            {
+                return true;
+            }
             if self.asking.values().any(|a| {
                 a.origin.parent.scope.as_ref() == Some(&s)
                     && a.origin.parent.session.as_deref() == Some(t.as_str())
@@ -2530,6 +3120,10 @@ impl Engine {
         if busy && let Some(entry) = self.workers.get_mut(scope, thread) {
             entry.marks.cancelled = true;
         }
+        self.withdraw_activations(
+            |r| &r.scope == scope && r.view.thread.as_deref() == Some(thread),
+            "The session ended before its pending mode request was answered.",
+        )?;
         self.end_children(scope, thread)?;
         Ok(())
     }
@@ -2617,12 +3211,14 @@ impl Engine {
             && live.confirming.is_none()
             && live.opening.is_none()
             && live.terminal.is_none()
-            && live.held_handoff.is_none();
+            && live.held_handoff.is_none()
+            && !self.mode_requests.values().any(|r| &r.scope == scope);
         if !idle {
             return Ok(());
         }
         // Keep each worker's final answer: the process is about to close.
         self.capture_finals(scope);
+        self.withdraw_activations(|r| &r.scope == scope, "The session host closed this route.")?;
         let live = self.running.remove(scope).expect("checked above");
         let mut recovered = SavedScope::from_state(&live.state).recover();
         self.ledger.data.worker_notices.apply_to(&mut recovered);
@@ -2827,7 +3423,13 @@ fn catalog_detail(state: &ScopeState) -> serde_json::Value {
         .iter()
         .filter_map(|ask| ask.thread.as_deref())
         .collect();
-    serde_json::json!({"archived":state.detail["archived"],"request_threads":requests})
+    let drafts: Vec<_> = state
+        .asks
+        .iter()
+        .filter(|ask| ask.thread.is_none())
+        .map(|ask| &ask.id)
+        .collect();
+    serde_json::json!({"archived":state.detail["archived"],"request_threads":requests,"draft_requests":drafts})
 }
 fn catalog_snapshot(state: &ScopeState) -> ScopeState {
     ScopeState {
@@ -2991,7 +3593,13 @@ fn advance_launch(live: &mut Live) -> Option<String> {
 /// across scopes through `origin.parent.scope`; a handoff target does not nest.
 /// A handoff source lists where it was handed off to, and a session with a YOLO
 /// grant lists the running children that grant allowed.
-fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, store: &mut Store) {
+fn annotate(
+    host_id: &str,
+    workers: &Registry,
+    data: &crate::durable::Owned,
+    scope: &Scope,
+    store: &mut Store,
+) {
     use ox_desk_core::origin::Relation;
     type Notes = BTreeMap<String, (Option<String>, serde_json::Map<String, Value>)>;
     let mut out: Notes = BTreeMap::new();
@@ -3025,10 +3633,13 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
             list.push(value);
         }
     };
+    let source_here = |source: &&ox_desk_core::handoff::HandoffSource| {
+        &source.scope == scope && source.host.as_ref().is_none_or(|h| h.id == host_id)
+    };
     for (s, id, entry) in workers.all() {
         let o = &entry.origin;
         if o.relation == Relation::Handoff
-            && let Some(h) = o.handoff.as_ref().filter(|h| &h.scope == scope)
+            && let Some(h) = o.handoff.as_deref().filter(source_here)
         {
             push(
                 &h.session,
@@ -3038,7 +3649,7 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
         }
     }
     for h in &data.handoffs {
-        if let Some(src) = h.origin.handoff.as_ref().filter(|src| &src.scope == scope) {
+        if let Some(src) = h.origin.handoff.as_deref().filter(source_here) {
             push(
                 &src.session,
                 "handoff_attempts",
@@ -3065,6 +3676,14 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
         e.1.insert("yolo_children".into(), children.into());
     }
     for (id, entry) in workers.in_scope(scope) {
+        if let Some(ceiling) = entry.origin.limits_children() {
+            let started = entry
+                .origin
+                .started
+                .and_then(|mode| ox_desk_core::modes::Level::of(scope.route.runtime, mode))
+                .unwrap_or(entry.origin.requested);
+            store.restore_worker_ceiling(id, ceiling.min(started));
+        }
         if let Some(contract) = entry.origin.claude_contract(entry.origin.mode) {
             store.restore_worker_contract(id, contract);
         }
@@ -3079,7 +3698,7 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
 fn caller_scope(caller: &Caller) -> Option<&Scope> {
     match caller {
         Caller::Hosted { scope, .. } | Caller::Operator { scope, .. } => Some(scope),
-        Caller::External(_) => None,
+        Caller::External(_) | Caller::Linked { .. } => None,
     }
 }
 fn key_ok(reply: &Replier) -> bool {
@@ -3263,11 +3882,13 @@ mod tests {
         engine.clients.insert(
             1,
             ClientState {
+                update_lease: None,
                 peer,
                 hello: true,
                 prepared: None,
                 subscription: None,
                 catalog: false,
+                watch_resources: false,
                 terminal: false,
                 surface: None,
             },
@@ -3359,11 +3980,13 @@ mod tests {
         engine.clients.insert(
             1,
             ClientState {
+                update_lease: None,
                 peer,
                 hello: true,
                 prepared: None,
                 subscription: Some(Some(scope.clone())),
                 catalog: false,
+                watch_resources: false,
                 terminal: false,
                 surface: None,
             },
@@ -3405,11 +4028,13 @@ mod tests {
             engine.clients.insert(
                 id,
                 ClientState {
+                    update_lease: None,
                     peer,
                     hello: false,
                     prepared: None,
                     subscription: None,
                     catalog: false,
+                    watch_resources: false,
                     terminal: false,
                     surface: None,
                 },
@@ -3423,13 +4048,13 @@ mod tests {
             .request(
                 1,
                 Client::Hello {
-                    version: wire::VERSION,
+                    version: wire::VERSION + 1,
                 },
             )
             .unwrap();
         let hello: Server = serde_json::from_slice(&frames[0].try_recv().unwrap()).unwrap();
         assert!(
-            matches!(&hello, Server::Hello { capabilities, .. } if capabilities.iter().any(|c| c == CAPABILITY)),
+            matches!(&hello, Server::Hello { version: wire::VERSION, capabilities, .. } if capabilities.iter().any(|c| c == CAPABILITY)),
             "{hello:?}"
         );
         engine.request(1, declare(Surface::Phone)).unwrap();
@@ -3464,6 +4089,9 @@ mod tests {
     #[test]
     fn internal_dispatch_paths_name_their_own_sender() {
         let worker = Payload::Worker(WorkerStart {
+            host: None,
+            needs: None,
+            placement: None,
             parent: "p".into(),
             subscription_model: None,
             checkout: None,
@@ -3510,11 +4138,13 @@ mod tests {
             engine.clients.insert(
                 id,
                 ClientState {
+                    update_lease: None,
                     peer,
                     hello: true,
                     prepared: None,
                     subscription,
                     catalog,
+                    watch_resources: false,
                     terminal: false,
                     surface: None,
                 },
@@ -3757,6 +4387,7 @@ mod tests {
         }
         fn origin(parent: ParentRef, ceiling: Ceiling) -> Origin {
             Origin {
+                linked: None,
                 relation: Relation::Worker,
                 parent,
                 launch: "helper:test".into(),
@@ -3796,6 +4427,9 @@ mod tests {
         }
         fn start(write: bool) -> WorkerStart {
             WorkerStart {
+                host: None,
+                needs: None,
+                placement: None,
                 parent: String::new(),
                 runtime: Runtime::Codex,
                 model: Some("fixture".into()),
@@ -4238,11 +4872,13 @@ mod tests {
                 engine.clients.insert(
                     id,
                     ClientState {
+                        update_lease: None,
                         peer,
                         hello: true,
                         prepared: None,
                         subscription: Some(Some(worker.clone())),
                         catalog: false,
+                        watch_resources: false,
                         terminal: false,
                         surface: None,
                     },
@@ -4457,6 +5093,9 @@ mod tests {
                 &launch,
                 None,
                 &WorkerStart {
+                    host: None,
+                    needs: None,
+                    placement: None,
                     parent: String::new(),
                     runtime: Runtime::Codex,
                     model: Some("fixture".into()),
@@ -4828,6 +5467,157 @@ mod tests {
             assert!(
                 matches!(launch.origin.yolo, Some(YoloAllowance::Inherited { session }) if session == "a")
             );
+        }
+
+        #[test]
+        fn session_yolo_requires_one_live_token_for_each_activation() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (scope, _, _) = routes(root.path());
+            let (route, log) = live(
+                &scope,
+                vec![view(&scope, "a", "idle", "workspace")],
+                &[],
+                vec![],
+            );
+            engine.running.insert(scope.clone(), route);
+            ox_desk_core::state_file::write_json(
+                &root.path().join("host-mode-policy.json"),
+                &HostPolicy::YoloAsksEveryTime,
+            )
+            .unwrap();
+            let activate = |engine: &mut Engine| {
+                engine
+                    .act(
+                        1,
+                        "mode",
+                        &scope,
+                        Action::SetAccess("a".into(), Access::Yolo),
+                        None,
+                    )
+                    .unwrap();
+                engine.process(&scope, vec![], true).unwrap();
+                engine.running[&scope]
+                    .state
+                    .asks
+                    .iter()
+                    .find(|a| crate::yolo::is_request(a))
+                    .unwrap()
+                    .clone()
+            };
+            let first = activate(&mut engine);
+            assert!(log.lock().unwrap().is_empty());
+            assert!(
+                engine
+                    .act(
+                        2,
+                        "no-proof",
+                        &scope,
+                        Action::AnswerAsk(first.id.clone(), 0),
+                        None
+                    )
+                    .is_err()
+            );
+            engine
+                .act(
+                    2,
+                    "accept",
+                    &scope,
+                    Action::AnswerAsk(first.id.clone(), 0),
+                    Some(first.token.clone()),
+                )
+                .unwrap();
+            assert!(matches!(
+                log.lock().unwrap().last(),
+                Some((Action::SetAccess(_, Access::Yolo), _))
+            ));
+            engine
+                .act(
+                    1,
+                    "lower",
+                    &scope,
+                    Action::SetAccess("a".into(), Access::Workspace),
+                    None,
+                )
+                .unwrap();
+            let next = activate(&mut engine);
+            assert_ne!(first.id, next.id);
+            assert!(
+                engine
+                    .act(
+                        2,
+                        "stale",
+                        &scope,
+                        Action::AnswerAsk(next.id.clone(), 0),
+                        Some(first.token)
+                    )
+                    .is_err()
+            );
+            engine
+                .act(
+                    2,
+                    "lower-instead",
+                    &scope,
+                    Action::AnswerAsk(next.id, 1),
+                    Some(next.token),
+                )
+                .unwrap();
+            assert!(matches!(
+                log.lock().unwrap().last(),
+                Some((Action::SetAccess(_, Access::AutoReview), _))
+            ));
+        }
+
+        #[test]
+        fn host_policy_controls_the_real_worker_admission_path() {
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _rx) = std::sync::mpsc::sync_channel(64);
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (parent, worker, _) = routes(root.path());
+            with_parent(&mut engine, &parent, "yolo");
+            engine
+                .running
+                .insert(worker.clone(), live(&worker, vec![], &[], vec![]).0);
+            let save = |policy| {
+                ox_desk_core::state_file::write_json(
+                    &root.path().join("host-mode-policy.json"),
+                    &policy,
+                )
+                .unwrap()
+            };
+            let caller = thread(&parent, "a");
+            save(HostPolicy::AlwaysYolo);
+            let origin = launched(engine.accept_launch(&caller, explicit_yolo(Runtime::Codex)));
+            assert_eq!(origin.yolo, Some(YoloAllowance::HostPolicy));
+            assert_eq!(
+                origin.decided,
+                Some(ox_desk_core::modes::Decision::HostPolicy)
+            );
+            save(HostPolicy::AlwaysRead);
+            let child = launched(engine.accept_launch(&caller, inherit(Runtime::Codex)));
+            assert_eq!(child.started, Some(Access::ReadOnly));
+            assert_eq!(child.ceiling, Ceiling::Yolo);
+            assert!(crate::workers::operator_access(&child, Access::Workspace).is_ok());
+            engine.set_grant(&parent, "a", true).unwrap();
+            save(HostPolicy::YoloAsksEveryTime);
+            assert!(matches!(
+                engine
+                    .accept_launch(&caller, inherit(Runtime::Codex))
+                    .unwrap(),
+                Accepted::Ask(_)
+            ));
+            let operator = Caller::Operator {
+                scope: parent.clone(),
+                parent: "a".into(),
+                device: "phone".into(),
+            };
+            let mut requested = explicit_yolo(Runtime::Codex);
+            requested.yolo_confirmed = true;
+            assert!(matches!(
+                engine.accept_launch(&operator, requested).unwrap(),
+                Accepted::Ask(_)
+            ));
         }
 
         #[test]
@@ -5357,6 +6147,7 @@ mod tests {
             let source = claude_source(root.path());
             let handoff = |request: &str| {
                 Action::StartHandoff(HandoffStart {
+                    host: None,
                     source: "s".into(),
                     runtime: Runtime::Codex,
                     model: Some("fixture".into()),
@@ -5462,6 +6253,7 @@ mod tests {
                         "h1",
                         &source,
                         Action::StartHandoff(HandoffStart {
+                            host: None,
                             source: "s".into(),
                             runtime: Runtime::Codex,
                             model: Some("fixture".into()),
@@ -5594,6 +6386,7 @@ mod tests {
                     "h1",
                     &source,
                     Action::StartHandoff(HandoffStart {
+                        host: None,
                         source: "s".into(),
                         runtime: Runtime::Claude,
                         model: None,
@@ -5729,6 +6522,8 @@ mod tests {
                 let mut o = origin(workers_parent(from, session), Ceiling::Write);
                 o.relation = ox_desk_core::origin::Relation::Handoff;
                 o.handoff = Some(Box::new(ox_desk_core::handoff::HandoffSource {
+                    history_broker: None,
+                    host: None,
                     scope: Scope {
                         project: project.to_owned(),
                         route: from.route.clone(),
@@ -5752,39 +6547,43 @@ mod tests {
             engine
                 .workers
                 .stamp(&back, "b", stamp(&target, "t", &project));
-            let read =
-                |engine: &mut Engine, caller: Caller, session: Option<&str>, item: Option<&str>| {
-                    let (done, result) = std::sync::mpsc::sync_channel(1);
-                    engine
-                        .read_thread(
-                            &caller,
-                            ParentCall::ReadThread {
-                                session: session.map(Into::into),
-                                item: item.map(Into::into),
-                                after: None,
-                                limit: None,
-                            },
-                            Replier::Channel(done),
-                        )
-                        .unwrap();
-                    result.try_recv().expect("answered at once")
-                };
+            let read = |engine: &mut Engine,
+                        caller: Caller,
+                        host: Option<&str>,
+                        session: Option<&str>,
+                        item: Option<&str>| {
+                let (done, result) = std::sync::mpsc::sync_channel(1);
+                engine
+                    .read_thread(
+                        &caller,
+                        ParentCall::ReadThread {
+                            host: host.map(Into::into),
+                            session: session.map(Into::into),
+                            item: item.map(Into::into),
+                            after: None,
+                            limit: None,
+                        },
+                        Replier::Channel(done),
+                    )
+                    .unwrap();
+                result.try_recv().expect("answered at once")
+            };
             // The Codex target reads an omitted item of its Claude source in full.
-            let page = read(&mut engine, thread(&target, "t"), None, Some("a1")).unwrap();
+            let page = read(&mut engine, thread(&target, "t"), None, None, Some("a1")).unwrap();
             assert_eq!(page["items"][0]["text"], "long answer");
             // The second handoff reads the whole chain, back to the first source.
-            let page = read(&mut engine, thread(&back, "b"), Some("s"), None).unwrap();
+            let page = read(&mut engine, thread(&back, "b"), None, Some("s"), None).unwrap();
             assert_eq!(page["items"][0]["text"], "first");
-            let page = read(&mut engine, thread(&back, "b"), None, None).unwrap();
+            let page = read(&mut engine, thread(&back, "b"), None, None, None).unwrap();
             assert_eq!(page["items"][0]["text"], "codex turn");
             // A sibling session on the same app-server has no chain; the source itself has none.
             assert!(
-                read(&mut engine, thread(&target, "x"), None, None)
+                read(&mut engine, thread(&target, "x"), None, None, None)
                     .unwrap_err()
                     .contains("no source")
             );
             assert!(
-                read(&mut engine, thread(&target, "t"), Some("x"), None)
+                read(&mut engine, thread(&target, "t"), None, Some("x"), None)
                     .unwrap_err()
                     .contains("not in this session's handoff chain")
             );
@@ -5793,9 +6592,40 @@ mod tests {
                 .workers
                 .stamp(&target, "x", stamp(&source, "s", Path::new("/elsewhere")));
             assert!(
-                read(&mut engine, thread(&target, "x"), None, None)
+                read(&mut engine, thread(&target, "x"), None, None, None)
                     .unwrap_err()
                     .contains("outside")
+            );
+            let me = engine.host_id.to_string();
+            let qualified =
+                read(&mut engine, thread(&back, "b"), Some(&me), Some("s"), None).unwrap();
+            assert_eq!(qualified["source"]["host"]["id"], me);
+            assert!(
+                read(
+                    &mut engine,
+                    thread(&back, "b"),
+                    Some("another-host"),
+                    Some("s"),
+                    None
+                )
+                .is_err()
+            );
+
+            // Two machines can have identical project paths and native session IDs.
+            // A foreign stamp must never turn into a lookup in this host's transcript.
+            let mut foreign = stamp(&source, "s", &project);
+            foreign.handoff.as_mut().unwrap().host = Some(ox_desk_core::handoff::SourceHost {
+                id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+                name: "studio".into(),
+            });
+            engine.workers.get_mut(&target, "x").unwrap().origin = foreign;
+            let chain = engine.handoff_chain(&target, "x");
+            assert_eq!(chain.len(), 1);
+            assert_eq!(chain[0].host.as_ref().unwrap().name, "studio");
+            assert!(
+                read(&mut engine, thread(&target, "x"), None, None, None)
+                    .unwrap_err()
+                    .contains("another host")
             );
             // A terminal launch is not a hosted session.
             let terminal = Caller::External(ExternalCaller {
@@ -5804,7 +6634,7 @@ mod tests {
                 session: Some("t".into()),
                 launch: "l".into(),
             });
-            assert!(read(&mut engine, terminal, None, None).is_err());
+            assert!(read(&mut engine, terminal, None, None, None).is_err());
         }
 
         /// A Live whose store is a real local Codex store on an inert stdio process.
@@ -6843,7 +7673,13 @@ mod tests {
                 },
             )
             .unwrap();
-            annotate(&engine.workers, &engine.ledger.data, &scope, &mut fresh);
+            annotate(
+                &engine.host_id.to_string(),
+                &engine.workers,
+                &engine.ledger.data,
+                &scope,
+                &mut fresh,
+            );
             fresh.restore_ended(&worker, "worker", 0, None);
             let end = Instant::now() + Duration::from_secs(10);
             while fresh.catalog_row(&worker).is_none() || !fresh.can_send(None) {
@@ -6918,11 +7754,13 @@ mod tests {
             engine.clients.insert(
                 1,
                 ClientState {
+                    update_lease: None,
                     peer,
                     hello: true,
                     prepared: None,
                     subscription: Some(Some(scope.clone())),
                     catalog: false,
+                    watch_resources: false,
                     terminal: false,
                     surface: None,
                 },
@@ -7196,11 +8034,13 @@ mod tests {
                 let (peer, frames) = crate::transport::test_peer();
                 (
                     ClientState {
+                        update_lease: None,
                         peer,
                         hello: true,
                         prepared: None,
                         subscription: None,
                         catalog: false,
+                        watch_resources: false,
                         terminal,
                         surface: None,
                     },
@@ -7256,11 +8096,13 @@ mod tests {
             engine.clients.insert(
                 9,
                 ClientState {
+                    update_lease: None,
                     peer,
                     hello: true,
                     prepared: None,
                     subscription: None,
                     catalog: false,
+                    watch_resources: false,
                     terminal: false,
                     surface: None,
                 },

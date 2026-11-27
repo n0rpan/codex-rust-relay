@@ -130,6 +130,9 @@ fn host(paths: &Paths, report: &mut Report) -> bool {
         Ok(Some(probe)) => {
             match &probe.host {
                 Some(info) => {
+                    if let Some(id) = &info.id {
+                        report.info(format!("host identity: {} ({id})", info.name.as_deref().unwrap_or("unnamed")));
+                    }
                     report.info(format!(
                         "host: running, version {}, epoch {}, pid {}, protocol {} ({})",
                         info.version,
@@ -138,6 +141,16 @@ fn host(paths: &Paths, report: &mut Report) -> bool {
                         probe.version,
                         probe.capabilities.join(", ")
                     ));
+                    if let Some(policy) = info.mode_policy {
+                        report.info(format!("host mode policy: {}", policy.label()));
+                    }
+                    if !info.labels.is_empty() {
+                        report.info(format!("host labels: {}", info.labels.join(", ")));
+                    }
+                    if let Some(r) = &info.resources {
+                        report.info(format!("host resources: {} {}, {:.1} GiB available of {:.1} GiB, load {:.1}, {} active workers",
+                            r.os, r.arch, r.available_memory as f64 / 1_073_741_824., r.total_memory as f64 / 1_073_741_824., r.load_one_minute, r.running_workers));
+                    }
                     if info.version != handover::version() {
                         report.add(
                             Level::Warn,
@@ -157,7 +170,7 @@ fn host(paths: &Paths, report: &mut Report) -> bool {
                     ),
                 ),
             }
-            if probe.version != ox_desk_core::host_protocol::VERSION {
+            if !ox_desk_core::host_protocol::supported(probe.version) {
                 report.add(
                     Level::Fail,
                     ox_desk_core::host_protocol::version_mismatch(
@@ -236,6 +249,18 @@ fn remote(paths: &Paths, report: &mut Report, tailscale: &Tailscale) {
             ago(now, d.last_used),
             if d.terminal { ", terminal allowed" } else { "" }
         ));
+    }
+    for host in &status.worker_hosts {
+        if let Some(grant) = &host.worker {
+            report.info(format!(
+                "worker host: {} ({}), launches {}, ceiling {}, last contact {}",
+                host.label,
+                host.login,
+                if grant.may_launch { "on" } else { "off" },
+                grant.ceiling.name(),
+                ago(now, host.last_used)
+            ));
+        }
     }
     if !status.enabled {
         report.info("remote access: off");

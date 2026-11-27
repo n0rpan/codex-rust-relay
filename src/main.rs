@@ -39,6 +39,7 @@ mod upstream;
 mod version;
 mod weather;
 mod worker_checkout;
+mod worker_placement;
 mod workers;
 
 use std::collections::BTreeSet;
@@ -394,12 +395,11 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         catalog::prioritize_favorites(catalog, &favorites);
     }
     app.client_kind = client_kind;
-    // A session the OX session host runs on an API alias gets read_ox_thread,
-    // so a handoff target can read its source. Workers stay subscription-only.
+    // Hosted parents can delegate across hosts on their own billing route.
     let gateway = if host_lifetime::hosted() {
         match workers::Relay::load(&codex_home).await? {
             Some(relay) => {
-                Some(relay.attach(&args, &codex_home, client_kind, workers::Tools::HandoffRead)?)
+                Some(relay.attach(&args, &codex_home, client_kind, workers::Tools::Hosted)?)
             }
             None => None,
         }

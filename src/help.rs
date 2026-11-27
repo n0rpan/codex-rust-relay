@@ -197,7 +197,8 @@ Phone (the paired web app)
   Sessions → ••• → Settings
   Accounts                Sign in; Configure API provider.
   Providers & models      The same provider editor.
-  Credentials             Provider keys.
+  Credentials             Manage provider and Brave Search keys. Copy selected keys
+                          from this host to a paired host with a destination review.
   Favorites               Order the model lists.
   Web search              Brave Search for both clients.
   Remote access           Pair another device and review paired devices.
@@ -217,6 +218,15 @@ Checks and next steps
   ox doctor               Check files, providers and saved accounts. It prints
                           home: and a next: line with the command to run.
   ox doctor --fix         Repair what ox can repair; files are backed up first.
+  ox host pair            Pair a desktop or phone over your tailnet.
+  ox host pair --worker-host  Create an invitation for a worker host.
+  ox host pair --terminal Include terminal access for the device that pairs.
+  ox host name [NAME]     Show or change the name shown on paired devices.
+  ox host policy          Show the host mode policy. Use set POLICY to change it.
+  ox host project add DIR  Keep a checkout available on a headless host. Use list or remove DIR to manage it.
+  ox host labels set big  Set placement labels used to identify this host.
+  ox host update dev      Follow development builds. Use stable for releases.
+  ox host devices         List device IDs for ox host revoke <device-id>.
   ox host doctor          Check the host, Tailscale Serve and paired devices.
   ox help share           Serve one gateway to another device.
   ox help subscriptions   Sign in with a ChatGPT or Claude plan.

@@ -35,6 +35,10 @@ pub(super) struct Jobs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Start {
+    #[serde(default)]
+    pub host: Option<String>,
+    pub needs: Option<Value>,
+    pub placement: Option<String>,
     runtime: Runtime,
     mode: Mode,
     #[serde(default)]
@@ -54,7 +58,7 @@ pub(super) struct Start {
     max_minutes: Option<u32>,
     /// Who pays, stated explicitly: `api` (the provider of the alias in `model`) or
     /// `subscription`. Absent keeps the old inference: an alias is API, none is the
-    /// Claude subscription.
+    /// selected runtime’s subscription.
     #[serde(default)]
     billing: Option<Billing>,
     /// The exact Claude subscription model to pin before the first inference, such as
@@ -347,7 +351,10 @@ impl Jobs {
             model: request
                 .model
                 .clone()
-                .unwrap_or_else(|| "Claude subscription".to_owned()),
+                .unwrap_or_else(|| match request.runtime {
+                    Runtime::Claude => "Claude subscription".into(),
+                    Runtime::Codex => "ChatGPT subscription".into(),
+                }),
             native_session: None,
             progress: request
                 .claude_fallback_notice()
@@ -483,6 +490,15 @@ impl Start {
             "max_minutes": self.max_minutes,
             "permission": self.permission_mode.as_deref().map(|m| permission_level(m).ok().flatten().unwrap_or("inherit")),
         });
+        if let Some(needs) = &self.needs {
+            start["needs"] = needs.clone();
+        }
+        if let Some(rule) = &self.placement {
+            start["placement"] = json!(rule);
+        }
+        if let Some(host) = self.host.as_deref() {
+            start["host"] = json!(host);
+        }
         if let Some(path) = &self.checkout {
             start["checkout"] = json!(path);
         }
@@ -510,6 +526,13 @@ impl Start {
         }
     }
     pub(super) fn validate(&self) -> Result<(), String> {
+        if self
+            .host
+            .as_ref()
+            .is_some_and(|h| h.trim().is_empty() || h.len() > 256)
+        {
+            return Err("Provide a worker host name or ID.".into());
+        }
         if self.max_minutes.is_some_and(|m| m == 0 || m > 7 * 24 * 60) {
             return Err("max_minutes must be between 1 and 10080.".into());
         }
@@ -529,9 +552,6 @@ impl Start {
         if self.mode == Mode::Workflow && self.runtime != Runtime::Claude {
             return Err("Workflow mode requires Claude Code.".into());
         }
-        if self.runtime == Runtime::Codex && self.model.is_none() {
-            return Err("Choose an ox API model for a Codex worker.".into());
-        }
         if self.model.as_ref().is_some_and(|model| {
             model.trim().is_empty() || model.len() > 256 || model.starts_with('-')
         }) {
@@ -539,7 +559,7 @@ impl Start {
         }
         match (self.billing, &self.model, &self.subscription_model) {
             (_, Some(_), Some(_)) | (Some(Billing::Subscription), Some(_), None) => {
-                return Err("model is an ox API alias, billed by its provider. For the Claude subscription, leave model out and pass subscription_model. Nothing was started.".into());
+                return Err("model is an ox API alias, billed by its provider. Leave model out for a subscription. An exact Claude subscription model goes in subscription_model. Nothing was started.".into());
             }
             (Some(Billing::Api), None, _) => {
                 return Err("billing api needs an ox API model alias in model. Check list_ox_models. Nothing was started.".into());
@@ -548,7 +568,7 @@ impl Start {
         }
         if let Some(pinned) = &self.subscription_model {
             if self.runtime != Runtime::Claude {
-                return Err("subscription_model pins a Claude subscription worker. Codex workers use an ox API model alias.".into());
+                return Err("subscription_model pins a Claude subscription model. Leave it out to use the ChatGPT subscription with Codex.".into());
             }
             if !crate::claude_models::valid_model(pinned) {
                 return Err(
@@ -574,6 +594,13 @@ impl Start {
                 command.args(["--model", model]);
             }
             command
+        } else if self.runtime == Runtime::Codex {
+            if !crate::native::has_saved_account(crate::clients::ClientKind::Codex, home) {
+                return Err(
+                    "Run ox login chatgpt on this host to use its ChatGPT subscription.".into(),
+                );
+            }
+            crate::native::codex_command(home)?
         } else {
             if !crate::native::has_saved_account(crate::clients::ClientKind::Claude, home) {
                 return Err(
@@ -873,6 +900,22 @@ async fn run_codex(
     )
     .await?;
     write_rpc(&mut input, json!({"method":"initialized"})).await?;
+    if request.model.is_none() {
+        let account = rpc(
+            &mut input,
+            &mut lines,
+            7,
+            "account/read",
+            json!({"refreshToken":false}),
+        )
+        .await?;
+        if account["account"]["type"] != "chatgpt" {
+            return Err(
+                "Codex did not confirm a ChatGPT sign-in. Run ox login chatgpt on this host."
+                    .into(),
+            );
+        }
+    }
     let session = rpc(
         &mut input,
         &mut lines,
@@ -1028,7 +1071,7 @@ async fn rpc(
         while let Some(line) = lines.next_line().await? {
             let Ok(event) = serde_json::from_str::<Value>(&line) else { continue };
             if event["id"] == id && event.get("method").is_none() {
-                return event.get("result").cloned().ok_or_else(|| format!("Codex rejected {method}. Check the installed client's Goal mode support and settings.").into());
+                return event.get("result").cloned().ok_or_else(|| format!("Codex rejected {method}. Check the installed Codex version and account settings.").into());
             }
             deny_approval(input, &event).await?;
         }

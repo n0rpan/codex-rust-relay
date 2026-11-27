@@ -71,6 +71,11 @@ class Forward(socketserver.StreamRequestHandler):
             if name.lower() in ("connection", "tailscale-user-login"):
                 continue
             headers.append(line)
+        body = self.rfile.read(length)
+        if fault := getattr(self.server, "job_fault", None):
+            if reply := fault(first, body):
+                self.wfile.write(reply)
+                return
         with socket.create_connection(
             ("127.0.0.1", self.server.backend), timeout=10
         ) as upstream:
@@ -79,7 +84,7 @@ class Forward(socketserver.StreamRequestHandler):
                 first
                 + b"".join(headers)
                 + f"Connection: {connection}\r\nTailscale-User-Login: phone@example.test\r\n\r\n".encode()
-                + self.rfile.read(length)
+                + body
             )
             upstream.settimeout(None)
             if upgrade:
@@ -150,9 +155,18 @@ class Host(socketserver.StreamRequestHandler):
                             "version": 1,
                             "routes": [f.scope["route"]],
                             "projects": [f.scope["project"]],
-                            "capabilities": ["snapshot", "resume", "actions"],
+                            "capabilities": ["snapshot", "resume", "actions", "worker_placement"],
                         }
                     )
+                elif frame["type"] == "worker_hosts":
+                    assert frame["project"] == f.scope["project"]
+                    send({"type":"worker_reply","id":frame["id"],"result":{"hosts":[
+                        {"host":{"id":"laptop","name":"laptop"},"status":"online","parent_host":True,"routes":[f.scope["route"]]},
+                        {"host":{"id":"build-id","name":"Build","subscription_limits":{"claude":[
+                            {"label":"five hour","used_percent":72,"status":"allowed","observed_at":1700000000,"resets_at":None},
+                            {"label":"old week","used_percent":99,"status":"allowed warning","observed_at":1,"resets_at":2}]},
+                            "resources":{"load_one_minute":0.4,"available_memory":64_000_000_000}},
+                         "status":"online","parent_host":False,"routes":[{"runtime":"claude","billing":"subscription"},{"runtime":"claude","billing":{"api":"build/only"}}]}]}})
                 elif frame["type"] == "discover":
                     send(
                         {
@@ -278,6 +292,10 @@ class Host(socketserver.StreamRequestHandler):
                         assert command in ("/status", "/project:lint src/mobile.rs")
                         f.detail["notice"] = "Native status received" if command == "/status" else "Native lint received"
                         changes.append({"kind":"state","connection":"ready","capabilities":f.caps,"detail":f.detail})
+                    if "start_worker" in action:
+                        refused = action["start_worker"]["task"] == "Unmet hardware"
+                        send({"type":"worker_reply","id":frame["id"],"error":"No host has 128 CPUs" if refused else None,
+                              "result":None if refused else {"job_id":52,"status":"running","model":"fixture/demo"}})
                     if changes:
                         sequence += 1
                         send({"type":"delta", "scope":f.scope, "cursor":{"epoch":"fixture","seq":sequence}, "changes":changes})
@@ -820,9 +838,14 @@ def run(harness, screenshot=None):
         codex=isolated/".codex"
         codex.mkdir(mode=0o700,parents=True)
         (codex/"codeox.toml").write_text('[providers.garden]\nname="Garden"\nbase_url="https://garden.invalid/v1"\nenv_key="GARDEN_TOKEN"\nwire_api="chat_completions"\ndiscovery=false\n[[providers.garden.models]]\nid="orchard"\n')
+        copy_fixture = None
+        if os.environ.get("OX_TEST_HOST_BIN"):
+            from key_copy import receiver
+            copy_fixture = receiver(d, stack)
+        source_env = dict(os.environ, **(copy_fixture[0] if copy_fixture else {}), DBUS_SESSION_BUS_ADDRESS="unix:path="+str(d/"no-session-bus"), SHELL="/bin/sh", GARDEN_TOKEN="fixture-env-token", HOME=str(isolated), CODEX_HOME=str(codex), CLAUDE_CONFIG_DIR=str(isolated/".claude"), XDG_STATE_HOME=str(isolated/"state"), XDG_CONFIG_HOME=str(isolated/"config"), OX_TEST_REMOTE_DIR=str(d))
         service = subprocess.Popen(
             [harness, "--exact", "fixture::browser_service", "--ignored"],
-            env=dict(os.environ, SHELL="/bin/sh", GARDEN_TOKEN="fixture-env-token", HOME=str(isolated), CODEX_HOME=str(codex), CLAUDE_CONFIG_DIR=str(isolated/".claude"), XDG_STATE_HOME=str(isolated/"state"), XDG_CONFIG_HOME=str(isolated/"config"), OX_TEST_REMOTE_DIR=str(d)),
+            env=source_env,
             stdout=subprocess.DEVNULL,
         )
         stack.callback(service.wait, 5)
@@ -1028,8 +1051,36 @@ def run(harness, screenshot=None):
         js("document.getElementById('worker-runtime').value='claude';document.getElementById('worker-task').value='Check the pool limits';document.getElementById('worker-form').requestSubmit()")
         wait(lambda: any(isinstance(a, dict) and a.get("start_worker", {}).get("parent") == "child"
                          and a["start_worker"]["task"] == "Check the pool limits" for a in host.actions))
+        wait(lambda: js("return document.getElementById('worker-form').hidden"))
         assert any(a["start_worker"].get("permission") == "inherit" for a in host.actions
                    if isinstance(a, dict) and "start_worker" in a), "workers inherit by default"
+        js("document.getElementById('start-worker').click()")
+        wait(lambda: js("return [...document.getElementById('worker-host').options].some(o=>o.value==='build-id' && o.text.includes('64.0 GB free'))"))
+        choose("worker-runtime","claude")
+        choose("worker-host","build-id")
+        choose("worker-model","")
+        wait(lambda: js("return document.getElementById('worker-subscription-limits').innerText.includes('Build · Claude · five hour · 72% used')"))
+        assert not js("return document.getElementById('worker-subscription-limits').innerText.includes('old week')")
+        choose("worker-host","parent")
+        assert js("return document.getElementById('worker-subscription-limits').hidden")
+        choose("worker-host","build-id")
+        choose("worker-model","build/only")
+        assert js("return document.getElementById('worker-subscription-limits').hidden")
+        js("document.getElementById('worker-task').value='Remote-only model'; document.getElementById('worker-form').requestSubmit()")
+        wait(lambda: any(a.get("start_worker",{}).get("host")=="build-id" and a["start_worker"]["model"]=="build/only" for a in host.actions if isinstance(a,dict)))
+        wait(lambda: js("return document.getElementById('worker-form').hidden"))
+        js("document.getElementById('start-worker').click()")
+        wait(lambda: js("return [...document.getElementById('worker-host').options].some(o=>o.value==='auto')"))
+        choose("worker-runtime","claude")
+        choose("worker-host","auto")
+        choose("worker-model","build/only")
+        js("document.getElementById('worker-memory').value='64'; document.getElementById('worker-cpus').value='8'; document.getElementById('worker-gpu').checked=true; document.getElementById('worker-os').value='linux'; document.getElementById('worker-task').value='Run on the build machine'; document.getElementById('worker-form').requestSubmit()")
+        wait(lambda: any(a.get("start_worker",{}).get("needs")=={"memory_gb":64,"cpus":8,"gpu":True,"os":"linux"} and a["start_worker"]["host"]=="auto" for a in host.actions if isinstance(a,dict)))
+        wait(lambda: js("return document.getElementById('worker-form').hidden"))
+        js("document.getElementById('start-worker').click(); document.getElementById('worker-task').value='Unmet hardware'; document.getElementById('worker-form').requestSubmit()")
+        wait(lambda: js("return !document.getElementById('worker-submit').disabled && !document.getElementById('worker-form').hidden && document.getElementById('worker-task').value==='Unmet hardware'") and any(a.get("start_worker", {}).get("task") == "Unmet hardware" for a in host.actions if isinstance(a,dict)))
+        js("document.getElementById('worker-cancel').click()")
+        print("PASS Chromium worker placement, target-only model and optional Auto requirements",flush=True)
         # The operator continues the open session in another route with the inherited mode.
         js("document.getElementById('continue-in').click()")
         js("const r=document.getElementById('handoff-runtime');for(const v of ['codex','claude']){r.value=v;r.dispatchEvent(new Event('change'));if(document.getElementById('handoff-route').options.length)break}"
@@ -1144,7 +1195,8 @@ def run(harness, screenshot=None):
         snapshot=settings({"action":"read_rows"})
         assert any(p["id"]=="garden" for p in snapshot["registry"]["providers"])
         laptop=settings({"action":"read_behavior"})
-        changed=dict(laptop["behavior"],reduce_motion=not laptop["behavior"]["reduce_motion"])
+        changed=dict(laptop["behavior"],reduce_motion=not laptop["behavior"]["reduce_motion"],
+                     worker_approvals="operator", claude_start="plan", codex_start="workspace")
         assert settings({"action":"save_behavior","revision":laptop["revision"],"behavior":changed})=={"status":"applied"}
         assert settings({"action":"read_behavior"})["behavior"]==changed
         assert settings({"action":"save_behavior","revision":laptop["revision"],"behavior":laptop["behavior"]})["status"]=="changed_on_disk"
@@ -1158,6 +1210,22 @@ def run(harness, screenshot=None):
         assert canary in (codex/"ox-api-keys.json").read_text()
         remaining=settings({"action":"read_rows"})
         assert canary not in json.dumps(remaining) and any(k["saved"] and k["name"]=="GARDEN_TOKEN" for k in remaining["credentials"])
+        brave = {"name": "BRAVE_SEARCH_API_KEY", "scope": "https://api.search.brave.com/"}
+        transfer = {"action": "import_keys", "revision": remaining["revisions"]["keys"],
+                    "keys": [dict(brave, value="fixture-transfer-brave")]}
+        assert settings(transfer) == {"status": "applied"}
+        assert settings(transfer)["status"] == "changed_on_disk"
+        after_transfer = settings({"action": "read_rows"})
+        assert "fixture-transfer-brave" not in json.dumps(after_transfer)
+        assert "fixture-transfer-brave" in (codex / "ox-api-keys.json").read_text()
+        if copy_fixture:
+            from key_copy import exercise as copy_keys
+            copy_keys(js, wait, *copy_fixture[1:5])
+            from key_copy import worker_links
+            worker_links(js, wait, *copy_fixture[3:], harness, source_env)
+        export = {"action": "export_keys", "selected": [brave], "revision": after_transfer["revisions"]["keys"]}
+        assert js("return import('./device.js').then(async m=>m.settingsRequest(await m.deviceKey(),"
+                  + json.dumps(export) + ").then(()=>false,e=>e.status===403))")
         docs=settings({"action":"read_advanced"})
         assert canary not in json.dumps(docs)
         registry=next(x for x in docs if x["id"]=="codeox.toml")
