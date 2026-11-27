@@ -21,6 +21,7 @@ pub mod host_policy;
 pub mod host_protocol;
 pub mod inbox;
 pub mod links;
+pub mod memory;
 pub mod perf;
 pub mod ports;
 pub mod slash;

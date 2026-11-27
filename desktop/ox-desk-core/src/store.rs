@@ -110,6 +110,7 @@ pub struct Store {
     /// The host's stamp on the action being dispatched now. Each submit copies it, so a
     /// queued or deferred message keeps the sender that was current when it was accepted.
     sender: Option<crate::surface::Sender>,
+    memory: Option<crate::memory::MemoryConfig>,
     worker_notice_receipts: Vec<WorkerNoticeReceipt>,
     /// The stamp of each message waiting in `resume_sends`.
     resume_commands: HashMap<String, (crate::codex::request::ThreadCommand, bool)>,
@@ -232,6 +233,7 @@ impl Store {
             ended_threads: Default::default(),
             resume_sends: Default::default(),
             sender: None,
+            memory: None,
             worker_notice_receipts: Vec::new(),
             resume_commands: Default::default(),
             resume_senders: Default::default(),

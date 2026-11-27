@@ -246,6 +246,10 @@ impl RuntimeConfig {
                     .current_dir(&project)
                     .env("PATH", &self.path)
                     .env("OX_HOST_WORKER_ROUTE", serde_json::to_string(&route)?)
+                    .env(
+                        "OX_MEMORY_MAX_SENSITIVITY",
+                        ox_desk_core::memory::route_sensitivity_ceiling(&route).as_str(),
+                    )
                     .env_remove("OX_HOST_WORKER_PARENT");
                 let link = codex::Link::from_command(command, move |e| {
                     match &e {
