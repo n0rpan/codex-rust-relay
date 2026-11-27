@@ -10,6 +10,7 @@ from pathlib import Path
 SCRIPT = Path(__file__).with_name("auto-queue.sh")
 HEAD = "9b8d038d0312e695dbee60d69dbc0c652097a9bd"
 BOT = "chatgpt-codex-connector[bot]"
+BOT_USER = {"login": BOT, "type": "Bot"}
 
 # A stand-in for the gh CLI: answers the three reads from files and records writes.
 FAKE_GH = r"""#!/bin/bash
@@ -36,8 +37,9 @@ def summary(sha, status):
     return f"<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {escaped} -->\n<details>"
 
 
-def thread(body, resolved=False, author="chatgpt-codex-connector"):
-    return {"isResolved": resolved, "comments": {"nodes": [{"author": {"login": author}, "body": body}]}}
+def thread(body, resolved=False, author="chatgpt-codex-connector", kind="Bot"):
+    return {"isResolved": resolved,
+            "comments": {"nodes": [{"author": {"__typename": kind, "login": author}, "body": body}]}}
 
 
 class AutoQueue(unittest.TestCase):
@@ -46,7 +48,7 @@ class AutoQueue(unittest.TestCase):
                 "head": {"sha": HEAD, "repo": {"full_name": "o/r"}}, "labels": [{"name": "full-ci"}]}
         base.update(pull or {})
         if comments is None:
-            comments = [{"user": {"login": BOT}, "body": summary(HEAD, "completed")}]
+            comments = [{"user": BOT_USER, "body": summary(HEAD, "completed")}]
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             (tmp / "pull.json").write_text(json.dumps(base))
@@ -75,7 +77,7 @@ class AutoQueue(unittest.TestCase):
     def test_a_resolved_or_minor_finding_does_not_block(self):
         out, calls = self.decide(threads=[thread("![P1 Badge](x) fixed", resolved=True),
                                           thread("![P2 Badge](x) nit"),
-                                          thread("![P1 Badge](x) a person quoting it", author="someone")])
+                                          thread("![P1 Badge](x) a person quoting it", author="someone", kind="User")])
         self.assertIn("queue:", out)
         self.assertIn("--auto", calls)
 
@@ -95,10 +97,20 @@ class AutoQueue(unittest.TestCase):
     def test_no_finished_review_of_the_head_commit_holds(self):
         cases = {
             "no review at all": [],
-            "review of an older commit": [{"user": {"login": BOT}, "body": summary("0" * 40, "completed")}],
-            "review still running": [{"user": {"login": BOT}, "body": summary(HEAD, "running")}],
-            "a person imitating the summary": [{"user": {"login": "someone"}, "body": summary(HEAD, "completed")}],
-            "a format this script cannot read": [{"user": {"login": BOT}, "body": "codex-review-state:v2 ???"}],
+            "review of an older commit": [{"user": BOT_USER, "body": summary("0" * 40, "completed")}],
+            "review still running": [{"user": BOT_USER, "body": summary(HEAD, "running")}],
+            "a person imitating the summary": [
+                {"user": {"login": "someone", "type": "User"}, "body": summary(HEAD, "completed")}],
+            "a longer name that starts like the reviewer's": [
+                {"user": {"login": "chatgpt-codex-connector-untrusted", "type": "User"},
+                 "body": summary(HEAD, "completed")}],
+            "another app with a name that starts like the reviewer's": [
+                {"user": {"login": "chatgpt-codex-connector-x[bot]", "type": "Bot"},
+                 "body": summary(HEAD, "completed")}],
+            "a person's account with the reviewer's bare name": [
+                {"user": {"login": "chatgpt-codex-connector", "type": "User"},
+                 "body": summary(HEAD, "completed")}],
+            "a format this script cannot read": [{"user": BOT_USER, "body": "codex-review-state:v2 ???"}],
         }
         for name, comments in cases.items():
             with self.subTest(name):

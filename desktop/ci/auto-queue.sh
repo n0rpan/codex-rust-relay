@@ -18,6 +18,10 @@ set -euo pipefail
 number=${1:?pass the pull request number}
 repo=${GITHUB_REPOSITORY:?}
 maintainer=${MAINTAINER:?}
+# The reviewer's exact identity. A GitHub App posts as "<slug>[bot]" with type
+# Bot, a name no person's account can have; GraphQL reports the same account
+# as "<slug>" with type Bot. A prefix match would trust anyone who registers a
+# longer name.
 reviewer='chatgpt-codex-connector'
 
 decide() {
@@ -32,7 +36,7 @@ decide() {
 
     # The reviewer keeps one summary comment with its state as escaped JSON.
     summary="$(gh api --paginate "repos/${repo}/issues/${number}/comments" \
-        --jq ".[] | select(.user.login | startswith(\"${reviewer}\")) | .body" |
+        --jq ".[] | select(.user.login == \"${reviewer}[bot]\" and .user.type == \"Bot\") | .body" |
         grep -o 'codex-review-state:v1 [^>]*' | tail -n 1 |
         sed -e 's/^codex-review-state:v1 //' -e 's/ *--$//' -e 's/&#123;/{/g' -e 's/&#125;/}/g' || true)"
     reviewed="$(jq -r --arg head "${head}" \
@@ -46,14 +50,14 @@ decide() {
         query($owner: String!, $name: String!, $number: Int!) {
           repository(owner: $owner, name: $name) { pullRequest(number: $number) {
             reviewThreads(first: 100) { pageInfo { hasNextPage } nodes { isResolved
-              comments(first: 1) { nodes { author { login } body } } } } } } }' \
+              comments(first: 1) { nodes { author { __typename login } body } } } } } } }' \
         --jq '.data.repository.pullRequest.reviewThreads')"
     if [ "$(jq -r '.pageInfo.hasNextPage' <<< "${threads}")" != false ]; then
         echo "hold: more than 100 review threads, not all read"; return
     fi
     blocking="$(jq -r --arg reviewer "${reviewer}" '[.nodes[]
         | select(.isResolved | not) | .comments.nodes[0]
-        | select(.author.login | startswith($reviewer))
+        | select(.author.__typename == "Bot" and .author.login == $reviewer)
         | select(.body | test("P[01] Badge"))] | length' <<< "${threads}")"
     if [ "${blocking}" != 0 ]; then echo "hold: ${blocking} unresolved P0/P1 finding(s)"; return; fi
     echo "queue: reviewed ${head:0:7}, nothing blocking"
