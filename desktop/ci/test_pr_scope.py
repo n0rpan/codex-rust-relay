@@ -16,11 +16,16 @@ class PullRequestLanes(unittest.TestCase):
                 self.assertTrue(flags["native"])
                 self.assertFalse(flags["packages"])
 
-    def test_window_tests_and_label_select_linux_package(self):
-        self.assertTrue(lanes(["desktop/tests/mixed_runtime_window.py"], False)["packages"])
+    def test_window_tests_select_the_linux_package(self):
+        flags = lanes(["desktop/tests/mixed_runtime_window.py"], False)
+        self.assertTrue(flags["packages"])
+        self.assertFalse(flags["full"])
+
+    def test_the_full_ci_label_selects_the_legs_main_builds(self):
+        # The macOS package runs the desktop tests, so no focused job repeats them.
         self.assertEqual(lanes(["README.md"], True),
-                         {"native": True, "packages": True, "mac_package": False,
-                          "focused": ["macos-26"]})
+                         {"native": True, "packages": True, "mac_package": True,
+                          "focused": [], "full": True})
 
     def test_shared_packaging_selects_both_platforms(self):
         for path in ("desktop/package.sh", "desktop/packaging/Info.plist", "install.sh",

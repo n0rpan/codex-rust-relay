@@ -236,7 +236,7 @@ jobs:
       - name: Worker turns across dropped connections, Stop and host restarts
         run: |
           if ! command -v bwrap || ! command -v socat; then
-            sudo apt-get update -o Acquire::Retries=3
+            desktop/ci/apt-update.sh
             sudo apt-get install -y -o Acquire::Retries=3 bubblewrap socat
           fi
           if ! bwrap --ro-bind / / --dev /dev --proc /proc true &&

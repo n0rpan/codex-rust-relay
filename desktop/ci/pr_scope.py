@@ -42,8 +42,10 @@ def lanes(paths, full_ci):
     def touched(patterns):
         return any(fnmatchcase(path, pattern) for path in paths for pattern in patterns)
 
-    mac_package = touched((*packaging, "desktop/tests/*.swift", "desktop/ox-desk-probe/src/gate.py",
-                           "desktop/gate.toml"))
+    # full-ci asks for the legs main builds: every release binary, every native
+    # leg and all four desktop packages, so green predicts the release build.
+    mac_package = full_ci or touched((*packaging, "desktop/tests/*.swift", "desktop/ox-desk-probe/src/gate.py",
+                                      "desktop/gate.toml"))
     packages = mac_package or full_ci or touched(window_tests)
     # The package runs the same tests on its platform. Exercise the focused workflow
     # itself when it or its selector changes, even if this PR also changes packaging.
@@ -54,7 +56,7 @@ def lanes(paths, full_ci):
     if verify_focus or (not packages and touched(browser)):
         focused.append("ubuntu-24.04")
     return {"native": full_ci or touched(native_tests), "packages": packages,
-            "mac_package": mac_package, "focused": focused}
+            "mac_package": mac_package, "focused": focused, "full": full_ci}
 
 
 if __name__ == "__main__":

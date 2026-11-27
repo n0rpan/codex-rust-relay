@@ -1,0 +1,47 @@
+name: Auto queue
+
+# The full-ci label on a pull request from the maintainer's account means
+# "merge this when it is green": CI then runs the legs main builds, and this
+# workflow turns on auto-merge, which moves the pull request into the merge
+# queue as soon as `OX merge check` passes. Removing the label withdraws it.
+# A draft is never queued, so a draft with the label only gets the full run.
+#
+# It uses AUTO_QUEUE_TOKEN, a token of the maintainer, not the workflow's own
+# token: GitHub starts no workflow for an event caused by the built-in token,
+# so a merge it started could land on main without a release build.
+#
+# pull_request_target runs this file as it is on main, never the pull
+# request's copy, and nothing here checks out or runs pull request code. A
+# branch therefore cannot rewrite the steps that hold the token.
+on:
+  pull_request_target:
+    types: [labeled, unlabeled, ready_for_review, converted_to_draft]
+
+permissions: {}
+
+jobs:
+  queue:
+    name: Queue when green
+    if: >-
+      github.event.pull_request.user.login == 'n0rpan' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.state == 'open'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.AUTO_QUEUE_TOKEN }}
+      PR: ${{ github.event.pull_request.html_url }}
+      WANTED: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') && !github.event.pull_request.draft }}
+    steps:
+      - run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::AUTO_QUEUE_TOKEN is not set as a repository secret"
+            exit 1
+          fi
+          if [ "${WANTED}" = true ]; then
+            # With a merge queue on the base branch the queue's own method applies.
+            gh pr merge "${PR}" --auto
+          else
+            gh pr merge "${PR}" --disable-auto || true
+          fi

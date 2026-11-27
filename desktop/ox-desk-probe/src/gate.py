@@ -773,20 +773,22 @@ def reuse(f):
     for i in range(20):
         target = 1 - i % 2
         f.agent("fixture-model" if target else "codex")
-        wait(lambda: f.stats()["pane"] == target)
+        f.wait_for(f"pane {target} to be active after route change {i} of 20",
+                   lambda: f.stats()["pane"] == target)
         if i == 0:
-            wait(lambda: len(f.events("spawn")) == 2)
+            f.wait_for("the first route change to reuse both servers", lambda: len(f.events("spawn")) == 2)
             first_route_spawns = len(f.events("spawn")) + len(f.events("helper")) - before_route
     servers = f.events("spawn")
     total = len(servers) + len(f.events("helper"))
     # Both pickers must also offer a model reported only by provider discovery.
     # This third route opens after the process-reuse measurement.
     f.agent("fixture-discovered")
-    wait(lambda: f.stats()["pane"] == 2 and f.stats()["connected"])
+    f.wait_for("the discovered-model pane to open and connect",
+               lambda: f.stats()["pane"] == 2 and f.stats()["connected"])
     f.agent("codex")
-    wait(lambda: f.stats()["pane"] == 0)
+    f.wait_for("the codex pane to be active after the discovered model", lambda: f.stats()["pane"] == 0)
     f.agent("fixture-discovered", "model-setting-0")
-    wait(lambda: f.stats()["pane"] == 2)
+    f.wait_for("the discovered-model pane to be active from the settings picker", lambda: f.stats()["pane"] == 2)
     record("G9", created == 20 and base == before_route and cold_route_spawns == 2 and first_route_spawns == 0 and
            total == before_route + first_route_spawns and len(servers) == 2,
            new_threads=created, thread_selections=20, route_changes=20, cold_route_spawns=cold_route_spawns,
