@@ -140,6 +140,9 @@ that goes wrong.
 
 ## Before asking for a merge
 
+- Open a pull request ready for review, not as a draft: reviews run when it is
+  opened, marked ready and on every push. A draft is only for holding a
+  `full-ci` pull request back from merging by itself.
 - Ask for a review of the final commit (`@codex review`) and answer or fix
   every finding. A review of an earlier commit does not cover a later push.
 - Resolve a P0 or P1 thread only when it is fixed or shown to be wrong, then
