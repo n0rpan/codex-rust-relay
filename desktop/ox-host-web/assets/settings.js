@@ -1221,6 +1221,32 @@ export function setupSettings({ request, open, close, notifications, login }) {
       if (pageId === id && !panel.hidden) await workerLinks();
     });
     body.append(form);
+    const waiting = node("div", undefined, "phone-settings-card");
+    waiting.append(
+      node("h2", "Hosts waiting to pair"),
+      node("p", "A host whose operator opened a pairing window appears here. Linking it needs no code."),
+      action("Look for hosts waiting to pair", async () => {
+        const found = await readPage(id, { action: "nearby_window_hosts" });
+        if (!found) return;
+        waiting.replaceChildren(
+          node("h2", "Hosts waiting to pair"),
+          node("p", "A host whose operator opened a pairing window appears here. Linking it needs no code."),
+        );
+        if (!(found.hosts || []).length) {
+          waiting.append(node("p", "Nothing is waiting on this tailnet right now."));
+          return;
+        }
+        for (const host of found.hosts) {
+          waiting.append(
+            action(`${host.name} · ${host.origin}`, async () => {
+              await request({ action: "add_worker_link_window", origin: host.origin });
+              if (pageId === id && !panel.hidden) await workerLinks();
+            }, "primary"),
+          );
+        }
+      }),
+    );
+    body.append(waiting);
     for (const host of outbound.hosts) {
       const card = node("div", undefined, "phone-settings-card");
       card.append(node("h2", host.name), node("p", host.origin), action("Remove outgoing link", async () => {
@@ -1272,6 +1298,27 @@ export function setupSettings({ request, open, close, notifications, login }) {
       action("Host mode policy", hostModePolicy),
       action("Worker host links", workerLinks),
     );
+    const left = result.window
+      ? Math.max(0, Math.ceil((result.window.expires_at * 1000 - Date.now()) / 60000))
+      : 0;
+    if (left > 0) {
+      body.append(
+        node("p", `Waiting for a device to pair · ${left} min left · ${result.window.paired} paired`),
+        node("p", "On the new device, open Add host and choose this host. There is no code to carry."),
+        action("Stop waiting", async () => {
+          await readPage(id, { action: "close_pairing_window" });
+          if (pageId === id && !panel.hidden) await remote();
+        }),
+      );
+    } else {
+      body.append(
+        action("Wait for a device to pair", async () => {
+          await readPage(id, { action: "open_pairing_window" });
+          if (pageId === id && !panel.hidden) await remote();
+        }),
+        node("p", "A device on this tailnet can pair from its own Add host within five minutes, with no code."),
+      );
+    }
     const invite = node("div", undefined, "phone-settings-invite");
     body.append(
       action(

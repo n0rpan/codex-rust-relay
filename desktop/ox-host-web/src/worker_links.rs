@@ -175,6 +175,18 @@ pub(super) fn execute(app: &App, device: Option<&str>, action: Action) -> io::Re
             })?;
             Ok(describe(&host))
         }
+        Action::NearbyWindowHosts => Ok(json!({
+            "hosts": crate::discovery::open_hosts()
+                .into_iter()
+                .filter(|host| Some(&host.origin) != origin.as_ref())
+                .map(|host| json!({
+                    "origin": host.origin,
+                    "name": host.name,
+                    "tags": host.tags,
+                    "expires_at": host.expires_at,
+                }))
+                .collect::<Vec<_>>()
+        })),
         Action::RemoveWorkerLink { host } => {
             super::background_keychain().map_err(io::Error::other)?;
             let target = rows

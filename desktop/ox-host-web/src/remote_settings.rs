@@ -34,6 +34,8 @@ enum DeviceAction {
     Devices,
     PairDevice,
     InviteWorkerHost,
+    OpenPairingWindow,
+    ClosePairingWindow,
     EditWorkerLink {
         id: String,
         before: crate::admin::WorkerGrant,
@@ -100,8 +102,18 @@ pub(super) async fn settings(
                         .filter(|d| d.login == identity)
                         .collect();
                     Some(
-                        json!({"devices":devices,"worker_hosts":worker_hosts,"self":id,"origin":reply.origin}),
+                        json!({"devices":devices,"worker_hosts":worker_hosts,"self":id,"origin":reply.origin,"window":reply.window}),
                     )
+                }
+                DeviceAction::OpenPairingWindow => Some(
+                    serde_json::to_value(
+                        state.open_window(None).map_err(|_| StatusCode::CONFLICT)?,
+                    )
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                ),
+                DeviceAction::ClosePairingWindow => {
+                    state.close_window();
+                    Some(json!({"status":"closed"}))
                 }
                 DeviceAction::PairDevice => Some(
                     serde_json::to_value(

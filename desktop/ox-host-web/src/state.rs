@@ -303,6 +303,9 @@ impl State {
             })?;
             self.invites.clear();
             self.challenges.clear();
+            // A window admits devices without a code, so disabling remote
+            // access or moving to another origin must withdraw it too.
+            self.window = None;
             self.signal();
         } else if kept_port != self.disk.port || https_port != self.disk.https_port {
             self.update(|d| {
@@ -1159,6 +1162,19 @@ mod tests {
             s.pair_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
                 .is_none()
         );
+
+        // Disabling remote access, or moving to another Serve origin, withdraws
+        // it: a window is code-free admission and must not outlive its origin.
+        at(start);
+        s.open_window(None).unwrap();
+        s.set_origin(None, 0).unwrap();
+        assert!(s.window().is_none());
+        s.set_origin(Some("https://lab.fixture.ts.net".into()), 8443)
+            .unwrap();
+        s.open_window(None).unwrap();
+        s.set_origin(Some("https://other.fixture.ts.net".into()), 8443)
+            .unwrap();
+        assert!(s.window().is_none());
     }
     #[test]
     fn worker_links_keep_their_own_role_and_grant_through_restart_and_repair() {

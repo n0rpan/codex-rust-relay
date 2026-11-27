@@ -185,6 +185,8 @@ pub enum WorkerLinkAction {
     AddWorkerLinkWindow {
         origin: String,
     },
+    /// Hosts on this tailnet whose operator is waiting for a device.
+    NearbyWindowHosts,
     LinkPairedHost {
         host: String,
     },

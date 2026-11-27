@@ -288,6 +288,44 @@ impl Render for Remote {
                         },
                         cx,
                     ));
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs() as i64);
+                    match report
+                        .access
+                        .host
+                        .window
+                        .as_ref()
+                        .filter(|w| w.expires_at > now)
+                    {
+                        Some(window) => {
+                            let minutes = (window.expires_at - now + 59) / 60;
+                            let who = window.login.as_deref().unwrap_or("a device");
+                            view = view.child(format!(
+                                "Waiting for {who} to pair · {minutes} min left · {} paired. On the other machine, choose this host under Add host.",
+                                window.paired
+                            ));
+                            buttons = buttons.child(self.action(
+                                p,
+                                "remote-window-close",
+                                "Stop waiting",
+                                Operation::CloseWindow,
+                                cx,
+                            ));
+                        }
+                        None => {
+                            view = view.child(
+                                "Waiting lets a device pair from its own Add host with no code to carry. It lasts five minutes.",
+                            );
+                            buttons = buttons.child(self.action(
+                                p,
+                                "remote-window-open",
+                                "Wait for a device to pair",
+                                Operation::OpenWindow { login: None },
+                                cx,
+                            ));
+                        }
+                    }
                 } else {
                     let port_input = self
                         .port_field

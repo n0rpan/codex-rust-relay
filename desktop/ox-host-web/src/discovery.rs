@@ -26,6 +26,11 @@ fn peers() -> Vec<(String, String, Vec<String>)> {
     let Ok(status) = serde_json::from_slice::<Value>(&output.stdout) else {
         return Vec::new();
     };
+    parse_peers(&status)
+}
+
+/// Online peers that name a usable MagicDNS address, as `(origin, name, tags)`.
+fn parse_peers(status: &Value) -> Vec<(String, String, Vec<String>)> {
     if status["BackendState"] != "Running" {
         return Vec::new();
     }
@@ -94,4 +99,33 @@ pub fn open_hosts() -> Vec<client::OpenHost> {
             .flatten()
             .collect()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_peers;
+    use serde_json::json;
+    #[test]
+    fn only_online_peers_with_a_magicdns_name_are_offered() {
+        let status = json!({
+            "BackendState": "Running",
+            "Peer": {
+                "a": {"DNSName": "lab.tail1234.ts.net.", "Online": true, "Tags": ["tag:home-control"]},
+                "b": {"DNSName": "offline.tail1234.ts.net.", "Online": false, "Tags": []},
+                "c": {"DNSName": "", "Online": true},
+                "d": {"DNSName": "bad name.tail1234.ts.net.", "Online": true}
+            }
+        });
+        let found = parse_peers(&status);
+        assert_eq!(
+            found,
+            vec![(
+                "https://lab.tail1234.ts.net:8443".to_owned(),
+                "lab.tail1234.ts.net".to_owned(),
+                vec!["tag:home-control".to_owned()]
+            )]
+        );
+        let stopped = json!({"BackendState": "Stopped", "Peer": {}});
+        assert!(parse_peers(&stopped).is_empty());
+    }
 }
