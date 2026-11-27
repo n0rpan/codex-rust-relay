@@ -80,7 +80,7 @@ With no host running, `ox claude` and `ox codex` run workers inside the launchin
 
 ## Handoffs
 
-A handoff continues a conversation in another runtime, billing route or model. The target is a new native session; the source stays as it was. A route or model change inside one runtime is a handoff too: a Claude session cannot be resumed across billing routes, because each route has its own config dir. On API routes the model is the OX alias, so choosing another alias is a route change.
+A handoff continues a conversation in another runtime, billing route or model. The target is a new native session; the source stays as it was. The composer can switch models within the same subscription or API provider in the existing session. A Claude API session keeps its original catalog binding and records the selected model for resume. Switching the runtime or billing provider uses a new session.
 
 **Starting one.** On the desktop type `/handoff <codex|claude>[:<alias>] [--mode <mode>] <request>` in the source session's composer, or choose "Continue in…" in the command palette, which fills that command in. On the phone use Continue in… in the session menu and choose the runtime, route and model, mode (default: inherited) and the request. Choosing YOLO in either is the confirmation that any YOLO change needs; inheriting YOLO without a grant is refused with a request to choose it explicitly. The phone sheet offers the grant with it. Before a conversation goes to a different provider than the source's, both clients say in one line which provider receives it.
 

@@ -94,7 +94,12 @@ impl Launch {
                 }
             }
             Billing::Api(alias) => {
-                cmd.args(["--model", alias]);
+                let model = self
+                    .model
+                    .as_deref()
+                    .filter(|m| crate::runtime::same_api_provider(alias, m))
+                    .unwrap_or(alias);
+                cmd.args(["--model", model]);
             }
         }
         cmd.args([
@@ -290,7 +295,7 @@ impl Link {
     }
     pub fn set_model(&self, model: &str) -> io::Result<String> {
         if let Billing::Api(alias) = &self.billing
-            && alias != model
+            && !crate::runtime::same_api_provider(alias, model)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

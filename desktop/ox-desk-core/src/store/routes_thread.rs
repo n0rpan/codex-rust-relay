@@ -100,19 +100,13 @@ impl Store {
         }
     }
     pub fn same_model_route(&self, model: &str) -> bool {
-        if self.is_session_scoped() {
-            return match &self.profile.route.billing {
-                Billing::Subscription => true,
-                Billing::Api(alias) => alias == model,
-            };
-        }
         match &self.profile.route.billing {
             Billing::Subscription => true,
-            Billing::Api(active) if active == model => true,
-            Billing::Api(active) if self.profile.provider == "codeox" => active
-                .split_once('/')
-                .zip(model.split_once('/'))
-                .is_some_and(|((a, _), (b, _))| a == b),
+            Billing::Api(active)
+                if self.is_session_scoped() || self.profile.provider == "codeox" =>
+            {
+                crate::runtime::same_api_provider(active, model)
+            }
             Billing::Api(_) => true, // One directly configured legacy Responses provider.
         }
     }

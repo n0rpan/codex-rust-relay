@@ -290,6 +290,13 @@ impl Store {
                 return Ok(Effect::Applied);
             }
             Action::Hint(message) => return Err(io::Error::other(message)),
+            Action::Native(NativeCommand::Model(model)) => {
+                self.choose(id, super::routes_thread::Choice::Model(model))?;
+                if palette_text.is_none() {
+                    self.edit(id, String::new());
+                }
+                return Ok(Effect::Applied);
+            }
             Action::Native(NativeCommand::Status) => {
                 format!(
                     "{} · {} · {} speed · {}",
@@ -365,7 +372,15 @@ pub struct Handoff {
 
 impl Store {
     pub fn handoff_argv(&self, thread: Option<&str>) -> io::Result<Vec<String>> {
-        let route = self.thread_route(thread);
+        let mut route = self.thread_route(thread);
+        if self.is_session_scoped()
+            && let crate::runtime::Billing::Api(alias) = &mut route.billing
+        {
+            let selected = self.options(thread).model;
+            if crate::runtime::same_api_provider(alias, &selected) {
+                *alias = selected;
+            }
+        }
         let native = thread.map(|id| self.terminal_session_id(id)).transpose()?;
         Ok(crate::runtime::terminal_args(
             &route,

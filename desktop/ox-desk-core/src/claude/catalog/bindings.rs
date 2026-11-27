@@ -18,6 +18,8 @@ struct Entry {
     profile: PathBuf,
     id: String,
     alias: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected_model: Option<String>,
 }
 
 // On the first API launch OX creates ox-clients/claude in its child process.
@@ -95,6 +97,25 @@ impl Bindings {
             .map(|r| r.alias))
     }
 
+    pub fn selected_model(
+        &self,
+        project: &Path,
+        relay_profile: &Path,
+        id: &str,
+        alias: &str,
+    ) -> io::Result<Option<String>> {
+        let project = project.canonicalize()?;
+        let profile = profile_identity(relay_profile)?;
+        Ok(self
+            .entries()?
+            .into_iter()
+            .find(|r| {
+                r.project == project && r.profile == profile && r.id == id && r.alias == alias
+            })
+            .and_then(|r| r.selected_model)
+            .filter(|m| crate::runtime::same_api_provider(alias, m)))
+    }
+
     pub fn bind(
         &self,
         project: &Path,
@@ -102,7 +123,19 @@ impl Bindings {
         id: &str,
         alias: &str,
     ) -> io::Result<()> {
-        if !valid_session_id(id)
+        self.record(project, relay_profile, id, alias, None)
+    }
+
+    pub fn record(
+        &self,
+        project: &Path,
+        relay_profile: &Path,
+        id: &str,
+        alias: &str,
+        model: Option<&str>,
+    ) -> io::Result<()> {
+        if model.is_some_and(|model| !crate::runtime::same_api_provider(alias, model))
+            || !valid_session_id(id)
             || alias.trim() != alias
             || alias.is_empty()
             || alias.chars().any(char::is_control)
@@ -130,24 +163,31 @@ impl Bindings {
         lock.lock()?;
         let mut rows = self.entries()?;
         if let Some(existing) = rows
-            .iter()
+            .iter_mut()
             .find(|r| r.project == project && r.profile == profile && r.id == id)
         {
-            return if existing.alias == alias {
-                Ok(())
-            } else {
-                Err(io::Error::new(
+            if existing.alias != alias {
+                return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "Claude session is bound to a different API alias",
-                ))
+                ));
+            }
+            let Some(model) = model else {
+                return Ok(());
             };
+            if existing.selected_model.as_deref() == Some(model) {
+                return Ok(());
+            }
+            existing.selected_model = Some(model.to_owned());
+        } else {
+            rows.push(Entry {
+                project,
+                profile,
+                id: id.into(),
+                alias: alias.into(),
+                selected_model: model.map(str::to_owned),
+            });
         }
-        rows.push(Entry {
-            project,
-            profile,
-            id: id.into(),
-            alias: alias.into(),
-        });
         // The adjacent lock serializes all writers, including other desktop windows.
         let tmp = self.path.with_extension("tmp");
         // An interrupted write may leave a temporary file: never reuse its inode.

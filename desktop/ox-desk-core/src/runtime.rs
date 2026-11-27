@@ -69,6 +69,15 @@ pub struct Route {
     pub billing: Billing,
 }
 
+/// The provider prefix identifies the account billed by an OX API model.
+pub fn same_api_provider(active: &str, model: &str) -> bool {
+    active == model
+        || active
+            .split_once('/')
+            .zip(model.split_once('/'))
+            .is_some_and(|((a, _), (b, _))| !a.is_empty() && a == b)
+}
+
 impl Route {
     pub const CODEX_SUBSCRIPTION: Self = Self {
         runtime: Runtime::Codex,

@@ -558,7 +558,40 @@ impl Store {
             .or(p.dispatching_worker.as_deref())
             .and_then(|k| p.sessions.get(k.split('/').next()?))
             .and_then(|s| s.capabilities.clone())
-            .unwrap_or_else(|| self.commands.schema.clone().unwrap_or_default())
+            .or_else(|| self.commands.schema.clone())
+            .unwrap_or_else(|| {
+                // Before the first turn there is no stock process. Its stable subscription
+                // aliases still work with --model, and API aliases come from this launcher.
+                let (current, names): (&str, Vec<&str>) = match &self.profile.route.billing {
+                    Billing::Subscription => {
+                        ("default", vec!["default", "opus", "sonnet", "haiku"])
+                    }
+                    Billing::Api(alias) => (
+                        alias,
+                        p.launcher.aliases.iter().map(String::as_str).collect(),
+                    ),
+                };
+                let models = names
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        (
+                            name.to_owned(),
+                            super::routes_thread::ModelInfo {
+                                label: crate::slash::readable_model(name),
+                                rank: Some(index as u32),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect();
+                crate::slash::Capabilities {
+                    provider: self.profile.provider.clone(),
+                    model: current.into(),
+                    models: Arc::new(models),
+                    ..Default::default()
+                }
+            })
     }
     pub fn open_claude(
         profile: Profile,
@@ -705,14 +738,30 @@ impl Store {
         // With no chosen mode, Claude Code starts in its own configured default,
         // as `claude` does in a terminal, and reports that mode on connect.
         let model = model.or_else(|| match &session {
-            Session::New(_) if contract.is_none() && !profile.route.is_api() => {
+            Session::New(_) if contract.is_none() => {
                 self.next_options.take().map(|options| options.model)
             }
-            Session::Resume(_) if !profile.route.is_api() => {
-                self.resume_models.get(&owner).cloned()
-            }
+            Session::Resume(_) => self.resume_models.get(&owner).cloned(),
             _ => None,
         });
+        let model = if let Billing::Api(alias) = &profile.route.billing {
+            let source = match &session {
+                Session::Resume(id) | Session::Fork { source: id, .. } => Some(id),
+                _ => None,
+            };
+            let launcher = &self.claude().launcher;
+            match (model, source) {
+                (None, Some(source)) => Bindings::new(launcher.index.clone()).selected_model(
+                    &profile.project,
+                    &launcher.profiles.api,
+                    source,
+                    alias,
+                )?,
+                (chosen, _) => chosen,
+            }
+        } else {
+            model
+        };
         // A failed first send may have a reserved ID but no stock journal. Retry
         // only that creation, preserving the session's options and the unrelated new draft.
         let session = if matches!(session, Session::Resume(_))
@@ -789,7 +838,13 @@ impl Store {
                     })?;
                 }
                 if let Billing::Api(alias) = &profile.route.billing {
-                    index.bind(&profile.project, &launcher.profiles.api, &id, alias)?
+                    index.record(
+                        &profile.project,
+                        &launcher.profiles.api,
+                        &id,
+                        alias,
+                        model.as_deref(),
+                    )?
                 }
                 let output = emit.clone();
                 let link = pipe::Link::spawn(
@@ -1246,6 +1301,19 @@ impl Store {
         process.controls.insert(request, Control::Mode(mode));
         Ok(())
     }
+    fn record_claude_model(&self, owner: &str, model: &str) -> io::Result<()> {
+        if let Billing::Api(alias) = &self.profile.route.billing {
+            let launcher = &self.claude().launcher;
+            Bindings::new(launcher.index.clone()).record(
+                &self.profile.project,
+                &launcher.profiles.api,
+                stock_id(owner)?,
+                alias,
+                Some(model),
+            )?;
+        }
+        Ok(())
+    }
     pub(super) fn claude_choose(
         &mut self,
         id: Option<&str>,
@@ -1254,10 +1322,21 @@ impl Store {
         let super::routes_thread::Choice::Model(model) = choice else {
             return Err(io::Error::other("Unsupported Claude session setting"));
         };
-        if self.profile.route.is_api() {
-            return Err(io::Error::other(
-                "Start a new Claude session to change its billing alias",
-            ));
+        match &self.profile.route.billing {
+            Billing::Api(_)
+                if !self.same_model_route(&model)
+                    || !self.claude().launcher.aliases.contains(&model) =>
+            {
+                return Err(io::Error::other(
+                    "Choose a configured model on this API provider.",
+                ));
+            }
+            Billing::Subscription if !crate::claude_models::valid_model(&model) => {
+                return Err(io::Error::other(
+                    "Enter a Claude model name, such as sonnet.",
+                ));
+            }
+            _ => {}
         }
         let Some(owner) = id else {
             self.next_options = Some(super::routes_thread::Options {
@@ -1267,6 +1346,7 @@ impl Store {
             return Ok(());
         };
         if self.can_configure_saved_claude(owner) {
+            self.record_claude_model(owner, &model)?;
             self.resume_models.insert(owner.to_owned(), model);
             self.changed.transcript(owner);
             return Ok(());

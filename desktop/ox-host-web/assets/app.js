@@ -1553,9 +1553,11 @@ new IntersectionObserver(([entry]) => {
 // An absolute path such as /home/oscar/project is still an ordinary message.
 function composerCommand(content) {
   const text = content.trim();
+  const name = text.split(/\s/, 1)[0];
+  if (name.startsWith("/") && Object.hasOwn(controls.schema.session_commands ?? {}, name)) return text;
   return /^\/[^\s/]*(?:\s|$)/.test(text) ? text : null;
 }
-const localCommands = new Set(["/new", "/resume", "/terminal", "/model"]);
+const localCommands = new Set(["/new", "/clear", "/resume", "/terminal", "/model"]);
 function commandSuggestions(command) {
   const menu = $("slash-choices"), schema = controls.schema;
   const name = command?.split(/\s/, 1)[0];
@@ -1571,9 +1573,11 @@ function commandSuggestions(command) {
         .map((name) => [name, "Service tier"]);
     }
   }
-  const terminal = !!command && !$("operator-session").hidden && !rows.length &&
-    !schema.choices?.some(([known]) => known === name);
-  const stamp = JSON.stringify([rows, terminal]);
+  const terminal = !!command && !$("operator-session").hidden && (
+    command === "/" || (!rows.length && !schema.choices?.some(([known]) => known === name)) ||
+    Object.hasOwn(schema.session_commands ?? {}, name)
+  );
+  const stamp = JSON.stringify([rows, terminal, command === "/"]);
   if (menu.dataset.choices === stamp) return;
   menu.dataset.choices = stamp;
   menu.hidden = !rows.length && !terminal;
@@ -1581,12 +1585,13 @@ function commandSuggestions(command) {
     const choice = button(name, () => {
       $("draft").value = name + " ";
       $("draft").oninput();
-      $("draft").focus();
+      if (name === "/model") $("composer").requestSubmit();
+      else $("draft").focus();
     });
     choice.title = hint;
     return choice;
   }));
-  if (terminal) menu.append(button("Open in native terminal", () => {
+  if (terminal) menu.append(button(command === "/" ? "All commands in native terminal" : "Open in native terminal", () => {
     if (selected?.id)
       openPhoneTerminal("native-session", null, { scope: selected.scope, thread: selected.id }, $("draft").value.trim());
   }));
@@ -2552,7 +2557,9 @@ $("composer").onsubmit = (e) => {
   const command = composerCommand(content);
   if (localCommands.has(command)) {
     if (command === "/model" && (!$("composer-model") || $("composer-models").hidden || $("composer-model").disabled)) {
-      controls.error = "Model selection is unavailable for this session right now.";
+      controls.error = scope.route.runtime === "claude" && !Object.keys(controls.schema.models ?? {}).length
+        ? "Type /model followed by a model name, such as /model sonnet."
+        : "Model selection is unavailable for this session right now.";
       controls.render();
       return;
     }
@@ -2565,7 +2572,7 @@ $("composer").onsubmit = (e) => {
     controls.render();
     $("draft").value = "";
     $("draft").oninput();
-    if (command === "/new") open(scope, null);
+    if (command === "/new" || command === "/clear") open(scope, null);
     if (command === "/resume") { home(); $("find-sessions").focus(); }
     if (command === "/terminal") $("operator-session").click();
     if (command === "/model") {

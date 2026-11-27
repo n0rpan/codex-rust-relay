@@ -290,10 +290,8 @@ export class SessionControls {
     const compatible = (id) =>
       typeof billing === "string" ||
       billing.api === id ||
-      (scope.route.runtime === "codex" &&
-        (detail.provider !== "codeox" ||
-          (id.includes("/") &&
-            id.split("/")[0] === billing.api.split("/")[0])));
+      (scope.route.runtime === "codex" && detail.provider !== "codeox") ||
+      (id.includes("/") && billing.api.includes("/") && id.split("/")[0] === billing.api.split("/")[0]);
     const modelRows = Object.entries(models)
       .filter(([k]) => compatible(k))
       .sort(([a, x], [b, y]) => (x.rank ?? Infinity) - (y.rank ?? Infinity) || a.localeCompare(b))

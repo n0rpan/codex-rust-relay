@@ -76,6 +76,26 @@ fn concurrent_windows_cannot_rebind_a_session() {
     });
     let alias = bindings.alias(project, project, ID).unwrap().unwrap();
     bindings.bind(project, project, ID, &alias).unwrap();
+    bindings
+        .record(project, project, ID, &alias, Some("vendor/next"))
+        .unwrap();
+    assert!(
+        bindings
+            .record(project, project, ID, &alias, Some("another/next"))
+            .is_err()
+    );
+    bindings.bind(project, project, ID, &alias).unwrap();
+    assert_eq!(
+        bindings
+            .selected_model(project, project, ID, &alias)
+            .unwrap()
+            .as_deref(),
+        Some("vendor/next")
+    );
+    assert_eq!(
+        bindings.alias(project, project, ID).unwrap().as_ref(),
+        Some(&alias)
+    );
     let different = project.join("other");
     fs::create_dir(&different).unwrap();
     assert_eq!(bindings.alias(project, &different, ID).unwrap(), None);

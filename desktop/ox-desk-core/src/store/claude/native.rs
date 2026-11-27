@@ -254,6 +254,19 @@ impl Store {
         }
         let snapshot_only = !self.is_native_live(id);
         if snapshot_only {
+            if let Billing::Api(alias) = &self.profile.route.billing
+                && !self.resume_models.contains_key(id)
+            {
+                let launcher = &self.claude().launcher;
+                if let Some(model) = Bindings::new(launcher.index.clone()).selected_model(
+                    &self.profile.project,
+                    &launcher.profiles.api,
+                    stock_id(id)?,
+                    alias,
+                )? {
+                    self.resume_models.insert(id.into(), model);
+                }
+            }
             self.ended_threads.insert(id.into());
         }
         let p = self.claude_mut();
