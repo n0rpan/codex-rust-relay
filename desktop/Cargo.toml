@@ -1,5 +1,5 @@
 [workspace]
-members = ["ox-desktop", "ox-desk-core", "ox-desk-probe", "ox-host", "ox-host-protocol", "ox-host-service", "ox-host-web", "ox-pty"]
+members = ["ox-desktop", "ox-desk-core", "ox-desk-probe", "ox-host", "ox-host-protocol", "ox-host-service", "ox-host-web", "ox-pty", "ox-memory"]
 default-members = ["ox-desktop"]
 resolver = "3"
 

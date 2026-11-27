@@ -23,6 +23,7 @@ mod diagnostics;
 mod help;
 mod host_lifetime;
 mod managed_install;
+mod memory_cli;
 mod native;
 mod picker;
 mod provider;
@@ -188,6 +189,9 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
     }
     if args.first().is_some_and(|arg| arg == "weather") {
         return weather::run(&args[1..]).await;
+    }
+    if args.first().is_some_and(|arg| arg == "memory") {
+        return memory_cli::run(&args[1..]);
     }
     if args.first().is_some_and(|arg| arg == "update") {
         return update::run(&args[1..]).await;

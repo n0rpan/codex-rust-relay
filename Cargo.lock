@@ -602,6 +602,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "ox-memory",
  "reqwest",
  "ring",
  "serde",
@@ -611,6 +612,16 @@ dependencies = [
  "tokio",
  "toml_edit",
  "unicode-width",
+]
+
+[[package]]
+name = "ox-memory"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

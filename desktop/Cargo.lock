@@ -4888,6 +4888,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ox-memory"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "ox-pty"
 version = "0.1.0"
 dependencies = [

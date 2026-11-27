@@ -20,6 +20,7 @@ If something is off
   ox ps              List the live sessions and workers the OX host runs
   ox end <id>        End a session (or --idle, --all); ox ps shows the ids
   ox weather [--json]  Weather for your timezone's city (MET Norway; OX_WEATHER=0 turns it off)
+  ox memory <cmd>    Inspect, search, pin, or edit persistent OX memories
 
 More
   ox codex --model provider/model-id   Skip the picker (same for ox claude)
