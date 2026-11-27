@@ -254,11 +254,12 @@ fn remote(paths: &Paths, report: &mut Report, tailscale: &Tailscale) {
     for host in &status.worker_hosts {
         if let Some(grant) = &host.worker {
             report.info(format!(
-                "worker host: {} ({}), launches {}, ceiling {}, last contact {}",
+                "worker host: {} ({}), launches {}, ceiling {}, memory sync {}, last contact {}",
                 host.label,
                 host.login,
                 if grant.may_launch { "on" } else { "off" },
                 grant.ceiling.name(),
+                if grant.may_sync_memory { "on" } else { "off" },
                 ago(now, host.last_used)
             ));
         }

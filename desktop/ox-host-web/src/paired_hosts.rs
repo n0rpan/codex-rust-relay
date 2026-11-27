@@ -228,7 +228,7 @@ pub(crate) fn window_origin(address: &str) -> io::Result<String> {
 /// True when an address alone names a host that is waiting, with no invitation
 /// fragment and no typed code. An invitation link carries its code in
 /// `#pair=` and is redeemed as one.
-pub(crate) fn window_address(address: &str, code: &str) -> bool {
+pub fn window_address(address: &str, code: &str) -> bool {
     code.trim().is_empty() && !address.contains("#pair=")
 }
 pub(crate) fn enroll(

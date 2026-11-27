@@ -27,6 +27,8 @@ pub use server::{run, run_with_jobs};
 #[cfg(feature = "server")]
 pub mod linked_jobs;
 #[cfg(feature = "server")]
+pub mod memory_sync;
+#[cfg(feature = "server")]
 pub mod worker_result;
 
 #[cfg(all(test, feature = "server"))]

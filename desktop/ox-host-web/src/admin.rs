@@ -71,6 +71,9 @@ pub enum Request {
         before: WorkerGrant,
         may_launch: bool,
         ceiling: ox_desk_core::modes::Level,
+        /// `None` leaves the link's memory-sync grant unchanged.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        may_sync_memory: Option<bool>,
     },
     WorkerInvitation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -106,6 +109,11 @@ pub struct WorkerGrant {
     /// Stable ID of the OX host that redeemed this invitation.
     pub source: String,
     pub may_launch: bool,
+    /// Receiver-side opt-in for `/api/memory/sync`. Links paired before this
+    /// grant existed read as `false`, so memory sync is denied until the
+    /// receiving host grants it explicitly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub may_sync_memory: bool,
     pub ceiling: ox_desk_core::modes::Level,
 }
 

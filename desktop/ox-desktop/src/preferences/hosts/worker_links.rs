@@ -79,13 +79,14 @@ impl Hosts {
         before: WorkerGrant,
         may_launch: bool,
         ceiling: Level,
+        may_sync_memory: bool,
         cx: &mut Context<Self>,
     ) {
         let selected = self.selected.clone();
         self.work(cx, move || {
             match selected.as_ref() {
-                Some(host) => { host.settings(json!({"action":"edit_worker_link", "id":id, "before":before, "may_launch":may_launch, "ceiling":ceiling}))?; },
-                None => { local(admin::Request::WorkerAccess { id, before, may_launch, ceiling })?; },
+                Some(host) => { host.settings(json!({"action":"edit_worker_link", "id":id, "before":before, "may_launch":may_launch, "ceiling":ceiling, "may_sync_memory":may_sync_memory}))?; },
+                None => { local(admin::Request::WorkerAccess { id, before, may_launch, ceiling, may_sync_memory: Some(may_sync_memory) })?; },
             }
             directory(selected.as_ref())
         }, |s, links, _| { s.links = Some(links); });
@@ -216,6 +217,30 @@ impl Hosts {
                         grant.clone(),
                         !grant.may_launch,
                         grant.ceiling,
+                        grant.may_sync_memory,
+                        cx,
+                    )
+                }),
+            ));
+            let id = incoming.id.clone();
+            let grant = before.clone();
+            section = section.child(button(
+                p,
+                ("worker-memory-sync", i),
+                if grant.may_sync_memory {
+                    "Allow memory sync · On"
+                } else {
+                    "Allow memory sync · Off"
+                },
+                grant.may_sync_memory,
+                !self.busy,
+                cx.listener(move |s, _, _, cx| {
+                    s.worker_access(
+                        id.clone(),
+                        grant.clone(),
+                        grant.may_launch,
+                        grant.ceiling,
+                        !grant.may_sync_memory,
                         cx,
                     )
                 }),
@@ -236,7 +261,14 @@ impl Hosts {
                     before.ceiling == level,
                     !self.busy,
                     cx.listener(move |s, _, _, cx| {
-                        s.worker_access(id.clone(), before.clone(), before.may_launch, level, cx)
+                        s.worker_access(
+                            id.clone(),
+                            before.clone(),
+                            before.may_launch,
+                            level,
+                            before.may_sync_memory,
+                            cx,
+                        )
                     }),
                 ));
             }

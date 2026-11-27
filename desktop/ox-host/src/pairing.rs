@@ -240,12 +240,13 @@ pub fn devices(paths: &Paths) -> Result<(), String> {
         };
         if let Some(worker) = &device.worker {
             println!(
-                "{}  {}  {class}  {}  launches {}  ceiling {}",
+                "{}  {}  {class}  {}  launches {}  ceiling {}  memory sync {}",
                 device.id,
                 device.label,
                 device.login,
                 if worker.may_launch { "on" } else { "off" },
-                worker.ceiling.name()
+                worker.ceiling.name(),
+                if worker.may_sync_memory { "on" } else { "off" }
             );
             continue;
         }
@@ -303,6 +304,33 @@ pub fn revoke(paths: &Paths, id: &str) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     println!("Revoked {}.", device.label);
+    Ok(())
+}
+
+/// Grant or revoke a paired worker host's access to this host's non-local memories.
+pub fn memory_sync(paths: &Paths, id: &str, enabled: bool) -> Result<(), String> {
+    let devices = access::status(paths)?.devices;
+    let device = match_device(&devices, id)?;
+    let grant = device
+        .worker
+        .clone()
+        .ok_or("That device is not a worker host link.")?;
+    admin::request(
+        &paths.state_dir,
+        &Request::WorkerAccess {
+            id: device.id.clone(),
+            may_launch: grant.may_launch,
+            ceiling: grant.ceiling,
+            before: grant,
+            may_sync_memory: Some(enabled),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    println!(
+        "Memory sync {} for {}.",
+        if enabled { "enabled" } else { "disabled" },
+        device.label
+    );
     Ok(())
 }
 
