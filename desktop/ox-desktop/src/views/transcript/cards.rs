@@ -164,7 +164,7 @@ fn stats_label(changes: &[ox_desk_core::transcript::item::FileChange]) -> String
     }
 }
 
-fn summary(item: &Item) -> String {
+pub(in crate::views) fn summary(item: &Item) -> String {
     match item {
         Item::CommandExecution { command, .. } => shell_summary(command),
         Item::FileChange { changes, .. } => match changes.as_slice() {

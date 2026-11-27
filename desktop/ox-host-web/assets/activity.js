@@ -140,6 +140,58 @@ export function sceneFor(items, running, waiting) {
   return "tool";
 }
 
+/**
+ * Short, human-readable summary of the latest activity in the active turn so
+ * the operator sees which tool or thought is running right now even when a
+ * long tool chain is collapsed.
+ */
+export function detailFor(items, running, waiting) {
+  if (!running || waiting || !items?.length) return "";
+  const last = items[items.length - 1];
+  if (!last) return "";
+  if (last.role === "thinking") {
+    const line = String(last.text ?? "")
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .pop();
+    return line ? line.slice(0, 72) : "";
+  }
+  const turn = last.turn;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    if (item.turn !== turn) break;
+    if (["user", "assistant", "result", "error"].includes(item.role)) break;
+    if (item.role !== "tool") continue;
+    const [kind, data] = Object.entries(item.detail?.item ?? {})[0] ?? [];
+    if (kind === "CommandExecution") {
+      const m = data?.command?.match(
+        /^(?:\S*\/)?(?:bash|zsh|sh)\s+-[a-z]*c\s+(['"]?)([\s\S]*)$/i,
+      );
+      let text = m ? m[2] : (data?.command ?? "");
+      if (m && m[1] && text.endsWith(m[1])) text = text.slice(0, -1);
+      return text.trim().split("\n")[0]?.slice(0, 72) || "Shell command";
+    }
+    if (kind === "FileChange") {
+      const changes = Array.isArray(data?.changes) ? data.changes : [];
+      if (changes.length === 1)
+        return String(changes[0].path ?? "File").slice(0, 72);
+      if (changes.length > 1) return `${changes.length} changed files`;
+      return "File changes";
+    }
+    if (kind === "WebSearch") {
+      return data?.query ? String(data.query).slice(0, 72) : "Web search";
+    }
+    const label =
+      data?.tool ??
+      String(item.text ?? "")
+        .split("\n", 1)[0]
+        ?.trim();
+    if (label) return String(label).slice(0, 72);
+  }
+  return "";
+}
+
 /** A stable seed for one turn of one thread, so a repaint never reshuffles. */
 export function seed(thread, turn) {
   let hash = 2166136261;
@@ -428,13 +480,20 @@ export class ActivityLine {
     this.turn = turn;
     scene ??= this.finale;
     const nextSeed = turn === null ? 0 : seed(session, turn);
+    const detail = detailFor(items, running, waiting);
+    const labelText = scene
+      ? detail
+        ? `${LABELS[scene]} · ${detail}`
+        : LABELS[scene]
+      : "";
+    if (this.label.textContent !== labelText)
+      this.label.textContent = labelText;
     if (scene === this.scene && nextSeed === this.seed) return;
     this.scene = scene;
     this.seed = nextSeed;
     this.frame = 0;
     this.left = ONE_SHOT[scene] ?? 0;
     this.line.hidden = !scene;
-    this.label.textContent = scene ? LABELS[scene] : "";
     clearTimeout(this.timer);
     this.timer = null;
     this.paint();

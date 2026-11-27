@@ -171,6 +171,8 @@ pub struct UserSection {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProjectFolderMeta {
+    /// Unix timestamp when starred; `Some` pins this project folder to the top of the project list.
+    pub starred_at: Option<i64>,
     pub color: Option<AccentColor>,
     pub collapsed: bool,
     pub order: Option<i64>,
@@ -485,6 +487,65 @@ impl SidebarState {
         self.projects.get(project).and_then(|p| p.color)
     }
 
+    pub fn is_project_starred(&self, project: &Path) -> bool {
+        self.projects
+            .get(project)
+            .and_then(|p| p.starred_at)
+            .is_some()
+    }
+
+    pub fn project_starred_at(&self, project: &Path) -> Option<i64> {
+        self.projects.get(project).and_then(|p| p.starred_at)
+    }
+
+    pub fn toggle_project_star(&mut self, project: &Path, now: i64) -> bool {
+        let entry = self.projects.entry(project.to_path_buf()).or_default();
+        if entry.starred_at.is_some() {
+            entry.starred_at = None;
+            false
+        } else {
+            entry.starred_at = Some(now.max(1));
+            true
+        }
+    }
+
+    pub fn project_order(&self, project: &Path) -> Option<i64> {
+        self.projects.get(project).and_then(|p| p.order)
+    }
+
+    /// Move a project folder up (`-1`) or down (`1`) within the current project folder order.
+    /// Crossing the boundary between starred and unstarred folders promotes or demotes the
+    /// folder's starred state so the swap always takes effect visually.
+    pub fn step_project_order(&mut self, ordered_projects: &[PathBuf], target: &Path, delta: i32) {
+        let Some(pos) = ordered_projects.iter().position(|p| p == target) else {
+            return;
+        };
+        let next = (pos as i32 + delta).clamp(0, ordered_projects.len() as i32 - 1) as usize;
+        if pos == next {
+            return;
+        }
+        let other = &ordered_projects[next];
+        let target_starred = self.is_project_starred(target);
+        let other_starred = self.is_project_starred(other);
+        if delta < 0 && !target_starred && other_starred {
+            let ts = self.project_starred_at(other).unwrap_or(1).max(1) + 1;
+            self.projects
+                .entry(target.to_path_buf())
+                .or_default()
+                .starred_at = Some(ts);
+        } else if delta > 0 && target_starred && !other_starred {
+            self.projects
+                .entry(target.to_path_buf())
+                .or_default()
+                .starred_at = None;
+        }
+        let mut ordered = ordered_projects.to_vec();
+        ordered.swap(pos, next);
+        for (idx, project) in ordered.into_iter().enumerate() {
+            self.projects.entry(project).or_default().order = Some((idx as i64 + 1) * 10);
+        }
+    }
+
     /// Move a thread up (`-1`) or down (`1`) within its current section or `Pinned` group.
     pub fn step_thread_order(
         &mut self,
@@ -576,5 +637,33 @@ mod tests {
         assert_eq!(state.effective_unread_override(&key, 1005), None);
         state.set_unread_override(&key, None);
         assert!(state.thread(&key).is_none());
+    }
+
+    #[test]
+    fn project_folder_star_and_order_step() {
+        let mut state = SidebarState::default();
+        let p_a = PathBuf::from("/work/alpha");
+        let p_b = PathBuf::from("/work/beta");
+        let p_c = PathBuf::from("/work/gamma");
+        assert!(!state.is_project_starred(&p_b));
+        assert!(state.toggle_project_star(&p_b, 100));
+        assert!(state.is_project_starred(&p_b));
+
+        // Rendered order has starred p_b first, followed by unstarred p_a and p_c.
+        let list = vec![p_b.clone(), p_a.clone(), p_c.clone()];
+        state.step_project_order(&list, &p_c, -1);
+        assert!(state.project_order(&p_c) < state.project_order(&p_a));
+
+        // Moving unstarred p_c up across starred p_b promotes p_c to starred.
+        let list2 = vec![p_b.clone(), p_c.clone(), p_a.clone()];
+        state.step_project_order(&list2, &p_c, -1);
+        assert!(state.is_project_starred(&p_c));
+        assert!(state.project_order(&p_c) < state.project_order(&p_b));
+
+        // Moving starred p_b down across unstarred p_a demotes p_b to unstarred.
+        let list3 = vec![p_c.clone(), p_b.clone(), p_a.clone()];
+        state.step_project_order(&list3, &p_b, 1);
+        assert!(!state.is_project_starred(&p_b));
+        assert!(state.project_order(&p_a) < state.project_order(&p_b));
     }
 }

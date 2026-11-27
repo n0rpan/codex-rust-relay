@@ -243,6 +243,10 @@ h1 {
   box-shadow: inset 0 -2px var(--accent);
 }
 .project {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
   margin: 1.55rem 0 0.4rem;
   font: 600 0.76rem/1.5 var(--mono);
   color: var(--muted);
@@ -250,8 +254,55 @@ h1 {
   cursor: pointer;
   user-select: none;
 }
-.project.pinned-project {
+.project.pinned-project,
+.project.starred-project {
   color: var(--accent);
+}
+.project-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0.35rem 0;
+}
+.project-tools {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: 0.25rem;
+}
+.project-action {
+  min-height: 36px;
+  min-width: 36px;
+  padding: 0.2rem 0.45rem;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.92rem;
+  border-radius: 6px;
+}
+.project-star[data-starred="true"] {
+  color: var(--accent);
+}
+.project-menu > summary {
+  width: 36px;
+  height: 36px;
+  font-size: 0.76rem;
+}
+.project[data-accent="cobalt"] .project-title {
+  color: var(--accent);
+}
+.project[data-accent="amber"] .project-title {
+  color: var(--warning);
+}
+.project[data-accent="emerald"] .project-title {
+  color: var(--success);
+}
+.project[data-accent="coral"] .project-title {
+  color: var(--error);
+}
+.project[data-accent="violet"] .project-title {
+  color: color-mix(in srgb, #d4a5ff 75%, var(--accent));
+}
+.project[data-accent="cyan"] .project-title {
+  color: color-mix(in srgb, #7ee8fa 75%, var(--success));
 }
 .session[data-accent="cobalt"] {
   border-left: 3px solid var(--accent);
@@ -1162,8 +1213,20 @@ main:has(#conversation:not([hidden])) {
 .tool-group[open] > summary::before {
   transform: rotate(90deg);
 }
+.tool-count {
+  flex-shrink: 0;
+}
+.tool-latest {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 500 0.8rem/1.25 var(--mono);
+  color: var(--muted);
+}
 .tool-state {
   margin-inline-start: auto;
+  flex-shrink: 0;
   font-size: 0.82em;
   color: var(--amber);
 }
@@ -1421,6 +1484,12 @@ main:has(#conversation:not([hidden])) {
   width: 40px;
   height: 22px;
   image-rendering: pixelated;
+}
+#activity-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .needs-bar {

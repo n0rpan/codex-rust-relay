@@ -197,10 +197,10 @@ OX Desktop
 Phone (the paired web app)
   Sessions → ••• → Settings
   Accounts                Sign in; Configure API provider.
+  Starred models          Browse the model catalog, star models, and order the model lists.
   Providers & models      The same provider editor.
-  Credentials             Manage provider and Brave Search keys. Copy selected keys
+  API keys                Manage provider and Brave Search keys. Copy selected keys
                           from this host to a paired host with a destination review.
-  Favorites               Order the model lists.
   Web search              Brave Search for both clients.
   Remote access           Pair another device and review paired devices.
   Install & notifications Home Screen and alert setup.
