@@ -49,6 +49,8 @@ append() {
 for entry in \
     ubuntu-24.04:linux-x86_64.tar.gz \
     ubuntu-24.04-arm:linux-aarch64.tar.gz \
+    "${signed}macos-26:macos-arm64.dmg" \
+    "${signed}macos-26-intel:macos-x86_64.dmg" \
     "${signed}macos-26:macos-arm64.zip" \
     "${signed}macos-26-intel:macos-x86_64.zip"; do
     append "ox-desktop-${entry%%:*}" "ox-desktop-${entry#*:}"

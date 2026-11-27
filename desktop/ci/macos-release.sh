@@ -17,7 +17,7 @@ ox_requirement() {
     printf '%s' "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$OX_SIGNING_TEAM\""
 }
 
-# ox_notarize ZIP WORK_DIR: submit to Apple, wait, and fail unless accepted.
+# ox_notarize FILE WORK_DIR: submit to Apple, wait, and fail unless accepted.
 ox_notarize() {
     ox_require APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER_ID
     key="$2/AuthKey.p8"

@@ -921,7 +921,11 @@ jobs:
             echo "- Version: \`${VERSION}\`"
             echo "- Commit: ${GITHUB_SHA}"
             echo
-            echo "Install or switch to this build:"
+            echo "### Download OX Desktop for macOS"
+            echo
+            sed "s|RELEASE_DOWNLOAD|https://github.com/${repo}/releases/download/dev|g" desktop/packaging/macos-download.md
+            echo
+            echo "Install or switch to this build from the terminal:"
             echo
             echo '```sh'
             echo "curl -fsSL https://raw.githubusercontent.com/${repo}/main/install.sh | sh -s -- --dev"
@@ -1044,8 +1048,16 @@ jobs:
           assets="$(desktop/ci/release-assets.sh dist "${VERSION}")"
           mapfile -t files <<< "${assets}"
           files=(install.sh "${files[@]}")
-          # Hand-written notes in docs/releases/<tag>.md go first; GitHub appends the change list.
-          notes=()
-          if [ -f "docs/releases/${TAG}.md" ]; then notes=(--notes-file "docs/releases/${TAG}.md"); fi
+          # Put the download links and any hand-written notes above the generated change list.
+          notes="$RUNNER_TEMP/stable-notes.md"
+          {
+            echo "### Download OX Desktop for macOS"
+            echo
+            sed "s|RELEASE_DOWNLOAD|https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}|g" desktop/packaging/macos-download.md
+            if [ -f "docs/releases/${TAG}.md" ]; then
+              echo
+              cat "docs/releases/${TAG}.md"
+            fi
+          } > "$notes"
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "OX ${TAG#v}" \
-            "${notes[@]}" --generate-notes --latest "${files[@]}"
+            --notes-file "$notes" --generate-notes --latest "${files[@]}"

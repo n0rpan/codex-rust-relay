@@ -6,8 +6,9 @@ import unittest
 
 SCRIPT = Path(__file__).with_name("release-assets.sh")
 VERSION = "1.2.3-dev.45"
-DESKTOP = {"ubuntu-24.04": "linux-x86_64.tar.gz", "ubuntu-24.04-arm": "linux-aarch64.tar.gz",
-           "macos-26": "macos-arm64.zip", "macos-26-intel": "macos-x86_64.zip"}
+DESKTOP = (("ubuntu-24.04", "linux-x86_64.tar.gz"), ("ubuntu-24.04-arm", "linux-aarch64.tar.gz"),
+           ("macos-26", "macos-arm64.dmg"), ("macos-26-intel", "macos-x86_64.dmg"),
+           ("macos-26", "macos-arm64.zip"), ("macos-26-intel", "macos-x86_64.zip"))
 TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
            "x86_64-apple-darwin", "aarch64-apple-darwin")
 
@@ -16,7 +17,7 @@ def expected(signed):
     """The release's files below the artifact directory, in upload order."""
     mac = "signed-" if signed else ""
     names = []
-    for runner, suffix in DESKTOP.items():
+    for runner, suffix in DESKTOP:
         names.append(f"ox-desktop-{mac if runner.startswith('macos') else ''}{runner}/ox-desktop-{suffix}")
     for target in TARGETS:
         artifact = f"ox-{mac if target.endswith('-apple-darwin') else ''}{target}"
@@ -47,7 +48,7 @@ class ReleaseAssets(unittest.TestCase):
             done = run(root)
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertEqual(done.stdout.splitlines(), [f"{root}/{name}" for name in expected(True)])
-            self.assertEqual(len(done.stdout.splitlines()), 32)
+            self.assertEqual(len(done.stdout.splitlines()), 36)
 
     def test_a_pull_request_finds_the_same_files_in_the_unsigned_artifacts(self):
         with tempfile.TemporaryDirectory() as root:
