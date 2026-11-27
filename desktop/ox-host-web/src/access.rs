@@ -52,8 +52,26 @@ pub enum Operation {
     Disable,
     Pair {
         terminal: bool,
+        /// Only this Tailscale login may redeem the invitation. `None` accepts
+        /// any login Tailscale Serve authenticated, which is the default.
+        login: Option<String>,
     },
-    PairWorker,
+    PairWorker {
+        login: Option<String>,
+    },
+    /// Let any device that reaches this host pair for five minutes, instead of
+    /// carrying an invitation to it.
+    OpenWindow {
+        login: Option<String>,
+    },
+    CloseWindow,
+    /// Accept a device that asked to pair through a window.
+    ApprovePending {
+        id: String,
+    },
+    DenyPending {
+        id: String,
+    },
     Revoke(String),
     TerminalGrant(String, bool),
 }
@@ -66,7 +84,11 @@ pub struct Report {
 #[derive(Clone)]
 pub struct Node {
     pub origin: String,
-    pub login: String,
+    /// The host's own Tailscale login. A tagged machine has no user, so it has
+    /// none: its invitations are redeemed by whoever the tailnet lets in.
+    pub login: Option<String>,
+    /// Tailscale tags applied to this host, such as `tag:home-control`.
+    pub tags: Vec<String>,
     pub https_port: u16,
     pub loopback_port: u16,
     state: Config,
@@ -97,6 +119,12 @@ impl Node {
 /// published through Funnel or taken by another application.
 fn admit(node: &Node) -> Result<(), String> {
     node.reason().map_or(Ok(()), Err)
+}
+
+/// The login an invitation binds, if any. `--for` wins over the operation's
+/// own field, and no host login is substituted: the default is unbound.
+fn invitation_login(for_login: Option<String>, requested: Option<String>) -> Option<String> {
+    for_login.or(requested)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -145,7 +173,7 @@ pub struct PermissionHelp {
     paths: ox_host_service::Paths,
     pub error: String,
     origin: String,
-    login: String,
+    login: Option<String>,
     change: ServeChange,
     expected_enabled: bool,
 }
@@ -292,7 +320,7 @@ impl PermissionHelp {
     }
 }
 
-fn cli() -> Result<PathBuf, String> {
+pub(crate) fn cli() -> Result<PathBuf, String> {
     let executable = |p: &Path| {
         p.metadata()
             .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
@@ -375,25 +403,33 @@ pub(crate) fn verify_key_destination(origin: &str, login: &str) -> Result<(), &'
         .map(|id| id.to_string())
         .or_else(|| owner.as_str().map(str::to_owned));
     let same_login = id.is_some_and(|id| status["User"][id]["LoginName"].as_str() == Some(login));
-    let owned = status["Peer"]
+    let peer = status["Peer"]
         .as_object()
         .into_iter()
         .flat_map(|peers| peers.values())
-        .any(|peer| {
+        .find(|peer| {
             peer["DNSName"]
                 .as_str()
                 .is_some_and(|dns| dns.trim_end_matches('.').eq_ignore_ascii_case(name))
-                && peer["UserID"] == *owner
-                && peer["Tags"].as_array().is_none_or(|tags| tags.is_empty())
         });
+    let tagged =
+        peer.is_some_and(|peer| peer["Tags"].as_array().is_some_and(|tags| !tags.is_empty()));
+    let owned = peer.is_some_and(|peer| peer["UserID"] == *owner) && !tagged;
     if status["BackendState"] == "Running" && same_login && owned {
         Ok(())
+    } else if tagged {
+        // A tagged node belongs to its tag, so Tailscale cannot name a person
+        // who owns it. Pair it on the desktop once, then copy keys to it there.
+        Err(
+            "That destination is a tagged Tailscale machine, not one owned by your login. Pair it in OX Desktop first, then copy keys to it.",
+        )
     } else {
         Err("Choose a destination owned by your Tailscale login, or pair it in OX Desktop.")
     }
 }
 
-fn inspect_ports(https_port: u16, loopback_port: u16) -> Result<Node, String> {
+/// The Tailscale Serve status of this host, with its own login when it has one.
+pub fn inspect_ports(https_port: u16, loopback_port: u16) -> Result<Node, String> {
     let v: Value = serde_json::from_slice(&output(&["status", "--json", "--peers=false"])?)
         .map_err(|_| "Tailscale returned an unreadable status.")?;
     if v["BackendState"] != "Running" {
@@ -410,6 +446,35 @@ fn inspect_ports(https_port: u16, loopback_port: u16) -> Result<Node, String> {
     {
         return Err("Enable MagicDNS and HTTPS in the tailnet DNS settings, then refresh.".into());
     }
+    let (login, tags) = self_identity(&v)?;
+    let authority = format!("{dns}:{https_port}");
+    let raw = output(&["serve", "status", "--json"])?;
+    let v: Value = serde_json::from_slice(&raw)
+        .map_err(|_| "Tailscale returned an unreadable Serve configuration.")?;
+    Ok(Node {
+        origin: format!("https://{authority}"),
+        login,
+        tags,
+        https_port,
+        loopback_port,
+        state: configuration(&v, &authority, https_port, loopback_port),
+    })
+}
+
+/// The login that may be bound to an invitation, and the host's own tags.
+/// A tagged machine belongs to its tag, not to a user, so it has no login.
+fn self_identity(v: &Value) -> Result<(Option<String>, Vec<String>), String> {
+    let tags: Vec<String> = v["Self"]["Tags"]
+        .as_array()
+        .map(|tags| {
+            tags.iter()
+                .filter_map(|tag| tag.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !tags.is_empty() {
+        return Ok((None, tags));
+    }
     let id = v["Self"]["UserID"]
         .as_u64()
         .map(|i| i.to_string())
@@ -420,17 +485,7 @@ fn inspect_ports(https_port: u16, loopback_port: u16) -> Result<Node, String> {
         .filter(|s| !s.is_empty())
         .ok_or("Sign in to Tailscale under a user account to pair a device.")?
         .to_owned();
-    let authority = format!("{dns}:{https_port}");
-    let raw = output(&["serve", "status", "--json"])?;
-    let v: Value = serde_json::from_slice(&raw)
-        .map_err(|_| "Tailscale returned an unreadable Serve configuration.")?;
-    Ok(Node {
-        origin: format!("https://{authority}"),
-        login,
-        https_port,
-        loopback_port,
-        state: configuration(&v, &authority, https_port, loopback_port),
-    })
+    Ok((Some(login), tags))
 }
 pub fn status(paths: &ox_host_service::Paths) -> Result<Reply, String> {
     ox_host_service::ensure_running(paths).map_err(|e| e.to_string())?;
@@ -454,6 +509,16 @@ pub fn status(paths: &ox_host_service::Paths) -> Result<Reply, String> {
     }
 }
 pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, String> {
+    run_with(paths, op, None)
+}
+/// `for_login` restricts a pairing invitation to one Tailscale login. Without
+/// it an invitation is open to any login Tailscale Serve authenticated on this
+/// host's origin, and the host records the login that redeems it.
+pub fn run_with(
+    paths: &ox_host_service::Paths,
+    op: Operation,
+    for_login: Option<String>,
+) -> Result<Report, String> {
     let request = |r: Request| admin::request(&paths.state_dir, &r).map_err(|e| e.to_string());
     let mut prior = status(paths)?;
     let (requested_https, requested_loopback) = match &op {
@@ -473,17 +538,31 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
     validate_ports(Some(https_port), Some(loopback_port))?;
     let mut network = inspect_ports(https_port, loopback_port);
     let mut denied = None;
+    let requested_login = invitation_login(
+        for_login,
+        match &op {
+            Operation::Pair { login, .. } | Operation::PairWorker { login } => login.clone(),
+            _ => None,
+        },
+    );
     let host = match op {
         Operation::Status => prior,
         Operation::TerminalGrant(id, enabled) => request(Request::TerminalGrant { id, enabled })?,
         Operation::Revoke(id) => request(Request::Revoke { id })?,
-        Operation::Pair { .. } | Operation::PairWorker => {
+        Operation::OpenWindow { login } => request(Request::OpenWindow { login })?,
+        Operation::CloseWindow => request(Request::CloseWindow)?,
+        Operation::ApprovePending { id } => request(Request::ApprovePending { id })?,
+        Operation::DenyPending { id } => request(Request::DenyPending { id })?,
+        Operation::Pair { .. } | Operation::PairWorker { .. } => {
             let node = network.as_ref().map_err(Clone::clone)?;
             if !node.ready() || !prior.enabled || prior.origin.as_ref() != Some(&node.origin) {
                 return Err("Enable tailnet access before pairing a device.".into());
             }
-            let login = node.login.clone();
-            if let Operation::Pair { terminal } = op {
+            // The host's own login is not a default: an invitation is unbound
+            // unless the operator named one, so a tagged host and a shared
+            // host behave the same way.
+            let login = requested_login;
+            if let Operation::Pair { terminal, .. } = op {
                 request(Request::Pair { terminal, login })?
             } else {
                 request(Request::WorkerInvitation { login })?
@@ -676,10 +755,53 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
 mod tests {
     use super::{
         Config, DEFAULT_HTTPS_PORT, DEFAULT_LOOPBACK_PORT, Node, admit, configuration,
-        validate_ports,
+        invitation_login, self_identity, validate_ports,
     };
     use serde_json::{Value, json};
     const PROXY: &str = "http://127.0.0.1:48162";
+    #[test]
+    fn an_invitation_binds_only_a_login_the_operator_named() {
+        assert_eq!(invitation_login(None, None), None);
+        assert_eq!(
+            invitation_login(Some("you@example.com".into()), None),
+            Some("you@example.com".into())
+        );
+        assert_eq!(
+            invitation_login(None, Some("operation@example.com".into())),
+            Some("operation@example.com".into())
+        );
+        assert_eq!(
+            invitation_login(
+                Some("flag@example.com".into()),
+                Some("operation@example.com".into())
+            ),
+            Some("flag@example.com".into())
+        );
+    }
+    #[test]
+    fn a_tagged_host_has_no_login_of_its_own_to_bind_invitations_to() {
+        let untagged = json!({
+            "Self": {"UserID": 42, "Tags": null},
+            "User": {"42": {"LoginName": "you@example.com"}}
+        });
+        assert_eq!(
+            self_identity(&untagged).unwrap(),
+            (Some("you@example.com".into()), Vec::new())
+        );
+        // A tag-owned node reports a synthetic user whose login is the node's
+        // own DNS name. Binding an invitation to it would admit nobody.
+        let tagged = json!({
+            "Self": {"UserID": "7379725336390388", "Tags": ["tag:home-control"]},
+            "User": {"7379725336390388": {"LoginName": "lab.tail1234.ts.net"}}
+        });
+        assert_eq!(
+            self_identity(&tagged).unwrap(),
+            (None, vec!["tag:home-control".to_owned()])
+        );
+        // An untagged node still needs a real login to bind one.
+        let anonymous = json!({"Self": {"UserID": 7, "Tags": []}, "User": {}});
+        assert!(self_identity(&anonymous).is_err());
+    }
     #[test]
     fn funnel_in_serve_status_fixture_refuses_remote_access() {
         let cases: Value = serde_json::from_str(include_str!(
@@ -689,7 +811,8 @@ mod tests {
         let authority = "work.tail1234.ts.net:8443";
         let node = |case: &str| Node {
             origin: format!("https://{authority}"),
-            login: "me@example.test".into(),
+            login: Some("me@example.test".into()),
+            tags: Vec::new(),
             https_port: DEFAULT_HTTPS_PORT,
             loopback_port: DEFAULT_LOOPBACK_PORT,
             state: configuration(

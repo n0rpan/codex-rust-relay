@@ -1,0 +1,154 @@
+//! Tailnet peers that will accept a pairing right now.
+//!
+//! A device that has never been paired cannot read this host's catalogue. It
+//! can read the tailnet, ask each peer whether a pairing window is open, and
+//! offer the reachable ones. Nothing here carries a secret: the window is the
+//! operator's own decision on the receiving host.
+use crate::client;
+use serde_json::Value;
+use std::{process::Command, time::Duration};
+
+use crate::access::DEFAULT_HTTPS_PORT;
+
+/// Peers from `tailscale status --json`, without this machine.
+fn peers(ports: &[u16]) -> Vec<(String, String, Vec<String>)> {
+    let Ok(cli) = crate::access::cli() else {
+        return Vec::new();
+    };
+    let Ok(output) = Command::new(cli)
+        .args(["status", "--json"])
+        .stdin(std::process::Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    let Ok(status) = serde_json::from_slice::<Value>(&output.stdout) else {
+        return Vec::new();
+    };
+    parse_peers(&status, ports)
+}
+
+/// Online peers that name a usable MagicDNS address, as `(origin, name, tags)`.
+fn parse_peers(status: &Value, ports: &[u16]) -> Vec<(String, String, Vec<String>)> {
+    if status["BackendState"] != "Running" {
+        return Vec::new();
+    }
+    let names = status["Peer"]
+        .as_object()
+        .into_iter()
+        .flat_map(|peers| peers.values())
+        .filter(|peer| peer["Online"].as_bool() == Some(true))
+        .filter_map(|peer| {
+            let dns = peer["DNSName"].as_str()?.trim_end_matches('.');
+            if dns.is_empty()
+                || !dns
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-'))
+            {
+                return None;
+            }
+            let tags: Vec<String> = peer["Tags"]
+                .as_array()
+                .map(|tags| {
+                    tags.iter()
+                        .filter_map(|tag| tag.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some((dns.to_owned(), tags))
+        })
+        .collect::<Vec<_>>();
+    names
+        .into_iter()
+        .flat_map(|(dns, tags)| {
+            ports
+                .iter()
+                .map(move |port| (format!("https://{dns}:{port}"), dns.clone(), tags.clone()))
+        })
+        .collect()
+}
+
+/// Ask every online peer, in parallel and with a short deadline, which ones
+/// are waiting for a device. Best effort: an unreachable or older peer is
+/// simply absent.
+///
+/// `port` is this host's own Tailscale Serve port, which a peer on the same
+/// tailnet usually shares; the OX default is always tried as well.
+pub fn open_hosts(port: Option<u16>) -> Vec<client::OpenHost> {
+    let mut ports = vec![DEFAULT_HTTPS_PORT];
+    if let Some(port) = port
+        && port != DEFAULT_HTTPS_PORT
+    {
+        ports.insert(0, port);
+    }
+    let peers = peers(&ports);
+    let Ok(runtime) = client::runtime() else {
+        return Vec::new();
+    };
+    runtime.block_on(async {
+        let probes = peers.into_iter().map(|(origin, name, tags)| async move {
+            let status =
+                tokio::time::timeout(Duration::from_secs(6), client::window_status(&origin))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .flatten()?;
+            let (host_name, expires_at) = status;
+            Some(client::OpenHost {
+                origin,
+                name: if host_name.is_empty() {
+                    name
+                } else {
+                    host_name
+                },
+                tags,
+                expires_at,
+            })
+        });
+        futures_util::future::join_all(probes)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_peers;
+    use serde_json::json;
+    #[test]
+    fn only_online_peers_with_a_magicdns_name_are_offered() {
+        let status = json!({
+            "BackendState": "Running",
+            "Peer": {
+                "a": {"DNSName": "lab.tail1234.ts.net.", "Online": true, "Tags": ["tag:home-control"]},
+                "b": {"DNSName": "offline.tail1234.ts.net.", "Online": false, "Tags": []},
+                "c": {"DNSName": "", "Online": true},
+                "d": {"DNSName": "bad name.tail1234.ts.net.", "Online": true}
+            }
+        });
+        let found = parse_peers(&status, &[8443]);
+        assert_eq!(
+            found,
+            vec![(
+                "https://lab.tail1234.ts.net:8443".to_owned(),
+                "lab.tail1234.ts.net".to_owned(),
+                vec!["tag:home-control".to_owned()]
+            )]
+        );
+        let stopped = json!({"BackendState": "Stopped", "Peer": {}});
+        assert!(parse_peers(&stopped, &[8443]).is_empty());
+        // A host that moved off the default port is tried on both.
+        let both = parse_peers(&status, &[7443, 8443]);
+        assert_eq!(
+            both.iter()
+                .map(|(origin, ..)| origin.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://lab.tail1234.ts.net:7443",
+                "https://lab.tail1234.ts.net:8443"
+            ]
+        );
+    }
+}

@@ -143,7 +143,9 @@ struct Invite {
     worker: bool,
     terminal: bool,
     short_hash: String,
-    login: String,
+    /// The Tailscale login allowed to redeem it. `None` accepts any login that
+    /// Tailscale Serve authenticated on this host's origin.
+    login: Option<String>,
     issuer: Option<String>,
     expires: i64,
 }
@@ -178,8 +180,71 @@ pub(crate) struct State {
     dir: PathBuf,
     disk: Disk,
     invites: HashMap<String, Invite>,
+    /// A deliberate, short-lived window in which any login this host
+    /// authenticated may enrol without an invitation code.
+    window: Option<Window>,
+    pending: HashMap<String, Pending>,
     challenges: HashMap<String, Challenge>,
     pub changed: watch::Sender<u64>,
+}
+
+#[derive(Clone)]
+struct Window {
+    expires: i64,
+    login: Option<String>,
+    paired: u8,
+}
+
+impl Window {
+    fn info(&self) -> crate::admin::PairingWindow {
+        crate::admin::PairingWindow {
+            expires_at: self.expires,
+            login: self.login.clone(),
+            paired: self.paired,
+        }
+    }
+}
+
+/// How many devices one window may admit before it closes itself.
+const WINDOW_PAIRS: u8 = 8;
+/// How long a device's request waits for the operator's decision.
+const PENDING_TTL: i64 = 180;
+/// How many requests one host will show at once.
+const PENDING_MAX: usize = 8;
+
+/// A pair request that the operator has not answered yet.
+struct Pending {
+    key: String,
+    label: String,
+    class: DeviceClass,
+    source: Option<String>,
+    login: String,
+    expires: i64,
+    /// The credential, once the operator accepted and before the device
+    /// collected it.
+    token: Option<String>,
+    /// The registered device, from the acceptance until the credential is
+    /// collected or the operator withdraws it.
+    device: Option<String>,
+}
+
+impl Pending {
+    fn reply(&self, id: &str) -> crate::admin::PendingPair {
+        crate::admin::PendingPair {
+            id: id.to_owned(),
+            label: self.label.clone(),
+            login: self.login.clone(),
+            class: self.class,
+            expires_at: self.expires,
+            approved: self.token.is_some(),
+        }
+    }
+}
+
+pub(crate) enum PollState {
+    Pending,
+    Approved(String),
+    Unknown,
 }
 
 impl State {
@@ -214,6 +279,8 @@ impl State {
             dir: dir.into(),
             disk,
             invites: HashMap::new(),
+            window: None,
+            pending: HashMap::new(),
             challenges: HashMap::new(),
             changed: watch::channel(0).0,
         };
@@ -277,6 +344,10 @@ impl State {
             })?;
             self.invites.clear();
             self.challenges.clear();
+            // A window admits devices without a code, so disabling remote
+            // access or moving to another origin must withdraw it too.
+            self.window = None;
+            self.pending.clear();
             self.signal();
         } else if kept_port != self.disk.port || https_port != self.disk.https_port {
             self.update(|d| {
@@ -334,10 +405,12 @@ impl State {
             https_port: self.https_port(),
             devices,
             pairing,
+            window: self.window(),
+            pending: self.pending(),
             reservation: None,
         }
     }
-    pub fn invite(&mut self, login: String, terminal: bool) -> io::Result<Pairing> {
+    pub fn invite(&mut self, login: Option<String>, terminal: bool) -> io::Result<Pairing> {
         self.create_invite(login, None, terminal, false)
     }
     pub fn device_invite(&mut self, id: &str) -> io::Result<Pairing> {
@@ -345,9 +418,9 @@ impl State {
             return Err(io::Error::other("Device is no longer paired"));
         }
         let login = self.disk.devices[id].device.login.clone();
-        self.create_invite(login, Some(id.to_owned()), false, false)
+        self.create_invite(Some(login), Some(id.to_owned()), false, false)
     }
-    pub fn local_worker_invite(&mut self, login: String) -> io::Result<Pairing> {
+    pub fn local_worker_invite(&mut self, login: Option<String>) -> io::Result<Pairing> {
         self.create_invite(login, None, false, true)
     }
     pub fn worker_invite(&mut self, id: &str) -> io::Result<Pairing> {
@@ -357,7 +430,7 @@ impl State {
             ));
         }
         self.create_invite(
-            self.disk.devices[id].device.login.clone(),
+            Some(self.disk.devices[id].device.login.clone()),
             Some(id.into()),
             false,
             true,
@@ -382,7 +455,7 @@ impl State {
     }
     fn create_invite(
         &mut self,
-        login: String,
+        login: Option<String>,
         issuer: Option<String>,
         terminal: bool,
         worker: bool,
@@ -392,10 +465,11 @@ impl State {
             .origin
             .as_ref()
             .ok_or_else(|| io::Error::other("Enable remote access first"))?;
-        if login.is_empty()
-            || login.len() > 254
-            || !login.is_ascii()
-            || login.bytes().any(|b| b.is_ascii_control() || b == b' ')
+        if let Some(login) = &login
+            && (login.is_empty()
+                || login.len() > 254
+                || !login.is_ascii()
+                || login.bytes().any(|b| b.is_ascii_control() || b == b' '))
         {
             return Err(io::Error::other("Invalid Tailscale login"));
         }
@@ -428,7 +502,7 @@ impl State {
                 terminal,
                 short_hash: digest(&short),
                 issuer,
-                login,
+                login: login.clone(),
                 expires: expires_at,
             },
         );
@@ -437,6 +511,7 @@ impl State {
             url,
             qr_svg,
             expires_at,
+            invited_login: login,
         })
     }
     pub fn pair<'a>(
@@ -473,40 +548,17 @@ impl State {
         {
             return None;
         }
-        let (message, worker) = if let Some(source) = source {
-            if !crate::paired_hosts::valid_id(source)
-                || self.host_id().ok()?.eq_ignore_ascii_case(source)
-            {
-                return None;
-            }
-            let mut grant = crate::admin::WorkerGrant {
-                source: source.to_ascii_lowercase(),
-                // Worker launches are the reason a link exists; memory sync is a
-                // separate opt-in the receiving host grants after pairing.
-                may_launch: true,
-                may_sync_memory: false,
-                ceiling: ox_desk_core::modes::Level::Yolo,
-            };
-            // A replacement key keeps restrictions the receiver already set for
-            // this source, even while the new key is still being persisted.
-            for prior in self
-                .disk
-                .devices
-                .values()
-                .filter(|r| r.device.login == login)
-                .filter_map(|r| r.device.worker.as_ref())
-                .filter(|w| w.source == grant.source)
-            {
-                grant.may_launch &= prior.may_launch;
-                // A replacement key keeps a grant the receiver already made.
-                grant.may_sync_memory |= prior.may_sync_memory;
-                grant.ceiling = grant.ceiling.min(prior.ceiling);
-            }
-            (format!("{code}.host.{source}"), Some(grant))
-        } else {
-            (code.to_owned(), None)
+        let (message, worker) = match source {
+            Some(source) => (
+                format!("{code}.host.{source}"),
+                Some(self.worker_grant_for(login, source)?),
+            ),
+            None => (code.to_owned(), None),
         };
-        if invitation.login != login
+        if invitation
+            .login
+            .as_deref()
+            .is_some_and(|expected| expected != login)
             || invitation.expires <= now()
             || invitation
                 .issuer
@@ -516,6 +568,222 @@ impl State {
         {
             return None;
         }
+        let terminal = invitation.terminal;
+        let (token, _) = self.register(login, key, label, class, terminal, worker)?;
+        self.invites.remove(&h);
+        Some(token)
+    }
+    /// A link opened by the operator for this host, not by the device that
+    /// redeems it. It admits any login Serve authenticated on this origin, or
+    /// the one login the operator named, until it expires or fills up.
+    pub fn open_window(
+        &mut self,
+        login: Option<String>,
+    ) -> io::Result<crate::admin::PairingWindow> {
+        if self.disk.origin.is_none() {
+            return Err(io::Error::other("Enable remote access first"));
+        }
+        if let Some(login) = &login
+            && (login.is_empty()
+                || login.len() > 254
+                || !login.is_ascii()
+                || login.bytes().any(|b| b.is_ascii_control() || b == b' '))
+        {
+            return Err(io::Error::other("Invalid Tailscale login"));
+        }
+        let window = Window {
+            expires: now() + PAIR_TTL,
+            login,
+            paired: 0,
+        };
+        let info = window.info();
+        self.window = Some(window);
+        Ok(info)
+    }
+    pub fn close_window(&mut self) {
+        self.window = None;
+    }
+    pub fn window(&self) -> Option<crate::admin::PairingWindow> {
+        self.window
+            .as_ref()
+            .filter(|w| w.expires > now())
+            .map(Window::info)
+    }
+    /// Ask to pair while a window is open. Nothing is granted yet: the
+    /// operator on this host accepts or declines the request, so a process
+    /// that can reach the loopback port cannot admit itself.
+    pub fn request_window<'a>(
+        &mut self,
+        login: &str,
+        key: &str,
+        label: &str,
+        registration: impl Into<Enrollment<'a>>,
+    ) -> Option<crate::admin::PendingPair> {
+        let Enrollment { class, source } = registration.into();
+        let window = self.window.as_ref().filter(|w| w.expires > now())?;
+        // Abandoned requests must not keep the window full forever.
+        self.pending.retain(|_, p| p.expires > now());
+        if window
+            .login
+            .as_deref()
+            .is_some_and(|expected| expected != login)
+            || window.paired + (self.pending.len() as u8) >= WINDOW_PAIRS
+            || source.is_some() != (class == DeviceClass::Host)
+            || label.trim().is_empty()
+            || label.chars().count() > 64
+            || label.chars().any(char::is_control)
+        {
+            return None;
+        }
+        if self.pending.len() >= PENDING_MAX {
+            return None;
+        }
+        let id = random();
+        let entry = Pending {
+            key: key.to_owned(),
+            label: label.trim().to_owned(),
+            class,
+            source: source.map(|s| s.to_ascii_lowercase()),
+            login: login.to_owned(),
+            expires: now() + PENDING_TTL,
+            token: None,
+            device: None,
+        };
+        let reply = entry.reply(&id);
+        self.pending.insert(id, entry);
+        Some(reply)
+    }
+    pub fn pending(&self) -> Vec<crate::admin::PendingPair> {
+        let now = now();
+        let mut rows: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.expires > now)
+            .map(|(id, p)| p.reply(id))
+            .collect();
+        rows.sort_by(|a, b| a.expires_at.cmp(&b.expires_at).then(a.id.cmp(&b.id)));
+        rows
+    }
+    /// The operator's decision. The device is only registered here.
+    pub fn approve_pending(&mut self, id: &str) -> Option<()> {
+        let entry = self.pending.get(id).filter(|p| p.expires > now())?;
+        if entry.token.is_some() {
+            return Some(());
+        }
+        let worker = match &entry.source {
+            Some(source) => Some(self.worker_grant_for(&entry.login, source)?),
+            None => None,
+        };
+        let (login, key, label, class) = (
+            entry.login.clone(),
+            entry.key.clone(),
+            entry.label.clone(),
+            entry.class,
+        );
+        let (token, device) = self.register(&login, &key, &label, class, false, worker)?;
+        let entry = self.pending.get_mut(id)?;
+        entry.token = Some(token);
+        entry.device = Some(device);
+        if let Some(window) = self.window.as_mut() {
+            window.paired += 1;
+            if window.paired >= WINDOW_PAIRS {
+                self.window = None;
+            }
+        }
+        Some(())
+    }
+    /// Withdraw a request. If the operator already accepted it, the device it
+    /// registered is revoked too, so declining always means "no access".
+    pub fn deny_pending(&mut self, id: &str) {
+        if let Some(entry) = self.pending.remove(id)
+            && let Some(device) = entry.device
+        {
+            let _ = self.revoke(&device);
+        }
+    }
+    /// The asking device withdrew. Its own request id is the secret, so a
+    /// client that stopped waiting can clean up after itself; an accepted
+    /// request takes the device it registered with it.
+    pub fn cancel_window(&mut self, id: &str) {
+        let device = self
+            .pending
+            .get(id)
+            .filter(|p| p.expires > now())
+            .and_then(|p| p.device.clone());
+        if let Some(device) = device {
+            let _ = self.revoke(&device);
+        }
+        self.pending.remove(id);
+    }
+    /// The login that asked, so a remote operator can only decide its own
+    /// requests.
+    pub fn pending_login(&self, id: &str) -> Option<String> {
+        self.pending
+            .get(id)
+            .filter(|p| p.expires > now())
+            .map(|p| p.login.clone())
+    }
+    /// The pair request's own view: pending, or the credential once accepted.
+    pub fn poll_window(&mut self, id: &str) -> PollState {
+        let now = now();
+        if self.pending.get(id).is_none_or(|p| p.expires <= now) {
+            self.pending.remove(id);
+            return PollState::Unknown;
+        }
+        if let Some(p) = self.pending.get_mut(id)
+            && let Some(token) = p.token.take()
+        {
+            self.pending.remove(id);
+            return PollState::Approved(token);
+        }
+        PollState::Pending
+    }
+    /// The grant a worker link starts with, narrowed by what the receiver
+    /// already allows this source host.
+    fn worker_grant_for(&self, login: &str, source: &str) -> Option<crate::admin::WorkerGrant> {
+        if !crate::paired_hosts::valid_id(source)
+            || self.host_id().ok()?.eq_ignore_ascii_case(source)
+        {
+            return None;
+        }
+        let mut grant = crate::admin::WorkerGrant {
+            source: source.to_ascii_lowercase(),
+            // Worker launches are the reason a link exists; memory sync is a
+            // separate opt-in the receiving host grants after pairing.
+            may_launch: true,
+            may_sync_memory: false,
+            ceiling: ox_desk_core::modes::Level::Yolo,
+        };
+        // A replacement key keeps restrictions the receiver already set for
+        // this source and this Tailscale login, even while the new key is
+        // still being persisted. A different login starts from the defaults,
+        // so it can never inherit a grant, such as memory sync, that the
+        // receiver gave to someone else.
+        for prior in self
+            .disk
+            .devices
+            .values()
+            .filter(|r| r.device.login == login)
+            .filter_map(|r| r.device.worker.as_ref())
+            .filter(|w| w.source == grant.source)
+        {
+            grant.may_launch &= prior.may_launch;
+            // A replacement key keeps a grant the receiver already made.
+            grant.may_sync_memory |= prior.may_sync_memory;
+            grant.ceiling = grant.ceiling.min(prior.ceiling);
+        }
+        Some(grant)
+    }
+    fn register(
+        &mut self,
+        login: &str,
+        key: &str,
+        label: &str,
+        class: DeviceClass,
+        terminal: bool,
+        worker: Option<crate::admin::WorkerGrant>,
+    ) -> Option<(String, String)> {
+        // Returns the credential and the exact device it belongs to.
         let t = random();
         let id = random();
         let registered = Registered {
@@ -523,7 +791,7 @@ impl State {
             device: Device {
                 class,
                 worker,
-                terminal: invitation.terminal,
+                terminal,
                 id: id.clone(),
                 login: login.into(),
                 label: label.trim().into(),
@@ -545,11 +813,10 @@ impl State {
         }
         self.update(|d| {
             d.devices.retain(|_, r| r.current());
-            d.devices.insert(id, registered);
+            d.devices.insert(id.clone(), registered);
         })
         .ok()?;
-        self.invites.remove(&h);
-        Some(t)
+        Some((t, id))
     }
     pub fn identity(&self, login: &str, cookie: &str) -> Option<String> {
         if self.disk.origin.is_none() || cookie.len() != 43 {
@@ -810,7 +1077,7 @@ mod tests {
         let mut s = State::load(dir.path()).unwrap();
         s.set_origin(Some("https://machine.tail.ts.net".into()), 48162)
             .unwrap();
-        let invite = s.invite("a@example.test".into(), false).unwrap();
+        let invite = s.invite(Some("a@example.test".into()), false).unwrap();
         assert!(invite.qr_svg.contains("<svg"));
         let code = invite.url.split_once("#pair=").unwrap().1;
         let key = SigningKey::random(&mut OsRng);
@@ -885,6 +1152,305 @@ mod tests {
         assert!(s.identity("a@example.test", &cookie).is_none());
     }
     #[test]
+    fn an_invitation_without_a_login_pairs_any_tailnet_user_under_that_login() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let mut s = State::load(dir.path()).unwrap();
+        s.set_origin(Some("https://tagged.tail.ts.net".into()), 8443)
+            .unwrap();
+        let key = SigningKey::random(&mut OsRng);
+        let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
+
+        // A host with no Tailscale user, such as a tagged machine, invites
+        // without naming one. The redeemer's own authenticated login is
+        // recorded, and that is what every later request is checked against.
+        let open = s.invite(None, false).unwrap();
+        assert_eq!(open.invited_login, None);
+        let code = open.url.split_once("#pair=").unwrap().1.to_owned();
+        let cookie = s
+            .pair(
+                "second@example.test",
+                &code,
+                &public,
+                &sign(&key, &code),
+                "Desktop",
+                DeviceClass::Desktop,
+            )
+            .unwrap();
+        let id = s.identity("second@example.test", &cookie).unwrap();
+        assert!(s.identity("first@example.test", &cookie).is_none());
+        assert_eq!(s.reply(None).devices[0].login, "second@example.test");
+        assert!(s.alive(&id));
+
+        // A named invitation still admits exactly one login.
+        let bound = s.invite(Some("owner@example.test".into()), false).unwrap();
+        assert_eq!(bound.invited_login.as_deref(), Some("owner@example.test"));
+        let code = bound.url.split_once("#pair=").unwrap().1.to_owned();
+        assert!(
+            s.pair(
+                "other@example.test",
+                &code,
+                &public,
+                &sign(&key, &code),
+                "Phone",
+                DeviceClass::Phone
+            )
+            .is_none()
+        );
+        assert!(
+            s.pair(
+                "owner@example.test",
+                &code,
+                &public,
+                &sign(&key, &code),
+                "Phone",
+                DeviceClass::Phone
+            )
+            .is_some()
+        );
+    }
+    #[test]
+    fn a_pairing_window_admits_a_device_only_after_the_operator_accepts() {
+        struct Unpin;
+        impl Drop for Unpin {
+            fn drop(&mut self) {
+                CLOCK.with(|c| c.set(None));
+            }
+        }
+        let _unpin = Unpin;
+        let at = |t: i64| CLOCK.with(|c| c.set(Some(t)));
+        let start = 1_950_000_000;
+        at(start);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("host-id"),
+            "b302b350-a07d-435d-bb7b-b675156681db",
+        )
+        .unwrap();
+        let mut s = State::load(dir.path()).unwrap();
+        s.set_origin(Some("https://lab.fixture.ts.net".into()), 8443)
+            .unwrap();
+        let key = SigningKey::random(&mut OsRng);
+        let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
+        let source = "74b2c731-b9f0-4b05-8672-3c42062b190a";
+
+        // Closed by default: the window is an explicit operator action.
+        assert!(s.window().is_none());
+        assert!(
+            s.request_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+                .is_none()
+        );
+
+        let window = s.open_window(None).unwrap();
+        assert_eq!(window.expires_at, start + PAIR_TTL);
+        let request = s
+            .request_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+            .unwrap();
+        // Asking grants nothing: no device exists until the operator accepts.
+        assert!(s.pending().iter().any(|p| p.id == request.id));
+        assert!(!s.pending()[0].approved);
+        assert!(matches!(s.poll_window(&request.id), PollState::Pending));
+        assert!(s.reply(None).devices.is_empty());
+        s.approve_pending(&request.id).unwrap();
+        assert!(s.pending()[0].approved);
+        let PollState::Approved(cookie) = s.poll_window(&request.id) else {
+            panic!("an accepted request must hand over the credential once");
+        };
+        let id = s.identity("owner@example.test", &cookie).unwrap();
+        assert!(s.alive(&id));
+        assert!(s.pending().is_empty());
+        assert_eq!(s.reply(None).window.unwrap().paired, 1);
+
+        // A declined request never becomes a device.
+        let refused = s
+            .request_window("other@example.test", &public, "Phone", DeviceClass::Phone)
+            .unwrap();
+        let before = s.reply(None).devices.len();
+        s.deny_pending(&refused.id);
+        assert!(matches!(s.poll_window(&refused.id), PollState::Unknown));
+        assert_eq!(s.reply(None).devices.len(), before);
+
+        // A worker link needs a source; a declined worker grant matches.
+        assert!(
+            s.request_window(
+                "owner@example.test",
+                &public,
+                "Worker",
+                Enrollment {
+                    class: DeviceClass::Host,
+                    source: None
+                }
+            )
+            .is_none()
+        );
+        let worker = s
+            .request_window(
+                "owner@example.test",
+                &public,
+                "Worker",
+                Enrollment {
+                    class: DeviceClass::Host,
+                    source: Some(source),
+                },
+            )
+            .unwrap();
+        s.approve_pending(&worker.id).unwrap();
+        let PollState::Approved(token) = s.poll_window(&worker.id) else {
+            panic!("accepted worker request");
+        };
+        let worker_id = s.identity("owner@example.test", &token).unwrap();
+        assert_eq!(s.device_class(&worker_id), Some(DeviceClass::Host));
+        assert!(s.worker_grant(&worker_id).unwrap().may_launch);
+
+        // A named window admits only that login.
+        s.open_window(Some("named@example.test".into())).unwrap();
+        assert!(
+            s.request_window("other@example.test", &public, "Phone", DeviceClass::Phone)
+                .is_none()
+        );
+        let named = s
+            .request_window("named@example.test", &public, "Phone", DeviceClass::Phone)
+            .unwrap();
+        assert!(s.approve_pending(&named.id).is_some());
+        // Declining after accepting withdraws the device it registered.
+        let before = s.reply(None).devices.len();
+        s.deny_pending(&named.id);
+        assert_eq!(s.reply(None).devices.len(), before - 1);
+        assert!(s.pending().iter().all(|p| p.id != named.id));
+        // A client that stops waiting withdraws its own request the same way.
+        let abandoned = s
+            .request_window("named@example.test", &public, "Phone", DeviceClass::Phone)
+            .unwrap();
+        s.approve_pending(&abandoned.id).unwrap();
+        let before = s.reply(None).devices.len();
+        s.cancel_window(&abandoned.id);
+        assert_eq!(s.reply(None).devices.len(), before - 1);
+        assert!(matches!(s.poll_window(&abandoned.id), PollState::Unknown));
+
+        // Closing the window ends new requests, and expiry ends pending ones.
+        s.close_window();
+        assert!(s.window().is_none());
+        assert!(
+            s.request_window("named@example.test", &public, "Phone", DeviceClass::Phone)
+                .is_none()
+        );
+        s.open_window(None).unwrap();
+        let late = s
+            .request_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+            .unwrap();
+        // Requests abandoned by devices expire long before the window does,
+        // and eight of them must not keep it full.
+        at(start + PENDING_TTL + 1);
+        for _ in 0..PENDING_MAX {
+            s.request_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+                .unwrap();
+        }
+        assert!(
+            s.request_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+                .is_none(),
+            "the queue is full until the stale ones expire"
+        );
+        at(start + 3 * PENDING_TTL);
+        // The window from `start` has expired too; a fresh one must not
+        // inherit the abandoned queue.
+        s.open_window(None).unwrap();
+        assert!(
+            s.request_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+                .is_some(),
+            "expired requests must not block the window"
+        );
+        at(start + 10 * PAIR_TTL);
+        assert!(s.window().is_none());
+        assert!(matches!(s.poll_window(&late.id), PollState::Unknown));
+
+        // Disabling remote access, or moving to another Serve origin, withdraws
+        // the window and every request it queued.
+        at(start);
+        s.open_window(None).unwrap();
+        s.request_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+            .unwrap();
+        s.set_origin(None, 0).unwrap();
+        assert!(s.window().is_none() && s.pending().is_empty());
+        s.set_origin(Some("https://lab.fixture.ts.net".into()), 8443)
+            .unwrap();
+        s.open_window(None).unwrap();
+        s.request_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+            .unwrap();
+        s.set_origin(Some("https://other.fixture.ts.net".into()), 8443)
+            .unwrap();
+        assert!(s.window().is_none() && s.pending().is_empty());
+    }
+    #[test]
+    fn a_worker_grant_is_inherited_only_by_the_same_login() {
+        use ox_desk_core::modes::Level;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("host-id"),
+            "b302b350-a07d-435d-bb7b-b675156681db",
+        )
+        .unwrap();
+        let mut s = State::load(dir.path()).unwrap();
+        s.set_origin(Some("https://lab.fixture.ts.net".into()), 8443)
+            .unwrap();
+        let key = SigningKey::random(&mut OsRng);
+        let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
+        let source = "74b2c731-b9f0-4b05-8672-3c42062b190a";
+        s.open_window(None).unwrap();
+        let link = s
+            .request_window(
+                "alice@example.test",
+                &public,
+                "Alice's laptop",
+                Enrollment {
+                    class: DeviceClass::Host,
+                    source: Some(source),
+                },
+            )
+            .unwrap();
+        s.approve_pending(&link.id).unwrap();
+        let PollState::Approved(token) = s.poll_window(&link.id) else {
+            panic!("accepted request");
+        };
+        let id = s.identity("alice@example.test", &token).unwrap();
+        // The receiver narrows the link and then grants memory sync.
+        s.update(|d| {
+            let grant = d
+                .devices
+                .get_mut(&id)
+                .unwrap()
+                .device
+                .worker
+                .as_mut()
+                .unwrap();
+            grant.may_launch = false;
+            grant.may_sync_memory = true;
+            grant.ceiling = Level::Read;
+        })
+        .unwrap();
+        let alice = s.worker_grant_for("alice@example.test", source).unwrap();
+        assert!(!alice.may_launch && alice.may_sync_memory);
+        assert_eq!(alice.ceiling, Level::Read);
+        // Another Tailscale login may claim the same source UUID, and must not
+        // inherit a grant given to Alice, least of all memory sync.
+        let bob = s.worker_grant_for("bob@example.test", source).unwrap();
+        assert!(bob.may_launch && !bob.may_sync_memory);
+        assert_eq!(bob.ceiling, Level::Yolo);
+    }
+    #[test]
     fn worker_links_keep_their_own_role_and_grant_through_restart_and_repair() {
         use ox_desk_core::modes::Level;
         let tmp = tempfile::tempdir().unwrap();
@@ -919,11 +1485,11 @@ mod tests {
                 },
             )
         };
-        let operator = state.invite(login.into(), true).unwrap();
+        let operator = state.invite(Some(login.into()), true).unwrap();
         let op = operator.short_code.unwrap();
         assert!(redeem(&mut state, &op, &format!("{op}.host.{source}")).is_none());
         let invite = state
-            .local_worker_invite(login.into())
+            .local_worker_invite(Some(login.into()))
             .unwrap()
             .short_code
             .unwrap();
@@ -999,7 +1565,7 @@ mod tests {
         assert!(restored.prove_worker(&id, &challenge, &signature, "info"));
         assert!(!restored.prove_worker(&id, &challenge, &signature, "info"));
         let next = restored
-            .local_worker_invite(login.into())
+            .local_worker_invite(Some(login.into()))
             .unwrap()
             .short_code
             .unwrap();
@@ -1027,7 +1593,7 @@ mod tests {
             .set_origin(Some("https://machine.tail.ts.net".into()), 48162)
             .unwrap();
         let login = "operator@example.test";
-        let invite = state.invite(login.into(), false).unwrap();
+        let invite = state.invite(Some(login.into()), false).unwrap();
         let short = invite.short_code.unwrap().to_lowercase();
         let long = invite.url.split_once("#pair=").unwrap().1;
         let key = SigningKey::random(&mut OsRng);
@@ -1079,7 +1645,7 @@ mod tests {
                 .unwrap();
             s.identity("tester", &cookie).unwrap()
         };
-        let invitation = state.invite("tester".into(), false).unwrap();
+        let invitation = state.invite(Some("tester".into()), false).unwrap();
         let id = register(&mut state, invitation);
         assert!(state.terminal_generation(&id).is_none());
         state.terminal_grant(&id, true).unwrap();
@@ -1098,7 +1664,7 @@ mod tests {
                 .prove_terminal(&id, &nonce, &sig, r#"{"preset":"claude-login"}"#)
                 .is_none()
         );
-        let preauthorized = state.invite("tester".into(), true).unwrap();
+        let preauthorized = state.invite(Some("tester".into()), true).unwrap();
         let trusted = register(&mut state, preauthorized);
         assert!(state.terminal_generation(&trusted).is_some());
         let next = state.device_invite(&trusted).unwrap();
@@ -1122,7 +1688,7 @@ mod tests {
         state.set_origin(Some(origin.into()), 48162).unwrap();
         let key = SigningKey::random(&mut OsRng);
         let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
-        let invite = state.invite("me".into(), false).unwrap();
+        let invite = state.invite(Some("me".into()), false).unwrap();
         let secret = invite.url.split_once("#pair=").unwrap().1;
         state.invites.get_mut(&digest(secret)).unwrap().expires = now() - 1;
         assert!(
@@ -1137,7 +1703,7 @@ mod tests {
                 )
                 .is_none()
         );
-        let invitation = state.invite("me".into(), false).unwrap();
+        let invitation = state.invite(Some("me".into()), false).unwrap();
         let secret = invitation.url.split_once("#pair=").unwrap().1;
         let cookie = state
             .pair(
@@ -1201,7 +1767,7 @@ mod tests {
         };
 
         // An invitation expires exactly PAIR_TTL seconds after it is issued.
-        let stale = s.invite("me".into(), false).unwrap();
+        let stale = s.invite(Some("me".into()), false).unwrap();
         assert_eq!(stale.expires_at, start + PAIR_TTL);
         let stale = stale.url.split_once("#pair=").unwrap().1.to_owned();
         at(start + PAIR_TTL);
@@ -1209,7 +1775,7 @@ mod tests {
 
         // A fresh invitation works once, one second before its deadline, then never again.
         let issued = start + PAIR_TTL;
-        let fresh = s.invite("me".into(), false).unwrap();
+        let fresh = s.invite(Some("me".into()), false).unwrap();
         let fresh = fresh.url.split_once("#pair=").unwrap().1.to_owned();
         at(issued + PAIR_TTL - 1);
         let cookie = pair(&mut s, &fresh, "Phone").unwrap();
@@ -1227,7 +1793,7 @@ mod tests {
         assert!(State::load(dir.path()).unwrap().disk.devices.is_empty());
 
         // Use renews the window: a device used on day 29 survives past day 30.
-        let fresh = s.invite("me".into(), false).unwrap();
+        let fresh = s.invite(Some("me".into()), false).unwrap();
         let fresh = fresh.url.split_once("#pair=").unwrap().1.to_owned();
         let cookie = pair(&mut s, &fresh, "Phone").unwrap();
         let id = s.identity("me", &cookie).unwrap();

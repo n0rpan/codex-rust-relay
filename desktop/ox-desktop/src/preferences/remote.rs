@@ -262,7 +262,14 @@ impl Render for Remote {
         buttons = buttons.child(self.action(p, "remote-refresh", "Refresh", Operation::Status, cx));
         if let Some(report) = &self.report {
             if let Ok(node) = &report.access.network {
-                view = view.child(format!("Tailscale account · {}", node.login));
+                view = match &node.login {
+                    Some(login) => view.child(format!("Tailscale account · {login}")),
+                    None => view
+                        .child(format!("Tagged machine · {}", node.tags.join(", ")))
+                        .child(
+                            "This machine belongs to a Tailscale tag, not a user. Anyone your tailnet lets reach it can redeem an invitation.",
+                        ),
+                };
                 if let Some(reason) = node.reason() {
                     view = view.child(reason);
                 }
@@ -275,9 +282,93 @@ impl Render for Remote {
                         p,
                         "remote-pair",
                         "Pair a device",
-                        Operation::Pair { terminal: false },
+                        Operation::Pair {
+                            terminal: false,
+                            login: None,
+                        },
                         cx,
                     ));
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs() as i64);
+                    match report
+                        .access
+                        .host
+                        .window
+                        .as_ref()
+                        .filter(|w| w.expires_at > now)
+                    {
+                        Some(window) => {
+                            let minutes = (window.expires_at - now + 59) / 60;
+                            let who = window.login.as_deref().unwrap_or("another device");
+                            view = view.child(format!(
+                                "Waiting for {who} · {minutes} min left · {} connected. On the other machine, choose this host under Add host.",
+                                window.paired
+                            ));
+                            buttons = buttons.child(self.action(
+                                p,
+                                "remote-window-close",
+                                "Stop waiting",
+                                Operation::CloseWindow,
+                                cx,
+                            ));
+                        }
+                        None => {
+                            view = view.child(
+                                "Waiting lets another device connect from its own Add host without a code. Its request appears here for you to accept. It lasts five minutes.",
+                            );
+                            buttons = buttons.child(self.action(
+                                p,
+                                "remote-window-open",
+                                "Wait for another device",
+                                Operation::OpenWindow { login: None },
+                                cx,
+                            ));
+                        }
+                    }
+                    for (index, pending) in report.access.host.pending.iter().enumerate() {
+                        let accept = pending.id.clone();
+                        let deny = pending.id.clone();
+                        let state = if pending.approved {
+                            "accepted, waiting for the device"
+                        } else {
+                            "waiting for your answer"
+                        };
+                        let mut row = div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .items_center()
+                            .child(format!("{} · {} · {state}", pending.label, pending.login));
+                        if !pending.approved {
+                            row = row.child(button(
+                                p,
+                                ("pending-accept", index),
+                                "Accept",
+                                true,
+                                !self.busy,
+                                cx.listener(move |s, _, _, cx| {
+                                    s.submit(Operation::ApprovePending { id: accept.clone() }, cx)
+                                }),
+                            ));
+                        }
+                        // Accepting registered the device; there is nothing
+                        // left to decline, and pretending otherwise would be
+                        // wrong.
+                        if !pending.approved {
+                            row = row.child(button(
+                                p,
+                                ("pending-deny", index),
+                                "Decline",
+                                false,
+                                !self.busy,
+                                cx.listener(move |s, _, _, cx| {
+                                    s.submit(Operation::DenyPending { id: deny.clone() }, cx)
+                                }),
+                            ));
+                        }
+                        view = view.child(row);
+                    }
                 } else {
                     let port_input = self
                         .port_field

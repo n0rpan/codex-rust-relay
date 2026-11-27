@@ -63,7 +63,7 @@ impl Hosts {
                 Some(host) => serde_json::from_value(host.settings(json!({"action":"invite_worker_host"}))?)?,
                 None => {
                     let paths = ox_host_service::Paths::discover()?;
-                    ox_host_web::access::run(&paths, ox_host_web::access::Operation::PairWorker).map_err(io::Error::other)?.host.pairing
+                    ox_host_web::access::run(&paths, ox_host_web::access::Operation::PairWorker { login: None }).map_err(io::Error::other)?.host.pairing
                         .ok_or_else(||io::Error::other("The host did not return a worker invitation."))?
                 }
             };

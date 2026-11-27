@@ -190,6 +190,9 @@ const USAGE: &str = "Usage: ox-host COMMAND [--socket PATH] [--state-dir PATH] [
   memory-sync [<device> on|off]
                             sync non-local memories with workers, or change a worker link’s memory-sync grant
   revoke <device-id>        disconnect a paired device
+  pending                   list devices waiting to pair through a window
+  approve <request-id>      accept one of them, registering the device
+  deny <request-id>         refuse it
   doctor [--errors N]       check the host, Tailscale Serve, paired devices and stock clients
   uninstall [--purge]       remove the login service; --purge also deletes OX host state
                             (session ledger, pairings, push keys). Codex and Claude Code data is never touched.";
@@ -291,6 +294,13 @@ fn entry() -> io::Result<()> {
             Ok(())
         }
         (Some("revoke"), [id]) => pairing::revoke(&paths, id).map_err(io::Error::other),
+        (Some("pending"), []) => pairing::pending(&paths).map_err(io::Error::other),
+        (Some("approve"), [flag]) if matches!(flag.as_str(), "-h" | "--help") => {
+            println!("Usage: ox host approve <request-id>");
+            Ok(())
+        }
+        (Some("approve"), [id]) => pairing::approve(&paths, id).map_err(io::Error::other),
+        (Some("deny"), [id]) => pairing::deny(&paths, id).map_err(io::Error::other),
         (Some("doctor"), rest) => doctor::run(&paths, rest),
         (Some("memory-sync"), []) => {
             let host_id = identity::load(&paths.state_dir)?.to_string();

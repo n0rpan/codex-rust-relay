@@ -222,6 +222,8 @@ Checks and next steps
   ox host pair [--port N] Pair a desktop or phone over your tailnet (default HTTPS port 8443).
   ox host pair --worker-host  Create an invitation for a worker host.
   ox host pair --terminal Include terminal access for the device that pairs.
+  ox host pair --for LOGIN Only that Tailscale login may redeem the invitation.
+  ox host pair --window    Wait five minutes for a device on the tailnet to pair, with no code.
   ox host name [NAME]     Show or change the name shown on paired devices.
   ox host policy          Show the host mode policy. Use set POLICY to change it.
   ox host project add DIR  Keep a checkout available on a headless host. Use list or remove DIR to manage it.

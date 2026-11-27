@@ -2,7 +2,7 @@ mod worker_links;
 use crate::{
     appearance::{Palette, Step},
     kit::{button, field},
-    platform::hosts::{self, KeyReview, SavedHost},
+    platform::hosts::{self, KeyReview, OpenHost, SavedHost},
 };
 use gpui::{prelude::*, *};
 use gpui_component::input::{Input, InputState};
@@ -13,6 +13,8 @@ use std::io;
 
 pub(crate) struct Hosts {
     links: Option<worker_links::Directory>,
+    nearby: Vec<OpenHost>,
+    scanning: bool,
     worker_address: Entity<InputState>,
     worker_code: Entity<InputState>,
     address: Entity<InputState>,
@@ -33,6 +35,8 @@ impl Hosts {
         let loaded = hosts::list();
         Self {
             links: None,
+            nearby: Vec::new(),
+            scanning: false,
             worker_address: field("", "Worker invitation or host URL", false, w, cx),
             worker_code: field("", "Code (for a host URL)", true, w, cx),
             profile_fields: None,
@@ -256,10 +260,59 @@ impl Hosts {
     fn add(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let address = self.address.read(cx).value().to_string();
         let code = self.code.read(cx).value().to_string();
+        // An address with no code and no invitation fragment means the other
+        // machine is waiting in a pairing window, so nothing is redeemed.
+        let paired = move || {
+            if hosts::window_address(&address, &code) {
+                hosts::pair_window(&address, &hosts::device_label())
+            } else {
+                hosts::pair(&address, &code, &hosts::device_label())
+            }
+        };
+        self.pair(w, cx, paired, true);
+    }
+    /// Find tailnet peers whose operator is waiting for a device right now.
+    fn scan(&mut self, w: &mut Window, cx: &mut Context<Self>) {
+        if self.scanning {
+            return;
+        }
+        self.scanning = true;
+        self.notice.clear();
+        cx.notify();
+        let task = cx.background_spawn(async move { hosts::waiting_hosts() });
+        cx.spawn_in(w, async move |this, cx| {
+            let found = task.await;
+            let _ = this.update_in(cx, |s, _, cx| {
+                s.scanning = false;
+                s.notice = if found.is_empty() {
+                    "No host on this tailnet is waiting to pair. Open a pairing window there, or pair with its invitation."
+                        .into()
+                } else {
+                    format!("{} host(s) waiting to pair.", found.len())
+                };
+                s.nearby = found;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+    fn pair_nearby(&mut self, index: usize, w: &mut Window, cx: &mut Context<Self>) {
+        let Some(host) = self.nearby.get(index).cloned() else {
+            return;
+        };
+        let paired = move || hosts::pair_window(&host.origin, &hosts::device_label());
+        self.pair(w, cx, paired, false);
+    }
+    fn pair(
+        &mut self,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+        paired: impl FnOnce() -> io::Result<SavedHost> + Send + 'static,
+        clear_fields: bool,
+    ) {
         let choice = self.pair_policy;
         let task = cx.background_spawn(async move {
-            let label = hosts::device_label();
-            let host = hosts::pair(&address, &code, &label)?;
+            let host = paired()?;
             let policy = choice
                 .map(|selected| Self::host_policy(Some(&host), Some(selected)))
                 .transpose();
@@ -276,8 +329,11 @@ impl Hosts {
                     Ok((host, policy)) => {
                         s.pair_policy = None;
                         s.choosing_pair_policy = false;
-                        s.address.update(cx, |v, cx| v.set_value("", w, cx));
-                        s.code.update(cx, |v, cx| v.set_value("", w, cx));
+                        if clear_fields {
+                            s.address.update(cx, |v, cx| v.set_value("", w, cx));
+                            s.code.update(cx, |v, cx| v.set_value("", w, cx));
+                        }
+                        s.nearby.clear();
                         s.hosts
                             .retain(|h| h.id != host.id && h.origin != host.origin);
                         s.hosts.push(host.clone());
@@ -580,7 +636,7 @@ impl Render for Hosts {
         }
         list = list
             .child(div().text_size(p.text(Step::Title)).child("Add host"))
-            .child("Run ox host pair on the other machine. Add --terminal to allow shells and subscription sign-in from this desktop.")
+            .child("Run ox host pair on the other machine. Add --terminal to allow shells and subscription sign-in from this desktop. Leave the code empty when that host is waiting in a pairing window.")
             .child(Input::new(&self.address))
             .child(Input::new(&self.code))
             .child(button(p,"pair-mode", format!("Mode policy · {}", self.pair_policy.map_or("Use host setting", HostPolicy::label)), false, !self.busy,
@@ -614,6 +670,50 @@ impl Render for Hosts {
             !self.busy,
             cx.listener(|s, _, w, cx| s.add(w, cx)),
         ));
+        list = list
+            .child(
+                button(
+                    p,
+                    "scan-hosts",
+                    if self.scanning {
+                        "Looking for hosts…"
+                    } else {
+                        "Look for hosts waiting to pair"
+                    },
+                    false,
+                    !self.busy && !self.scanning,
+                    cx.listener(|s, _, w, cx| s.scan(w, cx)),
+                ),
+            )
+            .child("A host whose operator opened a pairing window appears here. Pairing needs no code or link.");
+        for (index, host) in self.nearby.iter().enumerate() {
+            let tags = if host.tags.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", host.tags.join(", "))
+            };
+            list = list.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .items_center()
+                    .child(format!("{}{tags}", host.name))
+                    .child(
+                        div()
+                            .text_size(p.text(Step::Meta))
+                            .child(host.origin.clone()),
+                    )
+                    .child(button(
+                        p,
+                        ("pair-nearby", index),
+                        "Pair",
+                        true,
+                        !self.busy,
+                        cx.listener(move |s, _, w, cx| s.pair_nearby(index, w, cx)),
+                    )),
+            );
+        }
         if self.busy {
             list = list.child("Contacting host…");
         }

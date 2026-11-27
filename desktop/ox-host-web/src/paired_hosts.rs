@@ -194,6 +194,43 @@ pub fn pair(address: &str, code: &str, label: &str) -> io::Result<SavedHost> {
         |_, _| true,
     )
 }
+/// Pair with a host that is waiting for a device, using the pairing window its
+/// operator opened instead of an invitation.
+pub fn pair_window(origin: &str, label: &str) -> io::Result<SavedHost> {
+    let origin = window_origin(origin)?;
+    enroll_window(
+        &origin,
+        label,
+        &directory()?.join("hosts.json"),
+        false,
+        None,
+        |_, _| true,
+    )
+}
+/// The origin to ask for a pairing window. A bare host, or one with no port,
+/// is completed the way `ox host pair` prints it.
+pub(crate) fn window_origin(address: &str) -> io::Result<String> {
+    let address = address.trim().trim_end_matches('/');
+    let with_scheme = if address.contains("://") {
+        address.to_owned()
+    } else {
+        format!("https://{address}")
+    };
+    let with_port = if with_scheme.trim_start_matches("https://").contains(':') {
+        with_scheme
+    } else {
+        format!("{with_scheme}:{}", crate::access::DEFAULT_HTTPS_PORT)
+    };
+    crate::serve::origin(&with_port).ok_or_else(|| {
+        io::Error::other("Enter the HTTPS .ts.net address of a host that is waiting.")
+    })
+}
+/// True when an address alone names a host that is waiting, with no invitation
+/// fragment and no typed code. An invitation link carries its code in
+/// `#pair=` and is redeemed as one.
+pub fn window_address(address: &str, code: &str) -> bool {
+    code.trim().is_empty() && !address.contains("#pair=")
+}
 pub(crate) fn enroll(
     invite: Invitation,
     label: &str,
@@ -205,6 +242,45 @@ pub(crate) fn enroll(
     let origin = invite.origin.clone();
     let rt = client::runtime()?;
     let credential = rt.block_on(client::register_as(invite, label, worker_source))?;
+    finish(
+        origin,
+        credential,
+        registry,
+        background,
+        worker_source,
+        accept,
+    )
+}
+/// Pair with a host whose operator opened a pairing window, without carrying
+/// an invitation to it.
+pub(crate) fn enroll_window(
+    origin: &str,
+    label: &str,
+    registry: &Path,
+    background: bool,
+    worker_source: Option<&str>,
+    accept: impl FnOnce(&[SavedHost], &SavedHost) -> bool,
+) -> io::Result<SavedHost> {
+    let rt = client::runtime()?;
+    let credential = rt.block_on(client::register_window(origin, label, worker_source))?;
+    finish(
+        origin.to_owned(),
+        credential,
+        registry,
+        background,
+        worker_source,
+        accept,
+    )
+}
+fn finish(
+    origin: String,
+    credential: client::Credential,
+    registry: &Path,
+    background: bool,
+    worker_source: Option<&str>,
+    accept: impl FnOnce(&[SavedHost], &SavedHost) -> bool,
+) -> io::Result<SavedHost> {
+    let rt = client::runtime()?;
     let revoke = |client: &PairedClient| {
         if worker_source.is_some() {
             let _ = rt.block_on(client.worker_request(json!({"action":"revoke_self"})));
@@ -427,5 +503,38 @@ impl KeyReview {
                 "The server’s keys changed. Review the transfer again.",
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{window_address, window_origin};
+    #[test]
+    fn an_invitation_link_is_never_mistaken_for_a_waiting_host() {
+        // A pasted invitation carries its code in the fragment.
+        assert!(!window_address(
+            "https://lab.tail1234.ts.net:7443/#pair=abc",
+            ""
+        ));
+        assert!(window_address("https://lab.tail1234.ts.net:7443", ""));
+        assert!(window_address("lab.tail1234.ts.net", "  "));
+        // A typed code, or a short one, is redeemed as an invitation.
+        assert!(!window_address(
+            "https://lab.tail1234.ts.net:7443",
+            "Y02Z-1NET-TDH8"
+        ));
+    }
+    #[test]
+    fn a_waiting_host_needs_only_an_address() {
+        assert_eq!(
+            window_origin("lab.tail1234.ts.net").unwrap(),
+            "https://lab.tail1234.ts.net:8443"
+        );
+        assert_eq!(
+            window_origin("https://lab.tail1234.ts.net:7443/").unwrap(),
+            "https://lab.tail1234.ts.net:7443"
+        );
+        assert!(window_origin("https://example.com").is_err());
+        assert!(window_origin("").is_err());
     }
 }

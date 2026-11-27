@@ -34,6 +34,14 @@ enum DeviceAction {
     Devices,
     PairDevice,
     InviteWorkerHost,
+    OpenPairingWindow,
+    ClosePairingWindow,
+    ApprovePending {
+        id: String,
+    },
+    DenyPending {
+        id: String,
+    },
     EditWorkerLink {
         id: String,
         before: crate::admin::WorkerGrant,
@@ -103,8 +111,36 @@ pub(super) async fn settings(
                         .filter(|d| d.login == identity)
                         .collect();
                     Some(
-                        json!({"devices":devices,"worker_hosts":worker_hosts,"self":id,"origin":reply.origin}),
+                        json!({"devices":devices,"worker_hosts":worker_hosts,"self":id,"origin":reply.origin,"window":reply.window,"pending":reply.pending.into_iter().filter(|p| p.login == identity).collect::<Vec<_>>()}),
                     )
+                }
+                // A paired device speaks for the login it is paired under, so
+                // a window it opens admits only that login.
+                DeviceAction::OpenPairingWindow => Some(
+                    serde_json::to_value(
+                        state
+                            .open_window(Some(identity.to_owned()))
+                            .map_err(|_| StatusCode::CONFLICT)?,
+                    )
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+                ),
+                DeviceAction::ClosePairingWindow => {
+                    state.close_window();
+                    Some(json!({"status":"closed"}))
+                }
+                DeviceAction::ApprovePending { id } => {
+                    if state.pending_login(id).as_deref() != Some(identity) {
+                        return Err(DENY);
+                    }
+                    state.approve_pending(id).ok_or(StatusCode::CONFLICT)?;
+                    Some(json!({"status":"approved"}))
+                }
+                DeviceAction::DenyPending { id } => {
+                    if state.pending_login(id).as_deref() != Some(identity) {
+                        return Err(DENY);
+                    }
+                    state.deny_pending(id);
+                    Some(json!({"status":"denied"}))
                 }
                 DeviceAction::PairDevice => Some(
                     serde_json::to_value(

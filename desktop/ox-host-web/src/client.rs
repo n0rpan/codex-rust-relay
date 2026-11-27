@@ -323,6 +323,128 @@ impl Credential {
         }
     }
 }
+
+/// An OX host another machine can see on the tailnet, and whether it is
+/// waiting for a device to pair right now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenHost {
+    pub origin: String,
+    pub name: String,
+    pub tags: Vec<String>,
+    pub expires_at: i64,
+}
+
+/// Ask a host whether its pairing window is open. Only the window's state
+/// crosses the tailnet; the login it admits stays private.
+pub(crate) async fn window_status(origin: &str) -> io::Result<Option<(String, i64)>> {
+    let http = Client::builder()
+        .timeout(Duration::from_secs(4))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(io::Error::other)?;
+    let response = http
+        .post(format!("{origin}/api/pair/window/status"))
+        .header(header::ORIGIN, origin)
+        .json(&json!({}))
+        .send()
+        .await
+        .map_err(|e| io::Error::new(io::ErrorKind::NotConnected, e.without_url()))?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    let value: Value = response.json().await.map_err(io::Error::other)?;
+    Ok(value["open"].as_bool().filter(|open| *open).map(|_| {
+        (
+            value["name"].as_str().unwrap_or_default().to_owned(),
+            value["expires_at"].as_i64().unwrap_or_default(),
+        )
+    }))
+}
+
+/// Enrol in a host whose pairing window the operator opened, instead of
+/// carrying an invitation to it. The host only queues the request: the
+/// operator there accepts it, and this waits for that decision.
+pub(crate) async fn register_window(
+    origin: &str,
+    label: &str,
+    source: Option<&str>,
+) -> io::Result<Credential> {
+    let (http, (key, saved)) = (http()?, DeviceKey::generate()?);
+    let result: io::Result<String> = async {
+        let class = if source.is_some() { "host" } else { "desktop" };
+        let mut payload = json!({"key":key.public()?, "class":class, "label":label});
+        if let Some(source) = source {
+            payload["source"] = json!(source);
+        }
+        let response = checked(
+            http.post(format!("{origin}/api/pair/window"))
+                .header(header::ORIGIN, origin)
+                .json(&payload)
+                .send()
+                .await,
+            "That host is not waiting for a device to pair. Open a pairing window there and try again.",
+        )
+        .await?;
+        let request: Value = response.json().await.map_err(io::Error::other)?;
+        let id = request["request"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("The host did not name the pairing request"))?;
+        // The phone and the desktop both wrap this in a one-minute settings
+        // request, so wait inside that rather than outliving the caller.
+        let until = std::time::Instant::now() + Duration::from_secs(50);
+        loop {
+            let response = http
+                .post(format!("{origin}/api/pair/window/poll"))
+                .header(header::ORIGIN, origin)
+                .json(&json!({"request": id}))
+                .send()
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::NotConnected, e.without_url()))?;
+            if response.status() == reqwest::StatusCode::NO_CONTENT {
+                return response
+                    .headers()
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .filter_map(|v| v.to_str().ok()?.split(';').next()?.split_once('='))
+                    .find(|(k, t)| *k == COOKIE && B64.decode(t).is_ok_and(|b| b.len() == 32))
+                    .map(|(_, token)| token.to_owned())
+                    .ok_or_else(|| {
+                        io::Error::other("The host did not return a device credential")
+                    });
+            }
+            if response.status() != reqwest::StatusCode::ACCEPTED {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "The host declined this device or the request expired.",
+                ));
+            }
+            if std::time::Instant::now() >= until {
+                // Withdraw the request so an operator who reads it later does
+                // not register a device whose credential nobody can collect.
+                let _ = http
+                    .post(format!("{origin}/api/pair/window/cancel"))
+                    .header(header::ORIGIN, origin)
+                    .json(&json!({"request": id}))
+                    .send()
+                    .await;
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("No one accepted this device on {origin} within a minute. Ask for a fresh pairing window there and try again."),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+    }
+    .await;
+    let token = result.inspect_err(|_| {
+        let _ = key.discard();
+    })?;
+    Ok(Credential {
+        origin: origin.to_owned(),
+        key: saved,
+        token,
+    })
+}
 impl PairedClient {
     pub async fn worker_request(&self, call: Value) -> io::Result<Value> {
         let request = call.to_string();
@@ -423,6 +545,7 @@ impl PairedClient {
         let timeout = match action["action"].as_str() {
             Some(
                 "add_worker_link"
+                | "add_worker_link_window"
                 | "link_paired_host"
                 | "remove_worker_link"
                 | "pair_key_destination"

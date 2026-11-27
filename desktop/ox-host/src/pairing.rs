@@ -9,9 +9,11 @@ use std::{
     process::Command,
 };
 
-const PAIR_USAGE: &str = "Usage: ox host pair [--terminal | --worker-host] [--port HTTPS_PORT] [--listen-port LOCAL_PORT]
+const PAIR_USAGE: &str = "Usage: ox host pair [--terminal | --worker-host | --window] [--for LOGIN] [--port HTTPS_PORT] [--listen-port LOCAL_PORT]
   --terminal          grant terminal access on this host to the device that redeems the invitation
   --worker-host       create an invitation for another OX host to launch workers here
+  --window            wait five minutes for any device on the tailnet to pair, with no code to carry
+  --for LOGIN         only this Tailscale login may redeem it (default: any login the tailnet lets reach this host)
   --port PORT         Tailscale Serve HTTPS port (default 8443, range 1024..65535)
   --listen-port PORT  local loopback listener port (default 48162, range 1024..65535)";
 
@@ -19,6 +21,7 @@ pub struct PairOptions {
     pub operation: Operation,
     pub https_port: Option<u16>,
     pub loopback_port: Option<u16>,
+    pub for_login: Option<String>,
 }
 
 fn parse_port(flag: &str, value: &str) -> Result<u16, String> {
@@ -34,8 +37,10 @@ fn parse_port(flag: &str, value: &str) -> Result<u16, String> {
 pub fn parse_pair_args(args: &[String]) -> Result<Option<PairOptions>, String> {
     let mut terminal = false;
     let mut worker = false;
+    let mut window = false;
     let mut https_port = None;
     let mut loopback_port = None;
+    let mut for_login = None;
     let mut iter = args.iter().map(String::as_str);
     while let Some(arg) = iter.next() {
         match arg {
@@ -45,6 +50,16 @@ pub fn parse_pair_args(args: &[String]) -> Result<Option<PairOptions>, String> {
             }
             "--terminal" => terminal = true,
             "--worker-host" => worker = true,
+            "--window" => window = true,
+            "--for" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--for takes a Tailscale login.".to_owned())?;
+                for_login = Some(parse_login(value)?);
+            }
+            _ if arg.starts_with("--for=") => {
+                for_login = Some(parse_login(&arg["--for=".len()..])?);
+            }
             "--port" => {
                 let value = iter
                     .next()
@@ -66,27 +81,53 @@ pub fn parse_pair_args(args: &[String]) -> Result<Option<PairOptions>, String> {
             _ => return Err(PAIR_USAGE.into()),
         }
     }
-    if terminal && worker {
-        return Err("Choose either --terminal or --worker-host, not both.".into());
+    if [terminal, worker, window].iter().filter(|on| **on).count() > 1 {
+        return Err("Choose one of --terminal, --worker-host or --window.".into());
     }
     access::validate_ports(https_port, loopback_port)?;
-    let operation = if worker {
-        Operation::PairWorker
+    let operation = if window {
+        Operation::OpenWindow {
+            login: for_login.clone(),
+        }
+    } else if worker {
+        Operation::PairWorker { login: None }
     } else {
-        Operation::Pair { terminal }
+        Operation::Pair {
+            terminal,
+            login: None,
+        }
     };
     Ok(Some(PairOptions {
         operation,
         https_port,
         loopback_port,
+        for_login,
     }))
+}
+
+fn parse_login(value: &str) -> Result<String, String> {
+    let login = value.trim();
+    if login.is_empty()
+        || login.len() > 254
+        || !login.is_ascii()
+        || login.bytes().any(|b| b.is_ascii_control() || b == b' ')
+    {
+        return Err("--for takes an ASCII Tailscale login such as you@example.com.".into());
+    }
+    Ok(login.to_owned())
 }
 
 pub fn pair_cli(paths: &Paths, args: &[String]) -> Result<(), String> {
     let Some(opts) = parse_pair_args(args)? else {
         return Ok(());
     };
-    pair_with_ports(paths, opts.operation, opts.https_port, opts.loopback_port)
+    pair_with_ports(
+        paths,
+        opts.operation,
+        opts.https_port,
+        opts.loopback_port,
+        opts.for_login,
+    )
 }
 
 pub fn pair_with_ports(
@@ -94,6 +135,7 @@ pub fn pair_with_ports(
     operation: Operation,
     https_port: Option<u16>,
     loopback_port: Option<u16>,
+    for_login: Option<String>,
 ) -> Result<(), String> {
     let enable = if https_port.is_some() || loopback_port.is_some() {
         Operation::EnableOn {
@@ -127,12 +169,38 @@ pub fn pair_with_ports(
             return Err(error);
         }
     }
-    let terminal = matches!(operation, Operation::Pair { terminal: true });
-    let worker = matches!(operation, Operation::PairWorker);
-    let reply = access::run(paths, operation)?.host;
+    let terminal = matches!(operation, Operation::Pair { terminal: true, .. });
+    let worker = matches!(operation, Operation::PairWorker { .. });
+    let window = matches!(operation, Operation::OpenWindow { .. });
+    let reply = access::run_with(paths, operation, for_login)?.host;
+    if window {
+        let window = reply
+            .window
+            .ok_or("The host did not open a pairing window")?;
+        println!(
+            "Waiting five minutes for a device to pair. On the other machine, choose this host under Add host, or paste {} as a worker host.",
+            reply.origin.as_deref().unwrap_or("its Serve address")
+        );
+        println!(
+            "A request waits for you here: approve it in OX Desktop or on a paired phone, or run `ox host pending` and `ox host approve <id>`."
+        );
+        if let Some(login) = window.login.as_deref() {
+            println!("Only {login} may pair.");
+        } else {
+            println!("Any device your tailnet lets reach this host may pair.");
+        }
+        return Ok(());
+    }
     let pairing = reply
         .pairing
         .ok_or("The host did not issue an invitation")?;
+    if let Some(login) = pairing.invited_login.as_deref() {
+        println!("Only {login} may redeem this invitation.");
+    } else {
+        println!(
+            "Anyone your tailnet lets reach this host can redeem this invitation. Pass --for LOGIN to name one."
+        );
+    }
     if terminal {
         println!(
             "This invitation grants terminal access on this host to the device that redeems it."
@@ -159,6 +227,45 @@ pub fn pair_with_ports(
     if let (Some(origin), Some(code)) = (reply.origin, pairing.short_code) {
         println!("Host  {origin}\nCode  {code}");
     }
+    Ok(())
+}
+
+pub fn pending(paths: &Paths) -> Result<(), String> {
+    let rows = access::status(paths).map_err(|e| e.to_string())?.pending;
+    if rows.is_empty() {
+        println!("No device is waiting to pair.");
+    }
+    for row in rows {
+        println!(
+            "{}  {}  {}  {}{}",
+            row.id,
+            row.label,
+            row.login,
+            match row.class {
+                DeviceClass::Host => "worker host",
+                DeviceClass::Phone => "phone",
+                DeviceClass::Desktop => "desktop",
+            },
+            if row.approved {
+                "  accepted, waiting for the device"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
+pub fn approve(paths: &Paths, id: &str) -> Result<(), String> {
+    access::run(paths, Operation::ApprovePending { id: id.to_owned() })
+        .map_err(|e| e.to_string())?;
+    println!("Accepted. The device collects its credential within a minute.");
+    Ok(())
+}
+
+pub fn deny(paths: &Paths, id: &str) -> Result<(), String> {
+    access::run(paths, Operation::DenyPending { id: id.to_owned() }).map_err(|e| e.to_string())?;
+    println!("Declined.");
     Ok(())
 }
 
@@ -352,8 +459,12 @@ mod tests {
         let plain = args(&[]).unwrap().unwrap();
         assert!(matches!(
             plain.operation,
-            Operation::Pair { terminal: false }
+            Operation::Pair {
+                terminal: false,
+                login: None
+            }
         ));
+        assert_eq!(plain.for_login, None);
         assert_eq!((plain.https_port, plain.loopback_port), (None, None));
 
         let custom = args(&["--terminal", "--port", "9443", "--listen-port=49100"])
@@ -361,7 +472,10 @@ mod tests {
             .unwrap();
         assert!(matches!(
             custom.operation,
-            Operation::Pair { terminal: true }
+            Operation::Pair {
+                terminal: true,
+                login: None
+            }
         ));
         assert_eq!(
             (custom.https_port, custom.loopback_port),
@@ -369,8 +483,48 @@ mod tests {
         );
 
         let worker = args(&["--worker-host", "--port=10443"]).unwrap().unwrap();
-        assert!(matches!(worker.operation, Operation::PairWorker));
+        assert!(matches!(
+            worker.operation,
+            Operation::PairWorker { login: None }
+        ));
         assert_eq!(worker.https_port, Some(10443));
+
+        let named = args(&["--worker-host", "--for", "you@example.com"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(named.for_login.as_deref(), Some("you@example.com"));
+        assert_eq!(
+            args(&["--for=you@example.com"]).unwrap().unwrap().for_login,
+            Some("you@example.com".into())
+        );
+        assert!(matches!(
+            args(&["--for", "you@example.com"])
+                .unwrap()
+                .unwrap()
+                .operation,
+            Operation::Pair {
+                terminal: false,
+                login: None
+            }
+        ));
+        assert!(args(&["--for"]).is_err());
+        assert!(args(&["--for", "two words"]).is_err());
+        assert!(args(&["--for", ""]).is_err());
+
+        let window = args(&["--window", "--for", "you@example.com"])
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            window.operation,
+            Operation::OpenWindow { login: Some(ref login) } if login == "you@example.com"
+        ));
+        assert_eq!(
+            args(&["--window"]).unwrap().unwrap().for_login,
+            None,
+            "an open window needs no login"
+        );
+        assert!(args(&["--window", "--terminal"]).is_err());
+        assert!(args(&["--window", "--worker-host"]).is_err());
 
         assert!(args(&["--help"]).unwrap().is_none());
         assert!(args(&["--terminal", "--worker-host"]).is_err());

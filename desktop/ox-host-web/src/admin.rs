@@ -55,7 +55,10 @@ pub enum Request {
     },
     Disable,
     Pair {
-        login: String,
+        /// Only this Tailscale login may redeem the invitation. Omit it to
+        /// accept any login Tailscale Serve authenticated on this origin.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        login: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         terminal: bool,
     },
@@ -73,7 +76,20 @@ pub enum Request {
         may_sync_memory: Option<bool>,
     },
     WorkerInvitation {
-        login: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        login: Option<String>,
+    },
+    /// Open a window in which a device may pair without an invitation code.
+    OpenWindow {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        login: Option<String>,
+    },
+    CloseWindow,
+    ApprovePending {
+        id: String,
+    },
+    DenyPending {
+        id: String,
     },
     Revoke {
         id: String,
@@ -129,6 +145,39 @@ pub struct Pairing {
     pub url: String,
     pub qr_svg: String,
     pub expires_at: i64,
+    /// The one Tailscale login that may redeem it, when the invitation names
+    /// one. `None` means any login Tailscale Serve authenticated on the origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invited_login: Option<String>,
+}
+
+/// A deliberate pairing window. While it is open, a device that reaches this
+/// host's Serve origin may enrol without an invitation code.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PairingWindow {
+    pub expires_at: i64,
+    /// The one login it admits, when the operator named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
+    /// How many devices it has admitted so far.
+    #[serde(default)]
+    pub paired: u8,
+}
+
+/// A device that asked to pair while a window was open, waiting for the
+/// operator on this host to accept or decline it. The window is only the
+/// advertisement; this is the decision.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PendingPair {
+    pub id: String,
+    pub label: String,
+    pub login: String,
+    pub class: DeviceClass,
+    pub expires_at: i64,
+    /// Set once the operator accepted. The device is registered, and its next
+    /// poll collects the credential.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub approved: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -149,6 +198,10 @@ pub struct Reply {
     pub worker_links: Option<serde_json::Value>,
     pub pairing: Option<Pairing>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<PairingWindow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<PendingPair>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reservation: Option<String>,
 }
 
@@ -156,9 +209,22 @@ pub struct Reply {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkerLinkAction {
     WorkerLinks,
-    AddWorkerLink { address: String, code: String },
-    LinkPairedHost { host: String },
-    RemoveWorkerLink { host: String },
+    AddWorkerLink {
+        address: String,
+        code: String,
+    },
+    /// Link a host that is waiting in a pairing window on the other machine.
+    AddWorkerLinkWindow {
+        origin: String,
+    },
+    /// Hosts on this tailnet whose operator is waiting for a device.
+    NearbyWindowHosts,
+    LinkPairedHost {
+        host: String,
+    },
+    RemoveWorkerLink {
+        host: String,
+    },
 }
 // Listener configuration and terminal grants have a private, same-user administration socket.
 pub fn request(state_dir: &Path, req: &Request) -> io::Result<Reply> {

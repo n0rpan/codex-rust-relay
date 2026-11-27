@@ -39,7 +39,7 @@ fn describe(h: &SavedHost) -> Value {
 }
 
 pub(super) fn execute(app: &App, device: Option<&str>, action: Action) -> io::Result<Value> {
-    let (registry, destinations, source_id, name, origin) = {
+    let (registry, destinations, source_id, name, origin, local_https_port) = {
         let s = app.state.lock().unwrap();
         if device.is_some_and(|id| !s.alive(id)) {
             return Err(io::Error::other("This device needs to pair again."));
@@ -50,47 +50,52 @@ pub(super) fn execute(app: &App, device: Option<&str>, action: Action) -> io::Re
             s.host_id()?,
             s.host_profile(None)?.name,
             s.configuration().map(|(origin, _)| origin),
+            s.reply(None).https_port,
         )
     };
     let rows = paired_hosts::worker_links(&registry)?;
-    let pair = |invitation: Invitation, expected: Option<&SavedHost>| -> io::Result<Value> {
+    let acceptable = |expected: Option<&SavedHost>, current: &[SavedHost], new: &SavedHost| {
+        let matching = |h: &&SavedHost| h.id == new.id || h.origin == new.origin;
+        let old = rows.iter().find(matching);
+        let now = current.iter().find(matching);
+        let unchanged = match (old, now) {
+            (None, None) => true,
+            (Some(old), Some(now)) => {
+                old.same_pairing(now) && now.id == new.id && now.origin == new.origin
+            }
+            _ => false,
+        };
+        device.is_none_or(|id| app.state.lock().unwrap().alive(id))
+            && expected.is_none_or(|h| h.id == new.id && h.origin == new.origin)
+            && new.id != source_id
+            && unchanged
+    };
+    let on_tailnet = |target: &str| -> io::Result<()> {
         if origin.as_ref().is_some_and(|local| {
-            local == &invitation.origin
-                || super::key_transfer::tailnet(local)
-                    != super::key_transfer::tailnet(&invitation.origin)
+            local == target
+                || super::key_transfer::tailnet(local) != super::key_transfer::tailnet(target)
         }) {
             return Err(io::Error::other(
                 "Choose a different OX host on your tailnet.",
             ));
         }
-        let label = if name.is_empty() {
-            paired_hosts::device_label()
-        } else {
-            name
-        };
-        let label: String = label.chars().take(64).collect();
+        Ok(())
+    };
+    let label = if name.is_empty() {
+        paired_hosts::device_label()
+    } else {
+        name
+    };
+    let label: String = label.chars().take(64).collect();
+    let pair = |invitation: Invitation, expected: Option<&SavedHost>| -> io::Result<Value> {
+        on_tailnet(&invitation.origin)?;
         let host = paired_hosts::enroll(
             invitation,
             &label,
             &registry,
             true,
             Some(&source_id),
-            |current, new| {
-                let matching = |h: &&SavedHost| h.id == new.id || h.origin == new.origin;
-                let old = rows.iter().find(matching);
-                let now = current.iter().find(matching);
-                let unchanged = match (old, now) {
-                    (None, None) => true,
-                    (Some(old), Some(now)) => {
-                        old.same_pairing(now) && now.id == new.id && now.origin == new.origin
-                    }
-                    _ => false,
-                };
-                device.is_none_or(|id| app.state.lock().unwrap().alive(id))
-                    && expected.is_none_or(|h| h.id == new.id && h.origin == new.origin)
-                    && new.id != source_id
-                    && unchanged
-            },
+            |current, new| acceptable(expected, current, new),
         )?;
         Ok(describe(&host))
     };
@@ -145,8 +150,64 @@ pub(super) fn execute(app: &App, device: Option<&str>, action: Action) -> io::Re
         }
         Action::AddWorkerLink { address, code } => {
             super::background_keychain().map_err(io::Error::other)?;
-            pair(Invitation::parse(&address, &code)?, None)
+            if paired_hosts::window_address(&address, &code) {
+                // An address with no code and no invitation fragment means the
+                // host is waiting in a pairing window, so nothing is redeemed.
+                let target = paired_hosts::window_origin(&address).map_err(|_| {
+                    io::Error::other(
+                        "Enter the host's HTTPS .ts.net address, or paste its invitation link.",
+                    )
+                })?;
+                on_tailnet(&target)?;
+                let host = paired_hosts::enroll_window(
+                    &target,
+                    &label,
+                    &registry,
+                    true,
+                    Some(&source_id),
+                    |current, new| acceptable(None, current, new),
+                )?;
+                Ok(describe(&host))
+            } else {
+                pair(Invitation::parse(&address, &code)?, None)
+            }
         }
+        Action::AddWorkerLinkWindow { origin: target } => {
+            super::background_keychain().map_err(io::Error::other)?;
+            let target = crate::serve::origin(target.trim().trim_end_matches('/'))
+                .ok_or_else(|| io::Error::other("That is not an HTTPS tailnet address."))?;
+            on_tailnet(&target)?;
+            let host = paired_hosts::enroll_window(
+                &target,
+                &label,
+                &registry,
+                true,
+                Some(&source_id),
+                |current, new| acceptable(None, current, new),
+            )
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::PermissionDenied {
+                    io::Error::other(
+                        "That host is not waiting for a device. Open a pairing window there and try again.",
+                    )
+                } else {
+                    e
+                }
+            })?;
+            Ok(describe(&host))
+        }
+        Action::NearbyWindowHosts => Ok(json!({
+            "hosts": crate::discovery::open_hosts(local_https_port)
+                .into_iter()
+                .filter(|host| Some(&host.origin) != origin.as_ref())
+                .map(|host| json!({
+                    "origin": host.origin,
+                    "name": host.name,
+                    "tags": host.tags,
+                    "expires_at": host.expires_at,
+                }))
+                .collect::<Vec<_>>()
+        })),
         Action::RemoveWorkerLink { host } => {
             super::background_keychain().map_err(io::Error::other)?;
             let target = rows

@@ -267,6 +267,22 @@ async fn administer(
             }
             pairing = Some(app.state.lock().unwrap().local_worker_invite(login)?);
         }
+        Request::OpenWindow { login } => {
+            if listener.is_none() || staged.is_some() {
+                return Err(io::Error::other(
+                    "Enable remote access before opening a pairing window",
+                ));
+            }
+            app.state.lock().unwrap().open_window(login)?;
+        }
+        Request::CloseWindow => app.state.lock().unwrap().close_window(),
+        Request::ApprovePending { id } => app
+            .state
+            .lock()
+            .unwrap()
+            .approve_pending(&id)
+            .ok_or_else(|| io::Error::other("That pairing request expired."))?,
+        Request::DenyPending { id } => app.state.lock().unwrap().deny_pending(&id),
         Request::Pair { login, terminal } => {
             if listener.is_none() || staged.is_some() {
                 return Err(io::Error::other(
@@ -535,6 +551,10 @@ fn start_listener(app: App, origin: String, listener: TcpListener) -> Listener {
             post(remote_settings::settings).layer(DefaultBodyLimit::max(256 * 1024)),
         )
         .route("/api/pair", post(pair))
+        .route("/api/pair/window", post(pair_window))
+        .route("/api/pair/window/status", post(pair_window_status))
+        .route("/api/pair/window/poll", post(pair_window_poll))
+        .route("/api/pair/window/cancel", post(pair_window_cancel))
         .route("/api/challenge", post(challenge))
         .route("/api/worker-link", post(worker_link))
         .route(
@@ -712,6 +732,93 @@ async fn pair(
         StatusCode::NO_CONTENT,
     )
         .into_response())
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowPair {
+    #[serde(default)]
+    class: crate::admin::DeviceClass,
+    source: Option<String>,
+    key: String,
+    label: String,
+}
+/// Enrol through an open pairing window. The operator opened the window on
+/// this host; the caller proves nothing but that Serve authenticated it.
+async fn pair_window(
+    Extract(app): Extract<App>,
+    h: HeaderMap,
+    Json(p): Json<WindowPair>,
+) -> Result<Response, ErrCode> {
+    let request = app
+        .state
+        .lock()
+        .unwrap()
+        .request_window(
+            login(&h).ok_or(DENY)?,
+            &p.key,
+            &p.label,
+            state::Enrollment {
+                class: p.class,
+                source: p.source.as_deref(),
+            },
+        )
+        .ok_or(DENY)?;
+    // Accepted by the host, not by the operator: the device waits for the
+    // decision on this host and collects its credential from the poll.
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({"request": request.id, "expires_at": request.expires_at})),
+    )
+        .into_response())
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowPoll {
+    request: String,
+}
+/// The waiting device's own view of its request. The request id is its
+/// secret, so no cookie is needed yet.
+async fn pair_window_poll(
+    Extract(app): Extract<App>,
+    Json(p): Json<WindowPoll>,
+) -> Result<Response, ErrCode> {
+    let state = app.state.lock().unwrap().poll_window(&p.request);
+    match state {
+        state::PollState::Pending => Ok(StatusCode::ACCEPTED.into_response()),
+        state::PollState::Approved(token) => Ok((
+            [(
+                header::SET_COOKIE,
+                format!(
+                    "{COOKIE}={token}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+                    state::INACTIVE
+                ),
+            )],
+            StatusCode::NO_CONTENT,
+        )
+            .into_response()),
+        state::PollState::Unknown => Err(DENY),
+    }
+}
+/// What another host may learn about this one before it pairs: whether a
+/// window is open. The operator's chosen login stays private.
+async fn pair_window_status(Extract(app): Extract<App>) -> Json<serde_json::Value> {
+    let state = app.state.lock().unwrap();
+    let name = state.host_profile(None).map(|p| p.name).unwrap_or_default();
+    let status = match state.window() {
+        Some(window) => serde_json::json!({
+            "open": true,
+            "expires_at": window.expires_at,
+            "paired": window.paired,
+            "name": name,
+        }),
+        None => serde_json::json!({"open": false}),
+    };
+    Json(status)
+}
+/// The asking device stopped waiting; its request id is its own secret.
+async fn pair_window_cancel(Extract(app): Extract<App>, Json(p): Json<WindowPoll>) -> StatusCode {
+    app.state.lock().unwrap().cancel_window(&p.request);
+    StatusCode::NO_CONTENT
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -976,7 +1083,7 @@ mod tests {
             state.set_origin(Some(ORIGIN.into()), 0).unwrap();
             let key = SigningKey::random(&mut OsRng);
             let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
-            let invite = state.invite(LOGIN.into(), false).unwrap();
+            let invite = state.invite(Some(LOGIN.into()), false).unwrap();
             let code = invite.url.split_once("#pair=").unwrap().1;
             let cookie = state
                 .pair(

@@ -160,7 +160,8 @@ export function setupSettings({ request, open, close, notifications, login }) {
     pageId = 0,
     accountsPage,
     installPrompt,
-    inviteTimer;
+    inviteTimer,
+    pendingTimer = null;
   const localDefaults = {
     theme: "dark",
     font_size: 16,
@@ -239,6 +240,8 @@ export function setupSettings({ request, open, close, notifications, login }) {
   function screen(title, back = menu) {
     pageId++;
     clearTimeout(inviteTimer);
+    clearInterval(pendingTimer);
+    pendingTimer = null;
     status.textContent = "";
     body.replaceChildren();
     const heading = node("h1", title);
@@ -1211,7 +1214,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
       }));
     }
     const address = textField(form, "Worker invitation or host URL", "worker_address");
-    const code = textField(form, "Code (for a host URL)", "worker_code", "password");
+    const code = textField(form, "Code (leave empty while that host is waiting)", "worker_code", "password");
     address.required = true;
     address.spellcheck = false;
     address.setAttribute("autocapitalize", "none");
@@ -1221,6 +1224,32 @@ export function setupSettings({ request, open, close, notifications, login }) {
       if (pageId === id && !panel.hidden) await workerLinks();
     });
     body.append(form);
+    const waiting = node("div", undefined, "phone-settings-card");
+    waiting.append(
+      node("h2", "Hosts waiting to pair"),
+      node("p", "A host whose operator opened a pairing window appears here. Linking it needs no code."),
+      action("Look for hosts waiting to pair", async () => {
+        const found = await readPage(id, { action: "nearby_window_hosts" });
+        if (!found) return;
+        waiting.replaceChildren(
+          node("h2", "Hosts waiting to pair"),
+          node("p", "A host whose operator opened a pairing window appears here. Linking it needs no code."),
+        );
+        if (!(found.hosts || []).length) {
+          waiting.append(node("p", "Nothing is waiting on this tailnet right now."));
+          return;
+        }
+        for (const host of found.hosts) {
+          waiting.append(
+            action(`${host.name} · ${host.origin}`, async () => {
+              await request({ action: "add_worker_link_window", origin: host.origin });
+              if (pageId === id && !panel.hidden) await workerLinks();
+            }, "primary"),
+          );
+        }
+      }),
+    );
+    body.append(waiting);
     for (const host of outbound.hosts) {
       const card = node("div", undefined, "phone-settings-card");
       card.append(node("h2", host.name), node("p", host.origin), action("Remove outgoing link", async () => {
@@ -1274,6 +1303,74 @@ export function setupSettings({ request, open, close, notifications, login }) {
       action("Host mode policy", hostModePolicy),
       action("Worker host links", workerLinks),
     );
+    const left = result.window
+      ? Math.max(0, Math.ceil((result.window.expires_at * 1000 - Date.now()) / 60000))
+      : 0;
+    const pendingBox = node("div");
+    const renderPending = (rows, paired) => {
+      pendingBox.replaceChildren();
+      if (paired !== undefined)
+        pendingBox.append(
+          node("p", `Waiting for a device to pair · ${paired} paired`),
+          node("p", "On the new device, open Add host and choose this host. Its request appears here for you to accept."),
+        );
+      for (const pending of rows) {
+        const row = node("div", undefined, "phone-settings-card");
+        row.append(
+          node("h2", pending.label),
+          node("p", `${pending.login} · ${pending.approved ? "accepted, waiting for the device" : "wants to pair"}`),
+        );
+        if (!pending.approved) {
+          row.append(
+            action("Accept " + pending.label, async () => {
+              await readPage(id, { action: "approve_pending", id: pending.id });
+              if (pageId === id && !panel.hidden) await remote();
+            }, "primary"),
+          );
+          row.append(
+            action("Decline", async () => {
+              await readPage(id, { action: "deny_pending", id: pending.id });
+              if (pageId === id && !panel.hidden) await remote();
+            }),
+          );
+        }
+        pendingBox.append(row);
+      }
+    };
+    renderPending(result.pending || [], left > 0 ? result.window.paired : undefined);
+    body.append(pendingBox);
+    if (left > 0) {
+      body.append(
+        action("Stop waiting", async () => {
+          await readPage(id, { action: "close_pairing_window" });
+          if (pageId === id && !panel.hidden) await remote();
+        }),
+      );
+      // The operator is told to stay here, so this screen has to keep showing
+      // requests as they arrive.
+      if (!pendingTimer)
+        pendingTimer = setInterval(async () => {
+          if (pageId !== id || panel.hidden) {
+            clearInterval(pendingTimer);
+            pendingTimer = null;
+            return;
+          }
+          const fresh = await request({ action: "devices" }).catch(() => null);
+          if (!fresh || pageId !== id || panel.hidden) return;
+          const minutes = fresh.window
+            ? Math.max(0, Math.ceil((fresh.window.expires_at * 1000 - Date.now()) / 60000))
+            : 0;
+          renderPending(fresh.pending || [], minutes > 0 ? fresh.window.paired : undefined);
+        }, 3000);
+    } else {
+      body.append(
+        action("Wait for a device to pair", async () => {
+          await readPage(id, { action: "open_pairing_window" });
+          if (pageId === id && !panel.hidden) await remote();
+        }),
+        node("p", "A device on this tailnet can pair from its own Add host within five minutes, with no code."),
+      );
+    }
     const invite = node("div", undefined, "phone-settings-invite");
     body.append(
       action(
