@@ -353,7 +353,7 @@ impl State {
         self.dir.join("worker-links.json")
     }
     pub fn memory_path(&self) -> PathBuf {
-        self.dir.join("memory.json")
+        ox_memory::store_path_for(&self.dir)
     }
     fn create_invite(
         &mut self,

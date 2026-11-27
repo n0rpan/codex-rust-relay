@@ -177,7 +177,7 @@ pub fn sync_all_peers(
     local_host_id: &str,
 ) -> io::Result<Vec<(String, Result<MergeStats, String>)>> {
     let links = crate::paired_hosts::worker_links(&state_dir.join("worker-links.json"))?;
-    let memory_path = state_dir.join("memory.json");
+    let memory_path = ox_memory::store_path_for(state_dir);
     let cursors_path = state_dir.join("memory-sync-cursors.json");
     let mut cursors: SyncCursors = std::fs::read_to_string(&cursors_path)
         .ok()

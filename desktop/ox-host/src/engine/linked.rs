@@ -186,6 +186,7 @@ impl Engine {
             Operation::Start {
                 results,
                 memory_brief,
+                memory_brief_sensitivity,
                 parent,
                 level,
                 start,
@@ -255,10 +256,14 @@ impl Engine {
                     job: r.job,
                 };
                 let mut accepted = self.accept_launch(&caller, *start.clone())?;
-                if let Some(brief) = memory_brief
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
+                let receiver_cap = ox_desk_core::memory::route_sensitivity_ceiling(&start.route());
+                let brief_sensitivity =
+                    memory_brief_sensitivity.unwrap_or(ox_memory::Sensitivity::Private);
+                if brief_sensitivity <= receiver_cap
+                    && let Some(brief) = memory_brief
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
                 {
                     let capped: String =
                         brief.chars().take(ox_memory::DEFAULT_BRIEF_CHARS).collect();
