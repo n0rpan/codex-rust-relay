@@ -350,14 +350,19 @@ jobs:
         run: |
           set -euo pipefail
           found=0
-          for directory in "$RUNNER_TEMP"/packaged/ox-desktop-macos-*; do
-            runner="${directory##*/ox-desktop-}"
-            archive=("$directory"/ox-desktop-macos-*.zip)
-            (cd "$directory" && shasum -a 256 --check "${archive[0]##*/}.sha256")
-            desktop/ci/macos-notarize.sh "${archive[0]}" "$RUNNER_TEMP/signed/$runner"
+          # One matching artifact is unpacked straight into the path, several
+          # into a directory each, so find the archives wherever they landed.
+          while IFS= read -r archive; do
+            case "${archive##*/}" in
+              ox-desktop-macos-arm64.zip) runner=macos-26 ;;
+              ox-desktop-macos-x86_64.zip) runner=macos-26-intel ;;
+              *) echo "::error::unexpected archive ${archive##*/}"; exit 1 ;;
+            esac
+            (cd "${archive%/*}" && shasum -a 256 --check "${archive##*/}.sha256")
+            desktop/ci/macos-notarize.sh "$archive" "$RUNNER_TEMP/signed/$runner"
             echo "${runner}=true" >> "$GITHUB_OUTPUT"
             found=$((found + 1))
-          done
+          done < <(find "$RUNNER_TEMP/packaged" -name 'ox-desktop-macos-*.zip' | sort)
           [ "$found" -gt 0 ] || { echo "::error::no packaged macOS archive to sign"; exit 1; }
       - name: Remove the signing keychain
         if: always()
