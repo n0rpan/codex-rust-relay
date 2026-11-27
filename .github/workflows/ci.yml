@@ -21,6 +21,10 @@ on:
     tags: ["v*"]
   pull_request:
     types: [opened, reopened, synchronize, labeled, unlabeled]
+  # The merge queue tests main plus the queued pull requests with the same
+  # lanes a pull request gets, so a branch need not be brought up to date by
+  # hand. `OX merge check` is the one required status for both.
+  merge_group:
   workflow_dispatch:
   schedule:
     - cron: "27 6 * * *"
@@ -61,17 +65,32 @@ jobs:
       RUN_NUMBER: ${{ github.run_number }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
         with:
           fetch-depth: 2
           persist-credentials: false
       - name: Select tests for the proposed merge commit
         id: scope
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
         env:
           FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+          # A queue entry is compared with the commit it was built on.
+          SCOPE_BASE: ${{ github.event.merge_group.base_sha }}
         run: |
+          if [ -n "${SCOPE_BASE}" ]; then git fetch --no-tags --depth=1 origin "${SCOPE_BASE}"; fi
           python3 desktop/ci/pr_scope.py
+      # A guard against a mistaken tag, not a security boundary: who may create
+      # v* tags is set by the repository's tag ruleset.
+      - name: Require a release tag to point at a commit on main
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${GITHUB_SHA}" --jq .status)"
+          # identical: main's head. behind: an earlier commit of main.
+          if [ "${status}" != identical ] && [ "${status}" != behind ]; then
+            echo "::error::${REF_NAME} points at a commit that is not on main (${status})"
+            exit 1
+          fi
       - name: Resolve the version and channel
         id: resolve
         run: |
@@ -117,7 +136,7 @@ jobs:
           # of type hosted"), which turned the PR red for nothing. macOS builds
           # run for main, tags and manual runs, and the nightly OX Desktop run
           # builds the same ox binary on macos-26 inside its package.
-          if [ "${EVENT}" = pull_request ]; then
+          if [ "${EVENT}" = pull_request ] || [ "${EVENT}" = merge_group ]; then
             echo 'platforms=[{"platform":"linux-x86_64","runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","file_type":"x86-64","macos_deployment_target":""}]' >> "${GITHUB_OUTPUT}"
           else
             echo 'platforms=[{"platform":"linux-x86_64","runner":"ubuntu-24.04","target":"x86_64-unknown-linux-gnu","file_type":"x86-64","macos_deployment_target":""},{"platform":"linux-aarch64","runner":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","file_type":"aarch64","macos_deployment_target":""},{"platform":"macos-x86_64","runner":"macos-26-intel","target":"x86_64-apple-darwin","file_type":"x86_64","macos_deployment_target":"11.0"},{"platform":"macos-aarch64","runner":"macos-26","target":"aarch64-apple-darwin","file_type":"arm64","macos_deployment_target":"11.0"}]' >> "${GITHUB_OUTPUT}"
@@ -585,7 +604,9 @@ jobs:
     name: Sign and notarize the macOS ox binaries
     # Release runs: main, tags and manual runs. The release job holds no
     # secrets because it compiles third-party crates; only this job enters the
-    # apple-release environment, which is limited to main and v* tags.
+    # apple-release environment. Which refs may enter it is that environment's
+    # deployment rule in the repository settings (main and v* tags), not
+    # anything in this file.
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: [version, release]
     runs-on: macos-26
@@ -679,7 +700,7 @@ jobs:
   focused:
     name: Desktop application tests (${{ matrix.runner }})
     needs: version
-    if: github.event_name == 'pull_request' && needs.version.outputs.focused != '[]'
+    if: (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.version.outputs.focused != '[]'
     strategy:
       fail-fast: false
       matrix:
@@ -745,13 +766,18 @@ jobs:
       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
       needs.version.outputs.packages == 'true'
     uses: ./.github/workflows/desktop.yml
+    # A called workflow sees no secrets unless the caller hands them over, and
+    # that includes the secrets of an environment one of its jobs enters.
+    # Without this, sign-macos ran in apple-release with empty secrets. Only
+    # that job names any secret; the package jobs still receive none.
+    secrets: inherit
     with:
       build_version: ${{ needs.version.outputs.version }}
       pr_macos: ${{ needs.version.outputs.mac_package == 'true' }}
 
   merge:
     name: OX merge check
-    if: ${{ always() && github.event_name == 'pull_request' }}
+    if: ${{ always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
     needs: [version, fast, verify, release, native, focused, desktop-release]
     runs-on: ubuntu-24.04
     timeout-minutes: 2

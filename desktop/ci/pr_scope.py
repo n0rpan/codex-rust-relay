@@ -59,7 +59,7 @@ def lanes(paths, full_ci):
 
 if __name__ == "__main__":
     raw = subprocess.check_output(["git", "diff", "--no-renames", "--name-only", "-z",
-                                   "HEAD^1", "HEAD", "--"])
+                                   os.environ.get("SCOPE_BASE") or "HEAD^1", "HEAD", "--"])
     paths = [os.fsdecode(p) for p in raw.split(b"\0") if p]
     flags = lanes(paths, os.environ.get("FULL_CI") == "true")
     with Path(os.environ["GITHUB_OUTPUT"]).open("a") as out:

@@ -20,6 +20,7 @@ mod desktop;
 #[path = "update_preferences.rs"]
 mod preferences;
 use preferences::Channel;
+mod signing;
 mod standalone;
 
 const REPOSITORY: &str = "oxstack/ox";
@@ -719,6 +720,11 @@ async fn install(
 fn replace_cli(stage: &Path, installation: &Installation) -> Result<(), RelayError> {
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // Every path that replaces the CLI ends here: staged background updates,
+    // a direct `ox update` and a channel switch.
+    if cfg!(target_os = "macos") {
+        signing::require(signing::running_release(), "The downloaded ox", &[stage])?;
+    }
     let executable = &installation.path;
     let metadata = installation.file.metadata()?;
     let file = File::open(stage)?;

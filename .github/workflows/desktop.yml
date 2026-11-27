@@ -5,7 +5,7 @@ name: OX Desktop
 # check and stock-client protocol fixtures) is fast.yml and runs before merge.
 #
 # When this workflow runs, once per change:
-#   - pull request: ci.yml requests packaged tests for packaging and window-test
+#   - pull request and merge queue: ci.yml requests packaged tests for packaging and window-test
 #     changes or the full-ci label. Changes to macOS packaging also run on macOS.
 #   - push to main and v* tags: called by ci.yml (job desktop-release) with the
 #     release version, all four legs. That call is the only main/tag run, so the
@@ -20,8 +20,10 @@ name: OX Desktop
 # run with `sign`) the sign-macos job signs the tested bundles again with
 # Developer ID, has Apple notarize them and staples the ticket. Only that job
 # enters the apple-release environment, which holds the certificate and the
-# App Store Connect API key and is limited to main and v* tags. The signed
-# archives are the ones clean-account installs and the release publishes.
+# App Store Connect API key. Which refs may enter it is that environment's
+# deployment rule in the repository settings (main and v* tags); a manual run
+# with `sign` works only on a ref that rule admits. The signed archives are
+# the ones clean-account installs and the release publishes.
 #
 # Flake rule: a window test that fails intermittently is quarantined, not
 # retried and not deleted. Add it to desktop/ci/quarantine.toml with the
@@ -73,7 +75,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: >-
-          ${{ fromJSON(github.event_name == 'pull_request' && (inputs.pr_macos && '["ubuntu-24.04","macos-26"]' || '["ubuntu-24.04"]') ||
+          ${{ fromJSON(contains(fromJSON('["pull_request","merge_group"]'), github.event_name) && (inputs.pr_macos && '["ubuntu-24.04","macos-26"]' || '["ubuntu-24.04"]') ||
           (inputs.build_version || inputs.intel) && '["ubuntu-24.04","ubuntu-24.04-arm","macos-26","macos-26-intel"]' ||
           '["ubuntu-24.04","ubuntu-24.04-arm","macos-26"]') }}
     runs-on: ${{ matrix.runner }}
@@ -309,7 +311,7 @@ jobs:
       # would fill the repository's cache quota and evict main's, and every run
       # restores from main.
       - name: Cache native dependency build
-        if: "!cancelled() && github.event_name != 'pull_request' && steps.deps.outputs.cache-hit != 'true' && steps.deps.outputs.cache-primary-key != ''"
+        if: "!cancelled() && github.event_name != 'pull_request' && github.event_name != 'merge_group' && steps.deps.outputs.cache-hit != 'true' && steps.deps.outputs.cache-primary-key != ''"
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -328,7 +330,7 @@ jobs:
     # Release runs called by ci.yml on main and tags, or a manual run with `sign`.
     if: >-
       ${{ !cancelled() && needs.package.result == 'success' &&
-      github.event_name != 'pull_request' && github.event_name != 'schedule' &&
+      github.event_name != 'pull_request' && github.event_name != 'merge_group' && github.event_name != 'schedule' &&
       (inputs.build_version || inputs.sign) }}
     runs-on: macos-26
     environment: apple-release
@@ -394,7 +396,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(github.event_name == 'pull_request' && (inputs.pr_macos && '["ubuntu-24.04","macos-26"]' || '["ubuntu-24.04"]') || '["ubuntu-24.04","macos-26"]') }}
+        runner: ${{ fromJSON(contains(fromJSON('["pull_request","merge_group"]'), github.event_name) && (inputs.pr_macos && '["ubuntu-24.04","macos-26"]' || '["ubuntu-24.04"]') || '["ubuntu-24.04","macos-26"]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
