@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """A stock stdio peer for the host worker launch and relaunch tests."""
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -23,12 +24,17 @@ if "--session-id" in args:
     project = str(Path.cwd().resolve())
     directory = Path("native/projects") / re.sub("[^A-Za-z0-9]", "-", project)
     directory.mkdir(parents=True, exist_ok=True)
-    with (directory / f"{session}.jsonl").open("w") as journal:
+    # A fork launch is logged under its source's id and writes that journal again.
+    # Stock Claude Code only appends, so replace the file in one step: a store that
+    # lists sessions at that moment must not find the journal empty.
+    draft = directory / f"{session}.{os.getpid()}.draft"
+    with draft.open("w") as journal:
         for kind, suffix, content in (("user", "01", "hi"), ("assistant", "02", [{"type": "text", "text": "ok"}])):
             uuid = "00000000-0000-4000-8000-0000000000" + suffix
             row = {"type": kind, "uuid": uuid, "cwd": project, "sessionId": session, "entrypoint": "sdk-cli",
                    "message": {"role": kind, "id": uuid, "content": content}}
             journal.write(json.dumps(row) + "\n")
+    draft.replace(directory / f"{session}.jsonl")
 
 def finish(text):
     answer = {"type": "assistant", "uuid": f"a-{session}", "session_id": session, "parent_tool_use_id": None,
