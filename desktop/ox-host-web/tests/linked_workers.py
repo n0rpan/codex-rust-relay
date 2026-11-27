@@ -192,19 +192,27 @@ def parent_restart(root, project, target, tls_env, restart_target):
             env[name] = env[name.lower()] = "http://127.0.0.1:1"
         env["NO_PROXY"] = env["no_proxy"] = "127.0.0.1,localhost"
         (package / "codex").symlink_to(Path(os.environ["CODEOX_TEST_CODEX_BIN"]).resolve())
+        # The worker can finish before its checkout reaches the parent. Exercise that
+        # response deterministically by holding the actual result download across restart.
+        hold_result = receiver / "hold-result"
+        hold_result.touch()
         start(second)
 
         def finished():
             v = control(job, "status")
             if "error" in v and v["error"]:
                 raise AssertionError(v)
-            return (
-                v["result"]
-                if v["result"]["status"] == "completed" and "result" in v["result"]
-                else None
-            )
+            view = v["result"]
+            if view["status"] != "completed" or "result" not in view:
+                return None
+            if view.get("worker_changes_pending"):
+                hold_result.unlink(missing_ok=True)
+                return None
+            assert "worker_changes" in view, view
+            return view
 
         final = wait(finished, 45)
+        assert not hold_result.exists(), "Expected a completed worker with changes pending"
         assert "uncommitted on laptop" in final["result"], final
         assert final["worker_host"]["id"] == peer["id"]
         assert final["snapshot_commit"]

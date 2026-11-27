@@ -66,6 +66,8 @@ def receiver(d, stack):
     name = "build.fixture.ts.net"
     origin = f"https://{name}:{port}"
     def job_fault(first, body):
+        if first.startswith(b"GET /api/worker-result ") and (root / "hold-result").exists():
+            return b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         if not first.startswith(b"POST /api/worker-job "):
             return None
         job=json.loads(json.loads(body)["request"])
