@@ -79,6 +79,18 @@ jobs:
         run: |
           if [ -n "${SCOPE_BASE}" ]; then git fetch --no-tags --depth=1 origin "${SCOPE_BASE}"; fi
           python3 desktop/ci/pr_scope.py
+      # A guard against a mistaken tag, not a security boundary: who may create
+      # v* tags is set by the repository's tag ruleset.
+      - name: Require a release tag to point at a commit on main
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          status="$(gh api "repos/${GITHUB_REPOSITORY}/compare/main...${GITHUB_SHA}" --jq .status)"
+          # identical: main's head. behind: an earlier commit of main.
+          if [ "${status}" != identical ] && [ "${status}" != behind ]; then
+            echo "::error::${REF_NAME} points at a commit that is not on main (${status})"
+            exit 1
+          fi
       - name: Resolve the version and channel
         id: resolve
         run: |
