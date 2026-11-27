@@ -21,7 +21,7 @@ Each rule has one automated test. Run them with `cargo test --manifest-path desk
 - A way to reach the host from outside the tailnet: the phone on cellular with Tailscale turned off works.
 - Remote access is enabled in OX Desktop, Settings, Remote access, and the phone is paired and has notifications turned on.
 
-Below, `HOST` is the host's MagicDNS name, for example `work.tail1234.ts.net`, and `TSIP` is its tailnet IPv4 address from `tailscale ip -4`. OX uses HTTPS port 8443 on the tailnet and port 48162 on loopback.
+Below, `HOST` is the host's MagicDNS name, for example `work.tail1234.ts.net`, and `TSIP` is its tailnet IPv4 address from `tailscale ip -4`. By default, OX uses HTTPS port 8443 on the tailnet and port 48162 on loopback (`ox host pair --port <port> --listen-port <port>` overrides them when a port is already taken).
 
 Record before starting:
 

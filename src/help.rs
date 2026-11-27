@@ -218,7 +218,7 @@ Checks and next steps
   ox doctor               Check files, providers and saved accounts. It prints
                           home: and a next: line with the command to run.
   ox doctor --fix         Repair what ox can repair; files are backed up first.
-  ox host pair            Pair a desktop or phone over your tailnet.
+  ox host pair [--port N] Pair a desktop or phone over your tailnet (default HTTPS port 8443).
   ox host pair --worker-host  Create an invitation for a worker host.
   ox host pair --terminal Include terminal access for the device that pairs.
   ox host name [NAME]     Show or change the name shown on paired devices.

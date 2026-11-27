@@ -95,6 +95,8 @@ struct Disk {
     #[serde(default)]
     last_origin: Option<String>,
     port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    https_port: Option<u16>,
     devices: HashMap<String, Registered>,
     vapid: Option<String>,
 }
@@ -240,7 +242,24 @@ impl State {
     pub fn configuration(&self) -> Option<(String, u16)> {
         Some((self.disk.origin.clone()?, self.disk.port))
     }
+    pub fn https_port(&self) -> Option<u16> {
+        self.disk
+            .origin
+            .as_deref()
+            .and_then(crate::serve::https_port)
+            .or(self.disk.https_port)
+            .or_else(|| {
+                self.disk
+                    .last_origin
+                    .as_deref()
+                    .and_then(crate::serve::https_port)
+            })
+    }
     pub fn set_origin(&mut self, origin: Option<String>, port: u16) -> io::Result<()> {
+        let https_port = origin
+            .as_deref()
+            .and_then(crate::serve::https_port)
+            .or_else(|| self.https_port());
         if origin != self.disk.origin || origin.is_none() {
             self.update(|d| {
                 if let Some(next) = &origin {
@@ -253,12 +272,16 @@ impl State {
                 }
                 d.origin = origin;
                 d.port = port;
+                d.https_port = https_port;
             })?;
             self.invites.clear();
             self.challenges.clear();
             self.signal();
-        } else if port != self.disk.port {
-            self.update(|d| d.port = port)?
+        } else if port != self.disk.port || https_port != self.disk.https_port {
+            self.update(|d| {
+                d.port = port;
+                d.https_port = https_port;
+            })?
         }
         Ok(())
     }
@@ -307,6 +330,7 @@ impl State {
             enabled: self.disk.origin.is_some(),
             origin: self.disk.origin.clone(),
             port: self.disk.port,
+            https_port: self.https_port(),
             devices,
             pairing,
             reservation: None,
@@ -1204,5 +1228,15 @@ mod tests {
             origin("https://machine.tail.ts.net:8443/").as_deref(),
             Some("https://machine.tail.ts.net:8443")
         );
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("state");
+        let mut s = State::load(&root).unwrap();
+        s.set_origin(Some("https://machine.tail.ts.net:9443".into()), 49100)
+            .unwrap();
+        assert_eq!(s.reply(None).https_port, Some(9443));
+        assert_eq!(s.reply(None).port, 49100);
+        s.set_origin(None, 0).unwrap();
+        let reloaded = State::load(&root).unwrap();
+        assert_eq!(reloaded.reply(None).https_port, Some(9443));
     }
 }

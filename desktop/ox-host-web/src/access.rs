@@ -15,16 +15,44 @@ use std::{
     time::{Duration, Instant},
 };
 
-const PORT: u16 = 48162;
-const PROXY: &str = "http://127.0.0.1:48162";
-const HTTPS: &str = "8443";
+pub const DEFAULT_LOOPBACK_PORT: u16 = 48162;
+pub const DEFAULT_HTTPS_PORT: u16 = 8443;
+const PORT: u16 = DEFAULT_LOOPBACK_PORT;
+
+pub fn validate_ports(
+    https: Option<u16>,
+    loopback: Option<u16>,
+) -> Result<(Option<u16>, Option<u16>), String> {
+    if let Some(p) = https
+        && !crate::serve::valid_https_port(p)
+    {
+        return Err("--port takes an HTTPS port from 1024 to 65535.".into());
+    }
+    if let Some(p) = loopback
+        && !crate::serve::valid_https_port(p)
+    {
+        return Err("--listen-port takes a loopback port from 1024 to 65535.".into());
+    }
+    if let (Some(h), Some(l)) = (https, loopback)
+        && h == l
+    {
+        return Err("Choose different ports for Tailscale HTTPS (--port) and the local listener (--listen-port).".into());
+    }
+    Ok((https, loopback))
+}
 
 #[derive(Clone)]
 pub enum Operation {
     Status,
     Enable,
+    EnableOn {
+        https_port: Option<u16>,
+        loopback_port: Option<u16>,
+    },
     Disable,
-    Pair { terminal: bool },
+    Pair {
+        terminal: bool,
+    },
     PairWorker,
     Revoke(String),
     TerminalGrant(String, bool),
@@ -38,6 +66,8 @@ pub struct Report {
 pub struct Node {
     pub origin: String,
     pub login: String,
+    pub https_port: u16,
+    pub loopback_port: u16,
     state: Config,
 }
 use crate::serve::Config;
@@ -48,14 +78,15 @@ impl Node {
     pub fn available(&self) -> bool {
         matches!(self.state, Config::Owned | Config::Free)
     }
-    pub fn reason(&self) -> Option<&'static str> {
+    pub fn reason(&self) -> Option<String> {
+        let port = self.https_port;
         match self.state {
-            Config::Public => Some(
-                "Funnel is enabled on HTTPS port 8443. Remove public sharing on that port in Tailscale before enabling OX.",
-            ),
-            Config::Conflict => Some(
-                "HTTPS port 8443 already serves another application. Free that port in Tailscale to enable OX.",
-            ),
+            Config::Public => Some(format!(
+                "Funnel is enabled on HTTPS port {port}. Remove public sharing on that port in Tailscale (`tailscale funnel --https={port} off`) or pick another port with `ox host pair --port <port>` before enabling OX."
+            )),
+            Config::Conflict => Some(format!(
+                "HTTPS port {port} already serves another application. Run `ox host pair --port <port>` to use another port, or free port {port} in Tailscale (`tailscale serve --https={port} off`)."
+            )),
             _ => None,
         }
     }
@@ -64,20 +95,45 @@ impl Node {
 /// Enabling stops here, with the reason, when Serve status shows the OX port is
 /// published through Funnel or taken by another application.
 fn admit(node: &Node) -> Result<(), String> {
-    node.reason().map_or(Ok(()), |reason| Err(reason.into()))
+    node.reason().map_or(Ok(()), Err)
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum ServeChange {
-    Enable,
-    Disable,
+    Enable { https_port: u16, loopback_port: u16 },
+    Disable { https_port: u16 },
 }
 
 impl ServeChange {
-    fn args(self) -> &'static [&'static str] {
+    fn args(self) -> Vec<String> {
         match self {
-            Self::Enable => &["serve", "--bg", "--https=8443", PROXY],
-            Self::Disable => &["serve", "--https=8443", "off"],
+            Self::Enable {
+                https_port,
+                loopback_port,
+            } => vec![
+                "serve".into(),
+                "--bg".into(),
+                format!("--https={https_port}"),
+                format!("http://127.0.0.1:{loopback_port}"),
+            ],
+            Self::Disable { https_port } => {
+                vec![
+                    "serve".into(),
+                    format!("--https={https_port}"),
+                    "off".into(),
+                ]
+            }
+        }
+    }
+    fn https_port(self) -> u16 {
+        match self {
+            Self::Enable { https_port, .. } | Self::Disable { https_port } => https_port,
+        }
+    }
+    fn loopback_port(self) -> u16 {
+        match self {
+            Self::Enable { loopback_port, .. } => loopback_port,
+            Self::Disable { .. } => PORT,
         }
     }
 }
@@ -122,38 +178,38 @@ impl PermissionHelp {
         })
     }
     pub fn pending_removal(&self) -> bool {
-        self.change == ServeChange::Disable && self.expected_enabled
+        matches!(self.change, ServeChange::Disable { .. }) && self.expected_enabled
     }
     pub fn suggested(&self) -> String {
         format!("sudo tailscale {}", self.change.args().join(" "))
     }
     pub fn args(&self) -> Vec<OsString> {
-        std::iter::once("tailscale")
-            .chain(self.change.args().iter().copied())
+        std::iter::once("tailscale".to_owned())
+            .chain(self.change.args())
             .map(OsString::from)
             .collect()
     }
     fn check_mapping(&self, expected: Config) -> Result<(), String> {
-        let node = inspect()?;
+        let node = inspect_ports(self.change.https_port(), self.change.loopback_port())?;
         if node.origin != self.origin || node.login != self.login || node.state != expected {
-            return Err(node
-                .reason()
-                .unwrap_or("The Tailscale account or Serve mapping changed. Refresh Remote access.")
-                .into());
+            return Err(node.reason().unwrap_or_else(|| {
+                "The Tailscale account or Serve mapping changed. Refresh Remote access.".into()
+            }));
         }
         Ok(())
     }
     pub fn prepare(&self) -> Result<admin::Reservation, String> {
         let paths = &self.paths;
         match self.change {
-            ServeChange::Enable => {
+            ServeChange::Enable { loopback_port, .. } => {
                 self.check_mapping(Config::Free)?;
-                let lease = admin::Reservation::bind(&paths.state_dir, self.origin.clone(), PORT)
-                    .map_err(|e| e.to_string())?;
+                let lease =
+                    admin::Reservation::bind(&paths.state_dir, self.origin.clone(), loopback_port)
+                        .map_err(|e| e.to_string())?;
                 self.check_mapping(Config::Free)?;
                 Ok(lease)
             }
-            ServeChange::Disable => {
+            ServeChange::Disable { .. } => {
                 self.check_mapping(Config::Owned)?;
                 let lease = admin::Reservation::removal(
                     &paths.state_dir,
@@ -175,8 +231,8 @@ impl PermissionHelp {
             match status {
                 Some(0) => {
                     self.check_mapping(match self.change {
-                        ServeChange::Enable => Config::Owned,
-                        ServeChange::Disable => Config::Free,
+                        ServeChange::Enable { .. } => Config::Owned,
+                        ServeChange::Disable { .. } => Config::Free,
                     })?;
                     lease
                         .ok_or("The host reservation expired. Refresh Remote access.")?
@@ -264,8 +320,13 @@ fn output(args: &[&str]) -> Result<Vec<u8>, String> {
     }
     Ok(stdout)
 }
-fn configuration(v: &Value, authority: &str) -> Config {
-    crate::serve::configuration(v, authority, HTTPS, PROXY)
+fn configuration(v: &Value, authority: &str, https_port: u16, loopback_port: u16) -> Config {
+    crate::serve::configuration(
+        v,
+        authority,
+        &https_port.to_string(),
+        &format!("http://127.0.0.1:{loopback_port}"),
+    )
 }
 /// A browser can select a new key recipient without someone at the source console.
 #[cfg(feature = "server")]
@@ -300,7 +361,7 @@ pub(crate) fn verify_key_destination(origin: &str, login: &str) -> Result<(), &'
     }
 }
 
-fn inspect() -> Result<Node, String> {
+fn inspect_ports(https_port: u16, loopback_port: u16) -> Result<Node, String> {
     let v: Value = serde_json::from_slice(&output(&["status", "--json", "--peers=false"])?)
         .map_err(|_| "Tailscale returned an unreadable status.")?;
     if v["BackendState"] != "Running" {
@@ -327,14 +388,16 @@ fn inspect() -> Result<Node, String> {
         .filter(|s| !s.is_empty())
         .ok_or("Sign in to Tailscale under a user account to pair a device.")?
         .to_owned();
-    let authority = format!("{dns}:{HTTPS}");
+    let authority = format!("{dns}:{https_port}");
     let raw = output(&["serve", "status", "--json"])?;
     let v: Value = serde_json::from_slice(&raw)
         .map_err(|_| "Tailscale returned an unreadable Serve configuration.")?;
     Ok(Node {
         origin: format!("https://{authority}"),
         login,
-        state: configuration(&v, &authority),
+        https_port,
+        loopback_port,
+        state: configuration(&v, &authority, https_port, loopback_port),
     })
 }
 pub fn status(paths: &ox_host_service::Paths) -> Result<Reply, String> {
@@ -360,8 +423,23 @@ pub fn status(paths: &ox_host_service::Paths) -> Result<Reply, String> {
 }
 pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, String> {
     let request = |r: Request| admin::request(&paths.state_dir, &r).map_err(|e| e.to_string());
-    let mut network = inspect();
-    let prior = status(paths)?;
+    let mut prior = status(paths)?;
+    let (requested_https, requested_loopback) = match &op {
+        Operation::EnableOn {
+            https_port,
+            loopback_port,
+        } => validate_ports(*https_port, *loopback_port)?,
+        _ => (None, None),
+    };
+    let https_port = requested_https
+        .or(prior.https_port)
+        .or_else(|| prior.origin.as_deref().and_then(crate::serve::https_port))
+        .unwrap_or(DEFAULT_HTTPS_PORT);
+    let loopback_port = requested_loopback
+        .or_else(|| (prior.port != 0).then_some(prior.port))
+        .unwrap_or(DEFAULT_LOOPBACK_PORT);
+    validate_ports(Some(https_port), Some(loopback_port))?;
+    let mut network = inspect_ports(https_port, loopback_port);
     let mut denied = None;
     let host = match op {
         Operation::Status => prior,
@@ -379,22 +457,51 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
                 request(Request::WorkerInvitation { login })?
             }
         }
-        Operation::Enable => {
+        Operation::Enable | Operation::EnableOn { .. } => {
             let node = network.as_ref().map_err(Clone::clone)?;
             admit(node)?;
+            if prior.enabled
+                && (prior.origin.as_ref() != Some(&node.origin) || prior.port != loopback_port)
+            {
+                if let Some(old_https) = prior
+                    .https_port
+                    .or_else(|| prior.origin.as_deref().and_then(crate::serve::https_port))
+                    && old_https != https_port
+                {
+                    let old_loopback = if prior.port != 0 { prior.port } else { PORT };
+                    if let Ok(old_node) = inspect_ports(old_https, old_loopback)
+                        && old_node.ready()
+                    {
+                        let args = ServeChange::Disable {
+                            https_port: old_https,
+                        }
+                        .args();
+                        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                        let _ = output(&refs);
+                    }
+                }
+                prior = request(Request::Disable)?;
+            }
             if node.ready() {
                 request(Request::Enable {
                     origin: node.origin.clone(),
-                    port: PORT,
+                    port: loopback_port,
                 })?
             } else {
                 // Retain exclusive ownership of the loopback port until the exact
                 // Serve mapping is verified, including across an interactive sudo prompt.
-                let lease = admin::Reservation::bind(&paths.state_dir, node.origin.clone(), PORT)
-                    .map_err(|e| e.to_string())?;
-                match output(ServeChange::Enable.args()) {
+                let lease =
+                    admin::Reservation::bind(&paths.state_dir, node.origin.clone(), loopback_port)
+                        .map_err(|e| e.to_string())?;
+                let change = ServeChange::Enable {
+                    https_port,
+                    loopback_port,
+                };
+                let args = change.args();
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                match output(&refs) {
                     Ok(_) => {
-                        let after = inspect()?;
+                        let after = inspect_ports(https_port, loopback_port)?;
                         if !after.ready()
                             || node.origin != after.origin
                             || node.login != after.login
@@ -407,7 +514,7 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
                     Err(e) => {
                         denied = Some(PermissionHelp::denied(
                             paths,
-                            ServeChange::Enable,
+                            change,
                             node,
                             prior.enabled,
                             e,
@@ -431,9 +538,12 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
                     prior.enabled,
                 )
                 .map_err(|e| e.to_string())?;
-                match output(ServeChange::Disable.args()) {
+                let change = ServeChange::Disable { https_port };
+                let args = change.args();
+                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                match output(&refs) {
                     Ok(_) => {
-                        let after = inspect()?;
+                        let after = inspect_ports(https_port, loopback_port)?;
                         if after.state != Config::Free
                             || after.origin != node.origin
                             || after.login != node.login
@@ -448,7 +558,7 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
                     Err(e) => {
                         denied = Some(PermissionHelp::denied(
                             paths,
-                            ServeChange::Disable,
+                            change,
                             node,
                             prior.enabled,
                             e,
@@ -470,8 +580,12 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
 }
 #[cfg(test)]
 mod tests {
-    use super::{Config, Node, PROXY, admit, configuration};
+    use super::{
+        Config, DEFAULT_HTTPS_PORT, DEFAULT_LOOPBACK_PORT, Node, admit, configuration,
+        validate_ports,
+    };
     use serde_json::{Value, json};
+    const PROXY: &str = "http://127.0.0.1:48162";
     #[test]
     fn funnel_in_serve_status_fixture_refuses_remote_access() {
         let cases: Value = serde_json::from_str(include_str!(
@@ -482,7 +596,14 @@ mod tests {
         let node = |case: &str| Node {
             origin: format!("https://{authority}"),
             login: "me@example.test".into(),
-            state: configuration(&cases[case], authority),
+            https_port: DEFAULT_HTTPS_PORT,
+            loopback_port: DEFAULT_LOOPBACK_PORT,
+            state: configuration(
+                &cases[case],
+                authority,
+                DEFAULT_HTTPS_PORT,
+                DEFAULT_LOOPBACK_PORT,
+            ),
         };
         let private = node("private");
         assert!(private.ready());
@@ -503,28 +624,36 @@ mod tests {
         let key = "work.tail.ts.net:8443";
         let owned =
             json!({"TCP":{"8443":{"HTTPS":true}},"Web":{(key):{"Handlers":{"/":{"Proxy":PROXY}}}}});
-        assert_eq!(configuration(&json!({}), key), Config::Free);
-        assert_eq!(configuration(&owned, key), Config::Owned);
+        let cfg = |v: &Value| configuration(v, key, DEFAULT_HTTPS_PORT, DEFAULT_LOOPBACK_PORT);
+        assert_eq!(cfg(&json!({})), Config::Free);
+        assert_eq!(cfg(&owned), Config::Owned);
         let mut other = owned.clone();
         other["Web"][key]["Handlers"]["/"]["Proxy"] = "http://localhost:9999".into();
-        assert_eq!(configuration(&other, key), Config::Conflict);
+        assert_eq!(cfg(&other), Config::Conflict);
         let mut public = owned.clone();
         public["AllowFunnel"][key] = true.into();
-        assert_eq!(configuration(&public, key), Config::Public);
+        assert_eq!(cfg(&public), Config::Public);
         assert_eq!(
-            configuration(&json!({"Foreground":{"transient":public}}), key),
+            cfg(&json!({"Foreground":{"transient":public}})),
             Config::Public
         );
         assert_eq!(
-            configuration(&json!({"Foreground":{"transient":owned}}), key),
+            cfg(&json!({"Foreground":{"transient":owned}})),
             Config::Conflict
         );
         assert_eq!(
-            configuration(
-                &json!({"AllowFunnel":{"unrelated:443":true},"TCP":{"443":{"HTTPS":true}}}),
-                key
-            ),
+            cfg(&json!({"AllowFunnel":{"unrelated:443":true},"TCP":{"443":{"HTTPS":true}}})),
             Config::Free
         );
+        let custom_key = "work.tail.ts.net:9443";
+        let custom_owned = json!({"TCP":{"9443":{"HTTPS":true}},"Web":{(custom_key):{"Handlers":{"/":{"Proxy":"http://127.0.0.1:49000"}}}}});
+        assert_eq!(
+            configuration(&custom_owned, custom_key, 9443, 49000),
+            Config::Owned
+        );
+        assert!(validate_ports(Some(9443), Some(49000)).is_ok());
+        assert!(validate_ports(Some(443), None).is_err());
+        assert!(validate_ports(None, Some(80)).is_err());
+        assert!(validate_ports(Some(8443), Some(8443)).is_err());
     }
 }

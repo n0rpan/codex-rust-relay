@@ -1,10 +1,11 @@
 use crate::appearance::Step;
 use crate::{
     appearance::Palette,
-    kit::button,
+    kit::{button, field, input},
     platform::remote::{self, Operation, Report},
 };
 use gpui::{prelude::*, *};
+use gpui_component::input::InputState;
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -22,6 +23,7 @@ pub(super) struct Remote {
     expiry: Option<Task<()>>,
     /// Device whose terminal grant awaits a second click.
     confirm_grant: Option<String>,
+    port_field: Option<Entity<InputState>>,
 }
 impl Remote {
     pub fn new(project: PathBuf, cx: &mut Context<Self>) -> Self {
@@ -34,9 +36,37 @@ impl Remote {
             qr: None,
             expiry: None,
             confirm_grant: None,
+            port_field: None,
         };
         view.submit(Operation::Status, cx);
         view
+    }
+    fn enable(&mut self, cx: &mut Context<Self>) {
+        if let Some(field) = &self.port_field {
+            let text = field.read(cx).value();
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                let Ok(port) = trimmed.parse::<u16>() else {
+                    self.message = Some("Enter a Tailscale HTTPS port from 1024 to 65535.".into());
+                    cx.notify();
+                    return;
+                };
+                if !ox_host_web::serve::valid_https_port(port) {
+                    self.message = Some("Enter a Tailscale HTTPS port from 1024 to 65535.".into());
+                    cx.notify();
+                    return;
+                }
+                self.submit(
+                    Operation::EnableOn {
+                        https_port: Some(port),
+                        loopback_port: None,
+                    },
+                    cx,
+                );
+                return;
+            }
+        }
+        self.submit(Operation::Enable, cx);
     }
     fn submit(&mut self, op: Operation, cx: &mut Context<Self>) {
         self.perform(move || remote::run(op), cx);
@@ -164,7 +194,7 @@ impl Remote {
     }
 }
 impl Render for Remote {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::get(cx);
         let mut view = div()
             .flex()
@@ -248,14 +278,51 @@ impl Render for Remote {
                         Operation::Pair { terminal: false },
                         cx,
                     ));
-                } else if node.available() {
-                    buttons = buttons.child(self.action(
-                        p,
-                        "remote-enable",
-                        "Enable Tailscale Serve",
-                        Operation::Enable,
-                        cx,
-                    ));
+                } else {
+                    let port_input = self
+                        .port_field
+                        .get_or_insert_with(|| {
+                            let initial =
+                                if node.https_port == ox_host_web::access::DEFAULT_HTTPS_PORT {
+                                    String::new()
+                                } else {
+                                    node.https_port.to_string()
+                                };
+                            let entity = field(&initial, "HTTPS port (default 8443)", false, w, cx);
+                            cx.subscribe(
+                                &entity,
+                                |_, _, _: &gpui_component::input::InputEvent, cx| cx.notify(),
+                            )
+                            .detach();
+                            entity
+                        })
+                        .clone();
+                    let has_override = !port_input.read(cx).value().trim().is_empty();
+                    if !node.available() || has_override {
+                        view = view.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .text_size(p.text(Step::Ui))
+                                        .text_color(rgb(p.muted))
+                                        .child("Tailscale HTTPS port"),
+                                )
+                                .child(div().w(px(220.)).child(input(&port_input))),
+                        );
+                    }
+                    if node.available() || has_override {
+                        buttons = buttons.child(button(
+                            p,
+                            "remote-enable",
+                            "Enable Tailscale Serve",
+                            false,
+                            !self.busy,
+                            cx.listener(|s, _, _, cx| s.enable(cx)),
+                        ));
+                    }
                 }
             } else if let Err(msg) = &report.access.network {
                 view = view.child(msg.clone());

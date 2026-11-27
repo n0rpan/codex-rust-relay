@@ -16,10 +16,6 @@ use std::{
 };
 
 const GATE: &str = include_str!("../../gate.toml");
-/// Tailscale Serve exposes OX on this HTTPS port and proxies to the host's
-/// loopback listener (desktop/ox-desktop/src/platform/remote.rs).
-const SERVE_PORT: &str = "8443";
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Level {
     Ok,
@@ -56,6 +52,10 @@ impl Report {
 pub(crate) fn run(paths: &Paths, args: &[String]) -> io::Result<()> {
     let errors = match args {
         [] => 10,
+        [flag] if matches!(flag.as_str(), "-h" | "--help") => {
+            println!("Usage: ox host doctor [--errors N]");
+            return Ok(());
+        }
         [flag, n] if flag == "--errors" => n
             .parse()
             .map_err(|_| io::Error::other("--errors takes a number"))?,
@@ -215,10 +215,11 @@ impl Tailscale {
 /// What Tailscale Serve does with OX's HTTPS port, judged by the same rules
 /// as the desktop's Remote access setup.
 pub(crate) fn serve_state(v: &Value, authority: &str, port: u16) -> Config {
+    let https_port = authority.rsplit_once(':').map(|(_, p)| p).unwrap_or("8443");
     ox_host_web::serve::configuration(
         v,
         authority,
-        SERVE_PORT,
+        https_port,
         &format!("http://127.0.0.1:{port}"),
     )
 }
@@ -268,6 +269,10 @@ fn remote(paths: &Paths, report: &mut Report, tailscale: &Tailscale) {
     }
     let origin = status.origin.clone().unwrap_or_default();
     let authority = origin.trim_start_matches("https://").to_owned();
+    let https_port = status
+        .https_port
+        .or_else(|| ox_host_web::serve::https_port(&origin))
+        .unwrap_or(ox_host_web::access::DEFAULT_HTTPS_PORT);
     match tailscale.json(&["serve", "status", "--json"]) {
         Err(e) => report.add(
             Level::Fail,
@@ -281,19 +286,19 @@ fn remote(paths: &Paths, report: &mut Report, tailscale: &Tailscale) {
             Config::Public => report.add(
                 Level::Fail,
                 format!(
-                    "remote access: Funnel exposes port {SERVE_PORT} to the internet. OX refuses public access; run `tailscale funnel {SERVE_PORT} off`."
+                    "remote access: Funnel exposes port {https_port} to the internet. OX refuses public access; run `tailscale funnel --https={https_port} off`."
                 ),
             ),
             Config::Free => report.add(
                 Level::Fail,
                 format!(
-                    "remote access: on for {origin}, but Tailscale Serve is off. Turn Remote access off and on in Desktop settings."
+                    "remote access: on for {origin}, but Tailscale Serve is off. Run `ox host pair` or turn Remote access off and on in Desktop settings."
                 ),
             ),
             Config::Conflict => report.add(
                 Level::Fail,
                 format!(
-                    "remote access: Tailscale Serve port {SERVE_PORT} does not route {origin} to the host. Turn Remote access off and on in Desktop settings."
+                    "remote access: Tailscale Serve port {https_port} does not route {origin} to the host. Run `ox host pair --port <port>` to use another port, or turn Remote access off and on in Desktop settings."
                 ),
             ),
         },
@@ -490,6 +495,12 @@ mod tests {
         assert_eq!(serve_state(&funnel, authority, 48162), Config::Public);
         let foreground = json!({"Foreground": {"session": funnel}});
         assert_eq!(serve_state(&foreground, authority, 48162), Config::Public);
+        let custom_authority = "box.tail.ts.net:9443";
+        let custom_routed = json!({"TCP":{"9443":{"HTTPS":true}},"Web":{custom_authority:{"Handlers":{"/":{"Proxy":"http://127.0.0.1:49000"}}}}});
+        assert_eq!(
+            serve_state(&custom_routed, custom_authority, 49000),
+            Config::Owned
+        );
     }
 
     #[test]
