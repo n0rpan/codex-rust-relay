@@ -15,7 +15,7 @@ def lanes(paths, full_ci):
     window_tests = (
         "desktop/gate.toml", "desktop/ci/linux-deps.sh", "desktop/ci/apt_archives.py", "desktop/ci/test_apt_archives.py",
         "desktop/ci/browser-runtime.sh",
-        "desktop/ci/*protocol.sh", "desktop/ci/quarantine.*", "desktop/ci/wayland-smoke.sh",
+        "desktop/ci/*protocol.sh", "desktop/ci/test-bin.sh", "desktop/ci/quarantine.*", "desktop/ci/wayland-smoke.sh",
         "desktop/ox-desk-probe/*", "desktop/tests/*_window.py", "desktop/tests/packaged-window*",
         "desktop/tests/probe_input.py", "desktop/tests/stock_*.py", "desktop/tests/gtk_drop.py",
         "desktop/tests/claude_stock_session.py",

@@ -89,6 +89,10 @@ you call it done.
 - **Any failed job on `main` loses the release for every platform.**
   `publish-dev` needs every job. `retry-main.yml` re-runs failed jobs once;
   it does not make an intermittent test acceptable.
+- **`cargo test -p one-package` is not a slice of `--workspace`.** Cargo
+  resolves features for the packages it is asked for, so the narrower build
+  compiles the shared crates and the test again. The package job builds every
+  test once; its scripts get executables from `desktop/ci/test-bin.sh`.
 - **Tests that share a binary share a process.** A test that depends on a
   file descriptor being closed can be broken by a sibling test that spawns a
   child at the same moment.

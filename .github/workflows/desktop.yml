@@ -142,8 +142,22 @@ jobs:
           fi
       # fmt, the contract check and clippy run in the fast lane, which gates
       # every push and every release. Tests run again here in release mode.
+      #
+      # This job compiles three times and no more: every test of the workspace
+      # (here), what ships together with the probe tools (package.sh), and the
+      # ox relay, which is a separate workspace. The scripts below take their
+      # test executables from OX_TEST_ARTIFACTS (desktop/ci/test-bin.sh)
+      # instead of asking cargo for one package at a time, which resolves
+      # features differently and compiled the same crates again.
+      - name: Build every desktop test once
+        run: |
+          cargo test --workspace --locked --release --manifest-path desktop/Cargo.toml --no-run \
+            --message-format=json-render-diagnostics > "$RUNNER_TEMP/desktop-tests.json"
+          echo "OX_TEST_ARTIFACTS=$RUNNER_TEMP/desktop-tests.json" >> "$GITHUB_ENV"
       - run: cargo test --workspace --locked --release --manifest-path desktop/Cargo.toml
-      - run: desktop/package.sh
+      # The shipped binaries are a build of their own: the test build above
+      # turns on test-only features (ox-host-web's fixture transport).
+      - run: desktop/package.sh -p ox-desk-probe
       - name: Exercise gateway service lifecycle with the packaged host
         run: python3 desktop/tests/host_service.py desktop/target/release/ox desktop/target/release/ox-host
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -154,9 +168,7 @@ jobs:
           compression-level: 0
       - name: Package matching performance tools
         id: probe
-        run: |
-          cargo build --locked --release --manifest-path desktop/Cargo.toml -p ox-desk-probe --bins
-          tar -czf "$RUNNER_TEMP/desktop-probe.tar.gz" -C desktop/target/release ox-desk-probe fake-app-server fake-claude
+        run: tar -czf "$RUNNER_TEMP/desktop-probe.tar.gz" -C desktop/target/release ox-desk-probe fake-app-server fake-claude
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: probe-${{ matrix.runner }}
