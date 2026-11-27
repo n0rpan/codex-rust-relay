@@ -43,8 +43,11 @@ const DUMMY_KEY: &str = "dummy-alpha-key";
 /// from wedging the suite.
 const TEST_DEADLINE: Duration = Duration::from_secs(5);
 /// How long the upstream read timeout (injected into the relay client) gets to
-/// fire. Kept short so the stall tests finish quickly.
-const STALL_TIMEOUT: Duration = Duration::from_millis(250);
+/// fire. It also bounds the wait for the vendor's response headers, and the
+/// relay, the vendor and the client share this test's one thread: when that
+/// thread is not scheduled for this long the relay answers 502 before the
+/// stall starts. On a loaded four-core machine the headers took up to 0.94 s.
+const STALL_TIMEOUT: Duration = Duration::from_secs(2);
 /// The whole point of the disconnect tests: releasing the upstream request
 /// must take about as long as one downstream write, not linger for the vendor.
 const RELEASE_DEADLINE: Duration = Duration::from_secs(3);
