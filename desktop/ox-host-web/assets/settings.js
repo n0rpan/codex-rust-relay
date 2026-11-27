@@ -250,7 +250,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
           : back === remote
             ? "← Remote access"
           : back === credentials
-            ? "← Credentials"
+            ? "← API keys"
             : back === keyDestinations
               ? "← Destinations"
             : back === providers
@@ -365,29 +365,77 @@ export function setupSettings({ request, open, close, notifications, login }) {
   }
   function menu() {
     screen("Settings", close);
-    const choices = snapshot
+    const groups = snapshot
       ? [
-          ["Accounts", accounts],
-          ["Providers & models", providers],
-          ["Credentials", credentials],
-          ["Favorites", favorites],
-          ["Web search", search],
-          ["Advanced configuration", advanced],
+          [
+            "Models & accounts",
+            [
+              ["Accounts", "ChatGPT, Claude Code & agent start modes", accounts],
+              ["Starred models", "Browse catalog, star & reorder models", favorites],
+              ["Providers & models", "API endpoints & static models", providers],
+              ["API keys", "Manage & copy provider credentials", credentials],
+              ["Web search", "Brave Search for Codex & Claude", search],
+              ...(snapshot.legacy
+                ? [["Legacy Codex provider", "Edit legacy connection", legacy]]
+                : []),
+            ],
+          ],
         ]
       : [];
-    if (snapshot?.legacy)
-      choices.splice(5, 0, ["Legacy Codex provider", legacy]);
-    choices.push(
-      ["Remote access", remote],
-      ["Host updates", hostUpdates],
-      ["Install & notifications", phone],
-      ["Phone appearance & input", () => behaviorForm(true)],
-      ["Desktop appearance & input", () => behaviorForm(false)],
+    groups.push(
+      [
+        "This phone",
+        [
+          [
+            "Phone appearance & input",
+            "Theme, text size, Enter key & motion",
+            () => behaviorForm(true),
+          ],
+          [
+            "Install & notifications",
+            "Home Screen app & session alerts",
+            phone,
+          ],
+        ],
+      ],
+      [
+        "Host & remote",
+        [
+          [
+            "Remote access",
+            "Pair devices, mode policy & worker links",
+            remote,
+          ],
+          [
+            "Desktop appearance & input",
+            "Host theme, text size & weather",
+            () => behaviorForm(false),
+          ],
+          ["Host updates", "Release channel & automatic updates", hostUpdates],
+          ...(snapshot
+            ? [
+                [
+                  "Advanced configuration",
+                  "Edit codeox.toml & favorites as text",
+                  advanced,
+                ],
+              ]
+            : []),
+        ],
+      ],
     );
     const nav = node("nav", undefined, "phone-settings-menu");
     nav.setAttribute("aria-label", "Settings sections");
-    for (const [label, destination] of choices)
-      nav.append(action(label, destination));
+    for (const [heading, items] of groups) {
+      const sec = node("div", undefined, "phone-settings-group");
+      sec.append(node("h2", heading, "phone-settings-group-title"));
+      for (const [label, desc, destination] of items) {
+        const btn = action(label, destination);
+        btn.dataset.subtitle = desc;
+        sec.append(btn);
+      }
+      nav.append(sec);
+    }
     body.append(
       nav,
       action("Refresh host settings", () => load(), "quiet"),
@@ -812,7 +860,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
     );
   }
   function credentials() {
-    screen("Credentials");
+    screen("API keys");
     body.append(action("Copy keys to another host…", keyDestinations));
     if (!snapshot.credentials.length)
       body.append(
@@ -871,10 +919,34 @@ export function setupSettings({ request, open, close, notifications, login }) {
     }
   }
   function favorites() {
-    screen("Starred models");
+    const id = screen("Starred models");
+    body.append(
+      node(
+        "p",
+        "Starred models appear first in model pickers; any available model can still be used.",
+      ),
+    );
     const ordered = [...snapshot.favorites];
+    let catalogModels = [
+      ...new Set([...snapshot.favorites, ...snapshot.models]),
+    ];
     const list = node("ol", undefined, "phone-favorites");
+    const catalogBox = node("div", undefined, "phone-available-models");
+    const datalist = node("datalist");
+    datalist.id = "phone-known-models";
+    const form = node("form");
+    const input = textField(
+      form,
+      "Filter catalog or enter model alias",
+      "alias",
+    );
+    input.placeholder = "Search provider/model…";
+    input.setAttribute("list", datalist.id);
+    input.required = true;
     function draw() {
+      datalist.replaceChildren(
+        ...catalogModels.map((m) => new Option(m, m)),
+      );
       list.replaceChildren(
         ...ordered.map((model, i) => {
           const li = node("li"),
@@ -902,22 +974,78 @@ export function setupSettings({ request, open, close, notifications, login }) {
           return li;
         }),
       );
+      drawCatalog();
     }
+    function drawCatalog() {
+      const needle = input.value.trim().toLowerCase();
+      const unstarred = catalogModels.filter(
+        (m) =>
+          !ordered.includes(m) &&
+          (!needle || m.toLowerCase().includes(needle)),
+      );
+      if (!unstarred.length) {
+        catalogBox.replaceChildren(
+          node(
+            "p",
+            catalogModels.length
+              ? needle
+                ? "No unstarred models match your filter. Tap Add to favorites to star this custom alias."
+                : "All discovered models are starred."
+              : "No models discovered yet. Tap Refresh catalog or type an alias above.",
+          ),
+        );
+        return;
+      }
+      const byProvider = new Map();
+      for (const m of unstarred) {
+        const prov = m.includes("/") ? m.split("/")[0] : "Models";
+        const group = byProvider.get(prov) ?? [];
+        group.push(m);
+        byProvider.set(prov, group);
+      }
+      const frag = document.createDocumentFragment();
+      for (const [prov, models] of byProvider) {
+        const groupEl = node("div", undefined, "phone-model-provider-group");
+        groupEl.append(
+          node("h3", `${prov} (${models.length})`, "phone-model-provider-title"),
+        );
+        for (const alias of models.slice(0, 60)) {
+          const btn = button(`＋  ${alias}`, () => {
+            if (!ordered.includes(alias)) ordered.push(alias);
+            draw();
+          });
+          btn.className = "phone-star-candidate";
+          btn.dataset.modelAlias = alias;
+          groupEl.append(btn);
+        }
+        frag.append(groupEl);
+      }
+      catalogBox.replaceChildren(frag);
+    }
+    input.addEventListener("input", drawCatalog);
     draw();
-    const form = node("form"),
-      datalist = node("datalist");
-    datalist.id = "phone-known-models";
-    datalist.append(...snapshot.models.map((id) => new Option(id, id)));
-    const input = textField(form, "Model alias", "alias");
-    input.setAttribute("list", datalist.id);
-    input.required = true;
     submit(form, "Add to favorites", () => {
       const alias = input.value.trim();
       if (!alias) throw Error("Enter a model alias.");
       if (!ordered.includes(alias)) ordered.push(alias);
+      if (!catalogModels.includes(alias)) catalogModels.push(alias);
       input.value = "";
       draw();
     });
+    async function discoverCatalog() {
+      const found = await readPage(id, { action: "models" });
+      if (!found || !Array.isArray(found)) return;
+      catalogModels = [
+        ...new Set([...catalogModels, ...found.filter(Boolean)]),
+      ];
+      snapshot.models = catalogModels;
+      draw();
+    }
+    const catalogHeader = node("div", undefined, "phone-catalog-header");
+    catalogHeader.append(
+      node("h2", "Available models"),
+      action("Refresh catalog", discoverCatalog, "quiet"),
+    );
     body.append(
       list,
       datalist,
@@ -932,10 +1060,13 @@ export function setupSettings({ request, open, close, notifications, login }) {
           ),
         "primary",
       ),
+      catalogHeader,
+      catalogBox,
     );
+    void discoverCatalog();
   }
   function search() {
-    screen("Search");
+    screen("Web search");
     if (!snapshot.registry) {
       body.append(node("p", "The provider registry is unavailable."));
       return;

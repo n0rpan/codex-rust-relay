@@ -129,7 +129,7 @@ def exercise(js, wait, invite, saved, receiver_state, source):
             return response;
         };""")
     js("document.getElementById('open-phone-settings').click()")
-    go("Credentials")
+    go("API keys")
     go("Copy keys to another host…")
     wait(lambda: js("return !!document.querySelector('#settings input[name=destination]')"))
     field = "document.querySelector('#settings input[name=destination]').value=arguments[0]"

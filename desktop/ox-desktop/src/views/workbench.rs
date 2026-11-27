@@ -36,20 +36,20 @@ fn plain_status(message: &str) -> String {
     }
 }
 
-fn current_activity(store: &Store) -> Option<(activity::Scene, u64)> {
+fn current_activity(store: &Store) -> Option<(activity::Scene, u64, Option<String>)> {
     use activity::Scene;
-    use ox_desk_core::transcript::Row;
+    use ox_desk_core::transcript::{Row, item::Item};
     let id = store.selected()?;
     if store
         .asks()
         .iter()
         .any(|ask| ask.thread.as_deref() == Some(id))
     {
-        return Some((Scene::Waiting, 0));
+        return Some((Scene::Waiting, 0, None));
     }
     let transcript = store.transcript(id)?;
     if transcript.is_loading() {
-        return Some((Scene::Loading, 0));
+        return Some((Scene::Loading, 0, None));
     }
     let active = transcript.active_turn()?;
     let tail = transcript
@@ -64,9 +64,20 @@ fn current_activity(store: &Store) -> Option<(activity::Scene, u64)> {
     let item = key
         .filter(|key| key.turn == active)
         .and_then(|key| transcript.entry(key));
+    let detail = item
+        .and_then(|entry| match &entry.item {
+            Item::Reasoning { summary } => summary
+                .last()
+                .and_then(|s| s.lines().next())
+                .map(|s| s.trim().to_owned()),
+            Item::UserMessage { .. } | Item::AgentMessage { .. } | Item::Plan { .. } => None,
+            other => Some(super::transcript::cards::summary(other)),
+        })
+        .filter(|s| !s.is_empty());
     Some((
         Scene::for_item(item.map(|entry| &entry.item)),
         activity::seed(id, active),
+        detail,
     ))
 }
 
@@ -905,7 +916,7 @@ impl Workbench {
         .detach();
     }
     /// What the activity slot shows: the live scene, or the finale of a turn that just ended.
-    fn activity_scene(&mut self) -> Option<(activity::Scene, u64)> {
+    fn activity_scene(&mut self) -> Option<(activity::Scene, u64, Option<String>)> {
         use activity::Scene;
         let store = self.store.as_ref()?;
         let id = store.selected();
@@ -940,7 +951,7 @@ impl Workbench {
         {
             self.finale = None;
         }
-        current_activity(store).or(self.finale.as_ref().map(|(_, scene)| (*scene, 0)))
+        current_activity(store).or(self.finale.as_ref().map(|(_, scene)| (*scene, 0, None)))
     }
     pub(super) fn set_front(&mut self, front: bool, cx: &mut Context<Self>) {
         if !front {
@@ -1044,13 +1055,15 @@ impl Workbench {
         let seen = self.front && window.is_visible();
         let animate = p.motion && seen && window.is_window_active();
         // A finale plays once even with motion off: it is a still that leaves on one timer.
-        if let Some((scene, seed)) =
-            live.filter(|(scene, _)| animate || (seen && scene.one_shot().is_some()))
+        if let Some((scene, seed, _)) = live
+            .as_ref()
+            .filter(|(scene, _, _)| animate || (seen && scene.one_shot().is_some()))
         {
             if self.runner.as_ref().is_none_or(|r| {
                 let r = r.read(cx);
-                (r.scene, r.seed) != (scene, seed)
+                (r.scene, r.seed) != (*scene, *seed)
             }) {
+                let (scene, seed) = (*scene, *seed);
                 let runner = cx.new(|_| activity::Runner::new(scene, seed));
                 self.finale_watch = scene.one_shot().map(|_| {
                     cx.subscribe(&runner, |s, _, _: &activity::Finished, cx| {
@@ -1065,18 +1078,23 @@ impl Workbench {
             self.runner = None;
         }
         let activity_status = live
-            .filter(|(scene, _)| *scene != activity::Scene::Loading)
-            .map(|(scene, seed)| {
+            .filter(|(scene, _, _)| *scene != activity::Scene::Loading)
+            .map(|(scene, seed, detail)| {
                 let icon = self
                     .runner
                     .as_ref()
                     .map(|r| r.clone().into_any_element())
                     .unwrap_or_else(|| scene.still(p, seed));
+                let text = match detail {
+                    Some(d) => format!("{} · {d}", scene.label()),
+                    None => scene.label().to_owned(),
+                };
                 row()
                     .gap_2()
                     .py_1()
+                    .min_w_0()
                     .child(icon)
-                    .child(crate::kit::small(p, scene.label()))
+                    .child(crate::kit::small(p, text).min_w_0().truncate())
             });
         let ready = self.launch_error.is_none()
             && !self.connecting

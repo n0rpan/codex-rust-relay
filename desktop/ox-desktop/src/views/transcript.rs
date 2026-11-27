@@ -1,5 +1,5 @@
 use crate::appearance::Step;
-mod cards;
+pub(super) mod cards;
 mod tools;
 use super::workbench::Workbench;
 use crate::{

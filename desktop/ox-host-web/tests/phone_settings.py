@@ -42,7 +42,7 @@ def exercise(js, wait):
     assert provider["models"][0]["id"]["value"] == "model-one"
     assert provider["fields"]["discovery"] == {"type": "bool", "value": False}
     go("← Settings")
-    go("Credentials")
+    go("API keys")
     canary = "isolated-form-entry-for-remote-credentials"
     js("""const f=[...document.querySelectorAll('#settings form')].find(f=>f.querySelector('h2')?.textContent==='PHONE_UI_TEST_KEY');
           f.querySelector('input').value=arguments[0]; f.requestSubmit();""", canary)
@@ -52,9 +52,10 @@ def exercise(js, wait):
     assert canary not in json.dumps(snapshot) and js("""return !document.querySelector('#settings').textContent.includes(arguments[0]) &&
         !JSON.stringify(localStorage).includes(arguments[0]) && !JSON.stringify(sessionStorage).includes(arguments[0])""", canary)
     go("← Settings")
-    go("Favorites")
-    fill("alias", "phone-ui/model-one")
-    go("Add to favorites")
+    go("Starred models")
+    wait(lambda: js("return !!document.querySelector('#settings button[data-model-alias=\"phone-ui/model-one\"]')"))
+    js("document.querySelector('#settings button[data-model-alias=\"phone-ui/model-one\"]').click()")
+    assert js("return [...document.querySelectorAll('.phone-favorites li span')].some(s=>s.textContent==='phone-ui/model-one')")
     go("Save favorites")
     saved()
     assert "phone-ui/model-one" in settings({"action": "read_rows"})["favorites"]
