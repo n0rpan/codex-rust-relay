@@ -618,6 +618,8 @@ impl State {
     ) -> Option<crate::admin::PendingPair> {
         let Enrollment { class, source } = registration.into();
         let window = self.window.as_ref().filter(|w| w.expires > now())?;
+        // Abandoned requests must not keep the window full forever.
+        self.pending.retain(|_, p| p.expires > now());
         if window
             .login
             .as_deref()
@@ -630,7 +632,6 @@ impl State {
         {
             return None;
         }
-        self.pending.retain(|_, p| p.expires > now());
         if self.pending.len() >= PENDING_MAX {
             return None;
         }
@@ -1298,6 +1299,27 @@ mod tests {
         let late = s
             .request_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
             .unwrap();
+        // Requests abandoned by devices expire long before the window does,
+        // and eight of them must not keep it full.
+        at(start + PENDING_TTL + 1);
+        for _ in 0..PENDING_MAX {
+            s.request_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+                .unwrap();
+        }
+        assert!(
+            s.request_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+                .is_none(),
+            "the queue is full until the stale ones expire"
+        );
+        at(start + 3 * PENDING_TTL);
+        // The window from `start` has expired too; a fresh one must not
+        // inherit the abandoned queue.
+        s.open_window(None).unwrap();
+        assert!(
+            s.request_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+                .is_some(),
+            "expired requests must not block the window"
+        );
         at(start + 10 * PAIR_TTL);
         assert!(s.window().is_none());
         assert!(matches!(s.poll_window(&late.id), PollState::Unknown));

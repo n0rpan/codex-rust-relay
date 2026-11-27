@@ -83,6 +83,7 @@ export async function settingsRequest(key, operation) {
   const proof = await signedOperation(key, "settings", request);
   const transfer = [
     "add_worker_link",
+    "add_worker_link_window",
     "link_paired_host",
     "remove_worker_link",
     "pair_key_destination",

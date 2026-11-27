@@ -389,7 +389,9 @@ pub(crate) async fn register_window(
         let id = request["request"]
             .as_str()
             .ok_or_else(|| io::Error::other("The host did not name the pairing request"))?;
-        let until = std::time::Instant::now() + Duration::from_secs(120);
+        // The phone and the desktop both wrap this in a one-minute settings
+        // request, so wait inside that rather than outliving the caller.
+        let until = std::time::Instant::now() + Duration::from_secs(50);
         loop {
             let response = http
                 .post(format!("{origin}/api/pair/window/poll"))
@@ -535,6 +537,7 @@ impl PairedClient {
         let timeout = match action["action"].as_str() {
             Some(
                 "add_worker_link"
+                | "add_worker_link_window"
                 | "link_paired_host"
                 | "remove_worker_link"
                 | "pair_key_destination"
