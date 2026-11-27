@@ -508,7 +508,7 @@ impl State {
         let (message, worker) = match source {
             Some(source) => (
                 format!("{code}.host.{source}"),
-                Some(self.worker_grant_for(source)?),
+                Some(self.worker_grant_for(login, source)?),
             ),
             None => (code.to_owned(), None),
         };
@@ -591,7 +591,7 @@ impl State {
             return None;
         }
         let worker = match source {
-            Some(source) => Some(self.worker_grant_for(source)?),
+            Some(source) => Some(self.worker_grant_for(login, source)?),
             None => None,
         };
         let token = self.register(login, key, label, class, false, worker)?;
@@ -605,7 +605,7 @@ impl State {
     }
     /// The grant a worker link starts with, narrowed by what the receiver
     /// already allows this source host.
-    fn worker_grant_for(&self, source: &str) -> Option<crate::admin::WorkerGrant> {
+    fn worker_grant_for(&self, login: &str, source: &str) -> Option<crate::admin::WorkerGrant> {
         if !crate::paired_hosts::valid_id(source)
             || self.host_id().ok()?.eq_ignore_ascii_case(source)
         {
@@ -620,11 +620,15 @@ impl State {
             ceiling: ox_desk_core::modes::Level::Yolo,
         };
         // A replacement key keeps restrictions the receiver already set for
-        // this source, even while the new key is still being persisted.
+        // this source and this Tailscale login, even while the new key is
+        // still being persisted. A different login starts from the defaults,
+        // so it can never inherit a grant, such as memory sync, that the
+        // receiver gave to someone else.
         for prior in self
             .disk
             .devices
             .values()
+            .filter(|r| r.device.login == login)
             .filter_map(|r| r.device.worker.as_ref())
             .filter(|w| w.source == grant.source)
         {
@@ -1187,6 +1191,63 @@ mod tests {
         s.set_origin(Some("https://other.fixture.ts.net".into()), 8443)
             .unwrap();
         assert!(s.window().is_none());
+    }
+    #[test]
+    fn a_worker_grant_is_inherited_only_by_the_same_login() {
+        use ox_desk_core::modes::Level;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("host-id"),
+            "b302b350-a07d-435d-bb7b-b675156681db",
+        )
+        .unwrap();
+        let mut s = State::load(dir.path()).unwrap();
+        s.set_origin(Some("https://lab.fixture.ts.net".into()), 8443)
+            .unwrap();
+        let key = SigningKey::random(&mut OsRng);
+        let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
+        let source = "74b2c731-b9f0-4b05-8672-3c42062b190a";
+        s.open_window(None).unwrap();
+        let link = s
+            .pair_window(
+                "alice@example.test",
+                &public,
+                "Alice's laptop",
+                Enrollment {
+                    class: DeviceClass::Host,
+                    source: Some(source),
+                },
+            )
+            .unwrap();
+        let id = s.identity("alice@example.test", &link).unwrap();
+        // The receiver narrows the link and then grants memory sync.
+        s.update(|d| {
+            let grant = d
+                .devices
+                .get_mut(&id)
+                .unwrap()
+                .device
+                .worker
+                .as_mut()
+                .unwrap();
+            grant.may_launch = false;
+            grant.may_sync_memory = true;
+            grant.ceiling = Level::Read;
+        })
+        .unwrap();
+        let alice = s.worker_grant_for("alice@example.test", source).unwrap();
+        assert!(!alice.may_launch && alice.may_sync_memory);
+        assert_eq!(alice.ceiling, Level::Read);
+        // Another Tailscale login may claim the same source UUID, and must not
+        // inherit a grant given to Alice, least of all memory sync.
+        let bob = s.worker_grant_for("bob@example.test", source).unwrap();
+        assert!(bob.may_launch && !bob.may_sync_memory);
+        assert_eq!(bob.ceiling, Level::Yolo);
     }
     #[test]
     fn worker_links_keep_their_own_role_and_grant_through_restart_and_repair() {
