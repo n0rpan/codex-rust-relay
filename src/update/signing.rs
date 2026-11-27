@@ -4,6 +4,7 @@
 //! signature accepts only updates that carry it too, so a replaced download
 //! and checksum cannot install code from anyone else. Local, pull request and
 //! nightly builds are signed ad hoc and keep accepting ad hoc packages.
+//! `OX_ALLOW_UNSIGNED=1` turns the rule off for whoever wants another build.
 use super::*;
 
 /// Developer ID issued by Apple to the OX release team, as a code requirement.
@@ -25,13 +26,22 @@ pub(super) fn running_release() -> bool {
 /// Refuse `code` unless every item has the release identity, when the
 /// installation being updated has it. `what` names the update in the refusal.
 pub(super) fn require(release: bool, what: &str, code: &[&Path]) -> Result<(), RelayError> {
-    if release && !code.iter().all(|item| satisfies(item)) {
+    if release && !allowed_unsigned() && !code.iter().all(|item| satisfies(item)) {
         return Err(format!(
-            "{what} is not signed by the OX release identity. The update was not installed."
+            "{what} is not signed by the OX release identity. The update was not installed. \
+             To install it anyway, set {ALLOW_UNSIGNED}=1."
         )
         .into());
     }
     Ok(())
+}
+
+/// The owner of the machine decides: with this set, a signed installation
+/// accepts any build, for example a local or pull request build.
+const ALLOW_UNSIGNED: &str = "OX_ALLOW_UNSIGNED";
+
+fn allowed_unsigned() -> bool {
+    std::env::var_os(ALLOW_UNSIGNED).is_some_and(|value| value == "1")
 }
 
 #[cfg(test)]

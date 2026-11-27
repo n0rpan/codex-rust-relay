@@ -62,14 +62,16 @@ die() {
 # with it, so a replaced download and checksum cannot install anything else.
 # The installed CLI decides: desktop, host and CLI installations all have one,
 # and local, pull request and nightly builds are ad hoc and stay unrestricted.
+# --allow-unsigned (or OX_ALLOW_UNSIGNED=1) turns the rule off.
 release_identity='anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "ZN9XKLHU6J"'
 signed_release() {
     codesign --verify --strict -R="$release_identity" "$1" 2>/dev/null
 }
 require_release_identity() {
     [ "$(uname -s)" = Darwin ] || return 0
+    if [ "${OX_ALLOW_UNSIGNED:-}" = 1 ]; then return 0; fi
     if [ -e "$install_dir/ox" ] && signed_release "$install_dir/ox"; then
-        signed_release "$1" || die "this download is not signed by the OX release identity, unlike the installed ox."
+        signed_release "$1" || die "this download is not signed by the OX release identity, unlike the installed ox. To install it anyway, run the installer with --allow-unsigned."
     fi
 }
 
@@ -84,12 +86,14 @@ usage() {
     cat <<'EOF'
 Install ox on macOS or Linux.
 
-Usage: install.sh [--stable|--dev] [--desktop|--host]
+Usage: install.sh [--stable|--dev] [--desktop|--host] [--allow-unsigned]
 
   --host     Install the headless session host and CLI, with automatic idle updates
   --desktop  Include the native desktop application, session host and matching CLI
   --stable   Install the latest stable release (default)
   --dev      Install the rolling development pre-release
+  --allow-unsigned  macOS: install a build that is not signed by the OX release
+             identity over a signed installation (same as OX_ALLOW_UNSIGNED=1)
 
 Environment:
   OX_CHANNEL=stable|dev    Same as the flags
@@ -403,6 +407,7 @@ main() {
         case "$argument" in
             --desktop) desktop=1; explicit_kind=1; host_only=0 ;;
             --host) desktop=1; explicit_kind=1; host_only=1 ;;
+            --allow-unsigned) OX_ALLOW_UNSIGNED=1 ;;
             --dev) channel="dev" ;;
             --stable) channel="stable" ;;
             -h | --help)

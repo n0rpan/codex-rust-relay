@@ -20,8 +20,10 @@ name: OX Desktop
 # run with `sign`) the sign-macos job signs the tested bundles again with
 # Developer ID, has Apple notarize them and staples the ticket. Only that job
 # enters the apple-release environment, which holds the certificate and the
-# App Store Connect API key and is limited to main and v* tags. The signed
-# archives are the ones clean-account installs and the release publishes.
+# App Store Connect API key. Which refs may enter it is that environment's
+# deployment rule in the repository settings (main and v* tags); a manual run
+# with `sign` works only on a ref that rule admits. The signed archives are
+# the ones clean-account installs and the release publishes.
 #
 # Flake rule: a window test that fails intermittently is quarantined, not
 # retried and not deleted. Add it to desktop/ci/quarantine.toml with the

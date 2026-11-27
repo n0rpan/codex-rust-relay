@@ -604,7 +604,9 @@ jobs:
     name: Sign and notarize the macOS ox binaries
     # Release runs: main, tags and manual runs. The release job holds no
     # secrets because it compiles third-party crates; only this job enters the
-    # apple-release environment, which is limited to main and v* tags.
+    # apple-release environment. Which refs may enter it is that environment's
+    # deployment rule in the repository settings (main and v* tags), not
+    # anything in this file.
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: [version, release]
     runs-on: macos-26

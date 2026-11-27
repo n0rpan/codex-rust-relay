@@ -1,9 +1,9 @@
 name: Retry main
 
-# One failed leg on main blocks the dev release for every platform, and most
-# such failures are runner or network faults (an artifact upload, a runner
-# that never started). Re-run the failed jobs of a main build once. A second
-# failure stays red. The dev publisher already refuses to replace a newer
+# One failed leg on main blocks the dev release for every platform. Re-run the
+# failed jobs of a main build once, which recovers a runner or network fault
+# (an artifact upload, a runner that never started). It does not make an
+# intermittent test acceptable: that test gets a fix. A second failure stays red. The dev publisher already refuses to replace a newer
 # build, so a late re-run cannot move the release backwards.
 on:
   workflow_run:
@@ -27,4 +27,14 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
-        run: gh run rerun "${RUN_ID}" --repo "${GITHUB_REPOSITORY}" --failed
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          # A superseded build can no longer publish, so retrying it only
+          # spends an hour of runners.
+          head="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          if [ "${head}" != "${RUN_SHA}" ]; then
+            echo "::notice::main moved to ${head}; not retrying the build of ${RUN_SHA}"
+            exit 0
+          fi
+          gh run rerun "${RUN_ID}" --repo "${GITHUB_REPOSITORY}" --failed
