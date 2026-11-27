@@ -2,7 +2,7 @@
 
 Worktree `/home/oscar/Work/ox-multi-host`, branch `feat/multi-host`, based on `f44befe`. Oscar and the implementer will review the tradeoffs together before opening a PR.
 
-The seven milestones have Linux fixture coverage. The remaining acceptance run uses the physical laptop, Mac Studio and Linux host for pairing, macOS Keychain and alerts, concurrent sessions and Mac Studio placement. The Mac was offline at the last check. The multi-host PR is reserved for joint review.
+The seven milestones have Linux fixture coverage. The ARM64 Linux laptop and x86-64 Linux host have passed real tailnet pairing, selective credential transfer and worker recovery. The remaining three-machine run covers concurrent sessions and approvals, macOS Keychain and alerts, and Mac Studio placement. The Mac was offline at the last check. The multi-host PR is reserved for joint review.
 
 ## Decisions for review
 
@@ -19,17 +19,17 @@ The seven milestones have Linux fixture coverage. The remaining acceptance run u
 
 | Milestone | Evidence still needed |
 | --- | --- |
-| 1. Identity and first remote host | Real tailnet pairing and macOS credential storage on two physical machines. Linux native TLS fixtures cover remote PTYs and stock Codex/Claude turns through reconnect. Linux first-frame, signed gateway, attachment bytes and adjacent hello fixtures pass. |
+| 1. Identity and first remote host | Physical Linux-to-Linux pairing passed. macOS credential storage and reboot recovery remain. Linux native TLS fixtures cover remote PTYs and stock Codex/Claude turns through reconnect. Linux first-frame, signed gateway, attachment bytes and adjacent hello fixtures pass. |
 | 2. Multiple hosts | The grouped sidebar, fleet palette, shared-project chooser, host-keyed inbox, retained offline rows and client-only window have Linux fixture coverage. Physical simultaneous laptop, Mac Studio and Linux acceptance remains. |
 | 3. Host policy | Implemented on the host, desktop, web UI and CLI. Two real stock runtimes tested on Linux with fixture API routes. Multi-device hardware acceptance remains. |
 | 4. Resources | Host inventory, live load readings, CPU and memory ranking, and worker-sheet placement have Linux coverage. The desktop sidebar and worker sheet show these readings. The physical multi-machine fleet remains to verify. |
-| 5. Linked read workers | Two Linux hosts exercised enrollment, grant editing, dirty checkout transfer, stock Codex launch, control and recovery across restarts. Physical tailnet acceptance remains. |
+| 5. Linked read workers | Two Linux hosts exercised enrollment, grant editing, dirty checkout transfer, stock Codex launch, control and recovery across restarts. A physical ARM64 parent also recovered an x86-64 worker result over the tailnet after a parent process restart. Actual laptop sleep and wake remain. |
 | 6. Write results and placement | Linux coverage includes branch, ref and tailnet results, a sleeping parent, private return files, refused pushes, and ref retirement. The physical Mac Studio write-worker acceptance remains. |
 | 7. Conversation continuity | Two disposable Linux hosts exercised transfers in both directions, a differently named receiving clone, and stock Codex reading original history through two handoffs. Reads use the desktop that initiated each transfer. Physical acceptance and the decision on independent host-to-host history access remain. |
 
 ## Verification
 
-Verification entries below refer to the worktree above. Physical macOS/Linux and subscription sign-in scenarios are pending.
+Verification entries below refer to the worktree above. Physical macOS and live subscription sign-in scenarios are pending.
 
 - The CLI settings integration test sent a synthetic provider and Brave Search key between two isolated homes. It covers the active environment credential, atomic batch rejection, a changed destination revision, scope mismatch, and 0600 file permissions.
 - The Linux update smoke started the real host and CLI in a temporary managed package with a synthetic staged release. It verified the headless Automatic default, Dev/Stable selection, idle reservation, cancellation, and an in-place exec on the same PID with the old generation available for recovery. No production account, package, or service was used.
@@ -224,3 +224,11 @@ Verification entries below refer to the worktree above. Physical macOS/Linux and
 - On Wayland, the click selects the conversation. The compositor may leave OX on its original workspace. The Linux acceptance test checks the selected host and exact thread after returning to that workspace. Physical macOS notification delivery and activation remain on the acceptance list.
 - Claude Opus 5.5 reviewed this wave through OX on the subscription in jobs 1356357053090877 and 2899458625926594. Its findings led to loading personal preferences before connecting hosts, using one Linux session-bus connection for replaceable alerts, draining notification signals while a request is in flight, and checking the pairing again before navigating.
 - The desktop Rust suite, Clippy and protocol check passed. Two paired Linux engines exercised a burst of 128 D-Bus signals before the notification service replied. The alert appeared once and opened the expected Studio conversation. The complete fleet test also passed after switching hosts, restarting and going offline.
+
+### Physical Linux acceptance on the ARM64 laptop and x86-64 n0rpan
+
+- Tested commit `3a8fa8b` with isolated OX homes. The production native pairing client connected to n0rpan through its actual Tailscale Serve certificate and identity headers. The laptop web UI showed the credential-copy warning. Sending only the synthetic Brave Search key saved it on n0rpan with mode `0600`. The second provider key stayed on the laptop and the browser send request contained no key value.
+- n0rpan is a tagged Tailscale node. Direct invitation entry in the web UI requires an untagged peer with the same owner. The web UI can use an existing Desktop pairing for a tagged host. Port 8443 already served another application, so this run used a temporary Serve endpoint on 19443 and removed it afterward.
+- The laptop enrolled n0rpan as a worker, recognized its registered checkout and sent uncommitted and untracked inputs. Stock Codex on n0rpan used a local fixture model to read and edit the snapshot. The laptop's isolated OX process stopped mid-turn. n0rpan finished while it was down. After restart, the parent collected the result over the paired link, with the private input preserved and the original laptop checkout intact.
+- On n0rpan the library suite passed 41 tests with six ignored. Separate native and Chromium acceptance covered signed key import, reconnect, remote PTY, device revocation and update controls. A staged test release verified the automatic default, Dev/Stable selection, busy deferral, cancellation, at-idle process replacement and retention of the previous generation.
+- Claude Fable 5.2 reviewed the remaining acceptance gaps through OX on the subscription (job 2172108536860910). A disposable Mac runner can check signing, launchd restart and a temporary locked Keychain. A signed upgrade and unattended reboot with the real login Keychain, macOS notification permission and click-through, actual laptop suspend, phone Web Push, simultaneous three-host approvals and Mac Studio resource placement still need device-level acceptance.
