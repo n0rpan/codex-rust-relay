@@ -71,6 +71,10 @@ pub struct Workspace {
     page: Option<fleet::Page>,
     chooser: Option<projects::Chooser>,
     project_request: u64,
+    tree: fleet::tree::Expansion,
+    pub(crate) tree_cursor: Option<String>,
+    pub(crate) tree_focus: FocusHandle,
+    tree_scroll: UniformListScrollHandle,
     navigation_revision: u64,
     scoped_search: bool,
     searching: bool,
@@ -187,6 +191,10 @@ impl Workspace {
             inventory: Default::default(),
             chooser: None,
             project_request: 0,
+            tree: Default::default(),
+            tree_cursor: None,
+            tree_focus: cx.focus_handle(),
+            tree_scroll: Default::default(),
             navigation_revision: 0,
             scoped_search: false,
             searching: false,
@@ -285,6 +293,10 @@ impl Workspace {
             None => self.local.as_ref(),
         }
     }
+    pub(crate) fn session_host_name(&self, id: &Option<String>, cx: &App) -> Option<String> {
+        (self.inventory.contains_key(id) && self.inventory.keys().any(Option::is_some))
+            .then(|| self.host_name(id, cx))
+    }
     pub(crate) fn navigation_revision(&self) -> u64 {
         self.navigation_revision
     }
@@ -300,7 +312,12 @@ impl Workspace {
         self.searching = false;
         self.search_return = None;
         if self.active != id {
+            self.tree_cursor = None;
             crate::workspace_state::remember_host(id.clone());
+            if let Some(entry) = self.inventory.get(&id) {
+                self.tree.activate(entry.entity_id());
+            }
+            self.navigation_revision = self.navigation_revision.wrapping_add(1);
             self.active = id;
         }
     }
@@ -524,7 +541,47 @@ impl Render for Workspace {
             } else if let Some(host) = active {
                 view = view.child(div().relative().flex_1().min_h_0().child(host.clone()));
             } else {
-                view = view.child(kit::small(p, "Choose a host to open a project."));
+                let (rows, _) = self.tree_rows(&None, "", None, cx);
+                let ws = cx.weak_entity();
+                let keyboard = fleet::tree::Keyboard::new(
+                    &rows,
+                    self.tree_scroll.clone(),
+                    self.tree_focus.clone(),
+                    None,
+                );
+                keyboard.recover(self.tree_cursor.as_deref(), ws.clone(), None, window);
+                let width = px(300.).min(window.viewport_size().width);
+                view = view.child(
+                    kit::col()
+                        .w(width)
+                        .flex_1()
+                        .min_h_0()
+                        .bg(rgb(p.nav))
+                        .child(kit::small(p, "Choose a host to open a project."))
+                        .child(
+                            uniform_list(
+                                "client-hosts",
+                                rows.len(),
+                                cx.processor(move |s, range: std::ops::Range<usize>, _, _| {
+                                    range
+                                        .map(|i| {
+                                            rows[i].render(
+                                                &ws,
+                                                width,
+                                                p,
+                                                &keyboard,
+                                                i,
+                                                s.tree_cursor.as_deref(),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                }),
+                            )
+                            .track_scroll(&self.tree_scroll)
+                            .flex_1()
+                            .min_h_0(),
+                        ),
+                );
             }
             return view.into_any_element();
         }

@@ -1,4 +1,6 @@
 //! Live navigation metadata for a single host, including unopened sessions.
+mod cache;
+pub(crate) mod tree;
 use crate::platform::{CatalogEvent, CatalogWatch, HostLink};
 use gpui::*;
 use ox_desk_core::{
@@ -46,6 +48,11 @@ pub(super) struct Inventory {
     pub(super) directory: Option<ox_desk_core::host_protocol::ProjectDirectory>,
     projects: HashMap<Scope, Project>,
     saved: Library,
+    previous: Vec<(Scope, Option<String>, String)>,
+    received_catalog: bool,
+    complete_library: bool,
+    cache_scheduled: bool,
+    last_write: Option<Instant>,
     scan_requested: bool,
     scanning: bool,
     scan_started: Option<Instant>,
@@ -72,13 +79,27 @@ impl Inventory {
         match catalog.link.watch_catalog(true) {
             Ok((watch, events)) => {
                 catalog._watch = Some(watch);
+                let link = catalog.link.clone();
+                let restored = cx.background_spawn(async move { cache::Snapshot::read(&link) });
                 cx.spawn(async move |this, cx| {
+                    if let Some(snapshot) = restored.await {
+                        let _ = this.update(cx, |s, cx| {
+                            snapshot.restore(s);
+                            cx.notify();
+                        });
+                    }
                     while let Ok(first) = events.recv_async().await {
                         if this
                             .update(cx, |s, cx| {
+                                let was_online = s.online;
                                 s.receive(first);
                                 for e in events.try_iter() {
                                     s.receive(e);
+                                }
+                                if s.online {
+                                    s.schedule_cache(cx);
+                                } else if was_online {
+                                    s.save_cache(cx);
                                 }
                                 if s.scan_requested && s.scan_started.is_none() {
                                     s.load_saved(cx);
@@ -106,9 +127,9 @@ impl Inventory {
             self.online = false;
             return;
         }
+        self.last_seen = Some(chrono::Local::now());
         if !self.online {
-            // Keep last-known metadata while offline. A downgraded peer may now omit HostStatus.
-            self.info = None;
+            self.scan_started = None;
         }
         self.online = true;
         self.error = None;
@@ -117,8 +138,10 @@ impl Inventory {
                 self.legacy_projects = dir.is_none();
                 self.directory = dir;
             }
+            CatalogEvent::NoHostStatus => self.info = None,
             CatalogEvent::Host(h) => self.info = Some(h),
             CatalogEvent::Reset => {
+                self.received_catalog = true;
                 self.projects.clear();
             }
             CatalogEvent::Archived(scope, ids) => {
@@ -178,6 +201,7 @@ impl Inventory {
                         }
                         s.apply_saved(saved, errors.is_empty());
                         s.scan_error = errors.first().cloned();
+                        s.schedule_cache(cx);
                     }
                     Err(e) => s.scan_error = Some(e.to_string()),
                 }
@@ -189,6 +213,7 @@ impl Inventory {
     }
     fn apply_saved(&mut self, rows: Library, complete: bool) {
         if complete {
+            self.complete_library = true;
             self.saved = rows;
         } else {
             for (scope, items) in rows {
@@ -253,7 +278,16 @@ impl Inventory {
             Some(io::ErrorKind::PermissionDenied) => "Pairing needs attention".into(),
             Some(_) => self.last_seen.as_ref().map_or_else(
                 || "Offline".into(),
-                |t| format!("Offline · last seen {}", t.format("%a %H:%M")),
+                |t| {
+                    let state = if self.received_catalog
+                        && chrono::Local::now().signed_duration_since(*t).num_seconds() < 5
+                    {
+                        "Reconnecting"
+                    } else {
+                        "Offline"
+                    };
+                    format!("{state} · last seen {}", t.format("%a %H:%M"))
+                },
             ),
             None => "Connecting…".into(),
         }
@@ -304,6 +338,9 @@ impl Inventory {
                     ));
                 }
             }
+        }
+        if !waiting_only && !self.online && !self.complete_library {
+            self.add_last_seen(&mut rows);
         }
         rows.sort_by(|a, b| (&a.0.project, &a.2, &a.1).cmp(&(&b.0.project, &b.2, &b.1)));
         rows
@@ -446,6 +483,8 @@ impl super::Workspace {
     }
     pub(super) fn sync_inventory(&mut self, cx: &mut Context<Self>) {
         self.navigation_revision = self.navigation_revision.wrapping_add(1);
+        cx.background_spawn(async { cache::remove_unpaired() })
+            .detach();
         let saved = &cx.global::<crate::preferences::HostDirectory>().0;
         let mut links: Vec<_> = saved.iter().cloned().map(HostLink::Remote).collect();
         if (!links.is_empty() || self.scoped_search) && self.local.is_some() {
@@ -467,6 +506,8 @@ impl super::Workspace {
                 entry
             });
         }
+        self.tree
+            .retain(&self.inventory.values().map(Entity::entity_id).collect());
     }
     pub(crate) fn palette_rows(
         &self,
@@ -720,6 +761,51 @@ impl super::Workspace {
 mod tests {
     use super::*;
     use ox_desk_core::store::Route;
+    #[::core::prelude::v1::test]
+    fn short_reconnect_keeps_last_known_metadata_without_admitting_cached_sessions() {
+        use ox_desk_core::host_protocol::{ProjectCheckout, ProjectDirectory};
+        let mut host = Inventory::default();
+        let scope = Scope {
+            project: "/same".into(),
+            route: ox_desk_core::store::Route::CODEX_SUBSCRIPTION,
+        };
+        let row = (
+            scope.clone(),
+            Some("cached".to_owned()),
+            "Saved title".to_owned(),
+        );
+        host.previous = vec![row.clone()];
+        host.receive(CatalogEvent::Host(
+            serde_json::from_value(
+                serde_json::json!({"id":"studio","name":"Studio","version":"dev","epoch":"one"}),
+            )
+            .unwrap(),
+        ));
+        host.receive(CatalogEvent::Projects(Some(ProjectDirectory {
+            checkouts: vec![ProjectCheckout {
+                path: scope.project.clone(),
+                repository: None,
+            }],
+            routes: vec![scope.route.clone()],
+        })));
+        host.receive(CatalogEvent::Disconnected(io::ErrorKind::UnexpectedEof));
+        host.receive(CatalogEvent::Reset);
+        assert!(!host.can_open(Some(&scope), Some("cached")));
+        host.receive(CatalogEvent::Disconnected(io::ErrorKind::UnexpectedEof));
+        assert_eq!(host.display_name(), "Studio");
+        assert_eq!(
+            host.directory.as_ref().unwrap().checkouts[0].path,
+            scope.project
+        );
+        assert_eq!(host.rows(false), [row]);
+        host.receive(CatalogEvent::NoHostStatus);
+        host.receive(CatalogEvent::Projects(None));
+        assert!(host.info.is_none() && host.directory.is_none());
+        host.apply_saved(HashMap::new(), true);
+        host.receive(CatalogEvent::Disconnected(io::ErrorKind::UnexpectedEof));
+        assert!(host.rows(false).is_empty());
+    }
+
     #[::core::prelude::v1::test]
     fn filters_accept_host_name_id_local_alias_and_labels_together() {
         let mut host = Inventory::default();

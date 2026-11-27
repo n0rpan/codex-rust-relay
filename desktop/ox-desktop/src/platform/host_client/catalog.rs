@@ -3,6 +3,7 @@ use ox_desk_core::host_protocol::{Change, SessionView};
 use std::sync::Mutex;
 
 pub(crate) enum CatalogEvent {
+    NoHostStatus,
     Host(ox_desk_core::host_protocol::HostInfo),
     Projects(Option<ox_desk_core::host_protocol::ProjectDirectory>),
     Reset,
@@ -74,6 +75,9 @@ impl HostLink {
                             },
                         )
                     };
+                    if resources && !caps.iter().any(|c| c == "host_status") {
+                        emit(CatalogEvent::NoHostStatus)?;
+                    }
                     let mut pending_projects = has_projects;
                     let mut project_refresh = std::time::Instant::now();
                     if has_projects {

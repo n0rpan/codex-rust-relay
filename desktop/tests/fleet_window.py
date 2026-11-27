@@ -1,7 +1,9 @@
 """Two isolated Linux host engines, a signed desktop pairing and real keyboard input."""
+import itertools
 import json
 from pathlib import Path
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -12,6 +14,16 @@ from keyboard_window import wait_for
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ox-host-web/tests"))
 from native_client import Forward, ThreadedTCP, admin, certificate, managed_server
+
+
+
+class FleetForward(Forward):
+    def handle(self):
+        try:
+            super().handle()
+        except ConnectionRefusedError:
+            if not getattr(self.server, "fixture_offline", False):
+                raise
 
 
 def check_fleet(harness, gui, root, project, env, stack, log, launch, command, key):
@@ -25,10 +37,11 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
         shutil.copy2(gui.with_name(name), root / "bin" / name)
     target = dict(env, HOME=str(home), CODEX_HOME=str(codex), XDG_STATE_HOME=str(home / "state"),
                   XDG_CONFIG_HOME=str(home / "config"), CLAUDE_CONFIG_DIR=str(home / ".claude"))
-    stack.enter_context(session_host(gui.with_name("ox-host"), studio, target, log))
+    studio_host = stack.enter_context(session_host(gui.with_name("ox-host"), studio, target, log))
     state = Path(target["OX_HOST_STATE_DIR"])
     wait_for("the receiving host admin socket", lambda: (state / "remote-admin.sock").exists())
     subprocess.run([root / "bin/ox", "host", "name", "Studio"], env=target, check=True, stdout=log)
+    subprocess.run([root / "bin/ox", "host", "policy", "set", "always_read"], env=target, check=True, stdout=log)
     remote_project = studio / "alternate-checkout"
     duplicate = studio / "duplicate"
     for path in (remote_project, duplicate):
@@ -63,7 +76,7 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
         peer.until(lambda f: (s := change(f, "state")) and "start" in s["capabilities"])
     peer.act(scope, "seed", {"send_text": [None, "Inspect the remote navigation fixture"]})
     remote_id = peer.until(lambda f: f["type"] == "opened")["thread"]
-    public = ThreadedTCP(("127.0.0.1", 0), Forward)
+    public = ThreadedTCP(("127.0.0.1", 0), FleetForward)
     port = public.server_address[1]
     origin = f"https://studio.fixture.ts.net:{port}"
     public.backend = admin(state, {"type": "enable", "origin": origin, "port": 0})["port"]
@@ -76,6 +89,7 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
     managed_server(stack, public)
     env.update(OX_TEST_NATIVE_DIR=str(studio), OX_TEST_ORIGIN=origin, OX_TEST_LOOPBACK=f"127.0.0.1:{port}",
                OX_TEST_PROJECT=str(project), DBUS_SESSION_BUS_ADDRESS="unix:path=" + str(root / "unused-bus"))
+    Path(env["OX_DESK_STATS_SOCKET"]).unlink(missing_ok=True)
     app = launch(harness, "--exact", "paired_fleet_window", "--ignored", "--nocapture")
     wait_for("the paired desktop window", lambda: Path(env["OX_DESK_STATS_SOCKET"]).is_socket(), seconds=40)
 
@@ -102,9 +116,43 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
         wait_for("the destination row", lambda: expected in screen())
         key("Return")
 
+    requests = itertools.count()
+
+    def probe_request(request):
+        local = root / f"tree-probe-{next(requests)}"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as probe:
+            probe.bind(str(local))
+            probe.settimeout(2)
+            try:
+                probe.sendto(request.encode(), env["OX_DESK_STATS_SOCKET"])
+                return json.loads(probe.recv(1 << 20))
+            except (FileNotFoundError, ConnectionRefusedError, TimeoutError):
+                if request == "snapshot":
+                    return {}
+                raise
+            finally:
+                local.unlink(missing_ok=True)
+
+    def control(prefix, text, enabled=True):
+        return next((c for c in probe_request("snapshot").get("layout", [])
+                     if c["id"].startswith(prefix) and text.casefold() in c["label"].casefold()
+                     and c["enabled"] == enabled), None)
+
+    def press_tree(prefix, text):
+        row = wait_for("a visible " + prefix + " control for " + text,
+                       lambda: control(prefix, text))
+        reply = probe_request("press " + row["id"])
+        assert "error" not in reply, reply
+
     selected = root / "home/.local/state/ox/desktop/selected-host.json"
     host_id = (state / "host-id").read_text().strip()
-    choose("@studio " + str(remote_project), "inspect the remote navigation fixture")
+    wait_for("Studio's policy and resources in the host header",
+             lambda: "GiB available" in (control("tree-host", "Always read") or {}).get("label", ""))
+    press_tree("tree-host", "Studio · collapsed")
+    press_tree("tree-project", str(remote_project))
+    wait_for("the keyboard destination in Studio", lambda: control("tree-thread","Inspect the remote"))
+    key("Down")
+    key("Return")
     wait_for("selection of the paired host", lambda: selected.exists() and json.loads(selected.read_text()) == host_id)
     # Its private workspace layout records the actual selected native thread.
     wait_for("the remote thread on its own workbench", lambda: any(remote_id in f.read_text()
@@ -146,6 +194,7 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
 
     launch("wtype", "-k", "Shift_L", "-s", "180000")
     env["OX_TEST_CLIENT_ONLY"] = "1"
+    Path(env["OX_DESK_STATS_SOCKET"]).unlink(missing_ok=True)
     app = launch(harness, "--exact", "paired_fleet_window", "--ignored", "--nocapture")
     wait_for("the client-only workspace", lambda: "choose a host" in screen(), seconds=30)
     key("k", "ctrl")
@@ -160,4 +209,58 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
     wait_for("the client-only window to open the remote workbench", lambda: json.loads(selected.read_text()) == host_id)
     type_in_focused_field("Fleet selection keyboard focus")
     assert app.poll() is None
-    print("PASS signed navigation, live billing routes, alternate and duplicate checkouts, remembered host, changed origin, and client-only search.", flush=True)
+    app.terminate()
+    app.wait(timeout=5)
+    del env["OX_TEST_CLIENT_ONLY"]
+    env["OX_TEST_SAVED_PAIRING"] = "1"
+    launch("wtype", "-k", "Shift_L", "-s", "180000")
+    Path(env["OX_DESK_STATS_SOCKET"]).unlink(missing_ok=True)
+    app = launch(harness, "--exact", "paired_fleet_window", "--ignored", "--nocapture")
+    wait_for("the restored workbench", lambda: "manage hosts" in screen())
+    choose("@studio " + str(remote_project), "inspect the remote navigation fixture")
+    wait_for("the session header on Studio with its runtime and billing",
+             lambda: control("session-host-route", "Studio · Codex · API · fixture/demo", False))
+    choose("@local", "this computer")
+    wait_for("the explicit local selection", lambda: json.loads(selected.read_text()) is None)
+    press_tree("tree-host", "Studio · collapsed")
+    promised = wait_for("the named checkout's advertised billing route",
+                        lambda: control("tree-project", "New session on Studio · " + str(remote_project)))
+    assert promised["label"].endswith("fixture/demo"), promised
+    press_tree("tree-project", promised["label"])
+    wait_for("one-click New on the named checkout", lambda: json.loads(selected.read_text()) == host_id)
+    wait_for("the promised host and billing after starting the peer draft",
+             lambda: control("session-host-route", "Studio · Codex · API · fixture/demo", False))
+    choose("@local", "this computer")
+    wait_for("the laptop after the peer draft", lambda: json.loads(selected.read_text()) is None)
+    press_tree("tree-host", "Studio · collapsed")
+    press_tree("tree-project", str(remote_project))
+    wait_for("Studio's live session", lambda: control("tree-thread", "Inspect the remote"))
+    public.fixture_offline = True
+    studio_host.terminate()
+    studio_host.wait(timeout=12)
+    wait_for("the offline session to remain visible and disabled",
+             lambda: control("tree-thread", "Inspect the remote", False), seconds=30)
+    wait_for("the last time Studio was seen", lambda: control("tree-host", "last seen"))
+    assert json.loads(selected.read_text()) is None
+    key("n", "ctrl")
+    key("l", "ctrl")
+    type_in_focused_field("The laptop still works while Studio is offline")
+    cache = wait_for("Studio's saved navigation metadata", lambda: next((p for p in
+                     (selected.parent / "host-catalog").glob(host_id + "-*-catalog.json")
+                     if "Inspect the remote" in p.read_text()), None))
+    app.terminate()
+    app.wait(timeout=5)
+    launch("wtype", "-k", "Shift_L", "-s", "180000")
+    Path(env["OX_DESK_STATS_SOCKET"]).unlink(missing_ok=True)
+    app = launch(harness, "--exact", "paired_fleet_window", "--ignored", "--nocapture")
+    wait_for("the local window after restart", lambda: "manage hosts" in screen())
+    press_tree("tree-host", "Studio · collapsed")
+    press_tree("tree-project", str(remote_project))
+    wait_for("the offline thread after restarting the desktop",
+             lambda: control("tree-thread", "Inspect the remote", False))
+    assert cache.stat().st_mode & 0o077 == 0
+    press_tree("manage-hosts", "Manage hosts")
+    press_tree("host-" + host_id, "")
+    press_tree("forget-host", "Forget on this desktop")
+    wait_for("forgetting Studio to remove its offline catalog", lambda: not cache.exists())
+    print("PASS grouped navigation, live billing routes, alternate checkouts, client-only search, offline rows through restart and independent local work.", flush=True)

@@ -87,6 +87,7 @@ pub struct Workbench {
     review: review::ReviewPane,
     pub(super) review_width: u32,
     pub(super) pane_width: Pixels,
+    pub(super) host_caption: Option<String>,
     resizing_review: bool,
     pub(super) route_models: Entity<Vec<String>>,
     pub(super) model_picker: Option<super::route_chip::Picker>,
@@ -268,6 +269,7 @@ impl Workbench {
             review: Default::default(),
             review_width: 360,
             pane_width: window.viewport_size().width,
+            host_caption: None,
             resizing_review: false,
             model_picker: None,
             route_models,
@@ -1172,6 +1174,26 @@ impl Workbench {
                                                             .build(window, cx)
                                                         }),
                                                 )
+                                        })
+                                        .when_some(self.host_caption.as_ref(), |view, host| {
+                                            let route = match &self.route.billing {
+                                                ox_desk_core::runtime::Billing::Api(alias) => {
+                                                    format!("API · {alias}")
+                                                }
+                                                ox_desk_core::runtime::Billing::Subscription => {
+                                                    "subscription".into()
+                                                }
+                                            };
+                                            let label = SharedString::from(format!(
+                                                "{host} · {} · {route}",
+                                                self.route.runtime.name()
+                                            ));
+                                            view.child(crate::platform::layout_probe::mark_element(
+                                                crate::small(p, label.clone()).truncate(),
+                                                &"session-host-route".into(),
+                                                &label,
+                                                false,
+                                            ))
                                         })
                                         .when(status != "Connected", |view| {
                                             view.child(crate::small(p, status.clone()))

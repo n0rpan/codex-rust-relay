@@ -295,6 +295,7 @@ impl Discovery {
         };
         match event {
             CatalogEvent::Projects(_)
+            | CatalogEvent::NoHostStatus
             | CatalogEvent::Host(_)
             | CatalogEvent::DraftWaiting(..)
             | CatalogEvent::Waiting(..)

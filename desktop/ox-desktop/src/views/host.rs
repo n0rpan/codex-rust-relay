@@ -176,6 +176,7 @@ pub struct Host {
     favorite_models: Vec<String>,
     catalog_versions: Vec<(usize, u64)>,
     catalog: Vec<CatalogEntry>,
+    fleet_tree: crate::app::fleet::tree::Tree,
     discovery: Discovery,
     running: Entity<Running>,
     list_focus: FocusHandle,
@@ -313,6 +314,7 @@ impl Host {
             favorite_models: vec![],
             catalog_versions: vec![],
             catalog: vec![],
+            fleet_tree: Default::default(),
             discovery: Discovery::default(),
             running: cx.new(|_| Running::new(link)),
             list_focus: cx.focus_handle().tab_stop(true),
@@ -1365,6 +1367,7 @@ impl Host {
     }
     pub(super) fn save_sidebar(&mut self, cx: &mut Context<Self>) {
         self.discovery.revision += 1;
+        self.fleet_tree.revision = u64::MAX;
         crate::workspace_state::remember_sidebar(
             self.link.state_file("sidebar.json"),
             self.sidebar.clone(),
@@ -1818,6 +1821,9 @@ impl Host {
         if event.keystroke.modifiers != Modifiers::default() {
             return;
         }
+        if !self.fleet_tree.native {
+            return;
+        }
         let selected = self.panes[self.active]
             .read(cx)
             .store
@@ -1904,7 +1910,12 @@ impl Host {
         if let Some((index, (row, project, scope))) = target {
             self.activate_row(project.to_owned(), scope, row.clone(), window, cx);
             self.list_scroll
-                .scroll_to_item(index, ScrollStrategy::Nearest);
+                .scroll_to_item(self.fleet_tree.rows.len() + index, ScrollStrategy::Nearest);
+        } else if matches!(event.keystroke.key.as_str(), "up" | "k")
+            && let Some(last) = self.fleet_tree.rows.len().checked_sub(1)
+            && let (Some(keys), Some(ws)) = (&self.fleet_tree.keyboard, &self.workspace)
+        {
+            keys.select(last, ws, window, cx);
         }
         cx.stop_propagation();
     }
@@ -2343,6 +2354,40 @@ impl Host {
                 });
             }),
         )
+    }
+
+    fn navigation_rows(
+        &mut self,
+        range: Range<usize>,
+        width: Pixels,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let offset = self.fleet_tree.rows.len();
+        let mut rows = Vec::with_capacity(range.len());
+        if let Some(ws) = self.workspace.as_ref().and_then(WeakEntity::upgrade)
+            && let Some(keys) = &self.fleet_tree.keyboard
+        {
+            let p = Palette::get(cx);
+            let cursor = ws.read(cx).tree_cursor.as_deref();
+            for (i, row) in self
+                .fleet_tree
+                .rows
+                .iter()
+                .enumerate()
+                .take(range.end)
+                .skip(range.start)
+            {
+                rows.push(row.render(&ws.downgrade(), width, p, keys, i, cursor));
+            }
+        }
+        if self.fleet_tree.native && range.end > offset {
+            rows.extend(self.rows(
+                range.start.saturating_sub(offset)..range.end - offset,
+                width,
+                cx,
+            ));
+        }
+        rows
     }
 
     fn rows(
@@ -2969,6 +3014,55 @@ impl Host {
             eprintln!("desk-stats {}", self.snapshot(window, cx));
         }
         self.index_catalog(cx);
+        if let Some(ws) = self.workspace.as_ref().and_then(WeakEntity::upgrade) {
+            let ws = ws.read(cx);
+            let filter = self.filter.read(cx).value();
+            if self.fleet_tree.palette != Some(p)
+                || self.fleet_tree.revision != ws.navigation_revision()
+                || self.fleet_tree.filter != filter.as_str()
+            {
+                let active = self.link.remote().map(|h| h.id.clone());
+                let pane = self.panes[self.active].read(cx);
+                let native_projects = self
+                    .catalog
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        CatalogEntry::Project { project, .. } => Some(project.as_path()),
+                        _ => self.located_entry(entry, cx).map(|(_, project, _)| project),
+                    })
+                    .collect();
+                let current = crate::app::fleet::tree::Current {
+                    native_projects,
+                    sidebar: &self.sidebar,
+                    project: &pane.project,
+                    route: &pane.route,
+                    thread: pane.store.as_ref().and_then(|s| s.selected()),
+                };
+                let (rows, native) = ws.tree_rows(&active, &filter, Some(current), cx);
+                let keyboard = crate::app::fleet::tree::Keyboard::new(
+                    &rows,
+                    self.list_scroll.clone(),
+                    ws.tree_focus.clone(),
+                    (native && !self.catalog.is_empty()).then(|| self.list_focus.clone()),
+                );
+                if let Some(owner) = self.workspace.clone() {
+                    keyboard.recover(
+                        ws.tree_cursor.as_deref(),
+                        owner,
+                        Some(self.list_focus.clone()),
+                        window,
+                    );
+                }
+                self.fleet_tree = crate::app::fleet::tree::Tree {
+                    keyboard: Some(keyboard),
+                    palette: Some(p),
+                    revision: ws.navigation_revision(),
+                    filter: filter.to_string(),
+                    rows,
+                    native,
+                };
+            }
+        }
         let compact = self.compact(window);
         if !compact {
             self.close_drawer(window, cx);
@@ -2983,9 +3077,19 @@ impl Host {
             } else {
                 px(0.)
             };
-        if self.panes[self.active].read(cx).pane_width != pane_width {
+        let host_caption = self
+            .workspace
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .and_then(|ws| {
+                ws.read(cx)
+                    .session_host_name(&self.link.remote().map(|h| h.id.clone()), cx)
+            });
+        let pane = self.panes[self.active].read(cx);
+        if pane.pane_width != pane_width || pane.host_caption != host_caption {
             self.panes[self.active].update(cx, |pane, cx| {
                 pane.pane_width = pane_width;
+                pane.host_caption = host_caption;
                 cx.notify();
             });
         }
@@ -3003,7 +3107,12 @@ impl Host {
             .store
             .as_ref()
             .is_some_and(|s| s.state() == &Connection::Ready);
-        let count = self.catalog.len();
+        let count = self.fleet_tree.rows.len()
+            + if self.fleet_tree.native {
+                self.catalog.len()
+            } else {
+                0
+            };
         let (running_count, running_open) = {
             let running = self.running.read(cx);
             (running.process_count(), running.open)
@@ -3343,8 +3452,10 @@ impl Host {
                             "project-threads",
                             count,
                             cx.processor(move |s, range, _, cx| {
-                                crate::app::try_draw(cx, |cx| s.rows(range, sidebar_width, cx))
-                                    .unwrap_or_default()
+                                crate::app::try_draw(cx, |cx| {
+                                    s.navigation_rows(range, sidebar_width, cx)
+                                })
+                                .unwrap_or_default()
                             }),
                         )
                         .track_scroll(&self.list_scroll)

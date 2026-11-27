@@ -191,7 +191,7 @@ fn paired_fleet_window() {
     let mut args = vec!["--desk-stats".into()];
     if std::env::var_os("OX_TEST_CLIENT_ONLY").is_some() {
         args.push("--client-only".into());
-    } else {
+    } else if std::env::var_os("OX_TEST_SAVED_PAIRING").is_none() {
         platform::hosts::pair(
             &std::env::var("OX_TEST_ORIGIN").unwrap(),
             &std::fs::read_to_string(root.join("code")).unwrap(),

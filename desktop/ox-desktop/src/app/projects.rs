@@ -34,6 +34,27 @@ struct Choice {
     host_name: String,
     route: Option<Route>,
 }
+#[derive(Clone)]
+pub(crate) struct TreeStart {
+    pub checkout: Checkout,
+    pub registration: EntityId,
+    pub host_name: String,
+    pub repository: Option<String>,
+    pub route: Route,
+}
+
+pub(super) fn available_route(
+    routes: &[Route],
+    preferred: Option<&Route>,
+    remembered: Option<&Route>,
+) -> Option<Route> {
+    preferred
+        .into_iter()
+        .chain(remembered)
+        .find(|r| routes.contains(r))
+        .or_else(|| routes.first())
+        .cloned()
+}
 pub(super) struct Recent(pub crate::workspace_state::ProjectHosts);
 impl Global for Recent {}
 pub(super) struct Chooser {
@@ -102,7 +123,7 @@ impl Workspace {
             crate::workspace_state::remember_checkout(repo, loc);
         }
     }
-    fn host_name(&self, id: &Option<String>, cx: &App) -> String {
+    pub(crate) fn host_name(&self, id: &Option<String>, cx: &App) -> String {
         let entry = self.inventory[id].read(cx);
         let name = entry.display_name();
         if self
@@ -175,12 +196,7 @@ impl Workspace {
                 let remembered = opened
                     .and_then(|view| view.read(cx).project_route(&loc.path))
                     .or_else(|| inv.recent.saved_route(&loc.path));
-                let route = preferred_route
-                    .into_iter()
-                    .chain(remembered.as_ref())
-                    .find(|route| dir.routes.contains(route))
-                    .or_else(|| dir.routes.first())
-                    .cloned();
+                let route = available_route(&dir.routes, preferred_route, remembered.as_ref());
                 groups.entry(key).or_default().push(Choice {
                     checkout: loc,
                     registration: entry.entity_id(),
@@ -199,6 +215,28 @@ impl Workspace {
             });
         }
         groups
+    }
+    pub(super) fn start_tree_project(
+        &mut self,
+        start: &TreeStart,
+        w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = ProjectKey::new(&start.checkout, start.repository.as_ref());
+        let choice = Choice {
+            checkout: start.checkout.clone(),
+            registration: start.registration,
+            host_name: start.host_name.clone(),
+            route: Some(start.route.clone()),
+        };
+        if self.known(&choice, &key, cx) {
+            self.choose_project(key, vec![choice], Some(&start.checkout), w, cx);
+            self.submit_project(0, w, cx);
+        } else {
+            self.error =
+                Some("This checkout or route changed. Choose an available project.".into());
+            cx.notify();
+        }
     }
     pub(super) fn pick_for_workbench(
         &mut self,

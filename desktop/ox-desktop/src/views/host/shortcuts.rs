@@ -20,6 +20,7 @@ impl Host {
             Command::New if self.preferences.is_none() => self.request_active_draft(window, cx),
             Command::Sidebar => self.toggle_sidebar(window, cx),
             _ if self.preferences.is_some() => return false,
+            Command::Previous | Command::Next if !self.fleet_tree.native => return false,
             Command::Previous | Command::Next => {
                 self.index_catalog(cx);
                 let active = self.panes[self.active].read(cx);
@@ -44,7 +45,8 @@ impl Host {
                 };
                 if let Some((i, (row, project, scope))) = choice {
                     self.activate_row(project.to_owned(), scope, row.clone(), window, cx);
-                    self.list_scroll.scroll_to_item(i, ScrollStrategy::Nearest);
+                    self.list_scroll
+                        .scroll_to_item(self.fleet_tree.rows.len() + i, ScrollStrategy::Nearest);
                 }
             }
             _ => self.panes[self.active].update(cx, |pane, cx| {
