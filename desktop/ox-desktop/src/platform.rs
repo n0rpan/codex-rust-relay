@@ -5,7 +5,7 @@ pub(crate) mod hosts;
 pub(crate) use host_client::open_store;
 pub(crate) use host_client::{
     CatalogEvent, CatalogWatch, HOST_NOT_RUNNING, HostLink, IdleReservation, ProcessMonitor,
-    reserve_idle_update,
+    clean_handoff_pairings, reserve_idle_update,
 };
 pub mod onboarding;
 pub(crate) mod remote;

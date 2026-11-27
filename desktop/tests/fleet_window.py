@@ -7,6 +7,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import uuid
 
 from host_fixture import session_host
 from host_stock_session import Client, change
@@ -26,12 +27,13 @@ class FleetForward(Forward):
                 raise
 
 
-def check_fleet(harness, gui, root, project, env, stack, log, launch, command, key):
+def check_fleet(harness, gui, root, project, env, stack, log, launch, command, key, provider):
     studio = root / "studio"
     home = studio / "home"
     codex = home / ".codex"
     codex.mkdir(mode=0o700, parents=True)
-    shutil.copy2(Path(env["CODEX_HOME"]) / "codeox.toml", codex / "codeox.toml")
+    for config_name in ("codeox.toml", "config.toml"):
+        shutil.copy2(Path(env["CODEX_HOME"]) / config_name, codex / config_name)
     # The test binary lives under deps/ instead of beside the settings companion.
     for name in ("ox", "ox-host"):
         shutil.copy2(gui.with_name(name), root / "bin" / name)
@@ -227,6 +229,11 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
     peer.open(scope)
     source_state = peer.until(lambda f: f["type"] == "snapshot")["scopes"][0]
     pending = next(request for request in source_state["asks"] if request["thread"] == remote_id)
+    other_desktop = Client(env["OX_HOST_SOCKET"])
+    stack.callback(other_desktop.close)
+    other_desktop.send(type="surface", surface="desktop")
+    other_desktop.send(type="watch_handoff_reads", proof="f"*64)
+    provider.mode = "fleet-handoff"
     peer.act(scope, "finish-seed", {"answer_ask": [pending["id"], 0]}, pending["token"])
     peer.until(lambda f: (event := change(f, "notification")) and event["event"] == "finished" and event["thread"] == remote_id)
     peer.act(scope, "name-source", {"rename_thread": [remote_id, "Inspect the remote navigation fixture"]})
@@ -264,18 +271,44 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
     wait_for("the confirmed local thread to open", lambda: json.loads(selected.read_text()) is None
              and any(moved in path.read_text() for path in selected.parent.rglob("*layout*.json")))
     print("PASS paired desktop handed a stock conversation from Studio to the other checkout and applied the receiving host’s mode decision.", flush=True)
+    def source_read():
+        return next((m["content"] for req in provider.requests for m in req["messages"]
+                     if m["role"] == "tool" and host_id in str(m.get("content"))
+                     and remote_id in str(m.get("content")) and "OX_SOURCE_ONLY_END" in str(m.get("content"))), None)
+    try:
+        wait_for("stock Codex to read the Studio transcript through the paired desktop", source_read, seconds=65)
+    except AssertionError:
+        print("Read replies:", [str(m["content"])[:280] for req in provider.requests[-4:]
+                                for m in req["messages"] if m["role"] == "tool"], flush=True)
+        raise
+    print("PASS stock Codex read the cut Studio reply in full over the original pairing.", flush=True)
+    provider.mode = "allow"
     # A lost reply after import must resolve to the very same native session.
     local = Client(env["OX_HOST_SOCKET"])
     stack.callback(local.close)
     local_id = (Path(env["OX_HOST_STATE_DIR"]) / "host-id").read_text().strip()
     start = dict(source=remote_id, runtime="codex", model="fixture/demo", mode="read",
                  request="Handoff retry fixture")
-    peer.send(type="prepare_remote_handoff", id="prepare-retry", scope=scope, start=start,
+    transfer_id = str(uuid.uuid4())
+    peer.send(type="prepare_remote_handoff", id=transfer_id, scope=scope, start=start,
               target_host=local_id, window=36_000)
-    packet = peer.until(lambda f: f["type"] == "worker_reply" and f["id"] == "prepare-retry")["result"]
+    packet = peer.until(lambda f: f["type"] == "worker_reply" and f["id"] == transfer_id)["result"]
     assert packet["source"]["selection"]["window"] == 36_000
     assert any("Inspect the remote" in item["text"] for item in packet["carried"])
     to_scope = dict(project=str(project), route=scope["route"])
+    other_desktop.send(type="inspect_handoff_target", id="barrier", scope=to_scope)
+    def unrelated_desktop(frame):
+        assert frame["type"] != "relay_handoff_read", "A second desktop received another pairing's history request"
+        return frame["type"] == "worker_reply" and frame["id"] == "barrier"
+    other_desktop.until(unrelated_desktop)
+    # Lose delivery after prepare, continue the original source and retry the same intent.
+    provider.mode = "fleet-advance"
+    peer.act(scope, "later-source", {"send_text": [remote_id, "A later private source turn"]})
+    peer.until(lambda f: (n:=change(f,"notification")) and n["event"]=="finished" and n["thread"]==remote_id)
+    peer.send(type="prepare_remote_handoff", id=transfer_id, scope=scope, start=start, target_host=local_id, window=36_000)
+    retry = peer.until(lambda f: f["type"]=="worker_reply" and f["id"]==transfer_id)["result"]
+    assert retry["carried"] == packet["carried"] and retry["id"] == packet["id"]
+    provider.mode = "allow"
     def receive(key, transfer):
         local.send(type="receive_remote_handoff", id=key, scope=to_scope, packet=transfer)
         return local.until(lambda f: f["type"] == "worker_reply" and f["id"] == key)
@@ -285,6 +318,41 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
     assert placed["result"], placed
     replay = receive("repeated-delivery", packet)["result"]
     assert replay["recovered"] and replay["session"] == placed["result"]["session"]
+    local.send(type="inspect_handoff_target", id=packet["id"], scope=to_scope)
+    recovery = local.until(lambda f: f["type"]=="worker_reply" and f["id"]==packet["id"])
+    assert recovery["result"]["recovered"] == placed["result"]["session"]
+    peer.send(type="surface", surface="desktop")
+    peer.send(type="read_handoff_page", id="wrong-host", transfer=packet["id"], source_host=host_id,
+              target_host=host_id, scope=scope, page={"item": None, "after": None, "limit": 1})
+    wrong_host = peer.until(lambda f: f["type"] == "worker_reply" and f["id"] == "wrong-host")
+    assert "no matching handoff" in wrong_host["error"]
+    provider.mode = "fleet-return"
+    provider.original_host = host_id
+    provider.original_session = remote_id
+    choose("/handoff", "continue in")
+    type_in_focused_field("Continue on Studio and read the original source")
+    press_tree("handoff-host", str(duplicate))
+    press_tree("launch-submit", "Continue")
+    wait_for("the return handoff to Studio", lambda: json.loads(selected.read_text()) == host_id, seconds=45)
+    def ancestor_read():
+        for req in provider.requests:
+            if not any("Continue on Studio and read the original source" in str(m.get("content"))
+                       for m in req["messages"] if m["role"]=="user"):
+                continue
+            results = [m for m in req["messages"] if m["role"] == "tool" and host_id in str(m["content"])
+                       and remote_id in str(m["content"]) and "OX_SOURCE_ONLY_END" in str(m["content"])]
+            if len({m.get("tool_call_id") for m in results}) >= 5:
+                return True
+    try:
+        wait_for("the second handoff to read its original Studio ancestor", ancestor_read, seconds=80)
+    except AssertionError:
+        print("Ancestor tool replies:", [str(m["content"])[:250] for req in provider.requests[-3:]
+                                        for m in req["messages"] if m["role"] == "tool"], flush=True)
+        raise
+    provider.mode = "allow"
+    print("PASS remote receiving checkout and an earlier conversation across two handoffs.", flush=True)
+    choose("@local", "this computer")
+    wait_for("the laptop after the round trip", lambda: json.loads(selected.read_text()) is None)
     press_tree("tree-host", "Studio · collapsed")
     promised = wait_for("the named checkout's advertised billing route",
                         lambda: control("tree-project", "New session on Studio · " + str(remote_project)))
@@ -313,6 +381,15 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
                      if "Inspect the remote" in p.read_text()), None))
     app.terminate()
     app.wait(timeout=5)
+    provider.mode = "fleet-offline"
+    local.open(to_scope)
+    local.until(lambda f: f["type"] == "snapshot")
+    def read_unavailable(marker, expected):
+        local.act(to_scope, marker, {"send_text": [moved, marker]})
+        local.until(lambda f: (n := change(f,"notification")) and n["event"] == "finished" and n["thread"] == moved)
+        assert any(expected in str(m.get("content")) for req in provider.requests if marker in str(req["messages"])
+                   for m in req["messages"] if m["role"] == "tool"), expected
+    read_unavailable("OX-READ-WHILE-DESKTOP-CLOSED", "desktop that made the handoff")
     launch("wtype", "-k", "Shift_L", "-s", "180000")
     Path(env["OX_DESK_STATS_SOCKET"]).unlink(missing_ok=True)
     app = launch(harness, "--exact", "paired_fleet_window", "--ignored", "--nocapture")
@@ -321,9 +398,16 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
     press_tree("tree-project", str(remote_project))
     wait_for("the offline thread after restarting the desktop",
              lambda: control("tree-thread", "Inspect the remote", False))
+    read_unavailable("OX-READ-WHILE-STUDIO-OFFLINE", "Could not reach Studio")
+    print("PASS the destination distinguished a closed desktop from an offline source after restart.", flush=True)
     assert cache.stat().st_mode & 0o077 == 0
     press_tree("manage-hosts", "Manage hosts")
     press_tree("host-" + host_id, "")
+    receipts = list((selected.parent/"handoff-sources").glob("*.json"))
+    assert any(host_id in f.read_text() for f in receipts)
+    assert all("Inspect the remote navigation fixture" not in f.read_text() and f.stat().st_mode & 0o077 == 0 for f in receipts)
     press_tree("forget-host", "Forget on this desktop")
+    wait_for("forgetting Studio to remove its handoff history receipts", lambda: all(
+        host_id not in f.read_text() for f in (selected.parent/"handoff-sources").glob("*.json")))
     wait_for("forgetting Studio to remove its offline catalog", lambda: not cache.exists())
     print("PASS grouped navigation, live billing routes, alternate checkouts, client-only search, offline rows through restart and independent local work.", flush=True)

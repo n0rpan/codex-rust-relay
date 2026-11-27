@@ -157,6 +157,7 @@ fn with_cache_directory(
 }
 
 pub(super) fn remove_unpaired() {
+    crate::platform::clean_handoff_pairings();
     let Some(dir) = ox_desk_core::desktop_behavior::directory()
         .map(|d| d.join("host-catalog"))
         .filter(|d| d.is_dir())

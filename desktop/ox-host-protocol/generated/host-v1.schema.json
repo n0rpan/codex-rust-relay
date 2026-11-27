@@ -1062,6 +1062,87 @@
         {
           "additionalProperties": false,
           "properties": {
+            "proof": {
+              "type": "string"
+            },
+            "type": {
+              "const": "watch_handoff_reads",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "proof"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "broker": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "page": {
+              "$ref": "#/$defs/HandoffPage"
+            },
+            "scope": {
+              "$ref": "#/$defs/Scope"
+            },
+            "source_host": {
+              "type": "string"
+            },
+            "target_host": {
+              "type": "string"
+            },
+            "transfer": {
+              "type": "string"
+            },
+            "type": {
+              "const": "read_handoff_page",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "source_host",
+            "target_host",
+            "scope",
+            "transfer",
+            "page"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "result": {
+              "$ref": "#/$defs/Result_of_AnyValue_or_string"
+            },
+            "token": {
+              "type": "string"
+            },
+            "type": {
+              "const": "finish_handoff_read",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "token",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
             "id": {
               "type": "string"
             },
@@ -1481,11 +1562,54 @@
       ],
       "type": "object"
     },
+    "HandoffPage": {
+      "description": "A position in the conversation selected by the operator for a handoff.",
+      "properties": {
+        "after": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ancestor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HistoryRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "item": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "HandoffSource": {
       "description": "Where a handoff came from. Stored in the target's origin stamp.",
       "properties": {
         "decision": {
           "$ref": "#/$defs/Decision"
+        },
+        "history_broker": {
+          "description": "Digest of the desktop relay key for this destination pairing.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "host": {
           "anyOf": [
@@ -1640,6 +1764,21 @@
         "start",
         "source",
         "carried"
+      ],
+      "type": "object"
+    },
+    "HistoryRef": {
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "session": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "host",
+        "session"
       ],
       "type": "object"
     },
@@ -2295,6 +2434,30 @@
         }
       ]
     },
+    "Result_of_AnyValue_or_string": {
+      "oneOf": [
+        {
+          "properties": {
+            "Ok": true
+          },
+          "required": [
+            "Ok"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "Err": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "Err"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "Route": {
       "properties": {
         "billing": {
@@ -2459,6 +2622,34 @@
     },
     "Server": {
       "oneOf": [
+        {
+          "properties": {
+            "page": {
+              "$ref": "#/$defs/HandoffPage"
+            },
+            "target_host": {
+              "type": "string"
+            },
+            "token": {
+              "type": "string"
+            },
+            "transfer": {
+              "type": "string"
+            },
+            "type": {
+              "const": "relay_handoff_read",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "token",
+            "transfer",
+            "target_host",
+            "page"
+          ],
+          "type": "object"
+        },
         {
           "properties": {
             "host": {

@@ -145,8 +145,9 @@ def run(gui, codex, root, drop_probe=None, fleet_harness=None):
         time.sleep(.7)
         stack.enter_context(session_host(gui.with_name("ox-host"),root,env,log))
         if fleet_harness:
+            (home / ".codex/config.toml").write_text("[features]\ntool_search=false\n")
             from fleet_window import check_fleet
-            check_fleet(fleet_harness, gui, root, project, env, stack, log, launch, command, key)
+            check_fleet(fleet_harness, gui, root, project, env, stack, log, launch, command, key, server)
             return
         launch(gui, "--desk-stats", project)
         probe = stack.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM))

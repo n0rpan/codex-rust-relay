@@ -1001,7 +1001,14 @@ impl Host {
             pane,
             window,
             |s, pane, ready: &super::handoff_sheet::HandoffReady, window, cx| {
-                if *pane != s.panes[s.active] {
+                if *pane != s.panes[s.active]
+                    || pane
+                        .read(cx)
+                        .store
+                        .as_ref()
+                        .and_then(|store| store.selected())
+                        != Some(ready.source_session.as_str())
+                {
                     return;
                 }
                 let source = s.link.remote().map(|h| h.id.clone());

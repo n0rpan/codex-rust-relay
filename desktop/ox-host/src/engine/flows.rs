@@ -1,5 +1,6 @@
 //! Host flows of the mode model: YOLO acceptance and grants, cross-runtime
 //! handoffs, and `read_ox_thread`.
+pub(super) mod history;
 mod remote_handoff;
 use super::*;
 use crate::durable::{Grant, HandoffRecord, Outcome};
@@ -620,7 +621,13 @@ impl Engine {
         let Some(timeline) = live.state.transcripts.get(&start.source) else {
             fail!("The session's history is not loaded. Open it and try again.".into());
         };
-        let items = handoff::items(timeline);
+        let mut items = handoff::items(timeline);
+        if let Some((target, id)) = &export_to
+            && let Err(e) =
+                self.restore_export_boundary(*id, target, &src, &start.source, &mut items)
+        {
+            fail!(e.to_string());
+        }
         let title = live
             .store
             .catalog_row(&start.source)
@@ -641,8 +648,17 @@ impl Engine {
         let level = crate::workers::source_level(ceiling, src_origin.as_ref());
         // A source that was itself handed off carries only its own messages;
         // the earlier chain stays readable through read_ox_thread.
-        let earlier = self
-            .handoff_chain(&src, &start.source)
+        let chain = self.handoff_chain(&src, &start.source);
+        let ancestors = chain
+            .last()
+            .filter(|s| {
+                s.host
+                    .as_ref()
+                    .is_some_and(|h| h.id != self.host_id.to_string())
+            })
+            .map(|s| s.selection.earlier.clone())
+            .unwrap_or_default();
+        let earlier = chain
             .into_iter()
             .map(|h| handoff::Earlier {
                 host: h.host,
@@ -651,12 +667,15 @@ impl Engine {
                 runtime: h.runtime,
                 route: h.route,
             })
+            .chain(ancestors)
+            .take(32)
             .collect();
         let selection = match handoff::select_chained(items, &start.request, window, earlier) {
             Ok(s) => s,
             Err(e) => fail!(e),
         };
         let mut source = HandoffSource {
+            history_broker: None,
             host: Some(self.handoff_host()),
             scope: src.clone(),
             session: start.source.clone(),
@@ -685,6 +704,9 @@ impl Engine {
                 carried: selection.carried,
                 child_ceiling: src_origin.as_ref().and_then(Origin::limits_children),
             };
+            if let Err(e) = self.record_export(&packet) {
+                fail!(e.to_string());
+            }
             if let Err(e) = self.answer(reply, Ok(json!(packet))) {
                 tracing_error(&e);
             }
@@ -870,6 +892,7 @@ impl Engine {
     }
     fn advance_flows_inner(&mut self) -> io::Result<()> {
         let now = Instant::now();
+        self.expire_history(now)?;
         for prep in std::mem::take(&mut self.preparing) {
             let Some(live) = self.running.get_mut(&prep.source) else {
                 self.answer(prep.reply, Err("The source route closed.".into()))?;
@@ -978,45 +1001,41 @@ impl Engine {
         else {
             return self.answer(reply, Err("Not a read.".into()));
         };
-        let found = (|| {
-            let Resolved::Hosted { scope, session: me } = self.resolve(caller)? else {
-                return Err("read_ox_thread reads the handoff sources of sessions the OX session host runs. This launch has none.".to_owned());
-            };
-            let chain = self.handoff_chain(&scope, &me);
-            if chain.is_empty() {
-                return Err("This session was not handed off from another session, so it has no source to read.".into());
+        let (scope, owner) = match self.resolve(caller) {
+            Ok(Resolved::Hosted { scope, session }) => (scope, session),
+            Ok(_) => {
+                let message = "read_ox_thread reads the handoff sources of sessions the OX session host runs. This launch has none.";
+                return self.answer(reply, Err(message.into()));
             }
-            let mut matches = chain.into_iter().filter(|h| {
-                host.as_ref()
-                    .is_none_or(|id| h.host.as_ref().is_some_and(|m| &m.id == id))
-                    && session
-                        .as_ref()
-                        .is_none_or(|s| &h.session == s || h.native.as_ref() == Some(s))
-            });
-            let src = matches
-                .next()
-                .ok_or("That session is not in this session's handoff chain.")?;
-            if session.is_some() && matches.next().is_some() {
-                return Err(
-                    "That session ID occurs more than once. Include its source host ID.".into(),
-                );
-            }
-            if src
-                .host
-                .as_ref()
-                .is_some_and(|h| h.id != self.host_id.to_string())
-            {
-                return Err("This source belongs to another host.".into());
-            }
-            if src.scope.project != scope.project {
-                return Err("That source is outside this session's project.".into());
-            }
-            Ok((scope, src))
-        })();
-        let (_caller_scope, src) = match found {
-            Ok(v) => v,
-            Err(e) => return self.answer(reply, Err(e)),
+            Err(error) => return self.answer(reply, Err(error)),
         };
+        let page = wire::HandoffPage {
+            item,
+            after,
+            limit,
+            ancestor: None,
+        };
+        self.read_history_of(
+            &scope,
+            &owner,
+            host.as_deref(),
+            session.as_deref(),
+            page,
+            reply,
+            None,
+        )
+    }
+
+    fn load_source_page(
+        &mut self,
+        src: HandoffSource,
+        page: wire::HandoffPage,
+        reply: Replier,
+        frozen: bool,
+    ) -> io::Result<()> {
+        let wire::HandoffPage {
+            item, after, limit, ..
+        } = page;
         if let Err(e) = self.ensure(&src.scope, None) {
             return self.answer(
                 reply,
@@ -1024,6 +1043,7 @@ impl Engine {
             );
         }
         self.reading.push(Reading {
+            frozen,
             scope: src.scope.clone(),
             session: src.session.clone(),
             source: Box::new(src),
@@ -1069,7 +1089,7 @@ impl Engine {
         }
         match live.state.transcripts.get(&r.session) {
             Some(timeline) => {
-                let page = read_page(&r.source, timeline, &r.args);
+                let page = read_source_page(&r.source, timeline, &r.args, r.frozen);
                 Step::Answer(r.reply, page)
             }
             None => wait(r, "The source session is not loaded yet."),
@@ -1231,13 +1251,31 @@ fn tracing_error(e: &io::Error) {
     ox_host_service::errlog::record(&e.to_string());
 }
 
+/// Never let a resumed read or retried export include messages added after the handoff.
+fn freeze(items: &mut Vec<handoff::SourceItem>, source: &HandoffSource) -> Result<(), String> {
+    let count =
+        match source.selection.items.last() {
+            None => 0,
+            Some(last) => {
+                items.iter().position(|i| &i.id == last).ok_or(
+                    "The original end of this handoff is no longer in the source transcript.",
+                )? + 1
+            }
+        };
+    items.truncate(count);
+    Ok(())
+}
 /// One page of a handoff source for read_ox_thread.
-fn read_page(
+fn read_source_page(
     src: &HandoffSource,
     timeline: &wire::Timeline,
     args: &ReadArgs,
+    frozen: bool,
 ) -> Result<Value, String> {
-    let items = handoff::items(timeline);
+    let mut items = handoff::items(timeline);
+    if frozen {
+        freeze(&mut items, src)?;
+    }
     let view = |i: &handoff::SourceItem| {
         json!({
             "id": i.id,
@@ -1317,6 +1355,7 @@ mod tests {
     #[test]
     fn read_pages_by_item_id_and_returns_whole_items() {
         let src = HandoffSource {
+            history_broker: None,
             host: None,
             scope: Scope {
                 project: "/p".into(),
@@ -1342,17 +1381,23 @@ mod tests {
             after: after.map(Into::into),
             limit,
         };
-        let first = read_page(&src, &t, &args(None, None, 4)).unwrap();
+        let later = timeline(14);
+        let frozen = read_source_page(&src, &later, &args(None, None, 100), true).unwrap();
+        assert_eq!(frozen["source"]["total_items"], 10);
+        assert_eq!(frozen["items"][9]["text"], "text 9");
+        assert!(read_source_page(&src, &later, &args(Some("i11"), None, 1), true).is_err());
+        assert!(read_source_page(&src, &timeline(2), &args(None, None, 1), true).is_err());
+        let first = read_source_page(&src, &t, &args(None, None, 4), false).unwrap();
         assert_eq!(first["items"].as_array().unwrap().len(), 4);
         assert_eq!(first["items"][0]["carried"], true);
         assert_eq!(first["next_after"], "i3");
-        let next = read_page(&src, &t, &args(None, Some("i3"), 100)).unwrap();
+        let next = read_source_page(&src, &t, &args(None, Some("i3"), 100), false).unwrap();
         assert_eq!(next["items"][0]["id"], "i4");
         assert!(next["next_after"].is_null());
-        let one = read_page(&src, &t, &args(Some("i9"), None, 1)).unwrap();
+        let one = read_source_page(&src, &t, &args(Some("i9"), None, 1), false).unwrap();
         assert_eq!(one["items"][0]["text"], "text 9");
         assert_eq!(one["items"][0]["cut_in_handoff"], true);
-        assert!(read_page(&src, &t, &args(Some("nope"), None, 1)).is_err());
-        assert!(read_page(&src, &t, &args(None, Some("nope"), 1)).is_err());
+        assert!(read_source_page(&src, &t, &args(Some("nope"), None, 1), false).is_err());
+        assert!(read_source_page(&src, &t, &args(None, Some("nope"), 1), false).is_err());
     }
 }

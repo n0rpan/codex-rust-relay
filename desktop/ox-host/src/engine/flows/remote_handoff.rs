@@ -3,6 +3,15 @@ use super::*;
 
 impl Engine {
     pub(in crate::engine) fn inspect_handoff_target(&self, client: u64, key: String, scope: Scope) {
+        let owner = format!("handoff:{key}");
+        let recovered = if self.ledger.data.handoffs.iter().any(|r| r.id == key) {
+            None
+        } else {
+            self.workers
+                .all()
+                .find(|(s, _, entry)| *s == &scope && entry.origin.launch == owner)
+                .map(|(_, session, _)| session.to_owned())
+        };
         let mut scopes = self.scope_projects();
         scopes.extend(self.discovered.keys().map(|(s, _)| s.project.clone()));
         let config = self.config.clone();
@@ -43,7 +52,9 @@ impl Engine {
                     );
                 }
                 let window = crate::durable::handoff_window(&windows, &scope.route, catalog_window);
-                Ok(json!({"host":host.to_string(),"repository":repository,"window":window}))
+                Ok(
+                    json!({"host":host.to_string(),"repository":repository,"window":window,"recovered":recovered}),
+                )
             })();
             let _ = tx.send(Message::HandoffTarget(client, key, result));
         });

@@ -214,6 +214,7 @@ fn a_codex_handoff_sends_carried_messages_in_order_before_the_request() {
     ];
     let selection = handoff::select(&items, "NEW request", Some(200_000)).unwrap();
     let source = HandoffSource {
+        history_broker: None,
         host: None,
         scope: Scope {
             project: project.clone(),

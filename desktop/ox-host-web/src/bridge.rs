@@ -250,6 +250,16 @@ impl Access {
                 self.selected = None;
                 true
             }
+            Client::WatchHandoffReads { .. } | Client::FinishHandoffRead { .. } => {
+                self.ready && self.class == crate::admin::DeviceClass::Desktop
+            }
+            Client::ReadHandoffPage { id, scope, .. } => {
+                self.ready
+                    && self.class == crate::admin::DeviceClass::Desktop
+                    && !id.is_empty()
+                    && id.len() <= 96
+                    && self.reachable(app, scope)
+            }
             Client::InspectHandoffTarget { id, scope } => {
                 self.ready && !id.is_empty() && id.len() <= 96 && self.reachable(app, scope)
             }

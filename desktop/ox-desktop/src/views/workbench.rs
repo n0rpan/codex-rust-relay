@@ -81,7 +81,7 @@ pub(in crate::views) enum DeferredRowAction {
 
 pub struct Workbench {
     pub(super) workspace: Option<WeakEntity<crate::app::Workspace>>,
-    pub(super) handoff_pending: bool,
+    pub(super) handoff_pending: Option<String>,
     pub(super) link: HostLink,
     workers: Entity<super::host::WorkerIndex>,
     pub(super) pending_local_command: Option<super::terminal_review::Pending>,
@@ -263,7 +263,7 @@ impl Workbench {
         };
         Self {
             workspace: None,
-            handoff_pending: false,
+            handoff_pending: None,
             link,
             workers,
             enter_sends: cx
@@ -1013,17 +1013,21 @@ impl Workbench {
             });
         let connecting = format!("Connecting to {}…", self.route.runtime.name());
         let sign_in = format!("Sign in to {}", self.route.runtime.account());
-        let status = self.launch_error.as_deref().unwrap_or_else(|| {
-            if self.connecting {
-                return &connecting;
-            }
-            match self.store.as_ref().map(Store::state) {
-                None | Some(Connection::Connecting) => &connecting,
-                Some(Connection::Ready) => "Connected",
-                Some(Connection::SignInRequired) => &sign_in,
-                Some(Connection::Closed(message)) => message,
-            }
-        });
+        let status = self
+            .launch_error
+            .as_deref()
+            .or(self.handoff_pending.as_deref())
+            .unwrap_or_else(|| {
+                if self.connecting {
+                    return &connecting;
+                }
+                match self.store.as_ref().map(Store::state) {
+                    None | Some(Connection::Connecting) => &connecting,
+                    Some(Connection::Ready) => "Connected",
+                    Some(Connection::SignInRequired) => &sign_in,
+                    Some(Connection::Closed(message)) => message,
+                }
+            });
         let title = self
             .store
             .as_ref()

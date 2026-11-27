@@ -3,6 +3,7 @@
 import base64
 import json
 import os
+import re
 import ssl
 import shutil
 import subprocess
@@ -234,12 +235,44 @@ class Fixture(BaseHTTPRequestHandler):
             has_output = any(m["role"] == "tool" for m in req["messages"])
             chunks = [{"role": "assistant"}]
             calls = None
+            n_calls = 1
             naming = b"Name a conversation using its first user message" in body
             if naming:
                 assert not req.get("tools")
                 chunks.append({"content":"Fixture conversation"})
             elif any(m.get("role") == "user" and "model-switch-" in str(m.get("content")) for m in req["messages"]):
                 chunks.append({"content":"fixture complete"})
+            elif self.server.mode == "fleet-advance":
+                chunks.append({"content": "Finished the private source turn."})
+            elif self.server.mode == "fleet-offline" and b"OX-READ-WHILE" in body:
+                last_user = max(i for i,m in enumerate(req["messages"]) if m["role"]=="user")
+                if any(m["role"]=="tool" for m in req["messages"][last_user+1:]):
+                    chunks.append({"content":"Recorded source availability."})
+                else:
+                    name = next(t["function"]["name"] for t in req["tools"] if t["function"]["name"].endswith("read_ox_thread"))
+                    args = {"limit": 1}
+                    calls = (name,args)
+            elif self.server.mode == "fleet-return" and b"Continue on Studio and read the original source" in body:
+                last_user = max(i for i,m in enumerate(req["messages"]) if m["role"]=="user")
+                if any(m["role"]=="tool" for m in req["messages"][last_user+1:]):
+                    chunks.append({"content":"Retrieved the original Studio conversation."})
+                else:
+                    name = next(t["function"]["name"] for t in req["tools"] if t["function"]["name"].endswith("read_ox_thread"))
+                    n_calls = 5
+                    args = {"host":self.server.original_host,"session":self.server.original_session,"limit":100}
+                    calls = (name,args)
+            elif self.server.mode == "fleet-handoff" and b"Continue locally from Studio" in body:
+                last_user = max(n for n, m in enumerate(req["messages"]) if m["role"] == "user")
+                if any(m["role"] == "tool" for m in req["messages"][last_user+1:]):
+                    chunks.append({"content":"Read the source conversation."})
+                else:
+                    name = next(t["function"]["name"] for t in req["tools"] if t["function"]["name"].endswith("read_ox_thread"))
+                    cut = re.search(rb"read_ox_thread item (\S+) returns the full item",body)
+                    assert cut and b"OX_SOURCE_ONLY_END" not in body, "expected a cut Studio message"
+                    args = {"item": cut.group(1).decode()}
+                    calls = (name, args)
+            elif self.server.mode == "fleet-handoff" and has_output and b"Inspect the remote navigation fixture" in body:
+                chunks.append({"content":"Source fixture " + "abcdef"*2300 + " OX_SOURCE_ONLY_END"})
             elif self.server.mode == "linked-parent":
                 if b"OX worker #" in body and b"uncommitted on laptop" in body:
                     (self.server.project / "parent-received-result").touch()
@@ -361,17 +394,17 @@ class Fixture(BaseHTTPRequestHandler):
                     {
                         "tool_calls": [
                             {
-                                "index": 0,
+                                "index": index,
                                 "id": "call-"
                                 + str(
-                                    sum(m["role"] == "tool" for m in req["messages"])
+                                    index + sum(m["role"] == "tool" for m in req["messages"])
                                 ),
                                 "type": "function",
                                 "function": {
                                     "name": name,
                                     "arguments": json.dumps(args),
                                 },
-                            }
+                            } for index in range(n_calls)
                         ]
                     }
                 )

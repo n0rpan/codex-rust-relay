@@ -130,14 +130,23 @@ impl HostLink {
             project: to.project.clone(),
             route: start.route(),
         };
+        let key = serde_json::to_string(&(
+            self.remote().map(|h| (&h.id, h.pairing_id())),
+            to.link.remote().map(|h| h.pairing_id()),
+            &source,
+            &start,
+            &to.id,
+            &target,
+        ))?;
+        let pending = PendingTransfer::reserve(&key)?;
         let mut target_connection = to.link.handoff_connection()?;
         let target_info = handoff_call(
             &mut target_connection,
             Client::InspectHandoffTarget {
-                id: "inspect-handoff".into(),
+                id: pending.id.clone(),
                 scope: target.clone(),
             },
-            "inspect-handoff",
+            &pending.id,
             || {},
         )?;
         if target_info["host"].as_str() != Some(to.id.as_str())
@@ -147,14 +156,10 @@ impl HostLink {
                 "The selected host or checkout changed. Choose the destination again.",
             ));
         }
-        let key = serde_json::to_string(&(
-            self.remote().map(|h| &h.id),
-            &source,
-            &start,
-            &to.id,
-            &target,
-        ))?;
-        let pending = PendingTransfer::reserve(&key)?;
+        if let Some(session) = target_info["recovered"].as_str() {
+            pending.finish()?;
+            return Ok((target, session.to_owned()));
+        }
         let mut source_connection = self.handoff_connection()?;
         let request = Client::PrepareRemoteHandoff {
             id: pending.id.clone(),
@@ -163,12 +168,9 @@ impl HostLink {
             target_host: to.id.clone(),
             window: target_info["window"].as_u64(),
         };
-        let packet: ox_desk_core::handoff::HandoffTransfer = serde_json::from_value(handoff_call(
-            &mut source_connection,
-            request,
-            &pending.id,
-            || {},
-        )?)?;
+        let mut packet: ox_desk_core::handoff::HandoffTransfer = serde_json::from_value(
+            handoff_call(&mut source_connection, request, &pending.id, || {})?,
+        )?;
         if packet.id != pending.id
             || packet.target_host != to.id
             || packet.start.route() != target.route
@@ -178,6 +180,8 @@ impl HostLink {
                 "The source or destination checkout changed. Choose the destination again.",
             ));
         }
+        packet.source.history_broker = Some(history::binding(&to.link)?);
+        let receipt = history::record(self, &to.link, &packet)?;
         let request = Client::ReceiveRemoteHandoff {
             id: "receive-handoff".into(),
             scope: target.clone(),
@@ -192,6 +196,7 @@ impl HostLink {
         let result = match result {
             Ok(result) => result,
             Err(e) if e.kind() == io::ErrorKind::Other => {
+                let _ = std::fs::remove_file(receipt);
                 pending.finish()?;
                 return Err(e);
             }
@@ -287,7 +292,8 @@ fn handoff_call(
     key: &str,
     mut on_approval: impl FnMut(),
 ) -> io::Result<serde_json::Value> {
-    socket.set_read_timeout(Some(Duration::from_secs(300)))?;
+    let timeout = if key == "history" { 60 } else { 300 };
+    socket.set_read_timeout(Some(Duration::from_secs(timeout)))?;
     write_frame(socket, &request)?;
     loop {
         match read_frame(reader)? {
@@ -296,7 +302,7 @@ fn handoff_call(
                 result: Some(result),
                 ..
             } if id == key => {
-                if result["awaiting_approval"] == true {
+                if key == "receive-handoff" && result["awaiting_approval"] == true {
                     socket.set_read_timeout(None)?;
                     on_approval();
                 } else {
@@ -736,7 +742,9 @@ impl HostLink {
     }
 }
 mod catalog;
+mod history;
 pub(crate) use catalog::{CatalogEvent, CatalogWatch};
+pub(crate) use history::clean_handoff_pairings;
 
 #[cfg(test)]
 mod process_monitor_tests {

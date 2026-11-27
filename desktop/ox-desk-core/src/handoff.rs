@@ -453,6 +453,9 @@ pub fn select(
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HandoffSource {
+    /// Digest of the desktop relay key for this destination pairing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_broker: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<SourceHost>,
     pub scope: Scope,
@@ -1009,6 +1012,7 @@ mod tests {
 
     fn source(refs: SelectionRefs) -> HandoffSource {
         HandoffSource {
+            history_broker: None,
             host: None,
             scope: Scope {
                 project: "/p".into(),
@@ -1076,6 +1080,7 @@ mod tests {
     ) -> (Vec<SourceItem>, Earlier, String) {
         let selection = select_chained(items, request, Some(200_000), earlier).unwrap();
         let source = HandoffSource {
+            history_broker: None,
             host: None,
             scope: Scope {
                 project: "/p".into(),

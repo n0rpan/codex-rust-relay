@@ -31,6 +31,7 @@ pub(super) fn handoff_start(choice: &Choice, request: &str) -> Result<HandoffSta
 }
 
 pub(super) struct HandoffReady {
+    pub source_session: String,
     pub registration: gpui::EntityId,
     pub host: Option<String>,
     pub scope: Scope,
@@ -55,25 +56,29 @@ impl Workbench {
         cx: &App,
     ) -> Result<Option<HandoffDestination>, String> {
         let destinations = self.handoff_destinations(cx);
+        let local_alias = selector.eq_ignore_ascii_case("local");
         let mut found = destinations.into_iter().filter(|h| {
+            if local_alias {
+                return h.link.remote().is_none();
+            }
             h.name.eq_ignore_ascii_case(selector)
                 || (selector.len() >= 4 && h.id.starts_with(selector))
                 || h.link
                     .remote()
                     .is_some_and(|r| r.name.eq_ignore_ascii_case(selector))
-                || (selector == "local" && h.link.remote().is_none())
         });
         let current = self.link.remote();
-        let local_alias = selector.eq_ignore_ascii_case("local");
-        let current_matches = (local_alias && current.is_none())
-            || current.is_some_and(|h| {
+        let current_matches = if local_alias {
+            current.is_none()
+        } else {
+            current.is_some_and(|h| {
                 h.name.eq_ignore_ascii_case(selector)
                     || (selector.len() >= 4 && h.id.starts_with(selector))
-            })
-            || self
+            }) || self
                 .host_caption
                 .as_ref()
-                .is_some_and(|name| name.eq_ignore_ascii_case(selector));
+                .is_some_and(|name| name.eq_ignore_ascii_case(selector))
+        };
         let Some(selected) = found.next() else {
             return if current_matches {
                 Ok(None)
@@ -96,7 +101,7 @@ impl Workbench {
         to: HandoffDestination,
         cx: &mut Context<Self>,
     ) {
-        if self.handoff_pending {
+        if self.handoff_pending.is_some() {
             return;
         }
         if !self.handoff_destinations(cx).iter().any(|h| {
@@ -131,10 +136,12 @@ impl Workbench {
             route: start.route(),
         };
         let approval_host = host.clone();
+        let approval_source = owner.clone();
         cx.spawn(async move |this, cx| {
             if notices.recv_async().await.is_ok() {
                 let _ = this.update(cx, |_, cx| {
                     cx.emit(HandoffReady {
+                        source_session: approval_source,
                         registration,
                         host: approval_host,
                         scope: approval_scope,
@@ -144,8 +151,8 @@ impl Workbench {
             }
         })
         .detach();
-        self.handoff_pending = true;
-        self.launch_error = Some(format!("Starting handoff on {}…", to.name));
+        self.handoff_pending = Some(format!("Starting handoff on {}…", to.name));
+        self.launch_error = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -156,7 +163,7 @@ impl Workbench {
                 })
                 .await;
             let _ = this.update(cx, |s, cx| {
-                s.handoff_pending = false;
+                s.handoff_pending = None;
                 match result {
                     Ok((scope, session)) => {
                         if initial_draft.as_ref().is_some_and(|draft| {
@@ -168,7 +175,7 @@ impl Workbench {
                             s.action(
                                 cx,
                                 ox_desk_core::actions::Action::DraftEdit(
-                                    Some(owner),
+                                    Some(owner.clone()),
                                     String::new(),
                                 ),
                             );
@@ -176,6 +183,7 @@ impl Workbench {
                         s.close_launch(cx);
                         s.launch_error = None;
                         cx.emit(HandoffReady {
+                            source_session: owner,
                             registration,
                             host,
                             scope,

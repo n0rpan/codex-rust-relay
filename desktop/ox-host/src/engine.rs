@@ -188,6 +188,7 @@ struct Preparing {
 }
 /// A read_ox_thread call waiting for its source transcript to load.
 struct Reading {
+    frozen: bool,
     scope: Scope,
     session: String,
     source: Box<ox_desk_core::handoff::HandoffSource>,
@@ -343,6 +344,7 @@ pub(crate) struct Engine {
     mode_requests: BTreeMap<u64, mode_requests::ModeRequest>,
     preparing: Vec<Preparing>,
     reading: Vec<Reading>,
+    relays: flows::history::Relays,
     forward: forwarding::State,
     host_queries: HashMap<PathBuf, Vec<HostQuery>>,
     in_flows: bool,
@@ -432,6 +434,7 @@ impl Engine {
             mode_requests: Default::default(),
             preparing: Default::default(),
             reading: Default::default(),
+            relays: Default::default(),
             forward: Default::default(),
             host_queries: Default::default(),
             in_flows: false,
@@ -473,6 +476,7 @@ impl Engine {
                         .filter(|at| *at > Instant::now()),
                 )
                 .chain(self.reading.iter().map(|r| r.deadline))
+                .chain(self.relays.deadline())
                 .chain(self.draining)
                 .chain(
                     self.clients
@@ -631,6 +635,7 @@ impl Engine {
                 }
                 Some(Message::Disconnect(id)) => {
                     self.clients.remove(&id);
+                    self.drop_history_relay(id)?;
                     self.withdraw_activations(|request| matches!(
                         &request.activation, mode_requests::Activation::RemoteHandoff { client, .. } if *client == id
                     ), "The desktop disconnected before approving the handoff.")?;
@@ -776,6 +781,7 @@ impl Engine {
                 capabilities.push("worker_inventory".into());
                 capabilities.push("worker_placement".into());
                 capabilities.push("remote_handoff".into());
+                capabilities.push("handoff_history".into());
                 capabilities.push("linked_read_workers".into());
                 capabilities.push("linked_write_workers".into());
                 if prepared.is_some() {
@@ -907,6 +913,34 @@ impl Engine {
                 }
                 self.subscribe(id, scope, after)
             }
+            Client::WatchHandoffReads { proof } => {
+                if self
+                    .clients
+                    .get(&id)
+                    .is_some_and(|c| c.surface == Some(ox_desk_core::surface::Surface::Desktop))
+                {
+                    self.relays.watch(id, &proof);
+                }
+                Ok(())
+            }
+            Client::ReadHandoffPage {
+                id: key,
+                broker,
+                source_host,
+                target_host,
+                scope,
+                transfer,
+                page,
+            } => self.serve_history(
+                Replier::Client(id, key),
+                &source_host,
+                &target_host,
+                &scope,
+                &transfer,
+                page,
+                broker.as_deref(),
+            ),
+            Client::FinishHandoffRead { token, result } => self.finish_history(id, &token, result),
             Client::InspectHandoffTarget { id: key, scope } => {
                 self.inspect_handoff_target(id, key, scope);
                 Ok(())
@@ -6481,6 +6515,7 @@ mod tests {
                 let mut o = origin(workers_parent(from, session), Ceiling::Write);
                 o.relation = ox_desk_core::origin::Relation::Handoff;
                 o.handoff = Some(Box::new(ox_desk_core::handoff::HandoffSource {
+                    history_broker: None,
                     host: None,
                     scope: Scope {
                         project: project.to_owned(),

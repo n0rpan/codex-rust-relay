@@ -64,6 +64,16 @@ impl HostLink {
                     if resources && caps.iter().any(|cap| cap == "host_status") {
                         write_frame(&mut stream, &Client::WatchHost)?;
                     }
+                    let history = resources && caps.iter().any(|c| c == "handoff_history");
+                    if history {
+                        write_frame(
+                            &mut stream,
+                            &Client::WatchHandoffReads {
+                                proof: super::history::broker_key(&link)?,
+                            },
+                        )?;
+                    }
+                    let stream = Arc::new(Mutex::new(stream));
                     let emit = |event| tx.send(event).map_err(io::Error::other);
                     let has_projects = resources && caps.iter().any(|c| c == "project_directory");
                     let request_projects = |stream: &mut UnixStream| {
@@ -81,19 +91,34 @@ impl HostLink {
                     let mut pending_projects = has_projects;
                     let mut project_refresh = std::time::Instant::now();
                     if has_projects {
-                        request_projects(&mut stream)?;
+                        request_projects(&mut stream.lock().unwrap())?;
                     } else if resources {
                         emit(CatalogEvent::Projects(None))?;
                     }
                     loop {
                         match read_frame(&mut input)? {
+                            Server::RelayHandoffRead {
+                                token,
+                                transfer,
+                                target_host,
+                                page,
+                            } if history => {
+                                super::history::relay(
+                                    stream.clone(),
+                                    link.clone(),
+                                    token,
+                                    target_host,
+                                    transfer,
+                                    page,
+                                )?;
+                            }
                             Server::HostStatus { host } => {
                                 emit(CatalogEvent::Host(host))?;
                                 if has_projects
                                     && !pending_projects
                                     && project_refresh.elapsed() >= Duration::from_secs(25)
                                 {
-                                    request_projects(&mut stream)?;
+                                    request_projects(&mut stream.lock().unwrap())?;
                                     pending_projects = true;
                                     project_refresh = std::time::Instant::now();
                                 }

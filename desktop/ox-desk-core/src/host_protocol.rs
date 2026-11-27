@@ -56,6 +56,23 @@ pub enum Client {
         id: String,
         project: PathBuf,
     },
+    WatchHandoffReads {
+        proof: String,
+    },
+    ReadHandoffPage {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        broker: Option<String>,
+        source_host: String,
+        target_host: String,
+        scope: Scope,
+        transfer: String,
+        page: HandoffPage,
+    },
+    FinishHandoffRead {
+        token: String,
+        result: Result<Value, String>,
+    },
     InspectHandoffTarget {
         id: String,
         scope: Scope,
@@ -162,6 +179,24 @@ pub fn version_mismatch(host: u32, client: u32) -> String {
     }
 }
 
+/// A position in the conversation selected by the operator for a handoff.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct HandoffPage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ancestor: Option<HistoryRef>,
+    pub item: Option<String>,
+    pub after: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct HistoryRef {
+    pub host: String,
+    pub session: String,
+}
+
 /// A checkout query revalidates a specific known path after a user selects it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -189,6 +224,12 @@ pub struct ProjectDirectory {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Server {
+    RelayHandoffRead {
+        token: String,
+        transfer: String,
+        target_host: String,
+        page: HandoffPage,
+    },
     HostStatus {
         host: HostInfo,
     },

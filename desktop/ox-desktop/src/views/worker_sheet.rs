@@ -642,7 +642,9 @@ impl Workbench {
                         draft.destination.is_none(),
                         true,
                         cx.listener(|s, _, _, cx| {
-                            if let Some(Launch::Handoff(d)) = &mut s.launch {
+                            if let Some(Launch::Handoff(d)) = &mut s.launch
+                                && d.destination.is_some()
+                            {
                                 d.destination = None;
                                 d.choice.model = None;
                                 d.choice.error = None;
@@ -724,13 +726,13 @@ impl Workbench {
             .child(button(
                 p,
                 "launch-submit",
-                if self.handoff_pending && kind == LaunchKind::Handoff {
+                if self.handoff_pending.is_some() && kind == LaunchKind::Handoff {
                     "Starting…"
                 } else {
                     submit
                 },
                 true,
-                !self.handoff_pending || kind != LaunchKind::Handoff,
+                self.handoff_pending.is_none() || kind != LaunchKind::Handoff,
                 cx.listener(|s, _, _, cx| s.submit_launch(cx)),
             ));
         let frame = col()
