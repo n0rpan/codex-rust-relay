@@ -506,8 +506,13 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
             }
             admit(&node)?;
             let mut teardown_old = false;
-            if prior.enabled
-                && (prior.origin.as_ref() != Some(&node.origin) || prior.port != loopback_port)
+            let old_https = prior
+                .https_port
+                .or_else(|| prior.origin.as_deref().and_then(crate::serve::https_port));
+            let changing_https = old_https.is_some_and(|old| old != https_port);
+            if (prior.enabled
+                && (prior.origin.as_ref() != Some(&node.origin) || prior.port != loopback_port))
+                || changing_https
             {
                 if prior.port != loopback_port {
                     // Verify the replacement loopback port is free before tearing down
@@ -523,9 +528,7 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
                             }
                         })?;
                 }
-                if let Some(old_https) = prior
-                    .https_port
-                    .or_else(|| prior.origin.as_deref().and_then(crate::serve::https_port))
+                if let Some(old_https) = old_https
                     && old_https != https_port
                 {
                     let old_loopback = if prior.port != 0 { prior.port } else { PORT };
@@ -564,7 +567,7 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
                         }
                     }
                 }
-                if !teardown_old {
+                if !teardown_old && (prior.enabled || prior.origin.is_some()) {
                     prior = request(Request::Disable)?;
                 }
             }
