@@ -121,6 +121,7 @@ pub struct Workbench {
     pub(super) stats: Option<Stats>,
     pub(super) wake: flume::Sender<()>,
     waiting_frame: Option<flume::Sender<()>>,
+    pub(super) focus_editor_for: Option<Option<String>>,
     pub(super) editors: HashMap<Option<String>, Entity<gpui_component::input::TextareaState>>,
     pub(super) focused_ask: Option<ox_desk_core::runtime::RequestId>,
     pub(super) answer_fields:
@@ -302,6 +303,7 @@ impl Workbench {
             fire: None,
             focused_ask: None,
             mascot_frame: 0,
+            focus_editor_for: None,
             editors: HashMap::new(),
             answer_fields: HashMap::new(),
             transcript_views: HashMap::new(),
@@ -889,6 +891,9 @@ impl Workbench {
         current_activity(store).or(self.finale.as_ref().map(|(_, scene)| (*scene, 0)))
     }
     pub(super) fn set_front(&mut self, front: bool, cx: &mut Context<Self>) {
+        if !front {
+            self.focus_editor_for = None;
+        }
         self.front = front;
         if let Some(store) = &mut self.store {
             store.set_front(front);
@@ -907,6 +912,9 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !front {
+            self.focus_editor_for = None;
+        }
         self.front = front;
         if let Some(store) = &mut self.store {
             store.set_front(front);

@@ -364,6 +364,9 @@ impl HostLink {
 pub(crate) type CatalogResult = (Vec<(Scope, ThreadRow)>, Vec<String>);
 impl HostLink {
     pub(crate) fn discover(&self) -> io::Result<CatalogResult> {
+        self.discover_rows(false)
+    }
+    pub(crate) fn discover_rows(&self, available_only: bool) -> io::Result<CatalogResult> {
         let (mut input, mut socket, _) = self.handshake()?;
         write_frame(
             &mut socket,
@@ -381,6 +384,9 @@ impl HostLink {
                 } if id == "catalog" => {
                     rows.extend(
                         page.iter()
+                            .filter(|view| {
+                                !available_only || view.capabilities.iter().any(|c| c == "open")
+                            })
                             .filter_map(replica::row)
                             .map(|row| (scope.clone(), row)),
                     );

@@ -135,7 +135,10 @@ fn new_route_gate(
     }
 }
 
+impl EventEmitter<crate::app::fleet::EnsureInventory> for Host {}
+impl EventEmitter<crate::app::fleet::Destination> for Host {}
 pub struct Host {
+    pub(crate) workspace: Option<WeakEntity<crate::app::Workspace>>,
     link: platform::HostLink,
     palette: Option<palette::State>,
     _palette_keys: Subscription,
@@ -272,6 +275,7 @@ impl Host {
         .detach();
 
         let mut host = Self {
+            workspace: None,
             link: link.clone(),
             palette: None,
             sidebar_visible: !layout.sidebar_hidden,
@@ -1536,34 +1540,74 @@ impl Host {
         }
         cx.notify();
     }
+    pub(crate) fn sidebar_state(&self) -> &SidebarState {
+        &self.sidebar
+    }
     pub(crate) fn paired_with(&self, host: &crate::platform::hosts::SavedHost) -> bool {
         self.link
             .remote()
             .is_some_and(|other| host.same_pairing(other))
     }
+    pub(crate) fn focus_selection(&mut self, cx: &mut Context<Self>) {
+        self.panes[self.active].update(cx, |pane, cx| {
+            pane.focus_editor_for = Some(
+                pane.store
+                    .as_ref()
+                    .and_then(|s| s.selected())
+                    .map(str::to_owned),
+            );
+            cx.notify();
+        });
+    }
     pub(crate) fn show_thread(
         &mut self,
         scope: ox_desk_core::host_protocol::Scope,
         id: Option<String>,
+        row: Option<ThreadRow>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(id) = id else {
             self.open(scope.project, scope.route, window, cx);
-            self.panes[self.active].update(cx, |pane, cx| pane.action(cx, DeskAction::NewDraft));
+            self.panes[self.active].update(cx, |pane, cx| {
+                pane.focus_editor_for = Some(None);
+                pane.action(cx, DeskAction::NewDraft)
+            });
             return;
         };
-        let owner = self.panes[self.active].clone();
-        self.open_thread(
-            &owner,
-            ParentLink {
-                project: scope.project,
-                route: Some(scope.route),
-                id,
-                title: None,
-            },
+        self.with_project_dir(
+            scope.project,
+            false,
             window,
             cx,
+            move |s, project, w, cx| {
+                let row = row.unwrap_or_else(|| ThreadRow {
+                    id: id.clone(),
+                    cwd: project.clone(),
+                    model_provider: String::new(),
+                    worker: false,
+                    parent_thread_id: None,
+                    agent_nickname: None,
+                    model: None,
+                    name: None,
+                    preview: String::new(),
+                    generated_title: None,
+                    updated_at: 0,
+                    status: None,
+                    unread: false,
+                    activity_order: 0,
+                });
+                s.clear_row_unread(
+                    &ThreadMetaKey::new(project.clone(), scope.route.runtime, id),
+                    cx,
+                );
+                let selected = row.id.clone();
+                s.open_catalog(project, row, scope.route, w, cx);
+                s.panes[s.active].update(cx, |pane, cx| {
+                    pane.focus_editor_for = Some(Some(selected));
+                    cx.notify();
+                });
+            },
         );
     }
     fn open_catalog(
@@ -1678,6 +1722,17 @@ impl Host {
         });
     }
 
+    fn clear_row_unread(&mut self, key: &ThreadMetaKey, cx: &mut Context<Self>) {
+        if self
+            .sidebar
+            .thread(key)
+            .and_then(|m| m.unread_override)
+            .is_some()
+        {
+            self.sidebar.set_unread_override(key, None);
+            self.save_sidebar(cx);
+        }
+    }
     fn activate_row_then(
         &mut self,
         project: PathBuf,
@@ -1689,15 +1744,7 @@ impl Host {
     ) {
         let id = row.id.clone();
         let mkey = ThreadMetaKey::new(project.clone(), scope.runtime, id.clone());
-        if self
-            .sidebar
-            .thread(&mkey)
-            .and_then(|m| m.unread_override)
-            .is_some()
-        {
-            self.sidebar.set_unread_override(&mkey, None);
-            self.save_sidebar(cx);
-        }
+        self.clear_row_unread(&mkey, cx);
         let (route, _) = self.project_row_state(&project, &row, scope, cx);
         if let Some(route) = route {
             self.open_catalog(project, row, route, window, cx);

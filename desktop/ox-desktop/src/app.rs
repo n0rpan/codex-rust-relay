@@ -1,5 +1,5 @@
 //! Release the session tree if a desktop view fails while building a frame.
-mod fleet;
+pub(crate) mod fleet;
 use crate::{appearance::Palette, kit, views::host::Host};
 use gpui::*;
 use std::{
@@ -68,6 +68,10 @@ pub struct Workspace {
     error: Option<String>,
     inventory: std::collections::HashMap<Option<String>, Entity<fleet::Inventory>>,
     page: Option<fleet::Page>,
+    navigation_revision: u64,
+    scoped_search: bool,
+    searching: bool,
+    search_return: Option<FocusHandle>,
     filter: Entity<gpui_component::input::InputState>,
     _failure: Subscription,
     _updates: Subscription,
@@ -99,13 +103,73 @@ impl Workspace {
             w,
             cx,
         );
-        cx.subscribe(
+        cx.subscribe_in(
             &filter,
-            |_, _, _: &gpui_component::input::InputEvent, cx| cx.notify(),
+            w,
+            |s, _, event: &gpui_component::input::InputEvent, w, cx| {
+                if matches!(event, gpui_component::input::InputEvent::PressEnter { .. }) {
+                    let page = s
+                        .page
+                        .filter(|_| !s.searching)
+                        .unwrap_or(fleet::Page::Sessions);
+                    if let Some(row) = s.page_rows(page, cx).into_iter().find(|r| r.online) {
+                        s.open_destination(&row.target, w, cx);
+                    }
+                }
+                cx.notify();
+            },
         )
+        .detach();
+        let owner = cx.weak_entity();
+        let window_id = w.window_handle().window_id();
+        let bindings = crate::keymap::bindings(cx);
+        cx.intercept_keystrokes(move |event, w, cx| {
+            if w.window_handle().window_id() != window_id || w.default_prevented() {
+                return;
+            }
+            let key = &event.keystroke;
+            let toggle = bindings.iter().any(|(binding, cmd)| {
+                *cmd == ox_desk_core::keys::Command::Palette
+                    && binding.key == key.key
+                    && binding.modifiers == key.modifiers
+            });
+            let escape = key.modifiers == Modifiers::default() && key.key == "escape";
+            if !toggle && !escape {
+                return;
+            }
+            let _ = owner.update(cx, |s, cx| {
+                if s.visible_host().is_some() || (!toggle && !s.searching) {
+                    return;
+                }
+                if s.searching {
+                    if s.filter
+                        .update(cx, |f, cx| f.marked_text_range(w, cx).is_some())
+                    {
+                        return;
+                    }
+                    s.searching = false;
+                    if let Some(focus) = s.search_return.take() {
+                        focus.focus(w, cx);
+                    }
+                } else {
+                    s.search_return = w.focused(cx);
+                    s.searching = true;
+                    s.ensure_library(None, cx);
+                    let field = s.filter.clone();
+                    w.on_next_frame(move |w, cx| field.read(cx).focus_handle(cx).focus(w, cx));
+                }
+                w.prevent_default();
+                cx.stop_propagation();
+                cx.notify();
+            });
+        })
         .detach();
         let mut workspace = Self {
             inventory: Default::default(),
+            navigation_revision: 0,
+            scoped_search: false,
+            searching: false,
+            search_return: None,
             page: None,
             filter,
             local,
@@ -132,6 +196,9 @@ impl Workspace {
                 cx.notify();
             }),
         };
+        if let Some(host) = &workspace.local {
+            workspace.attach_host(host, w, cx);
+        }
         workspace.sync_inventory(cx);
         if restore_host
             && let Ok(Some(id)) =
@@ -147,7 +214,49 @@ impl Workspace {
         }
         workspace
     }
+    fn attach_host(&self, view: &Entity<Host>, w: &mut Window, cx: &mut Context<Self>) {
+        let workspace = cx.entity();
+        view.update(cx, |host, cx| {
+            host.workspace = Some(workspace.downgrade());
+            cx.observe(&workspace, |host, workspace, cx| {
+                if workspace.read(cx).visible_host().map(Entity::entity_id) != Some(cx.entity_id())
+                {
+                    host.hide_palette(cx);
+                }
+            })
+            .detach();
+        });
+        cx.subscribe(view, |s, _, request: &fleet::EnsureInventory, cx| {
+            s.ensure_library(Some(&fleet::Query::parse(&request.query)), cx);
+        })
+        .detach();
+        cx.subscribe_in(view, w, |s, _, target: &fleet::Destination, w, cx| {
+            s.open_destination(target, w, cx)
+        })
+        .detach();
+    }
+    pub(crate) fn visible_host(&self) -> Option<&Entity<Host>> {
+        if self.searching || self.settings.is_some() || self.page.is_some() {
+            return None;
+        }
+        match &self.active {
+            Some(id) => self.hosts.get(id),
+            None => self.local.as_ref(),
+        }
+    }
+    pub(crate) fn navigation_revision(&self) -> u64 {
+        self.navigation_revision
+    }
+    fn fleet_changed(&mut self, cx: &mut Context<Self>) {
+        self.navigation_revision = self.navigation_revision.wrapping_add(1);
+        if let Some(view) = self.visible_host() {
+            gpui::App::notify(cx, view.entity_id());
+        }
+        cx.notify();
+    }
     fn set_active(&mut self, id: Option<String>) {
+        self.searching = false;
+        self.search_return = None;
         if self.active != id {
             crate::workspace_state::remember_host(id.clone());
             self.active = id;
@@ -160,6 +269,8 @@ impl Workspace {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.searching = false;
+        self.search_return = None;
         self.settings = None;
         self.page = None;
         self.error = None;
@@ -217,6 +328,7 @@ impl Workspace {
         let layouts = crate::workspace_state::read_preference(&link.state_file("layout.json"))
             .unwrap_or_default();
         let view = cx.new(|cx| Host::new(link, Some(route), path, layouts, None, false, w, cx));
+        self.attach_host(&view, w, cx);
         self.hosts.insert(id.clone(), view);
         self.set_active(Some(id));
         self.settings = None;
@@ -236,6 +348,8 @@ impl Render for Workspace {
                 .or(self.local.as_ref());
             if saved.is_empty()
                 && self.settings.is_none()
+                && !self.searching
+                && self.page.is_none()
                 && let Some(host) = active
                 && let Some(banner) = crate::updates::banner(p, cx)
             {
@@ -247,6 +361,8 @@ impl Render for Workspace {
             }
             if saved.is_empty()
                 && self.settings.is_none()
+                && !self.searching
+                && self.page.is_none()
                 && let Some(host) = active
             {
                 return host.clone().into_any_element();
@@ -296,11 +412,16 @@ impl Render for Workspace {
                         self.page == Some(page),
                         true,
                         cx.listener(move |s, _, _, cx| {
+                            s.searching = false;
+                            s.search_return = None;
                             s.page = if s.page == Some(page) {
                                 None
                             } else {
                                 Some(page)
                             };
+                            for host in s.inventory.values() {
+                                host.update(cx, |h, cx| h.load_saved(cx));
+                            }
                             s.settings = None;
                             cx.notify();
                         }),
@@ -314,6 +435,8 @@ impl Render for Workspace {
                 self.settings.is_some(),
                 true,
                 cx.listener(|s, _, w, cx| {
+                    s.searching = false;
+                    s.search_return = None;
                     s.page = None;
                     s.settings = if s.settings.is_some() {
                         None
@@ -331,7 +454,9 @@ impl Render for Workspace {
             if let Some(error) = &self.error {
                 view = view.child(kit::small(p, error.clone()));
             }
-            if let Some(settings) = &self.settings {
+            if self.searching {
+                view = view.child(self.fleet_view(fleet::Page::Sessions, cx));
+            } else if let Some(settings) = &self.settings {
                 view = view.child(
                     div()
                         .id("manage-hosts-pane")

@@ -13,13 +13,19 @@ struct Host {
     resources: Option<HostResources>,
 }
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum OfferedRoute {
+    Known(Route),
+    Other(serde::de::IgnoredAny),
+}
+#[derive(Deserialize)]
 struct Entry {
     host: Host,
     parent_host: bool,
     paired_name: Option<String>,
     status: String,
     #[serde(default)]
-    routes: Vec<serde_json::Value>,
+    routes: Vec<OfferedRoute>,
 }
 #[derive(Deserialize)]
 struct Inventory {
@@ -106,10 +112,13 @@ impl Picker {
                     matches!(self.target.as_str(), "auto" | "project") || self.target == e.host.id
                 })
                 .flat_map(|e| e.routes.iter())
-                .filter_map(|v| serde_json::from_value::<Route>(v.clone()).ok())
+                .filter_map(|route| match route {
+                    OfferedRoute::Known(route) => Some(route),
+                    OfferedRoute::Other(_) => None,
+                })
                 .filter(|r| r.runtime == runtime)
-                .filter_map(|r| match r.billing {
-                    Billing::Api(alias) => Some(alias),
+                .filter_map(|r| match &r.billing {
+                    Billing::Api(alias) => Some(alias.clone()),
                     _ => None,
                 })
                 .collect::<std::collections::BTreeSet<_>>()

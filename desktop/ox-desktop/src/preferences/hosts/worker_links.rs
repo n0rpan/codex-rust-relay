@@ -4,7 +4,7 @@ use super::*;
 use ox_desk_core::modes::Level;
 use ox_host_web::admin::{self, WorkerGrant, WorkerLinkAction as Action};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 
 #[derive(Deserialize)]
 struct Target {
@@ -24,16 +24,24 @@ fn local(request: admin::Request) -> io::Result<admin::Reply> {
     ox_host_web::access::status(&paths).map_err(io::Error::other)?;
     admin::request(&paths.state_dir, &request)
 }
-fn call(host: Option<&SavedHost>, command: Action) -> io::Result<Value> {
-    match host {
+#[derive(Deserialize)]
+struct LinkChange {
+    revoked: Option<bool>,
+}
+fn call<T: serde::de::DeserializeOwned>(
+    host: Option<&SavedHost>,
+    command: Action,
+) -> io::Result<T> {
+    let reply = match host {
         Some(h) => h.settings(json!(command)),
         None => local(admin::Request::WorkerLinks { command })?
             .worker_links
             .ok_or_else(|| io::Error::other("Update the host to manage its worker links.")),
-    }
+    }?;
+    Ok(serde_json::from_value(reply)?)
 }
 fn directory(host: Option<&SavedHost>) -> io::Result<Directory> {
-    Ok(serde_json::from_value(call(host, Action::WorkerLinks)?)?)
+    call(host, Action::WorkerLinks)
 }
 
 impl Hosts {
@@ -42,8 +50,8 @@ impl Hosts {
         self.work(cx, move || {
             let mut message = String::new();
             if !matches!(command, Action::WorkerLinks) {
-                let result = call(selected.as_ref(), command)?;
-                if result["revoked"] == false { message = "Removed here. Revoke the incoming link on the other host when it is reachable.".into(); }
+                let result:LinkChange = call(selected.as_ref(), command)?;
+                if result.revoked == Some(false) { message = "Removed here. Revoke the incoming link on the other host when it is reachable.".into(); }
             }
             Ok((directory(selected.as_ref())?, message))
         }, |s, (links, message), _| { s.links = Some(links); s.notice = message; })
@@ -160,7 +168,10 @@ impl Hosts {
                     s.work(
                         cx,
                         move || {
-                            call(selected.as_ref(), Action::AddWorkerLink { address, code })?;
+                            call::<serde::de::IgnoredAny>(
+                                selected.as_ref(),
+                                Action::AddWorkerLink { address, code },
+                            )?;
                             directory(selected.as_ref())
                         },
                         move |s, links, cx| {

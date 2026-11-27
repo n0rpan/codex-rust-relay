@@ -3,9 +3,29 @@ use crate::appearance::Step;
 use crate::kit::{DropdownMenu, PopupMenuItem};
 use crate::{appearance::Palette, col, kit::button, row};
 use gpui::{prelude::FluentBuilder, *};
-use gpui_component::input::{InputEvent, TextareaState};
+use gpui_component::{
+    button::ButtonVariants,
+    input::{InputEvent, TextareaState},
+};
 use ox_desk_core::actions::Action as DeskAction;
 use ox_desk_core::runtime::Access;
+
+pub(super) fn typed_launch(owner: &str, text: &str) -> Option<Result<DeskAction, String>> {
+    use ox_desk_core::modes::{Level, ModeRequest};
+    let yolo = ModeRequest::Level(Level::Yolo);
+    if let Some(result) = ox_desk_core::handoff::HandoffStart::parse_command(owner, text) {
+        return Some(result.map(|mut start| {
+            start.yolo_confirmed = start.mode == yolo;
+            DeskAction::StartHandoff(start)
+        }));
+    }
+    ox_desk_core::origin::WorkerStart::parse_command(owner, text).map(|result| {
+        result.map(|mut start| {
+            start.yolo_confirmed = start.permission == Some(yolo);
+            DeskAction::StartWorker(start)
+        })
+    })
+}
 
 impl Workbench {
     fn send_input(&mut self, owner: Option<&str>, cx: &mut Context<Self>) {
@@ -24,38 +44,10 @@ impl Workbench {
             return;
         }
         let id = owner.map(str::to_owned);
-        if let Some(source) = owner
-            && let Some(start) =
-                ox_desk_core::handoff::HandoffStart::parse_command(source, store.draft(owner))
-        {
-            match start {
-                Ok(mut start) => {
-                    // Typing `--mode yolo` is the explicit YOLO confirmation on the desktop.
-                    start.yolo_confirmed = start.mode
-                        == ox_desk_core::modes::ModeRequest::Level(
-                            ox_desk_core::modes::Level::Yolo,
-                        );
-                    self.action(cx, DeskAction::StartHandoff(start));
-                    self.action(cx, DeskAction::DraftEdit(id, String::new()));
-                }
-                Err(message) => {
-                    self.launch_error = Some(message);
-                    cx.notify();
-                }
-            }
-            return;
-        }
-        if let Some(parent) = owner
-            && let Some(start) =
-                ox_desk_core::origin::WorkerStart::parse_command(parent, store.draft(owner))
-        {
-            match start {
-                Ok(mut start) => {
-                    start.yolo_confirmed = start.permission
-                        == Some(ox_desk_core::modes::ModeRequest::Level(
-                            ox_desk_core::modes::Level::Yolo,
-                        ));
-                    self.action(cx, DeskAction::StartWorker(start));
+        if let Some(result) = owner.and_then(|id| typed_launch(id, store.draft(owner))) {
+            match result {
+                Ok(action) => {
+                    self.action(cx, action);
                     self.action(cx, DeskAction::DraftEdit(id, String::new()));
                 }
                 Err(message) => {
@@ -190,6 +182,10 @@ impl Workbench {
             });
         }
         let is_command = draft.trim_start().starts_with('/');
+        if self.focus_editor_for.as_ref() == Some(&selected) {
+            self.focus_editor_for = None;
+            editor.read(cx).focus_handle(cx).focus(window, cx);
+        }
         let caps = store.command_caps(key);
         let discovering = is_command && (!store.has_command_schema() || store.commands_loading());
         let term = is_command
@@ -377,11 +373,7 @@ impl Workbench {
                 enabled,
                 cx.listener(move |s, _, _, cx| s.send_input(send_owner.as_deref(), cx)),
             )
-            .when(enabled, |b| {
-                b.bg(rgb(p.accent))
-                    .text_color(rgb(p.on_accent))
-                    .hover(move |h| h.bg(rgb(crate::appearance::mix(p.accent, p.fg, 14))))
-            })
+            .when(enabled, |b| b.primary())
             .when(!enabled, |b| b.bg(rgb(p.raised)).text_color(rgb(p.quiet())))
         };
         let native = key.filter(|id| store.is_native_live(id)).map(str::to_owned);

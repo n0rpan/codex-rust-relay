@@ -9,8 +9,14 @@ mod search;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Target {
+    Fleet(crate::app::fleet::Destination),
     Thread(usize, String),
     Saved(PathBuf, Scope, String),
+    TypedLaunch {
+        pane: usize,
+        owner: String,
+        text: String,
+    },
     Refresh,
     LocalTerminal,
     Project(PathBuf, Route),
@@ -41,6 +47,7 @@ struct Item {
     title: String,
     context: String,
     target: Target,
+    online: bool,
 }
 #[derive(Default, PartialEq)]
 struct Sources {
@@ -51,6 +58,7 @@ struct Sources {
     routes: Vec<String>,
     provider: Option<String>,
     discovery_revision: usize,
+    fleet_revision: u64,
     discovering: bool,
 }
 pub(super) struct State {
@@ -72,7 +80,7 @@ impl Host {
         let view = cx.weak_entity();
         let bindings = crate::keymap::bindings(cx);
         cx.intercept_keystrokes(move |event, window, cx| {
-            if window.window_handle().window_id() != id {
+            if window.window_handle().window_id() != id || window.default_prevented() {
                 return;
             }
             let key = &event.keystroke;
@@ -90,6 +98,12 @@ impl Host {
                 return;
             }
             let _ = view.update(cx, |host, cx| {
+                if let Some(workspace) = host.workspace.as_ref().and_then(WeakEntity::upgrade)
+                    && workspace.read(cx).visible_host().map(Entity::entity_id)
+                        != Some(cx.entity_id())
+                {
+                    return;
+                }
                 if toggle {
                     if host.palette.is_some() {
                         host.close_palette(window, cx);
@@ -177,10 +191,11 @@ impl Host {
         if self.palette.is_some() {
             return;
         }
+        self.panes[self.active].update(cx, |pane, _| pane.focus_editor_for = None);
         let previous_focus = window.focused(cx);
         let input = field(
             "",
-            "Find threads, projects, routes or commands…",
+            "Find threads, projects, routes or commands · @host",
             false,
             window,
             cx,
@@ -196,7 +211,13 @@ impl Host {
             };
             state.cursor = 0;
             state.scroll.scroll_to_item(0, ScrollStrategy::Top);
+            let scoped = crate::app::fleet::Query::parse(&query.to_lowercase()).scoped();
             if !query.is_empty() && !query.starts_with('/') {
+                cx.emit(crate::app::fleet::EnsureInventory {
+                    query: query.to_lowercase(),
+                });
+            }
+            if !scoped && !query.is_empty() && !query.starts_with('/') {
                 state.debounce = Some(cx.spawn(async move |this, cx| {
                     cx.background_executor()
                         .timer(std::time::Duration::from_millis(140))
@@ -213,6 +234,13 @@ impl Host {
             }
         });
         input.read(cx).focus_handle(cx).focus(window, cx);
+        let focus = input.read(cx).focus_handle(cx);
+        let view = cx.weak_entity();
+        window.on_next_frame(move |w, cx| {
+            if view.upgrade().is_some_and(|h| h.read(cx).palette.is_some()) {
+                focus.focus(w, cx);
+            }
+        });
         self.palette = Some(State {
             input,
             sources: None,
@@ -283,6 +311,12 @@ impl Host {
         }
         cx.notify();
     }
+    pub(crate) fn hide_palette(&mut self, cx: &mut Context<Self>) {
+        if self.palette.take().is_some() {
+            self.reset_palette_search(cx);
+            cx.notify();
+        }
+    }
     fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(state) = self.palette.take() else {
             return;
@@ -319,6 +353,7 @@ impl Host {
                 title,
                 context,
                 target,
+                online: true,
             })
         };
         add(
@@ -338,6 +373,50 @@ impl Host {
             && store.state() == &Connection::Ready
             && !store.in_terminal(owner)
         {
+            if let Some(result) = crate::views::compose::typed_launch(owner, query) {
+                let pane = self.active;
+                let target = match query {
+                    "/worker" => Target::Worker {
+                        pane,
+                        owner: owner.into(),
+                    },
+                    "/handoff" => Target::Handoff {
+                        pane,
+                        owner: owner.into(),
+                    },
+                    _ => Target::TypedLaunch {
+                        pane,
+                        owner: owner.into(),
+                        text: query.to_owned(),
+                    },
+                };
+                let (title, context, online) = match target {
+                    Target::Worker { .. } => (
+                        "Start worker…".into(),
+                        active.route.label().to_string(),
+                        true,
+                    ),
+                    Target::Handoff { .. } => (
+                        "Continue in…".into(),
+                        active.route.label().to_string(),
+                        true,
+                    ),
+                    _ => match result {
+                        Ok(_) => (
+                            query.to_owned(),
+                            format!("Run from {} · {}", project.display(), active.route.label()),
+                            true,
+                        ),
+                        Err(e) => (query.to_owned(), e, false),
+                    },
+                };
+                return vec![Item {
+                    title,
+                    context,
+                    target,
+                    online,
+                }];
+            }
             add(
                 "Start worker…".into(),
                 "Run a task in a worker under this session · /worker [@host] codex:<model> [--mode <mode>] [--goal] <task>".into(),
@@ -395,6 +474,40 @@ impl Host {
             }
         }
         let query = query.to_lowercase();
+        let selection = crate::app::fleet::Query::parse(&query);
+        let scoped = !query.starts_with('/') && selection.scoped();
+        let mut fleet: Vec<_> = if !query.is_empty() && !query.starts_with('/') {
+            self.workspace
+                .as_ref()
+                .and_then(WeakEntity::upgrade)
+                .map(|w| {
+                    w.read(cx).palette_rows(
+                        &selection,
+                        Some((self.link.remote().map(|h| h.id.as_str()), &self.sidebar)),
+                        cx,
+                    )
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|r| {
+                    Some((
+                        search::rank(&selection.text, &r.title, &r.context)?,
+                        Item {
+                            title: r.title,
+                            context: r.context,
+                            target: Target::Fleet(r.target),
+                            online: r.online,
+                        },
+                    ))
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        if scoped {
+            fleet.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+            return fleet.into_iter().map(|(_, row)| row).collect();
+        }
         let mut preview_matches = HashMap::new();
         let mut threads = HashSet::new();
         let mut projects = HashSet::new();
@@ -564,6 +677,7 @@ impl Host {
                 Some((score, item))
             })
             .collect();
+        matches.extend(fleet);
         matches.sort_by_key(|item| std::cmp::Reverse(item.0));
         let mut rows: Vec<_> = matches.into_iter().map(|(_, item)| item).collect();
         if self.panes.iter().any(|p| {
@@ -576,6 +690,7 @@ impl Host {
                 title: "More matching threads".into(),
                 context: "Search older sessions".into(),
                 target: Target::More,
+                online: true,
             });
         }
         rows
@@ -587,15 +702,31 @@ impl Host {
         let input = state.input.read(cx).value();
         let query = input.trim();
         let target = if state.sources.as_ref().is_some_and(|s| s.query == query) {
-            state.rows.get(state.cursor).map(|row| row.target.clone())
+            state
+                .rows
+                .get(state.cursor)
+                .filter(|row| row.online)
+                .map(|row| row.target.clone())
         } else {
             self.palette_items(query, cx)
                 .into_iter()
                 .next()
+                .filter(|row| row.online)
                 .map(|row| row.target)
         };
         let Some(target) = target else { return };
         match target {
+            Target::Fleet(destination) => {
+                let online = self
+                    .workspace
+                    .as_ref()
+                    .and_then(WeakEntity::upgrade)
+                    .is_some_and(|w| w.read(cx).reachable(&destination, cx));
+                if online {
+                    self.close_palette(window, cx);
+                    cx.emit(destination);
+                }
+            }
             Target::More => {
                 for pane in &self.panes {
                     pane.update(cx, |p, _| {
@@ -659,6 +790,22 @@ impl Host {
                     s.open(path, route, window, cx)
                 });
             }
+            Target::TypedLaunch { pane, owner, text } => {
+                if let Some(Ok(action)) = crate::views::compose::typed_launch(&owner, &text)
+                    && self
+                        .panes
+                        .get(pane)
+                        .and_then(|p| p.read(cx).store.as_ref())
+                        .is_some_and(|store| {
+                            store.selected() == Some(&owner)
+                                && !store.in_terminal(&owner)
+                                && store.state() == &Connection::Ready
+                        })
+                {
+                    self.close_palette(window, cx);
+                    self.panes[pane].update(cx, |p, cx| p.action(cx, action));
+                }
+            }
             Target::Handoff { pane, owner } => {
                 self.close_palette(window, cx);
                 self.open_launch_sheet(pane, owner, LaunchKind::Handoff, window, cx);
@@ -721,6 +868,14 @@ impl Host {
             routes: self.models.read(cx).clone(),
             provider: self.api_provider.clone(),
             discovery_revision: self.discovery.revision,
+            fleet_revision: if query.is_empty() || query.starts_with('/') {
+                0
+            } else {
+                self.workspace
+                    .as_ref()
+                    .and_then(WeakEntity::upgrade)
+                    .map_or(0, |w| w.read(cx).navigation_revision())
+            },
             discovering: self.discovery.pending > 0,
         };
         if state.sources.as_ref() != Some(&sources) {
@@ -742,6 +897,17 @@ impl Host {
         let p = Palette::get(cx);
         let state = self.palette.as_ref().unwrap();
         let count = state.rows.len();
+        let lower = query.to_lowercase();
+        let loading = count == 0
+            && !query.starts_with('/')
+            && self
+                .workspace
+                .as_ref()
+                .and_then(WeakEntity::upgrade)
+                .is_some_and(|w| {
+                    w.read(cx)
+                        .loading_results(&crate::app::fleet::Query::parse(&lower), cx)
+                });
         let errors = self
             .panes
             .iter()
@@ -780,7 +946,16 @@ impl Host {
                         )
                         .child(Input::new(&state.input))
                         .when(!errors.is_empty(), |d| d.child(small(p, errors)))
-                        .when(count == 0, |d| d.child(small(p, "No matches")))
+                        .when(count == 0, |d| {
+                            d.child(small(
+                                p,
+                                if loading {
+                                    "Loading sessions…"
+                                } else {
+                                    "No matches"
+                                },
+                            ))
+                        })
                         .when(count > 0, |d| {
                             d.child(
                                 uniform_list(
@@ -800,7 +975,8 @@ impl Host {
                                                         .px_2()
                                                         .justify_center()
                                                         .rounded_sm()
-                                                        .cursor_pointer()
+                                                        .when(item.online, |d| d.cursor_pointer())
+                                                        .when(!item.online, |d| d.opacity(0.55))
                                                         .when(state.cursor == i, |d| {
                                                             d.bg(rgb(p.hover))
                                                         })
