@@ -446,15 +446,8 @@ impl Workbench {
         field(p, "Runtime", chips)
     }
 
-    fn model_row(
-        &self,
-        p: Palette,
-        kind: LaunchKind,
-        choice: &Choice,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        // A Codex worker needs an OX API model; a handoff may use either subscription.
-        let subscription_ok = kind == LaunchKind::Handoff || choice.runtime == Runtime::Claude;
+    fn model_row(&self, p: Palette, choice: &Choice, cx: &mut Context<Self>) -> Div {
+        let subscription_ok = !matches!(&self.launch, Some(Launch::Worker(d)) if !d.hosts.offers_subscription(choice.runtime));
         let model_label = match &choice.model {
             Some(model) => format!(
                 "{} · {}",
@@ -494,11 +487,7 @@ impl Workbench {
                 true,
                 cx.listener(|s, _, window, cx| s.toggle_launch_picker(window, cx)),
             ));
-        let mut control = col().gap_1().child(chips);
-        if !subscription_ok {
-            control = control.child(small(p, "Codex workers need an OX API model."));
-        }
-        field(p, "Model", control)
+        field(p, "Model", chips)
     }
 
     fn permission_row(&self, p: Palette, choice: &Choice, cx: &mut Context<Self>) -> Div {
@@ -630,7 +619,7 @@ impl Workbench {
                 body = body
                     .child(self.host_row(p, draft, cx))
                     .child(self.mode_row(p, draft, cx))
-                    .child(self.model_row(p, kind, &choice, cx));
+                    .child(self.model_row(p, &choice, cx));
             }
             Launch::Handoff(draft) => {
                 let targets = self.handoff_destinations(cx);
@@ -683,7 +672,7 @@ impl Workbench {
                     }
                     body = body.child(field(p, "Host", chips));
                 }
-                body = body.child(self.model_row(p, kind, &choice, cx));
+                body = body.child(self.model_row(p, &choice, cx));
             }
         }
         if let Some(picker) = picker {
@@ -839,8 +828,8 @@ mod tests {
     }
 
     #[test]
-    fn codex_worker_needs_a_model_and_goal_needs_codex() {
-        let needs_model = worker_start(
+    fn codex_worker_accepts_its_subscription_and_goal_needs_codex() {
+        let subscription = worker_start(
             "s1",
             Runtime::Codex,
             WorkerMode::Session,
@@ -848,7 +837,7 @@ mod tests {
             None,
             "task",
         );
-        assert!(needs_model.is_err());
+        assert_eq!(subscription.unwrap().route(), Runtime::Codex.route(None));
         let goal_on_claude = worker_start(
             "s1",
             Runtime::Claude,

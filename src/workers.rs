@@ -818,11 +818,11 @@ impl Service {
         }
         let next = filters.offset.saturating_add(models.len());
         let subscriptions: Vec<_> = [
-            (ClientKind::Codex, "codex", "openai", "ChatGPT subscription", false),
-            (ClientKind::Claude, "claude", "anthropic", "Claude subscription", true),
+            (ClientKind::Codex, "codex", "openai", "ChatGPT subscription"),
+            (ClientKind::Claude, "claude", "anthropic", "Claude subscription"),
         ]
         .into_iter()
-        .filter_map(|(client, runtime, provider, name, worker)| {
+        .filter_map(|(client, runtime, provider, name)| {
             let account = crate::native::saved_subscription(client, &self.home)?;
             if !format!("{name} {runtime} {provider}").to_lowercase().contains(&query) {
                 return None;
@@ -834,7 +834,7 @@ impl Service {
                 "account": account,
                 "runtime": runtime,
                 "main_client": client == self.client,
-                "worker_available": worker,
+                "worker_available": true,
                 "model_picker": "Use /model in the stock subscription client to see account model choices",
             }))
         })
@@ -990,14 +990,14 @@ fn tools() -> Value {
             },
             {
                 "name": "start_ox_worker",
-                "description": "Start a background coding job in this project and return its job ID at once. Choose by fit: a Codex goal for one long objective with a checkable stop condition; a Claude workflow for work Claude Code splits into steps with its Workflow tool and subagents; a session for ordinary coding on either runtime. Task up to 32 KiB. There is no time or count limit by default; set max_minutes per job, or OX_WORKER_MAX_MINUTES and OX_WORKER_MAX_PER_PARENT, to add one. A write worker starting while another writes in the same project returns a warning: consider a separate git worktree. Without the OX session host they stop when this launch exits. Inherit uses your mode only with the session host; without it, inherit is read. Lower with permission_mode, never raise it. For ordinary work, omit permission_mode to inherit the hosted parent’s verified mode, including YOLO. Request read for a read-only review. Explicit YOLO requests can require operator acceptance. Pin a subscription model with subscription_model. Status reports the actual_model that answered.",
+                "description": "Start a background coding job in this project and return its job ID at once. Choose by fit: a Codex goal for one long objective with a checkable stop condition; a Claude workflow for work Claude Code splits into steps with its Workflow tool and subagents; a session for ordinary coding on either runtime. Task up to 32 KiB. There is no time or count limit by default; set max_minutes per job, or OX_WORKER_MAX_MINUTES and OX_WORKER_MAX_PER_PARENT, to add one. A write worker starting while another writes in the same project returns a warning: consider a separate git worktree. Without the OX session host they stop when this launch exits. Inherit uses your mode only with the session host; without it, inherit is read. Lower with permission_mode, never raise it. For ordinary work, omit permission_mode to inherit the hosted parent’s verified mode, including YOLO. Request read for a read-only review. Explicit YOLO requests can require operator acceptance. Pin a Claude subscription model with subscription_model. Status reports the actual_model that answered.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "runtime": {"enum": ["codex", "claude"]},
                         "mode": {"enum": ["session", "goal", "workflow"], "description": "session: background coding session on either runtime. goal: Codex only; task becomes the Codex goal objective, at most 4,000 characters. workflow: Claude Code only; the job fails if the Workflow tool is not used."},
-                        "model": {"type": "string", "description": "Exact ox API model alias, billed by its provider. Leave out for a Claude subscription worker."},
-                        "billing": {"enum": ["api", "subscription"], "description": "Who pays. api: the provider of model. subscription: the user's Claude subscription. Optional: a model means api, none means subscription. A conflicting model is refused."},
+                        "model": {"type": "string", "description": "Exact ox API model alias, billed by its provider. Leave out to use the selected runtime’s subscription."},
+                        "billing": {"enum": ["api", "subscription"], "description": "Who pays. api: the provider of model. subscription: the user's ChatGPT or Claude subscription for the selected runtime. Optional: a model means api, none means subscription. A conflicting model is refused."},
                         "subscription_model": {"type": "string", "description": "Exact Claude subscription model to pin, such as claude-fable-5-2, from list_ox_models subscription_models. Claude runtime only, without model. Checked against the account's model picker before the first turn: an unoffered model is refused and nothing runs or bills. Leave out for the subscription's default model."},
                         "task": {"type": "string", "description": "The job objective, desired validation, and stopping condition."},
                         "permission_mode": {"enum": ["inherit", "read", "write", "classifier", "yolo"], "default": "inherit", "description": "read: Codex Read only or Claude Plan. Standalone Claude read workers get only read tools. write: workspace edits and shell access. Codex uses its Workspace sandbox. Claude Code pre-approves Bash and uses its own sandbox when available. Without it, commands can run unsandboxed. classifier: Codex Auto-review / Claude Auto. yolo: Codex YOLO / Claude bypass. Above your mode is refused."},

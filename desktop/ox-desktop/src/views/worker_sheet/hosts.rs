@@ -30,6 +30,8 @@ enum OfferedRoute {
 struct Entry {
     host: Host,
     parent_host: bool,
+    #[serde(default)]
+    codex_subscription_workers: bool,
     paired_name: Option<String>,
     status: String,
     #[serde(default)]
@@ -198,6 +200,28 @@ impl Picker {
     pub(super) fn same_as_parent(&self) -> bool {
         self.target == "parent"
     }
+    pub(super) fn offers_subscription(&self, runtime: Runtime) -> bool {
+        let Some(Ok(inventory)) = self.inventory.as_ref() else {
+            return true;
+        };
+        let Some(inventory) = inventory else {
+            return runtime == Runtime::Claude;
+        };
+        let route = runtime.route(None);
+        inventory.hosts.iter().any(|entry| {
+            let selected = matches!(self.target.as_str(), "auto" | "project")
+                || (self.target == "parent" && entry.parent_host)
+                || self.target == entry.host.id;
+            selected
+                && entry.status == "online"
+                && (runtime != Runtime::Codex || entry.codex_subscription_workers)
+                && entry
+                    .routes
+                    .iter()
+                    .any(|r| matches!(r, OfferedRoute::Known(r) if r == &route))
+        })
+    }
+
     pub(super) fn aliases(&self, runtime: Runtime) -> Option<Vec<String>> {
         if self.target == "parent" {
             return None;
@@ -227,6 +251,9 @@ impl Picker {
     }
 
     pub(super) fn apply(&self, start: &mut WorkerStart, cx: &App) -> Result<(), String> {
+        if start.model.is_none() && !self.offers_subscription(start.runtime) {
+            return Err("The selected host does not offer this subscription for workers. Check its sign-in and OX version, or choose an API model.".into());
+        }
         if self.target == "project" {
             return Ok(());
         }

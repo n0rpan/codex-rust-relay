@@ -146,7 +146,7 @@ impl Engine {
                 })
                 .collect();
             let local = json!({"host":host, "parent_host":true, "status":"online", "runtimes":runtimes,
-                "routes":routes, "routes_known":prepared.is_ok(), "has_project":true});
+                "routes":routes, "codex_subscription_workers":true, "routes_known":prepared.is_ok(), "has_project":true});
             let result = ox_host_web::inventory::list(
                 &registry,
                 &project,

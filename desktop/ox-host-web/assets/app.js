@@ -332,6 +332,7 @@ class Link {
         projects = msg.projects;
       }
       this.placement = msg.capabilities.includes("worker_placement");
+      this.codexSubscriptionWorkers = msg.capabilities.includes("worker_codex_subscription");
       const liveCatalog =
         !this.scope && msg.capabilities.includes("live_catalog");
       this.send(
@@ -2142,12 +2143,16 @@ function fillWorkerModels() {
     starred = modelChoices.starred.filter(m => aliases.includes(m)),
     rest = aliases.filter((m) => !starred.includes(m));
   const option = (m) => new Option(m, m);
-  // A Codex worker needs an OX API model (desktop worker_sheet.rs subscription_ok).
   const subscription = new Option(
     runtime === "codex" ? "ChatGPT subscription" : "Claude subscription",
     "",
   );
-  subscription.disabled = runtime === "codex";
+  const host = $("worker-host").value;
+  const hostOffers = workerHosts.filter(row => row.status === "online" && (host === "auto" || host === "project" ||
+    (host === "parent" && row.parent_host) || host === row.host.id));
+  subscription.disabled = workerHosts.length ? !hostOffers.some(row =>
+    (runtime !== "codex" || row.codex_subscription_workers) && row.routes?.some(r => r.runtime === runtime && r.billing === "subscription"))
+    : runtime === "codex" && !detailLink?.codexSubscriptionWorkers;
   select.replaceChildren(
     subscription,
     ...(starred.length ? [optgroup("Starred", starred.map(option))] : []),
@@ -2156,8 +2161,6 @@ function fillWorkerModels() {
   select.value = [...select.options].some((o) => o.value === current)
     ? current
     : "";
-  if (runtime === "codex" && !select.value && select.options.length > 1)
-    select.value = select.options[1].value;
   // Free text is the fallback only when the phone has no model list at all.
   const free = !aliases.length;
   select.hidden = free;
@@ -2242,6 +2245,7 @@ $("worker-permission").onchange = renderWorkerPermission;
 $("start-worker").onclick = () => {
   // Start from the parent session's route, as the desktop sheet does.
   workerSubmission = null;
+  $("worker-model-free").value = "";
   $("worker-submit").disabled = false;
   workerHosts = [];
   $("worker-placement").hidden = !detailLink?.placement;
@@ -2275,6 +2279,12 @@ $("worker-form").onsubmit = (e) => {
   const runtime = $("worker-runtime").value,
     permission = $("worker-permission").value;
   // No model chosen means the runtime's subscription, which must be configured.
+  if (
+    !workerModelValue() && $("worker-model").options[0]?.disabled
+  ) {
+    notice("The selected host does not offer this subscription for workers. Check its sign-in and OX version, or choose an API model.");
+    return;
+  }
   if (
     !workerModelValue() &&
     !(workerRoutes() || routes).some((r) => r.runtime === runtime && r.billing === "subscription")

@@ -781,6 +781,7 @@ impl Engine {
                 .map(str::to_owned)
                 .into();
                 capabilities.push("worker_inventory".into());
+                capabilities.push("worker_codex_subscription".into());
                 capabilities.push("worker_placement".into());
                 capabilities.push("remote_handoff".into());
                 capabilities.push("handoff_history".into());

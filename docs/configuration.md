@@ -715,6 +715,7 @@ Approve the tool call when your client prompts.
 | Ask for | What starts |
 | --- | --- |
 | Codex session on an API model | Stock Codex in the project with the selected ox alias |
+| Codex session or goal on your ChatGPT subscription | Stock Codex using the selected host’s ChatGPT sign-in. Omit the API alias. |
 | Codex goal on an API model | A stock Codex app-server thread with Goal mode |
 | Claude Code session or workflow on an API model | Stock Claude Code in the project with the selected ox alias |
 | Claude Code session or workflow on your subscription | Stock Claude Code on the host's saved Claude account. Ask for a subscription worker and omit the API alias. |
@@ -808,8 +809,8 @@ worker’s OS permissions. Codex read workers use the Read only sandbox.
 
 Give concurrent writers separate working directories by starting their parent
 sessions there. The main session and its built-in subagents use your subscription.
-The worker bills the API provider you picked or the Claude subscription you
-requested.
+A worker can use a configured API model or the target host’s subscription.
+Choose **ChatGPT subscription** for Codex or **Claude subscription** for Claude Code.
 
 For a second opinion on a piece of text, ask for `delegate_to_ox_model`.
 That tool makes one model request with a 90-second timeout. For development,
@@ -817,7 +818,8 @@ tests, and other multi-step tasks, ask for a background worker.
 
 In the client, `/model` shows the subscription's account-specific model choices.
 The worker catalog reports the detected subscription routes alongside the API
-models and identifies Claude as a supported subscription worker.
+models. In the worker sheet, a subscription route shows the host’s last reported
+limits and reset times when its native client has supplied them.
 [Codex subagent settings](https://learn.chatgpt.com/docs/agent-configuration/subagents) ·
 [Claude Code subagent model selection](https://code.claude.com/docs/en/sub-agents#choose-a-model)
 

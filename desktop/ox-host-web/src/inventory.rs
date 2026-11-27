@@ -29,6 +29,8 @@ pub(crate) struct Inventory {
     routes: Vec<Route>,
     routes_known: bool,
     #[serde(default)]
+    codex_subscription_workers: bool,
+    #[serde(default)]
     linked_read: bool,
     #[serde(default)]
     linked_write: bool,
@@ -152,6 +154,7 @@ async fn sample(app: &App) -> io::Result<(Inventory, HashSet<String>)> {
             routes,
             has_project: None,
             routes_known: supports("worker_routes_known"),
+            codex_subscription_workers: supports("worker_codex_subscription"),
             linked_read: supports("linked_read_workers"),
             linked_write: supports("linked_write_workers"),
         },
@@ -175,7 +178,7 @@ async fn query_peer(
         request["fresh"] = true.into();
     }
     let reply = host.client()?.worker_request(request).await?;
-    let peer: Peer = serde_json::from_value(reply).map_err(|_| {
+    let mut peer: Peer = serde_json::from_value(reply).map_err(|_| {
         io::Error::new(
             io::ErrorKind::Unsupported,
             "Update the receiving OX host to use linked workers.",
@@ -186,6 +189,11 @@ async fn query_peer(
             io::ErrorKind::PermissionDenied,
             "Worker link identity changed.",
         ));
+    }
+    if !peer.inventory.codex_subscription_workers {
+        peer.inventory
+            .routes
+            .retain(|r| *r != Route::CODEX_SUBSCRIPTION);
     }
     Ok(peer)
 }
@@ -228,6 +236,11 @@ fn check_peer(
         return Err(io::Error::other(format!(
             "{} is not installed on {target}.",
             start.runtime.name()
+        )));
+    }
+    if start.route() == Route::CODEX_SUBSCRIPTION && !peer.inventory.codex_subscription_workers {
+        return Err(io::Error::other(format!(
+            "Update {target} to run workers on its ChatGPT subscription."
         )));
     }
     if !peer.inventory.routes.contains(&start.route()) {

@@ -221,7 +221,7 @@ impl WorkerStart {
         if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
             return None;
         }
-        let usage = "Use /worker [@host] codex:<model> [--mode <mode>] [--goal] <task> or /worker [@host] claude[:<model>] [--mode <mode>] [--workflow] <task>.";
+        let usage = "Use /worker [@host] codex[:<model>] [--mode <mode>] [--goal] <task> or /worker [@host] claude[:<model>] [--mode <mode>] [--workflow] <task>.";
         let rest = rest.trim_start();
         let (host, rest) = match rest.strip_prefix('@') {
             Some(named) => {
@@ -321,9 +321,6 @@ impl WorkerStart {
         if self.mode == WorkerMode::Workflow && self.runtime != Runtime::Claude {
             return Err("Workflow mode requires Claude Code.".into());
         }
-        if self.runtime == Runtime::Codex && self.model.is_none() {
-            return Err("Choose an ox API model for a Codex worker.".into());
-        }
         if self.model.as_ref().is_some_and(|model| {
             model.trim().is_empty() || model.len() > 256 || model.starts_with('-')
         }) {
@@ -331,7 +328,7 @@ impl WorkerStart {
         }
         if let Some(pinned) = &self.subscription_model {
             if self.runtime != Runtime::Claude {
-                return Err("subscription_model pins a Claude subscription worker. Codex workers use an ox API model alias.".into());
+                return Err("subscription_model pins a Claude subscription model. Leave it out to use the ChatGPT subscription with Codex.".into());
             }
             if self.model.is_some() {
                 return Err("Choose either an ox API model alias (billed by its provider) or a subscription_model (billed to the Claude subscription), not both.".into());
@@ -484,11 +481,10 @@ mod tests {
         assert_eq!(claude.route(), Runtime::Claude.route(None));
         assert_eq!(claude.mode, WorkerMode::Workflow);
         assert_eq!(claude.mode_request(), ModeRequest::Inherit);
-        assert!(
-            WorkerStart::parse_command("p", "/worker codex task")
-                .unwrap()
-                .is_err()
-        );
+        let native = WorkerStart::parse_command("p", "/worker codex task")
+            .unwrap()
+            .unwrap();
+        assert_eq!(native.route(), Route::CODEX_SUBSCRIPTION);
         assert!(
             WorkerStart::parse_command("p", "/worker claude --goal x")
                 .unwrap()
