@@ -111,6 +111,7 @@ fn cmd_search(
 ) -> Result<u8, RelayError> {
     let mut query_parts = Vec::new();
     let mut scope_filter: Option<Scope> = None;
+    let mut include_all_scopes = false;
     let mut kind_filter: Option<Kind> = None;
     let mut max_sensitivity = Sensitivity::LocalOnly;
     let mut limit = 8usize;
@@ -119,6 +120,7 @@ fn cmd_search(
         match args[i].as_str() {
             "--scope" => {
                 let val = next_val(args, &mut i, "--scope")?;
+                include_all_scopes = val.trim().eq_ignore_ascii_case("all");
                 scope_filter = parse_scope_filter(val, project, host)?;
             }
             "--kind" => {
@@ -151,6 +153,7 @@ fn cmd_search(
             project: Some(project.to_string()),
             host: Some(host.to_string()),
             scope: scope_filter,
+            include_all_scopes,
             kind: kind_filter,
             max_sensitivity,
             limit,

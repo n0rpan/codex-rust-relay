@@ -346,6 +346,7 @@ impl Service {
                     project: Some(project.clone()),
                     host: Some(host),
                     scope,
+                    include_all_scopes: false,
                     kind,
                     max_sensitivity: ceiling,
                     limit,

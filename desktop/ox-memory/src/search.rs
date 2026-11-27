@@ -13,8 +13,11 @@ pub struct RecallQuery {
     pub project: Option<String>,
     /// Active host ID (used for scope filtering & affinity boost).
     pub host: Option<String>,
-    /// Optional explicit scope filter (`None` matches Global + active project + active host).
+    /// Optional explicit scope filter (`None` matches Global + active project + active host,
+    /// unless `include_all_scopes` is true).
     pub scope: Option<Scope>,
+    /// When true (and `scope` is `None`), search across all stored projects and hosts.
+    pub include_all_scopes: bool,
     /// Optional kind filter.
     pub kind: Option<Kind>,
     /// Maximum allowed sensitivity level.
@@ -30,6 +33,7 @@ impl Default for RecallQuery {
             project: None,
             host: None,
             scope: None,
+            include_all_scopes: false,
             kind: None,
             max_sensitivity: Sensitivity::Private,
             limit: 6,
@@ -271,6 +275,9 @@ fn scope_rank(scope: &Scope) -> u8 {
 fn scope_matches(entry: &MemoryEntry, query: &RecallQuery) -> bool {
     if let Some(explicit) = &query.scope {
         return &entry.scope == explicit;
+    }
+    if query.include_all_scopes {
+        return true;
     }
     match &entry.scope {
         Scope::Global => true,
