@@ -1282,7 +1282,13 @@ impl Engine {
         if let Some(previous) = previous {
             store.recover_from(&mut previous.store);
         }
-        annotate(&self.workers, &self.ledger.data, scope, &mut store);
+        annotate(
+            &self.host_id.to_string(),
+            &self.workers,
+            &self.ledger.data,
+            scope,
+            &mut store,
+        );
         let recovered = self
             .cold
             .remove(scope)
@@ -1952,7 +1958,13 @@ impl Engine {
             live.store.drop_claude_worker();
             launched = Some(Finished::new(l, Err(error), None));
         }
-        annotate(&self.workers, &self.ledger.data, scope, &mut live.store);
+        annotate(
+            &self.host_id.to_string(),
+            &self.workers,
+            &self.ledger.data,
+            scope,
+            &mut live.store,
+        );
         let previous_yolo: Vec<wire::AskView> = {
             let (yolo, native): (Vec<_>, Vec<_>) = std::mem::take(&mut live.state.asks)
                 .into_iter()
@@ -3508,7 +3520,13 @@ fn advance_launch(live: &mut Live) -> Option<String> {
 /// across scopes through `origin.parent.scope`; a handoff target does not nest.
 /// A handoff source lists where it was handed off to, and a session with a YOLO
 /// grant lists the running children that grant allowed.
-fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, store: &mut Store) {
+fn annotate(
+    host_id: &str,
+    workers: &Registry,
+    data: &crate::durable::Owned,
+    scope: &Scope,
+    store: &mut Store,
+) {
     use ox_desk_core::origin::Relation;
     type Notes = BTreeMap<String, (Option<String>, serde_json::Map<String, Value>)>;
     let mut out: Notes = BTreeMap::new();
@@ -3542,10 +3560,13 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
             list.push(value);
         }
     };
+    let source_here = |source: &&ox_desk_core::handoff::HandoffSource| {
+        &source.scope == scope && source.host.as_ref().is_none_or(|h| h.id == host_id)
+    };
     for (s, id, entry) in workers.all() {
         let o = &entry.origin;
         if o.relation == Relation::Handoff
-            && let Some(h) = o.handoff.as_ref().filter(|h| &h.scope == scope)
+            && let Some(h) = o.handoff.as_deref().filter(source_here)
         {
             push(
                 &h.session,
@@ -3555,7 +3576,7 @@ fn annotate(workers: &Registry, data: &crate::durable::Owned, scope: &Scope, sto
         }
     }
     for h in &data.handoffs {
-        if let Some(src) = h.origin.handoff.as_ref().filter(|src| &src.scope == scope) {
+        if let Some(src) = h.origin.handoff.as_deref().filter(source_here) {
             push(
                 &src.session,
                 "handoff_attempts",
@@ -6425,6 +6446,7 @@ mod tests {
                 let mut o = origin(workers_parent(from, session), Ceiling::Write);
                 o.relation = ox_desk_core::origin::Relation::Handoff;
                 o.handoff = Some(Box::new(ox_desk_core::handoff::HandoffSource {
+                    host: None,
                     scope: Scope {
                         project: project.to_owned(),
                         route: from.route.clone(),
@@ -6448,39 +6470,43 @@ mod tests {
             engine
                 .workers
                 .stamp(&back, "b", stamp(&target, "t", &project));
-            let read =
-                |engine: &mut Engine, caller: Caller, session: Option<&str>, item: Option<&str>| {
-                    let (done, result) = std::sync::mpsc::sync_channel(1);
-                    engine
-                        .read_thread(
-                            &caller,
-                            ParentCall::ReadThread {
-                                session: session.map(Into::into),
-                                item: item.map(Into::into),
-                                after: None,
-                                limit: None,
-                            },
-                            Replier::Channel(done),
-                        )
-                        .unwrap();
-                    result.try_recv().expect("answered at once")
-                };
+            let read = |engine: &mut Engine,
+                        caller: Caller,
+                        host: Option<&str>,
+                        session: Option<&str>,
+                        item: Option<&str>| {
+                let (done, result) = std::sync::mpsc::sync_channel(1);
+                engine
+                    .read_thread(
+                        &caller,
+                        ParentCall::ReadThread {
+                            host: host.map(Into::into),
+                            session: session.map(Into::into),
+                            item: item.map(Into::into),
+                            after: None,
+                            limit: None,
+                        },
+                        Replier::Channel(done),
+                    )
+                    .unwrap();
+                result.try_recv().expect("answered at once")
+            };
             // The Codex target reads an omitted item of its Claude source in full.
-            let page = read(&mut engine, thread(&target, "t"), None, Some("a1")).unwrap();
+            let page = read(&mut engine, thread(&target, "t"), None, None, Some("a1")).unwrap();
             assert_eq!(page["items"][0]["text"], "long answer");
             // The second handoff reads the whole chain, back to the first source.
-            let page = read(&mut engine, thread(&back, "b"), Some("s"), None).unwrap();
+            let page = read(&mut engine, thread(&back, "b"), None, Some("s"), None).unwrap();
             assert_eq!(page["items"][0]["text"], "first");
-            let page = read(&mut engine, thread(&back, "b"), None, None).unwrap();
+            let page = read(&mut engine, thread(&back, "b"), None, None, None).unwrap();
             assert_eq!(page["items"][0]["text"], "codex turn");
             // A sibling session on the same app-server has no chain; the source itself has none.
             assert!(
-                read(&mut engine, thread(&target, "x"), None, None)
+                read(&mut engine, thread(&target, "x"), None, None, None)
                     .unwrap_err()
                     .contains("no source")
             );
             assert!(
-                read(&mut engine, thread(&target, "t"), Some("x"), None)
+                read(&mut engine, thread(&target, "t"), None, Some("x"), None)
                     .unwrap_err()
                     .contains("not in this session's handoff chain")
             );
@@ -6489,9 +6515,40 @@ mod tests {
                 .workers
                 .stamp(&target, "x", stamp(&source, "s", Path::new("/elsewhere")));
             assert!(
-                read(&mut engine, thread(&target, "x"), None, None)
+                read(&mut engine, thread(&target, "x"), None, None, None)
                     .unwrap_err()
                     .contains("outside")
+            );
+            let me = engine.host_id.to_string();
+            let qualified =
+                read(&mut engine, thread(&back, "b"), Some(&me), Some("s"), None).unwrap();
+            assert_eq!(qualified["source"]["host"]["id"], me);
+            assert!(
+                read(
+                    &mut engine,
+                    thread(&back, "b"),
+                    Some("another-host"),
+                    Some("s"),
+                    None
+                )
+                .is_err()
+            );
+
+            // Two machines can have identical project paths and native session IDs.
+            // A foreign stamp must never turn into a lookup in this host's transcript.
+            let mut foreign = stamp(&source, "s", &project);
+            foreign.handoff.as_mut().unwrap().host = Some(ox_desk_core::handoff::SourceHost {
+                id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".into(),
+                name: "studio".into(),
+            });
+            engine.workers.get_mut(&target, "x").unwrap().origin = foreign;
+            let chain = engine.handoff_chain(&target, "x");
+            assert_eq!(chain.len(), 1);
+            assert_eq!(chain[0].host.as_ref().unwrap().name, "studio");
+            assert!(
+                read(&mut engine, thread(&target, "x"), None, None, None)
+                    .unwrap_err()
+                    .contains("another host")
             );
             // A terminal launch is not a hosted session.
             let terminal = Caller::External(ExternalCaller {
@@ -6500,7 +6557,7 @@ mod tests {
                 session: Some("t".into()),
                 launch: "l".into(),
             });
-            assert!(read(&mut engine, terminal, None, None).is_err());
+            assert!(read(&mut engine, terminal, None, None, None).is_err());
         }
 
         /// A Live whose store is a real local Codex store on an inert stdio process.
@@ -7539,7 +7596,13 @@ mod tests {
                 },
             )
             .unwrap();
-            annotate(&engine.workers, &engine.ledger.data, &scope, &mut fresh);
+            annotate(
+                &engine.host_id.to_string(),
+                &engine.workers,
+                &engine.ledger.data,
+                &scope,
+                &mut fresh,
+            );
             fresh.restore_ended(&worker, "worker", 0, None);
             let end = Instant::now() + Duration::from_secs(10);
             while fresh.catalog_row(&worker).is_none() || !fresh.can_send(None) {

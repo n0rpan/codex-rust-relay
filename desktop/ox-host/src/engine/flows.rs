@@ -681,6 +681,7 @@ impl Engine {
             .handoff_chain(&src, &start.source)
             .into_iter()
             .map(|h| handoff::Earlier {
+                host: h.host,
                 session: h.session,
                 title: h.title,
                 runtime: h.runtime,
@@ -692,6 +693,7 @@ impl Engine {
             Err(e) => fail!(e),
         };
         let source = HandoffSource {
+            host: Some(self.handoff_host()),
             scope: src.clone(),
             session: start.source.clone(),
             native,
@@ -834,8 +836,21 @@ impl Engine {
         Ok(())
     }
 
+    fn handoff_host(&self) -> handoff::SourceHost {
+        let name = ox_host_web::host_profile::HostProfile::read(&self.state_dir)
+            .ok()
+            .map(|p| p.name)
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| self.host_name.clone());
+        handoff::SourceHost {
+            id: self.host_id.to_string(),
+            name,
+        }
+    }
+
     /// The handoff sources of a session, nearest first.
     pub(super) fn handoff_chain(&self, scope: &Scope, session: &str) -> Vec<HandoffSource> {
+        let local_host = self.handoff_host();
         let mut chain: Vec<HandoffSource> = Vec::new();
         let mut current = (scope.clone(), session.to_owned());
         for _ in 0..32 {
@@ -846,14 +861,21 @@ impl Engine {
             else {
                 break;
             };
-            if chain
-                .iter()
-                .any(|c| c.scope == h.scope && c.session == h.session)
-            {
+            let mut source = h.clone();
+            let host = source.host.get_or_insert_with(|| local_host.clone());
+            let local = host.id == local_host.id;
+            if chain.iter().any(|c| {
+                c.host.as_ref().map(|h| &h.id) == Some(&host.id)
+                    && c.scope == source.scope
+                    && c.session == source.session
+            }) {
                 break;
             }
             current = (h.scope.clone(), h.session.clone());
-            chain.push(h.clone());
+            chain.push(source);
+            if !local {
+                break;
+            }
         }
         chain
     }
@@ -868,6 +890,7 @@ impl Engine {
         reply: Replier,
     ) -> io::Result<()> {
         let ParentCall::ReadThread {
+            host,
             session,
             item,
             after,
@@ -884,14 +907,28 @@ impl Engine {
             if chain.is_empty() {
                 return Err("This session was not handed off from another session, so it has no source to read.".into());
             }
-            let src = match &session {
-                None => chain[0].clone(),
-                Some(s) => chain
-                    .iter()
-                    .find(|h| &h.session == s || h.native.as_ref() == Some(s))
-                    .cloned()
-                    .ok_or("That session is not in this session's handoff chain.")?,
-            };
+            let mut matches = chain.into_iter().filter(|h| {
+                host.as_ref()
+                    .is_none_or(|id| h.host.as_ref().is_some_and(|m| &m.id == id))
+                    && session
+                        .as_ref()
+                        .is_none_or(|s| &h.session == s || h.native.as_ref() == Some(s))
+            });
+            let src = matches
+                .next()
+                .ok_or("That session is not in this session's handoff chain.")?;
+            if session.is_some() && matches.next().is_some() {
+                return Err(
+                    "That session ID occurs more than once. Include its source host ID.".into(),
+                );
+            }
+            if src
+                .host
+                .as_ref()
+                .is_some_and(|h| h.id != self.host_id.to_string())
+            {
+                return Err("This source belongs to another host.".into());
+            }
             if src.scope.project != scope.project {
                 return Err("That source is outside this session's project.".into());
             }
@@ -1133,6 +1170,7 @@ fn read_page(
         })
     };
     let header = json!({
+        "host": src.host,
         "session": src.session,
         "native_session": src.native,
         "title": src.title,
@@ -1200,6 +1238,7 @@ mod tests {
     #[test]
     fn read_pages_by_item_id_and_returns_whole_items() {
         let src = HandoffSource {
+            host: None,
             scope: Scope {
                 project: "/p".into(),
                 route: ox_desk_core::runtime::Route::CODEX_SUBSCRIPTION,

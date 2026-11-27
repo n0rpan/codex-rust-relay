@@ -285,6 +285,8 @@ struct ListModels {
 #[serde(deny_unknown_fields)]
 struct ReadThread {
     #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
     session: Option<String>,
     #[serde(default)]
     item: Option<String>,
@@ -749,18 +751,18 @@ impl Service {
             return Err("read_ox_thread needs the OX session host, which ran the handoff.".into());
         }
         if read.limit.is_some_and(|l| l == 0 || l > 100)
-            || [&read.session, &read.item, &read.after]
+            || [&read.host, &read.session, &read.item, &read.after]
                 .into_iter()
                 .flatten()
                 .any(|s| s.is_empty() || s.len() > 256)
         {
             return Err("Use a limit of 1 to 100 and IDs of up to 256 bytes.".into());
         }
-        self.host_call(
-            json!({"op":"read_thread","session":read.session,"item":read.item,"after":read.after,"limit":read.limit}),
-            thread,
-        )
-        .await
+        let mut call = json!({"op":"read_thread","session":read.session,"item":read.item,"after":read.after,"limit":read.limit});
+        if let Some(host) = read.host {
+            call["host"] = host.into();
+        }
+        self.host_call(call, thread).await
     }
 
     async fn list_hosts(&self, thread: Option<&str>) -> Result<Value, String> {
@@ -1015,6 +1017,7 @@ fn tools() -> Value {
                 "name":"read_ox_thread",
                 "description":"Read the session this one was handed off from (and earlier sources in its chain), read-only and within this project. The handoff carried a budgeted selection of real messages; use this to read omitted or cut items in full. Pages by item ID: item returns one item, after continues after an item. Omit session for the nearest source.",
                 "inputSchema":{"type":"object","properties":{
+                    "host":{"type":"string","description":"Stable source host ID from the handoff note. Use with a session ID shared by multiple hosts."},
                     "session":{"type":"string","description":"A source session ID from the handoff note. Omit for the nearest source."},
                     "item":{"type":"string","description":"Return this item in full."},
                     "after":{"type":"string","description":"Start after this item ID. Use next_after from the previous page."},

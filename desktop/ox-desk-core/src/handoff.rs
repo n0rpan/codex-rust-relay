@@ -243,10 +243,20 @@ fn is_zero(n: &u32) -> bool {
     *n == 0
 }
 
+/// A host-local session or path is meaningful only on its owning machine.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SourceHost {
+    pub id: String,
+    pub name: String,
+}
+
 /// An earlier session in a handoff chain, readable through read_ox_thread.
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Earlier {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<SourceHost>,
     pub session: String,
     pub title: String,
     pub runtime: Runtime,
@@ -442,6 +452,8 @@ pub fn select(
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct HandoffSource {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<SourceHost>,
     pub scope: Scope,
     pub session: String,
     /// The source's native session ID, when it differs from the host ID.
@@ -487,18 +499,30 @@ impl HandoffSource {
                 " That session itself continued {}; the context carried into it is not repeated here. read_ox_thread with that session ID reads it.",
                 r.earlier
                     .iter()
-                    .map(|e| format!(
-                        "\"{}\" (session {}, {})",
-                        e.title.replace('"', "'"),
-                        e.session,
-                        e.route.label()
-                    ))
+                    .map(|e| {
+                        let host = e
+                            .host
+                            .as_ref()
+                            .map(|h| format!(", host {}", h.id))
+                            .unwrap_or_default();
+                        format!(
+                            "\"{}\" (session {}, {}{host})",
+                            e.title.replace('"', "'"),
+                            e.session,
+                            e.route.label()
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(", which continued ")
             )
         };
+        let host = self
+            .host
+            .as_ref()
+            .map(|h| format!(" Source host {} ({}).", h.name, h.id))
+            .unwrap_or_default();
         format!(
-            "OX handoff: this session continues \"{}\" (session {}, {}, {}). The messages that follow are real earlier messages from it, in order, not a summary: {} of {} carried. {omitted}{attachments}{chain} Use the read_ox_thread tool to read the source session's omitted or cut items by ID. Answer the request after them.",
+            "OX handoff: this session continues \"{}\" (session {}, {}, {}). The messages that follow are real earlier messages from it, in order, not a summary: {} of {} carried. {omitted}{attachments}{chain}{host} Use the read_ox_thread tool to read the source session's omitted or cut items by ID. Answer the request after them.",
             self.title.replace('"', "'"),
             self.session,
             self.runtime.name(),
@@ -938,7 +962,13 @@ mod tests {
         assert!(text.contains("1 attachment(s)"), "{text}");
         let plain = select(&history(1, 10), "next", Some(200_000)).unwrap();
         assert_eq!(plain.refs.attachments, 0);
-        assert!(!source(plain.refs).preamble().contains("attachment"));
+        let mut stamped = source(plain.refs);
+        assert!(!stamped.preamble().contains("attachment"));
+        stamped.host = Some(SourceHost {
+            id: "host-a".into(),
+            name: "studio".into(),
+        });
+        assert!(stamped.preamble().contains("Source host studio (host-a)"));
     }
 
     fn items_with_attachment() -> Vec<SourceItem> {
@@ -949,6 +979,7 @@ mod tests {
 
     fn source(refs: SelectionRefs) -> HandoffSource {
         HandoffSource {
+            host: None,
             scope: Scope {
                 project: "/p".into(),
                 route: Runtime::Claude.route(None),
@@ -1015,6 +1046,7 @@ mod tests {
     ) -> (Vec<SourceItem>, Earlier, String) {
         let selection = select_chained(items, request, Some(200_000), earlier).unwrap();
         let source = HandoffSource {
+            host: None,
             scope: Scope {
                 project: "/p".into(),
                 route: from.2.clone(),
@@ -1054,6 +1086,7 @@ mod tests {
             ),
         ];
         let me = Earlier {
+            host: None,
             session: from.0.into(),
             title: format!("title {}", from.0),
             runtime: from.1,

@@ -417,6 +417,8 @@ pub enum ParentCall {
     /// source in the caller's chain; absent means the nearest one. Pages by item
     /// ID: `after` starts after that item, `item` returns one item in full.
     ReadThread {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
         #[serde(default)]
         session: Option<String>,
         #[serde(default)]

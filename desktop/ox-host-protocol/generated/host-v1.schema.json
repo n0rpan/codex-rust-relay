@@ -1700,6 +1700,12 @@
                 "null"
               ]
             },
+            "host": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "item": {
               "default": null,
               "type": [
