@@ -20,6 +20,7 @@ mod desktop;
 #[path = "update_preferences.rs"]
 mod preferences;
 use preferences::Channel;
+mod signing;
 mod standalone;
 
 const REPOSITORY: &str = "oxstack/ox";

@@ -284,6 +284,17 @@ fn verify_package(root: &Path, version: &str) -> Result<(), RelayError> {
     )
     .map_err(|_| format!("OX {version} failed macOS signature verification."))?;
     let bin = root.join(BIN_DIR);
+    if cfg!(target_os = "macos") {
+        signing::require(
+            signing::running_release(),
+            version,
+            &[
+                &root.join("OX Desktop.app"),
+                &bin.join("ox"),
+                &bin.join("ox-host"),
+            ],
+        )?;
+    }
     let headless = root
         .parent()
         .is_some_and(|store| store.join("headless").is_file());

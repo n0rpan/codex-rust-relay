@@ -89,6 +89,13 @@ fn apply(cache: &Path, executable: &Path, staged: &Staged) -> Result<(), RelayEr
         fs::remove_file(cache.join("pending.json"))?;
         return Err("The staged CLI failed SHA-256 verification. Run ox update again.".into());
     }
+    if cfg!(target_os = "macos")
+        && let Err(refused) =
+            signing::require(signing::running_release(), &staged.version, &[&path])
+    {
+        fs::remove_file(cache.join("pending.json"))?;
+        return Err(refused);
+    }
     replace_cli(&path, &installation)?;
     fs::remove_file(cache.join("pending.json"))?;
     Ok(())

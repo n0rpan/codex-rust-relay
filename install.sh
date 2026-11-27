@@ -279,6 +279,14 @@ prepare_desktop() {
     if [ "$os" = Darwin ]; then
         ditto -x -k "$work/$asset" "$desktop_stage"
         codesign --verify --strict --deep "$desktop_stage/OX Desktop.app"
+        # An installation signed with OX's Developer ID only accepts packages
+        # signed with it, so a replaced download cannot install other code.
+        release_identity='anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "ZN9XKLHU6J"'
+        if [ -d "$HOME/Applications/OX Desktop.app" ] &&
+            codesign --verify --strict -R="$release_identity" "$HOME/Applications/OX Desktop.app" 2>/dev/null; then
+            codesign --verify --strict -R="$release_identity" "$desktop_stage/OX Desktop.app" ||
+                die "this OX Desktop package is not signed by the OX release identity."
+        fi
     else
         tar -xzf "$work/$asset" -C "$desktop_stage"
     fi
