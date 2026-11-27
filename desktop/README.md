@@ -1,6 +1,10 @@
 # OX Desktop
 
-## Install or update the dev release
+## Install on macOS
+
+Download the signed DMG for [Apple Silicon](https://github.com/oxstack/ox/releases/download/dev/ox-desktop-macos-arm64.dmg) or [Intel](https://github.com/oxstack/ox/releases/download/dev/ox-desktop-macos-x86_64.dmg). Open it, drag **OX Desktop** onto **Applications**, then launch OX Desktop from Applications. To upgrade, quit OX Desktop and replace it with the app from a newer DMG.
+
+## Install or update from the terminal
 
 The rolling dev release is published after a successful build of `main`. Once its assets include `ox-desktop-linux-*` and `ox-desktop-macos-*`, the installer can choose the right package for Linux x86-64 or ARM64, Intel macOS or Apple Silicon. [Dev release and assets](https://github.com/oxstack/ox/releases/tag/dev)
 
@@ -11,7 +15,7 @@ ox desktop .
 
 Run the launch command from the project you want to open, or pass a directory such as `ox desktop ~/Work/my-project`. The installer verifies the archive checksum, installs `ox`, `ox-desktop` and `ox-host` under `~/.local/bin` by default, and adds **OX Desktop** to your Linux launcher or macOS **~/Applications**. Follow the installer's PATH hint if your shell cannot find `ox`.
 
-Once installed, OX Desktop and the headless session host check for releases in the background. Desktop offers **Restart to update** after it has verified the entire package. **Later** keeps the current release running. Open **Settings → Accounts → Restart to update** to see the prompt again. From a terminal, `ox update` applies the staged release or downloads one. Older desktop installations need one more run of the installer above to enable this behavior.
+Installer-managed copies of OX Desktop and the headless session host check for releases in the background. Desktop offers **Restart to update** after it has verified the entire package. **Later** keeps the current release running. Open **Settings → Accounts → Restart to update** to see the prompt again. From a terminal, `ox update` applies the staged release or downloads one. Older desktop installations need one more run of the installer above to enable this behavior.
 
 The desktop, session host, phone interface and CLI switch together. A running host allows up to ten minutes for active turns to finish. Turns still running at the deadline can be interrupted. Paired phones reconnect to the updated host. Use `ox host doctor` to check the running host version.
 
@@ -100,12 +104,12 @@ OX stores its desktop state under `$XDG_STATE_HOME/ox/desktop` when that variabl
 
 Download the artifact for your OS and architecture from the [OX Desktop workflow](https://github.com/oxstack/ox/actions/workflows/desktop.yml). Each archive includes the matching desktop app, session host and CLI. Use the artifact from the branch and commit you intend to test.
 
-- On macOS, extract the ZIP and open **OX Desktop.app**. Workflow artifacts named `ox-desktop-macos-*` are ad-hoc signed: if Gatekeeper requests confirmation, use System Settings → Privacy & Security → Open Anyway for the downloaded app. Released builds, and the `ox-desktop-signed-macos-*` artifacts of a release run, are signed with Developer ID and notarized by Apple. Terminal may request Automation permission for native sign-in or a terminal handoff.
+- On macOS, open the DMG and drag **OX Desktop** onto **Applications**. Artifacts from the package job are ad hoc signed and intended for testing. The release downloads and the `ox-desktop-signed-macos-*` artifacts use Developer ID signing and Apple notarization. Terminal may request Automation permission for native sign-in or a terminal handoff.
 - On Linux, extract the tarball and run `./ox-desktop/ox-desktop`. Keep all three executables in the extracted directory. Linux builds target glibc 2.39 or later and use Wayland or X11 with a Vulkan-capable driver. The tarball contains its shared library requirements in `shared-libraries.txt`.
 
 Install stock Codex or Claude Code for each route you intend to use. A desktop launch searches your PATH, user-local binaries and the standard Homebrew locations. If you use a different installation directory, start the desktop executable from a shell with the CLI on PATH.
 
-To install a checked workflow artifact locally, download and unzip the GitHub artifact for your platform. From this checkout, point the installer at the directory containing the native archive and its sibling `.sha256` file.
+To install a checked workflow artifact locally, download and unzip the GitHub artifact for your platform. From this checkout, point the installer at the directory containing the Linux tarball or macOS ZIP and its sibling `.sha256` file.
 
 ```sh
 OX_INSTALL_BASE_URL="file://$PWD/desktop/dist" sh install.sh --desktop

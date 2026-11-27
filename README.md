@@ -6,7 +6,9 @@ OX does not replace either client. It starts the official `codex` and `claude` C
 
 ## Install and first run
 
-You need macOS 11 or later, or Linux with glibc 2.39 or later (x86-64 or ARM64). One command on both:
+**macOS 11 or later.** Download the DMG for [Apple Silicon](https://github.com/oxstack/ox/releases/download/dev/ox-desktop-macos-arm64.dmg) or [Intel](https://github.com/oxstack/ox/releases/download/dev/ox-desktop-macos-x86_64.dmg). Open it, drag **OX Desktop** onto **Applications**, then launch OX Desktop from Applications. To update, quit OX Desktop and replace it with the app from a newer DMG.
+
+**Linux (glibc 2.39 or later, x86-64 or ARM64) and macOS terminal installs.** Use the installer for CLI commands and background updates:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/oxstack/ox/main/install.sh | sh -s -- --desktop
@@ -25,7 +27,7 @@ The desktop can install or update Codex for you from its first-run card, and lin
 
 ### macOS notes
 
-The installer verifies the download's SHA-256 checksum, installs `ox`, `ox-desktop` and `ox-host` in `~/.local/bin`, and puts **OX Desktop** in `~/Applications`. If your shell cannot find `ox`, add the line the installer prints to your shell profile. If Gatekeeper asks, allow the app in **System Settings → Privacy & Security**.
+The installer verifies the download's SHA-256 checksum, installs `ox`, `ox-desktop` and `ox-host` in `~/.local/bin`, and puts **OX Desktop** in `~/Applications`. If your shell cannot find `ox`, add the line the installer prints to your shell profile.
 
 ### Linux notes
 
@@ -77,7 +79,7 @@ ox codex      # or: ox claude
 
 ## Upgrade
 
-OX Desktop downloads and verifies a complete release in the background. Choose **Restart to update** to switch the desktop, CLI, session host and bundled phone interface together, **Restart when idle** to switch automatically once all host-managed agents finish, or **Later** to defer the decision. You can bring the prompt back from **Settings → Accounts → Restart to update**.
+Installer-managed copies of OX Desktop download and verify a complete release in the background. Choose **Restart to update** to switch the desktop, CLI, session host and bundled phone interface together, **Restart when idle** to switch automatically once all host-managed agents finish, or **Later** to defer the decision. You can bring the prompt back from **Settings → Accounts → Restart to update**.
 
 For an older installation, rerun the install command once to enable background updates. Include `--desktop` for the full suite or omit it for the standalone CLI. Run `ox update` to apply an update from the terminal, including on a headless machine. A running host gives active turns up to ten minutes to finish. Check the running version with `ox host doctor`.
 

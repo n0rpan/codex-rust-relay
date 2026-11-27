@@ -1,13 +1,14 @@
 #!/bin/sh
 # Re-sign a packaged macOS archive with Developer ID, notarize it, staple the
-# ticket and write the archive that ships, with its checksum.
+# ticket and write the updater ZIP and the Finder disk image with checksums.
 #
-# Usage: desktop/ci/macos-notarize.sh INPUT_ZIP OUTPUT_DIR
+# Usage: desktop/ci/macos-notarize.sh INPUT_ZIP INPUT_DMG OUTPUT_DIR
 #   OX_CODESIGN_IDENTITY, OX_CODESIGN_KEYCHAIN, OX_SIGNING_TEAM: from macos-keychain.sh
 #   APPLE_API_KEY_P8, APPLE_API_KEY_ID, APPLE_API_ISSUER_ID: App Store Connect API key (macos-release.sh)
 set -eu
 input=${1:?pass the packaged archive}
-output=${2:?pass the output directory}
+image=${2:?pass the packaged disk image}
+output=${3:?pass the output directory}
 ci=$(cd "$(dirname "$0")" && pwd)
 name=$(basename "$input")
 . "$ci/macos-release.sh"
@@ -56,3 +57,5 @@ case "$name" in
         ;;
     *) echo "Signed and notarized $name (another architecture; not started here)" ;;
 esac
+
+"$ci/macos-dmg.sh" "$image" "$shipped" "$output/${name%.zip}.dmg"
