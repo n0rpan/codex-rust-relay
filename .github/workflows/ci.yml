@@ -81,21 +81,25 @@ jobs:
         run: |
           if [ -n "${SCOPE_BASE}" ]; then git fetch --no-tags --depth=1 origin "${SCOPE_BASE}"; fi
           python3 desktop/ci/pr_scope.py
-      # A merge that changes only documentation builds the same binaries as
-      # the commit before it, so it builds and publishes nothing.
+      # When everything since the released commit is documentation, the
+      # binaries would be the same, so this push builds and publishes nothing.
+      # The comparison starts at the released commit, not at the push before
+      # this one: a push cancels the build of the push before it, so code that
+      # was merged but never published must still be released by this run.
       - name: Detect a documentation-only push to main
         id: docs
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        env:
-          BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
           docs_only=false
-          if files="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BEFORE}...${GITHUB_SHA}" \
-              --jq '.files[].filename')" && [ -n "${files}" ] && [ "$(wc -l <<< "${files}")" -lt 300 ] &&
+          released="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/dev" --jq .object.sha 2>/dev/null || true)"
+          if [ -n "${released}" ] &&
+              files="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${released}...${GITHUB_SHA}" \
+              --jq 'select(.status == "ahead") | .files[].filename')" &&
+              [ -n "${files}" ] && [ "$(wc -l <<< "${files}")" -lt 300 ] &&
               ! grep -qvE '^(docs/.*|[^/]*\.md|desktop/README\.md)$' <<< "${files}"; then
             docs_only=true
-            echo "::notice::documentation-only push: no build and no dev release"
+            echo "::notice::only documentation changed since the released ${released}: no build and no dev release"
           fi
           echo "docs_only=${docs_only}" >> "${GITHUB_OUTPUT}"
       # A guard against a mistaken tag, not a security boundary: who may create

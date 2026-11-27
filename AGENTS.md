@@ -28,8 +28,8 @@ decides.
 3. **The merge queue** tests the pull request on top of current `main` and
    merges it. Never update a branch from `main` by hand.
 4. **`main`** builds, signs with Developer ID, notarizes and publishes the
-   rolling `dev` release. A push that changes only documentation builds and
-   publishes nothing.
+   rolling `dev` release. A push builds and publishes nothing when everything
+   since the released commit is documentation.
 5. **A `v*` tag** publishes a stable release. Only the maintainer creates tags.
 
 ## Rules for agents
