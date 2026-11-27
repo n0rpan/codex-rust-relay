@@ -15,6 +15,17 @@ pub enum Config {
     Public,
 }
 
+/// HTTPS ports above 1024 are valid for OX Serve mappings.
+pub fn valid_https_port(port: u16) -> bool {
+    port >= 1024
+}
+
+/// Extract the HTTPS Serve port from a canonical origin (`https://host.ts.net:8443`).
+pub fn https_port(origin: &str) -> Option<u16> {
+    let u = url::Url::parse(origin).ok()?;
+    u.port().filter(|p| valid_https_port(*p))
+}
+
 /// `https` is the Serve HTTPS port ("8443"), `proxy` the loopback URL OX
 /// expects (`http://127.0.0.1:48162`).
 pub fn configuration(v: &Value, authority: &str, https: &str, proxy: &str) -> Config {

@@ -17,9 +17,12 @@ class PullRequestLanes(unittest.TestCase):
                 self.assertFalse(flags["packages"])
 
     def test_window_tests_select_the_linux_package(self):
-        flags = lanes(["desktop/tests/mixed_runtime_window.py"], False)
-        self.assertTrue(flags["packages"])
-        self.assertFalse(flags["full"])
+        # test-bin.sh hands the package's scripts their test executables.
+        for path in ("desktop/tests/mixed_runtime_window.py", "desktop/ci/test-bin.sh"):
+            with self.subTest(path=path):
+                flags = lanes([path], False)
+                self.assertTrue(flags["packages"])
+                self.assertFalse(flags["full"])
 
     def test_the_full_ci_label_selects_the_legs_main_builds(self):
         # The macOS package runs the desktop tests, so no focused job repeats them.

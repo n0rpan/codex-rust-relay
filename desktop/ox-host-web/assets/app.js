@@ -157,6 +157,10 @@ let cold = new Map(),
   // The last `restored_draft.message` applied per owner, so each host restore lands once.
   restoredSeen = new Map(),
   foldedProjects = new Set(),
+  starredProjects = new Map(),
+  projectOrder = new Map(),
+  projectColors = new Map(),
+  openProjectMenu = null,
   pinnedThreads = new Map(),
   threadColors = new Map(),
   visibleRows = 200;
@@ -174,6 +178,12 @@ function loadSidebarMeta() {
       if (ACCENT_COLORS.includes(c)) threadColors.set(k, c);
     for (const p of parsed.foldedProjects || [])
       if (typeof p === "string") foldedProjects.add(p);
+    for (const [p, ts] of Object.entries(parsed.starredProjects || {}))
+      if (typeof ts === "number") starredProjects.set(p, ts);
+    for (const [p, ord] of Object.entries(parsed.projectOrder || {}))
+      if (typeof ord === "number") projectOrder.set(p, ord);
+    for (const [p, c] of Object.entries(parsed.projectColors || {}))
+      if (ACCENT_COLORS.includes(c)) projectColors.set(p, c);
   } catch {}
 }
 function saveSidebarMeta() {
@@ -184,6 +194,9 @@ function saveSidebarMeta() {
         pinned: Object.fromEntries(pinnedThreads),
         colors: Object.fromEntries(threadColors),
         foldedProjects: [...foldedProjects],
+        starredProjects: Object.fromEntries(starredProjects),
+        projectOrder: Object.fromEntries(projectOrder),
+        projectColors: Object.fromEntries(projectColors),
       }),
     );
   } catch {}
@@ -899,7 +912,7 @@ function catalog() {
       elsewhere = recorded && recorded.project !== scope.project,
       model = actualModel(session),
       isPinned = pinnedThreads.has(key),
-      accent = threadColors.get(key);
+      accent = threadColors.get(key) || projectColors.get(scope.project);
     const b = button("", () => open(scope, session.id));
     b.dataset.source =
       session.parent || session.detail?.worker || session.detail?.origin
@@ -965,12 +978,71 @@ function catalog() {
       for (const entry of pinnedList) renderEntry(entry, 0, true);
     }
   }
-  for (const [project, list] of [...byProject].sort((a, b) =>
-    a[0].localeCompare(b[0]),
-  )) {
+  const latestReplyIn = (list) => {
+    let max = 0;
+    const visit = (entry) => {
+      const ts = entry.session.updated_at || 0;
+      if (ts > max) max = ts;
+      for (const child of tree.children.get(
+        keyOf(entry.scope, entry.session.id),
+      ) || [])
+        visit(child);
+    };
+    for (const entry of list) visit(entry);
+    return max;
+  };
+  const latestByProject = new Map();
+  for (const [project, list] of byProject)
+    latestByProject.set(project, latestReplyIn(list));
+  const sortedProjects = [...byProject].sort((a, b) => {
+    const pa = a[0],
+      pb = b[0];
+    const starA = starredProjects.has(pa) ? 1 : 0,
+      starB = starredProjects.has(pb) ? 1 : 0;
+    if (starA !== starB) return starB - starA;
+    const ordA = projectOrder.has(pa) ? projectOrder.get(pa) : Infinity,
+      ordB = projectOrder.has(pb) ? projectOrder.get(pb) : Infinity;
+    if (ordA !== ordB) return ordA - ordB;
+    if (starA && starB) {
+      const tsA = starredProjects.get(pa) || 0,
+        tsB = starredProjects.get(pb) || 0;
+      if (tsA !== tsB) return tsB - tsA;
+    }
+    const recA = latestByProject.get(pa) || 0,
+      recB = latestByProject.get(pb) || 0;
+    if (recA !== recB) return recB - recA;
+    return pa.localeCompare(pb);
+  });
+  const stepProjectOrder = (project, delta) => {
+    const keys = sortedProjects.map(([p]) => p);
+    const idx = keys.indexOf(project);
+    if (idx < 0) return;
+    const target = Math.max(0, Math.min(keys.length - 1, idx + delta));
+    if (target === idx) return;
+    const other = keys[target];
+    if (
+      delta < 0 &&
+      !starredProjects.has(project) &&
+      starredProjects.has(other)
+    )
+      starredProjects.set(project, (starredProjects.get(other) || 1) + 1);
+    else if (
+      delta > 0 &&
+      starredProjects.has(project) &&
+      !starredProjects.has(other)
+    )
+      starredProjects.delete(project);
+    [keys[idx], keys[target]] = [keys[target], keys[idx]];
+    keys.forEach((p, i) => projectOrder.set(p, (i + 1) * 10));
+    saveSidebarMeta();
+    repaint();
+  };
+  sortedProjects.forEach(([project, list], projectIdx) => {
     const name = leaf(project);
     const label = names.get(name) === 1 ? name : project;
     const folded = !filtering && foldedProjects.has(project);
+    const starred = starredProjects.has(project);
+    const folderColor = projectColors.get(project) || null;
     let runningCount = 0,
       waitingCount = 0;
     for (const entry of list) {
@@ -982,22 +1054,97 @@ function catalog() {
     else if (runningCount) badge += ` · ${runningCount} running`;
     const heading = el(
       "h2",
-      "project",
-      `${folded ? "▸" : "▾"} ${label}${badge}`,
+      "project" + (starred ? " starred-project" : ""),
     );
+    heading.dataset.project = project;
+    if (starred) heading.dataset.starred = "true";
+    if (folderColor) heading.dataset.accent = folderColor;
     heading.title = project;
-    heading.onclick = () => {
+    const toggle = el(
+      "span",
+      "project-title",
+      `${folded ? "▸" : "▾"} ${starred ? "★ " : ""}${label}${badge}`,
+    );
+    toggle.onclick = () => {
       if (foldedProjects.has(project)) foldedProjects.delete(project);
       else foldedProjects.add(project);
       saveSidebarMeta();
       repaint();
     };
+    const tools = el("span", "project-tools");
+    const starBtn = button(starred ? "★" : "☆", (e) => {
+      e.stopPropagation();
+      if (starredProjects.has(project)) starredProjects.delete(project);
+      else starredProjects.set(project, Date.now());
+      saveSidebarMeta();
+      repaint();
+    });
+    starBtn.className = "project-action project-star";
+    starBtn.dataset.starred = String(starred);
+    starBtn.setAttribute(
+      "aria-label",
+      (starred ? "Unstar " : "Star ") + label,
+    );
+    const menu = el("details", "action-menu project-menu");
+    if (openProjectMenu === project) menu.open = true;
+    menu.ontoggle = () => {
+      if (menu.open) openProjectMenu = project;
+      else if (openProjectMenu === project) openProjectMenu = null;
+    };
+    const summary = el("summary", "", "•••");
+    summary.setAttribute("aria-label", `Folder actions for ${label}`);
+    const sheet = el("div");
+    const starMenuBtn = button(
+      starred ? "Unstar folder" : "Star folder",
+      () => {
+        if (starredProjects.has(project)) starredProjects.delete(project);
+        else starredProjects.set(project, Date.now());
+        openProjectMenu = null;
+        saveSidebarMeta();
+        repaint();
+      },
+    );
+    const upBtn = button("Move folder up", () => {
+      openProjectMenu = null;
+      stepProjectOrder(project, -1);
+    });
+    upBtn.disabled = projectIdx === 0;
+    const downBtn = button("Move folder down", () => {
+      openProjectMenu = null;
+      stepProjectOrder(project, 1);
+    });
+    downBtn.disabled = projectIdx + 1 === sortedProjects.length;
+    const colorName = folderColor
+      ? folderColor.charAt(0).toUpperCase() + folderColor.slice(1)
+      : "None";
+    const colorBtn = button(`Folder colour · ${colorName}`, () => {
+      const idx = folderColor ? ACCENT_COLORS.indexOf(folderColor) : -1;
+      if (idx + 1 < ACCENT_COLORS.length)
+        projectColors.set(project, ACCENT_COLORS[idx + 1]);
+      else projectColors.delete(project);
+      saveSidebarMeta();
+      repaint();
+    });
+    sheet.append(starMenuBtn, upBtn, downBtn, colorBtn);
+    if (projectOrder.size > 0) {
+      sheet.append(
+        button("Sort folders by latest reply", () => {
+          projectOrder.clear();
+          openProjectMenu = null;
+          saveSidebarMeta();
+          repaint();
+        }),
+      );
+    }
+    menu.append(summary, sheet);
+    tools.append(starBtn, menu);
+    heading.append(toggle, tools);
     frag.append(heading);
     if (!folded) {
       list.sort((a, b) => b.session.updated_at - a.session.updated_at);
       for (const entry of list) renderEntry(entry, 0, false);
     }
-  }
+  });
   if (!frag.childNodes.length)
     frag.append(
       el(
@@ -1193,9 +1340,10 @@ function toolGroup(row, group) {
   if (!row.node) {
     row.node = el("details", "tool-group");
     row.count = el("span", "tool-count");
+    row.latest = el("span", "tool-latest");
     row.state = el("span", "tool-state");
     const summary = el("summary");
-    summary.append(row.count, row.state);
+    summary.append(row.count, row.latest, row.state);
     row.list = el("div", "tool-list");
     row.node.append(summary, row.list);
     row.children = new Map();
@@ -1206,6 +1354,13 @@ function toolGroup(row, group) {
   row.group = group;
   row.count.textContent =
     group.length === 1 ? "1 tool call" : group.length + " tool calls";
+  const activeEntry = group.findLast((entry) => entry.info.active);
+  const tailEntry = activeEntry ?? group[group.length - 1];
+  const isActiveGroup =
+    Boolean(activeEntry) ||
+    (row.activeTurn && group[group.length - 1]?.item.turn === row.activeTurn);
+  row.latest.textContent =
+    isActiveGroup && tailEntry?.info.title ? `· ${tailEntry.info.title}` : "";
   const failed = group.filter((entry) => entry.info.failed).length;
   row.state.textContent = failed
     ? failed + " failed"
@@ -1262,7 +1417,7 @@ function splitHandoff(text) {
 
 // Only the first user message of a handoff target carries the folded block,
 // and only once the first page of history is loaded.
-function transcript(items, handoffTarget = false) {
+function transcript(items, handoffTarget = false, activeTurn = null) {
   const foldId = handoffTarget
     ? items.find((i) => i.role === "user")?.id
     : undefined;
@@ -1289,6 +1444,7 @@ function transcript(items, handoffTarget = false) {
         const item = visible[++n];
         group.push({ item, info: toolInfo(item) });
       }
+      row.activeTurn = activeTurn;
       toolGroup(row, group);
     } else {
       if (!row.node) {
@@ -1524,9 +1680,12 @@ function conversation() {
   const items = timeline?.items || [];
   const tail = items[items.length - 1];
   const asks = (s?.asks || []).filter((a) => a.thread === id);
+  const activeTurn =
+    detailLink?.ready && caps.includes("stop") ? (tail?.turn ?? null) : null;
   transcript(
     items,
     !!origin?.handoff && !timeline?.detail?.older,
+    activeTurn,
   );
   $("older").hidden = !timeline?.detail?.older;
   $("older").onclick = () => detailLink.act({ load_older: id });

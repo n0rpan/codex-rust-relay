@@ -804,10 +804,39 @@ jobs:
       pr_macos: ${{ needs.version.outputs.mac_package == 'true' }}
       full: ${{ needs.version.outputs.full == 'true' }}
 
+  # The publish jobs run for the first time on main or a tag. This runs their
+  # asset check on the artifacts of a full-ci pull request, which builds the
+  # same four platforms, so a renamed artifact or file is caught before merge.
+  # It downloads and reads; it holds the read-only token and publishes nothing.
+  release-assets:
+    name: Check the release asset list
+    needs: [version, release, desktop-release]
+    if: needs.version.outputs.full == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require every file a release uploads, with a matching checksum
+        run: |
+          set -euo pipefail
+          # The download the publish jobs use. Signing needs main, so the macOS
+          # files come from the build jobs' artifacts.
+          gh run download "${GITHUB_RUN_ID}" --repo "${GITHUB_REPOSITORY}" --pattern 'ox-*' --dir dist
+          test -f install.sh
+          desktop/ci/release-assets.sh --unsigned dist "${VERSION}"
+
   merge:
     name: OX merge check
     if: ${{ always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
-    needs: [version, fast, verify, release, native, focused, desktop-release]
+    needs: [version, fast, verify, release, native, focused, desktop-release, release-assets]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
@@ -820,7 +849,8 @@ jobs:
           jobs = json.loads(os.environ["RESULTS"])
           scope = jobs["version"]["outputs"]
           selected = {"version", "fast", "verify", "release"}
-          for job, flag in [("native", "native"), ("desktop-release", "packages")]:
+          for job, flag in [("native", "native"), ("desktop-release", "packages"),
+                            ("release-assets", "full")]:
               if scope[flag] == "true":
                   selected.add(job)
           if json.loads(scope["focused"]):
@@ -876,23 +906,10 @@ jobs:
           fi
 
           gh run download "${GITHUB_RUN_ID}" --repo "${repo}" --pattern 'ox-*' --dir dist
-          files=(install.sh)
-          source desktop/ci/release-assets.sh
-          append_desktop_assets
-          for platform in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
-            directory="dist/ox-${platform}"
-            # macOS ships the Developer ID signed and notarized build (job sign-cli).
-            if [[ "${platform}" == *-apple-darwin ]]; then directory="dist/ox-signed-${platform}"; fi
-            executable="ox-${VERSION}-${platform}"
-            alias="ox-${platform}.tar.gz"
-            (
-              cd "${directory}"
-              sha256sum --check --strict "${executable}.sha256" "${executable}.tar.gz.sha256" "${alias}.sha256"
-            )
-            files+=("${directory}/${executable}" "${directory}/${executable}.sha256"
-                    "${directory}/${executable}.tar.gz" "${directory}/${executable}.tar.gz.sha256"
-                    "${directory}/${alias}" "${directory}/${alias}.sha256")
-          done
+          # The checked asset list, shared with the release-assets job.
+          assets="$(desktop/ci/release-assets.sh dist "${VERSION}")"
+          mapfile -t files <<< "${assets}"
+          files=(install.sh "${files[@]}")
 
           notes="${RUNNER_TEMP}/dev-notes.md"
           {
@@ -1023,23 +1040,10 @@ jobs:
             exit 1
           fi
           gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'ox-*' --dir dist
-          files=(install.sh)
-          source desktop/ci/release-assets.sh
-          append_desktop_assets
-          for platform in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
-            directory="dist/ox-${platform}"
-            # macOS ships the Developer ID signed and notarized build (job sign-cli).
-            if [[ "${platform}" == *-apple-darwin ]]; then directory="dist/ox-signed-${platform}"; fi
-            executable="ox-${VERSION}-${platform}"
-            alias="ox-${platform}.tar.gz"
-            (
-              cd "$directory"
-              sha256sum --check --strict "${executable}.sha256" "${executable}.tar.gz.sha256" "${alias}.sha256"
-            )
-            files+=("$directory/$executable" "$directory/$executable.sha256"
-                    "$directory/$executable.tar.gz" "$directory/$executable.tar.gz.sha256"
-                    "$directory/$alias" "$directory/$alias.sha256")
-          done
+          # The checked asset list, shared with the release-assets job.
+          assets="$(desktop/ci/release-assets.sh dist "${VERSION}")"
+          mapfile -t files <<< "${assets}"
+          files=(install.sh "${files[@]}")
           # Hand-written notes in docs/releases/<tag>.md go first; GitHub appends the change list.
           notes=()
           if [ -f "docs/releases/${TAG}.md" ]; then notes=(--notes-file "docs/releases/${TAG}.md"); fi

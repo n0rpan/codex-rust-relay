@@ -141,6 +141,60 @@ def run(ox, host, root):
             args = shlex.split(next(line.removeprefix("ExecStart=") for line in unit.read_text().splitlines() if line.startswith("ExecStart=")))
             assert Path(args[0]).resolve() == host and args[1:] == ["run", "--socket", str(sock), "--state-dir", str(directories["state"])]
         reserve_serve_port(directories["state"])
+        tailscale = binary / "tailscale"
+        tailscale.write_text("""#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+mapping = Path(os.environ["OX_HOST_STATE_DIR"]) / "mock-serve.json"
+args = sys.argv[1:]
+node = "workstation.fixture.ts.net"
+if args == ["status", "--json", "--peers=false"]:
+    print(json.dumps({"BackendState": "Running", "Self": {"DNSName": node + ".", "UserID": 1},
+                      "User": {"1": {"LoginName": "fixture@example.test"}}}))
+elif args == ["serve", "status", "--json"]:
+    print(mapping.read_text() if mapping.exists() else "{}")
+elif len(args) == 4 and args[:2] == ["serve", "--bg"] and args[2].startswith("--https="):
+    port = args[2].removeprefix("--https=")
+    data = json.loads(mapping.read_text()) if mapping.exists() else {}
+    data.setdefault("TCP", {})[port] = {"HTTPS": True}
+    data.setdefault("Web", {})[f"{node}:{port}"] = {"Handlers": {"/": {"Proxy": args[3]}}}
+    mapping.write_text(json.dumps(data))
+elif len(args) == 3 and args[0] == "serve" and args[1].startswith("--https=") and args[2] == "off":
+    port = args[1].removeprefix("--https=")
+    if mapping.exists():
+        data = json.loads(mapping.read_text())
+        data.get("TCP", {}).pop(port, None)
+        data.get("Web", {}).pop(f"{node}:{port}", None)
+        mapping.write_text(json.dumps(data))
+else:
+    raise SystemExit(f"unexpected tailscale args: {args}")
+""")
+        tailscale.chmod(0o700)
+        (directories["state"] / "mock-serve.json").write_text(json.dumps({
+            "TCP": {"8443": {"HTTPS": True}},
+            "Web": {"workstation.fixture.ts.net:8443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:9999"}}}},
+        }))
+        conflict = command("pair", check=False)
+        assert conflict.returncode != 0 and "--port" in conflict.stderr, conflict
+        paired = command("pair", "--port", "9443", "--listen-port", "49162")
+        assert "https://workstation.fixture.ts.net:9443/#pair=" in paired.stdout, paired
+        assert "https://workstation.fixture.ts.net:9443 → 127.0.0.1:49162" in command("status").stdout
+        # Subsequent pair without flags remembers the configured custom ports.
+        paired_again = command("pair")
+        assert "https://workstation.fixture.ts.net:9443/#pair=" in paired_again.stdout, paired_again
+        # Changing --listen-port on the same HTTPS port updates the OX-owned mapping in place.
+        relocated = command("pair", "--listen-port", "49200")
+        assert "https://workstation.fixture.ts.net:9443/#pair=" in relocated.stdout, relocated
+        assert "https://workstation.fixture.ts.net:9443 → 127.0.0.1:49200" in command("status").stdout
+        # Trying to switch to an already-occupied loopback port fails cleanly without tearing down active access.
+        with socket.socket() as occupied_loopback:
+            occupied_loopback.bind(("127.0.0.1", 0))
+            busy_port = str(occupied_loopback.getsockname()[1])
+            failed_move = command("pair", "--listen-port", busy_port, check=False)
+            assert failed_move.returncode != 0 and "--listen-port" in failed_move.stderr, failed_move
+            assert "https://workstation.fixture.ts.net:9443 → 127.0.0.1:49200" in command("status").stdout
+        doctor = command("doctor", check=False)
+        assert "remote access: https://workstation.fixture.ts.net:9443 → 127.0.0.1:49200 (tailnet only)" in doctor.stdout, doctor
         first = (directories["state"] / "mock-service-pid").read_text()
         command("install")
         assert (directories["state"] / "mock-service-pid").read_text() == first

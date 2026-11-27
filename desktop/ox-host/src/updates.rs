@@ -188,6 +188,12 @@ pub fn cli(paths: &Paths, args: &[String]) -> io::Result<()> {
         .collect::<Vec<_>>()
         .as_slice()
     {
+        ["-h" | "--help"] => {
+            println!(
+                "Usage: ox host update [status|when-idle|automatic|download|manual|stable|dev|cancel]"
+            );
+            return Ok(());
+        }
         [] | ["when-idle"] => Command::UpdateWhenIdle,
         ["status"] => Command::Status,
         ["cancel"] => Command::Cancel,

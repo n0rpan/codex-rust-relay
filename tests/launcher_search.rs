@@ -9,6 +9,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "common/executable.rs"]
+mod executable;
+
 const BRAVE_KEY: &str = "brave-test-key-must-not-leak";
 const CLAUDE_DISCOVERY_ENV: &str = "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY";
 
@@ -45,9 +48,8 @@ fn base_env(command: &mut Command, home: &Path) {
 }
 
 fn write_fake_client(dir: &Path, client: &str) {
-    let script = dir.join(client);
-    fs::write(
-        &script,
+    executable::write(
+        &dir.join(client),
         r#"#!/bin/sh
 if [ "$1" = "debug" ] && [ "$2" = "models" ]; then
   env > "$CAPTURE/bundled-env"
@@ -66,15 +68,7 @@ env > "$CAPTURE/run-env"
 printf '%s\n' "$@" > "$CAPTURE/run-args"
 exit 0
 "#,
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
-    }
+    );
 }
 
 fn write_codeox_config(home: &Path, search: bool) {
@@ -686,17 +680,10 @@ fn an_old_codex_fails_the_launch_with_the_floor_and_its_own_error() {
     let home = TempDir::new("launcher-old-codex-home");
     let capture = TempDir::new("launcher-old-codex-capture");
     let fake_bin = TempDir::new("launcher-old-codex-bin");
-    let script = fake_bin.0.join("codex");
-    fs::write(
-        &script,
+    executable::write(
+        &fake_bin.0.join("codex"),
         "#!/bin/sh\n[ \"$1\" = --version ] && { echo 'codex-cli 0.98.0'; exit 0; }\necho \"error: unrecognized subcommand 'models'\" >&2\nexit 2\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    );
     write_codeox_config(&home.0, false);
 
     let output = run_launcher(

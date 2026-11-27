@@ -45,6 +45,7 @@ enum CatalogEntry {
     /// Auto-grouped project folder header (`ox`, `oxa`, …).
     Project {
         project: PathBuf,
+        starred: bool,
         color: Option<AccentColor>,
         count: usize,
         folded: bool,
@@ -2089,6 +2090,18 @@ impl Host {
         group
     }
 
+    fn ordered_project_keys(&self) -> Vec<PathBuf> {
+        let mut list = Vec::new();
+        for entry in &self.catalog {
+            if let CatalogEntry::Project { project, .. } = entry
+                && !list.contains(project)
+            {
+                list.push(project.clone());
+            }
+        }
+        list
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_thread_row_menu(
         mut menu: gpui_component::menu::PopupMenu,
@@ -2600,6 +2613,7 @@ impl Host {
                 }
                 CatalogEntry::Project {
                     project,
+                    starred,
                     color,
                     count,
                     folded,
@@ -2607,6 +2621,7 @@ impl Host {
                     waiting,
                 } => {
                     let proj_path = project.clone();
+                    let proj_starred = *starred;
                     let proj_color = *color;
                     let proj_name = proj_path
                         .file_name()
@@ -2649,6 +2664,22 @@ impl Host {
                                     },
                                 ),
                             );
+                            let host_star = host.clone();
+                            let p_star = menu_proj.clone();
+                            let star_label = if proj_starred {
+                                "Unstar folder"
+                            } else {
+                                "Star folder"
+                            };
+                            menu = menu.item(crate::kit::menu_item(star_label).on_click(
+                                move |_, _, cx| {
+                                    let _ = host_star.update(cx, |s, cx| {
+                                        let now = chrono::Local::now().timestamp();
+                                        s.sidebar.toggle_project_star(&p_star, now);
+                                        s.save_sidebar(cx);
+                                    });
+                                },
+                            ));
                             let host_color = host.clone();
                             let p_color = menu_proj.clone();
                             menu =
@@ -2681,6 +2712,30 @@ impl Host {
                                             }),
                                     )
                                 });
+                            let host_up = host.clone();
+                            let p_up = menu_proj.clone();
+                            let host_down = host.clone();
+                            let p_down = menu_proj.clone();
+                            menu = menu
+                                .separator()
+                                .item(crate::kit::menu_item("Move folder up").on_click(
+                                    move |_, _, cx| {
+                                        let _ = host_up.update(cx, |s, cx| {
+                                            let ordered = s.ordered_project_keys();
+                                            s.sidebar.step_project_order(&ordered, &p_up, -1);
+                                            s.save_sidebar(cx);
+                                        });
+                                    },
+                                ))
+                                .item(crate::kit::menu_item("Move folder down").on_click(
+                                    move |_, _, cx| {
+                                        let _ = host_down.update(cx, |s, cx| {
+                                            let ordered = s.ordered_project_keys();
+                                            s.sidebar.step_project_order(&ordered, &p_down, 1);
+                                            s.save_sidebar(cx);
+                                        });
+                                    },
+                                ));
                             let p_copy = menu_proj.display().to_string();
                             menu.separator().item(
                                 crate::kit::menu_item("Copy project path").on_click(
@@ -2702,7 +2757,7 @@ impl Host {
                         *running,
                         *waiting,
                         proj_color,
-                        false,
+                        proj_starred,
                         Some(menu),
                         cx.listener(move |s, _, _, cx| {
                             s.sidebar.toggle_project_collapsed(&proj_path);

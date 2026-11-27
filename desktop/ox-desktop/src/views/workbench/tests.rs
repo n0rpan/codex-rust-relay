@@ -32,7 +32,9 @@ fn stock_ox_worker() {
         if parent.is_none() {
             parent = store.selected().map(str::to_owned);
         }
-        if let Some(ask) = store.asks().first() {
+        // The host lists an approval until it has taken the answer, so answer
+        // it once; a second answer is refused as already resolved.
+        if !allowed && let Some(ask) = store.asks().first() {
             assert!(
                 ask.detail.contains("start_ox_worker") && ask.detail.contains("fixture/demo"),
                 "{}",
@@ -283,7 +285,10 @@ fn stock_reopen() {
                 .expect("stock turn timed out"),
         );
         assert!(store.notice().is_none(), "{:?}", store.notice());
-        if let Some(ask) = store.asks().first() {
+        // The host lists an approval until it has taken the answer. Any event
+        // that arrives in between runs this loop again; answering a second
+        // time is refused as already resolved, and that refusal is a notice.
+        if !answered && let Some(ask) = store.asks().first() {
             assert!(
                 api && ask.detail.contains("approved.txt"),
                 "unexpected request: {}",

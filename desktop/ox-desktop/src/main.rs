@@ -1,6 +1,9 @@
 mod activity;
 mod app;
 mod appearance;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../../tests/common/executable.rs"]
+mod executable;
 mod keymap;
 mod kit;
 mod platform;

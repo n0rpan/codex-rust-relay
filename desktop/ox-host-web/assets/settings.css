@@ -18,10 +18,43 @@
 }
 .phone-settings-body,
 .phone-settings-menu,
+.phone-settings-group,
+.phone-available-models,
+.phone-model-provider-group,
 .phone-settings-body form {
   display: grid;
   gap: 0.65rem;
   min-width: 0;
+}
+.phone-settings-group {
+  gap: 0.45rem;
+}
+.phone-settings-group + .phone-settings-group {
+  margin-top: 0.55rem;
+}
+.phone-settings-group-title,
+.phone-model-provider-title {
+  margin: 0.35rem 0 0.1rem;
+  font: 600 0.76rem/1.4 var(--mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.phone-catalog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--line);
+}
+.phone-star-candidate {
+  width: 100%;
+  text-align: left;
+  font-family: var(--mono);
+  font-size: 0.86rem;
+  overflow-wrap: anywhere;
 }
 .phone-settings-body {
   padding-bottom: max(2rem, env(safe-area-inset-bottom));

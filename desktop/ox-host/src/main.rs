@@ -2,6 +2,9 @@ mod control;
 mod doctor;
 mod durable;
 mod engine;
+#[cfg(test)]
+#[path = "../../../tests/common/executable.rs"]
+mod executable;
 mod handover;
 mod identity;
 mod lease;
@@ -174,8 +177,10 @@ const USAGE: &str = "Usage: ox-host COMMAND [--socket PATH] [--state-dir PATH] [
   status                    show whether the host and its login service run
   stop                      stop the host now; running turns are interrupted
   restart [--timeout SECS]  finish running turns (default bound 600s), then start the installed host
-  pair --worker-host        invite another OX host to launch workers here
-  pair [--terminal]         print a private Serve invitation, optionally granting a terminal
+  pair [--terminal] [--port HTTPS_PORT] [--listen-port LOCAL_PORT]
+                            print a private Serve invitation, optionally granting a terminal
+  pair --worker-host [--port HTTPS_PORT] [--listen-port LOCAL_PORT]
+                            invite another OX host to launch workers here
   update [setting]          install when idle or set automatic, download, manual, stable or dev
   name [NAME]               show or set the name shown to clients
   policy [set POLICY]       show or set the starting mode for this host
@@ -198,6 +203,10 @@ fn entry() -> io::Result<()> {
                 .filter(|s| !s.is_empty())
                 .unwrap_or(env!("CARGO_PKG_VERSION"))
         );
+        return Ok(());
+    }
+    if matches!(op.to_str(), Some("-h" | "--help" | "help")) {
+        println!("{USAGE}");
         return Ok(());
     }
     let mut paths = Paths::discover()?;
@@ -226,33 +235,60 @@ fn entry() -> io::Result<()> {
     }
     match (op.to_str(), rest.as_slice()) {
         (Some("run"), []) => run(paths),
-        (Some(action @ ("install" | "status")), []) => ox_host_service::manage(action, &paths),
+        (Some("install"), []) => ox_host_service::manage("install", &paths),
+        (Some("status"), []) => {
+            ox_host_service::manage("status", &paths)?;
+            if ox_host_service::is_running(&paths).unwrap_or(false)
+                && let Ok(reply) = ox_host_web::admin::request(
+                    &paths.state_dir,
+                    &ox_host_web::admin::Request::Status,
+                )
+            {
+                match (reply.enabled, reply.origin) {
+                    (true, Some(origin)) if reply.port > 0 => {
+                        println!("Remote access: {origin} → 127.0.0.1:{}", reply.port);
+                    }
+                    (true, Some(origin)) => println!("Remote access: {origin}"),
+                    _ => println!("Remote access: off"),
+                }
+            }
+            Ok(())
+        }
+        (Some("install" | "status" | "stop" | "devices"), [flag])
+            if matches!(flag.as_str(), "-h" | "--help") =>
+        {
+            println!("{USAGE}");
+            Ok(())
+        }
         (Some("uninstall"), []) => ox_host_service::manage("uninstall", &paths),
         (Some("uninstall"), [purge]) if purge == "--purge" => control::purge(&paths),
+        (Some("uninstall"), [flag]) if matches!(flag.as_str(), "-h" | "--help") => {
+            println!("Usage: ox host uninstall [--purge]");
+            Ok(())
+        }
         (Some("stop"), []) => control::stop(&paths),
         (Some("restart-if-updated"), []) => control::restart_if_updated(&paths),
+        (Some("restart"), [flag]) if matches!(flag.as_str(), "-h" | "--help") => {
+            println!("Usage: ox host restart [--timeout SECS]");
+            Ok(())
+        }
         (Some("restart"), rest) => control::restart(&paths, control::timeout(rest)?),
         (Some(kind @ ("name" | "labels")), rest) => pairing::profile(&paths, kind, rest),
         (Some("project"), rest) => projects::cli(&paths.state_dir, rest),
         (Some("policy"), rest) => pairing::mode_policy(&paths, rest),
         (Some("update"), rest) => updates::cli(&paths, rest),
-        (Some("pair"), []) => pairing::pair(
-            &paths,
-            ox_host_web::access::Operation::Pair { terminal: false },
-        )
-        .map_err(io::Error::other),
-        (Some("pair"), [flag]) if flag == "--terminal" => pairing::pair(
-            &paths,
-            ox_host_web::access::Operation::Pair { terminal: true },
-        )
-        .map_err(io::Error::other),
-        (Some("pair"), [flag]) if flag == "--worker-host" => {
-            pairing::pair(&paths, ox_host_web::access::Operation::PairWorker)
-                .map_err(io::Error::other)
-        }
+        (Some("pair"), rest) => pairing::pair_cli(&paths, rest).map_err(io::Error::other),
         (Some("devices"), []) => pairing::devices(&paths).map_err(io::Error::other),
+        (Some("terminal"), [flag]) if matches!(flag.as_str(), "-h" | "--help") => {
+            println!("Usage: ox host terminal <device> on|off");
+            Ok(())
+        }
         (Some("terminal"), [id, setting]) if matches!(setting.as_str(), "on" | "off") => {
             pairing::terminal(&paths, id, setting == "on").map_err(io::Error::other)
+        }
+        (Some("revoke"), [flag]) if matches!(flag.as_str(), "-h" | "--help") => {
+            println!("Usage: ox host revoke <device-id>");
+            Ok(())
         }
         (Some("revoke"), [id]) => pairing::revoke(&paths, id).map_err(io::Error::other),
         (Some("doctor"), rest) => doctor::run(&paths, rest),

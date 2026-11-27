@@ -332,14 +332,12 @@ pub(crate) fn canonical_scope(scope: Scope) -> io::Result<Scope> {
 mod tests {
     use super::*;
     use ox_desk_core::settings_protocol::{VERSION, model::Snapshot};
-    use std::os::unix::fs::PermissionsExt;
 
     const STOCK: &str = "stock/model";
     const UNSTARRED: &str = "fixture/unstarred-only";
 
     fn script(path: &std::path::Path, body: &str) {
-        std::fs::write(path, format!("#!/usr/bin/env python3\n{body}")).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::executable::write(path, &format!("#!/usr/bin/env python3\n{body}"));
     }
 
     /// A fixture provider: settings list only the stock alias, discovery also lists an

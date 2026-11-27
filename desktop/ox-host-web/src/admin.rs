@@ -140,6 +140,8 @@ pub struct Reply {
     pub enabled: bool,
     pub origin: Option<String>,
     pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_port: Option<u16>,
     pub devices: Vec<Device>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub worker_hosts: Vec<Device>,

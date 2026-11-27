@@ -6,9 +6,7 @@ trap 'rm -rf "$stage"' EXIT
 floor=$(python3 -c 'import tomllib; print(tomllib.load(open("desktop/gate.toml", "rb"))["claude"]["minimum_version"])')
 latest=$(npm view @anthropic-ai/claude-code@latest version)
 ox=$(realpath "${1:?pass the path to the built OX helper}")
-OX_CLAUDE_WORKBENCH_TEST_BIN=$(cargo test --no-run --locked --release --manifest-path desktop/Cargo.toml \
-    -p ox-desktop --message-format=json | jq -r 'select(.profile.test == true and .target.name == "ox-desktop" and .executable != null) | .executable')
-test -x "$OX_CLAUDE_WORKBENCH_TEST_BIN"
+OX_CLAUDE_WORKBENCH_TEST_BIN=$(desktop/ci/test-bin.sh ox-desktop --release -p ox-desktop)
 export OX_CLAUDE_WORKBENCH_TEST_BIN
 versions=("$floor")
 if [ "$latest" != "$floor" ]; then versions+=("$latest"); fi
@@ -24,9 +22,7 @@ for version in "${versions[@]}"; do
     python3 desktop/tests/claude_stock_session.py "$ox" "$binary"
 done
 
-title_test=$(cargo test --no-run --locked --release --manifest-path desktop/Cargo.toml \
-    -p ox-desk-core --lib --message-format=json | jq -r 'select(.profile.test == true and .target.name == "ox_desk_core" and .executable != null) | .executable')
-test -x "$title_test"
+title_test=$(desktop/ci/test-bin.sh ox_desk_core --release -p ox-desk-core --lib)
 codex_floor=$(python3 -c 'import tomllib; print(tomllib.load(open("desktop/gate.toml", "rb"))["codex"]["minimum_version"])')
 codex_latest=$(npm view @openai/codex@latest version)
 for track in floor latest; do

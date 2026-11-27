@@ -59,6 +59,10 @@ pub(crate) fn registered(dir: &Path) -> io::Result<BTreeSet<PathBuf>> {
 pub(crate) fn cli(dir: &Path, args: &[String]) -> io::Result<()> {
     match args {
         [] => (),
+        [flag] if matches!(flag.as_str(), "-h" | "--help") => {
+            println!("Usage: ox host project [list | add PATH | remove PATH]");
+            return Ok(());
+        }
         [action] if action == "list" => (),
         [action, path] if matches!(action.as_str(), "add" | "remove") => {
             let path = std::path::absolute(path)?;

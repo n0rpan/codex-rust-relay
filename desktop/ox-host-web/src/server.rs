@@ -377,7 +377,20 @@ async fn administer(
 /// The only way the remote listener opens a TCP socket. Tailscale Serve is the sole
 /// path in, so the address is loopback whatever origin or port is configured.
 async fn bind(port: u16) -> io::Result<TcpListener> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+        .await
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::AddrInUse {
+                io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "Local listener port {port} is already in use on 127.0.0.1. Run `ox host pair --listen-port <port>` to pick another local port."
+                    ),
+                )
+            } else {
+                e
+            }
+        })?;
     if !listener.local_addr()?.ip().is_loopback() {
         return Err(io::Error::other("Remote listener must bind to loopback"));
     }

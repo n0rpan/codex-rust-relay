@@ -1189,12 +1189,21 @@ impl Host {
                 }
                 let mut project_groups: Vec<_> = by_project.into_iter().collect();
                 project_groups.sort_by(|(pa, la), (pb, lb)| {
+                    let star_a = self.sidebar.is_project_starred(pa);
+                    let star_b = self.sidebar.is_project_starred(pb);
+                    let order_a = self.sidebar.project_order(pa).unwrap_or(i64::MAX);
+                    let order_b = self.sidebar.project_order(pb).unwrap_or(i64::MAX);
+                    let star_ts_a = self.sidebar.project_starred_at(pa).unwrap_or(0);
+                    let star_ts_b = self.sidebar.project_starred_at(pb).unwrap_or(0);
                     let active_a = *pa == active_project;
                     let active_b = *pb == active_project;
                     let newest_a = la.first().map_or(0, |r| r.1);
                     let newest_b = lb.first().map_or(0, |r| r.1);
-                    active_b
-                        .cmp(&active_a)
+                    star_b
+                        .cmp(&star_a)
+                        .then_with(|| order_a.cmp(&order_b))
+                        .then_with(|| star_ts_b.cmp(&star_ts_a))
+                        .then_with(|| active_b.cmp(&active_a))
                         .then_with(|| newest_b.cmp(&newest_a))
                         .then_with(|| pa.cmp(pb))
                 });
@@ -1219,8 +1228,10 @@ impl Host {
                     let (running, waiting) = node_rollup(&list, &tree_snapshot);
                     let folded = !filtering && self.sidebar.is_project_collapsed(&project);
                     let color = self.sidebar.project_color(&project);
+                    let starred = self.sidebar.is_project_starred(&project);
                     catalog.push(CatalogEntry::Project {
                         project,
+                        starred,
                         color,
                         count: list.len(),
                         folded,

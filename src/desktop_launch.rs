@@ -87,8 +87,10 @@ fn companion(program: &str) -> Result<PathBuf, RelayError> {
 const HOST_USAGE: &str = "Usage: ox host COMMAND
   install                   start the session host at login
   status                    show whether the host and its login service run
-  pair [--terminal]         enable private Serve access and print a device invitation
-  pair --worker-host        invite another OX host to launch workers here
+  pair [--terminal] [--port HTTPS_PORT] [--listen-port LOCAL_PORT]
+                            enable private Serve access and print a device invitation
+  pair --worker-host [--port HTTPS_PORT] [--listen-port LOCAL_PORT]
+                            invite another OX host to launch workers here
   update [setting]          install when idle or set automatic, download, manual, stable or dev
   name [NAME]               show or change this host’s display name
   project [list | add DIR | remove DIR]  manage registered checkouts

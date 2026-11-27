@@ -197,10 +197,10 @@ OX Desktop
 Phone (the paired web app)
   Sessions → ••• → Settings
   Accounts                Sign in; Configure API provider.
+  Starred models          Browse the model catalog, star models, and order the model lists.
   Providers & models      The same provider editor.
-  Credentials             Manage provider and Brave Search keys. Copy selected keys
+  API keys                Manage provider and Brave Search keys. Copy selected keys
                           from this host to a paired host with a destination review.
-  Favorites               Order the model lists.
   Web search              Brave Search for both clients.
   Remote access           Pair another device and review paired devices.
   Install & notifications Home Screen and alert setup.
@@ -219,7 +219,7 @@ Checks and next steps
   ox doctor               Check files, providers and saved accounts. It prints
                           home: and a next: line with the command to run.
   ox doctor --fix         Repair what ox can repair; files are backed up first.
-  ox host pair            Pair a desktop or phone over your tailnet.
+  ox host pair [--port N] Pair a desktop or phone over your tailnet (default HTTPS port 8443).
   ox host pair --worker-host  Create an invitation for a worker host.
   ox host pair --terminal Include terminal access for the device that pairs.
   ox host name [NAME]     Show or change the name shown on paired devices.

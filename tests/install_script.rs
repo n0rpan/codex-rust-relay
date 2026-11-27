@@ -11,6 +11,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[path = "common/executable.rs"]
+mod executable;
+
 const FAKE_OX: &str = "#!/bin/sh\necho \"ox 9.9.9-dev.1\"\n";
 
 struct TempDir(PathBuf);
@@ -338,8 +341,7 @@ fn optional_desktop_installs_launches_and_preserves_existing_profile() {
         let script = format!(
             "#!/bin/sh\ncase \"$1\" in --version) echo '{name} 9.9.9';; restart-if-updated) [ -f \"$HOME/fail-restart\" ] && exit 1; touch \"$HOME/restarted\";; esac\n"
         );
-        fs::write(&file, script).unwrap();
-        fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+        executable::write(&file, &script);
         assert!(bin.join(name).canonicalize().unwrap().starts_with(&current));
     }
     fs::write(next.join(".ready"), "9.9.9").unwrap();
@@ -398,11 +400,10 @@ fn optional_desktop_installs_launches_and_preserves_existing_profile() {
         .unwrap()
         .stdout;
     for version in [std::str::from_utf8(&running).unwrap().trim(), "ox 0.0.0"] {
-        fs::write(
-            next_bin.join("ox"),
-            format!("#!/bin/sh\necho '{version}'\n"),
-        )
-        .unwrap();
+        executable::write(
+            &next_bin.join("ox"),
+            &format!("#!/bin/sh\necho '{version}'\n"),
+        );
         let check = Command::new(&pinned)
             .args(["update", "--stage-desktop"])
             .output()

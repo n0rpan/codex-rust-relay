@@ -163,6 +163,9 @@ impl Preferences {
         if page == Page::Accounts && self.link.remote().is_some() {
             self.refresh_remote_behavior(cx);
         }
+        if page == Page::Favorites {
+            self.fetch_models(cx);
+        }
         self.scroll.set_offset(point(px(0.), px(0.)));
         cx.notify();
     }
@@ -557,7 +560,8 @@ impl Preferences {
                 s.loading_models = false;
                 match result {
                     Ok(models) => {
-                        s.settings.models = models;
+                        s.settings.models =
+                            ox_desk_core::ports::ox::merge_catalog(&s.settings.models, models);
                         s.report(Ok(()), "Model catalog updated.", cx)
                     }
                     Err(e) => s.report(Err(e), "", cx),
