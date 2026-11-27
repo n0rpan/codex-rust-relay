@@ -352,16 +352,21 @@ impl Render for Remote {
                                 }),
                             ));
                         }
-                        row = row.child(button(
-                            p,
-                            ("pending-deny", index),
-                            "Decline",
-                            false,
-                            !self.busy,
-                            cx.listener(move |s, _, _, cx| {
-                                s.submit(Operation::DenyPending { id: deny.clone() }, cx)
-                            }),
-                        ));
+                        // Accepting registered the device; there is nothing
+                        // left to decline, and pretending otherwise would be
+                        // wrong.
+                        if !pending.approved {
+                            row = row.child(button(
+                                p,
+                                ("pending-deny", index),
+                                "Decline",
+                                false,
+                                !self.busy,
+                                cx.listener(move |s, _, _, cx| {
+                                    s.submit(Operation::DenyPending { id: deny.clone() }, cx)
+                                }),
+                            ));
+                        }
                         view = view.child(row);
                     }
                 } else {

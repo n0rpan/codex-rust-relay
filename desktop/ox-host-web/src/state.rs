@@ -223,6 +223,9 @@ struct Pending {
     /// The credential, once the operator accepted and before the device
     /// collected it.
     token: Option<String>,
+    /// The registered device, from the acceptance until the credential is
+    /// collected or the operator withdraws it.
+    device: Option<String>,
 }
 
 impl Pending {
@@ -644,6 +647,7 @@ impl State {
             login: login.to_owned(),
             expires: now() + PENDING_TTL,
             token: None,
+            device: None,
         };
         let reply = entry.reply(&id);
         self.pending.insert(id, entry);
@@ -677,8 +681,10 @@ impl State {
             entry.class,
         );
         let token = self.register(&login, &key, &label, class, false, worker)?;
+        let device = self.device_for_key(&login, &key);
         let entry = self.pending.get_mut(id)?;
         entry.token = Some(token);
+        entry.device = device;
         if let Some(window) = self.window.as_mut() {
             window.paired += 1;
             if window.paired >= WINDOW_PAIRS {
@@ -687,8 +693,29 @@ impl State {
         }
         Some(())
     }
+    /// Withdraw a request. If the operator already accepted it, the device it
+    /// registered is revoked too, so declining always means "no access".
     pub fn deny_pending(&mut self, id: &str) {
-        self.pending.remove(id);
+        if let Some(entry) = self.pending.remove(id)
+            && let Some(device) = entry.device
+        {
+            let _ = self.revoke(&device);
+        }
+    }
+    /// The login that asked, so a remote operator can only decide its own
+    /// requests.
+    pub fn pending_login(&self, id: &str) -> Option<String> {
+        self.pending
+            .get(id)
+            .filter(|p| p.expires > now())
+            .map(|p| p.login.clone())
+    }
+    fn device_for_key(&self, login: &str, key: &str) -> Option<String> {
+        self.disk
+            .devices
+            .values()
+            .find(|r| r.device.login == login && r.key == key)
+            .map(|r| r.device.id.clone())
     }
     /// The pair request's own view: pending, or the credential once accepted.
     pub fn poll_window(&mut self, id: &str) -> PollState {
@@ -1287,6 +1314,11 @@ mod tests {
             .request_window("named@example.test", &public, "Phone", DeviceClass::Phone)
             .unwrap();
         assert!(s.approve_pending(&named.id).is_some());
+        // Declining after accepting withdraws the device it registered.
+        let before = s.reply(None).devices.len();
+        s.deny_pending(&named.id);
+        assert_eq!(s.reply(None).devices.len(), before - 1);
+        assert!(s.pending().iter().all(|p| p.id != named.id));
 
         // Closing the window ends new requests, and expiry ends pending ones.
         s.close_window();

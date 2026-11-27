@@ -160,7 +160,8 @@ export function setupSettings({ request, open, close, notifications, login }) {
     pageId = 0,
     accountsPage,
     installPrompt,
-    inviteTimer;
+    inviteTimer,
+    pendingTimer = null;
   const localDefaults = {
     theme: "dark",
     font_size: 16,
@@ -239,6 +240,8 @@ export function setupSettings({ request, open, close, notifications, login }) {
   function screen(title, back = menu) {
     pageId++;
     clearTimeout(inviteTimer);
+    clearInterval(pendingTimer);
+    pendingTimer = null;
     status.textContent = "";
     body.replaceChildren();
     const heading = node("h1", title);
@@ -1303,36 +1306,62 @@ export function setupSettings({ request, open, close, notifications, login }) {
     const left = result.window
       ? Math.max(0, Math.ceil((result.window.expires_at * 1000 - Date.now()) / 60000))
       : 0;
-    for (const pending of result.pending || []) {
-      const row = node("div", undefined, "phone-settings-card");
-      row.append(
-        node("h2", pending.label),
-        node("p", `${pending.login} · ${pending.approved ? "accepted, waiting for the device" : "wants to pair"}`),
-      );
-      if (!pending.approved)
-        row.append(
-          action("Accept " + pending.label, async () => {
-            await readPage(id, { action: "approve_pending", id: pending.id });
-            if (pageId === id && !panel.hidden) await remote();
-          }, "primary"),
+    const pendingBox = node("div");
+    const renderPending = (rows, paired) => {
+      pendingBox.replaceChildren();
+      if (paired !== undefined)
+        pendingBox.append(
+          node("p", `Waiting for a device to pair · ${paired} paired`),
+          node("p", "On the new device, open Add host and choose this host. Its request appears here for you to accept."),
         );
-      row.append(
-        action("Decline", async () => {
-          await readPage(id, { action: "deny_pending", id: pending.id });
-          if (pageId === id && !panel.hidden) await remote();
-        }),
-      );
-      body.append(row);
-    }
+      for (const pending of rows) {
+        const row = node("div", undefined, "phone-settings-card");
+        row.append(
+          node("h2", pending.label),
+          node("p", `${pending.login} · ${pending.approved ? "accepted, waiting for the device" : "wants to pair"}`),
+        );
+        if (!pending.approved) {
+          row.append(
+            action("Accept " + pending.label, async () => {
+              await readPage(id, { action: "approve_pending", id: pending.id });
+              if (pageId === id && !panel.hidden) await remote();
+            }, "primary"),
+          );
+          row.append(
+            action("Decline", async () => {
+              await readPage(id, { action: "deny_pending", id: pending.id });
+              if (pageId === id && !panel.hidden) await remote();
+            }),
+          );
+        }
+        pendingBox.append(row);
+      }
+    };
+    renderPending(result.pending || [], left > 0 ? result.window.paired : undefined);
+    body.append(pendingBox);
     if (left > 0) {
       body.append(
-        node("p", `Waiting for a device to pair · ${left} min left · ${result.window.paired} paired`),
-        node("p", "On the new device, open Add host and choose this host. Its request appears here for you to accept."),
         action("Stop waiting", async () => {
           await readPage(id, { action: "close_pairing_window" });
           if (pageId === id && !panel.hidden) await remote();
         }),
       );
+      // The operator is told to stay here, so this screen has to keep showing
+      // requests as they arrive.
+      if (!pendingTimer)
+        pendingTimer = setInterval(async () => {
+          if (pageId !== id || panel.hidden) {
+            clearInterval(pendingTimer);
+            pendingTimer = null;
+            return;
+          }
+          const fresh = await request({ action: "devices" }).catch(() => null);
+          if (!fresh || pageId !== id || panel.hidden) return;
+          const minutes = fresh.window
+            ? Math.max(0, Math.ceil((fresh.window.expires_at * 1000 - Date.now()) / 60000))
+            : 0;
+          renderPending(fresh.pending || [], minutes > 0 ? fresh.window.paired : undefined);
+        }, 3000);
     } else {
       body.append(
         action("Wait for a device to pair", async () => {
