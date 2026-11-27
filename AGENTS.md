@@ -124,6 +124,10 @@ you call it done.
   on macOS Intel, none on macOS ARM or Linux. Keep that end open until the
   program has exited and the output is drained
   (`tests/fixtures/setup_selector.py`).
+- **A test loop that reacts to every event must act once.** The desktop
+  lists an approval until the host has taken the answer. A loop that answers
+  "whenever an approval is listed" answers twice if any event arrives in
+  between, and the host refuses the second as already resolved.
 - **Tests that share a binary share a process.** A test that depends on a
   file descriptor being closed can be broken by a sibling test that spawns a
   child at the same moment.
