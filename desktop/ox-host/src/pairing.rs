@@ -103,8 +103,11 @@ pub fn pair_with_ports(
     } else {
         Operation::Enable
     };
-    let report = access::run(paths, enable)?;
-    if let Some(help) = report.denied {
+    for _ in 0..2 {
+        let report = access::run(paths, enable.clone())?;
+        let Some(help) = report.denied else {
+            break;
+        };
         if !io::stdin().is_terminal() {
             return Err(format!(
                 "{} Run ox host pair in an interactive terminal to authorize Tailscale Serve.",

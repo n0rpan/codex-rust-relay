@@ -186,6 +186,13 @@ else:
         relocated = command("pair", "--listen-port", "49200")
         assert "https://workstation.fixture.ts.net:9443/#pair=" in relocated.stdout, relocated
         assert "https://workstation.fixture.ts.net:9443 → 127.0.0.1:49200" in command("status").stdout
+        # Trying to switch to an already-occupied loopback port fails cleanly without tearing down active access.
+        with socket.socket() as occupied_loopback:
+            occupied_loopback.bind(("127.0.0.1", 0))
+            busy_port = str(occupied_loopback.getsockname()[1])
+            failed_move = command("pair", "--listen-port", busy_port, check=False)
+            assert failed_move.returncode != 0 and "--listen-port" in failed_move.stderr, failed_move
+            assert "https://workstation.fixture.ts.net:9443 → 127.0.0.1:49200" in command("status").stdout
         doctor = command("doctor", check=False)
         assert "remote access: https://workstation.fixture.ts.net:9443 → 127.0.0.1:49200 (tailnet only)" in doctor.stdout, doctor
         first = (directories["state"] / "mock-service-pid").read_text()

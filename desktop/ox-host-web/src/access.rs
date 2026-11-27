@@ -212,9 +212,11 @@ impl PermissionHelp {
                     );
                 }
                 let prior = status(paths)?;
-                let prior_loopback = (prior.port != 0)
-                    .then_some(prior.port)
-                    .unwrap_or(DEFAULT_LOOPBACK_PORT);
+                let prior_loopback = if prior.port != 0 {
+                    prior.port
+                } else {
+                    DEFAULT_LOOPBACK_PORT
+                };
                 let owned_prior = prior_loopback != loopback_port
                     && inspect_ports(self.change.https_port(), prior_loopback)
                         .is_ok_and(|n| n.ready());
@@ -488,9 +490,11 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
             }
         }
         Operation::Enable | Operation::EnableOn { .. } => {
-            let prior_loopback = (prior.port != 0)
-                .then_some(prior.port)
-                .unwrap_or(DEFAULT_LOOPBACK_PORT);
+            let prior_loopback = if prior.port != 0 {
+                prior.port
+            } else {
+                DEFAULT_LOOPBACK_PORT
+            };
             let mut node = network.as_ref().map_err(Clone::clone)?.clone();
             if node.state == Config::Conflict
                 && prior_loopback != loopback_port
@@ -501,9 +505,24 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
                 node.state = Config::Free;
             }
             admit(&node)?;
+            let mut teardown_old = false;
             if prior.enabled
                 && (prior.origin.as_ref() != Some(&node.origin) || prior.port != loopback_port)
             {
+                if prior.port != loopback_port {
+                    // Verify the replacement loopback port is free before tearing down
+                    // the currently active listener or Serve mapping.
+                    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, loopback_port))
+                        .map_err(|e| {
+                            if e.kind() == std::io::ErrorKind::AddrInUse {
+                                format!(
+                                    "Local listener port {loopback_port} is already in use on 127.0.0.1. Run `ox host pair --listen-port <port>` to pick another local port."
+                                )
+                            } else {
+                                e.to_string()
+                            }
+                        })?;
+                }
                 if let Some(old_https) = prior
                     .https_port
                     .or_else(|| prior.origin.as_deref().and_then(crate::serve::https_port))
@@ -513,18 +532,45 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
                     if let Ok(old_node) = inspect_ports(old_https, old_loopback)
                         && old_node.ready()
                     {
-                        let args = ServeChange::Disable {
+                        let change = ServeChange::Disable {
                             https_port: old_https,
                             loopback_port: old_loopback,
-                        }
-                        .args();
+                        };
+                        let args = change.args();
                         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                        let _ = output(&refs);
+                        match output(&refs) {
+                            Ok(_) => {
+                                let after = inspect_ports(old_https, old_loopback)?;
+                                if after.state != Config::Free
+                                    || after.origin != old_node.origin
+                                    || after.login != old_node.login
+                                {
+                                    return Err(
+                                        "Tailscale did not confirm removal of the previous OX mapping."
+                                            .into(),
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                denied = Some(PermissionHelp::denied(
+                                    paths,
+                                    change,
+                                    &old_node,
+                                    prior.enabled,
+                                    e,
+                                )?);
+                                teardown_old = true;
+                            }
+                        }
                     }
                 }
-                prior = request(Request::Disable)?;
+                if !teardown_old {
+                    prior = request(Request::Disable)?;
+                }
             }
-            if node.ready() {
+            if teardown_old {
+                prior
+            } else if node.ready() {
                 request(Request::Enable {
                     origin: node.origin.clone(),
                     port: loopback_port,
