@@ -227,11 +227,14 @@ impl HostLink {
         Ok((reader, socket, caps))
     }
     fn handshake(&self) -> io::Result<StreamHello> {
+        self.named_handshake().map(|(stream, _)| stream)
+    }
+    fn named_handshake(&self) -> io::Result<(StreamHello, Option<String>)> {
         match self {
             Self::Local => {
                 let paths = Paths::discover()?;
                 ensure_running(&paths)?;
-                open_handshake(&paths)
+                handshake_stream(UnixStream::connect(&paths.socket)?, None)
             }
             Self::Remote(host) => handshake_stream(host.connect()?, Some(&host.id)),
         }
@@ -379,13 +382,16 @@ fn connect_existing(paths: &Paths) -> io::Result<BufReader<UnixStream>> {
     open_handshake(paths).map(|(input, _, _)| input)
 }
 fn open_handshake(paths: &Paths) -> io::Result<(BufReader<UnixStream>, UnixStream, Vec<String>)> {
-    handshake_stream(UnixStream::connect(&paths.socket)?, None)
+    handshake_stream(UnixStream::connect(&paths.socket)?, None).map(|(stream, _)| stream)
 }
-fn handshake_stream(mut socket: UnixStream, remote_id: Option<&str>) -> io::Result<StreamHello> {
+fn handshake_stream(
+    mut socket: UnixStream,
+    remote_id: Option<&str>,
+) -> io::Result<(StreamHello, Option<String>)> {
     socket.set_read_timeout(Some(Duration::from_secs(15)))?;
     write_frame(&mut socket, &Client::Hello { version: VERSION })?;
     let mut input = BufReader::new(socket.try_clone()?);
-    let caps = match read_frame(&mut input)? {
+    let (caps, name) = match read_frame(&mut input)? {
         Server::Hello {
             version,
             capabilities,
@@ -399,7 +405,7 @@ fn handshake_stream(mut socket: UnixStream, remote_id: Option<&str>) -> io::Resu
                     "Host identity changed. Pair this host again.",
                 ));
             }
-            capabilities
+            (capabilities, host.and_then(|h| h.name))
         }
         Server::Hello { version, .. } => {
             return Err(io::Error::new(
@@ -419,7 +425,7 @@ fn handshake_stream(mut socket: UnixStream, remote_id: Option<&str>) -> io::Resu
     if remote_id.is_none() {
         declare_surface(&mut socket, &caps)?;
     }
-    Ok((input, socket, caps))
+    Ok(((input, socket, caps), name))
 }
 /// Tell a host that negotiates it that a person on OX Desktop uses this connection. An
 /// older host rejects the frame, so it is sent only when the hello lists the capability.
@@ -809,7 +815,7 @@ mod process_monitor_tests {
                 ));
                 writeln!(host, "{}", serde_json::json!({"type":"snapshot","cursor":{"epoch":"e","seq":0},"scopes":[]})).unwrap();
             });
-            let (mut input, mut out, _) = handshake_stream(client, id).unwrap();
+            let ((mut input, mut out, _), _) = handshake_stream(client, id).unwrap();
             write_frame(
                 &mut out,
                 &Client::Subscribe {

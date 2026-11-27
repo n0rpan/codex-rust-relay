@@ -92,9 +92,12 @@ impl Inventory {
                         if this
                             .update(cx, |s, cx| {
                                 let was_online = s.online;
-                                s.receive(first);
-                                for e in events.try_iter() {
-                                    s.receive(e);
+                                for event in std::iter::once(first).chain(events.try_iter()) {
+                                    if let CatalogEvent::Notice(notice) = &event {
+                                        notice.show(&s.link, cx);
+                                    } else {
+                                        s.receive(event);
+                                    }
                                 }
                                 if s.online {
                                     s.schedule_cache(cx);
@@ -134,6 +137,7 @@ impl Inventory {
         self.online = true;
         self.error = None;
         match event {
+            CatalogEvent::Notice(_) => (),
             CatalogEvent::Projects(dir) => {
                 self.legacy_projects = dir.is_none();
                 self.directory = dir;
@@ -493,6 +497,7 @@ impl super::Workspace {
         })
     }
     pub(super) fn sync_inventory(&mut self, cx: &mut Context<Self>) {
+        super::notifications::remove_unpaired(cx);
         self.navigation_revision = self.navigation_revision.wrapping_add(1);
         cx.background_spawn(async { cache::remove_unpaired() })
             .detach();

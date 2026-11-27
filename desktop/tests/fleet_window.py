@@ -1,6 +1,7 @@
 """Two isolated Linux host engines, a signed desktop pairing and real keyboard input."""
 import itertools
 import json
+import os
 from pathlib import Path
 import shutil
 import socket
@@ -91,7 +92,23 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
     managed_server(stack, public)
     env.update(OX_TEST_NATIVE_DIR=str(studio), OX_TEST_ORIGIN=origin, OX_TEST_LOOPBACK=f"127.0.0.1:{port}",
                OX_TEST_PROJECT=str(project), DBUS_SESSION_BUS_ADDRESS="unix:path=" + str(root / "unused-bus"))
+    # The desktop gets a private bus with only our notification service. It cannot
+    # activate an OS credential store or send a real desktop notification.
+    bus = root / "notification-bus.conf"
+    address = env["DBUS_SESSION_BUS_ADDRESS"]
+    bus.write_text(f'<busconfig><type>session</type><listen>{address}</listen><policy context="default">'
+                   '<allow own="*"/><allow send_destination="*"/><allow receive_sender="*"/></policy></busconfig>')
+    launch("dbus-daemon", "--nofork", "--config-file=" + str(bus))
+    wait_for("the notification bus", lambda: (root / "unused-bus").is_socket())
+    notifications = root / "notifications.jsonl"
+    launch("/usr/bin/python3", Path(__file__).with_name("notification_service.py"), notifications)
+    wait_for("the notification service", lambda: b"true" in command("busctl", "--address=" + address, "call",
+             "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner",
+             "s", "org.freedesktop.Notifications"))
     Path(env["OX_DESK_STATS_SOCKET"]).unlink(missing_ok=True)
+    prefs = root / "home/.local/state/ox/desktop/notifications.json"
+    prefs.parent.mkdir(parents=True, exist_ok=True)
+    prefs.write_text(json.dumps({"events":"all","titles":True}))
     app = launch(harness, "--exact", "paired_fleet_window", "--ignored", "--nocapture")
     wait_for("the paired desktop window", lambda: Path(env["OX_DESK_STATS_SOCKET"]).is_socket(), seconds=40)
 
@@ -106,7 +123,10 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
         def type_and_copy():
             command("wtype", "-M", "ctrl", "-k", "a", "-m", "ctrl", "-s", "40", text)
             command("wtype", "-M", "ctrl", "-k", "a", "-s", "50", "-k", "c", "-m", "ctrl")
-            result = subprocess.run(["wl-paste", "--no-newline"], env=env, capture_output=True, timeout=3)
+            try:
+                result = subprocess.run(["wl-paste", "--no-newline"], env=env, capture_output=True, timeout=3)
+            except subprocess.TimeoutExpired:
+                return False
             return result.stdout == text.encode()
         wait_for("the focused field to receive " + text, type_and_copy)
         key("End")
@@ -165,6 +185,35 @@ def check_fleet(harness, gui, root, project, env, stack, log, launch, command, k
              for f in selected.parent.rglob("*layout*.json")), seconds=30)
     choose("@local", "this computer")
     wait_for("keyboard navigation back to the original host", lambda: json.loads(selected.read_text()) is None)
+    swaymsg = shutil.which("swaymsg") or str(Path(os.environ.get("SWAY_BIN", "sway")).with_name("swaymsg"))
+    command(swaymsg, "workspace", "number", "2")
+    wait_for("an empty foreground workspace", lambda: any(w["focused"] and w["num"]==2
+             for w in json.loads(command(swaymsg, "-t", "get_workspaces"))))
+    provider.mode = "fleet-alert"
+    peer.act(scope, "background-notice", {"send_text":[None, "Finish a background Studio turn"]})
+    notice_thread = peer.until(lambda f: f["type"]=="opened")["thread"]
+    peer.until(lambda f: any(d.get("kind")=="notification" and d.get("event")=="finished"
+                             and d.get("thread")==notice_thread for d in f.get("changes", [])))
+    provider.mode = "allow"
+    def studio_notice():
+        if notifications.exists():
+            return next((n for line in notifications.read_text().splitlines()
+                         if (n := json.loads(line))["title"] == "Studio · Turn finished"), None)
+    alert = wait_for("the native notification naming Studio", studio_notice, seconds=35)
+    assert alert["body"], alert
+    command("busctl", "--address=" + address, "call", "org.freedesktop.Notifications",
+            "/org/freedesktop/Notifications", "dev.ox.Fixture", "Open", "u", str(alert["id"]))
+    wait_for("notification activation opening its paired host", lambda: json.loads(selected.read_text()) == host_id)
+    command(swaymsg, "workspace", "number", "1")
+    def remote_selection():
+        layout = selected.with_name(host_id + "-layout.json")
+        return layout.exists() and any((pane.get("selection") or {}).get("id") == notice_thread
+               for pane in json.loads(layout.read_text()).get("panes", []))
+    wait_for("notification activation selecting " + notice_thread + " on Studio", remote_selection, seconds=30)
+    assert sum(json.loads(line)["title"] == "Studio · Turn finished" for line in notifications.read_text().splitlines()) == 1
+    print("PASS one native alert named Studio and opened the correct remote thread.", flush=True)
+    choose("@local", "this computer")
+    wait_for("the original host after checking notifications", lambda: json.loads(selected.read_text()) is None)
     # The last session opened in this repository was on Studio. Its checkout
     # has a different name and directory, and the local workbench is visible.
     key("n", "ctrl")

@@ -109,7 +109,7 @@ jobs:
         if: runner.os == 'Linux'
         env:
           OX_CACHE_PACKAGE_DEBS: '1'
-        run: desktop/ci/linux-deps.sh bubblewrap imagemagick tesseract-ocr fonts-dejavu-core sway grim wtype wl-clipboard fcitx5 fcitx5-chinese-addons dbus-daemon
+        run: desktop/ci/linux-deps.sh bubblewrap imagemagick tesseract-ocr fonts-dejavu-core sway grim wtype wl-clipboard fcitx5 fcitx5-chinese-addons dbus-daemon python3-dbus python3-gi
       - name: Save current Ubuntu archives for subsequent builds
         if: runner.os == 'Linux' && github.ref == 'refs/heads/main' && steps.apt-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

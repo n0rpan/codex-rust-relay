@@ -2,6 +2,8 @@
 
 Worktree `/home/oscar/Work/ox-multi-host`, branch `feat/multi-host`, based on `f44befe`. Oscar and the implementer will review the tradeoffs together before opening a PR.
 
+The seven milestones have Linux fixture coverage. The remaining acceptance run uses the physical laptop, Mac Studio and Linux host for pairing, macOS Keychain and alerts, concurrent sessions and Mac Studio placement. The Mac was offline at the last check. The multi-host PR is reserved for joint review.
+
 ## Decisions for review
 
 - A host's UUID lives in a private, atomically created `host-id` file. An older host can rewrite its own ledger without dropping the UUID. Renaming the machine or restarting OX preserves its identity. Purging the state creates a new identity. Older hello frames can omit the UUID.
@@ -9,7 +11,7 @@ Worktree `/home/oscar/Work/ox-multi-host`, branch `feat/multi-host`, based on `f
 - Headless pairing and desktop Settings use the same Serve checks, listener reservation and confirmation. A public Funnel or another application's mapping on port 8443 stops pairing. I think requiring the owner to fix that mapping is worth the friction because a new device can control sessions.
 - Device class is stored at registration. The authenticated bridge supplies the surface to the host on each connection. Existing registrations default to phone. Local argv handoffs and the remote terminal grant are distinct permissions.
 
-- A desktop can explicitly copy selected provider and Brave Search keys to a paired host. The review names the target, scopes, possible charges, and continued use after revocation. Replacing existing keys requires selecting them. Copies retain their provider endpoint and the host's environment takes precedence.
+- Desktop and paired web clients can explicitly copy selected provider and Brave Search keys to another host. The review names the target, scopes, possible charges, and continued use after revocation. Replacing existing keys requires selecting them. Copies retain their provider endpoint and the host's environment takes precedence.
 - Managed headless installations default to automatic updates at idle. The operator can switch to download-only or manual and select Dev or Stable. An active turn, pending approval or active remote terminal delays installation. I think this wait is worth preserving live work.
 - Wave 1 used Claude Opus 5.5 via OX on the subscription. Its findings prompted the separate host ID file, an older-host pairing error and prefix/label revocation. One invitation can still enroll either operator device. A host-to-host link grants different capabilities and needs separate enrollment. The read-only worker's approval prompt for returning findings is tracked in [#26](https://github.com/oxstack/ox/issues/26).
 
@@ -214,3 +216,11 @@ Verification entries below refer to the worktree above. Physical macOS/Linux and
 - A Codex worker can run on the selected host’s ChatGPT subscription from the desktop, web UI, composer or worker tool. Supplying an API alias still selects that provider. OX checks the native ChatGPT account before a standalone worker starts a thread, and advertises the new worker capability independently of ordinary subscription sessions. An older receiving host can still run workers on its existing routes.
 - **Billing decision before the PR.** If the selected subscription is unavailable, OX explains why and lets the operator choose another route. Automatically switching a subscription request to a metered API key would charge a different account. This is worth one explicit selection.
 - Claude Opus 5.5 reviewed this wave on the subscription (OX job 3505473999618646). Its review led to the older-host capability check, consistent desktop and browser choices, and additional stock acceptance. Disposable stock Codex instances ran a standalone and a host-owned subscription worker against the selected account endpoint. A configured credential store containing an API-key account failed before a model turn. The same fixture also completed API goals, Claude workflows, steering, editing and cancellation. The browser suite exercised scoped key copying and update mode/channel selection again. No personal credentials were used.
+
+### Wave 24 · Host names and navigation in desktop notifications
+
+- A background desktop names the originating host when a turn finishes, fails, asks a question or needs approval. Clicking selects the exact host, project and conversation. Overlapping fleet and workspace subscriptions produce one notification. Forgetting or replacing a pairing invalidates its old notification targets.
+- **Decision before the PR.** Host names appear by default. Thread titles can contain the first prompt, so the default omits them from OS alerts that might appear on a lock screen. One personal preference enables titles for every host. The same settings panel offers all activity, attention only, and off.
+- On Wayland, the click selects the conversation. The compositor may leave OX on its original workspace. The Linux acceptance test checks the selected host and exact thread after returning to that workspace. Physical macOS notification delivery and activation remain on the acceptance list.
+- Claude Opus 5.5 reviewed this wave through OX on the subscription in jobs 1356357053090877 and 2899458625926594. Its findings led to loading personal preferences before connecting hosts, using one Linux session-bus connection for replaceable alerts, draining notification signals while a request is in flight, and checking the pairing again before navigating.
+- The desktop Rust suite, Clippy and protocol check passed. Two paired Linux engines exercised a burst of 128 D-Bus signals before the notification service replied. The alert appeared once and opened the expected Studio conversation. The complete fleet test also passed after switching hosts, restarting and going offline.

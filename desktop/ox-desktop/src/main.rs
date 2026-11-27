@@ -70,6 +70,8 @@ fn run(args: impl Iterator<Item = std::ffi::OsString>) {
         .run(move |cx| {
             #[cfg(target_os = "macos")]
             platform::set_application_icon();
+            cx.set_app_identity("dev.ox.desktop", "OX Desktop");
+            app::notifications::init(cx);
             gpui_component::init(cx);
             appearance::init(cx);
             sky::start(cx);

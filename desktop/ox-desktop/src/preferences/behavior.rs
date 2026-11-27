@@ -213,12 +213,78 @@ impl Preferences {
                     .child("A parent agent answers its workers' questions, and approves their actions when its own mode runs without asking you (Auto, Auto-review or YOLO). Read-only workers and mode changes always ask you. You can still answer any request yourself."),
             )
     }
+    fn notification_controls(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        use crate::app::notifications::{Events, Settings};
+        let current = *cx.default_global::<Settings>();
+        let mut controls = div().flex().gap_1().flex_wrap();
+        for (label, mode) in [
+            ("Off", Events::Off),
+            ("Needs attention", Events::Attention),
+            ("All activity", Events::All),
+        ] {
+            controls = controls.child(crate::kit::button(
+                p,
+                SharedString::from(format!("desktop-notices-{label}")),
+                label,
+                current.events == mode,
+                true,
+                cx.listener(move |s, _, _, cx| {
+                    s.save_notifications(
+                        Settings {
+                            events: mode,
+                            ..current
+                        },
+                        cx,
+                    )
+                }),
+            ));
+        }
+        controls = controls.child(crate::kit::button(
+            p,
+            "notification-titles",
+            "Include thread titles",
+            current.titles,
+            current.events != Events::Off,
+            cx.listener(move |s, _, _, cx| {
+                s.save_notifications(
+                    Settings {
+                        titles: !current.titles,
+                        ..current
+                    },
+                    cx,
+                )
+            }),
+        ));
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(
+                div()
+                    .w(px(162.))
+                    .text_size(p.text(Step::Ui))
+                    .child("Desktop notifications"),
+            )
+            .child(controls)
+    }
+    fn save_notifications(
+        &mut self,
+        next: crate::app::notifications::Settings,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = next.save(cx) {
+            self.message = e.to_string();
+            self.error = true;
+        }
+        cx.notify();
+    }
     pub(super) fn behavior_page(&self, p: Palette, cx: &mut Context<Self>) -> Div {
         let b = cx.global::<Active>().0;
         div()
             .flex()
             .flex_col()
             .gap_4()
+            .child(self.notification_controls(p,cx))
             .child(self.preference_choices(
                 "Send messages",
                 &[

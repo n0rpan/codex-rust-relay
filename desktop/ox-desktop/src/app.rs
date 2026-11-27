@@ -1,5 +1,6 @@
 //! Release the session tree if a desktop view fails while building a frame.
 pub(crate) mod fleet;
+pub(crate) mod notifications;
 pub(crate) mod projects;
 use crate::{appearance::Palette, kit, views::host::Host};
 use gpui::*;
@@ -96,6 +97,7 @@ impl Workspace {
                 crate::workspace_state::read_preference("project-hosts.json").unwrap_or_default(),
             ));
         }
+        notifications::listen(w, cx);
         let failure = cx.observe_global::<FailedView>(|s, cx| {
             s.local.take();
             s.hosts.clear();

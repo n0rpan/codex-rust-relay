@@ -242,6 +242,8 @@ class Fixture(BaseHTTPRequestHandler):
                 chunks.append({"content":"Fixture conversation"})
             elif any(m.get("role") == "user" and "model-switch-" in str(m.get("content")) for m in req["messages"]):
                 chunks.append({"content":"fixture complete"})
+            elif self.server.mode == "fleet-alert":
+                chunks.append({"content":"Background turn finished"})
             elif self.server.mode == "fleet-advance":
                 chunks.append({"content": "Finished the private source turn."})
             elif self.server.mode == "fleet-offline" and b"OX-READ-WHILE" in body:

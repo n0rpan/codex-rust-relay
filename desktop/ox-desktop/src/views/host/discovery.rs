@@ -299,7 +299,8 @@ impl Discovery {
             | CatalogEvent::Host(_)
             | CatalogEvent::DraftWaiting(..)
             | CatalogEvent::Waiting(..)
-            | CatalogEvent::Disconnected(_) => false,
+            | CatalogEvent::Disconnected(_)
+            | CatalogEvent::Notice(_) => false,
             CatalogEvent::Reset => {
                 let changed = !self.hosted.is_empty()
                     || !self.archived.is_empty()
@@ -467,9 +468,13 @@ impl Host {
             while let Ok(first) = events.recv_async().await {
                 if this
                     .update_in(cx, |s, window, cx| {
-                        let mut changed = s.discovery.live_event(first);
-                        for event in events.try_iter() {
-                            changed |= s.discovery.live_event(event)
+                        let mut changed = false;
+                        for event in std::iter::once(first).chain(events.try_iter()) {
+                            if let platform::CatalogEvent::Notice(notice) = &event {
+                                notice.show(&s.link, cx);
+                            } else {
+                                changed |= s.discovery.live_event(event);
+                            }
                         }
                         if changed {
                             s.discovery.revision += 1;

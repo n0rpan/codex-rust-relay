@@ -4,6 +4,7 @@ use std::sync::Mutex;
 
 pub(crate) enum CatalogEvent {
     NoHostStatus,
+    Notice(crate::app::notifications::Notice),
     Host(ox_desk_core::host_protocol::HostInfo),
     Projects(Option<ox_desk_core::host_protocol::ProjectDirectory>),
     Reset,
@@ -42,7 +43,7 @@ impl HostLink {
             .name("ox-host-catalog".into())
             .spawn(move || {
                 let read = || -> io::Result<()> {
-                    let (mut input, mut stream, caps) = link.handshake()?;
+                    let ((mut input, mut stream, caps), host_name) = link.named_handshake()?;
                     {
                         let mut active = connection.lock().unwrap();
                         if cancelled.try_recv() != Err(mpsc::TryRecvError::Empty) {
@@ -154,9 +155,27 @@ impl HostLink {
                                     emit(CatalogEvent::Replace(s.scope, s.sessions))?;
                                 }
                             }
-                            Server::Delta { scope, changes, .. } => {
+                            Server::Delta {
+                                scope,
+                                changes,
+                                cursor,
+                            } => {
                                 for change in changes {
                                     match change {
+                                        Change::Notification {
+                                            thread,
+                                            title,
+                                            event,
+                                        } => emit(CatalogEvent::Notice(
+                                            crate::app::notifications::Notice {
+                                                host_name: host_name.clone(),
+                                                cursor: cursor.clone(),
+                                                scope: scope.clone(),
+                                                thread,
+                                                title,
+                                                kind: event,
+                                            },
+                                        ))?,
                                         Change::Sessions { sessions } => {
                                             emit(CatalogEvent::Replace(scope.clone(), sessions))?
                                         }
