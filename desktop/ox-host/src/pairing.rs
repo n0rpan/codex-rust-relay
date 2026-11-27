@@ -181,6 +181,9 @@ pub fn pair_with_ports(
             "Waiting five minutes for a device to pair. On the other machine, choose this host under Add host, or paste {} as a worker host.",
             reply.origin.as_deref().unwrap_or("its Serve address")
         );
+        println!(
+            "A request waits for you here: approve it in OX Desktop or on a paired phone, or run `ox host pending` and `ox host approve <id>`."
+        );
         if let Some(login) = window.login.as_deref() {
             println!("Only {login} may pair.");
         } else {
@@ -224,6 +227,45 @@ pub fn pair_with_ports(
     if let (Some(origin), Some(code)) = (reply.origin, pairing.short_code) {
         println!("Host  {origin}\nCode  {code}");
     }
+    Ok(())
+}
+
+pub fn pending(paths: &Paths) -> Result<(), String> {
+    let rows = access::status(paths).map_err(|e| e.to_string())?.pending;
+    if rows.is_empty() {
+        println!("No device is waiting to pair.");
+    }
+    for row in rows {
+        println!(
+            "{}  {}  {}  {}{}",
+            row.id,
+            row.label,
+            row.login,
+            match row.class {
+                DeviceClass::Host => "worker host",
+                DeviceClass::Phone => "phone",
+                DeviceClass::Desktop => "desktop",
+            },
+            if row.approved {
+                "  accepted, waiting for the device"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
+pub fn approve(paths: &Paths, id: &str) -> Result<(), String> {
+    access::run(paths, Operation::ApprovePending { id: id.to_owned() })
+        .map_err(|e| e.to_string())?;
+    println!("Accepted. The device collects its credential within a minute.");
+    Ok(())
+}
+
+pub fn deny(paths: &Paths, id: &str) -> Result<(), String> {
+    access::run(paths, Operation::DenyPending { id: id.to_owned() }).map_err(|e| e.to_string())?;
+    println!("Declined.");
     Ok(())
 }
 

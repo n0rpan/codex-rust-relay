@@ -36,6 +36,12 @@ enum DeviceAction {
     InviteWorkerHost,
     OpenPairingWindow,
     ClosePairingWindow,
+    ApprovePending {
+        id: String,
+    },
+    DenyPending {
+        id: String,
+    },
     EditWorkerLink {
         id: String,
         before: crate::admin::WorkerGrant,
@@ -105,7 +111,7 @@ pub(super) async fn settings(
                         .filter(|d| d.login == identity)
                         .collect();
                     Some(
-                        json!({"devices":devices,"worker_hosts":worker_hosts,"self":id,"origin":reply.origin,"window":reply.window}),
+                        json!({"devices":devices,"worker_hosts":worker_hosts,"self":id,"origin":reply.origin,"window":reply.window,"pending":reply.pending}),
                     )
                 }
                 DeviceAction::OpenPairingWindow => Some(
@@ -117,6 +123,14 @@ pub(super) async fn settings(
                 DeviceAction::ClosePairingWindow => {
                     state.close_window();
                     Some(json!({"status":"closed"}))
+                }
+                DeviceAction::ApprovePending { id } => {
+                    state.approve_pending(id).ok_or(StatusCode::CONFLICT)?;
+                    Some(json!({"status":"approved"}))
+                }
+                DeviceAction::DenyPending { id } => {
+                    state.deny_pending(id);
+                    Some(json!({"status":"denied"}))
                 }
                 DeviceAction::PairDevice => Some(
                     serde_json::to_value(

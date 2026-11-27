@@ -183,6 +183,7 @@ pub(crate) struct State {
     /// A deliberate, short-lived window in which any login this host
     /// authenticated may enrol without an invitation code.
     window: Option<Window>,
+    pending: HashMap<String, Pending>,
     challenges: HashMap<String, Challenge>,
     pub changed: watch::Sender<u64>,
 }
@@ -206,6 +207,42 @@ impl Window {
 
 /// How many devices one window may admit before it closes itself.
 const WINDOW_PAIRS: u8 = 8;
+/// How long a device's request waits for the operator's decision.
+const PENDING_TTL: i64 = 180;
+/// How many requests one host will show at once.
+const PENDING_MAX: usize = 8;
+
+/// A pair request that the operator has not answered yet.
+struct Pending {
+    key: String,
+    label: String,
+    class: DeviceClass,
+    source: Option<String>,
+    login: String,
+    expires: i64,
+    /// The credential, once the operator accepted and before the device
+    /// collected it.
+    token: Option<String>,
+}
+
+impl Pending {
+    fn reply(&self, id: &str) -> crate::admin::PendingPair {
+        crate::admin::PendingPair {
+            id: id.to_owned(),
+            label: self.label.clone(),
+            login: self.login.clone(),
+            class: self.class,
+            expires_at: self.expires,
+            approved: self.token.is_some(),
+        }
+    }
+}
+
+pub(crate) enum PollState {
+    Pending,
+    Approved(String),
+    Unknown,
+}
 
 impl State {
     pub fn load(dir: &Path) -> io::Result<Self> {
@@ -240,6 +277,7 @@ impl State {
             disk,
             invites: HashMap::new(),
             window: None,
+            pending: HashMap::new(),
             challenges: HashMap::new(),
             changed: watch::channel(0).0,
         };
@@ -306,6 +344,7 @@ impl State {
             // A window admits devices without a code, so disabling remote
             // access or moving to another origin must withdraw it too.
             self.window = None;
+            self.pending.clear();
             self.signal();
         } else if kept_port != self.disk.port || https_port != self.disk.https_port {
             self.update(|d| {
@@ -364,6 +403,7 @@ impl State {
             devices,
             pairing,
             window: self.window(),
+            pending: self.pending(),
             reservation: None,
         }
     }
@@ -566,42 +606,103 @@ impl State {
             .filter(|w| w.expires > now())
             .map(Window::info)
     }
-    pub fn pair_window<'a>(
+    /// Ask to pair while a window is open. Nothing is granted yet: the
+    /// operator on this host accepts or declines the request, so a process
+    /// that can reach the loopback port cannot admit itself.
+    pub fn request_window<'a>(
         &mut self,
         login: &str,
         key: &str,
         label: &str,
         registration: impl Into<Enrollment<'a>>,
-    ) -> Option<String> {
+    ) -> Option<crate::admin::PendingPair> {
         let Enrollment { class, source } = registration.into();
         let window = self.window.as_ref().filter(|w| w.expires > now())?;
         if window
             .login
             .as_deref()
             .is_some_and(|expected| expected != login)
-            || window.paired >= WINDOW_PAIRS
+            || window.paired + (self.pending.len() as u8) >= WINDOW_PAIRS
             || source.is_some() != (class == DeviceClass::Host)
-        {
-            return None;
-        }
-        if label.trim().is_empty()
+            || label.trim().is_empty()
             || label.chars().count() > 64
             || label.chars().any(char::is_control)
         {
             return None;
         }
-        let worker = match source {
-            Some(source) => Some(self.worker_grant_for(login, source)?),
+        self.pending.retain(|_, p| p.expires > now());
+        if self.pending.len() >= PENDING_MAX {
+            return None;
+        }
+        let id = random();
+        let entry = Pending {
+            key: key.to_owned(),
+            label: label.trim().to_owned(),
+            class,
+            source: source.map(|s| s.to_ascii_lowercase()),
+            login: login.to_owned(),
+            expires: now() + PENDING_TTL,
+            token: None,
+        };
+        let reply = entry.reply(&id);
+        self.pending.insert(id, entry);
+        Some(reply)
+    }
+    pub fn pending(&self) -> Vec<crate::admin::PendingPair> {
+        let now = now();
+        let mut rows: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.expires > now)
+            .map(|(id, p)| p.reply(id))
+            .collect();
+        rows.sort_by(|a, b| a.expires_at.cmp(&b.expires_at).then(a.id.cmp(&b.id)));
+        rows
+    }
+    /// The operator's decision. The device is only registered here.
+    pub fn approve_pending(&mut self, id: &str) -> Option<()> {
+        let entry = self.pending.get(id).filter(|p| p.expires > now())?;
+        if entry.token.is_some() {
+            return Some(());
+        }
+        let worker = match &entry.source {
+            Some(source) => Some(self.worker_grant_for(&entry.login, source)?),
             None => None,
         };
-        let token = self.register(login, key, label, class, false, worker)?;
+        let (login, key, label, class) = (
+            entry.login.clone(),
+            entry.key.clone(),
+            entry.label.clone(),
+            entry.class,
+        );
+        let token = self.register(&login, &key, &label, class, false, worker)?;
+        let entry = self.pending.get_mut(id)?;
+        entry.token = Some(token);
         if let Some(window) = self.window.as_mut() {
             window.paired += 1;
             if window.paired >= WINDOW_PAIRS {
                 self.window = None;
             }
         }
-        Some(token)
+        Some(())
+    }
+    pub fn deny_pending(&mut self, id: &str) {
+        self.pending.remove(id);
+    }
+    /// The pair request's own view: pending, or the credential once accepted.
+    pub fn poll_window(&mut self, id: &str) -> PollState {
+        let now = now();
+        if self.pending.get(id).is_none_or(|p| p.expires <= now) {
+            self.pending.remove(id);
+            return PollState::Unknown;
+        }
+        if let Some(p) = self.pending.get_mut(id)
+            && let Some(token) = p.token.take()
+        {
+            self.pending.remove(id);
+            return PollState::Approved(token);
+        }
+        PollState::Pending
     }
     /// The grant a worker link starts with, narrowed by what the receiver
     /// already allows this source host.
@@ -1078,7 +1179,7 @@ mod tests {
         );
     }
     #[test]
-    fn a_pairing_window_admits_a_device_without_an_invitation() {
+    fn a_pairing_window_admits_a_device_only_after_the_operator_accepts() {
         struct Unpin;
         impl Drop for Unpin {
             fn drop(&mut self) {
@@ -1110,23 +1211,42 @@ mod tests {
         // Closed by default: the window is an explicit operator action.
         assert!(s.window().is_none());
         assert!(
-            s.pair_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+            s.request_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
                 .is_none()
         );
 
         let window = s.open_window(None).unwrap();
         assert_eq!(window.expires_at, start + PAIR_TTL);
-        assert_eq!(s.reply(None).window.unwrap().paired, 0);
-        let cookie = s
-            .pair_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+        let request = s
+            .request_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
             .unwrap();
+        // Asking grants nothing: no device exists until the operator accepts.
+        assert!(s.pending().iter().any(|p| p.id == request.id));
+        assert!(!s.pending()[0].approved);
+        assert!(matches!(s.poll_window(&request.id), PollState::Pending));
+        assert!(s.reply(None).devices.is_empty());
+        s.approve_pending(&request.id).unwrap();
+        assert!(s.pending()[0].approved);
+        let PollState::Approved(cookie) = s.poll_window(&request.id) else {
+            panic!("an accepted request must hand over the credential once");
+        };
         let id = s.identity("owner@example.test", &cookie).unwrap();
         assert!(s.alive(&id));
+        assert!(s.pending().is_empty());
         assert_eq!(s.reply(None).window.unwrap().paired, 1);
 
-        // A worker link needs a source and gets the same starting grant.
+        // A declined request never becomes a device.
+        let refused = s
+            .request_window("other@example.test", &public, "Phone", DeviceClass::Phone)
+            .unwrap();
+        let before = s.reply(None).devices.len();
+        s.deny_pending(&refused.id);
+        assert!(matches!(s.poll_window(&refused.id), PollState::Unknown));
+        assert_eq!(s.reply(None).devices.len(), before);
+
+        // A worker link needs a source; a declined worker grant matches.
         assert!(
-            s.pair_window(
+            s.request_window(
                 "owner@example.test",
                 &public,
                 "Worker",
@@ -1138,7 +1258,7 @@ mod tests {
             .is_none()
         );
         let worker = s
-            .pair_window(
+            .request_window(
                 "owner@example.test",
                 &public,
                 "Worker",
@@ -1148,49 +1268,56 @@ mod tests {
                 },
             )
             .unwrap();
-        let worker_id = s.identity("owner@example.test", &worker).unwrap();
+        s.approve_pending(&worker.id).unwrap();
+        let PollState::Approved(token) = s.poll_window(&worker.id) else {
+            panic!("accepted worker request");
+        };
+        let worker_id = s.identity("owner@example.test", &token).unwrap();
         assert_eq!(s.device_class(&worker_id), Some(DeviceClass::Host));
         assert!(s.worker_grant(&worker_id).unwrap().may_launch);
 
-        // A named window admits only that login, and closing it ends pairing.
+        // A named window admits only that login.
         s.open_window(Some("named@example.test".into())).unwrap();
-        assert_eq!(s.reply(None).window.unwrap().paired, 0);
         assert!(
-            s.pair_window("other@example.test", &public, "Phone", DeviceClass::Phone)
+            s.request_window("other@example.test", &public, "Phone", DeviceClass::Phone)
                 .is_none()
         );
-        assert!(
-            s.pair_window("named@example.test", &public, "Phone", DeviceClass::Phone)
-                .is_some()
-        );
+        let named = s
+            .request_window("named@example.test", &public, "Phone", DeviceClass::Phone)
+            .unwrap();
+        assert!(s.approve_pending(&named.id).is_some());
+
+        // Closing the window ends new requests, and expiry ends pending ones.
         s.close_window();
         assert!(s.window().is_none());
         assert!(
-            s.pair_window("named@example.test", &public, "Phone", DeviceClass::Phone)
+            s.request_window("named@example.test", &public, "Phone", DeviceClass::Phone)
                 .is_none()
         );
-
-        // It expires on its own.
         s.open_window(None).unwrap();
+        let late = s
+            .request_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+            .unwrap();
         at(start + 10 * PAIR_TTL);
         assert!(s.window().is_none());
-        assert!(
-            s.pair_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
-                .is_none()
-        );
+        assert!(matches!(s.poll_window(&late.id), PollState::Unknown));
 
         // Disabling remote access, or moving to another Serve origin, withdraws
-        // it: a window is code-free admission and must not outlive its origin.
+        // the window and every request it queued.
         at(start);
         s.open_window(None).unwrap();
+        s.request_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+            .unwrap();
         s.set_origin(None, 0).unwrap();
-        assert!(s.window().is_none());
+        assert!(s.window().is_none() && s.pending().is_empty());
         s.set_origin(Some("https://lab.fixture.ts.net".into()), 8443)
             .unwrap();
         s.open_window(None).unwrap();
+        s.request_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+            .unwrap();
         s.set_origin(Some("https://other.fixture.ts.net".into()), 8443)
             .unwrap();
-        assert!(s.window().is_none());
+        assert!(s.window().is_none() && s.pending().is_empty());
     }
     #[test]
     fn a_worker_grant_is_inherited_only_by_the_same_login() {
@@ -1214,7 +1341,7 @@ mod tests {
         let source = "74b2c731-b9f0-4b05-8672-3c42062b190a";
         s.open_window(None).unwrap();
         let link = s
-            .pair_window(
+            .request_window(
                 "alice@example.test",
                 &public,
                 "Alice's laptop",
@@ -1224,7 +1351,11 @@ mod tests {
                 },
             )
             .unwrap();
-        let id = s.identity("alice@example.test", &link).unwrap();
+        s.approve_pending(&link.id).unwrap();
+        let PollState::Approved(token) = s.poll_window(&link.id) else {
+            panic!("accepted request");
+        };
+        let id = s.identity("alice@example.test", &token).unwrap();
         // The receiver narrows the link and then grants memory sync.
         s.update(|d| {
             let grant = d

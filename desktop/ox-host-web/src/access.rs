@@ -65,6 +65,13 @@ pub enum Operation {
         login: Option<String>,
     },
     CloseWindow,
+    /// Accept a device that asked to pair through a window.
+    ApprovePending {
+        id: String,
+    },
+    DenyPending {
+        id: String,
+    },
     Revoke(String),
     TerminalGrant(String, bool),
 }
@@ -544,6 +551,8 @@ pub fn run_with(
         Operation::Revoke(id) => request(Request::Revoke { id })?,
         Operation::OpenWindow { login } => request(Request::OpenWindow { login })?,
         Operation::CloseWindow => request(Request::CloseWindow)?,
+        Operation::ApprovePending { id } => request(Request::ApprovePending { id })?,
+        Operation::DenyPending { id } => request(Request::DenyPending { id })?,
         Operation::Pair { .. } | Operation::PairWorker { .. } => {
             let node = network.as_ref().map_err(Clone::clone)?;
             if !node.ready() || !prior.enabled || prior.origin.as_ref() != Some(&node.origin) {

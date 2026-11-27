@@ -85,6 +85,12 @@ pub enum Request {
         login: Option<String>,
     },
     CloseWindow,
+    ApprovePending {
+        id: String,
+    },
+    DenyPending {
+        id: String,
+    },
     Revoke {
         id: String,
     },
@@ -158,6 +164,22 @@ pub struct PairingWindow {
     pub paired: u8,
 }
 
+/// A device that asked to pair while a window was open, waiting for the
+/// operator on this host to accept or decline it. The window is only the
+/// advertisement; this is the decision.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PendingPair {
+    pub id: String,
+    pub label: String,
+    pub login: String,
+    pub class: DeviceClass,
+    pub expires_at: i64,
+    /// Set once the operator accepted. The device is registered, and its next
+    /// poll collects the credential.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub approved: bool,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Reply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,6 +199,8 @@ pub struct Reply {
     pub pairing: Option<Pairing>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<PairingWindow>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<PendingPair>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reservation: Option<String>,
 }

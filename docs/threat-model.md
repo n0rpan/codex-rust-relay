@@ -89,12 +89,15 @@ install code that is not ours.
   wants that stronger rule.
 - A pairing window is the alternative to carrying a code: the operator opens
   it on the host (desktop, phone or `ox host pair --window`) for five
-  minutes, and any login Serve authenticated on that origin may enrol
-  meanwhile. It closes on its own, after eight devices, when the operator
-  closes it, or on a restart. It is the one place where reachability alone
-  admits a device, which is why it is a deliberate, visible, short-lived
-  action on the receiving host rather than a stored setting. `--for LOGIN`
-  narrows it to one person.
+  minutes, and a device that reaches that origin may ask to pair meanwhile.
+  The window is only the advertisement. Asking registers nothing: the request
+  waits for the operator on that host to accept it, in the desktop, on a
+  paired phone or with `ox host approve`, and only that decision creates the
+  device. A process that can reach the loopback port therefore cannot admit
+  itself, with or without a window open. It closes on its own after five
+  minutes or eight devices, when the operator closes it, on a restart, or
+  when remote access or the Serve origin changes. `--for LOGIN` narrows who
+  may ask.
 - Device keys are non-extractable in the browser, in the Secure Enclave or
   Keychain on macOS, and in Secret Service or a 0600 file on Linux.
 - Revoking a device removes its record and closes its live sockets and

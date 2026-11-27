@@ -315,7 +315,7 @@ impl Render for Remote {
                         }
                         None => {
                             view = view.child(
-                                "Waiting lets a device pair from its own Add host with no code to carry. It lasts five minutes.",
+                                "Waiting lets a device ask to pair from its own Add host with no code to carry. Its request appears here for you to accept. It lasts five minutes.",
                             );
                             buttons = buttons.child(self.action(
                                 p,
@@ -325,6 +325,44 @@ impl Render for Remote {
                                 cx,
                             ));
                         }
+                    }
+                    for (index, pending) in report.access.host.pending.iter().enumerate() {
+                        let accept = pending.id.clone();
+                        let deny = pending.id.clone();
+                        let state = if pending.approved {
+                            "accepted, waiting for the device"
+                        } else {
+                            "wants to pair"
+                        };
+                        let mut row = div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .items_center()
+                            .child(format!("{} · {} · {state}", pending.label, pending.login));
+                        if !pending.approved {
+                            row = row.child(button(
+                                p,
+                                ("pending-accept", index),
+                                "Accept",
+                                true,
+                                !self.busy,
+                                cx.listener(move |s, _, _, cx| {
+                                    s.submit(Operation::ApprovePending { id: accept.clone() }, cx)
+                                }),
+                            ));
+                        }
+                        row = row.child(button(
+                            p,
+                            ("pending-deny", index),
+                            "Decline",
+                            false,
+                            !self.busy,
+                            cx.listener(move |s, _, _, cx| {
+                                s.submit(Operation::DenyPending { id: deny.clone() }, cx)
+                            }),
+                        ));
+                        view = view.child(row);
                     }
                 } else {
                     let port_input = self

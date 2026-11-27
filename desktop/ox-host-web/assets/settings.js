@@ -1303,10 +1303,31 @@ export function setupSettings({ request, open, close, notifications, login }) {
     const left = result.window
       ? Math.max(0, Math.ceil((result.window.expires_at * 1000 - Date.now()) / 60000))
       : 0;
+    for (const pending of result.pending || []) {
+      const row = node("div", undefined, "phone-settings-card");
+      row.append(
+        node("h2", pending.label),
+        node("p", `${pending.login} · ${pending.approved ? "accepted, waiting for the device" : "wants to pair"}`),
+      );
+      if (!pending.approved)
+        row.append(
+          action("Accept " + pending.label, async () => {
+            await readPage(id, { action: "approve_pending", id: pending.id });
+            if (pageId === id && !panel.hidden) await remote();
+          }, "primary"),
+        );
+      row.append(
+        action("Decline", async () => {
+          await readPage(id, { action: "deny_pending", id: pending.id });
+          if (pageId === id && !panel.hidden) await remote();
+        }),
+      );
+      body.append(row);
+    }
     if (left > 0) {
       body.append(
         node("p", `Waiting for a device to pair · ${left} min left · ${result.window.paired} paired`),
-        node("p", "On the new device, open Add host and choose this host. There is no code to carry."),
+        node("p", "On the new device, open Add host and choose this host. Its request appears here for you to accept."),
         action("Stop waiting", async () => {
           await readPage(id, { action: "close_pairing_window" });
           if (pageId === id && !panel.hidden) await remote();

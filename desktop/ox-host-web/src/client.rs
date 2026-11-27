@@ -362,7 +362,8 @@ pub(crate) async fn window_status(origin: &str) -> io::Result<Option<(String, i6
 }
 
 /// Enrol in a host whose pairing window the operator opened, instead of
-/// carrying an invitation to it.
+/// carrying an invitation to it. The host only queues the request: the
+/// operator there accepts it, and this waits for that decision.
 pub(crate) async fn register_window(
     origin: &str,
     label: &str,
@@ -384,14 +385,45 @@ pub(crate) async fn register_window(
             "That host is not waiting for a device to pair. Open a pairing window there and try again.",
         )
         .await?;
-        response
-            .headers()
-            .get_all(header::SET_COOKIE)
-            .iter()
-            .filter_map(|v| v.to_str().ok()?.split(';').next()?.split_once('='))
-            .find(|(k, t)| *k == COOKIE && B64.decode(t).is_ok_and(|b| b.len() == 32))
-            .map(|(_, token)| token.to_owned())
-            .ok_or_else(|| io::Error::other("The host did not return a device credential"))
+        let request: Value = response.json().await.map_err(io::Error::other)?;
+        let id = request["request"]
+            .as_str()
+            .ok_or_else(|| io::Error::other("The host did not name the pairing request"))?;
+        let until = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let response = http
+                .post(format!("{origin}/api/pair/window/poll"))
+                .header(header::ORIGIN, origin)
+                .json(&json!({"request": id}))
+                .send()
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::NotConnected, e.without_url()))?;
+            if response.status() == reqwest::StatusCode::NO_CONTENT {
+                return response
+                    .headers()
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .filter_map(|v| v.to_str().ok()?.split(';').next()?.split_once('='))
+                    .find(|(k, t)| *k == COOKIE && B64.decode(t).is_ok_and(|b| b.len() == 32))
+                    .map(|(_, token)| token.to_owned())
+                    .ok_or_else(|| {
+                        io::Error::other("The host did not return a device credential")
+                    });
+            }
+            if response.status() != reqwest::StatusCode::ACCEPTED {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "The host declined this device or the request expired.",
+                ));
+            }
+            if std::time::Instant::now() >= until {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("No one accepted this device on {origin}. Approve it there and try again."),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
     }
     .await;
     let token = result.inspect_err(|_| {
