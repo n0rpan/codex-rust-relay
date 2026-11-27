@@ -26,7 +26,7 @@ decides.
    a change to workflows or packaging adds desktop packages, which take a
    quarter of an hour or more.
 2. **The `full-ci` label** runs the legs `main` builds: four release binaries,
-   three native test legs, four desktop packages. About 40 minutes.
+   three native test legs, four desktop packages. About 25 minutes.
 3. **The merge queue** tests the pull request on top of current `main` and
    merges it. A branch does not have to be current with `main`, so do not
    update one just to catch up.
@@ -46,7 +46,7 @@ decides.
   head commit with no unresolved P0 or P1 finding and no open security
   finding (`auto-queue.yml`). A push takes it out of line until the new
   commit is reviewed. Keep the pull request a draft if you want the full run
-  without the merge. It costs about 40 minutes of runners on every later
+  without the merge. It costs another full run on every later
   push. Use it when code, packaging or workflows changed; documentation does
   not need it. Adding the label cancels the scoped run and starts the full
   one, so add it once the review of the head commit is clean; waiting for the
@@ -58,7 +58,10 @@ decides.
   job, the test and the evidence.
 - **One re-run per job, at most.** "Flaky" is not a cause. A test that fails
   and then passes on the same code has a bug: find it and fix the test or the
-  product. Reproduce locally by running the test binary a few hundred times.
+  product. Reproduce by running the test a few hundred times on the platform
+  that failed: a loop on Linux says nothing about a failure on macOS Intel.
+  A throwaway branch with a workflow that runs on its own push can loop a
+  small reproduction on any runner in minutes; delete the branch after.
 - **Never skip, ignore or quarantine a test to get green.** Every test is there
   for a reason, or it is removed with that reason written down.
 - **Say what you did not verify.** A workflow change is unverified until the
@@ -67,7 +70,7 @@ decides.
 ## Waiting for CI and reviews
 
 Waiting costs nothing; looking costs tokens every time. A `full-ci` run takes
-about 40 minutes, so a look every two minutes is twenty turns that each say
+about 25 minutes, so a look every two minutes is a dozen turns that each say
 "still running".
 
 Not this, repeated:
@@ -86,7 +89,7 @@ gh pr checks 40 --watch --fail-fast --interval 60
   if the run failed. For a single run, use
   `gh run watch <run-id> --exit-status --interval 60`. Start it in the
   background, or with a timeout longer than the run: 5 minutes scoped, 20 with
-  desktop packages, 45 for `full-ci`, the same again for `main`'s release.
+  desktop packages, 30 for `full-ci`, 50 for `main`'s release.
 - **If your harness delivers pull request events, end your turn.** A failed
   check, a review or a comment wakes you. Do not also poll.
 - **While you wait, do not push to that branch.** Start the next task on its
