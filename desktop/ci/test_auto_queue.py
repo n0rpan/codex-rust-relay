@@ -15,6 +15,7 @@ BOT_USER = {"login": BOT, "type": "Bot"}
 # A stand-in for the gh CLI: answers the three reads from files and records writes.
 FAKE_GH = r"""#!/bin/bash
 dir="$(dirname "$0")"
+fail="$(cat "$dir/fail" 2>/dev/null || true)"
 case "$*" in
     *"pr merge"*) echo "$*" >> "$dir/calls"; exit 0 ;;
     *graphql*) file=threads.json ;;
@@ -22,6 +23,7 @@ case "$*" in
     */pulls/*) file=pull.json ;;
     *) echo "unexpected gh $*" >&2; exit 1 ;;
 esac
+if [ "$fail" = "$file" ]; then echo "HTTP 503" >&2; exit 1; fi
 filter=.
 while [ $# -gt 0 ]; do
     if [ "$1" = --jq ]; then filter="$2"; fi
@@ -43,7 +45,7 @@ def thread(body, resolved=False, author="chatgpt-codex-connector", kind="Bot"):
 
 
 class AutoQueue(unittest.TestCase):
-    def decide(self, *, pull=None, comments=None, threads=None, more_threads=False, dry_run=False):
+    def decide(self, *, pull=None, comments=None, threads=None, more_threads=False, dry_run=False, fail=None):
         base = {"state": "open", "draft": False, "user": {"login": "maintainer"},
                 "head": {"sha": HEAD, "repo": {"full_name": "o/r"}}, "labels": [{"name": "full-ci"}]}
         base.update(pull or {})
@@ -56,6 +58,8 @@ class AutoQueue(unittest.TestCase):
             (tmp / "threads.json").write_text(json.dumps(
                 {"data": {"repository": {"pullRequest": {"reviewThreads": {
                     "pageInfo": {"hasNextPage": more_threads}, "nodes": threads or []}}}}}))
+            if fail:
+                (tmp / "fail").write_text(fail)
             gh = tmp / "gh"
             gh.write_text(FAKE_GH)
             gh.chmod(gh.stat().st_mode | stat.S_IXUSR)
@@ -64,15 +68,23 @@ class AutoQueue(unittest.TestCase):
             env.pop("GITHUB_STEP_SUMMARY", None)
             if dry_run:
                 env["AUTO_QUEUE_DRY_RUN"] = "1"
-            out = subprocess.run(["bash", str(SCRIPT), "38"], env=env, check=True,
-                                 capture_output=True, text=True).stdout.strip()
+            run = subprocess.run(["bash", str(SCRIPT), "38"], env=env, capture_output=True, text=True)
+            self.assertEqual(run.returncode, 1 if fail else 0, run.stderr)
             calls = (tmp / "calls").read_text() if (tmp / "calls").exists() else ""
-            return out, calls
+            return run.stdout.strip(), calls
 
-    def test_a_reviewed_labelled_pull_request_is_queued(self):
+    def test_a_reviewed_labelled_pull_request_is_queued_at_the_commit_that_was_judged(self):
         out, calls = self.decide()
         self.assertIn("queue:", out)
-        self.assertIn("--auto", calls)
+        self.assertIn(f"--auto --match-head-commit {HEAD}", calls)
+
+    def test_a_read_that_fails_holds_and_fails_the_run(self):
+        for file in ("pull.json", "comments.json", "threads.json"):
+            with self.subTest(file):
+                out, calls = self.decide(fail=file)
+                self.assertIn("hold: could not read", out)
+                self.assertIn("--disable-auto", calls)
+                self.assertNotIn("--auto --match", calls)
 
     def test_a_resolved_or_minor_finding_does_not_block(self):
         out, calls = self.decide(threads=[thread("![P1 Badge](x) fixed", resolved=True),
@@ -87,7 +99,7 @@ class AutoQueue(unittest.TestCase):
                 out, calls = self.decide(threads=[thread(f"**![{badge} Badge](x)** leak")])
                 self.assertIn("hold: 1 unresolved", out)
                 self.assertIn("--disable-auto", calls)
-                self.assertNotIn("--auto\n", calls)
+                self.assertNotIn("--auto --match", calls)
 
     def test_threads_beyond_the_page_read_hold(self):
         out, calls = self.decide(more_threads=True)
@@ -129,7 +141,7 @@ class AutoQueue(unittest.TestCase):
             with self.subTest(name):
                 out, calls = self.decide(pull=pull)
                 self.assertIn(word, out)
-                self.assertNotIn("--auto\n", calls)
+                self.assertNotIn("--auto --match", calls)
                 # A pull request this workflow does not own is left alone.
                 if word == "skip:":
                     self.assertEqual(calls, "")
