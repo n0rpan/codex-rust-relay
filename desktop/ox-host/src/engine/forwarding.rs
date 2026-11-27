@@ -301,13 +301,31 @@ impl Engine {
                 destination,
                 max_age_days,
             }),
-            project,
-            operation: Operation::Start {
-                results: None,
-                parent: parent_ref,
-                level,
-                start: Box::new(start),
+            operation: {
+                let brief_ceiling = ox_desk_core::memory::route_sensitivity_ceiling(&start.route())
+                    .min(ox_memory::Sensitivity::Private);
+                let project_id = ox_memory::canonical_project_id(&project);
+                let memory_brief =
+                    ox_memory::MemoryStore::open(ox_memory::store_path_for(&self.state_dir))
+                        .tier1_brief(
+                            Some(&project_id),
+                            None,
+                            brief_ceiling,
+                            ox_memory::DEFAULT_BRIEF_CHARS,
+                        )
+                        .ok()
+                        .flatten();
+                let memory_brief_sensitivity = memory_brief.as_ref().map(|_| brief_ceiling);
+                Operation::Start {
+                    results: None,
+                    memory_brief,
+                    memory_brief_sensitivity,
+                    parent: parent_ref,
+                    level,
+                    start: Box::new(start),
+                }
             },
+            project,
         }
         .save(&queue)
         .map_err(|e| e.to_string())?;
@@ -339,15 +357,24 @@ impl Engine {
                     start,
                     level,
                     results,
+                    memory_brief,
+                    memory_brief_sensitivity,
                     ..
                 } = &mut p.operation
                 else {
                     return Err(io::Error::other("Invalid queued worker request."));
                 };
                 if !queue.join("snapshot").is_dir() {
-                    if ox_host_web::inventory::check_launch(
+                    let launch = ox_host_web::inventory::check_launch(
                         &host, &source, &p.project, start, *level,
-                    )? {
+                    )?;
+                    // A receiver from before the brief existed rejects the
+                    // optional fields, so omit them instead of failing the launch.
+                    if !launch.memory_brief {
+                        *memory_brief = None;
+                        *memory_brief_sensitivity = None;
+                    }
+                    if launch.linked_write {
                         *results = Some(p.policy.clone().unwrap_or_default());
                     }
                     ox_desk_core::state_file::write_json(&queue.join("start.json"), &p)?;

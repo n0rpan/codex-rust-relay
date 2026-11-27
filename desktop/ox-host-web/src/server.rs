@@ -241,11 +241,14 @@ async fn administer(
             before,
             may_launch,
             ceiling,
-        } => app
-            .state
-            .lock()
-            .unwrap()
-            .edit_worker(&id, &before, may_launch, ceiling)?,
+            may_sync_memory,
+        } => app.state.lock().unwrap().edit_worker(
+            &id,
+            &before,
+            may_launch,
+            ceiling,
+            may_sync_memory,
+        )?,
         Request::Update { .. } | Request::WorkerLinks { .. } => {
             unreachable!("handled before Serve administration")
         }
@@ -537,6 +540,12 @@ fn start_listener(app: App, origin: String, listener: TcpListener) -> Listener {
         .route(
             "/api/worker-job",
             post(crate::linked_jobs::handle).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route(
+            "/api/memory/sync",
+            post(crate::memory_sync::handle).layer(DefaultBodyLimit::max(
+                crate::memory_sync::MAX_SYNC_BODY_BYTES,
+            )),
         )
         .route(
             "/api/worker-checkout",

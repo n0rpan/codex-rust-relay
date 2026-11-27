@@ -187,6 +187,8 @@ const USAGE: &str = "Usage: ox-host COMMAND [--socket PATH] [--state-dir PATH] [
   labels [set LABEL…]       show or replace placement labels
   devices                   list paired devices and their IDs
   terminal <device> on|off  change a paired device’s terminal grant
+  memory-sync [<device> on|off]
+                            sync non-local memories with workers, or change a worker link’s memory-sync grant
   revoke <device-id>        disconnect a paired device
   doctor [--errors N]       check the host, Tailscale Serve, paired devices and stock clients
   uninstall [--purge]       remove the login service; --purge also deletes OX host state
@@ -290,6 +292,36 @@ fn entry() -> io::Result<()> {
         }
         (Some("revoke"), [id]) => pairing::revoke(&paths, id).map_err(io::Error::other),
         (Some("doctor"), rest) => doctor::run(&paths, rest),
+        (Some("memory-sync"), []) => {
+            let host_id = identity::load(&paths.state_dir)?.to_string();
+            let results = ox_host_web::memory_sync::sync_all_peers(&paths.state_dir, &host_id)?;
+            if results.is_empty() {
+                println!("No paired worker hosts configured.");
+            } else {
+                let mut failures = 0usize;
+                for (name, res) in results {
+                    match res {
+                        Ok(stats) => println!(
+                            "{name}: synced (+{} inserted, ~{} updated, {} ignored)",
+                            stats.inserted, stats.updated, stats.ignored
+                        ),
+                        Err(err) => {
+                            failures += 1;
+                            eprintln!("{name}: sync failed: {err}");
+                        }
+                    }
+                }
+                if failures > 0 {
+                    return Err(io::Error::other(format!(
+                        "{failures} peer(s) failed to synchronize."
+                    )));
+                }
+            }
+            Ok(())
+        }
+        (Some("memory-sync"), [id, setting]) if matches!(setting.as_str(), "on" | "off") => {
+            pairing::memory_sync(&paths, id, setting == "on").map_err(io::Error::other)
+        }
         _ => Err(io::Error::other(USAGE)),
     }
 }

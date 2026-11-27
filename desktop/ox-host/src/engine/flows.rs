@@ -386,11 +386,13 @@ impl Engine {
                 }
                 let target = a.target.clone();
                 let start = a.start.clone();
+                let memory_brief = a.memory_brief.clone();
                 // A busy route keeps the request pending so the operator can retry.
                 let mut l = self
                     .prepare_launch(&target, origin, Payload::Worker(start))
                     .map_err(io::Error::other)?;
                 l.detached = true;
+                l.memory_brief = memory_brief;
                 self.asking.remove(&job);
                 self.ledger
                     .change(|d| d.asking.retain(|o| o.job_id != job))?;

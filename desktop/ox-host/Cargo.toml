@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 ox-desk-core = { path = "../ox-desk-core" }
+ox-memory = { path = "../ox-memory" }
 ox-host-service = { path = "../ox-host-service" }
 ox-host-web = { path = "../ox-host-web", features = ["server"] }
 serde = { version = "1", features = ["derive"] }

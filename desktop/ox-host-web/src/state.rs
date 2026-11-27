@@ -377,6 +377,9 @@ impl State {
     pub fn worker_links_path(&self) -> PathBuf {
         self.dir.join("worker-links.json")
     }
+    pub fn memory_path(&self) -> PathBuf {
+        ox_memory::store_path_for(&self.dir)
+    }
     fn create_invite(
         &mut self,
         login: String,
@@ -478,7 +481,10 @@ impl State {
             }
             let mut grant = crate::admin::WorkerGrant {
                 source: source.to_ascii_lowercase(),
+                // Worker launches are the reason a link exists; memory sync is a
+                // separate opt-in the receiving host grants after pairing.
                 may_launch: true,
+                may_sync_memory: false,
                 ceiling: ox_desk_core::modes::Level::Yolo,
             };
             // A replacement key keeps restrictions the receiver already set for
@@ -492,6 +498,8 @@ impl State {
                 .filter(|w| w.source == grant.source)
             {
                 grant.may_launch &= prior.may_launch;
+                // A replacement key keeps a grant the receiver already made.
+                grant.may_sync_memory |= prior.may_sync_memory;
                 grant.ceiling = grant.ceiling.min(prior.ceiling);
             }
             (format!("{code}.host.{source}"), Some(grant))
@@ -580,6 +588,7 @@ impl State {
         before: &crate::admin::WorkerGrant,
         may_launch: bool,
         ceiling: ox_desk_core::modes::Level,
+        may_sync_memory: Option<bool>,
     ) -> io::Result<()> {
         let mut grant = self
             .worker_grant(id)
@@ -593,6 +602,9 @@ impl State {
         }
         grant.may_launch = may_launch;
         grant.ceiling = ceiling;
+        if let Some(allowed) = may_sync_memory {
+            grant.may_sync_memory = allowed;
+        }
         self.update(|disk| disk.devices.get_mut(id).unwrap().device.worker = Some(grant))?;
         self.signal();
         Ok(())
@@ -941,12 +953,24 @@ mod tests {
         assert!(state.terminal_grant(&id, true).is_err());
         let original = state.worker_grant(&id).unwrap().clone();
         assert_eq!(original.ceiling, Level::Yolo);
+        assert!(
+            !original.may_sync_memory,
+            "memory sync needs an explicit receiver-side grant"
+        );
         state
-            .edit_worker(&id, &original, false, Level::Read)
+            .edit_worker(&id, &original, true, Level::Yolo, Some(true))
             .unwrap();
+        let granted = state.worker_grant(&id).unwrap().clone();
+        assert!(granted.may_sync_memory && granted.may_launch);
+        // `None` leaves the memory grant alone while other access changes.
+        state
+            .edit_worker(&id, &granted, false, Level::Read, None)
+            .unwrap();
+        let restricted = state.worker_grant(&id).unwrap().clone();
+        assert!(restricted.may_sync_memory && !restricted.may_launch);
         assert!(
             state
-                .edit_worker(&id, &original, true, Level::Yolo)
+                .edit_worker(&id, &original, true, Level::Yolo, None)
                 .is_err()
         );
         let stored: serde_json::Value =
