@@ -17,7 +17,7 @@ FAKE_GH = r"""#!/bin/bash
 dir="$(dirname "$0")"
 fail="$(cat "$dir/fail" 2>/dev/null || true)"
 case "$*" in
-    *"pr merge"*) echo "$*" >> "$dir/calls"; exit 0 ;;
+    *"pr merge"*|*"pr comment"*) echo "$*" >> "$dir/calls"; exit 0 ;;
     *graphql*) file=threads.json ;;
     */comments*) file=comments.json ;;
     */pulls/*) file=pull.json ;;
@@ -33,8 +33,12 @@ jq -r "$filter" "$dir/$file"
 """
 
 
-def summary(sha, status):
-    state = json.dumps({"code_review": {"commit_sha": sha, "status": status}})
+def summary(sha, status, security="completed", security_sha=None, unresolved=False):
+    state = {"code_review": {"commit_sha": sha, "status": status}}
+    if security:
+        state["security_review"] = {"commit_sha": security_sha or sha, "status": security,
+                                    "has_unresolved_findings": unresolved if security == "completed" else None}
+    state = json.dumps(state)
     escaped = state.replace("{", "&#123;").replace("}", "&#125;")
     return f"<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {escaped} -->\n<details>"
 
@@ -145,6 +149,38 @@ class AutoQueue(unittest.TestCase):
                 # A pull request this workflow does not own is left alone.
                 if word == "skip:":
                     self.assertEqual(calls, "")
+
+    def test_a_head_commit_without_a_security_review_gets_one_requested_once(self):
+        for comments in ([{"user": BOT_USER, "body": summary(HEAD, "completed", security=None)}],
+                         [{"user": BOT_USER, "body": summary(HEAD, "running", security="completed", security_sha="0" * 40)}]):
+            out, calls = self.decide(comments=comments)
+            self.assertIn("hold:", out)
+            self.assertIn("pr comment", calls)
+            self.assertIn(f"@codex security review\n\nAsked for by the `full-ci` label, for commit {HEAD}.", calls)
+            self.assertIn("--disable-auto", calls)
+            asked = {"user": {"login": "maintainer", "type": "User"},
+                     "body": f"@codex security review\n\nAsked for by the `full-ci` label, for commit {HEAD}."}
+            out, calls = self.decide(comments=comments + [asked])
+            self.assertIn("hold:", out)
+            self.assertNotIn("pr comment", calls)
+        # Someone else's comment is not the maintainer's request.
+        asked["user"] = {"login": "someone", "type": "User"}
+        out, calls = self.decide(comments=comments + [asked])
+        self.assertIn("pr comment", calls)
+
+    def test_a_running_or_unresolved_security_review_holds_without_a_new_request(self):
+        for state in ({"security": "running"}, {"security": "completed", "unresolved": True},
+                      {"security": "completed", "unresolved": None}):
+            out, calls = self.decide(comments=[{"user": BOT_USER, "body": summary(HEAD, "completed", **state)}])
+            self.assertIn("security review", out)
+            self.assertNotIn("pr comment", calls)
+            self.assertNotIn("--auto", calls)
+
+    def test_no_security_review_is_requested_without_the_label_or_for_a_draft(self):
+        bare = [{"user": BOT_USER, "body": summary(HEAD, "completed", security=None)}]
+        for pull in ({"labels": []}, {"draft": True}):
+            out, calls = self.decide(pull=pull, comments=bare)
+            self.assertNotIn("pr comment", calls)
 
     def test_dry_run_changes_nothing(self):
         out, calls = self.decide(dry_run=True)

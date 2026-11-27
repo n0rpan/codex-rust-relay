@@ -10,8 +10,12 @@
 #   - it is open, not a draft, from this repository and from the maintainer;
 #   - it carries the full-ci label;
 #   - Codex has finished a code review of its current head commit;
+#   - Codex has finished a security review of that commit with nothing open;
 #   - no unresolved Codex review thread is marked P0 or P1.
-# Otherwise auto-merge is turned off. Anything this script cannot read counts
+# Otherwise auto-merge is turned off. A labelled pull request whose head
+# commit has no security review gets one requested, once per commit, by a
+# comment from the maintainer's token: the security review runs by itself
+# only when a pull request opens. Anything this script cannot read counts
 # as "not reviewed": a failed lookup or a change in the reviewer's comment
 # format stops automatic merges; it never lets one through.
 set -euo pipefail
@@ -24,13 +28,15 @@ maintainer=${MAINTAINER:?}
 # longer name.
 reviewer='chatgpt-codex-connector'
 
-# Sets `decision` and, when the pull request could be read, `head`. It runs in
+# Sets `decision`, when the pull request could be read `head`, and `request`
+# when a security review of that commit has to be asked for. It runs in
 # this shell, not in a command substitution, so the commit it judged is the
 # commit the merge request is bound to.
 decision=''
 head=''
+request=''
 decide() {
-    local pr bodies summary reviewed threads blocking
+    local pr comments summary reviewed security threads blocking
     if ! pr="$(gh api "repos/${repo}/pulls/${number}")" || [ -z "${pr}" ]; then
         decision="hold: could not read the pull request"; return
     fi
@@ -42,16 +48,33 @@ decide() {
     if ! jq -e '.labels | map(.name) | index("full-ci")' <<< "${pr}" > /dev/null; then decision="hold: no full-ci label"; return; fi
 
     # The reviewer keeps one summary comment with its state as escaped JSON.
-    if ! bodies="$(gh api --paginate "repos/${repo}/issues/${number}/comments" \
-        --jq ".[] | select(.user.login == \"${reviewer}[bot]\" and .user.type == \"Bot\") | .body")"; then
+    if ! comments="$(gh api --paginate "repos/${repo}/issues/${number}/comments" \
+        --jq '.[] | {login: .user.login, type: .user.type, body: .body}' | jq -s .)"; then
         decision="hold: could not read the comments"; return
     fi
-    summary="$(grep -o 'codex-review-state:v1 [^>]*' <<< "${bodies}" | tail -n 1 |
+    summary="$(jq -r --arg bot "${reviewer}[bot]" \
+        '.[] | select(.login == $bot and .type == "Bot") | .body' <<< "${comments}" |
+        grep -o 'codex-review-state:v1 [^>]*' | tail -n 1 |
         sed -e 's/^codex-review-state:v1 //' -e 's/ *--$//' -e 's/&#123;/{/g' -e 's/&#125;/}/g' || true)"
+    # Before any hold below, so the two reviews run side by side.
+    security="$(jq -r --arg head "${head}" '.security_review | select(.commit_sha == $head)
+        | if .status != "completed" then "running"
+          elif .has_unresolved_findings == false then "clean" else "open" end' \
+        <<< "${summary:-null}" 2>/dev/null || true)"
+    if [ -z "${security}" ] && ! jq -e --arg who "${maintainer}" --arg head "${head}" \
+        'any(.[]; .login == $who and (.body | startswith("@codex security review")) and (.body | contains($head)))' \
+        <<< "${comments}" > /dev/null; then
+        request=yes
+    fi
     reviewed="$(jq -r --arg head "${head}" \
         'select(.code_review.commit_sha == $head and .code_review.status == "completed") | "yes"' \
         <<< "${summary:-null}" 2>/dev/null || true)"
     if [ "${reviewed}" != yes ]; then decision="hold: no finished review of ${head:0:7}"; return; fi
+    case "${security}" in
+        clean) ;;
+        open) decision="hold: the security review of ${head:0:7} has unresolved findings"; return ;;
+        *) decision="hold: no finished security review of ${head:0:7}"; return ;;
+    esac
 
     # One page of threads. With more than a page this holds: an unread thread
     # could be the blocking one.
@@ -85,6 +108,14 @@ case "${decision}" in
     queue:*) gh pr merge "${url}" --auto --match-head-commit "${head}" ;;
     hold:*) gh pr merge "${url}" --disable-auto || true ;;
 esac
+# After auto-merge is off, so a comment that cannot be posted leaves nothing
+# queued. The commit is in the text so that a later run finds this request
+# and does not repeat it.
+if [ "${request}" = yes ]; then
+    gh pr comment "${url}" --body "@codex security review
+
+Asked for by the \`full-ci\` label, for commit ${head}."
+fi
 # A lookup that failed is a fault someone should see, not a quiet hold.
 case "${decision}" in
     "hold: could not read"*) exit 1 ;;

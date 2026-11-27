@@ -40,8 +40,9 @@ decides.
 - **Add `full-ci` last, and only when you would merge the change yourself.**
   On a pull request from the maintainer's account that is not a draft, the
   label also queues it for merge once it is green and Codex has reviewed the
-  head commit with no unresolved P0 or P1 finding (`auto-queue.yml`). A push
-  takes it out of line until the new commit is reviewed. Keep the pull
+  head commit with no unresolved P0 or P1 finding and no open security
+  finding (`auto-queue.yml`). A push takes it out of line until the new
+  commit is reviewed. Keep the pull
   request a draft if you want the full run without the merge. It costs about
   40 minutes of runners on every later push. Use it when code, packaging or
   workflows changed; documentation does not need it.
@@ -170,9 +171,13 @@ that goes wrong.
 - Open a pull request ready for review, not as a draft: reviews run when it is
   opened, marked ready and on every push. A draft is only for holding a
   `full-ci` pull request back from merging by itself.
-- Codex reviews a ready pull request by itself, when it is opened and on
-  every push. Wait for the review of the head commit and answer or fix every
-  finding. A review of an earlier commit does not cover a later push.
+- Codex reviews the code of a ready pull request by itself, when it is opened
+  and on every push. Wait for the review of the head commit and answer or fix
+  every finding. A review of an earlier commit does not cover a later push.
+- The security review runs by itself only when the pull request opens. The
+  `full-ci` label asks for one of the head commit, and again after each
+  later push; do not ask by hand as well. Ask by hand
+  (`@codex security review`) only after resolving a security finding.
 - Ask by hand (`@codex review`) in two cases only: no review of the head
   commit has appeared, or you resolved a P0 or P1 thread. Resolving alone
   does not put the pull request back in line.
