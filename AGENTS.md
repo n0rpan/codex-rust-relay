@@ -103,6 +103,11 @@ gh pr checks 40 --watch --fail-fast --interval 60
   red check on the head commit is a failure to read.
 - **Read a failure once, from the log of the failed job**
   (`gh run view <run-id> --log-failed`), not from the list of checks.
+- **A labelled pull request says where it stands.** The merge check keeps one
+  comment on it, starting "In line to merge" or "Not in line to merge", with
+  the reason and what to do. Read that comment, not the workflow's log. It
+  also says when GitHub removed the pull request from the merge queue; then
+  read the failed job of the queue's run, fix it and push.
 - **Codex's code review takes one to two minutes** and edits its summary
   comment when it starts and when it ends. Read the summary once it says the
   review of the head commit is completed.
@@ -144,7 +149,9 @@ and each one gets its own review. Only the bottom one can merge.
   on another branch does nothing: automatic merging holds it, because that
   branch has no required checks.
 - **When the one below has merged**, bring the next one down to `main`:
-  1. Change its base to `main` (`gh pr edit <number> --base main`).
+  1. Check that its base is now `main`. Head branches are deleted on merge,
+     and GitHub then moves the pull requests that were based on one to
+     `main`. If it did not, change it: `gh pr edit <number> --base main`.
   2. Merge `main` into its branch. The squash rewrote the commits it was
      built on, so git reports conflicts; check that `main` holds what you
      built on (`git diff <old base tip> origin/main -- <paths>`) and resolve
