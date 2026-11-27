@@ -63,6 +63,7 @@ pub struct Report {
     pub denied: Option<PermissionHelp>,
     pub notice: Option<String>,
 }
+#[derive(Clone)]
 pub struct Node {
     pub origin: String,
     pub login: String,
@@ -101,7 +102,7 @@ fn admit(node: &Node) -> Result<(), String> {
 #[derive(Clone, Copy, PartialEq)]
 enum ServeChange {
     Enable { https_port: u16, loopback_port: u16 },
-    Disable { https_port: u16 },
+    Disable { https_port: u16, loopback_port: u16 },
 }
 
 impl ServeChange {
@@ -116,7 +117,7 @@ impl ServeChange {
                 format!("--https={https_port}"),
                 format!("http://127.0.0.1:{loopback_port}"),
             ],
-            Self::Disable { https_port } => {
+            Self::Disable { https_port, .. } => {
                 vec![
                     "serve".into(),
                     format!("--https={https_port}"),
@@ -127,13 +128,14 @@ impl ServeChange {
     }
     fn https_port(self) -> u16 {
         match self {
-            Self::Enable { https_port, .. } | Self::Disable { https_port } => https_port,
+            Self::Enable { https_port, .. } | Self::Disable { https_port, .. } => https_port,
         }
     }
     fn loopback_port(self) -> u16 {
         match self {
-            Self::Enable { loopback_port, .. } => loopback_port,
-            Self::Disable { .. } => PORT,
+            Self::Enable { loopback_port, .. } | Self::Disable { loopback_port, .. } => {
+                loopback_port
+            }
         }
     }
 }
@@ -202,11 +204,39 @@ impl PermissionHelp {
         let paths = &self.paths;
         match self.change {
             ServeChange::Enable { loopback_port, .. } => {
-                self.check_mapping(Config::Free)?;
+                let node = inspect_ports(self.change.https_port(), loopback_port)?;
+                if node.origin != self.origin || node.login != self.login {
+                    return Err(
+                        "The Tailscale account or Serve mapping changed. Refresh Remote access."
+                            .into(),
+                    );
+                }
+                let prior = status(paths)?;
+                let prior_loopback = (prior.port != 0)
+                    .then_some(prior.port)
+                    .unwrap_or(DEFAULT_LOOPBACK_PORT);
+                let owned_prior = prior_loopback != loopback_port
+                    && inspect_ports(self.change.https_port(), prior_loopback)
+                        .is_ok_and(|n| n.ready());
+                if node.state != Config::Free && !owned_prior {
+                    return Err(node.reason().unwrap_or_else(|| {
+                        "The Tailscale account or Serve mapping changed. Refresh Remote access."
+                            .into()
+                    }));
+                }
                 let lease =
                     admin::Reservation::bind(&paths.state_dir, self.origin.clone(), loopback_port)
                         .map_err(|e| e.to_string())?;
-                self.check_mapping(Config::Free)?;
+                let after = inspect_ports(self.change.https_port(), loopback_port)?;
+                if after.origin != self.origin
+                    || after.login != self.login
+                    || (after.state != Config::Free && !owned_prior)
+                {
+                    return Err(after.reason().unwrap_or_else(|| {
+                        "The Tailscale account or Serve mapping changed. Refresh Remote access."
+                            .into()
+                    }));
+                }
                 Ok(lease)
             }
             ServeChange::Disable { .. } => {
@@ -458,8 +488,19 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
             }
         }
         Operation::Enable | Operation::EnableOn { .. } => {
-            let node = network.as_ref().map_err(Clone::clone)?;
-            admit(node)?;
+            let prior_loopback = (prior.port != 0)
+                .then_some(prior.port)
+                .unwrap_or(DEFAULT_LOOPBACK_PORT);
+            let mut node = network.as_ref().map_err(Clone::clone)?.clone();
+            if node.state == Config::Conflict
+                && prior_loopback != loopback_port
+                && inspect_ports(https_port, prior_loopback).is_ok_and(|n| n.ready())
+            {
+                // The HTTPS port is already owned by OX's previous loopback port.
+                // Treat it as available to update to the new loopback port.
+                node.state = Config::Free;
+            }
+            admit(&node)?;
             if prior.enabled
                 && (prior.origin.as_ref() != Some(&node.origin) || prior.port != loopback_port)
             {
@@ -474,6 +515,7 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
                     {
                         let args = ServeChange::Disable {
                             https_port: old_https,
+                            loopback_port: old_loopback,
                         }
                         .args();
                         let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -515,7 +557,7 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
                         denied = Some(PermissionHelp::denied(
                             paths,
                             change,
-                            node,
+                            &node,
                             prior.enabled,
                             e,
                         )?);
@@ -538,7 +580,10 @@ pub fn run(paths: &ox_host_service::Paths, op: Operation) -> Result<Report, Stri
                     prior.enabled,
                 )
                 .map_err(|e| e.to_string())?;
-                let change = ServeChange::Disable { https_port };
+                let change = ServeChange::Disable {
+                    https_port,
+                    loopback_port,
+                };
                 let args = change.args();
                 let refs: Vec<&str> = args.iter().map(String::as_str).collect();
                 match output(&refs) {

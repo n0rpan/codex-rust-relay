@@ -182,8 +182,12 @@ else:
         # Subsequent pair without flags remembers the configured custom ports.
         paired_again = command("pair")
         assert "https://workstation.fixture.ts.net:9443/#pair=" in paired_again.stdout, paired_again
+        # Changing --listen-port on the same HTTPS port updates the OX-owned mapping in place.
+        relocated = command("pair", "--listen-port", "49200")
+        assert "https://workstation.fixture.ts.net:9443/#pair=" in relocated.stdout, relocated
+        assert "https://workstation.fixture.ts.net:9443 → 127.0.0.1:49200" in command("status").stdout
         doctor = command("doctor", check=False)
-        assert "remote access: https://workstation.fixture.ts.net:9443 → 127.0.0.1:49162 (tailnet only)" in doctor.stdout, doctor
+        assert "remote access: https://workstation.fixture.ts.net:9443 → 127.0.0.1:49200 (tailnet only)" in doctor.stdout, doctor
         first = (directories["state"] / "mock-service-pid").read_text()
         command("install")
         assert (directories["state"] / "mock-service-pid").read_text() == first

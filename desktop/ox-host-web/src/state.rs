@@ -260,6 +260,7 @@ impl State {
             .as_deref()
             .and_then(crate::serve::https_port)
             .or_else(|| self.https_port());
+        let kept_port = if port != 0 { port } else { self.disk.port };
         if origin != self.disk.origin || origin.is_none() {
             self.update(|d| {
                 if let Some(next) = &origin {
@@ -271,15 +272,15 @@ impl State {
                     d.last_origin = Some(prior.clone());
                 }
                 d.origin = origin;
-                d.port = port;
+                d.port = kept_port;
                 d.https_port = https_port;
             })?;
             self.invites.clear();
             self.challenges.clear();
             self.signal();
-        } else if port != self.disk.port || https_port != self.disk.https_port {
+        } else if kept_port != self.disk.port || https_port != self.disk.https_port {
             self.update(|d| {
-                d.port = port;
+                d.port = kept_port;
                 d.https_port = https_port;
             })?
         }
@@ -1238,5 +1239,6 @@ mod tests {
         s.set_origin(None, 0).unwrap();
         let reloaded = State::load(&root).unwrap();
         assert_eq!(reloaded.reply(None).https_port, Some(9443));
+        assert_eq!(reloaded.reply(None).port, 49100);
     }
 }
