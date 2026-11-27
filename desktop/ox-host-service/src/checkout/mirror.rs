@@ -120,7 +120,7 @@ impl Mirror {
         &self.path
     }
 
-    fn refresh_lock(&self) -> io::Result<fs::File> {
+    fn refresh_lock(&self) -> io::Result<RefreshLock> {
         let f = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -128,7 +128,7 @@ impl Mirror {
             .truncate(false)
             .open(self.path.join("ox-refresh.lock"))?;
         f.try_lock()?;
-        Ok(f)
+        Ok(RefreshLock(f))
     }
 
     /// Best-effort upstream refresh. The bound applies only to the optional Git
@@ -194,6 +194,17 @@ impl Mirror {
             return Ok(Vec::new());
         }
         known_commits(&self.path, candidates)
+    }
+}
+
+/// Ownership of a mirror's refresh lock. Closing the file is not enough: a
+/// child another thread is spawning holds a copy of the descriptor until it
+/// execs, and the next launch would then skip its local fetch as if a refresh
+/// were still running. An explicit release ends ownership for every copy.
+struct RefreshLock(fs::File);
+impl Drop for RefreshLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
     }
 }
 
@@ -417,4 +428,24 @@ pub fn negotiate(
     let _ = child.kill();
     child.wait()?;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_released_refresh_lock_is_free_while_a_spawning_child_still_holds_its_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = Mirror {
+            path: dir.path().to_path_buf(),
+            registered: dir.path().to_path_buf(),
+        };
+        let lock = mirror.refresh_lock().unwrap();
+        // The copy a child forked by another thread holds until it execs.
+        let _inherited = lock.0.try_clone().unwrap();
+        assert!(mirror.refresh_lock().is_err());
+        drop(lock);
+        mirror.refresh_lock().unwrap();
+    }
 }

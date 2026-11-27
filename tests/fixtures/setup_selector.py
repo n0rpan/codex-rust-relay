@@ -1,6 +1,5 @@
 """Exercise the release binary's terminal-only setup entry point with stub clients."""
 
-import errno
 import fcntl
 import http.server
 import json
@@ -126,35 +125,41 @@ fi
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
         proc = subprocess.Popen([binary, *args], env=env, stdin=slave, stdout=slave, stderr=slave)
-        os.close(slave)
+        # This process keeps its end of the terminal open until the output has
+        # been read. With it closed, a program that prints and exits at once
+        # closes the last writer before the first read, and macOS may then
+        # discard what was printed.
         capture = bytearray()
         deadline = time.monotonic() + 8
 
-        def read():
-            if select.select([master], [], [], .2)[0]:
-                try:
-                    chunk = os.read(master, 8192)
-                    if not chunk:
-                        return False
-                    capture.extend(chunk)
-                except OSError as error:
-                    if error.errno != errno.EIO:
-                        raise
-                    return False
+        def read(wait=.05):
+            if not select.select([master], [], [], wait)[0]:
+                return False
+            capture.extend(os.read(master, 8192))
             return True
+
+        def drain():
+            while read(0):
+                pass
 
         try:
             steps = [(prompt, choices)] if isinstance(choices, bytes) else choices or []
             previous = 0
             for marker, answer in steps:
                 while marker not in capture[previous:] and time.monotonic() < deadline:
-                    assert read(), f"ox exited before prompt {marker!r}"
-                assert marker in capture[previous:], f"Missing prompt {marker!r}"
+                    if proc.poll() is not None:
+                        drain()
+                        assert marker in capture[previous:], \
+                            f"ox exited before prompt {marker!r}: {capture.decode(errors='replace')}"
+                    else:
+                        read()
+                assert marker in capture[previous:], f"Missing prompt {marker!r}: {capture.decode(errors='replace')}"
                 previous = len(capture)
                 os.write(master, answer)
-            while time.monotonic() < deadline and read():
-                pass
+            while proc.poll() is None and time.monotonic() < deadline:
+                read()
             assert proc.wait(timeout=2) == 0, capture.decode()
+            drain()
             text = capture.decode()
             assert "Provider key:" not in text
             assert "dummy-fixture-credential" not in text
@@ -237,6 +242,7 @@ fi
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+            os.close(slave)
             os.close(master)
 
 
@@ -483,7 +489,7 @@ assert argv == [] and registry is None
 print("setup: checks both existing native sign-ins in one pass")
 
 text, argv, registry = run(["doctor"], signed_in=True, claude_signed_in=True)
-assert "API gateway providers: 0" in text and "saved ChatGPT sign-in found" in text and "saved Claude account found" in text
+assert "API gateway providers: 0" in text and "saved ChatGPT sign-in found" in text and "saved Claude account found" in text, text
 assert argv == [] and registry is None
 print("doctor: zero API providers and both native accounts detected")
 

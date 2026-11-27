@@ -123,11 +123,7 @@ impl SchemaReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        io::Read,
-        os::unix::{fs::PermissionsExt, net::UnixListener},
-        sync::Arc,
-    };
+    use std::{io::Read, os::unix::net::UnixListener, sync::Arc};
 
     #[test]
     fn shutting_down_reaps_a_slow_schema_launcher_and_its_child() {
@@ -135,7 +131,7 @@ mod tests {
         let listener = UnixListener::bind(dir.path().join("ready")).unwrap();
         listener.set_nonblocking(true).unwrap();
         let bin = dir.path().join("codex");
-        fs::write(
+        crate::executable::write(
             &bin,
             r#"#!/usr/bin/env python3
 import pathlib, socket, subprocess
@@ -145,9 +141,7 @@ with subprocess.Popen(["sleep", "30"], pass_fds=(sock.fileno(),)) as child:
     sock.sendall(b"x")
     child.wait()
 "#,
-        )
-        .unwrap();
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let path = std::env::join_paths(
             std::iter::once(dir.path().to_owned())
                 .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),

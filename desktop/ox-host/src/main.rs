@@ -2,6 +2,9 @@ mod control;
 mod doctor;
 mod durable;
 mod engine;
+#[cfg(test)]
+#[path = "../../../tests/common/executable.rs"]
+mod executable;
 mod handover;
 mod identity;
 mod lease;

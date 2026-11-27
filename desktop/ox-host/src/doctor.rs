@@ -520,10 +520,7 @@ mod tests {
             ("codex", "codex-cli 0.1.0"),
             ("claude", "9.9.9 (Claude Code)"),
         ] {
-            let file = bin.join(name);
-            std::fs::write(&file, format!("#!/bin/sh\necho '{out}'\n")).unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::executable::write(&bin.join(name), &format!("#!/bin/sh\necho '{out}'\n"));
         }
         let mut report = Report::default();
         stock_clients(&mut report, &[bin]);

@@ -932,6 +932,10 @@ mod tests {
             .chain(stream::pending())
             .boxed();
         let mut state = chat_state(upstream);
+        // The window must outlast a pause of this thread between arming it and
+        // starting the 5 ms wait above. On a loaded four-core machine a running
+        // thread stayed off the CPU for up to 0.46 s.
+        state.finish_grace = Duration::from_secs(1);
         tokio::time::timeout(Duration::from_secs(2), async {
             while !state.done {
                 state.pump().await;

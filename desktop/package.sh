@@ -6,7 +6,10 @@ root=$(pwd)
 out="$root/desktop/dist"
 build="${CARGO_TARGET_DIR:-$root/desktop/target}"
 export CARGO_TARGET_DIR="$build"
-cargo build --release --locked --manifest-path desktop/Cargo.toml -p ox-desktop -p ox-host
+# Arguments go to this one build. CI passes "-p ox-desk-probe" so the probe
+# links the ox-desk-core the package ships; built on its own, cargo resolves
+# the shared crates' features differently and compiles ox-desk-core again.
+cargo build --release --locked --manifest-path desktop/Cargo.toml -p ox-desktop -p ox-host "$@"
 cargo build --release --locked --bin ox
 mkdir -p "$out"
 stage=$(mktemp -d)
