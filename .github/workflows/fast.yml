@@ -96,6 +96,7 @@ jobs:
       - run: cargo fmt --manifest-path desktop/Cargo.toml --all -- --check
       - run: python3 -m unittest discover -s desktop/ci -p test_pr_scope.py
       - run: python3 -m unittest discover -s desktop/ci -p test_auto_queue.py
+      - run: bash -n desktop/ci/release-assets.sh && test -x desktop/ci/release-assets.sh && python3 -m unittest discover -s desktop/ci -p test_release_assets.py
       - run: python3 desktop/ci/contract.py --final
       - run: python3 desktop/ci/quarantine.py --self-test && python3 desktop/ci/quarantine.py --check
       - run: cargo clippy --manifest-path desktop/Cargo.toml --locked --workspace --all-targets -- -D warnings

@@ -66,7 +66,8 @@ you call it done.
 | Path | Where it lives | How to exercise it before merge |
 | --- | --- | --- |
 | Developer ID signing and notarization | `sign-cli` in `ci.yml`, `sign-macos` in `desktop.yml`, `desktop/ci/macos-*.sh` | Manual OX Desktop run with `sign` on a ref the `apple-release` environment admits. Ask the maintainer to admit the branch for that run. |
-| Publishing | `publish-dev` and `publish` in `ci.yml`, `desktop/ci/release-assets.sh` | Cannot be rehearsed. Keep changes small and watch the first `main` run. |
+| The release asset list | `desktop/ci/release-assets.sh`, used by both publish jobs | `full-ci` runs it on the pull request's unsigned artifacts (job `release-assets`). Signing itself still runs only on `main`. |
+| Publishing | `publish-dev` and `publish` in `ci.yml` | The upload and the swap cannot be rehearsed. Keep changes small and watch the first `main` run. |
 | Tagged release | `publish` in `ci.yml` | Has never run. Rehearse before the first `v*` tag. |
 | Intel desktop package | `package (macos-26-intel)` | `full-ci`, or a manual OX Desktop run with `intel`. |
 

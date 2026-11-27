@@ -49,7 +49,7 @@ def lanes(paths, full_ci):
     packages = mac_package or full_ci or touched(window_tests)
     # The package runs the same tests on its platform. Exercise the focused workflow
     # itself when it or its selector changes, even if this PR also changes packaging.
-    verify_focus = touched((".github/workflows/ci.yml", "desktop/ci/pr_scope.py"))
+    verify_focus = touched((".github/workflows/ci.yml", "desktop/ci/pr_scope.py", "desktop/ci/test-bin.sh"))
     focused = []
     if verify_focus or (not mac_package and (full_ci or touched(mac_desktop))):
         focused.append("macos-26")
