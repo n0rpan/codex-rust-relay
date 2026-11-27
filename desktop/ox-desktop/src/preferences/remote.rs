@@ -267,7 +267,7 @@ impl Render for Remote {
                     None => view
                         .child(format!("Tagged machine · {}", node.tags.join(", ")))
                         .child(
-                            "This machine belongs to a Tailscale tag, not a user. Anyone your tailnet lets reach it can redeem a pairing invitation.",
+                            "This machine belongs to a Tailscale tag, not a user. Anyone your tailnet lets reach it can redeem an invitation.",
                         ),
                 };
                 if let Some(reason) = node.reason() {
@@ -300,9 +300,9 @@ impl Render for Remote {
                     {
                         Some(window) => {
                             let minutes = (window.expires_at - now + 59) / 60;
-                            let who = window.login.as_deref().unwrap_or("a device");
+                            let who = window.login.as_deref().unwrap_or("another device");
                             view = view.child(format!(
-                                "Waiting for {who} to pair · {minutes} min left · {} paired. On the other machine, choose this host under Add host.",
+                                "Waiting for {who} · {minutes} min left · {} connected. On the other machine, choose this host under Add host.",
                                 window.paired
                             ));
                             buttons = buttons.child(self.action(
@@ -315,12 +315,12 @@ impl Render for Remote {
                         }
                         None => {
                             view = view.child(
-                                "Waiting lets a device ask to pair from its own Add host with no code to carry. Its request appears here for you to accept. It lasts five minutes.",
+                                "Waiting lets another device connect from its own Add host without a code. Its request appears here for you to accept. It lasts five minutes.",
                             );
                             buttons = buttons.child(self.action(
                                 p,
                                 "remote-window-open",
-                                "Wait for a device to pair",
+                                "Wait for another device",
                                 Operation::OpenWindow { login: None },
                                 cx,
                             ));
@@ -332,7 +332,7 @@ impl Render for Remote {
                         let state = if pending.approved {
                             "accepted, waiting for the device"
                         } else {
-                            "wants to pair"
+                            "waiting for your answer"
                         };
                         let mut row = div()
                             .flex()
