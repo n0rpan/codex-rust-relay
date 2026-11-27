@@ -136,6 +136,13 @@ A paired device doing any of this is the user acting remotely.
   jobs run no third-party code.
 - Which branches and tags may enter that environment, and who may create `v*`
   tags, are repository settings.
+- Merging by itself uses `AUTO_QUEUE_TOKEN`, a token of the maintainer. Only
+  `auto-queue.yml` names it. That workflow runs `main`'s copy of itself and
+  of its script, checks out no pull request code, and starts only for the
+  maintainer's own pull requests from this repository.
+- A pull request merges by itself only after the reviewer app has finished a
+  review of its head commit. The app is matched by its exact account and
+  type, and the merge is bound to the commit that was judged.
 
 ## Not threats
 
@@ -180,5 +187,9 @@ Report these.
   through a link someone else controls.
 - A workflow change lets a job that runs third-party code, or a pull request
   from outside, read the signing secrets or the auto-queue token.
+- A pull request merges by itself on the word of anyone but the reviewer app:
+  a comment from another account is taken as a finished review, a commit
+  pushed after the review is merged, or a lookup that failed is read as
+  "nothing blocking".
 - Prompts, replies, file contents or terminal output are sent anywhere the
   user did not configure.

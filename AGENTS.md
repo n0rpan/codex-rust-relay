@@ -22,7 +22,9 @@ decides.
 ## How a change reaches users
 
 1. **Every push to a pull request** runs the scoped fast checks, about 5
-   minutes. `desktop/ci/pr_scope.py` picks extra lanes from the files changed.
+   minutes. `desktop/ci/pr_scope.py` picks extra lanes from the files changed;
+   a change to workflows or packaging adds desktop packages, which take a
+   quarter of an hour or more.
 2. **The `full-ci` label** runs the legs `main` builds: four release binaries,
    three native test legs, four desktop packages. About 40 minutes.
 3. **The merge queue** tests the pull request on top of current `main` and
@@ -36,16 +38,19 @@ decides.
 ## Rules for agents
 
 - **Push per finished step, not per edit.** Each push cancels the run before
-  it.
+  it and starts the review over. Fix everything one review found in one push,
+  and wait for the review of that push before the next.
 - **Add `full-ci` last, and only when you would merge the change yourself.**
   On a pull request from the maintainer's account that is not a draft, the
   label also queues it for merge once it is green and Codex has reviewed the
   head commit with no unresolved P0 or P1 finding and no open security
   finding (`auto-queue.yml`). A push takes it out of line until the new
-  commit is reviewed. Keep the pull
-  request a draft if you want the full run without the merge. It costs about
-  40 minutes of runners on every later push. Use it when code, packaging or
-  workflows changed; documentation does not need it.
+  commit is reviewed. Keep the pull request a draft if you want the full run
+  without the merge. It costs about 40 minutes of runners on every later
+  push. Use it when code, packaging or workflows changed; documentation does
+  not need it. Adding the label cancels the scoped run and starts the full
+  one, so add it once the review of the head commit is clean; waiting for the
+  scoped run first only wastes it.
 - **Do not merge, enqueue, tag or change repository settings** unless the
   maintainer asked for that action.
 - **A red check is yours until you have shown otherwise.** Read the log. If the
@@ -58,6 +63,31 @@ decides.
   for a reason, or it is removed with that reason written down.
 - **Say what you did not verify.** A workflow change is unverified until the
   path it changes has actually run.
+
+## Waiting for CI and reviews
+
+Waiting costs nothing; looking costs tokens every time. Do not list checks or
+read the pull request every minute.
+
+- **Wait with one blocking command.** It returns when the run ends and fails
+  if the run failed:
+  `gh pr checks <number> --watch --fail-fast --interval 60`, or for one run
+  `gh run watch <run-id> --exit-status --interval 60`. Start it in the
+  background, or with a timeout longer than the run: 5 minutes scoped, 20 with
+  desktop packages, 45 for `full-ci`, the same again for `main`'s release.
+- **If your harness delivers pull request events, end your turn.** A failed
+  check, a review or a comment wakes you. Do not also poll.
+- **While you wait, do not push.** Work on something that is not this branch,
+  or stop.
+- **A red `OX merge check` on a commit that is no longer the head is the run
+  your push or label cancelled.** Confirm with
+  `gh run view <run-id> --json conclusion` (`cancelled`) and move on. Only a
+  red check on the head commit is a failure to read.
+- **Read a failure once, from the log of the failed job**
+  (`gh run view <run-id> --log-failed`), not from the list of checks.
+- **Codex's code review takes one to two minutes** and edits its summary
+  comment when it starts and when it ends. Read the summary once it says the
+  review of the head commit is completed.
 
 ## While `main` moves under you
 
@@ -78,7 +108,11 @@ So, before you call work finished:
 - Fetch `main` and read what landed since you branched in the areas you
   touched: `git fetch origin main && git log --oneline HEAD..origin/main -- <paths>`.
 - If something there overlaps, merge `main` into your branch and reconcile it
-  on purpose. That is the one reason to bring `main` in by hand.
+  on purpose. That, and a branch stacked on a pull request that was then
+  squash-merged, are the reasons to bring `main` in by hand. For the stacked
+  branch, first check that `main` holds exactly what you built on
+  (`git diff <old base tip> origin/main` is empty); then every conflict is
+  resolved with your side.
 - Say in the description which commit of `main` you checked against.
 
 ## What a pull request cannot test
@@ -94,6 +128,7 @@ you call it done.
 | Publishing | `publish-dev` and `publish` in `ci.yml` | The upload and the swap cannot be rehearsed. Keep changes small and watch the first `main` run. |
 | Tagged release | `publish` in `ci.yml` | Has never run. Rehearse before the first `v*` tag. |
 | Intel desktop package | `package (macos-26-intel)` | `full-ci`, or a manual OX Desktop run with `intel`. |
+| Automatic merging | `auto-queue.yml`, `desktop/ci/auto-queue.sh` | Both triggers run `main`'s copy, never the pull request's. Before merge: `desktop/ci/test_auto_queue.py`, and the script against a real pull request with `AUTO_QUEUE_DRY_RUN=1`, which reads GitHub and changes nothing. After merge: watch the first labelled pull request. |
 
 ## Traps we have already paid for
 
@@ -128,6 +163,14 @@ you call it done.
   lists an approval until the host has taken the answer. A loop that answers
   "whenever an approval is listed" answers twice if any event arrives in
   between, and the host refuses the second as already resolved.
+- **A fake of an outside service proves your reading of it, not the
+  service.** The merge gate's tests passed while it required a field that
+  Codex leaves empty; every labelled pull request would have been held. Read
+  one real answer before you write the code that parses it.
+- **Codex answers `@codex security review` with a review of the head
+  commit**, posted as "Codex Review". The security row of its summary can
+  stay at an earlier commit, and a finished security review with no findings
+  leaves its findings fields empty, not false.
 - **Tests that share a binary share a process.** A test that depends on a
   file descriptor being closed can be broken by a sibling test that spawns a
   child at the same moment.
@@ -185,8 +228,9 @@ that goes wrong.
   and on every push. Wait for the review of the head commit and answer or fix
   every finding. A review of an earlier commit does not cover a later push.
 - The security review runs by itself only when the pull request opens. The
-  `full-ci` label asks for one of the head commit, and again after each
-  later push; do not ask by hand as well. Ask by hand
+  `full-ci` label asks for one of the head commit, and again after each later
+  push, and holds the merge until Codex has answered. Do not ask by hand as
+  well: a request the workflow did not write is not counted. Ask by hand
   (`@codex security review`) only after resolving a security finding.
 - Ask by hand (`@codex review`) in two cases only: no review of the head
   commit has appeared, or you resolved a P0 or P1 thread. Resolving alone
@@ -202,6 +246,8 @@ cargo fmt --manifest-path desktop/Cargo.toml --all -- --check
 sh -n install.sh && bash -n install.sh && shellcheck install.sh
 python3 -m unittest discover -s desktop/ci -p 'test_*.py'
 ```
+
+`desktop/ci/linux-deps.sh shellcheck` installs shellcheck on Ubuntu.
 
 ## Keeping this file true
 

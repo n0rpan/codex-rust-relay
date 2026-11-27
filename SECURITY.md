@@ -43,6 +43,9 @@ without the user having chosen it:
 - **Exposes release secrets.** A workflow lets a job that runs third-party
   code, or a pull request from outside, read the signing secrets or the
   auto-queue token.
+- **Merges unreviewed code.** A pull request merges by itself without a
+  finished review of its head commit from the reviewer app: on another
+  account's comment, on a later commit, or after a lookup that failed.
 
 ### Do not report
 
