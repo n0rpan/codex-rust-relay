@@ -17,7 +17,7 @@ FAKE_GH = r"""#!/bin/bash
 dir="$(dirname "$0")"
 fail="$(cat "$dir/fail" 2>/dev/null || true)"
 case "$*" in
-    *"pr merge"*|*"pr comment"*) echo "$*" >> "$dir/calls"; exit 0 ;;
+    *"pr merge"*|*"pr comment"*|*"--method"*) echo "$*" >> "$dir/calls"; exit 0 ;;
     *graphql*) file=threads.json ;;
     */comments*) file=comments.json ;;
     */pulls/*) file=pull.json ;;
@@ -49,9 +49,11 @@ def thread(body, resolved=False, author="chatgpt-codex-connector", kind="Bot"):
 
 
 class AutoQueue(unittest.TestCase):
-    def decide(self, *, pull=None, comments=None, threads=None, more_threads=False, dry_run=False, fail=None):
+    def decide(self, *, pull=None, comments=None, threads=None, more_threads=False, dry_run=False, fail=None,
+               event=None, reason=None):
         base = {"state": "open", "draft": False, "user": {"login": "maintainer"},
-                "head": {"sha": HEAD, "repo": {"full_name": "o/r"}}, "labels": [{"name": "full-ci"}]}
+                "head": {"sha": HEAD, "repo": {"full_name": "o/r"}}, "labels": [{"name": "full-ci"}],
+                "base": {"ref": "main", "repo": {"default_branch": "main"}}}
         base.update(pull or {})
         if comments is None:
             comments = [{"user": BOT_USER, "body": summary(HEAD, "completed")}]
@@ -74,6 +76,10 @@ class AutoQueue(unittest.TestCase):
             env.pop("GITHUB_STEP_SUMMARY", None)
             if dry_run:
                 env["AUTO_QUEUE_DRY_RUN"] = "1"
+            if event:
+                env["AUTO_QUEUE_EVENT"] = event
+            if reason:
+                env["AUTO_QUEUE_REASON"] = reason
             run = subprocess.run(["bash", str(SCRIPT), "38"], env=env, capture_output=True, text=True)
             self.assertEqual(run.returncode, 1 if fail else 0, run.stderr)
             calls = (tmp / "calls").read_text() if (tmp / "calls").exists() else ""
@@ -143,6 +149,8 @@ class AutoQueue(unittest.TestCase):
         for name, pull, word in (
             ("draft", {"draft": True}, "hold: draft"),
             ("no label", {"labels": []}, "hold: no full-ci label"),
+            ("stacked on another branch",
+             {"base": {"ref": "feat/first", "repo": {"default_branch": "main"}}}, "hold: targets feat/first"),
             ("another author", {"user": {"login": "someone"}}, "skip:"),
             ("a fork", {"head": {"sha": HEAD, "repo": {"full_name": "fork/r"}}}, "skip:"),
             ("closed", {"state": "closed"}, "skip:"),
@@ -214,6 +222,39 @@ class AutoQueue(unittest.TestCase):
         for pull in ({"labels": []}, {"draft": True}):
             out, calls = self.decide(pull=pull, comments=bare)
             self.assertNotIn("pr comment", calls)
+
+    def test_a_labelled_pull_request_says_where_it_stands_in_one_comment(self):
+        reviewed = {"user": BOT_USER, "body": summary(HEAD, "completed")}
+        out, calls = self.decide(comments=[reviewed])
+        self.assertIn("--method POST repos/o/r/issues/38/comments", calls)
+        self.assertIn("**In line to merge.**", calls)
+        # The same state again writes nothing; a new state edits that comment.
+        said = "<!-- ox-auto-queue -->\n**In line to merge.** Commit 9b8d038 is reviewed with nothing blocking; " \
+               "it enters the merge queue when `OX merge check` passes."
+        mine = {"id": 77, "user": {"login": "maintainer", "type": "User"}, "body": said}
+        out, calls = self.decide(comments=[reviewed, mine])
+        self.assertNotIn("--method", calls)
+        out, calls = self.decide(comments=[reviewed, mine], threads=[thread("**![P1 Badge](x)** leak")])
+        self.assertIn("--method PATCH repos/o/r/issues/comments/77", calls)
+        self.assertIn("**Not in line to merge:** 1 unresolved P0/P1 or security finding(s)", calls)
+        # A pull request without the label, or a draft, gets no comment.
+        for pull in ({"labels": []}, {"draft": True}):
+            out, calls = self.decide(pull=pull, comments=[reviewed])
+            self.assertNotIn("--method", calls)
+
+    def test_a_stacked_pull_request_is_told_to_change_its_base(self):
+        out, calls = self.decide(pull={"base": {"ref": "feat/first", "repo": {"default_branch": "main"}}})
+        self.assertIn("targets feat/first, not the default branch. Change its base to `main` first", calls)
+        self.assertNotIn("--auto ", calls)
+
+    def test_removal_from_the_merge_queue_is_reported_and_not_undone(self):
+        out, calls = self.decide(event="dequeued", reason="CI_FAILURE")
+        self.assertIn("queue:", out)
+        self.assertNotIn("pr merge", calls)
+        self.assertIn("**GitHub removed this pull request from the merge queue (CI_FAILURE).**", calls)
+        # A merged pull request also leaves the queue; that needs no comment.
+        out, calls = self.decide(pull={"state": "closed"}, event="dequeued")
+        self.assertEqual(calls, "")
 
     def test_dry_run_changes_nothing(self):
         out, calls = self.decide(dry_run=True)

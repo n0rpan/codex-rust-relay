@@ -24,7 +24,7 @@ name: Auto queue
 # therefore cannot rewrite the steps that hold the token.
 on:
   pull_request_target:
-    types: [labeled, unlabeled, ready_for_review, converted_to_draft, synchronize]
+    types: [labeled, unlabeled, ready_for_review, converted_to_draft, synchronize, dequeued]
   issue_comment:
     types: [created, edited]
 
@@ -87,6 +87,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.AUTO_QUEUE_TOKEN }}
           MAINTAINER: n0rpan
+          AUTO_QUEUE_EVENT: ${{ github.event.action }}
+          AUTO_QUEUE_REASON: ${{ github.event.reason }}
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN}" ]; then

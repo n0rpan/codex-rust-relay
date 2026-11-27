@@ -31,8 +31,11 @@ decides.
    merges it. A branch does not have to be current with `main`, so do not
    update one just to catch up.
 4. **`main`** builds, signs with Developer ID, notarizes and publishes the
-   rolling `dev` release. A push builds and publishes nothing when everything
-   since the released commit is documentation.
+   rolling `dev` release, about 50 minutes. Its builds run one at a time and
+   are never cancelled: a merge during a build waits for it, and several
+   merges while one build runs are built together afterwards. A push builds
+   and publishes nothing when everything since the released commit is
+   documentation.
 5. **A `v*` tag** publishes a stable release. Only the maintainer creates tags.
 
 ## Rules for agents
@@ -100,6 +103,11 @@ gh pr checks 40 --watch --fail-fast --interval 60
   red check on the head commit is a failure to read.
 - **Read a failure once, from the log of the failed job**
   (`gh run view <run-id> --log-failed`), not from the list of checks.
+- **A labelled pull request says where it stands.** The merge check keeps one
+  comment on it, starting "In line to merge" or "Not in line to merge", with
+  the reason and what to do. Read that comment, not the workflow's log. It
+  also says when GitHub removed the pull request from the merge queue; then
+  read the failed job of the queue's run, fix it and push.
 - **Codex's code review takes one to two minutes** and edits its summary
   comment when it starts and when it ends. Read the summary once it says the
   review of the head commit is completed.
@@ -130,6 +138,28 @@ So, before you call work finished:
   resolved with your side.
 - Say in the description which commit of `main` you checked against.
 
+## Stacked pull requests
+
+Splitting a large change into pull requests that build on each other is fine,
+and each one gets its own review. Only the bottom one can merge.
+
+- **Base each pull request on the one below it**, so its diff shows only its
+  own change. Say in the description what it is stacked on.
+- **Label only the one based on `main`.** `full-ci` on a pull request based
+  on another branch does nothing: automatic merging holds it, because that
+  branch has no required checks.
+- **When the one below has merged**, bring the next one down to `main`:
+  1. Check that its base is now `main`. Head branches are deleted on merge,
+     and GitHub then moves the pull requests that were based on one to
+     `main`. If it did not, change it: `gh pr edit <number> --base main`.
+  2. Merge `main` into its branch. The squash rewrote the commits it was
+     built on, so git reports conflicts; check that `main` holds what you
+     built on (`git diff <old base tip> origin/main -- <paths>`) and resolve
+     with your side.
+  3. Push, wait for the review of that commit, then add `full-ci`.
+- **One at a time.** Do not retarget the whole stack at once: every pull
+  request above the bottom would show the changes below it as its own.
+
 ## What a pull request cannot test
 
 These run for the first time on `main` or a tag. A green pull request says
@@ -140,7 +170,7 @@ you call it done.
 | --- | --- | --- |
 | Developer ID signing and notarization | `sign-cli` in `ci.yml`, `sign-macos` in `desktop.yml`, `desktop/ci/macos-*.sh` | Manual OX Desktop run with `sign` on a ref the `apple-release` environment admits. Ask the maintainer to admit the branch for that run. |
 | The release asset list | `desktop/ci/release-assets.sh`, used by both publish jobs | `full-ci` runs it on the pull request's unsigned artifacts (job `release-assets`). Signing itself still runs only on `main`. |
-| Publishing | `publish-dev` and `publish` in `ci.yml` | The upload and the swap cannot be rehearsed. Keep changes small and watch the first `main` run. |
+| Publishing | `publish-dev` and `publish` in `ci.yml` | The upload and the swap cannot be rehearsed. Keep changes small and watch the first `main` run. The "is a newer commit already released" test is one API call you can run by hand: `gh api repos/oxstack/ox/compare/<this commit>...<dev tag commit> --jq .status`. |
 | Tagged release | `publish` in `ci.yml` | Has never run. Rehearse before the first `v*` tag. |
 | Intel desktop package | `package (macos-26-intel)` | `full-ci`, or a manual OX Desktop run with `intel`. |
 | Automatic merging | `auto-queue.yml`, `desktop/ci/auto-queue.sh` | Both triggers run `main`'s copy, never the pull request's. Before merge: `desktop/ci/test_auto_queue.py`, and the script against a real pull request with `AUTO_QUEUE_DRY_RUN=1`, which reads GitHub and changes nothing. After merge: watch the first labelled pull request. |
@@ -159,6 +189,13 @@ you call it done.
 - **Linux runners deny unprivileged user namespaces.** Stock Codex needs them
   for its sandbox. Every Linux leg that runs Codex lifts the restriction
   first; the probe must unshare the network, as Codex does.
+- **Cancelling `main`'s build for the next merge starves the release.** With
+  merges coming faster than a build, five merges in two hours published
+  nothing. `main`'s runs are not cancelled, and a build publishes even when
+  `main` has moved, unless a newer commit is already released.
+- **Automatic merging is for pull requests into `main`.** Another branch has
+  no required checks: a stacked pull request with auto-merge on would merge
+  into its base at once and reach nobody. See "Stacked pull requests".
 - **A platform a pull request skips is a platform it can break.** Linux ARM
   and macOS Intel only run with `full-ci` or on `main`.
 - **Any failed job on `main` loses the release for every platform.**

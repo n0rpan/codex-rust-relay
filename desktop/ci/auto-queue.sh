@@ -5,9 +5,12 @@
 #   GH_TOKEN, GITHUB_REPOSITORY  as in a workflow
 #   MAINTAINER                   login whose pull requests may be queued
 #   AUTO_QUEUE_DRY_RUN=1         print the decision, change nothing
+#   AUTO_QUEUE_EVENT             the event's action; `dequeued` is special
+#   AUTO_QUEUE_REASON            GitHub's reason for a `dequeued` event, if any
 #
 # A pull request is queued when all of these hold:
 #   - it is open, not a draft, from this repository and from the maintainer;
+#   - it targets the default branch;
 #   - it carries the full-ci label;
 #   - Codex has finished a code review of its current head commit;
 #   - a security review of that commit was asked for, and Codex's state shows
@@ -23,6 +26,11 @@
 # as a security entry for it. Anything this script cannot read counts
 # as "not reviewed": a failed lookup or a change in the reviewer's comment
 # format stops automatic merges; it never lets one through.
+#
+# A labelled pull request always says where it stands: the script keeps one
+# comment on it with the current state and what, if anything, to do. When
+# GitHub removes a pull request from the merge queue the comment says so, and
+# this run does not put it back; the next push, label or review does.
 set -euo pipefail
 number=${1:?pass the pull request number}
 repo=${GITHUB_REPOSITORY:?}
@@ -40,8 +48,10 @@ reviewer='chatgpt-codex-connector'
 decision=''
 head=''
 request=''
+comments=''
+labelled=''
 decide() {
-    local pr comments summary stated reviewed security asked threads blocking
+    local pr summary stated reviewed security asked threads blocking
     if ! pr="$(gh api "repos/${repo}/pulls/${number}")" || [ -z "${pr}" ]; then
         decision="hold: could not read the pull request"; return
     fi
@@ -51,12 +61,20 @@ decide() {
     head="$(jq -r '.head.sha' <<< "${pr}")"
     if [ "$(jq -r '.draft' <<< "${pr}")" != false ]; then decision="hold: draft"; return; fi
     if ! jq -e '.labels | map(.name) | index("full-ci")' <<< "${pr}" > /dev/null; then decision="hold: no full-ci label"; return; fi
+    labelled=yes
 
     # The reviewer keeps one summary comment with its state as escaped JSON.
     if ! comments="$(gh api --paginate "repos/${repo}/issues/${number}/comments" \
-        --jq '.[] | {login: .user.login, type: .user.type, body: .body, created: .created_at, updated: .updated_at}' |
+        --jq '.[] | {id: .id, login: .user.login, type: .user.type, body: .body, created: .created_at, updated: .updated_at}' |
         jq -s .)"; then
+        comments=''
         decision="hold: could not read the comments"; return
+    fi
+    # Only the default branch has required checks and the merge queue. A pull
+    # request stacked on another branch would merge there at once, unchecked,
+    # and reach nobody.
+    if [ "$(jq -r '.base.ref' <<< "${pr}")" != "$(jq -r '.base.repo.default_branch' <<< "${pr}")" ]; then
+        decision="hold: targets $(jq -r '.base.ref' <<< "${pr}"), not the default branch"; return
     fi
     summary="$(jq -r --arg bot "${reviewer}[bot]" \
         '.[] | select(.login == $bot and .type == "Bot") | .body' <<< "${comments}" |
@@ -118,12 +136,46 @@ echo "#${number}: ${decision}"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then echo "- #${number}: ${decision}" >> "${GITHUB_STEP_SUMMARY}"; fi
 if [ "${AUTO_QUEUE_DRY_RUN:-}" = 1 ]; then exit 0; fi
 url="https://github.com/${repo}/pull/${number}"
+# GitHub took the pull request out of the queue: its checks failed there, or
+# it no longer merges. Turning auto-merge on again now would send it straight
+# back to fail again.
+removed=''
+if [ "${AUTO_QUEUE_EVENT:-}" = dequeued ] && [[ "${decision}" != skip:* ]]; then
+    removed="GitHub removed this pull request from the merge queue${AUTO_QUEUE_REASON:+ (${AUTO_QUEUE_REASON})}"
+fi
 case "${decision}" in
     # Bound to the commit that was judged: if a push landed since, GitHub
     # refuses, and that push's own run decides about the new commit.
-    queue:*) gh pr merge "${url}" --auto --match-head-commit "${head}" ;;
+    queue:*) [ -n "${removed}" ] || gh pr merge "${url}" --auto --match-head-commit "${head}" ;;
     hold:*) gh pr merge "${url}" --disable-auto || true ;;
 esac
+
+# One comment that says where the pull request stands, written when it first
+# has something to say and edited only when that changes.
+marker='<!-- ox-auto-queue -->'
+status=''
+if [ -n "${removed}" ]; then
+    status="**${removed}.** The run that tested it on top of \`main\` is in this pull request's checks: read the failed job there. It goes back in line with the next push, or when \`full-ci\` is removed and added again."
+elif [ "${labelled}" = yes ]; then
+    case "${decision}" in
+        queue:*) status="**In line to merge.** Commit ${head:0:7} is reviewed with nothing blocking; it enters the merge queue when \`OX merge check\` passes." ;;
+        *"not the default branch") status="**Not in line to merge:** this pull request ${decision#hold: }. Change its base to \`main\` first; see \"Stacked pull requests\" in \`AGENTS.md\`." ;;
+        *"finding"*) status="**Not in line to merge:** ${decision#hold: }. Fix or answer each one, resolve its thread, then comment \`@codex review\`." ;;
+        "hold: could not read"*) status="**Not in line to merge:** the merge check ${decision#hold: }. See the failed Auto queue run." ;;
+        hold:*) status="**Not in line to merge yet:** ${decision#hold: }. Nothing to do; this updates when Codex has answered." ;;
+    esac
+fi
+if [ -n "${status}" ] && [ -n "${comments}" ]; then
+    status="${marker}
+${status}"
+    previous="$(jq -r --arg who "${maintainer}" --arg marker "${marker}" \
+        '[.[] | select(.login == $who and (.body | startswith($marker)))] | last // empty | "\(.id)\t\(.body | @base64)"' <<< "${comments}")"
+    if [ -z "${previous}" ]; then
+        gh api --method POST "repos/${repo}/issues/${number}/comments" -f body="${status}" > /dev/null
+    elif [ "$(cut -f2 <<< "${previous}" | base64 --decode)" != "${status}" ]; then
+        gh api --method PATCH "repos/${repo}/issues/comments/$(cut -f1 <<< "${previous}")" -f body="${status}" > /dev/null
+    fi
+fi
 # After auto-merge is off, so a comment that cannot be posted leaves nothing
 # queued. The commit is in the text so that a later run finds this request
 # and does not repeat it.
