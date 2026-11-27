@@ -1659,3 +1659,32 @@ main:has(#conversation:not([hidden])) {
   object-fit: cover;
   border-radius: 2px;
 }
+
+#composer-models {
+  margin-inline-end: auto;
+  min-width: 0;
+  flex: 1;
+}
+#composer-models label {
+  font-size: 0;
+  display: block;
+}
+#composer-model {
+  width: 100%;
+  min-width: 0;
+  font-size: max(16px, 1rem);
+  text-overflow: ellipsis;
+}
+#slash-choices {
+  max-height: 22dvh;
+  overflow: auto;
+}
+#slash-choices button {
+  margin: 0 .3rem .2rem 0;
+}
+#composer-status {
+  margin: .2rem;
+  max-height: 15dvh;
+  overflow: auto;
+  white-space: pre-wrap;
+}

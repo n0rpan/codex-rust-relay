@@ -399,6 +399,10 @@ pub fn completions(text: &str, caps: &Capabilities) -> Vec<(String, String)> {
     }
     caps.choices()
         .into_iter()
+        .chain(std::iter::once((
+            "/model".into(),
+            "Choose the session model".into(),
+        )))
         .filter(|(name, _)| name.starts_with(word))
         .map(|(name, hint)| {
             let method = match name.as_str() {

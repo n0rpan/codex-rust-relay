@@ -28,7 +28,7 @@ pub(super) fn typed_launch(owner: &str, text: &str) -> Option<Result<DeskAction,
 }
 
 impl Workbench {
-    fn send_input(&mut self, owner: Option<&str>, cx: &mut Context<Self>) {
+    fn send_input(&mut self, owner: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(store) = &self.store else {
             return;
         };
@@ -44,6 +44,11 @@ impl Workbench {
             return;
         }
         let id = owner.map(str::to_owned);
+        if store.draft(owner).trim() == "/model" {
+            self.action(cx, DeskAction::DraftEdit(id, String::new()));
+            self.open_model_picker(super::route_chip::Kind::Model, window, cx);
+            return;
+        }
         if let Some(result) = owner.and_then(|id| typed_launch(id, store.draft(owner))) {
             match result {
                 Ok(action) => {
@@ -169,7 +174,7 @@ impl Workbench {
                                     .global::<crate::preferences::behavior::Active>()
                                     .enter_sends)) =>
                     {
-                        s.send_input(owner.as_deref(), cx)
+                        s.send_input(owner.as_deref(), window, cx)
                     }
                     _ => (),
                 },
@@ -193,6 +198,7 @@ impl Workbench {
         let caps = store.command_caps(key);
         let discovering = is_command && (!store.has_command_schema() || store.commands_loading());
         let term = is_command
+            && draft.trim() != "/model"
             && matches!(
                 store.parse_command(key, draft),
                 Some(ox_desk_core::slash::Action::Terminal)
@@ -375,7 +381,9 @@ impl Workbench {
                 gpui_component::IconName::ArrowUp,
                 send,
                 enabled,
-                cx.listener(move |s, _, _, cx| s.send_input(send_owner.as_deref(), cx)),
+                cx.listener(move |s, _, window, cx| {
+                    s.send_input(send_owner.as_deref(), window, cx)
+                }),
             )
             .when(enabled, |b| b.primary())
             .when(!enabled, |b| b.bg(rgb(p.raised)).text_color(rgb(p.quiet())))

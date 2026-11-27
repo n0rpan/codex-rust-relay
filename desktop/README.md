@@ -78,7 +78,7 @@ Type `/` for commands available from the installed client. Use `/terminal` to co
 
 ## Codex commands
 
-Type `/` in the composer to see commands for the installed Codex and the selected route. Use `/goal <objective>` to set a goal, `/goal` to view it, and `/goal pause`, `/goal resume`, or `/goal clear` to manage it. Use `/speed` to see service tiers offered by the active model. Selecting a tier applies it to subsequent turns in that thread. The menu also offers session actions such as `/new`, `/resume`, and `/compact`.
+Type `/` in the desktop or phone composer to see commands for the installed Codex and the selected route. Use `/goal <objective>` to set a goal, `/goal` to view it, and `/goal pause`, `/goal resume`, or `/goal clear` to manage it. Use `/speed` to see service tiers offered by the active model. Selecting a tier applies it to subsequent turns in that thread. The menu also offers session actions such as `/new`, `/resume`, and `/compact`. Use `/model` or the model selector beside the message box to change the model. On the phone, a terminal-only command can be opened in the native session terminal when the paired device has terminal access.
 
 Use `/terminal` to open the stock CLI’s complete live command menu. For a command the desktop does not implement, **Copy command and open stock Codex** opens the same project, billing route and thread, then copies the command. Paste it into the native composer for Codex to interpret. Close that CLI session before reconnecting in the desktop.
 

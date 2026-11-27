@@ -83,6 +83,29 @@ fn timeline(t: &Transcript) -> Timeline {
         detail: timeline_detail(t),
     }
 }
+// Send the same top-level completions the desktop composer displays. Individual
+// sessions can have a different command inventory, particularly Claude skills.
+#[derive(serde::Serialize)]
+struct ComposerSchema {
+    #[serde(flatten)]
+    caps: crate::slash::Capabilities,
+    choices: Vec<(String, String)>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    goal_choices: Vec<(String, String)>,
+}
+fn composer_schema(caps: crate::slash::Capabilities) -> ComposerSchema {
+    let choices = crate::slash::completions("/", &caps);
+    let goal_choices = if caps.supports_goal() {
+        crate::slash::completions("/goal", &caps)
+    } else {
+        Vec::new()
+    };
+    ComposerSchema {
+        caps,
+        choices,
+        goal_choices,
+    }
+}
 impl Store {
     fn scope_status(&self) -> String {
         match self.state() {
@@ -129,7 +152,7 @@ impl Store {
         };
         json!({"provider":self.profile.provider,"selected":self.selected(),"error":closed,"notice":self.notice(),
            "next_access":self.next_access(),"applied_draft_access":self.applied_access(None),"default_options":self.options(None),"schema":self.has_command_schema(),"loading_commands":self.commands_loading(),
-           "commands":self.command_caps(None),"usage":self.usage,"archived":self.archived_threads(),"mention":self.mention,
+           "commands":composer_schema(self.command_caps(None)),"usage":self.usage,"archived":self.archived_threads(),"mention":self.mention,
            "palette_query":self.palette_query(),"palette_more":self.palette_has_more(),"palette_error":self.palette_search_error(),"palette_rows":self.palette_rows(),
            "more":self.has_more(),"next_sending":self.sending(None),"author":self.runtime_name(),"access_choices":crate::runtime::Access::choices(self.profile.route.runtime)})
     }
@@ -182,8 +205,7 @@ impl Store {
                 && !self.commands_loading()
             {
                 caps.push("native_commands".into());
-                if !running
-                    && !self.changing_options(id)
+                if !self.changing_options(id)
                     && (self.is_session_scoped()
                         || self
                             .command_caps(Some(id))
@@ -225,7 +247,7 @@ impl Store {
         };
         let detail = json!({"row":r,"worker":r.worker,"unread":r.unread,"order":r.activity_order.to_string(),"generated":r.generated_title,
             "owned":t.is_some(),"native_live":self.is_native_live(id).then(||self.native_app()),"changing":self.changing_options(id),"terminal":self.in_terminal(id),"sending":self.sending(Some(id)),
-            "route":self.thread_route(Some(id)),"options":t.map(|_|self.options(Some(id))),"access":self.applied_access(Some(id)),"resume_access":self.resume_access.get(id),"restored_draft":self.restored_drafts.get(id).map(|(message,text)|json!({"message":message,"text":text})),"command_caps":(self.is_session_scoped() && t.is_some()).then(||self.command_caps(Some(id)))});
+            "route":self.thread_route(Some(id)),"options":t.map(|_|self.options(Some(id))),"access":self.applied_access(Some(id)),"resume_access":self.resume_access.get(id),"restored_draft":self.restored_drafts.get(id).map(|(message,text)|json!({"message":message,"text":text})),"command_caps":(self.is_session_scoped() && t.is_some()).then(||composer_schema(self.command_caps(Some(id))))});
         let mut detail = detail;
         let mut parent = r.parent_thread_id.clone();
         if let Some((nest, extra)) = self.host_annotations.get(id) {

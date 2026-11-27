@@ -94,7 +94,8 @@ impl Store {
         {
             caps.model.clone_from(alias);
         }
-        self.changed.mark(Changed::NOTICE);
+        // Discovery enables native commands and model changes on existing session rows too.
+        self.changed.mark(Changed::NOTICE | Changed::THREADS);
     }
     pub(super) fn discovery_failed(&mut self, stage: Discovery, why: String) {
         self.notice = Some(why);

@@ -6,6 +6,7 @@ export async function openPhoneTerminal(
   preset,
   project = null,
   session = null,
+  initialInput = "",
 ) {
   if (active) {
     el("operator-close").focus();
@@ -207,6 +208,7 @@ export async function openPhoneTerminal(
         el("operator-run").hidden = false;
       }
       if (f.running) {
+        if (!running && preset === "native-session") input.value = initialInput;
         running = true;
         el("operator-review").hidden = true;
         el("operator-tools").hidden = false;

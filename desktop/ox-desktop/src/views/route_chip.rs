@@ -15,7 +15,7 @@ use ox_desk_core::{
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(super) enum Kind {
     Model,
     Effort,
     Speed,
@@ -285,7 +285,12 @@ impl Workbench {
         )
         .into_any_element()
     }
-    fn open_model_picker(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn open_model_picker(
+        &mut self,
+        kind: Kind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // The press that dismissed the panel from outside is also the click on its chip.
         if self
             .picker_dismissed
