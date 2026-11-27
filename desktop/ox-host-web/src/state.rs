@@ -569,7 +569,7 @@ impl State {
             return None;
         }
         let terminal = invitation.terminal;
-        let token = self.register(login, key, label, class, terminal, worker)?;
+        let (token, _) = self.register(login, key, label, class, terminal, worker)?;
         self.invites.remove(&h);
         Some(token)
     }
@@ -680,11 +680,10 @@ impl State {
             entry.label.clone(),
             entry.class,
         );
-        let token = self.register(&login, &key, &label, class, false, worker)?;
-        let device = self.device_for_key(&login, &key);
+        let (token, device) = self.register(&login, &key, &label, class, false, worker)?;
         let entry = self.pending.get_mut(id)?;
         entry.token = Some(token);
-        entry.device = device;
+        entry.device = Some(device);
         if let Some(window) = self.window.as_mut() {
             window.paired += 1;
             if window.paired >= WINDOW_PAIRS {
@@ -702,6 +701,20 @@ impl State {
             let _ = self.revoke(&device);
         }
     }
+    /// The asking device withdrew. Its own request id is the secret, so a
+    /// client that stopped waiting can clean up after itself; an accepted
+    /// request takes the device it registered with it.
+    pub fn cancel_window(&mut self, id: &str) {
+        let device = self
+            .pending
+            .get(id)
+            .filter(|p| p.expires > now())
+            .and_then(|p| p.device.clone());
+        if let Some(device) = device {
+            let _ = self.revoke(&device);
+        }
+        self.pending.remove(id);
+    }
     /// The login that asked, so a remote operator can only decide its own
     /// requests.
     pub fn pending_login(&self, id: &str) -> Option<String> {
@@ -709,13 +722,6 @@ impl State {
             .get(id)
             .filter(|p| p.expires > now())
             .map(|p| p.login.clone())
-    }
-    fn device_for_key(&self, login: &str, key: &str) -> Option<String> {
-        self.disk
-            .devices
-            .values()
-            .find(|r| r.device.login == login && r.key == key)
-            .map(|r| r.device.id.clone())
     }
     /// The pair request's own view: pending, or the credential once accepted.
     pub fn poll_window(&mut self, id: &str) -> PollState {
@@ -776,7 +782,8 @@ impl State {
         class: DeviceClass,
         terminal: bool,
         worker: Option<crate::admin::WorkerGrant>,
-    ) -> Option<String> {
+    ) -> Option<(String, String)> {
+        // Returns the credential and the exact device it belongs to.
         let t = random();
         let id = random();
         let registered = Registered {
@@ -806,10 +813,10 @@ impl State {
         }
         self.update(|d| {
             d.devices.retain(|_, r| r.current());
-            d.devices.insert(id, registered);
+            d.devices.insert(id.clone(), registered);
         })
         .ok()?;
-        Some(t)
+        Some((t, id))
     }
     pub fn identity(&self, login: &str, cookie: &str) -> Option<String> {
         if self.disk.origin.is_none() || cookie.len() != 43 {
@@ -1319,6 +1326,15 @@ mod tests {
         s.deny_pending(&named.id);
         assert_eq!(s.reply(None).devices.len(), before - 1);
         assert!(s.pending().iter().all(|p| p.id != named.id));
+        // A client that stops waiting withdraws its own request the same way.
+        let abandoned = s
+            .request_window("named@example.test", &public, "Phone", DeviceClass::Phone)
+            .unwrap();
+        s.approve_pending(&abandoned.id).unwrap();
+        let before = s.reply(None).devices.len();
+        s.cancel_window(&abandoned.id);
+        assert_eq!(s.reply(None).devices.len(), before - 1);
+        assert!(matches!(s.poll_window(&abandoned.id), PollState::Unknown));
 
         // Closing the window ends new requests, and expiry ends pending ones.
         s.close_window();

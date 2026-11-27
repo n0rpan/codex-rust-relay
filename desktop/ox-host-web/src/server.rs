@@ -554,6 +554,7 @@ fn start_listener(app: App, origin: String, listener: TcpListener) -> Listener {
         .route("/api/pair/window", post(pair_window))
         .route("/api/pair/window/status", post(pair_window_status))
         .route("/api/pair/window/poll", post(pair_window_poll))
+        .route("/api/pair/window/cancel", post(pair_window_cancel))
         .route("/api/challenge", post(challenge))
         .route("/api/worker-link", post(worker_link))
         .route(
@@ -813,6 +814,11 @@ async fn pair_window_status(Extract(app): Extract<App>) -> Json<serde_json::Valu
         None => serde_json::json!({"open": false}),
     };
     Json(status)
+}
+/// The asking device stopped waiting; its request id is its own secret.
+async fn pair_window_cancel(Extract(app): Extract<App>, Json(p): Json<WindowPoll>) -> StatusCode {
+    app.state.lock().unwrap().cancel_window(&p.request);
+    StatusCode::NO_CONTENT
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

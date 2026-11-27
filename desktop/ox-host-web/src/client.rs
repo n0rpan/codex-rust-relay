@@ -419,9 +419,17 @@ pub(crate) async fn register_window(
                 ));
             }
             if std::time::Instant::now() >= until {
+                // Withdraw the request so an operator who reads it later does
+                // not register a device whose credential nobody can collect.
+                let _ = http
+                    .post(format!("{origin}/api/pair/window/cancel"))
+                    .header(header::ORIGIN, origin)
+                    .json(&json!({"request": id}))
+                    .send()
+                    .await;
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!("No one accepted this device on {origin}. Approve it there and try again."),
+                    format!("No one accepted this device on {origin} within a minute. Ask for a fresh pairing window there and try again."),
                 ));
             }
             tokio::time::sleep(Duration::from_millis(1500)).await;
