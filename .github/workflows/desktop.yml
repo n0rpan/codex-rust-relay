@@ -156,17 +156,23 @@ jobs:
           name: probe-${{ matrix.runner }}
           path: ${{ runner.temp }}/desktop-probe.tar.gz
           compression-level: 0
+      # Stock Codex runs commands in a bubblewrap sandbox with its own network
+      # namespace, which the runner image denies to unprivileged users. Every
+      # Linux leg runs stock Codex (the linked worker tests among them), so
+      # lift the restriction for all of them, not only where protocol.sh runs.
+      - name: Allow Codex's bubblewrap sandbox
+        if: runner.os == 'Linux'
+        run: |
+          probe() { bwrap --unshare-net --ro-bind / / --dev /dev --proc /proc true; }
+          if ! probe && [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          probe
       - name: Verify the workbench against floor and current stock Codex
         if: matrix.runner == 'ubuntu-24.04'
         env:
           OX_TEST_OX_BIN: ${{ github.workspace }}/desktop/target/release/ox
-        run: |
-          if ! bwrap --ro-bind / / --dev /dev --proc /proc true &&
-              [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-          bwrap --ro-bind / / --dev /dev --proc /proc true
-          desktop/ci/protocol.sh
+        run: desktop/ci/protocol.sh
       - name: Exercise Claude subscription and relay sessions in the stock CLI and workbench
         run: desktop/ci/claude-protocol.sh desktop/target/release/ox
       - name: Open the packaged Linux app on X11
