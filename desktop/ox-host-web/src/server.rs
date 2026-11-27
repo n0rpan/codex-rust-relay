@@ -264,6 +264,15 @@ async fn administer(
             }
             pairing = Some(app.state.lock().unwrap().local_worker_invite(login)?);
         }
+        Request::OpenWindow { login } => {
+            if listener.is_none() || staged.is_some() {
+                return Err(io::Error::other(
+                    "Enable remote access before opening a pairing window",
+                ));
+            }
+            app.state.lock().unwrap().open_window(login)?;
+        }
+        Request::CloseWindow => app.state.lock().unwrap().close_window(),
         Request::Pair { login, terminal } => {
             if listener.is_none() || staged.is_some() {
                 return Err(io::Error::other(
@@ -532,6 +541,8 @@ fn start_listener(app: App, origin: String, listener: TcpListener) -> Listener {
             post(remote_settings::settings).layer(DefaultBodyLimit::max(256 * 1024)),
         )
         .route("/api/pair", post(pair))
+        .route("/api/pair/window", post(pair_window))
+        .route("/api/pair/window/status", post(pair_window_status))
         .route("/api/challenge", post(challenge))
         .route("/api/worker-link", post(worker_link))
         .route(
@@ -703,6 +714,64 @@ async fn pair(
         StatusCode::NO_CONTENT,
     )
         .into_response())
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowPair {
+    #[serde(default)]
+    class: crate::admin::DeviceClass,
+    source: Option<String>,
+    key: String,
+    label: String,
+}
+/// Enrol through an open pairing window. The operator opened the window on
+/// this host; the caller proves nothing but that Serve authenticated it.
+async fn pair_window(
+    Extract(app): Extract<App>,
+    h: HeaderMap,
+    Json(p): Json<WindowPair>,
+) -> Result<Response, ErrCode> {
+    let token = app
+        .state
+        .lock()
+        .unwrap()
+        .pair_window(
+            login(&h).ok_or(DENY)?,
+            &p.key,
+            &p.label,
+            state::Enrollment {
+                class: p.class,
+                source: p.source.as_deref(),
+            },
+        )
+        .ok_or(DENY)?;
+    Ok((
+        [(
+            header::SET_COOKIE,
+            format!(
+                "{COOKIE}={token}; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
+                state::INACTIVE
+            ),
+        )],
+        StatusCode::NO_CONTENT,
+    )
+        .into_response())
+}
+/// What another host may learn about this one before it pairs: whether a
+/// window is open. The operator's chosen login stays private.
+async fn pair_window_status(Extract(app): Extract<App>) -> Json<serde_json::Value> {
+    let state = app.state.lock().unwrap();
+    let name = state.host_profile(None).map(|p| p.name).unwrap_or_default();
+    let status = match state.window() {
+        Some(window) => serde_json::json!({
+            "open": true,
+            "expires_at": window.expires_at,
+            "paired": window.paired,
+            "name": name,
+        }),
+        None => serde_json::json!({"open": false}),
+    };
+    Json(status)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

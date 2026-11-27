@@ -194,6 +194,20 @@ pub fn pair(address: &str, code: &str, label: &str) -> io::Result<SavedHost> {
         |_, _| true,
     )
 }
+/// Pair with a host that is waiting for a device, using the pairing window its
+/// operator opened instead of an invitation.
+pub fn pair_window(origin: &str, label: &str) -> io::Result<SavedHost> {
+    let origin = crate::serve::origin(origin.trim().trim_end_matches('/'))
+        .ok_or_else(|| io::Error::other("That is not an HTTPS tailnet address."))?;
+    enroll_window(
+        &origin,
+        label,
+        &directory()?.join("hosts.json"),
+        false,
+        None,
+        |_, _| true,
+    )
+}
 pub(crate) fn enroll(
     invite: Invitation,
     label: &str,
@@ -205,6 +219,45 @@ pub(crate) fn enroll(
     let origin = invite.origin.clone();
     let rt = client::runtime()?;
     let credential = rt.block_on(client::register_as(invite, label, worker_source))?;
+    finish(
+        origin,
+        credential,
+        registry,
+        background,
+        worker_source,
+        accept,
+    )
+}
+/// Pair with a host whose operator opened a pairing window, without carrying
+/// an invitation to it.
+pub(crate) fn enroll_window(
+    origin: &str,
+    label: &str,
+    registry: &Path,
+    background: bool,
+    worker_source: Option<&str>,
+    accept: impl FnOnce(&[SavedHost], &SavedHost) -> bool,
+) -> io::Result<SavedHost> {
+    let rt = client::runtime()?;
+    let credential = rt.block_on(client::register_window(origin, label, worker_source))?;
+    finish(
+        origin.to_owned(),
+        credential,
+        registry,
+        background,
+        worker_source,
+        accept,
+    )
+}
+fn finish(
+    origin: String,
+    credential: client::Credential,
+    registry: &Path,
+    background: bool,
+    worker_source: Option<&str>,
+    accept: impl FnOnce(&[SavedHost], &SavedHost) -> bool,
+) -> io::Result<SavedHost> {
+    let rt = client::runtime()?;
     let revoke = |client: &PairedClient| {
         if worker_source.is_some() {
             let _ = rt.block_on(client.worker_request(json!({"action":"revoke_self"})));

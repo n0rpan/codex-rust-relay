@@ -76,6 +76,12 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         login: Option<String>,
     },
+    /// Open a window in which a device may pair without an invitation code.
+    OpenWindow {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        login: Option<String>,
+    },
+    CloseWindow,
     Revoke {
         id: String,
     },
@@ -131,6 +137,19 @@ pub struct Pairing {
     pub invited_login: Option<String>,
 }
 
+/// A deliberate pairing window. While it is open, a device that reaches this
+/// host's Serve origin may enrol without an invitation code.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PairingWindow {
+    pub expires_at: i64,
+    /// The one login it admits, when the operator named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
+    /// How many devices it has admitted so far.
+    #[serde(default)]
+    pub paired: u8,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Reply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,6 +168,8 @@ pub struct Reply {
     pub worker_links: Option<serde_json::Value>,
     pub pairing: Option<Pairing>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<PairingWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reservation: Option<String>,
 }
 
@@ -156,9 +177,20 @@ pub struct Reply {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkerLinkAction {
     WorkerLinks,
-    AddWorkerLink { address: String, code: String },
-    LinkPairedHost { host: String },
-    RemoveWorkerLink { host: String },
+    AddWorkerLink {
+        address: String,
+        code: String,
+    },
+    /// Link a host that is waiting in a pairing window on the other machine.
+    AddWorkerLinkWindow {
+        origin: String,
+    },
+    LinkPairedHost {
+        host: String,
+    },
+    RemoveWorkerLink {
+        host: String,
+    },
 }
 // Listener configuration and terminal grants have a private, same-user administration socket.
 pub fn request(state_dir: &Path, req: &Request) -> io::Result<Reply> {

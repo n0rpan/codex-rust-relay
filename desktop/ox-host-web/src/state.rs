@@ -180,9 +180,32 @@ pub(crate) struct State {
     dir: PathBuf,
     disk: Disk,
     invites: HashMap<String, Invite>,
+    /// A deliberate, short-lived window in which any login this host
+    /// authenticated may enrol without an invitation code.
+    window: Option<Window>,
     challenges: HashMap<String, Challenge>,
     pub changed: watch::Sender<u64>,
 }
+
+#[derive(Clone)]
+struct Window {
+    expires: i64,
+    login: Option<String>,
+    paired: u8,
+}
+
+impl Window {
+    fn info(&self) -> crate::admin::PairingWindow {
+        crate::admin::PairingWindow {
+            expires_at: self.expires,
+            login: self.login.clone(),
+            paired: self.paired,
+        }
+    }
+}
+
+/// How many devices one window may admit before it closes itself.
+const WINDOW_PAIRS: u8 = 8;
 
 impl State {
     pub fn load(dir: &Path) -> io::Result<Self> {
@@ -216,6 +239,7 @@ impl State {
             dir: dir.into(),
             disk,
             invites: HashMap::new(),
+            window: None,
             challenges: HashMap::new(),
             changed: watch::channel(0).0,
         };
@@ -336,6 +360,7 @@ impl State {
             https_port: self.https_port(),
             devices,
             pairing,
+            window: self.window(),
             reservation: None,
         }
     }
@@ -474,32 +499,12 @@ impl State {
         {
             return None;
         }
-        let (message, worker) = if let Some(source) = source {
-            if !crate::paired_hosts::valid_id(source)
-                || self.host_id().ok()?.eq_ignore_ascii_case(source)
-            {
-                return None;
-            }
-            let mut grant = crate::admin::WorkerGrant {
-                source: source.to_ascii_lowercase(),
-                may_launch: true,
-                ceiling: ox_desk_core::modes::Level::Yolo,
-            };
-            // A replacement key keeps restrictions the receiver already set for
-            // this source, even while the new key is still being persisted.
-            for prior in self
-                .disk
-                .devices
-                .values()
-                .filter_map(|r| r.device.worker.as_ref())
-                .filter(|w| w.source == grant.source)
-            {
-                grant.may_launch &= prior.may_launch;
-                grant.ceiling = grant.ceiling.min(prior.ceiling);
-            }
-            (format!("{code}.host.{source}"), Some(grant))
-        } else {
-            (code.to_owned(), None)
+        let (message, worker) = match source {
+            Some(source) => (
+                format!("{code}.host.{source}"),
+                Some(self.worker_grant_for(source)?),
+            ),
+            None => (code.to_owned(), None),
         };
         if invitation
             .login
@@ -514,6 +519,120 @@ impl State {
         {
             return None;
         }
+        let terminal = invitation.terminal;
+        let token = self.register(login, key, label, class, terminal, worker)?;
+        self.invites.remove(&h);
+        Some(token)
+    }
+    /// A link opened by the operator for this host, not by the device that
+    /// redeems it. It admits any login Serve authenticated on this origin, or
+    /// the one login the operator named, until it expires or fills up.
+    pub fn open_window(
+        &mut self,
+        login: Option<String>,
+    ) -> io::Result<crate::admin::PairingWindow> {
+        if self.disk.origin.is_none() {
+            return Err(io::Error::other("Enable remote access first"));
+        }
+        if let Some(login) = &login
+            && (login.is_empty()
+                || login.len() > 254
+                || !login.is_ascii()
+                || login.bytes().any(|b| b.is_ascii_control() || b == b' '))
+        {
+            return Err(io::Error::other("Invalid Tailscale login"));
+        }
+        let window = Window {
+            expires: now() + PAIR_TTL,
+            login,
+            paired: 0,
+        };
+        let info = window.info();
+        self.window = Some(window);
+        Ok(info)
+    }
+    pub fn close_window(&mut self) {
+        self.window = None;
+    }
+    pub fn window(&self) -> Option<crate::admin::PairingWindow> {
+        self.window
+            .as_ref()
+            .filter(|w| w.expires > now())
+            .map(Window::info)
+    }
+    pub fn pair_window<'a>(
+        &mut self,
+        login: &str,
+        key: &str,
+        label: &str,
+        registration: impl Into<Enrollment<'a>>,
+    ) -> Option<String> {
+        let Enrollment { class, source } = registration.into();
+        let window = self.window.as_ref().filter(|w| w.expires > now())?;
+        if window
+            .login
+            .as_deref()
+            .is_some_and(|expected| expected != login)
+            || window.paired >= WINDOW_PAIRS
+            || source.is_some() != (class == DeviceClass::Host)
+        {
+            return None;
+        }
+        if label.trim().is_empty()
+            || label.chars().count() > 64
+            || label.chars().any(char::is_control)
+        {
+            return None;
+        }
+        let worker = match source {
+            Some(source) => Some(self.worker_grant_for(source)?),
+            None => None,
+        };
+        let token = self.register(login, key, label, class, false, worker)?;
+        if let Some(window) = self.window.as_mut() {
+            window.paired += 1;
+            if window.paired >= WINDOW_PAIRS {
+                self.window = None;
+            }
+        }
+        Some(token)
+    }
+    /// The grant a worker link starts with, narrowed by what the receiver
+    /// already allows this source host.
+    fn worker_grant_for(&self, source: &str) -> Option<crate::admin::WorkerGrant> {
+        if !crate::paired_hosts::valid_id(source)
+            || self.host_id().ok()?.eq_ignore_ascii_case(source)
+        {
+            return None;
+        }
+        let mut grant = crate::admin::WorkerGrant {
+            source: source.to_ascii_lowercase(),
+            may_launch: true,
+            ceiling: ox_desk_core::modes::Level::Yolo,
+        };
+        // A replacement key keeps restrictions the receiver already set for
+        // this source, even while the new key is still being persisted.
+        for prior in self
+            .disk
+            .devices
+            .values()
+            .filter_map(|r| r.device.worker.as_ref())
+            .filter(|w| w.source == grant.source)
+        {
+            grant.may_launch &= prior.may_launch;
+            grant.ceiling = grant.ceiling.min(prior.ceiling);
+        }
+        Some(grant)
+    }
+    fn register(
+        &mut self,
+        login: &str,
+        key: &str,
+        label: &str,
+        class: DeviceClass,
+        terminal: bool,
+        worker: Option<crate::admin::WorkerGrant>,
+    ) -> Option<String> {
         let t = random();
         let id = random();
         let registered = Registered {
@@ -521,7 +640,7 @@ impl State {
             device: Device {
                 class,
                 worker,
-                terminal: invitation.terminal,
+                terminal,
                 id: id.clone(),
                 login: login.into(),
                 label: label.trim().into(),
@@ -546,7 +665,6 @@ impl State {
             d.devices.insert(id, registered);
         })
         .ok()?;
-        self.invites.remove(&h);
         Some(t)
     }
     pub fn identity(&self, login: &str, cookie: &str) -> Option<String> {
@@ -938,6 +1056,108 @@ mod tests {
                 DeviceClass::Phone
             )
             .is_some()
+        );
+    }
+    #[test]
+    fn a_pairing_window_admits_a_device_without_an_invitation() {
+        struct Unpin;
+        impl Drop for Unpin {
+            fn drop(&mut self) {
+                CLOCK.with(|c| c.set(None));
+            }
+        }
+        let _unpin = Unpin;
+        let at = |t: i64| CLOCK.with(|c| c.set(Some(t)));
+        let start = 1_950_000_000;
+        at(start);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("host-id"),
+            "b302b350-a07d-435d-bb7b-b675156681db",
+        )
+        .unwrap();
+        let mut s = State::load(dir.path()).unwrap();
+        s.set_origin(Some("https://lab.fixture.ts.net".into()), 8443)
+            .unwrap();
+        let key = SigningKey::random(&mut OsRng);
+        let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
+        let source = "74b2c731-b9f0-4b05-8672-3c42062b190a";
+
+        // Closed by default: the window is an explicit operator action.
+        assert!(s.window().is_none());
+        assert!(
+            s.pair_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+                .is_none()
+        );
+
+        let window = s.open_window(None).unwrap();
+        assert_eq!(window.expires_at, start + PAIR_TTL);
+        assert_eq!(s.reply(None).window.unwrap().paired, 0);
+        let cookie = s
+            .pair_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+            .unwrap();
+        let id = s.identity("owner@example.test", &cookie).unwrap();
+        assert!(s.alive(&id));
+        assert_eq!(s.reply(None).window.unwrap().paired, 1);
+
+        // A worker link needs a source and gets the same starting grant.
+        assert!(
+            s.pair_window(
+                "owner@example.test",
+                &public,
+                "Worker",
+                Enrollment {
+                    class: DeviceClass::Host,
+                    source: None
+                }
+            )
+            .is_none()
+        );
+        let worker = s
+            .pair_window(
+                "owner@example.test",
+                &public,
+                "Worker",
+                Enrollment {
+                    class: DeviceClass::Host,
+                    source: Some(source),
+                },
+            )
+            .unwrap();
+        let worker_id = s.identity("owner@example.test", &worker).unwrap();
+        assert_eq!(s.device_class(&worker_id), Some(DeviceClass::Host));
+        assert!(s.worker_grant(&worker_id).unwrap().may_launch);
+
+        // A named window admits only that login, and closing it ends pairing.
+        s.open_window(Some("named@example.test".into())).unwrap();
+        assert_eq!(s.reply(None).window.unwrap().paired, 0);
+        assert!(
+            s.pair_window("other@example.test", &public, "Phone", DeviceClass::Phone)
+                .is_none()
+        );
+        assert!(
+            s.pair_window("named@example.test", &public, "Phone", DeviceClass::Phone)
+                .is_some()
+        );
+        s.close_window();
+        assert!(s.window().is_none());
+        assert!(
+            s.pair_window("named@example.test", &public, "Phone", DeviceClass::Phone)
+                .is_none()
+        );
+
+        // It expires on its own.
+        s.open_window(None).unwrap();
+        at(start + 10 * PAIR_TTL);
+        assert!(s.window().is_none());
+        assert!(
+            s.pair_window("owner@example.test", &public, "Phone", DeviceClass::Phone)
+                .is_none()
         );
     }
     #[test]

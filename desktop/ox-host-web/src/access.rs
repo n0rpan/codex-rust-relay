@@ -59,6 +59,12 @@ pub enum Operation {
     PairWorker {
         login: Option<String>,
     },
+    /// Let any device that reaches this host pair for five minutes, instead of
+    /// carrying an invitation to it.
+    OpenWindow {
+        login: Option<String>,
+    },
+    CloseWindow,
     Revoke(String),
     TerminalGrant(String, bool),
 }
@@ -106,6 +112,12 @@ impl Node {
 /// published through Funnel or taken by another application.
 fn admit(node: &Node) -> Result<(), String> {
     node.reason().map_or(Ok(()), Err)
+}
+
+/// The login an invitation binds, if any. `--for` wins over the operation's
+/// own field, and no host login is substituted: the default is unbound.
+fn invitation_login(for_login: Option<String>, requested: Option<String>) -> Option<String> {
+    for_login.or(requested)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -301,7 +313,7 @@ impl PermissionHelp {
     }
 }
 
-fn cli() -> Result<PathBuf, String> {
+pub(crate) fn cli() -> Result<PathBuf, String> {
     let executable = |p: &Path| {
         p.metadata()
             .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
@@ -519,20 +531,28 @@ pub fn run_with(
     validate_ports(Some(https_port), Some(loopback_port))?;
     let mut network = inspect_ports(https_port, loopback_port);
     let mut denied = None;
-    let requested_login = for_login.or(match &op {
-        Operation::Pair { login, .. } | Operation::PairWorker { login } => login.clone(),
-        _ => None,
-    });
+    let requested_login = invitation_login(
+        for_login,
+        match &op {
+            Operation::Pair { login, .. } | Operation::PairWorker { login } => login.clone(),
+            _ => None,
+        },
+    );
     let host = match op {
         Operation::Status => prior,
         Operation::TerminalGrant(id, enabled) => request(Request::TerminalGrant { id, enabled })?,
         Operation::Revoke(id) => request(Request::Revoke { id })?,
+        Operation::OpenWindow { login } => request(Request::OpenWindow { login })?,
+        Operation::CloseWindow => request(Request::CloseWindow)?,
         Operation::Pair { .. } | Operation::PairWorker { .. } => {
             let node = network.as_ref().map_err(Clone::clone)?;
             if !node.ready() || !prior.enabled || prior.origin.as_ref() != Some(&node.origin) {
                 return Err("Enable tailnet access before pairing a device.".into());
             }
-            let login = requested_login.or_else(|| node.login.clone());
+            // The host's own login is not a default: an invitation is unbound
+            // unless the operator named one, so a tagged host and a shared
+            // host behave the same way.
+            let login = requested_login;
             if let Operation::Pair { terminal, .. } = op {
                 request(Request::Pair { terminal, login })?
             } else {
@@ -726,10 +746,29 @@ pub fn run_with(
 mod tests {
     use super::{
         Config, DEFAULT_HTTPS_PORT, DEFAULT_LOOPBACK_PORT, Node, admit, configuration,
-        self_identity, validate_ports,
+        invitation_login, self_identity, validate_ports,
     };
     use serde_json::{Value, json};
     const PROXY: &str = "http://127.0.0.1:48162";
+    #[test]
+    fn an_invitation_binds_only_a_login_the_operator_named() {
+        assert_eq!(invitation_login(None, None), None);
+        assert_eq!(
+            invitation_login(Some("you@example.com".into()), None),
+            Some("you@example.com".into())
+        );
+        assert_eq!(
+            invitation_login(None, Some("operation@example.com".into())),
+            Some("operation@example.com".into())
+        );
+        assert_eq!(
+            invitation_login(
+                Some("flag@example.com".into()),
+                Some("operation@example.com".into())
+            ),
+            Some("flag@example.com".into())
+        );
+    }
     #[test]
     fn a_tagged_host_has_no_login_of_its_own_to_bind_invitations_to() {
         let untagged = json!({

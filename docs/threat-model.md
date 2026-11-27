@@ -87,6 +87,14 @@ install code that is not ours.
   gate. `ox host pair --for LOGIN`, an invitation minted by a paired device,
   and the phone's "Pair another device" all bind one login when the operator
   wants that stronger rule.
+- A pairing window is the alternative to carrying a code: the operator opens
+  it on the host (desktop, phone or `ox host pair --window`) for five
+  minutes, and any login Serve authenticated on that origin may enrol
+  meanwhile. It closes on its own, after eight devices, when the operator
+  closes it, or on a restart. It is the one place where reachability alone
+  admits a device, which is why it is a deliberate, visible, short-lived
+  action on the receiving host rather than a stored setting. `--for LOGIN`
+  narrows it to one person.
 - Device keys are non-extractable in the browser, in the Secure Enclave or
   Keychain on macOS, and in Secret Service or a 0600 file on Linux.
 - Revoking a device removes its record and closes its live sockets and

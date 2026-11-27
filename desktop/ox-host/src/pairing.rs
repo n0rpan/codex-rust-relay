@@ -9,9 +9,10 @@ use std::{
     process::Command,
 };
 
-const PAIR_USAGE: &str = "Usage: ox host pair [--terminal | --worker-host] [--for LOGIN] [--port HTTPS_PORT] [--listen-port LOCAL_PORT]
+const PAIR_USAGE: &str = "Usage: ox host pair [--terminal | --worker-host | --window] [--for LOGIN] [--port HTTPS_PORT] [--listen-port LOCAL_PORT]
   --terminal          grant terminal access on this host to the device that redeems the invitation
   --worker-host       create an invitation for another OX host to launch workers here
+  --window            wait five minutes for any device on the tailnet to pair, with no code to carry
   --for LOGIN         only this Tailscale login may redeem it (default: any login the tailnet lets reach this host)
   --port PORT         Tailscale Serve HTTPS port (default 8443, range 1024..65535)
   --listen-port PORT  local loopback listener port (default 48162, range 1024..65535)";
@@ -36,6 +37,7 @@ fn parse_port(flag: &str, value: &str) -> Result<u16, String> {
 pub fn parse_pair_args(args: &[String]) -> Result<Option<PairOptions>, String> {
     let mut terminal = false;
     let mut worker = false;
+    let mut window = false;
     let mut https_port = None;
     let mut loopback_port = None;
     let mut for_login = None;
@@ -48,6 +50,7 @@ pub fn parse_pair_args(args: &[String]) -> Result<Option<PairOptions>, String> {
             }
             "--terminal" => terminal = true,
             "--worker-host" => worker = true,
+            "--window" => window = true,
             "--for" => {
                 let value = iter
                     .next()
@@ -78,11 +81,15 @@ pub fn parse_pair_args(args: &[String]) -> Result<Option<PairOptions>, String> {
             _ => return Err(PAIR_USAGE.into()),
         }
     }
-    if terminal && worker {
-        return Err("Choose either --terminal or --worker-host, not both.".into());
+    if [terminal, worker, window].iter().filter(|on| **on).count() > 1 {
+        return Err("Choose one of --terminal, --worker-host or --window.".into());
     }
     access::validate_ports(https_port, loopback_port)?;
-    let operation = if worker {
+    let operation = if window {
+        Operation::OpenWindow {
+            login: for_login.clone(),
+        }
+    } else if worker {
         Operation::PairWorker { login: None }
     } else {
         Operation::Pair {
@@ -164,7 +171,23 @@ pub fn pair_with_ports(
     }
     let terminal = matches!(operation, Operation::Pair { terminal: true, .. });
     let worker = matches!(operation, Operation::PairWorker { .. });
+    let window = matches!(operation, Operation::OpenWindow { .. });
     let reply = access::run_with(paths, operation, for_login)?.host;
+    if window {
+        let window = reply
+            .window
+            .ok_or("The host did not open a pairing window")?;
+        println!(
+            "Waiting five minutes for a device to pair. On the other machine, choose this host under Add host, or paste {} as a worker host.",
+            reply.origin.as_deref().unwrap_or("its Serve address")
+        );
+        if let Some(login) = window.login.as_deref() {
+            println!("Only {login} may pair.");
+        } else {
+            println!("Any device your tailnet lets reach this host may pair.");
+        }
+        return Ok(());
+    }
     let pairing = reply
         .pairing
         .ok_or("The host did not issue an invitation")?;
@@ -417,6 +440,21 @@ mod tests {
         assert!(args(&["--for"]).is_err());
         assert!(args(&["--for", "two words"]).is_err());
         assert!(args(&["--for", ""]).is_err());
+
+        let window = args(&["--window", "--for", "you@example.com"])
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            window.operation,
+            Operation::OpenWindow { login: Some(ref login) } if login == "you@example.com"
+        ));
+        assert_eq!(
+            args(&["--window"]).unwrap().unwrap().for_login,
+            None,
+            "an open window needs no login"
+        );
+        assert!(args(&["--window", "--terminal"]).is_err());
+        assert!(args(&["--window", "--worker-host"]).is_err());
 
         assert!(args(&["--help"]).unwrap().is_none());
         assert!(args(&["--terminal", "--worker-host"]).is_err());
