@@ -1,8 +1,14 @@
 # Multi-host implementation handoff
 
-Worktree `/home/oscar/Work/ox-multi-host`, branch `feat/multi-host`, based on `f44befe`. Oscar and the implementer will review the tradeoffs together before opening a PR.
+The seven milestones have Linux fixture coverage. Two physical Linux machines, an ARM64 laptop and an x86-64 host, also passed pairing, selective key transfer and worker recovery over a real tailnet. The physical run used commit `3a8fa8b`, isolated host state, throwaway keys and a local model fixture. [Physical run details](#physical-linux-acceptance-on-the-arm64-laptop-and-x86-64-n0rpan)
 
-The seven milestones have Linux fixture coverage. The ARM64 Linux laptop and x86-64 Linux host have passed real tailnet pairing, selective credential transfer and worker recovery. The remaining three-machine run covers concurrent sessions and approvals, macOS Keychain and alerts, and Mac Studio placement. The Mac was offline at the last check. The multi-host PR is reserved for joint review.
+## Pending verification
+
+- [ ] Close the laptop lid mid-job, allow the worker to finish, then wake the laptop and collect the result after Wi-Fi reconnects. The physical run stopped and restarted the parent OX process while the laptop remained awake.
+- [ ] On a managed Mac installation, install a signed update, reboot unattended and verify that the host restarts under launchd and can use its pairing from the login Keychain. The Linux update smoke used a staged test release.
+- [ ] On macOS, check notification permission, lock-screen privacy and click-through to the correct host and conversation. On a physical phone, receive a Web Push and open its conversation.
+- [ ] With the laptop, Mac Studio and Linux host online together, exercise concurrent sessions and approvals, place a worker using the Studio’s reported resources, and hand off a conversation and read its source history.
+- [ ] Verify live subscription sign-in and account reporting on the chosen worker host. Stock runtime acceptance used fixture endpoints.
 
 ## Decisions for review
 
@@ -24,7 +30,7 @@ The seven milestones have Linux fixture coverage. The ARM64 Linux laptop and x86
 | 3. Host policy | Implemented on the host, desktop, web UI and CLI. Two real stock runtimes tested on Linux with fixture API routes. Multi-device hardware acceptance remains. |
 | 4. Resources | Host inventory, live load readings, CPU and memory ranking, and worker-sheet placement have Linux coverage. The desktop sidebar and worker sheet show these readings. The physical multi-machine fleet remains to verify. |
 | 5. Linked read workers | Two Linux hosts exercised enrollment, grant editing, dirty checkout transfer, stock Codex launch, control and recovery across restarts. A physical ARM64 parent also recovered an x86-64 worker result over the tailnet after a parent process restart. Actual laptop sleep and wake remain. |
-| 6. Write results and placement | Linux coverage includes branch, ref and tailnet results, a sleeping parent, private return files, refused pushes, and ref retirement. The physical Mac Studio write-worker acceptance remains. |
+| 6. Write results and placement | Linux coverage includes branch, ref and tailnet results, a stopped parent, private return files, refused pushes, and ref retirement. The physical Mac Studio write-worker acceptance remains. |
 | 7. Conversation continuity | Two disposable Linux hosts exercised transfers in both directions, a differently named receiving clone, and stock Codex reading original history through two handoffs. Reads use the desktop that initiated each transfer. Physical acceptance and the decision on independent host-to-host history access remain. |
 
 ## Verification
