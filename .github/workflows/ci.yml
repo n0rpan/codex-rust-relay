@@ -35,9 +35,16 @@ permissions:
 concurrency:
   # The nightly run has its own group. Sharing main's group, a late-running
   # schedule cancelled main's release run, its macOS clean-account test and
-  # the dev release publish. A new push still replaces an older one.
+  # the dev release publish. A new push to a pull request replaces the run
+  # before it.
+  #
+  # main is different: its runs are never cancelled. A release build takes
+  # about 50 minutes; when merges came faster than that, each build was
+  # cancelled by the next merge and no release was published for hours. A
+  # run on main now finishes and publishes, the next merge waits behind it,
+  # and only a run that is still waiting is replaced by a newer one.
   group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'schedule' && 'nightly' || 'change' }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -897,12 +904,21 @@ jobs:
             echo "::error::expected a dev version, got ${VERSION} (${CHANNEL})"
             exit 1
           fi
-          # A re-run of an old workflow run must not replace a newer dev build.
-          head="$(gh api "repos/${repo}/git/ref/heads/main" --jq '.object.sha')"
-          if [ "${head}" != "${GITHUB_SHA}" ]; then
-            echo "::notice::main moved to ${head}; leaving the dev release to that commit's run"
-            echo "published=false" >> "${GITHUB_OUTPUT}"
-            exit 0
+          # main may have moved while this build ran; it still publishes, and
+          # the build of the newer commit publishes after it. What must not
+          # happen is an older build replacing a newer release, as a re-run
+          # of an old workflow run would. So: skip only when the released
+          # commit is ahead of this one. Re-publishing the same commit repairs
+          # a release.
+          released="$(gh api "repos/${repo}/git/matching-refs/tags/dev" \
+            --jq '.[] | select(.ref == "refs/tags/dev") | .object.sha')"
+          if [ -n "${released}" ]; then
+            position="$(gh api "repos/${repo}/compare/${GITHUB_SHA}...${released}" --jq .status)"
+            if [ "${position}" = ahead ]; then
+              echo "::notice::the dev release is already at ${released}, which is newer than ${GITHUB_SHA}; not replacing it"
+              echo "published=false" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
           fi
 
           gh run download "${GITHUB_RUN_ID}" --repo "${repo}" --pattern 'ox-*' --dir dist

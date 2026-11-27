@@ -8,6 +8,7 @@
 #
 # A pull request is queued when all of these hold:
 #   - it is open, not a draft, from this repository and from the maintainer;
+#   - it targets the default branch;
 #   - it carries the full-ci label;
 #   - Codex has finished a code review of its current head commit;
 #   - a security review of that commit was asked for, and Codex's state shows
@@ -49,6 +50,12 @@ decide() {
     if [ "$(jq -r '.user.login' <<< "${pr}")" != "${maintainer}" ]; then decision="skip: not the maintainer's"; return; fi
     if [ "$(jq -r '.head.repo.full_name' <<< "${pr}")" != "${repo}" ]; then decision="skip: from another repository"; return; fi
     head="$(jq -r '.head.sha' <<< "${pr}")"
+    # Only the default branch has required checks and the merge queue. A pull
+    # request stacked on another branch would merge there at once, unchecked,
+    # and reach nobody.
+    if [ "$(jq -r '.base.ref' <<< "${pr}")" != "$(jq -r '.base.repo.default_branch' <<< "${pr}")" ]; then
+        decision="hold: targets $(jq -r '.base.ref' <<< "${pr}"), not the default branch"; return
+    fi
     if [ "$(jq -r '.draft' <<< "${pr}")" != false ]; then decision="hold: draft"; return; fi
     if ! jq -e '.labels | map(.name) | index("full-ci")' <<< "${pr}" > /dev/null; then decision="hold: no full-ci label"; return; fi
 

@@ -51,7 +51,8 @@ def thread(body, resolved=False, author="chatgpt-codex-connector", kind="Bot"):
 class AutoQueue(unittest.TestCase):
     def decide(self, *, pull=None, comments=None, threads=None, more_threads=False, dry_run=False, fail=None):
         base = {"state": "open", "draft": False, "user": {"login": "maintainer"},
-                "head": {"sha": HEAD, "repo": {"full_name": "o/r"}}, "labels": [{"name": "full-ci"}]}
+                "head": {"sha": HEAD, "repo": {"full_name": "o/r"}}, "labels": [{"name": "full-ci"}],
+                "base": {"ref": "main", "repo": {"default_branch": "main"}}}
         base.update(pull or {})
         if comments is None:
             comments = [{"user": BOT_USER, "body": summary(HEAD, "completed")}]
@@ -143,6 +144,8 @@ class AutoQueue(unittest.TestCase):
         for name, pull, word in (
             ("draft", {"draft": True}, "hold: draft"),
             ("no label", {"labels": []}, "hold: no full-ci label"),
+            ("stacked on another branch",
+             {"base": {"ref": "feat/first", "repo": {"default_branch": "main"}}}, "hold: targets feat/first"),
             ("another author", {"user": {"login": "someone"}}, "skip:"),
             ("a fork", {"head": {"sha": HEAD, "repo": {"full_name": "fork/r"}}}, "skip:"),
             ("closed", {"state": "closed"}, "skip:"),
