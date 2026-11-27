@@ -66,7 +66,7 @@ if obsolete:
     raise SystemExit(f"Legacy desktop dependencies: {sorted(obsolete)}")
 core = next(p for p in metadata["packages"] if p["name"] == "ox-desk-core")
 # tempfile provides private scratch directories and atomic title-cache writes.
-allowed = {"serde", "serde_json", "libc", "notify", "tempfile", "schemars"}
+allowed = {"serde", "serde_json", "libc", "notify", "tempfile", "schemars", "ox-memory"}
 bad = {d["name"] for d in core["dependencies"] if d["kind"] is None} - allowed
 if bad:
     raise SystemExit(f"Unexpected production dependencies in ox-desk-core: {sorted(bad)}")

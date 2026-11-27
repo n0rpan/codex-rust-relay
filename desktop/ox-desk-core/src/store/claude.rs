@@ -84,6 +84,7 @@ struct Process {
     /// The explicit subscription model to reuse if a turn needs to be retried.
     selected_model: Option<String>,
     started_new: bool,
+    memory_brief_pending: bool,
     /// Reading a saved journal, optionally following a live external client.
     viewer: Option<native::Viewer>,
     /// Models that answered top-level turns in this process, in first-answer order.
@@ -722,8 +723,14 @@ impl Store {
         } else {
             session
         };
+        let is_new = matches!(session, Session::New(_));
+        let first_is_command = first
+            .as_ref()
+            .is_some_and(|(_, text)| text.trim_start().starts_with('/'));
+        let deliver_brief_now = is_new && first.is_some() && !first_is_command;
+        let memory_brief_pending = is_new && !deliver_brief_now;
         let first_context = first.as_ref().and_then(|_| {
-            if matches!(session, Session::New(_)) {
+            if deliver_brief_now {
                 self.first_turn_context()
             } else {
                 self.sender_context()
@@ -747,7 +754,8 @@ impl Store {
                 worker_notice,
                 launch_mode: mode.clone(),
                 selected_model: model.clone(),
-                started_new: matches!(session, Session::New(_)),
+                started_new: is_new,
+                memory_brief_pending,
                 ..Default::default()
             },
         );
@@ -937,7 +945,15 @@ impl Store {
         }
         self.selected = Some(owner.clone());
         self.selection += 1;
-        let context = if id.is_none() {
+        let is_command = command.is_some() || text.trim_start().starts_with('/');
+        let brief_pending = id.is_none()
+            || self
+                .claude()
+                .sessions
+                .get(&owner)
+                .is_some_and(|p| p.memory_brief_pending);
+        let deliver_brief = brief_pending && !is_command;
+        let context = if deliver_brief {
             self.first_turn_context()
         } else {
             self.sender_context()
@@ -948,6 +964,9 @@ impl Store {
             .sessions
             .get_mut(&owner)
             .ok_or_else(|| io::Error::other("Reconnect the session before sending"))?;
+        if deliver_brief {
+            process.memory_brief_pending = false;
+        }
         if let Some(id) = worker_notice {
             process.worker_notice = Some((message.clone(), id));
         }
