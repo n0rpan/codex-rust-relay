@@ -116,7 +116,14 @@ def verify_hosted_inheritance(project, env):
         parent.until(finished)
         deadline = time.monotonic() + 20
         marker = checkout / "worker-marker"
-        while not marker.exists() and time.monotonic() < deadline:
+        # The worker's `cat >` creates the marker before it writes the content,
+        # so wait for the bytes instead of just the file.
+        while time.monotonic() < deadline:
+            try:
+                if marker.read_text() == "inherited":
+                    break
+            except FileNotFoundError:
+                pass
             time.sleep(.05)
         assert marker.read_text() == "inherited"
         assert not (project / marker.name).exists()
