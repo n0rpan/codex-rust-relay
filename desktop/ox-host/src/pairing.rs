@@ -9,9 +9,10 @@ use std::{
     process::Command,
 };
 
-const PAIR_USAGE: &str = "Usage: ox host pair [--terminal | --worker-host] [--port HTTPS_PORT] [--listen-port LOCAL_PORT]
+const PAIR_USAGE: &str = "Usage: ox host pair [--terminal | --worker-host] [--for LOGIN] [--port HTTPS_PORT] [--listen-port LOCAL_PORT]
   --terminal          grant terminal access on this host to the device that redeems the invitation
   --worker-host       create an invitation for another OX host to launch workers here
+  --for LOGIN         only this Tailscale login may redeem it (default: any login the tailnet lets reach this host)
   --port PORT         Tailscale Serve HTTPS port (default 8443, range 1024..65535)
   --listen-port PORT  local loopback listener port (default 48162, range 1024..65535)";
 
@@ -19,6 +20,7 @@ pub struct PairOptions {
     pub operation: Operation,
     pub https_port: Option<u16>,
     pub loopback_port: Option<u16>,
+    pub for_login: Option<String>,
 }
 
 fn parse_port(flag: &str, value: &str) -> Result<u16, String> {
@@ -36,6 +38,7 @@ pub fn parse_pair_args(args: &[String]) -> Result<Option<PairOptions>, String> {
     let mut worker = false;
     let mut https_port = None;
     let mut loopback_port = None;
+    let mut for_login = None;
     let mut iter = args.iter().map(String::as_str);
     while let Some(arg) = iter.next() {
         match arg {
@@ -45,6 +48,15 @@ pub fn parse_pair_args(args: &[String]) -> Result<Option<PairOptions>, String> {
             }
             "--terminal" => terminal = true,
             "--worker-host" => worker = true,
+            "--for" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--for takes a Tailscale login.".to_owned())?;
+                for_login = Some(parse_login(value)?);
+            }
+            _ if arg.starts_with("--for=") => {
+                for_login = Some(parse_login(&arg["--for=".len()..])?);
+            }
             "--port" => {
                 let value = iter
                     .next()
@@ -71,22 +83,44 @@ pub fn parse_pair_args(args: &[String]) -> Result<Option<PairOptions>, String> {
     }
     access::validate_ports(https_port, loopback_port)?;
     let operation = if worker {
-        Operation::PairWorker
+        Operation::PairWorker { login: None }
     } else {
-        Operation::Pair { terminal }
+        Operation::Pair {
+            terminal,
+            login: None,
+        }
     };
     Ok(Some(PairOptions {
         operation,
         https_port,
         loopback_port,
+        for_login,
     }))
+}
+
+fn parse_login(value: &str) -> Result<String, String> {
+    let login = value.trim();
+    if login.is_empty()
+        || login.len() > 254
+        || !login.is_ascii()
+        || login.bytes().any(|b| b.is_ascii_control() || b == b' ')
+    {
+        return Err("--for takes an ASCII Tailscale login such as you@example.com.".into());
+    }
+    Ok(login.to_owned())
 }
 
 pub fn pair_cli(paths: &Paths, args: &[String]) -> Result<(), String> {
     let Some(opts) = parse_pair_args(args)? else {
         return Ok(());
     };
-    pair_with_ports(paths, opts.operation, opts.https_port, opts.loopback_port)
+    pair_with_ports(
+        paths,
+        opts.operation,
+        opts.https_port,
+        opts.loopback_port,
+        opts.for_login,
+    )
 }
 
 pub fn pair_with_ports(
@@ -94,6 +128,7 @@ pub fn pair_with_ports(
     operation: Operation,
     https_port: Option<u16>,
     loopback_port: Option<u16>,
+    for_login: Option<String>,
 ) -> Result<(), String> {
     let enable = if https_port.is_some() || loopback_port.is_some() {
         Operation::EnableOn {
@@ -127,12 +162,19 @@ pub fn pair_with_ports(
             return Err(error);
         }
     }
-    let terminal = matches!(operation, Operation::Pair { terminal: true });
-    let worker = matches!(operation, Operation::PairWorker);
-    let reply = access::run(paths, operation)?.host;
+    let terminal = matches!(operation, Operation::Pair { terminal: true, .. });
+    let worker = matches!(operation, Operation::PairWorker { .. });
+    let reply = access::run_with(paths, operation, for_login)?.host;
     let pairing = reply
         .pairing
         .ok_or("The host did not issue an invitation")?;
+    if let Some(login) = pairing.invited_login.as_deref() {
+        println!("Only {login} may redeem this invitation.");
+    } else {
+        println!(
+            "Anyone your tailnet lets reach this host can redeem this invitation. Pass --for LOGIN to name one."
+        );
+    }
     if terminal {
         println!(
             "This invitation grants terminal access on this host to the device that redeems it."
@@ -324,8 +366,12 @@ mod tests {
         let plain = args(&[]).unwrap().unwrap();
         assert!(matches!(
             plain.operation,
-            Operation::Pair { terminal: false }
+            Operation::Pair {
+                terminal: false,
+                login: None
+            }
         ));
+        assert_eq!(plain.for_login, None);
         assert_eq!((plain.https_port, plain.loopback_port), (None, None));
 
         let custom = args(&["--terminal", "--port", "9443", "--listen-port=49100"])
@@ -333,7 +379,10 @@ mod tests {
             .unwrap();
         assert!(matches!(
             custom.operation,
-            Operation::Pair { terminal: true }
+            Operation::Pair {
+                terminal: true,
+                login: None
+            }
         ));
         assert_eq!(
             (custom.https_port, custom.loopback_port),
@@ -341,8 +390,33 @@ mod tests {
         );
 
         let worker = args(&["--worker-host", "--port=10443"]).unwrap().unwrap();
-        assert!(matches!(worker.operation, Operation::PairWorker));
+        assert!(matches!(
+            worker.operation,
+            Operation::PairWorker { login: None }
+        ));
         assert_eq!(worker.https_port, Some(10443));
+
+        let named = args(&["--worker-host", "--for", "you@example.com"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(named.for_login.as_deref(), Some("you@example.com"));
+        assert_eq!(
+            args(&["--for=you@example.com"]).unwrap().unwrap().for_login,
+            Some("you@example.com".into())
+        );
+        assert!(matches!(
+            args(&["--for", "you@example.com"])
+                .unwrap()
+                .unwrap()
+                .operation,
+            Operation::Pair {
+                terminal: false,
+                login: None
+            }
+        ));
+        assert!(args(&["--for"]).is_err());
+        assert!(args(&["--for", "two words"]).is_err());
+        assert!(args(&["--for", ""]).is_err());
 
         assert!(args(&["--help"]).unwrap().is_none());
         assert!(args(&["--terminal", "--worker-host"]).is_err());

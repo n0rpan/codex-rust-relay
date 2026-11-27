@@ -262,7 +262,14 @@ impl Render for Remote {
         buttons = buttons.child(self.action(p, "remote-refresh", "Refresh", Operation::Status, cx));
         if let Some(report) = &self.report {
             if let Ok(node) = &report.access.network {
-                view = view.child(format!("Tailscale account · {}", node.login));
+                view = match &node.login {
+                    Some(login) => view.child(format!("Tailscale account · {login}")),
+                    None => view
+                        .child(format!("Tagged machine · {}", node.tags.join(", ")))
+                        .child(
+                            "This machine belongs to a Tailscale tag, not a user. Anyone your tailnet lets reach it can redeem a pairing invitation.",
+                        ),
+                };
                 if let Some(reason) = node.reason() {
                     view = view.child(reason);
                 }
@@ -275,7 +282,10 @@ impl Render for Remote {
                         p,
                         "remote-pair",
                         "Pair a device",
-                        Operation::Pair { terminal: false },
+                        Operation::Pair {
+                            terminal: false,
+                            login: None,
+                        },
                         cx,
                     ));
                 } else {

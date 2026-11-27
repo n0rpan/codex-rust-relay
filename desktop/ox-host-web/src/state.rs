@@ -143,7 +143,9 @@ struct Invite {
     worker: bool,
     terminal: bool,
     short_hash: String,
-    login: String,
+    /// The Tailscale login allowed to redeem it. `None` accepts any login that
+    /// Tailscale Serve authenticated on this host's origin.
+    login: Option<String>,
     issuer: Option<String>,
     expires: i64,
 }
@@ -337,7 +339,7 @@ impl State {
             reservation: None,
         }
     }
-    pub fn invite(&mut self, login: String, terminal: bool) -> io::Result<Pairing> {
+    pub fn invite(&mut self, login: Option<String>, terminal: bool) -> io::Result<Pairing> {
         self.create_invite(login, None, terminal, false)
     }
     pub fn device_invite(&mut self, id: &str) -> io::Result<Pairing> {
@@ -345,9 +347,9 @@ impl State {
             return Err(io::Error::other("Device is no longer paired"));
         }
         let login = self.disk.devices[id].device.login.clone();
-        self.create_invite(login, Some(id.to_owned()), false, false)
+        self.create_invite(Some(login), Some(id.to_owned()), false, false)
     }
-    pub fn local_worker_invite(&mut self, login: String) -> io::Result<Pairing> {
+    pub fn local_worker_invite(&mut self, login: Option<String>) -> io::Result<Pairing> {
         self.create_invite(login, None, false, true)
     }
     pub fn worker_invite(&mut self, id: &str) -> io::Result<Pairing> {
@@ -357,7 +359,7 @@ impl State {
             ));
         }
         self.create_invite(
-            self.disk.devices[id].device.login.clone(),
+            Some(self.disk.devices[id].device.login.clone()),
             Some(id.into()),
             false,
             true,
@@ -379,7 +381,7 @@ impl State {
     }
     fn create_invite(
         &mut self,
-        login: String,
+        login: Option<String>,
         issuer: Option<String>,
         terminal: bool,
         worker: bool,
@@ -389,10 +391,11 @@ impl State {
             .origin
             .as_ref()
             .ok_or_else(|| io::Error::other("Enable remote access first"))?;
-        if login.is_empty()
-            || login.len() > 254
-            || !login.is_ascii()
-            || login.bytes().any(|b| b.is_ascii_control() || b == b' ')
+        if let Some(login) = &login
+            && (login.is_empty()
+                || login.len() > 254
+                || !login.is_ascii()
+                || login.bytes().any(|b| b.is_ascii_control() || b == b' '))
         {
             return Err(io::Error::other("Invalid Tailscale login"));
         }
@@ -425,7 +428,7 @@ impl State {
                 terminal,
                 short_hash: digest(&short),
                 issuer,
-                login,
+                login: login.clone(),
                 expires: expires_at,
             },
         );
@@ -434,6 +437,7 @@ impl State {
             url,
             qr_svg,
             expires_at,
+            invited_login: login,
         })
     }
     pub fn pair<'a>(
@@ -487,7 +491,6 @@ impl State {
                 .disk
                 .devices
                 .values()
-                .filter(|r| r.device.login == login)
                 .filter_map(|r| r.device.worker.as_ref())
                 .filter(|w| w.source == grant.source)
             {
@@ -498,7 +501,10 @@ impl State {
         } else {
             (code.to_owned(), None)
         };
-        if invitation.login != login
+        if invitation
+            .login
+            .as_deref()
+            .is_some_and(|expected| expected != login)
             || invitation.expires <= now()
             || invitation
                 .issuer
@@ -798,7 +804,7 @@ mod tests {
         let mut s = State::load(dir.path()).unwrap();
         s.set_origin(Some("https://machine.tail.ts.net".into()), 48162)
             .unwrap();
-        let invite = s.invite("a@example.test".into(), false).unwrap();
+        let invite = s.invite(Some("a@example.test".into()), false).unwrap();
         assert!(invite.qr_svg.contains("<svg"));
         let code = invite.url.split_once("#pair=").unwrap().1;
         let key = SigningKey::random(&mut OsRng);
@@ -873,6 +879,68 @@ mod tests {
         assert!(s.identity("a@example.test", &cookie).is_none());
     }
     #[test]
+    fn an_invitation_without_a_login_pairs_any_tailnet_user_under_that_login() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let mut s = State::load(dir.path()).unwrap();
+        s.set_origin(Some("https://tagged.tail.ts.net".into()), 8443)
+            .unwrap();
+        let key = SigningKey::random(&mut OsRng);
+        let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
+
+        // A host with no Tailscale user, such as a tagged machine, invites
+        // without naming one. The redeemer's own authenticated login is
+        // recorded, and that is what every later request is checked against.
+        let open = s.invite(None, false).unwrap();
+        assert_eq!(open.invited_login, None);
+        let code = open.url.split_once("#pair=").unwrap().1.to_owned();
+        let cookie = s
+            .pair(
+                "second@example.test",
+                &code,
+                &public,
+                &sign(&key, &code),
+                "Desktop",
+                DeviceClass::Desktop,
+            )
+            .unwrap();
+        let id = s.identity("second@example.test", &cookie).unwrap();
+        assert!(s.identity("first@example.test", &cookie).is_none());
+        assert_eq!(s.reply(None).devices[0].login, "second@example.test");
+        assert!(s.alive(&id));
+
+        // A named invitation still admits exactly one login.
+        let bound = s.invite(Some("owner@example.test".into()), false).unwrap();
+        assert_eq!(bound.invited_login.as_deref(), Some("owner@example.test"));
+        let code = bound.url.split_once("#pair=").unwrap().1.to_owned();
+        assert!(
+            s.pair(
+                "other@example.test",
+                &code,
+                &public,
+                &sign(&key, &code),
+                "Phone",
+                DeviceClass::Phone
+            )
+            .is_none()
+        );
+        assert!(
+            s.pair(
+                "owner@example.test",
+                &code,
+                &public,
+                &sign(&key, &code),
+                "Phone",
+                DeviceClass::Phone
+            )
+            .is_some()
+        );
+    }
+    #[test]
     fn worker_links_keep_their_own_role_and_grant_through_restart_and_repair() {
         use ox_desk_core::modes::Level;
         let tmp = tempfile::tempdir().unwrap();
@@ -907,11 +975,11 @@ mod tests {
                 },
             )
         };
-        let operator = state.invite(login.into(), true).unwrap();
+        let operator = state.invite(Some(login.into()), true).unwrap();
         let op = operator.short_code.unwrap();
         assert!(redeem(&mut state, &op, &format!("{op}.host.{source}")).is_none());
         let invite = state
-            .local_worker_invite(login.into())
+            .local_worker_invite(Some(login.into()))
             .unwrap()
             .short_code
             .unwrap();
@@ -975,7 +1043,7 @@ mod tests {
         assert!(restored.prove_worker(&id, &challenge, &signature, "info"));
         assert!(!restored.prove_worker(&id, &challenge, &signature, "info"));
         let next = restored
-            .local_worker_invite(login.into())
+            .local_worker_invite(Some(login.into()))
             .unwrap()
             .short_code
             .unwrap();
@@ -1003,7 +1071,7 @@ mod tests {
             .set_origin(Some("https://machine.tail.ts.net".into()), 48162)
             .unwrap();
         let login = "operator@example.test";
-        let invite = state.invite(login.into(), false).unwrap();
+        let invite = state.invite(Some(login.into()), false).unwrap();
         let short = invite.short_code.unwrap().to_lowercase();
         let long = invite.url.split_once("#pair=").unwrap().1;
         let key = SigningKey::random(&mut OsRng);
@@ -1055,7 +1123,7 @@ mod tests {
                 .unwrap();
             s.identity("tester", &cookie).unwrap()
         };
-        let invitation = state.invite("tester".into(), false).unwrap();
+        let invitation = state.invite(Some("tester".into()), false).unwrap();
         let id = register(&mut state, invitation);
         assert!(state.terminal_generation(&id).is_none());
         state.terminal_grant(&id, true).unwrap();
@@ -1074,7 +1142,7 @@ mod tests {
                 .prove_terminal(&id, &nonce, &sig, r#"{"preset":"claude-login"}"#)
                 .is_none()
         );
-        let preauthorized = state.invite("tester".into(), true).unwrap();
+        let preauthorized = state.invite(Some("tester".into()), true).unwrap();
         let trusted = register(&mut state, preauthorized);
         assert!(state.terminal_generation(&trusted).is_some());
         let next = state.device_invite(&trusted).unwrap();
@@ -1098,7 +1166,7 @@ mod tests {
         state.set_origin(Some(origin.into()), 48162).unwrap();
         let key = SigningKey::random(&mut OsRng);
         let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
-        let invite = state.invite("me".into(), false).unwrap();
+        let invite = state.invite(Some("me".into()), false).unwrap();
         let secret = invite.url.split_once("#pair=").unwrap().1;
         state.invites.get_mut(&digest(secret)).unwrap().expires = now() - 1;
         assert!(
@@ -1113,7 +1181,7 @@ mod tests {
                 )
                 .is_none()
         );
-        let invitation = state.invite("me".into(), false).unwrap();
+        let invitation = state.invite(Some("me".into()), false).unwrap();
         let secret = invitation.url.split_once("#pair=").unwrap().1;
         let cookie = state
             .pair(
@@ -1177,7 +1245,7 @@ mod tests {
         };
 
         // An invitation expires exactly PAIR_TTL seconds after it is issued.
-        let stale = s.invite("me".into(), false).unwrap();
+        let stale = s.invite(Some("me".into()), false).unwrap();
         assert_eq!(stale.expires_at, start + PAIR_TTL);
         let stale = stale.url.split_once("#pair=").unwrap().1.to_owned();
         at(start + PAIR_TTL);
@@ -1185,7 +1253,7 @@ mod tests {
 
         // A fresh invitation works once, one second before its deadline, then never again.
         let issued = start + PAIR_TTL;
-        let fresh = s.invite("me".into(), false).unwrap();
+        let fresh = s.invite(Some("me".into()), false).unwrap();
         let fresh = fresh.url.split_once("#pair=").unwrap().1.to_owned();
         at(issued + PAIR_TTL - 1);
         let cookie = pair(&mut s, &fresh, "Phone").unwrap();
@@ -1203,7 +1271,7 @@ mod tests {
         assert!(State::load(dir.path()).unwrap().disk.devices.is_empty());
 
         // Use renews the window: a device used on day 29 survives past day 30.
-        let fresh = s.invite("me".into(), false).unwrap();
+        let fresh = s.invite(Some("me".into()), false).unwrap();
         let fresh = fresh.url.split_once("#pair=").unwrap().1.to_owned();
         let cookie = pair(&mut s, &fresh, "Phone").unwrap();
         let id = s.identity("me", &cookie).unwrap();

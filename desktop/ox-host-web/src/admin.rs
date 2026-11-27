@@ -55,7 +55,10 @@ pub enum Request {
     },
     Disable,
     Pair {
-        login: String,
+        /// Only this Tailscale login may redeem the invitation. Omit it to
+        /// accept any login Tailscale Serve authenticated on this origin.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        login: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         terminal: bool,
     },
@@ -70,7 +73,8 @@ pub enum Request {
         ceiling: ox_desk_core::modes::Level,
     },
     WorkerInvitation {
-        login: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        login: Option<String>,
     },
     Revoke {
         id: String,
@@ -121,6 +125,10 @@ pub struct Pairing {
     pub url: String,
     pub qr_svg: String,
     pub expires_at: i64,
+    /// The one Tailscale login that may redeem it, when the invitation names
+    /// one. `None` means any login Tailscale Serve authenticated on the origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invited_login: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]

@@ -69,14 +69,24 @@ install code that is not ours.
 - A destination added from the web view must be an untagged machine of the
   same Tailscale user. A host already paired from the desktop can be chosen
   without that check: the paired operator is trusted to pick the recipient.
+  A tagged machine is refused by the direct path and names its tag in the
+  error, because Tailscale cannot say which person owns a tag.
 - The receiver can use the keys and incur charges. That is stated to the user.
 
 ### Pairing and devices
 
-- An invitation is a one-time code, valid for five minutes, bound to the
-  Tailscale login that created it. The device proves a P-256 key and gets a
-  host-only, HTTP-only cookie. Sensitive requests are signed with a fresh
-  single-use nonce.
+- An invitation is a one-time code, valid for five minutes. The device proves
+  a P-256 key and gets a host-only, HTTP-only cookie. Sensitive requests are
+  signed with a fresh single-use nonce.
+- By default an invitation is redeemable by any Tailscale login that Serve
+  authenticated on the receiving host's origin, and the login that redeems it
+  becomes the device's identity for every later request. That is what makes a
+  tagged machine pairable: it belongs to a tag, not a user, so binding its
+  invitation to "its" login would admit nobody. The one-time code, its five
+  minute life, the loopback listener and the tailnet's own ACL remain the
+  gate. `ox host pair --for LOGIN`, an invitation minted by a paired device,
+  and the phone's "Pair another device" all bind one login when the operator
+  wants that stronger rule.
 - Device keys are non-extractable in the browser, in the Secure Enclave or
   Keychain on macOS, and in Secret Service or a 0600 file on Linux.
 - Revoking a device removes its record and closes its live sockets and

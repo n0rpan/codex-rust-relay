@@ -967,7 +967,7 @@ mod tests {
             state.set_origin(Some(ORIGIN.into()), 0).unwrap();
             let key = SigningKey::random(&mut OsRng);
             let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
-            let invite = state.invite(LOGIN.into(), false).unwrap();
+            let invite = state.invite(Some(LOGIN.into()), false).unwrap();
             let code = invite.url.split_once("#pair=").unwrap().1;
             let cookie = state
                 .pair(
