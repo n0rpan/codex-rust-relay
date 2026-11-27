@@ -118,6 +118,12 @@ you call it done.
   resolves features for the packages it is asked for, so the narrower build
   compiles the shared crates and the test again. The package job builds every
   test once; its scripts get executables from `desktop/ci/test-bin.sh`.
+- **On macOS, a pseudo-terminal can drop what a program printed.** A test
+  that closes its own copy of the terminal's writing end and then reads loses
+  the whole output of a program that prints and exits at once: 1 run in 1500
+  on macOS Intel, none on macOS ARM or Linux. Keep that end open until the
+  program has exited and the output is drained
+  (`tests/fixtures/setup_selector.py`).
 - **Tests that share a binary share a process.** A test that depends on a
   file descriptor being closed can be broken by a sibling test that spawns a
   child at the same moment.
