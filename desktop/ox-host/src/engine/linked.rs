@@ -262,8 +262,9 @@ impl Engine {
                 {
                     let capped: String =
                         brief.chars().take(ox_memory::DEFAULT_BRIEF_CHARS).collect();
-                    if let Accepted::Launch(_, l) = &mut accepted {
-                        l.memory_brief = Some(capped);
+                    match &mut accepted {
+                        Accepted::Launch(_, l) => l.memory_brief = Some(capped),
+                        Accepted::Ask(a) => a.memory_brief = Some(capped),
                     }
                 }
                 let origin = match &accepted {

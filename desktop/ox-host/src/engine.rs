@@ -171,6 +171,7 @@ pub(crate) struct Asking {
     pub(crate) start: WorkerStart,
     pub(crate) target: Scope,
     pub(crate) parent_title: String,
+    pub(crate) memory_brief: Option<String>,
 }
 /// A handoff waiting for its source's older history to load.
 struct Preparing {
@@ -2560,6 +2561,7 @@ impl Engine {
             start,
             target,
             parent_title,
+            memory_brief: None,
         }))
     }
     /// Open the child's route and check that nothing else is opening there.

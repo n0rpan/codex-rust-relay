@@ -38,6 +38,8 @@ pub struct SyncRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncResponse {
     pub latest_seq: u64,
+    #[serde(default)]
+    pub has_more: bool,
     pub entries: Vec<MemoryEntry>,
     pub stats: MergeStats,
 }
@@ -99,15 +101,33 @@ pub(crate) async fn handle(
 
 /// Apply an incoming sync request against `memory_path` and return the peer delta.
 pub fn apply_sync(memory_path: &Path, request: &SyncRequest) -> Result<SyncResponse, String> {
+    apply_sync_bounded(memory_path, request, MAX_SYNC_ENTRIES)
+}
+
+fn apply_sync_bounded(
+    memory_path: &Path,
+    request: &SyncRequest,
+    max_entries: usize,
+) -> Result<SyncResponse, String> {
     let store = MemoryStore::open(memory_path);
     let stats = store
         .merge_remote(&request.entries)
         .map_err(|e| e.to_string())?;
-    let (entries, latest_seq) = store
+    let (mut entries, store_seq) = store
         .export_peer_since(request.since_seq)
         .map_err(|e| e.to_string())?;
+    let has_more = entries.len() > max_entries;
+    if has_more {
+        entries.truncate(max_entries);
+    }
+    let latest_seq = if has_more {
+        entries.last().map_or(request.since_seq, |e| e.seq)
+    } else {
+        store_seq
+    };
     Ok(SyncResponse {
         latest_seq,
+        has_more,
         entries,
         stats,
     })
