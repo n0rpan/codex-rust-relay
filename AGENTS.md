@@ -36,11 +36,9 @@ decides.
 
 - **Push per finished step, not per edit.** Each push cancels the run before
   it.
-- **Add `full-ci` last, and only when you would merge the change yourself.**
-  On a pull request from the maintainer's account that is not a draft, the
-  label also queues it for merge when green (`auto-queue.yml`). Keep the pull
-  request a draft if you want the full run without the merge. Use the label
-  when code, packaging or workflows changed; documentation does not need it.
+- **Add `full-ci` last, when the work is finished.** It costs about 40
+  minutes of runners on every later push. Use it when code, packaging or
+  workflows changed; documentation does not need it.
 - **Do not merge, enqueue, tag or change repository settings** unless the
   maintainer asked for that action.
 - **A red check is yours until you have shown otherwise.** Read the log. If the
