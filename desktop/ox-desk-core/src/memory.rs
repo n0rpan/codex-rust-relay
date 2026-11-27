@@ -44,6 +44,47 @@ fn is_local_inference_alias(alias: &str) -> bool {
 /// Build the Tier-1 pinned memory brief to attach once on the first turn of a session or worker.
 ///
 /// Returns `None` if no eligible pinned memories exist or if the store cannot be read.
+/// Maximum UTF-8 bytes for the rendered Tier-1 brief body so that
+/// `sender_context + brief + recall hint` always fits inside Claude's 2048-byte context limit,
+/// even for multibyte CJK/emoji text.
+pub const MAX_BRIEF_BYTES: usize = 1400;
+
+const RECALL_HINT: &str =
+    "(Use recall_ox_memory for additional saved preferences or project facts.)";
+
+fn fit_utf8_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for line in text.lines() {
+        let sep = if out.is_empty() { 0 } else { 1 };
+        if out.len() + sep + line.len() <= max_bytes {
+            if sep == 1 {
+                out.push('\n');
+            }
+            out.push_str(line);
+        } else {
+            break;
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+    // Single line exceeded max_bytes: truncate cleanly on a UTF-8 char boundary.
+    let budget = max_bytes.saturating_sub('…'.len_utf8());
+    let mut end = 0;
+    for (idx, ch) in text.char_indices() {
+        if idx + ch.len_utf8() > budget {
+            break;
+        }
+        end = idx + ch.len_utf8();
+    }
+    let mut truncated = text[..end].to_string();
+    truncated.push('…');
+    truncated
+}
+
 pub fn first_turn_brief(config: &MemoryConfig, project: &Path, route: &Route) -> Option<String> {
     if let Some(override_brief) = config
         .brief_override
@@ -51,10 +92,9 @@ pub fn first_turn_brief(config: &MemoryConfig, project: &Path, route: &Route) ->
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        let capped: String = override_brief.chars().take(DEFAULT_BRIEF_CHARS).collect();
-        return Some(format!(
-            "{capped}\n(Use recall_ox_memory for additional saved preferences or project facts.)"
-        ));
+        let char_capped: String = override_brief.chars().take(DEFAULT_BRIEF_CHARS).collect();
+        let byte_capped = fit_utf8_bytes(&char_capped, MAX_BRIEF_BYTES);
+        return Some(format!("{byte_capped}\n{RECALL_HINT}"));
     }
 
     let store = MemoryStore::open(&config.store_path);
@@ -68,9 +108,8 @@ pub fn first_turn_brief(config: &MemoryConfig, project: &Path, route: &Route) ->
             DEFAULT_BRIEF_CHARS,
         )
         .ok()??;
-    Some(format!(
-        "{brief}\n(Use recall_ox_memory for additional saved preferences or project facts.)"
-    ))
+    let byte_capped = fit_utf8_bytes(&brief, MAX_BRIEF_BYTES);
+    Some(format!("{byte_capped}\n{RECALL_HINT}"))
 }
 
 #[cfg(test)]
@@ -158,5 +197,48 @@ mod tests {
         let brief =
             first_turn_brief(&override_cfg, dir.path(), &Route::CODEX_SUBSCRIPTION).unwrap();
         assert!(brief.contains("Custom brief."));
+    }
+
+    #[test]
+    fn multibyte_brief_fits_within_claude_context_byte_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("memory.json");
+        let store = MemoryStore::open(&store_path);
+        // Two ~400-char CJK entries (~2400 bytes total) would exceed 2048 bytes without byte capping
+        let cjk1 = "あ".repeat(380);
+        let cjk2 = "い".repeat(380);
+        store
+            .upsert(NewMemory {
+                id: None,
+                scope: Scope::Global,
+                kind: Kind::RoutingPolicy,
+                sensitivity: Sensitivity::Private,
+                text: cjk1,
+                tags: vec![],
+                pin: true,
+                source_host: "host-a".into(),
+            })
+            .unwrap();
+        store
+            .upsert(NewMemory {
+                id: None,
+                scope: Scope::Global,
+                kind: Kind::Preference,
+                sensitivity: Sensitivity::Private,
+                text: cjk2,
+                tags: vec![],
+                pin: true,
+                source_host: "host-a".into(),
+            })
+            .unwrap();
+
+        let cfg = MemoryConfig {
+            store_path,
+            host_id: "host-a".into(),
+            brief_override: None,
+        };
+        let rendered = first_turn_brief(&cfg, dir.path(), &Runtime::Claude.route(None)).unwrap();
+        assert!(rendered.len() <= MAX_BRIEF_BYTES + RECALL_HINT.len() + 1);
+        assert!(rendered.ends_with(RECALL_HINT));
     }
 }

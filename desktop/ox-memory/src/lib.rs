@@ -333,6 +333,15 @@ pub fn default_host_id() -> String {
             return trimmed.to_string();
         }
     }
+    if let Ok(store_path) = default_store_path()
+        && let Some(dir) = store_path.parent()
+        && let Ok(host_id) = std::fs::read_to_string(dir.join("host-id"))
+    {
+        let trimmed = host_id.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
     if let Ok(hostname) = std::fs::read_to_string("/etc/hostname") {
         let trimmed = hostname.trim();
         if !trimmed.is_empty() {
