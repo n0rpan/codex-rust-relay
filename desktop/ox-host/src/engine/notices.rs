@@ -204,10 +204,13 @@ impl Engine {
         }
         if !updates.is_empty() {
             self.ledger.change(|d| {
-                for (origin, status, preview) in updates {
-                    d.worker_notices.observe(&origin, &status, &preview);
+                for (origin, status, preview) in &updates {
+                    d.worker_notices.observe(origin, status, preview);
                 }
             })?;
+            for (origin, status, _) in updates {
+                self.prepare_worker_result(&origin, &status);
+            }
         }
         Ok(())
     }

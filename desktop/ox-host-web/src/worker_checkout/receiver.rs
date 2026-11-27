@@ -310,6 +310,15 @@ async fn install(
             .as_os_str()
             .as_bytes()
             .to_vec();
+        let baseline =
+            ox_host_service::checkout::results::Baseline::read_checkout(&work, &saved.commit)?;
+        crate::worker_result::save_base(
+            stage.path(),
+            baseline,
+            mirror.registered(),
+            mirror.path(),
+            &req.repository,
+        )?;
         fs::rename(work, stage.path().join("checkout"))?;
         let f = fs::File::create(stage.path().join("receipt.json"))?;
         serde_json::to_writer(

@@ -4846,6 +4846,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rustix",
+ "serde",
  "sha2 0.10.9",
  "tempfile",
  "url",

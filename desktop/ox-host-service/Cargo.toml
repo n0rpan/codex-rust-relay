@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 libc = "0.2"
 sha2 = "0.10"
 rustix = { version = "1", features = ["fs"] }

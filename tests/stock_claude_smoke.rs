@@ -71,6 +71,8 @@ mod catalog;
 mod profile_snapshot;
 #[path = "../src/provider.rs"]
 mod provider;
+#[path = "../src/worker_placement.rs"]
+mod worker_placement;
 
 use std::collections::BTreeMap;
 use std::env;

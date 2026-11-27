@@ -40,6 +40,7 @@ pub(crate) enum Message {
     ProjectDirectory(wire::ProjectDirectory),
     HostsListed(PathBuf, Result<Value, String>),
     Outbound(Box<forwarding::Event>),
+    WorkerResult(u64, Box<Result<ox_host_web::worker_result::Report, String>>),
     LinkedJob(Box<ox_host_web::linked_jobs::VerifiedJob>, Replier),
     Gateway {
         caller: Caller,
@@ -323,6 +324,8 @@ pub(crate) struct Engine {
     cold: HashMap<Scope, ScopeState>,
     launched: u64,
     workers: Registry,
+    result_maintenance: Option<thread::JoinHandle<()>>,
+    worker_results: HashMap<u64, linked::ResultState>,
     receipts: Receipts,
     notice_attempts: HashMap<u64, Instant>,
     notice_history: HashMap<u64, notices::HistoryPage>,
@@ -413,6 +416,8 @@ impl Engine {
             cold,
             launched: 0,
             workers,
+            result_maintenance: None,
+            worker_results: Default::default(),
             receipts: Receipts::default(),
             notice_attempts: HashMap::new(),
             notice_history: HashMap::new(),
@@ -437,6 +442,7 @@ impl Engine {
         })
     }
     pub(crate) fn serve(&mut self, rx: Receiver<Message>) -> io::Result<()> {
+        self.recover_worker_results();
         // Mailbox messages served in a row while a timer was already overdue.
         let mut overdue_streak = 0u32;
         loop {
@@ -539,6 +545,8 @@ impl Engine {
                     if now >= self.next_reap {
                         self.next_reap = now + REAP_EVERY;
                         self.refresh_mode_policy()?;
+                        self.recover_worker_results();
+                        self.maintain_worker_results();
                         self.reap_idle(now)?;
                     }
                     self.poll_forwarded(now)?;
@@ -577,6 +585,16 @@ impl Engine {
                     self.hosts_listed(project, result)?
                 }
                 Some(Message::Outbound(event)) => self.outbound(*event)?,
+                Some(Message::WorkerResult(id, result)) => {
+                    let state = match *result {
+                        Ok(report) => linked::ResultState::Ready(report),
+                        Err(error) => linked::ResultState::Retry {
+                            error,
+                            after: Instant::now() + Duration::from_secs(60),
+                        },
+                    };
+                    self.worker_results.insert(id, state);
+                }
                 Some(Message::LinkedJob(job, reply)) => self.linked_job(*job, reply)?,
                 Some(Message::Gateway {
                     caller,
@@ -750,6 +768,7 @@ impl Engine {
                 capabilities.push("worker_inventory".into());
                 capabilities.push("worker_placement".into());
                 capabilities.push("linked_read_workers".into());
+                capabilities.push("linked_write_workers".into());
                 if prepared.is_some() {
                     capabilities.push("worker_routes_known".into());
                 }
@@ -1756,6 +1775,26 @@ impl Engine {
         self.mode_requests.retain(|_, request| {
             &request.scope != scope || !matches!(&request.activation, mode_requests::Activation::Resume(id) if !live.store.resume_held(id))
         });
+        // Record archival even if result preparation is still running. A restarted
+        // host can subsequently retire the published ref from this durable marker.
+        for (id, entry) in self.workers.in_scope(scope) {
+            if let Some(link) = &entry.origin.linked
+                && entry.origin.requested != Level::Read
+                && live.store.archived_threads().contains(id)
+            {
+                let job = self
+                    .state_dir
+                    .join("linked-work/jobs")
+                    .join(&link.host)
+                    .join(entry.origin.job_id.to_string());
+                if let Err(e) = ox_host_web::worker_result::archive(&job) {
+                    eprintln!(
+                        "ox host: could not record worker archival for job {}: {e}",
+                        entry.origin.job_id
+                    );
+                }
+            }
+        }
         let archived: HashSet<_> = self
             .mode_requests
             .values()
@@ -2339,11 +2378,6 @@ impl Engine {
         let ceiling = source.unwrap_or(crate::workers::TERMINAL_CEILING);
         let requested = resolved.level;
         let resolved = policy.child_start(resolved, start.mode_request(), ceiling, start.runtime);
-        if matches!(caller, Caller::Linked { .. })
-            && resolved.level != ox_desk_core::modes::Level::Read
-        {
-            return Err("This host version supports cross-host read workers. Choose read mode for this job.".into());
-        }
         let this_parent = crate::workers::parent_ref(caller, parent.clone());
         self.check_worker_cap(&this_parent)?;
         let project = ox_desk_core::worker_checkout::resolve(

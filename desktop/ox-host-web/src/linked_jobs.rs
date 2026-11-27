@@ -28,9 +28,14 @@ use std::{
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Start {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        results: Option<crate::worker_result::Policy>,
         parent: ParentRef,
         level: Level,
         start: Box<WorkerStart>,
+    },
+    ReleaseResult {
+        commit: String,
     },
     Control {
         call: ParentCall,
@@ -196,6 +201,7 @@ mod tests {
             session: Some("fixture-parent".into()),
         };
         let start = request(Operation::Start {
+            results: None,
             parent,
             level: Level::Yolo,
             start: Box::new(start),

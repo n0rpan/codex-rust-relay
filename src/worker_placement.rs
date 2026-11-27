@@ -12,7 +12,7 @@ pub struct Rule {
     pub os: Option<String>,
 }
 
-pub fn rule(project: &Path, name: Option<&str>) -> Result<Rule, String> {
+pub fn document(project: &Path) -> Result<Option<toml_edit::Document<String>>, String> {
     let root = project
         .ancestors()
         .find(|p| p.join(".git").exists())
@@ -23,20 +23,17 @@ pub fn rule(project: &Path, name: Option<&str>) -> Result<Rule, String> {
         .map(|p| p.join("codeox.toml"))
         .find(|p| p.exists())
         .unwrap_or_else(|| project.join("codeox.toml"));
-    let missing = || match name {
-        Some(name) if name != "default" => Err(format!(
-            "No [workers.placement] rule named {name:?} in {}.",
-            path.display()
-        )),
-        _ => Ok(Rule::default()),
-    };
+    read_document(&path)
+}
+
+pub fn read_document(path: &Path) -> Result<Option<toml_edit::Document<String>>, String> {
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
-        .open(&path)
+        .open(path)
     {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return missing(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("Cannot read {}: {e}", path.display())),
     };
     if !file.metadata().map_err(|e| e.to_string())?.is_file() {
@@ -51,6 +48,45 @@ pub fn rule(project: &Path, name: Option<&str>) -> Result<Rule, String> {
     }
     let doc = toml_edit::Document::parse(text)
         .map_err(|_| format!("Invalid TOML in {}.", path.display()))?;
+    Ok(Some(doc))
+}
+pub const RESULT_DEFAULTS: (&str, u32) = ("branch", 30);
+pub fn result_settings(
+    workers: Option<&toml_edit::Item>,
+    defaults: (&'static str, u32),
+) -> Result<(&'static str, u32), String> {
+    let destination = match workers.and_then(|w| w.get("results")) {
+        None => defaults.0,
+        Some(item) => match item.as_str() {
+            Some("branch") => "branch",
+            Some("ref") => "ref",
+            Some("tailnet") => "tailnet",
+            _ => return Err("workers.results must be branch, ref or tailnet.".into()),
+        },
+    };
+    let days = workers
+        .and_then(|w| w.get("result_max_age_days"))
+        .map(|v| {
+            v.as_integer()
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .ok_or("workers.result_max_age_days must be a positive number of days.")
+        })
+        .transpose()?
+        .unwrap_or(defaults.1);
+    Ok((destination, days))
+}
+pub fn rule(project: &Path, name: Option<&str>) -> Result<Rule, String> {
+    let missing = || match name {
+        Some(name) if name != "default" => Err(format!(
+            "No [workers.placement] rule named {name:?} in {}.",
+            project.display()
+        )),
+        _ => Ok(Rule::default()),
+    };
+    let Some(doc) = document(project)? else {
+        return missing();
+    };
     let Some(rules) = doc.get("workers").and_then(|w| w.get("placement")) else {
         return missing();
     };

@@ -529,6 +529,10 @@ fn start_listener(app: App, origin: String, listener: TcpListener) -> Listener {
             "/api/worker-checkout",
             get(crate::worker_checkout::receiver::upgrade),
         )
+        .route(
+            "/api/worker-result",
+            get(crate::worker_result::transport::upgrade),
+        )
         .route("/api/push", post(subscribe))
         .route("/api/weather", post(weather::weather))
         .route("/api/operator", get(operator::upgrade))

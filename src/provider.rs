@@ -854,8 +854,12 @@ fn parse_workers(item: &Item) -> Result<(WorkersHost, Vec<std::path::PathBuf>), 
     let table = item
         .as_table()
         .ok_or("`workers` must be a table of worker settings")?;
+    crate::worker_placement::result_settings(Some(item), crate::worker_placement::RESULT_DEFAULTS)?;
     for key in table.iter().map(|(key, _)| key) {
-        if key != "host" && key != "yolo_grant_projects" {
+        if !matches!(
+            key,
+            "host" | "yolo_grant_projects" | "results" | "result_max_age_days" | "placement"
+        ) {
             return Err(format!("workers.{key} is not a recognized setting").into());
         }
     }

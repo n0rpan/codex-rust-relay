@@ -37,6 +37,18 @@ pub(crate) struct Job {
     recovered: bool,
     #[serde(default)]
     cancel_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    changes: Option<ox_host_web::worker_result::Local>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    changes_error: Option<String>,
+    #[serde(default)]
+    changes_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repository: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_branch: Option<String>,
 }
 impl Job {
     pub(super) fn owned(&self, me: &Resolved) -> bool {
@@ -71,11 +83,78 @@ impl Job {
         if self.recovered {
             v["checkout_recovered"] = true.into();
         }
+        if let Some(r) = &self.changes {
+            v["worker_changes"] = json!(r);
+        }
+        if self.changes_pending {
+            v["worker_changes_pending"] = true.into();
+        }
+        if let Some(error) = &self.changes_error {
+            v["worker_changes_error"] = json!(error);
+        }
         if self.cancel_requested {
             v["cancellation_pending"] = true.into();
         }
         v
     }
+    fn collect_result(
+        &self,
+        host: &SavedHost,
+        req: &JobRequest,
+        view: &mut Value,
+        returns: &Path,
+    ) -> io::Result<()> {
+        let object = view
+            .as_object_mut()
+            .ok_or_else(|| io::Error::other("Invalid result response."))?;
+        // Only the parent may attach paths or ref names from its own checkout.
+        object.remove("worker_changes");
+        let Some(raw) = object.remove("change_result") else {
+            return Ok(());
+        };
+        let report: ox_host_web::worker_result::Report = serde_json::from_value(raw)?;
+        if self.checkout.as_deref() != Some(&report.summary.snapshot)
+            || view["job_id"] != req.job
+            || !view["status"].as_str().is_some_and(super::linked::terminal)
+        {
+            return Err(io::Error::other(
+                "The worker result does not match the submitted snapshot or job.",
+            ));
+        }
+        if let Some(previous) = &self.changes {
+            if previous.report != report {
+                return Err(io::Error::other("The worker returned conflicting results."));
+            }
+            return Ok(());
+        }
+        let project = self
+            .project
+            .as_deref()
+            .ok_or_else(|| io::Error::other("This job has no source checkout."))?;
+        let repo = self
+            .repository
+            .as_deref()
+            .ok_or_else(|| io::Error::other("This job has no repository identity."))?;
+        match ox_host_web::worker_result::collect(host, req, &report, project, repo, returns) {
+            Ok(local) => view["worker_changes"] = json!(local),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::AlreadyExists | io::ErrorKind::InvalidInput
+                ) =>
+            {
+                view["worker_changes_error"] = json!(e.to_string())
+            }
+            Err(e) => {
+                view["worker_changes_error"] = json!(format!(
+                    "The worker finished. Receiving its changes will retry: {e}"
+                ));
+                view["worker_changes_pending"] = true.into();
+            }
+        }
+        Ok(())
+    }
+
     fn destination(&self, registry: &Path) -> io::Result<SavedHost> {
         let peers = paired_hosts::worker_links(registry)?;
         peers.into_iter().find(|host|host.id==self.host && host.pairing_id()==self.pairing).ok_or_else(|| {
@@ -104,6 +183,8 @@ pub(crate) enum Kind {
 }
 
 pub(super) fn recover(ledger: &Ledger, state: &Path) -> io::Result<()> {
+    // The owning engine has not started any return downloads yet.
+    ox_host_web::worker_result::discard_stages(&state.join("linked-work/returns"), &[".return-"])?;
     let queue = state.join("linked-work/outgoing/requests");
     let entries = match fs::read_dir(queue) {
         Ok(entries) => entries,
@@ -191,11 +272,38 @@ impl Engine {
             checkout: None,
             recovered: false,
             cancel_requested: false,
+            changes: None,
+            changes_error: None,
+            changes_pending: false,
+            source_branch: ox_host_service::checkout::results::source_branch(&project),
+            project: Some(project.clone()),
+            repository: ox_host_service::checkout::repository_id(&project),
         };
         let queue = queue_path(&self.state_dir, &saved.request);
+        use crate::worker_placement::{RESULT_DEFAULTS, document, read_document, result_settings};
+        let home = std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")));
+        let global = home
+            .map(|dir| read_document(&dir.join("codeox.toml")))
+            .transpose()?
+            .flatten();
+        let defaults = result_settings(
+            global.as_ref().and_then(|d| d.get("workers")),
+            RESULT_DEFAULTS,
+        )?;
+        let doc = document(&project)?;
+        let (dest, max_age_days) =
+            result_settings(doc.as_ref().and_then(|d| d.get("workers")), defaults)?;
+        let destination = serde_json::from_value(json!(dest)).map_err(|e| e.to_string())?;
         Pending {
+            policy: Some(ox_host_web::worker_result::Policy {
+                destination,
+                max_age_days,
+            }),
             project,
             operation: Operation::Start {
+                results: None,
                 parent: parent_ref,
                 level,
                 start: Box::new(start),
@@ -225,15 +333,24 @@ impl Engine {
         self.forward.preparing.insert(id, stop.clone());
         thread::spawn(move || {
             let prepare = || -> io::Result<_> {
-                let p = Pending::load(&queue)?;
+                let mut p = Pending::load(&queue)?;
                 let host = j.destination(&registry)?;
-                let Operation::Start { start, level, .. } = &p.operation else {
+                let Operation::Start {
+                    start,
+                    level,
+                    results,
+                    ..
+                } = &mut p.operation
+                else {
                     return Err(io::Error::other("Invalid queued worker request."));
                 };
                 if !queue.join("snapshot").is_dir() {
-                    ox_host_web::inventory::check_launch(
+                    if ox_host_web::inventory::check_launch(
                         &host, &source, &p.project, start, *level,
-                    )?;
+                    )? {
+                        *results = Some(p.policy.clone().unwrap_or_default());
+                    }
+                    ox_desk_core::state_file::write_json(&queue.join("start.json"), &p)?;
                 }
                 let sender = ox_host_web::worker_checkout::Sender {
                     host: &host,
@@ -329,6 +446,7 @@ impl Engine {
             if !j.active() {
                 j.awaiting_start = false;
                 j.sync_notices = false;
+                j.changes_pending = false;
                 j.cancel_requested = false;
             }
             if !matches!(status, "starting" | "preparing") {
@@ -362,21 +480,100 @@ impl Engine {
         };
         self.forward.busy.insert(id);
         let tx = self.tx.clone();
+        let returns = self.state_dir.join("linked-work/returns");
         thread::spawn(move || {
-            let result = j
-                .destination(&registry)
-                .and_then(|host| linked_jobs::send(&host, &req));
+            let result = j.destination(&registry).and_then(|host| {
+                let mut result = linked_jobs::send(&host, &req)?;
+                if let Ok(view) = &mut result {
+                    j.collect_result(&host, &req, view, &returns)?;
+                }
+                Ok(result)
+            });
             let _ = tx.send(Message::Outbound(Box::new(Event::Reply(
                 id, kind, reply, result,
             ))));
         });
     }
+    pub(super) fn maintain_worker_results(&mut self) {
+        if self
+            .result_maintenance
+            .as_ref()
+            .is_some_and(|t| !t.is_finished())
+        {
+            return;
+        }
+        let root = self.state_dir.join("linked-work");
+        let registry = self.state_dir.join("worker-links.json");
+        let source = self.host_id.to_string();
+        let jobs: Vec<_> = self
+            .ledger
+            .data
+            .forwarded
+            .values()
+            .filter(|j| {
+                j.changes
+                    .as_ref()
+                    .is_some_and(|r| r.report.remote_ref.is_some())
+            })
+            .cloned()
+            .collect();
+        self.result_maintenance = Some(thread::spawn(move || {
+            for j in jobs {
+                let Some(local) = &j.changes else { continue };
+                let marker = root
+                    .join("returns")
+                    .join(j.request.to_string())
+                    .join("cleanup-ack");
+                if marker.exists() {
+                    continue;
+                }
+                let Some(project) = &j.project else { continue };
+                let Some(branch) = &j.source_branch else {
+                    continue;
+                };
+                if ox_host_service::checkout::repository_id(project) != j.repository
+                    || !ox_host_service::checkout::results::merged(
+                        project,
+                        branch,
+                        &local.report.summary.commit,
+                    )
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let req = JobRequest {
+                    source: source.clone(),
+                    target: j.host.clone(),
+                    request_id: j.request.to_string(),
+                    job: j.origin.job_id,
+                    acknowledged: j.cursor,
+                    operation: Operation::ReleaseResult {
+                        commit: local.report.summary.commit.clone(),
+                    },
+                };
+                if j.destination(&registry)
+                    .and_then(|h| linked_jobs::send(&h, &req))
+                    .is_ok_and(|v| v.is_ok_and(|reply| reply["released"] == true))
+                {
+                    // A lost local marker only repeats the idempotent release.
+                    let _ = fs::write(marker, []);
+                }
+            }
+            if let Err(e) = ox_host_web::worker_result::sweep(&root.join("jobs")) {
+                eprintln!("ox host: could not inspect worker refs for cleanup: {e}");
+            }
+        }));
+    }
+
     pub(super) fn forward_deadline(&self) -> Option<Instant> {
         self.ledger
             .data
             .forwarded
             .iter()
-            .filter(|(id, j)| (j.active() || j.sync_notices) && !self.forward.busy.contains(id))
+            .filter(|(id, j)| {
+                (j.active() || j.sync_notices || j.changes_pending)
+                    && !self.forward.busy.contains(id)
+            })
             .map(|(id, _)| {
                 self.forward
                     .next
@@ -393,7 +590,7 @@ impl Engine {
             .forwarded
             .iter()
             .filter(|(id, j)| {
-                (j.active() || j.sync_notices)
+                (j.active() || j.sync_notices || j.changes_pending)
                     && !self.forward.busy.contains(id)
                     && self.forward.next.get(id).is_none_or(|at| *at <= now)
             })
@@ -467,19 +664,61 @@ impl Engine {
                 return Ok(Ok(job.summary()));
             }
         }
+        let local = view
+            .get("worker_changes")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
         self.ledger.change(|d| {
             let j = d.forwarded.get_mut(&id).unwrap();
+            let recovered = j.changes_error.is_some() && j.changes.is_none() && local.is_some();
+            j.changes_pending = view["worker_changes_pending"] == true;
+            if local.is_some() {
+                j.changes_error = None;
+                j.changes = local;
+            }
+            if let Some(error) = view["worker_changes_error"].as_str() {
+                j.changes_error = Some(error.into());
+            }
             let old = j.cursor;
             for n in notices {
                 if n.job == id && n.id > j.cursor {
-                    d.worker_notices.observe_on(
-                        &j.origin,
-                        &n.status,
-                        &format!("Worker on {}. {}", j.name, n.preview),
-                        Some(&j.name),
-                    );
+                    let mut preview = format!("Worker on {}. ", j.name);
+                    if super::linked::terminal(&n.status) {
+                        if let Some(local) = &j.changes {
+                            preview.push_str(&format!(
+                                "{} {}. ",
+                                local.reference, local.report.summary.diffstat
+                            ));
+                            if let Some(note) = &local.report.note {
+                                preview.push_str(note);
+                                preview.push(' ');
+                            }
+                        }
+                        if let Some(error) = &j.changes_error {
+                            preview.push_str(error);
+                            preview.push(' ');
+                        }
+                    }
+                    preview.push_str(&n.preview);
+                    d.worker_notices
+                        .observe_on(&j.origin, &n.status, &preview, Some(&j.name));
                     j.cursor = n.id;
                 }
+            }
+            if recovered
+                && old == j.cursor
+                && let Some(changes) = &j.changes
+            {
+                let message = format!(
+                    "Worker on {}. {} {}. {}",
+                    j.name,
+                    changes.reference,
+                    changes.report.summary.diffstat,
+                    changes.report.note.as_deref().unwrap_or("")
+                );
+                d.worker_notices
+                    .observe_on(&j.origin, "changes_ready", &message, Some(&j.name));
             }
             j.sync_notices = kind == Kind::Start || j.cursor != old || view["more_notices"] == true;
             j.awaiting_start = false;
@@ -493,6 +732,11 @@ impl Engine {
                     .observe_on(&j.origin, status, &j.message, Some(&j.name));
             }
         })?;
+        if view["worker_changes_pending"] == true && view["worker_changes_error"].is_string() {
+            self.forward
+                .next
+                .insert(id, Instant::now() + Duration::from_secs(60));
+        }
         let mut view = view;
         if let Some(o) = view.as_object_mut() {
             o.remove("linked_notices");

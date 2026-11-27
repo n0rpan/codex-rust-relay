@@ -10,7 +10,7 @@ use tokio_tungstenite::tungstenite;
 const HEARTBEAT: Duration = Duration::from_secs(15);
 pub(super) const IDLE: Duration = Duration::from_secs(90);
 
-pub(super) trait Frame: Send + 'static {
+pub(crate) trait Frame: Send + 'static {
     fn ping() -> Self;
     fn is_heartbeat(&self) -> bool;
 }
@@ -31,7 +31,7 @@ impl Frame for axum::extract::ws::Message {
     }
 }
 type Outbound<M> = (M, oneshot::Sender<()>);
-pub(super) struct Connection<M> {
+pub(crate) struct Connection<M> {
     out: mpsc::Sender<Outbound<M>>,
     incoming: mpsc::Receiver<M>,
     task: tokio::task::JoinHandle<()>,

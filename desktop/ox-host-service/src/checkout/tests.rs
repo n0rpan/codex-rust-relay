@@ -532,3 +532,193 @@ fn sparse_and_assume_unchanged_files_keep_their_actual_state_and_source_flags() 
     assert_eq!(fs::read(job.join("other/data")).unwrap(), b"base");
     assert_eq!(fs::read(src.join(".git/index")).unwrap(), index);
 }
+
+#[test]
+fn write_results_keep_dirty_parent_and_private_inputs_and_publish_create_only() {
+    use results::{Baseline, Destination, Frozen, import, publish_checkout};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let parent = root.join("parent");
+    repo(&parent);
+    fs::write(parent.join("src"), "base\n").unwrap();
+    run(git(&parent).args(["add", "src"])).unwrap();
+    run(git(&parent).args(["commit", "-qm", "base"])).unwrap();
+    let base = object(&parent, "HEAD").unwrap();
+    let remote = root.join("bare origin.git");
+    run(git(root)
+        .args(["clone", "--bare", "--"])
+        .arg(&parent)
+        .arg(&remote))
+    .unwrap();
+    run(git(&parent).args(["remote", "add", "origin"]).arg(&remote)).unwrap();
+    fs::write(parent.join("src"), "dirty source\n").unwrap();
+    fs::write(parent.join("private input"), "local content").unwrap();
+    let sent = Snapshot::capture(root, &parent, std::slice::from_ref(&base)).unwrap();
+    let work = receive(root, 73, &remote, sent.open().unwrap()).unwrap();
+    let baseline = Baseline::read_checkout(&work, &sent.commit).unwrap();
+    fs::write(work.join("src"), "worker edit\n").unwrap();
+    run(git(&work).args(["add", "src"])).unwrap();
+    run(git(&work).args([
+        "-c",
+        "user.name=Worker",
+        "-c",
+        "user.email=w@localhost",
+        "commit",
+        "-qm",
+        "work",
+    ]))
+    .unwrap();
+    fs::write(work.join("new file"), "also return this").unwrap();
+    run(git(&work).args(["add", "new file"])).unwrap();
+    fs::write(work.join("unstaged file"), "only over link").unwrap();
+    use std::io::Write;
+    writeln!(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(work.join(".git/info/exclude"))
+            .unwrap(),
+        "/scratch.log"
+    )
+    .unwrap();
+    fs::write(work.join("scratch.log"), "ignore me").unwrap();
+    fs::write(work.join("private input"), "private edit").unwrap();
+    let frozen = Frozen::capture(root, &work, &baseline, &[]).unwrap();
+    assert_eq!(frozen.summary.snapshot, sent.commit);
+    assert!(
+        frozen.summary.diffstat.contains("2 files changed"),
+        "{:?}",
+        frozen.summary
+    );
+    let clean = receive_result(
+        root,
+        74,
+        frozen.packet.open().unwrap(),
+        &frozen.summary.commit,
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(clean.join("private input")).unwrap(),
+        b"private edit"
+    );
+    assert_eq!(
+        fs::read(clean.join("unstaged file")).unwrap(),
+        b"only over link"
+    );
+    assert!(!clean.join("scratch.log").exists());
+    let checkout = run(git(&clean).args(["ls-tree", "--name-only", "HEAD"])).unwrap();
+    assert_eq!(checkout, b"new file\nsrc\n");
+    for dest in [Destination::Branch, Destination::Ref] {
+        let name = dest.reference(73).unwrap();
+        let mut fingerprint = String::new();
+        for _ in 0..2 {
+            fingerprint =
+                publish_checkout(&clean, &parent, &baseline, 73, dest, &frozen.summary).unwrap();
+            assert_eq!(object(&remote, &name).unwrap(), frozen.summary.commit);
+        }
+        assert!(
+            results::retire(
+                &parent,
+                &remote,
+                73,
+                dest,
+                &frozen.summary.commit,
+                "changed-url"
+            )
+            .is_err()
+        );
+        results::retire(
+            &parent,
+            &remote,
+            73,
+            dest,
+            &frozen.summary.commit,
+            &fingerprint,
+        )
+        .unwrap();
+        assert!(object(&remote, &name).is_err());
+        results::retire(
+            &parent,
+            &remote,
+            73,
+            dest,
+            &frozen.summary.commit,
+            &fingerprint,
+        )
+        .unwrap();
+        run(git(&remote).args(["update-ref", &name, &base])).unwrap();
+        assert!(publish_checkout(&clean, &parent, &baseline, 73, dest, &frozen.summary).is_err());
+        results::retire(
+            &parent,
+            &remote,
+            73,
+            dest,
+            &frozen.summary.commit,
+            &fingerprint,
+        )
+        .unwrap();
+        assert_eq!(object(&remote, &name).unwrap(), base);
+    }
+    let index = fs::read(parent.join(".git/index")).unwrap();
+    fs::write(parent.join(".git/FETCH_HEAD"), "preserve").unwrap();
+    for _ in 0..2 {
+        let r = import(&parent, &clean, 73, &frozen.summary).unwrap();
+        assert_eq!(object(&parent, &r).unwrap(), frozen.summary.commit);
+    }
+    let reference = "refs/ox/jobs/73/result";
+    run(git(&parent).args(["update-ref", reference, &base])).unwrap();
+    let collision = import(&parent, &clean, 73, &frozen.summary).unwrap_err();
+    assert_eq!(collision.kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(object(&parent, reference).unwrap(), base);
+    assert_eq!(fs::read(parent.join(".git/index")).unwrap(), index);
+    assert_eq!(object(&parent, "HEAD").unwrap(), base);
+    assert_eq!(
+        fs::read(parent.join(".git/FETCH_HEAD")).unwrap(),
+        b"preserve"
+    );
+    assert_eq!(fs::read(parent.join("src")).unwrap(), b"dirty source\n");
+    assert_eq!(
+        fs::read(parent.join("private input")).unwrap(),
+        b"local content"
+    );
+    run(git(&work).args(["add", "-f", "private input"])).unwrap();
+    run(git(&work).args([
+        "-c",
+        "user.name=Worker",
+        "-c",
+        "user.email=w@localhost",
+        "commit",
+        "-qm",
+        "forced",
+    ]))
+    .unwrap();
+    run(git(&work).args(["rm", "private input"])).unwrap();
+    run(git(&work).args([
+        "-c",
+        "user.name=Worker",
+        "-c",
+        "user.email=w@localhost",
+        "commit",
+        "-qm",
+        "removed",
+    ]))
+    .unwrap();
+    let private = Frozen::capture(root, &work, &baseline, &[]).unwrap();
+    let clean = receive_result(
+        root,
+        75,
+        private.packet.open().unwrap(),
+        &private.summary.commit,
+    )
+    .unwrap();
+    let err = publish_checkout(
+        &clean,
+        &parent,
+        &baseline,
+        75,
+        Destination::Branch,
+        &private.summary,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("private input"), "{err}");
+    assert!(object(&remote, "refs/heads/ox/75").is_err());
+}

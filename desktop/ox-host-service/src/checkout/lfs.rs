@@ -21,6 +21,9 @@ struct Pointer {
     sha: String,
     size: u64,
 }
+pub(super) fn is_pointer(bytes: &[u8]) -> bool {
+    pointer(bytes).is_some()
+}
 fn pointer(text: &[u8]) -> Option<Pointer> {
     let mut lines = std::str::from_utf8(text).ok()?.lines();
     if lines.next()? != "version https://git-lfs.github.com/spec/v1" {

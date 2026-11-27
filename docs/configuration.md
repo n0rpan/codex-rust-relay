@@ -844,7 +844,23 @@ heavy = "label:big"
 os = "linux"
 ```
 
-A worker with `placement: "heavy"` uses the named rule. A launch without an explicit host or hardware request uses the default rule, then falls back to the parent when the project has no rule. An OS-only rule prefers the parent if eligible. The sheet shows **Project rule** alongside the explicit choices when the project sets a default host or OS. A rule naming a remote host authorizes sending the tracked snapshot and non-ignored, untracked inputs to that paired host. An unmet choice reports why it failed. Cross-host launches currently support read mode.
+A worker with `placement: "heavy"` uses the named rule. A launch without an explicit host or hardware request uses the default rule, then falls back to the parent when the project has no rule. An OS-only rule prefers the parent if eligible. The sheet shows **Project rule** alongside the explicit choices when the project sets a default host or OS. A rule naming a remote host authorizes sending the tracked snapshot and non-ignored, untracked inputs to that paired host. An unmet choice reports why it failed. A writable remote job needs a target that supports write results. Its existing link grant and host policy determine the effective permission.
+
+Set the result destination in the project’s `codeox.toml`. Values you omit inherit your `$CODEX_HOME/codeox.toml` settings.
+
+```toml
+[workers]
+results = "branch"
+result_max_age_days = 30
+```
+
+* **branch** creates `ox/<job>` on the target checkout’s origin, so branch CI can run. This is the default.
+* **ref** creates `refs/ox/jobs/<job>/result` on that origin.
+* **tailnet** keeps the entire exchange on your two hosts.
+
+Branch and ref publication include the tracked snapshot you launched from, including local commits and uncommitted tracked edits. Stage or commit a new file in the worker to publish it. Other new, non-ignored files and transferred private inputs come back in an isolated checkout on the parent host. A refused push, a conflicting ref, or an unverified LFS or submodule dependency returns the result over the paired link. The job status gives the reason.
+
+When the parent reconnects, its job status shows the local result ref, commit, diff stat and private checkout path. Inspect the ref with `git show refs/ox/jobs/<job>/result`, then merge or cherry-pick when ready. OX retires its origin ref after a merge into the original source branch, archival of the worker on the target, or the configured age. A ref someone has moved remains theirs. Failed, interrupted and cancelled jobs return partial work privately. The published ref records the original job. If you continue its session on the target, those later edits stay in its checkout.
 
 ### Continue a session in another runtime, route or model
 

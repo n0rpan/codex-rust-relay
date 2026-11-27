@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import subprocess
 
 from browser import admin, wait, managed_server
 from native_client import session_host
@@ -64,7 +65,7 @@ def parent_restart(root, project, target, tls_env, restart_target):
             }
         )
 
-    def launch(name=None, **placement):
+    def launch(name=None, task="linked-parent-offline-fixture. Read tracked.", **placement):
         return exchange(
             {
                 "type": "worker_launch",
@@ -78,7 +79,7 @@ def parent_restart(root, project, target, tls_env, restart_target):
                     "permission": "read",
                     "host": name,
                     **placement,
-                    "task": "linked-parent-offline-fixture. Read tracked.",
+                    "task": task,
                 },
             }
         )
@@ -123,7 +124,19 @@ def parent_restart(root, project, target, tls_env, restart_target):
         assert "4000000000 GB" in refusal, refusal
         receiver = Path(tls_env["OX_TEST_NATIVE_DIR"])
         (receiver / "hold-start").touch()
-        result = launch("label:fixture-build")
+        # Only a disposable origin receives the CI branch. The registered checkout
+        # retains its fixture fetch URL for repository identity and mirror negotiation.
+        registered = Path(tls_env["OX_TEST_NATIVE_DIR"]) / "build-checkout"
+        bare = root / "build-origin.git"
+        def git(path, *args):
+            return subprocess.check_output(["git", "-C", str(path), *map(str,args)])
+        git(root, "clone", "--bare", "--", registered, bare)
+        git(registered, "config", "remote.origin.pushurl", bare)
+        index = git(project, "diff", "--cached")
+        original = git(project, "rev-parse", "HEAD")
+        result = launch("label:fixture-build", permission="write",
+                        task="linked-parent-offline-fixture linked-write-fixture. Read tracked and create worker-output.")
+
         assert result.get("result") and result["result"]["status"] == "preparing", result
         job = result["result"]["job_id"]
         wait(lambda: (receiver / "start-rejected").exists(), 45)
@@ -146,6 +159,12 @@ def parent_restart(root, project, target, tls_env, restart_target):
         assert "Unknown worker job" in other["error"], other
     # The real target finishes its native turn while the parent host is entirely stopped.
     (receiver / "release-request").touch()
+    result_ref = f"refs/heads/ox/{job}"
+    def published():
+        result = subprocess.run(["git", "-C", str(bare), "rev-parse", "--verify", "--quiet", result_ref],
+                                capture_output=True, text=True)
+        return result.stdout.strip() if result.returncode == 0 else None
+    published_commit = wait(published, 45)
     with ExitStack() as second:
         from http.server import ThreadingHTTPServer
         from stock_session import Fixture
@@ -189,6 +208,20 @@ def parent_restart(root, project, target, tls_env, restart_target):
         assert "uncommitted on laptop" in final["result"], final
         assert final["worker_host"]["id"] == peer["id"]
         assert final["snapshot_commit"]
+        changes = final["worker_changes"]
+        assert changes["report"]["summary"]["commit"] == published_commit, changes
+        assert changes["report"]["remote_ref"] == result_ref, changes
+        assert changes["received_bytes"] == changes["report"]["increment"]["bytes"], changes
+        assert changes["received_bytes"] < 1_000_000 < changes["report"]["bytes"], changes
+        assert changes["reference"] == f"refs/ox/jobs/{job}/result", changes
+        assert git(project, "rev-parse", changes["reference"]).decode().strip() == published_commit
+        assert git(project, "show", published_commit + ":nested/tracked") == b"from worker\n"
+        assert git(bare, "ls-tree", "-r", "--name-only", published_commit).splitlines().count(b"nested/input") == 0
+        assert (Path(changes["checkout"]) / "nested/input").read_bytes() == (project / "input").read_bytes()
+        assert git(project, "rev-parse", "HEAD") == original and git(project, "diff", "--cached") == index
+        assert (Path(changes["checkout"]) / "nested/worker-output").read_text() == "private\n"
+        assert not (project / "worker-output").exists()
+        print("PASS write worker publishes while parent is offline and returns its commit over the paired link", flush=True)
         (receiver / "malformed-notices").touch()
         wait(lambda: "incompatible worker notices" in (control(job, "status").get("error") or ""), 15)
         (receiver / "malformed-notices").unlink()
@@ -207,6 +240,21 @@ def parent_restart(root, project, target, tls_env, restart_target):
         )
         assert job in [x["job_id"] for x in listing["result"]["jobs"]]
         assert control(job, "cancel")["result"]["status"] == "completed"
+        # An unrelated project rule must inherit the user's private result policy.
+        with (cfg / "codeox.toml").open("a") as settings:
+            settings.write('\n[workers]\nresults="tailnet"\nresult_max_age_days=9\n')
+        private_job = launch("label:fixture-build", permission="write",
+                             task="linked-write-fixture. Read tracked and create worker-output.")["result"]["job_id"]
+        def private_result():
+            view = control(private_job, "status")
+            return (view.get("result") or {}).get("worker_changes")
+        private_change = wait(private_result,45)
+        assert private_change["report"]["remote_ref"] is None and private_change["report"]["note"] is None
+        assert git(project,"show",private_change["reference"]+":nested/tracked") == b"from worker\n"
+        assert git(bare,"for-each-ref","--format=%(refname)",f"refs/heads/ox/{private_job}") == b""
+        policy, = (target / "linked-work/jobs").glob(f"*/{private_job}/result-policy.json")
+        assert json.loads(policy.read_text()) == {"destination":"tailnet","max_age_days":9}
+        print("PASS global tailnet preference returns a write worker privately",flush=True)
         # A second job accepts control while the inference is in flight.
         (receiver / "request-received").unlink()
         (receiver / "release-request").unlink()

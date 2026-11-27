@@ -7,6 +7,7 @@ pub use identity::repository_id;
 mod lfs;
 pub use files::changed_private_inputs;
 mod mirror;
+pub mod results;
 mod shallow;
 mod submodules;
 pub use mirror::{Mirror, negotiate};
@@ -158,6 +159,7 @@ fn index_version(path: &Path) -> io::Result<Option<(u64, u64, i64, i64)>> {
 /// A self-contained staged transfer, backed by a private file. Drop removes it.
 pub struct Snapshot {
     _stage: TempDir,
+    result_objects: Option<TempDir>,
     archive: PathBuf,
     pub commit: String,
     pub bundle_bytes: u64,
@@ -178,7 +180,7 @@ pub struct Untracked {
 impl Snapshot {
     /// `known` are commit IDs already present in the target's mirror.
     pub fn capture(staging: &Path, project: &Path, known: &[String]) -> io::Result<Self> {
-        Self::capture_inner(staging, project, known, 0)
+        Self::capture_inner(staging, project, known, 0, None)
     }
 
     fn capture_inner(
@@ -186,6 +188,7 @@ impl Snapshot {
         project: &Path,
         known: &[String],
         depth: usize,
+        returning: Option<results::Inputs<'_>>,
     ) -> io::Result<Self> {
         submodules::check_depth(depth)?;
         let root = git_path(project, &["rev-parse", "--show-toplevel"])?;
@@ -216,6 +219,38 @@ impl Snapshot {
         fs::create_dir(&repo)?;
         bare(&repo, object_format(&root)?)?;
         alternate(&repo, &objects)?;
+        if let Some(inputs) = &returning {
+            // Result capture runs on the host after the worker stops. Only the host's
+            // own Git config/filter definitions are eligible to execute here.
+            if !project.symlink_metadata()?.is_dir()
+                || root != project.canonicalize()?
+                || objects.join("info/alternates").try_exists()?
+                || git_path(&root, &["rev-parse", "--absolute-git-dir"])? != root.join(".git")
+                || objects.canonicalize()? != root.join(".git/objects")
+                || index != root.join(".git/index")
+            {
+                return Err(io::Error::other(
+                    "The worker checkout Git directory moved. Its files remain on the target.",
+                ));
+            }
+            if let Some(head) = &base {
+                run(git(&repo).args(["update-ref", "HEAD", head]))?;
+            }
+            let mut excludes = File::create(repo.join("info/exclude"))?;
+            let exclude_path = root.join(".git/info/exclude");
+            if exclude_path.try_exists()? {
+                if exclude_path.canonicalize()? != exclude_path || !exclude_path.is_file() {
+                    return Err(io::Error::other(
+                        "Worker ignore rules must be a regular file in the checkout.",
+                    ));
+                }
+                io::copy(&mut File::open(exclude_path)?, &mut excludes)?;
+                writeln!(excludes)?;
+            }
+            for name in inputs.paths() {
+                files::exclude(&mut excludes, name.as_os_str().as_bytes())?;
+            }
+        }
         let boundaries = shallow::prepare(&root, &repo)?;
         let private_index = builder.path().join("index");
         let before = index_version(&index)?;
@@ -224,6 +259,12 @@ impl Snapshot {
         }
         let source = || {
             let mut cmd = git(&root);
+            if returning.is_some() {
+                cmd.arg("--git-dir")
+                    .arg(&repo)
+                    .arg("--work-tree")
+                    .arg(&root);
+            }
             cmd.env("GIT_INDEX_FILE", &private_index)
                 .env("GIT_OBJECT_DIRECTORY", repo.join("objects"))
                 .args(["-c", "core.splitIndex=false", "-c", "core.fsmonitor=false"]);
@@ -248,7 +289,9 @@ impl Snapshot {
         unresolved_paths.dedup();
         files::refresh_tracked_flags(&root, source)?;
         run(source().args(["add", "--update", "--sparse"]))?;
-        let modules = submodules::capture(&root, builder.path(), source, depth)?;
+        let private = returning.as_ref().map(|r| r.paths()).unwrap_or_default();
+        let modules =
+            submodules::capture(&root, builder.path(), source, depth, returning.as_ref())?;
         let tree = line(run(source().arg("write-tree"))?)?;
         let commit = if let Some(base) = &base
             && tree.as_bytes() == object(&root, &format!("{base}^{{tree}}"))?.as_bytes()
@@ -268,7 +311,12 @@ impl Snapshot {
             if let Some(parent) = &base {
                 make.args(["-p", parent]);
             }
-            let id = line(run(make.args(["-m", "OX worker checkout"]))?)?;
+            let message = if returning.is_some() {
+                "OX worker result"
+            } else {
+                "OX worker checkout"
+            };
+            let id = line(run(make.args(["-m", message]))?)?;
             oid(id.as_bytes())?.to_owned()
         };
         let bundle = builder.path().join("snapshot.bundle");
@@ -304,7 +352,26 @@ impl Snapshot {
             unresolved_paths.extend(module.unresolved_paths.iter().map(|path| name.join(path)));
         }
         let nested = submodules::pack(modules, &mut output)?;
-        let paths = run(source().args(["ls-files", "-z", "--others", "--exclude-standard"]))?;
+        let mut paths = run(source().args(["ls-files", "-z", "--others", "--exclude-standard"]))?;
+        if !private.is_empty() {
+            let tracked = run(source().args(["ls-files", "-z", "--cached"]))?;
+            let tracked: std::collections::HashSet<_> = tracked.split(|b| *b == 0).collect();
+            let already: std::collections::HashSet<Vec<u8>> =
+                paths.split(|b| *b == 0).map(<[u8]>::to_vec).collect();
+            for path in private {
+                let name = path.as_os_str().as_bytes();
+                if !already.contains(name)
+                    && !tracked.contains(name)
+                    && root
+                        .join(path)
+                        .symlink_metadata()
+                        .is_ok_and(|m| m.is_file() || m.is_symlink())
+                {
+                    paths.extend_from_slice(name);
+                    paths.push(0);
+                }
+            }
+        }
         let mut untracked = files::pack(&root, stage.path(), &paths, &mut output)?;
         let ignored = run(source().args([
             "ls-files",
@@ -330,6 +397,7 @@ impl Snapshot {
         }
         Ok(Self {
             _stage: stage,
+            result_objects: returning.is_some().then_some(builder),
             archive,
             commit,
             bundle_bytes: size,
@@ -383,6 +451,16 @@ pub fn receive_commit(
     commit: &str,
 ) -> io::Result<PathBuf> {
     receive_inner(jobs, job, Some(mirror), &mut input, 0, Some(commit))
+}
+
+/// A result archive includes its own base history and never contacts an upstream.
+pub fn receive_result(
+    jobs: &Path,
+    job: u64,
+    mut input: impl Read,
+    tip: &str,
+) -> io::Result<PathBuf> {
+    receive_inner(jobs, job, None, &mut input, 0, Some(tip))
 }
 
 fn receive_inner(

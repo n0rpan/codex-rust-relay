@@ -30,6 +30,8 @@ pub(crate) struct Inventory {
     routes_known: bool,
     #[serde(default)]
     linked_read: bool,
+    #[serde(default)]
+    linked_write: bool,
     has_project: Option<bool>,
 }
 // A newer host may also run an agent or billing route this client cannot launch.
@@ -151,6 +153,7 @@ async fn sample(app: &App) -> io::Result<(Inventory, HashSet<String>)> {
             has_project: None,
             routes_known: supports("worker_routes_known"),
             linked_read: supports("linked_read_workers"),
+            linked_write: supports("linked_write_workers"),
         },
         projects,
     ))
@@ -190,11 +193,12 @@ pub fn check_launch(
     project: &Path,
     start: &ox_desk_core::origin::WorkerStart,
     parent: ox_desk_core::modes::Level,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let repo = repository_id(project)
         .ok_or_else(|| io::Error::other("Remote workers need a shared Git origin."))?;
     let peer = client::runtime()?.block_on(query_peer(host, source, Some(&repo), true))?;
-    check_peer(&peer, &host.name, start, parent)
+    check_peer(&peer, &host.name, start, parent)?;
+    Ok(peer.inventory.linked_write)
 }
 fn check_peer(
     peer: &Peer,
@@ -237,6 +241,7 @@ fn check_peer(
         .child_start(mode, start.mode_request(), ceiling, start.runtime)
         .level
         != ox_desk_core::modes::Level::Read
+        && !peer.inventory.linked_write
     {
         return Err(io::Error::other(format!(
             "{target} supports linked read workers. Choose read mode for this job."

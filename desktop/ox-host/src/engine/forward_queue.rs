@@ -11,6 +11,8 @@ use std::{
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct Pending {
+    #[serde(default)]
+    pub policy: Option<ox_host_web::worker_result::Policy>,
     pub project: PathBuf,
     pub operation: Operation,
 }

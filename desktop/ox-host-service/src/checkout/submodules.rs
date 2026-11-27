@@ -20,7 +20,7 @@ pub(super) fn check_depth(depth: usize) -> io::Result<()> {
     Ok(())
 }
 
-fn gitlinks(cmd: &mut Command) -> io::Result<BTreeMap<PathBuf, String>> {
+pub(super) fn gitlinks(cmd: &mut Command) -> io::Result<BTreeMap<PathBuf, String>> {
     let index = run(cmd.args(["ls-files", "--stage", "-z"]))?;
     let mut links = BTreeMap::new();
     for entry in index.split(|b| *b == 0) {
@@ -48,6 +48,7 @@ pub(super) fn capture(
     staging: &Path,
     source: impl Fn() -> Command,
     depth: usize,
+    returning: Option<&super::results::Inputs<'_>>,
 ) -> io::Result<Vec<(PathBuf, Snapshot)>> {
     let mut modules = Vec::new();
     let tree = files::Tree::open(root)?;
@@ -74,8 +75,14 @@ pub(super) fn capture(
                 "A populated submodule has no working Git checkout. Restore it or move its files before transfer.",
             ));
         }
-        let packet = Snapshot::capture_inner(staging, &checkout, &[], depth + 1)
-            .map_err(|e| io::Error::new(e.kind(), format!("Submodule {path:?}: {e}")))?;
+        let packet = Snapshot::capture_inner(
+            staging,
+            &checkout,
+            &[],
+            depth + 1,
+            returning.map(|r| r.child(&path)),
+        )
+        .map_err(|e| io::Error::new(e.kind(), format!("Submodule {path:?}: {e}")))?;
         run(source()
             .args(["update-index", "--cacheinfo", "160000", &packet.commit])
             .arg(&path))?;

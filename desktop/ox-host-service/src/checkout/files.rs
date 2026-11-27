@@ -213,7 +213,7 @@ pub(super) fn pack(
     Ok(summary)
 }
 
-fn exclude(file: &mut File, path: &[u8]) -> io::Result<()> {
+pub(super) fn exclude(file: &mut File, path: &[u8]) -> io::Result<()> {
     file.write_all(b"/")?;
     for &b in path {
         if b == b'\n' {
@@ -235,7 +235,7 @@ fn exclude(file: &mut File, path: &[u8]) -> io::Result<()> {
     file.write_all(b"\n")
 }
 
-const BASELINE: &str = ".git/ox-private-inputs-v1";
+pub(super) const BASELINE: &str = ".git/ox-private-inputs-v1";
 
 struct HashingWriter<W> {
     output: W,

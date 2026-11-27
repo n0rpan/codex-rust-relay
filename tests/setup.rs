@@ -15,6 +15,8 @@ mod provider;
 mod setup;
 #[path = "../src/ui.rs"]
 mod ui;
+#[path = "../src/worker_placement.rs"]
+mod worker_placement;
 
 use std::ffi::OsString;
 use std::fs;

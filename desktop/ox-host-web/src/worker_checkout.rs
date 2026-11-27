@@ -1,6 +1,6 @@
 //! A host-to-host checkout session. Git IDs and archive chunks share the same
 //! authenticated connection. The receiver's filesystem paths stay on the receiver.
-mod connection;
+pub(crate) mod connection;
 pub(crate) mod receiver;
 mod sender;
 pub use sender::{Sender, transfer};

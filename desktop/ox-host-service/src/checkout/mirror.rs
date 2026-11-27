@@ -15,6 +15,7 @@ use std::{
 
 pub struct Mirror {
     path: PathBuf,
+    registered: PathBuf,
 }
 
 impl Mirror {
@@ -77,7 +78,10 @@ impl Mirror {
         let key = format!("{:x}", Sha256::digest(url.as_bytes()));
         let path = cache.join(key);
         if path.try_exists()? {
-            let mirror = Self { path };
+            let mirror = Self {
+                path,
+                registered: checkout.clone(),
+            };
             if let Ok(_lock) = mirror.refresh_lock() {
                 // A network outage never prevents a launch from reusing the registered clone.
                 let copy_tracking = !mirror.path.join("ox-origin-refreshed").exists();
@@ -103,9 +107,15 @@ impl Mirror {
                 ) && path.is_dir() => {}
             Err(error) => return Err(error),
         }
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            registered: checkout,
+        })
     }
 
+    pub fn registered(&self) -> &Path {
+        &self.registered
+    }
     pub fn path(&self) -> &Path {
         &self.path
     }

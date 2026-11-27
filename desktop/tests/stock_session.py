@@ -266,7 +266,10 @@ class Fixture(BaseHTTPRequestHandler):
                     chunks.append({"content": "Linked read result: " + output})
                 else:
                     name = next(t["function"]["name"] for t in req["tools"] if t["function"]["name"].endswith("exec_command"))
-                    args = {"cmd": "cat tracked"}
+                    cmd = "cat tracked"
+                    if b"linked-write-fixture" in body:
+                        cmd = "cat tracked && echo 'from worker' > tracked && echo private > worker-output"
+                    args = {"cmd": cmd}
                     calls = (name, args)
             elif self.server.mode in ("worker-cwd", "worker-inherit"):
                 if has_output:
