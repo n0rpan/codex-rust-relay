@@ -722,7 +722,13 @@ impl Store {
         } else {
             session
         };
-        let first_context = first.as_ref().and_then(|_| self.sender_context());
+        let first_context = first.as_ref().and_then(|_| {
+            if matches!(session, Session::New(_)) {
+                self.first_turn_context()
+            } else {
+                self.sender_context()
+            }
+        });
         let worker_notice = first
             .as_ref()
             .and_then(|(uuid, _)| Some((uuid.clone(), self.worker_notice_id()?)));
@@ -931,7 +937,11 @@ impl Store {
         }
         self.selected = Some(owner.clone());
         self.selection += 1;
-        let context = self.sender_context();
+        let context = if id.is_none() {
+            self.first_turn_context()
+        } else {
+            self.sender_context()
+        };
         let worker_notice = self.worker_notice_id();
         let process = self
             .claude_mut()

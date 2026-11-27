@@ -4759,6 +4759,7 @@ name = "ox-desk-core"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "ox-memory",
  "schemars",
  "serde",
  "serde_json",

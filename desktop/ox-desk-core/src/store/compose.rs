@@ -120,11 +120,39 @@ impl Store {
         self.sender = previous;
         result
     }
+    /// Enable budgeted Tier-1 memory injection on the first turn of new sessions and workers.
+    pub fn enable_memory(&mut self, store_path: std::path::PathBuf, host_id: String) {
+        self.memory = Some(crate::memory::MemoryConfig {
+            store_path,
+            host_id,
+            brief_override: None,
+        });
+    }
+    /// Set or clear a pre-filtered Tier-1 brief override (used for remote worker jobs).
+    pub fn set_memory_brief_override(&mut self, brief: Option<String>) {
+        if let Some(cfg) = &mut self.memory {
+            cfg.brief_override = brief;
+        }
+    }
     /// The statement for a message submitted now, from the host's current stamp.
     pub(super) fn sender_context(&self) -> Option<String> {
         self.sender
             .as_ref()
             .map(|sender| sender.context(&self.profile.route))
+    }
+    /// Sender context plus the budgeted Tier-1 pinned memory brief, attached once on
+    /// the first turn of a new session or worker so subsequent turns stay cache-stable.
+    pub(super) fn first_turn_context(&self) -> Option<String> {
+        let sender = self.sender_context();
+        let brief = self.memory.as_ref().and_then(|cfg| {
+            crate::memory::first_turn_brief(cfg, &self.profile.project, &self.profile.route)
+        });
+        match (sender, brief) {
+            (Some(s), Some(b)) => Some(format!("{s}\n\n{b}")),
+            (Some(s), None) => Some(s),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
     }
     pub fn new_session(&mut self) {
         if self.remote().is_some() {
@@ -452,7 +480,11 @@ impl Store {
             } else {
                 vec![]
             },
-            context: self.sender_context(),
+            context: if id.is_none() {
+                self.first_turn_context()
+            } else {
+                self.sender_context()
+            },
             worker_notice: self.worker_notice_id(),
         };
         if id.is_none() {
@@ -1805,5 +1837,38 @@ mod tests {
             },
         });
         assert!(!t.interrupted(), "a finished turn is done");
+    }
+
+    #[test]
+    fn first_turn_attaches_tier1_memory_brief_once_and_not_on_followup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem_path = dir.path().join("memory.json");
+        let mem_store = ox_memory::MemoryStore::open(&mem_path);
+        mem_store
+            .upsert(ox_memory::NewMemory {
+                id: None,
+                scope: ox_memory::Scope::Global,
+                kind: ox_memory::Kind::RoutingPolicy,
+                sensitivity: ox_memory::Sensitivity::Private,
+                text: "Use Claude subscription for confidential work.".into(),
+                tags: vec!["routing".into()],
+                pin: true,
+                source_host: "host-a".into(),
+            })
+            .unwrap();
+
+        let mut store = ready();
+        store.enable_memory(mem_path, "host-a".into());
+        store.sender = Some(crate::surface::Sender::Person {
+            surface: crate::surface::Surface::Desktop,
+        });
+
+        let turn1 = store.first_turn_context().unwrap();
+        assert!(turn1.contains("OX Desktop"));
+        assert!(turn1.contains("Use Claude subscription for confidential work."));
+
+        let turn2 = store.sender_context().unwrap();
+        assert!(turn2.contains("OX Desktop"));
+        assert!(!turn2.contains("Use Claude subscription for confidential work."));
     }
 }

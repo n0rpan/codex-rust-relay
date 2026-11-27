@@ -74,6 +74,10 @@ impl Launch {
                 serde_json::to_string(&route).expect("serializable billing route"),
             )
             .env(
+                "OX_MEMORY_MAX_SENSITIVITY",
+                crate::memory::route_sensitivity_ceiling(&route).as_str(),
+            )
+            .env(
                 "OX_HOST_WORKER_PARENT",
                 format!("claude:{tag}:{}", self.session.id()),
             );

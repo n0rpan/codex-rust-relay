@@ -1339,6 +1339,7 @@ impl Engine {
         // Opening the route also subscribes it for stop, approval and recovery.
         // Actual launches read the policy again and report an unreadable file.
         store.use_host_policy(HostPolicy::read(&self.state_dir).unwrap_or(HostPolicy::AlwaysRead));
+        store.enable_memory(self.state_dir.join("memory.json"), self.host_id.to_string());
         let previous = self.running.get_mut(scope);
         let prior = previous
             .as_ref()
