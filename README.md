@@ -59,7 +59,7 @@ The same installer adds **OX Desktop** to your application launcher. It runs on 
 
 ### Pair a headless host
 
-On the server, run the installer with `--host`, then run `ox host pair`. Paste the invitation into **Settings → Hosts** on OX Desktop. To reuse configured API keys, select the server and choose **Send API keys…**. From a paired browser, open **Settings → Credentials → Copy keys to another host…** on the host that already has the keys. Choose the destination, select the provider or Brave Search keys you want, and send. The receiver can use those keys and incur charges until you remove or rotate them.
+On the server, run the installer with `--host`, then run `ox host pair` (if HTTPS port 8443 is already used in Tailscale Serve, pass `--port <port>`, or `--listen-port <port>` if loopback port 48162 is taken). Paste the invitation into **Settings → Hosts** on OX Desktop. To reuse configured API keys, select the server and choose **Send API keys…**. From a paired browser, open **Settings → Credentials → Copy keys to another host…** on the host that already has the keys. Choose the destination, select the provider or Brave Search keys you want, and send. The receiver can use those keys and incur charges until you remove or rotate them.
 
 Managed headless hosts install updates automatically when idle. Use **Settings → Host updates** in the paired web UI, or select the server in desktop **Settings → Hosts**, to choose Automatic, Download only or Manual and the Dev or Stable channel.
 
@@ -92,7 +92,7 @@ To remove the login service, run `ox host uninstall`. It keeps your sessions and
 | "The running OX session host speaks protocol …" | `ox host restart`. The desktop and host versions differ. |
 | The phone says the host is restarting for an update | Wait a few seconds and send again. |
 | `codex` or `claude` is below OX's floor | Update the stock client; `ox host doctor` prints the command. |
-| Remote access fails after a Tailscale change | Turn Remote access off and on in Desktop settings. If doctor reports Funnel, run `tailscale funnel 8443 off`. |
+| Remote access fails or port 8443 is taken in Tailscale | Run `ox host pair --port <port>` (or enter another HTTPS port in **Settings → Remote access**). If doctor reports Funnel, run `tailscale funnel --https=8443 off`. |
 
 ## Documentation
 

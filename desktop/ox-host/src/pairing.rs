@@ -9,9 +9,105 @@ use std::{
     process::Command,
 };
 
-pub fn pair(paths: &Paths, operation: Operation) -> Result<(), String> {
-    let report = access::run(paths, Operation::Enable)?;
-    if let Some(help) = report.denied {
+const PAIR_USAGE: &str = "Usage: ox host pair [--terminal | --worker-host] [--port HTTPS_PORT] [--listen-port LOCAL_PORT]
+  --terminal          grant terminal access on this host to the device that redeems the invitation
+  --worker-host       create an invitation for another OX host to launch workers here
+  --port PORT         Tailscale Serve HTTPS port (default 8443, range 1024..65535)
+  --listen-port PORT  local loopback listener port (default 48162, range 1024..65535)";
+
+pub struct PairOptions {
+    pub operation: Operation,
+    pub https_port: Option<u16>,
+    pub loopback_port: Option<u16>,
+}
+
+fn parse_port(flag: &str, value: &str) -> Result<u16, String> {
+    let port: u16 = value
+        .parse()
+        .map_err(|_| format!("{flag} takes a port from 1024 to 65535."))?;
+    if !ox_host_web::serve::valid_https_port(port) {
+        return Err(format!("{flag} takes a port from 1024 to 65535."));
+    }
+    Ok(port)
+}
+
+pub fn parse_pair_args(args: &[String]) -> Result<Option<PairOptions>, String> {
+    let mut terminal = false;
+    let mut worker = false;
+    let mut https_port = None;
+    let mut loopback_port = None;
+    let mut iter = args.iter().map(String::as_str);
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-h" | "--help" => {
+                println!("{PAIR_USAGE}");
+                return Ok(None);
+            }
+            "--terminal" => terminal = true,
+            "--worker-host" => worker = true,
+            "--port" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--port takes a port from 1024 to 65535.".to_owned())?;
+                https_port = Some(parse_port("--port", value)?);
+            }
+            "--listen-port" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--listen-port takes a port from 1024 to 65535.".to_owned())?;
+                loopback_port = Some(parse_port("--listen-port", value)?);
+            }
+            _ if arg.starts_with("--port=") => {
+                https_port = Some(parse_port("--port", &arg["--port=".len()..])?);
+            }
+            _ if arg.starts_with("--listen-port=") => {
+                loopback_port = Some(parse_port("--listen-port", &arg["--listen-port=".len()..])?);
+            }
+            _ => return Err(PAIR_USAGE.into()),
+        }
+    }
+    if terminal && worker {
+        return Err("Choose either --terminal or --worker-host, not both.".into());
+    }
+    access::validate_ports(https_port, loopback_port)?;
+    let operation = if worker {
+        Operation::PairWorker
+    } else {
+        Operation::Pair { terminal }
+    };
+    Ok(Some(PairOptions {
+        operation,
+        https_port,
+        loopback_port,
+    }))
+}
+
+pub fn pair_cli(paths: &Paths, args: &[String]) -> Result<(), String> {
+    let Some(opts) = parse_pair_args(args)? else {
+        return Ok(());
+    };
+    pair_with_ports(paths, opts.operation, opts.https_port, opts.loopback_port)
+}
+
+pub fn pair_with_ports(
+    paths: &Paths,
+    operation: Operation,
+    https_port: Option<u16>,
+    loopback_port: Option<u16>,
+) -> Result<(), String> {
+    let enable = if https_port.is_some() || loopback_port.is_some() {
+        Operation::EnableOn {
+            https_port,
+            loopback_port,
+        }
+    } else {
+        Operation::Enable
+    };
+    for _ in 0..2 {
+        let report = access::run(paths, enable.clone())?;
+        let Some(help) = report.denied else {
+            break;
+        };
         if !io::stdin().is_terminal() {
             return Err(format!(
                 "{} Run ox host pair in an interactive terminal to authorize Tailscale Serve.",
@@ -147,6 +243,10 @@ pub fn revoke(paths: &Paths, id: &str) -> Result<(), String> {
 
 pub fn profile(paths: &Paths, kind: &str, args: &[String]) -> io::Result<()> {
     use ox_host_web::host_profile::Edit;
+    if matches!(args, [flag] if matches!(flag.as_str(), "-h" | "--help")) {
+        println!("Usage: ox host name [NAME] or ox host labels [set LABEL…]");
+        return Ok(());
+    }
     access::status(paths).map_err(io::Error::other)?;
     let request = |edit| {
         admin::request(&paths.state_dir, &Request::HostProfile { edit })?
@@ -210,4 +310,45 @@ Policies: follow-interface (default), always-read, always-write, always-classifi
     };
     println!("{}", policy.label());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pair_cli_parses_ports_and_rejects_conflicting_or_privileged_values() {
+        let args = |words: &[&str]| {
+            parse_pair_args(&words.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+        };
+        let plain = args(&[]).unwrap().unwrap();
+        assert!(matches!(
+            plain.operation,
+            Operation::Pair { terminal: false }
+        ));
+        assert_eq!((plain.https_port, plain.loopback_port), (None, None));
+
+        let custom = args(&["--terminal", "--port", "9443", "--listen-port=49100"])
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            custom.operation,
+            Operation::Pair { terminal: true }
+        ));
+        assert_eq!(
+            (custom.https_port, custom.loopback_port),
+            (Some(9443), Some(49100))
+        );
+
+        let worker = args(&["--worker-host", "--port=10443"]).unwrap().unwrap();
+        assert!(matches!(worker.operation, Operation::PairWorker));
+        assert_eq!(worker.https_port, Some(10443));
+
+        assert!(args(&["--help"]).unwrap().is_none());
+        assert!(args(&["--terminal", "--worker-host"]).is_err());
+        assert!(args(&["--port", "443"]).is_err());
+        assert!(args(&["--listen-port", "80"]).is_err());
+        assert!(args(&["--port", "9443", "--listen-port", "9443"]).is_err());
+        assert!(args(&["--port"]).is_err());
+    }
 }
