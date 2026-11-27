@@ -318,7 +318,6 @@ impl Service {
                         &|name| keys.get(name),
                         None,
                         crate::Catalog::Shared,
-                        None,
                     )
                     .await
                 }

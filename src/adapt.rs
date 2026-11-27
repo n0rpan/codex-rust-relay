@@ -26,7 +26,6 @@
 
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 use std::sync::Mutex;
 
 /// How many times one request may be sent: the original plus two adaptations.
@@ -88,9 +87,11 @@ impl Action {
     /// Advice the user can apply permanently, when one exists.
     pub fn advice(self) -> &'static str {
         match self {
+            Self::ReasoningOff => {
+                "set reasoning_mandatory = true for this model in codeox.toml so `none` is never offered"
+            }
             Self::Drop("reasoning" | "reasoning_effort" | "thinking" | "output_config")
-            | Self::DropReasoningField(_)
-            | Self::ReasoningOff => {
+            | Self::DropReasoningField(_) => {
                 "declare the model's reasoning levels in codeox.toml (reasoning_efforts, default_reasoning_effort)"
             }
             Self::Drop("cache_control") => {
@@ -326,55 +327,18 @@ fn mentions_reasoning_shutdown(text: &str) -> bool {
 #[derive(Default)]
 pub struct Memory {
     rules: Mutex<BTreeMap<(String, String), BTreeSet<Action>>>,
-    /// Where a lasting fix is recorded for `ox doctor` and OX Desktop.
-    advice_home: Option<PathBuf>,
 }
 
 impl Memory {
-    /// A memory that also records a configuration fix the first time a
-    /// provider proves a model's reasoning is mandatory.
-    pub fn with_advice(home: Option<PathBuf>) -> Self {
-        Self {
-            rules: Mutex::default(),
-            advice_home: home,
-        }
-    }
-
     /// Records a rule. Returns true only the first time this provider/model
     /// needs it, which is when the caller should explain the change.
     pub fn learn(&self, vendor: &str, model: &str, action: Action) -> bool {
-        let new = self
-            .rules
+        self.rules
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry((vendor.to_owned(), model.to_owned()))
             .or_default()
-            .insert(action);
-        // A rejected "reasoning off" means the catalog did not know the model
-        // is reasoning-mandatory. Writing that into codeox.toml lets the
-        // catalog hide `none`, so the next process never pays this 400. This
-        // runs once per provider/model, never per request.
-        if new
-            && action == Action::ReasoningOff
-            && let Some(home) = &self.advice_home
-        {
-            crate::advice::record(
-                home,
-                crate::advice::Advice {
-                    id: format!("model-mandatory:{vendor}:{model}"),
-                    provider: vendor.to_owned(),
-                    model: Some(model.to_owned()),
-                    message: "the provider refused to turn reasoning off for this model".to_owned(),
-                    fix: crate::advice::Fix::SetModelReasoning {
-                        provider: vendor.to_owned(),
-                        model: model.to_owned(),
-                        effort: None,
-                        mandatory: true,
-                    },
-                },
-            );
-        }
-        new
+            .insert(action)
     }
 
     /// Applies every rule learned for this provider/model so far.
@@ -549,31 +513,6 @@ mod tests {
             &mut only_summary
         ));
         assert!(only_summary.get("reasoning").is_none());
-    }
-
-    #[test]
-    fn a_refused_reasoning_shutdown_is_recorded_as_a_fix_once() {
-        let mut bytes = [0u8; 8];
-        getrandom::fill(&mut bytes).unwrap();
-        let home = std::env::temp_dir().join(format!("ox-adapt-{}", hex::encode(bytes)));
-        std::fs::create_dir_all(&home).unwrap();
-        let memory = Memory::with_advice(Some(home.clone()));
-        assert!(memory.learn("openrouter", "gpt", Action::ReasoningOff));
-        assert!(!memory.learn("openrouter", "gpt", Action::ReasoningOff));
-        // Other rules are process-local workarounds, not configuration fixes.
-        memory.learn("openrouter", "gpt", Action::Drop("cache_control"));
-        let advice = crate::advice::read(&home);
-        assert_eq!(advice.len(), 1, "{advice:?}");
-        assert_eq!(
-            advice[0].fix,
-            crate::advice::Fix::SetModelReasoning {
-                provider: "openrouter".to_owned(),
-                model: "gpt".to_owned(),
-                effort: None,
-                mandatory: true,
-            }
-        );
-        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

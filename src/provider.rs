@@ -225,23 +225,6 @@ impl SavedKeys {
         Ok(serde_json::to_string(self)?)
     }
 
-    /// Moves a saved key to a new destination after its provider's base URL
-    /// changes. Returns the new file text when a key was moved.
-    pub(crate) fn rescope(
-        &mut self,
-        name: &str,
-        from: &str,
-        to: &str,
-    ) -> Result<Option<String>, RelayError> {
-        if let Some(entry) = self.0.get_mut(name)
-            && entry.scope == from
-        {
-            entry.scope = to.to_owned();
-            return Ok(Some(serde_json::to_string(self)?));
-        }
-        Ok(None)
-    }
-
     pub(crate) fn set(
         &mut self,
         name: &str,

@@ -80,28 +80,6 @@ pub enum Request {
     Models,
     /// Context windows of launchable API aliases, from OX's model catalog.
     ModelContexts,
-    /// Provider workarounds the relay recorded, with the safe configuration fix.
-    Advice,
-    /// Apply one recorded advice by id, then forget it.
-    ApplyAdvice {
-        id: String,
-    },
-    /// Forget one recorded advice without changing any configuration.
-    DismissAdvice {
-        id: String,
-    },
-}
-
-/// One recorded provider workaround, as shown by OX Desktop.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ProviderAdvice {
-    pub id: String,
-    pub provider: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    pub message: String,
-    /// Human-readable description of the change the Fix button applies.
-    pub fix: String,
 }
 
 /// Directories in which stock Claude Code persists sessions for each OX launch.

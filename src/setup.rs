@@ -2542,27 +2542,7 @@ fn doctor_report(home: &Path, env: &crate::provider::Env<'_>) -> DoctorReport {
         report.mode = "legacy (no codeox.toml; using config.toml)".to_owned();
         doctor_legacy(&mut report, home, env);
     }
-    doctor_advice(&mut report, home);
     report
-}
-
-/// Recorded provider workarounds, with the configuration fix that makes them go
-/// away. `ox doctor --fix` applies them; OX Desktop shows the same list.
-fn doctor_advice(report: &mut DoctorReport, home: &Path) {
-    let advice = crate::advice::read(home);
-    if advice.is_empty() {
-        return;
-    }
-    for record in advice {
-        let target = match &record.model {
-            Some(model) => format!("{} / {model}", record.provider),
-            None => record.provider.clone(),
-        };
-        report.warning(
-            Some("advice".to_owned()),
-            format!("{target}: {} (fix: ox doctor --fix)", record.message),
-        );
-    }
 }
 
 fn doctor_multi_vendor(
@@ -3357,27 +3337,13 @@ pub(crate) fn run_doctor_styled(
         }
     }
     if fix {
-        let mut repairs = repair(codex_home)?;
-        // A fix that was refused is not a repair; it is listed separately so
-        // the output never shows a green "fixed" next to a failure.
-        let mut refused = Vec::new();
-        // Advice is applied after the repair lock is released: both paths
-        // rewrite the same files and must not nest the lock.
-        for record in crate::advice::read(codex_home) {
-            match crate::advice::apply(codex_home, &record.id) {
-                Ok(_) => repairs.push(format!("applied: {}", record.message)),
-                Err(error) => refused.push(format!(
-                    "could not apply the fix for {}: {error}",
-                    record.provider
-                )),
-            }
-        }
+        let repairs = repair(codex_home)?;
         writeln!(
             output,
             "{}",
             crate::ui::paint("repairs", crate::ui::BOLD, color)
         )?;
-        if repairs.is_empty() && refused.is_empty() {
+        if repairs.is_empty() {
             writeln!(output, "  · nothing needed repair")?;
         }
         for line in &repairs {
@@ -3385,13 +3351,6 @@ pub(crate) fn run_doctor_styled(
                 output,
                 "  {} fixed: {line}",
                 crate::ui::paint("✓", crate::ui::GREEN, color)
-            )?;
-        }
-        for line in &refused {
-            writeln!(
-                output,
-                "  {} {line}",
-                crate::ui::paint("!", crate::ui::YELLOW, color)
             )?;
         }
         writeln!(output)?;

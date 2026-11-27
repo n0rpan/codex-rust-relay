@@ -6,7 +6,6 @@
 
 mod adapt;
 mod adapters;
-mod advice;
 mod catalog;
 mod claude_frontend;
 mod claude_gateway;
@@ -99,8 +98,6 @@ struct App {
     /// One line per provider/model adaptation, so a corrected default is
     /// explained once instead of on every turn.
     notices: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// Where to record provider advice for `ox doctor` and OX Desktop.
-    advice_home: Option<std::path::PathBuf>,
     /// Request-shape rules learned from providers that rejected a field.
     adapt: adapt::Memory,
     /// One pooled Brave client, present only when live search is opted in and
@@ -362,7 +359,6 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
                 env,
                 search,
                 Catalog::For(client_kind),
-                Some(&codex_home),
             )
             .await?
         }
@@ -707,7 +703,6 @@ impl App {
             max_request_bytes: MAX_REQUEST_BYTES,
             secrets: Arc::new(secrets),
             notices: std::sync::Mutex::default(),
-            advice_home: None,
             adapt: adapt::Memory::default(),
             search: None,
         })
@@ -725,7 +720,6 @@ impl App {
         env: &Env<'_>,
         search: Option<BraveSearch>,
         catalog: Catalog,
-        advice_home: Option<&std::path::Path>,
     ) -> Result<Self, RelayError> {
         Self::codeox_with(
             config,
@@ -736,7 +730,6 @@ impl App {
             env,
             search,
             catalog,
-            advice_home,
         )
         .await
     }
@@ -754,7 +747,6 @@ impl App {
         env: &Env<'_>,
         search: Option<BraveSearch>,
         catalog: Catalog,
-        advice_home: Option<&std::path::Path>,
     ) -> Result<Self, RelayError> {
         let client_kind = catalog.client_kind();
         let harness = catalog.harness();
@@ -798,10 +790,6 @@ impl App {
                 })
                 .collect();
             let mut requests = futures_util::stream::iter(requests).buffer_unordered(4);
-            // Probes run after every discovery has answered, so a slow 403
-            // probe cannot starve a healthy provider that shares the deadline.
-            let mut probes: Vec<(usize, SecretKey)> = Vec::new();
-
             while let Some((index, result)) = requests.next().await {
                 match result {
                     Ok(mut models) => {
@@ -818,43 +806,17 @@ impl App {
                             "ox: provider {:?}: model discovery failed: {reason}",
                             vendors[index].key
                         );
-                        // Only a 403 from the global host can mean "this key is
-                        // regional". An in-region route never gets a suggestion
-                        // to move its data to the other region.
+                        // A key restricted to a data region is rejected by the
+                        // global host. OX only says how to fix that; it never
+                        // probes other hosts or edits the configuration itself.
                         if vendors[index].openrouter_region() == Some(provider::Region::Global)
                             && reason.contains("403")
-                            && let Some(key) = auths[index].as_ref()
                         {
-                            probes.push((index, key.clone()));
+                            eprintln!(
+                                "  if this key is limited to a data region, set base_url = \"https://eu.openrouter.ai/api/v1\" (or us.openrouter.ai) in codeox.toml"
+                            );
                         }
                     }
-                }
-            }
-            for (index, key) in probes {
-                let Some(region) = regional_host_for(client, &vendors[index], &key, deadline).await
-                else {
-                    continue;
-                };
-                eprintln!(
-                    "ox: provider {:?}: the key may use {region}.openrouter.ai\n  fix: set base_url = \"https://{region}.openrouter.ai/api/v1\"",
-                    vendors[index].key
-                );
-                if let Some(home) = advice_home {
-                    crate::advice::record(
-                        home,
-                        crate::advice::Advice {
-                            id: format!("region:{}", vendors[index].key),
-                            provider: vendors[index].key.clone(),
-                            model: None,
-                            message: format!(
-                                "model discovery was rejected from the global host; this key may use {region}.openrouter.ai"
-                            ),
-                            fix: crate::advice::Fix::UseRegionalHost {
-                                provider: vendors[index].key.clone(),
-                                region: region.to_owned(),
-                            },
-                        },
-                    );
                 }
             }
             Ok::<(), RelayError>(())
@@ -958,8 +920,7 @@ impl App {
             max_request_bytes,
             secrets: Arc::new(secrets),
             notices: std::sync::Mutex::default(),
-            advice_home: advice_home.map(std::path::Path::to_path_buf),
-            adapt: adapt::Memory::with_advice(advice_home.map(std::path::Path::to_path_buf)),
+            adapt: adapt::Memory::default(),
             search,
         })
     }
@@ -968,30 +929,12 @@ impl App {
     /// process. The condition it explains is a configuration default, not a
     /// per-turn event, so repeating it in the log would only add noise.
     fn notice_once(&self, key: impl std::fmt::Display, message: impl std::fmt::Display) {
-        if self.first_time(key) {
-            eprintln!("{message}");
-        }
-    }
-
-    /// True the first time `key` is seen in this process.
-    fn first_time(&self, key: impl std::fmt::Display) -> bool {
-        self.notices
+        let mut notices = self
+            .notices
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(key.to_string())
-    }
-
-    /// Records a fixable provider condition for `ox doctor` and OX Desktop.
-    ///
-    /// Recording takes the config file lock and reads the advice file, which
-    /// is blocking I/O on the request path. The condition is a configuration
-    /// default, so it is written once per process instead of on every turn
-    /// (and every parallel worker turn) that hits it.
-    fn record_advice(&self, advice: crate::advice::Advice) {
-        if let Some(home) = &self.advice_home
-            && self.first_time(format!("advice:{}", advice.id))
-        {
-            crate::advice::record(home, advice);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if notices.insert(key.to_string()) {
+            eprintln!("{message}");
         }
     }
 
@@ -1301,16 +1244,6 @@ impl App {
                             state.vendor.key, route.upstream_model
                         ),
                     );
-                    self.record_advice(crate::advice::Advice {
-                        id: format!(
-                            "model-reasoning:{}:{}",
-                            state.vendor.key, route.upstream_model
-                        ),
-                        provider: state.vendor.key.clone(),
-                        model: Some(route.upstream_model.clone()),
-                        message: notice,
-                        fix: crate::advice::Fix::ClearRelayReasoningEffort,
-                    });
                 }
                 if translate::sanitize_replayed_history(&mut payload, route.wire) {
                     eprintln!(
@@ -1637,32 +1570,6 @@ fn discovery_url(vendor: &provider::Vendor, harness: Option<ClientKind>) -> reqw
     url.set_query(None);
     url.query_pairs_mut().extend_pairs(&query);
     url
-}
-
-/// After a 403 from the global host, find the in-region host this key may use.
-/// Only two small GETs, only on failure, and both inside the launch deadline.
-async fn regional_host_for(
-    client: &Client,
-    vendor: &provider::Vendor,
-    key: &SecretKey,
-    deadline: tokio::time::Instant,
-) -> Option<&'static str> {
-    let headers = vendor.discovery_headers(key).ok()?;
-    for region in ["eu", "us"] {
-        let mut url = vendor.models_url.clone();
-        url.set_host(Some(&format!("{region}.openrouter.ai")))
-            .ok()?;
-        let Ok(Ok(response)) =
-            tokio::time::timeout_at(deadline, client.get(url).headers(headers.clone()).send())
-                .await
-        else {
-            continue;
-        };
-        if response.status().is_success() {
-            return Some(region);
-        }
-    }
-    None
 }
 
 async fn collect_model_pages(
@@ -2620,7 +2527,6 @@ id = "fast-coder"
             &environment,
             None,
             Catalog::For(ClientKind::Codex),
-            None,
         )
         .await
         .unwrap();
@@ -2665,7 +2571,6 @@ id = "fast-coder"
             &|_| None,
             None,
             Catalog::For(ClientKind::Codex),
-            None,
         )
         .await
         .unwrap();
@@ -2719,7 +2624,6 @@ alias = "together-llama"
             &|_| None,
             None,
             Catalog::For(ClientKind::Codex),
-            None,
         )
         .await
         .unwrap();
@@ -2792,7 +2696,6 @@ alias = "together-llama"
             &environment,
             search,
             Catalog::For(client_kind),
-            None,
         )
         .await
         .unwrap();
@@ -3020,7 +2923,6 @@ env_key = "ALPHA_KEY"
                 &environment,
                 None,
                 Catalog::For(ClientKind::Codex),
-                None,
             ),
         )
         .await
@@ -3056,7 +2958,6 @@ env_key = "ALPHA_KEY"
                 &environment,
                 None,
                 Catalog::For(ClientKind::Codex),
-                None,
             ),
         )
         .await

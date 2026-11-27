@@ -70,7 +70,6 @@ pub(crate) async fn run(args: &[OsString], home: &Path) -> Result<u8, RelayError
         &env,
         search,
         crate::Catalog::Shared,
-        Some(home),
     )
     .await?;
     gateway.persistent = true;

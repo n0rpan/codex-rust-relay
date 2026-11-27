@@ -120,7 +120,6 @@ async fn start_relay(config: &str, read_timeout: Duration) -> Relay {
         &environment,
         None,
         crate::Catalog::For(crate::clients::ClientKind::Codex),
-        None,
     )
     .await
     .unwrap();
