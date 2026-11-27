@@ -156,6 +156,18 @@ pub const MODEL: &[Spec] = &[
     ),
     field(Key::InputModalities, "Input types", List, "text, image"),
     field(
+        Key::DefaultReasoningEffort,
+        "Default reasoning effort",
+        Text,
+        "Provider default",
+    ),
+    field(
+        Key::ReasoningMandatory,
+        "Reasoning is mandatory",
+        Choices(&["true", "false"]),
+        "false",
+    ),
+    field(
         Key::ReasoningEfforts,
         "Reasoning levels",
         List,

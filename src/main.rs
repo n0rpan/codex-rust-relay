@@ -4,6 +4,7 @@
 //! same provider registry and credential lookup. The relay lives for the
 //! lifetime of the client process.
 
+mod adapt;
 mod adapters;
 mod catalog;
 mod claude_frontend;
@@ -95,6 +96,11 @@ struct App {
     max_request_bytes: usize,
     /// Configured vendor credentials, used to scrub upstream error text.
     secrets: Arc<Vec<String>>,
+    /// One line per provider/model adaptation, so a corrected default is
+    /// explained once instead of on every turn.
+    notices: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Request-shape rules learned from providers that rejected a field.
+    adapt: adapt::Memory,
     /// One pooled Brave client, present only when live search is opted in and
     /// its credential reference is usable.
     search: Option<BraveSearch>,
@@ -353,6 +359,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
                 MAX_REQUEST_BYTES,
                 env,
                 search,
+                Catalog::For(client_kind),
             )
             .await?
         }
@@ -695,10 +702,15 @@ impl App {
             local_auth: provider::bearer(token)?,
             max_request_bytes: MAX_REQUEST_BYTES,
             secrets: Arc::new(secrets),
+            notices: std::sync::Mutex::default(),
+            adapt: adapt::Memory::default(),
             search: None,
         })
     }
 
+    // Every argument is a launch input assembled once; grouping them would only
+    // move the list to another type.
+    #[allow(clippy::too_many_arguments)]
     async fn codeox(
         config: CodeoxConfig,
         bundled: BundledModels,
@@ -707,6 +719,7 @@ impl App {
         max_request_bytes: usize,
         env: &Env<'_>,
         search: Option<BraveSearch>,
+        catalog: Catalog,
     ) -> Result<Self, RelayError> {
         Self::codeox_with(
             config,
@@ -716,6 +729,7 @@ impl App {
             max_request_bytes,
             env,
             search,
+            catalog,
         )
         .await
     }
@@ -723,6 +737,7 @@ impl App {
     /// Like [`App::codeox`], but the bundled Codex catalog is still loading.
     /// It is awaited concurrently with provider model discovery so a launch
     /// waits for the slower of the two instead of their sum.
+    #[allow(clippy::too_many_arguments)]
     async fn codeox_with(
         config: CodeoxConfig,
         bundled: impl Future<Output = Result<BundledModels, RelayError>>,
@@ -731,7 +746,10 @@ impl App {
         max_request_bytes: usize,
         env: &Env<'_>,
         search: Option<BraveSearch>,
+        catalog: Catalog,
     ) -> Result<Self, RelayError> {
+        let client_kind = catalog.client_kind();
+        let harness = catalog.harness();
         let vendors = config.vendors;
         let mut secrets = Vec::new();
         let auths: Vec<_> = vendors
@@ -763,18 +781,42 @@ impl App {
                 .enumerate()
                 .filter_map(|(index, (vendor, auth))| {
                     let key = auth.as_ref().filter(|_| vendor.discovery)?;
-                    Some(async move { (index, discover(client, vendor, key, deadline).await) })
+                    Some(async move {
+                        (
+                            index,
+                            discover(client, vendor, key, deadline, harness).await,
+                        )
+                    })
                 })
                 .collect();
             let mut requests = futures_util::stream::iter(requests).buffer_unordered(4);
-
             while let Some((index, result)) = requests.next().await {
                 match result {
-                    Ok(models) => discovered[index] = Some(models),
-                    Err(reason) => eprintln!(
-                        "ox: provider {:?}: model discovery failed: {reason}",
-                        vendors[index].key
-                    ),
+                    Ok(mut models) => {
+                        if vendors[index].is_openrouter() {
+                            // Hide models that cannot answer the configured
+                            // wire (for example OpenRouter's `:batch` rows).
+                            let wire = vendors[index].wire;
+                            models.retain_wire(wire);
+                        }
+                        discovered[index] = Some(models);
+                    }
+                    Err(reason) => {
+                        eprintln!(
+                            "ox: provider {:?}: model discovery failed: {reason}",
+                            vendors[index].key
+                        );
+                        // A key restricted to a data region is rejected by the
+                        // global host. OX only says how to fix that; it never
+                        // probes other hosts or edits the configuration itself.
+                        if vendors[index].openrouter_region() == Some(provider::Region::Global)
+                            && reason.contains("403")
+                        {
+                            eprintln!(
+                                "  if this key is limited to a data region, set base_url = \"https://eu.openrouter.ai/api/v1\" (or us.openrouter.ai) in codeox.toml"
+                            );
+                        }
+                    }
                 }
             }
             Ok::<(), RelayError>(())
@@ -818,16 +860,36 @@ impl App {
                     Some(alias) => alias.clone(),
                     None => provider::alias_for(&vendor.key, &spec.id, None)?,
                 };
+                let name = spec.name.clone().unwrap_or_else(|| spec.id.clone());
+                // OpenRouter picks the data boundary per hostname. Say which
+                // one this route uses, and mark regional rows in the name every
+                // client shows.
+                let (display_name, description) = match vendor.openrouter_region() {
+                    Some(region) => {
+                        let suffix = match region {
+                            provider::Region::Eu => " · EU",
+                            provider::Region::Us => " · US",
+                            provider::Region::Global => "",
+                        };
+                        (
+                            format!("{name}{suffix}"),
+                            format!("{} · {}", vendor.name, region.label()),
+                        )
+                    }
+                    None => (name, vendor.name.clone()),
+                };
                 entries.push(CatalogModel {
                     slug: alias,
-                    display_name: spec.name.clone().unwrap_or_else(|| spec.id.clone()),
-                    description: vendor.name.clone(),
+                    display_name,
+                    description,
                     context_window: spec
                         .context_window
                         .or_else(|| catalog::published_context_window(&vendor.base_url, &spec.id)),
                     max_output_tokens: spec.max_output_tokens,
                     input_modalities: spec.input_modalities.clone(),
                     reasoning_efforts: spec.reasoning_efforts.clone(),
+                    default_reasoning_effort: spec.default_reasoning_effort.clone(),
+                    reasoning_mandatory: spec.reasoning_mandatory,
                     apply_patch: vendor.wire.is_translated(),
                 });
             }
@@ -851,14 +913,29 @@ impl App {
                 routes,
                 catalog,
             },
-            client_kind: ClientKind::Codex,
+            client_kind,
             persistent: false,
             client,
             local_auth: provider::bearer(token)?,
             max_request_bytes,
             secrets: Arc::new(secrets),
+            notices: std::sync::Mutex::default(),
+            adapt: adapt::Memory::default(),
             search,
         })
+    }
+
+    /// Prints one adaptation notice per provider/model for the life of the
+    /// process. The condition it explains is a configuration default, not a
+    /// per-turn event, so repeating it in the log would only add noise.
+    fn notice_once(&self, key: impl std::fmt::Display, message: impl std::fmt::Display) {
+        let mut notices = self
+            .notices
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if notices.insert(key.to_string()) {
+            eprintln!("{message}");
+        }
     }
 
     fn visible_models(&self) -> impl Iterator<Item = &Value> {
@@ -1159,11 +1236,38 @@ impl App {
                 if path == "/responses" {
                     route.bound_output(&mut payload, "max_output_tokens", &state.vendor);
                 }
+                if let Some(notice) = route.normalize_reasoning(&mut payload) {
+                    self.notice_once(
+                        format!("reasoning:{}:{}", state.vendor.key, route.upstream_model),
+                        format!(
+                            "ox: provider {:?}: model {:?}: {notice}",
+                            state.vendor.key, route.upstream_model
+                        ),
+                    );
+                }
                 if translate::sanitize_replayed_history(&mut payload, route.wire) {
                     eprintln!(
                         "ox: sending this thread's history to provider {:?}",
                         state.vendor.key
                     );
+                }
+                if state.vendor.is_openrouter() && route.wire != provider::Wire::AnthropicMessages {
+                    let session =
+                        state
+                            .vendor
+                            .openrouter_session_id(auth, Some(&parts.headers), &payload);
+                    if state
+                        .vendor
+                        .prepare_openrouter_request(&mut payload, session.as_deref())
+                    {
+                        self.notice_once(
+                            format!("stateless:{}", state.vendor.key),
+                            format!(
+                                "ox: provider {:?} keeps no conversation state; OX sends the full history and omits store/previous_response_id",
+                                state.vendor.key
+                            ),
+                        );
+                    }
                 }
 
                 if route.wire.is_translated() {
@@ -1182,6 +1286,8 @@ impl App {
                             upstream_model: &route.upstream_model,
                             requested_model: &requested,
                             secrets: Arc::clone(&self.secrets),
+                            adapt: &self.adapt,
+                            reasoning: &route.reasoning,
                         },
                         payload,
                     )
@@ -1191,16 +1297,26 @@ impl App {
                 if path == "/responses" {
                     state.vendor.add_cache_hints(&mut payload);
                 }
-                let body = match serde_json::to_vec(&payload) {
-                    Ok(body) => body,
-                    Err(_) => {
-                        return error_response(
-                            StatusCode::BAD_REQUEST,
-                            "Request body could not be encoded",
-                        );
-                    }
-                };
-                drop(payload);
+                for action in self.adapt.apply_known(
+                    state.vendor.key.as_str(),
+                    route.upstream_model.as_str(),
+                    &mut payload,
+                ) {
+                    self.notice_once(
+                        format!(
+                            "adapt:{}:{}:{}",
+                            state.vendor.key,
+                            route.upstream_model,
+                            action.label()
+                        ),
+                        format!(
+                            "ox: provider {:?}: model {:?}: {} (remembered from an earlier rejection)",
+                            state.vendor.key,
+                            route.upstream_model,
+                            action.label()
+                        ),
+                    );
+                }
                 let vendor_headers =
                     match state.vendor.inference_headers(auth, Some(&parts.headers)) {
                         Ok(headers) => headers,
@@ -1227,16 +1343,75 @@ impl App {
                     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
                 }
                 headers.extend(vendor_headers);
-                let upstream = self
-                    .client
-                    .post(state.vendor.responses_url(&path, query.as_deref()))
-                    .headers(headers)
-                    .body(body)
-                    .send()
-                    .await;
-                match upstream {
-                    Ok(response) => responses_response(response, &self.secrets).await,
-                    Err(_) => error_response(StatusCode::BAD_GATEWAY, "Inference request failed"),
+                let mut attempt = 0;
+                loop {
+                    attempt += 1;
+                    let body = match serde_json::to_vec(&payload) {
+                        Ok(body) => body,
+                        Err(_) => {
+                            return error_response(
+                                StatusCode::BAD_REQUEST,
+                                "Request body could not be encoded",
+                            );
+                        }
+                    };
+                    let upstream = self
+                        .client
+                        .post(state.vendor.responses_url(&path, query.as_deref()))
+                        .headers(headers.clone())
+                        .body(body)
+                        .send()
+                        .await;
+                    let upstream = match upstream {
+                        Ok(response) => response,
+                        Err(_) => {
+                            return error_response(
+                                StatusCode::BAD_GATEWAY,
+                                "Inference request failed",
+                            );
+                        }
+                    };
+                    if !upstream.status().is_client_error()
+                        || !matches!(upstream.status().as_u16(), 400 | 422)
+                    {
+                        return responses_response(upstream, &self.secrets).await;
+                    }
+                    let status = upstream.status();
+                    let retry_after = upstream
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse::<u32>().ok());
+                    let error_body = upstream::read_error_body(upstream).await;
+                    let action = error_body
+                        .as_ref()
+                        .and_then(upstream::extract_error_message)
+                        .and_then(|message| adapt::classify(status.as_u16(), message, &payload));
+                    if attempt < adapt::MAX_ATTEMPTS
+                        && let Some(action) = action
+                        && adapt::apply(action, &mut payload)
+                    {
+                        if self.adapt.learn(
+                            state.vendor.key.as_str(),
+                            route.upstream_model.as_str(),
+                            action,
+                        ) {
+                            eprintln!(
+                                "ox: provider {:?}: model {:?}: {} because the provider rejected it\n  fix: {}",
+                                state.vendor.key,
+                                route.upstream_model,
+                                action.label(),
+                                action.advice()
+                            );
+                        }
+                        continue;
+                    }
+                    return upstream::http_failure_parts(
+                        status,
+                        retry_after,
+                        error_body,
+                        &self.secrets,
+                    );
                 }
             }
         }
@@ -1321,21 +1496,80 @@ async fn discover(
     vendor: &provider::Vendor,
     key: &SecretKey,
     deadline: tokio::time::Instant,
+    harness: Option<ClientKind>,
 ) -> Result<ProviderModels, String> {
     let headers = vendor
         .discovery_headers(key)
         .map_err(|_| "could not build discovery headers".to_owned())?;
+    let url = discovery_url(vendor, harness);
     let response = tokio::time::timeout_at(
         deadline,
-        client
-            .get(vendor.models_url.clone())
-            .headers(headers.clone())
-            .send(),
+        client.get(url.clone()).headers(headers.clone()).send(),
     )
     .await
     .map_err(|_| "startup deadline reached".to_owned())?
     .map_err(|_| "request failed".to_owned())?;
-    collect_model_pages(client, &vendor.models_url, &headers, response, deadline).await
+    collect_model_pages(client, &url, &headers, response, deadline).await
+}
+
+/// Which harness a provider catalog is discovered for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Catalog {
+    /// A launch for one client: OpenRouter is asked for that harness's models.
+    For(ClientKind),
+    /// A gateway or listing that serves both Codex and Claude clients
+    /// (`ox serve`, OX Desktop's model list, ox workers). Filtering by one
+    /// harness would hide the other's models, so OpenRouter is asked for every
+    /// model the account may use and enforces its harness rules per request.
+    Shared,
+}
+
+impl Catalog {
+    /// The client the app answers by default. A shared gateway routes Claude
+    /// paths by URL, so it keeps the Codex default it always had.
+    fn client_kind(self) -> ClientKind {
+        match self {
+            Self::For(kind) => kind,
+            Self::Shared => ClientKind::Codex,
+        }
+    }
+
+    fn harness(self) -> Option<ClientKind> {
+        match self {
+            Self::For(kind) => Some(kind),
+            Self::Shared => None,
+        }
+    }
+}
+
+/// OpenRouter's keyed catalog answers with the models this account, its
+/// guardrails and the launched harness may actually use. Ask it for text output
+/// only, and for the launched harness when there is one; every other provider
+/// keeps its configured URL untouched.
+fn discovery_url(vendor: &provider::Vendor, harness: Option<ClientKind>) -> reqwest::Url {
+    let mut url = vendor.models_url.clone();
+    if !vendor.is_openrouter() || !url.path().ends_with("/models/user") {
+        return url;
+    }
+    let client = harness.map(|kind| match kind {
+        ClientKind::Codex => "codex",
+        ClientKind::Claude => "claude_code",
+    });
+    let mut query: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    if !query.iter().any(|(key, _)| key == "output_modalities") {
+        query.push(("output_modalities".to_owned(), "text".to_owned()));
+    }
+    if let Some(client) = client
+        && !query.iter().any(|(key, _)| key == "client")
+    {
+        query.push(("client".to_owned(), client.to_owned()));
+    }
+    url.set_query(None);
+    url.query_pairs_mut().extend_pairs(&query);
+    url
 }
 
 async fn collect_model_pages(
@@ -1982,6 +2216,7 @@ mod tests {
     #[derive(Clone, Debug)]
     struct Hit {
         path: String,
+        query: Option<String>,
         authorization: Option<String>,
         body: Option<Value>,
     }
@@ -1993,6 +2228,21 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter(|hit| hit.path.starts_with("/v1/responses"))
+                .cloned()
+                .collect()
+        }
+
+        /// Every inference request, whichever wire the provider speaks.
+        fn inference_hits(&self) -> Vec<Hit> {
+            self.hits
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|hit| {
+                    hit.path.starts_with("/v1/responses")
+                        || hit.path.starts_with("/v1/chat/completions")
+                        || hit.path.starts_with("/v1/messages")
+                })
                 .cloned()
                 .collect()
         }
@@ -2016,6 +2266,24 @@ mod tests {
         /// A canned native Responses HTTP failure, with headers to prove that
         /// arbitrary vendor headers are not relayed.
         responses_error: Option<(u16, Value, Vec<(&'static str, &'static str)>)>,
+        /// Responses returned in order before the normal echo, so a test can
+        /// make the first attempt fail the way a real provider does.
+        responses_script: Vec<(u16, Value)>,
+        responses_cursor: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Default for Behavior {
+        fn default() -> Self {
+            Self {
+                catalog_pages: Default::default(),
+                models: Ok(Value::Null),
+                catalog_barrier: None,
+                redirect: None,
+                responses_error: None,
+                responses_script: Vec::new(),
+                responses_cursor: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
     }
 
     fn models_body(ids: &[&str]) -> Value {
@@ -2024,11 +2292,9 @@ mod tests {
 
     async fn spawn_mock(models: Result<Value, u16>, redirect: Option<String>) -> MockVendor {
         spawn_mock_behavior(Behavior {
-            catalog_pages: Default::default(),
             models,
-            catalog_barrier: None,
             redirect,
-            responses_error: None,
+            ..Behavior::default()
         })
         .await
     }
@@ -2039,11 +2305,19 @@ mod tests {
         headers: &[(&'static str, &'static str)],
     ) -> MockVendor {
         spawn_mock_behavior(Behavior {
-            catalog_pages: Default::default(),
-            models: Ok(Value::Null),
-            catalog_barrier: None,
-            redirect: None,
             responses_error: Some((status, body, headers.to_vec())),
+            ..Behavior::default()
+        })
+        .await
+    }
+
+    /// A mock whose successive Responses requests answer from `script`, then
+    /// fall back to the normal echo.
+    async fn spawn_mock_with_responses(models: Value, script: Vec<(u16, Value)>) -> MockVendor {
+        spawn_mock_behavior(Behavior {
+            models: Ok(models),
+            responses_script: script,
+            ..Behavior::default()
         })
         .await
     }
@@ -2101,6 +2375,7 @@ mod tests {
             .map(str::to_owned);
         hits.lock().unwrap().push(Hit {
             path: path.clone(),
+            query: parts.uri.query().map(str::to_owned),
             authorization: authorization.clone(),
             body: serde_json::from_slice(&bytes).ok(),
         });
@@ -2111,7 +2386,7 @@ mod tests {
                 .insert(LOCATION, HeaderValue::from_str(target).unwrap());
             return response;
         }
-        if path == "/v1/models" {
+        if path == "/v1/models" || path == "/v1/models/user" {
             if let Some(barrier) = &behavior.catalog_barrier {
                 barrier.wait().await;
             }
@@ -2128,7 +2403,25 @@ mod tests {
                 ),
             };
         }
-        if path.starts_with("/v1/responses") {
+        if path.starts_with("/v1/responses")
+            || path.starts_with("/v1/chat/completions")
+            || path.starts_with("/v1/messages")
+        {
+            let cursor = behavior
+                .responses_cursor
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some((status, body)) = behavior.responses_script.get(cursor) {
+                // A string body is an event stream, which is what the
+                // translated wires expect from a successful provider.
+                if let Value::String(stream) = body {
+                    return bytes_response(
+                        StatusCode::from_u16(*status).unwrap(),
+                        Bytes::from(stream.clone()),
+                        "text/event-stream",
+                    );
+                }
+                return json_response(StatusCode::from_u16(*status).unwrap(), body.clone());
+            }
             if let Some((status, body, headers)) = &behavior.responses_error {
                 let mut response =
                     json_response(StatusCode::from_u16(*status).unwrap(), body.clone());
@@ -2233,6 +2526,7 @@ id = "fast-coder"
             1 << 20,
             &environment,
             None,
+            Catalog::For(ClientKind::Codex),
         )
         .await
         .unwrap();
@@ -2276,6 +2570,7 @@ id = "fast-coder"
             MAX_REQUEST_BYTES,
             &|_| None,
             None,
+            Catalog::For(ClientKind::Codex),
         )
         .await
         .unwrap();
@@ -2328,6 +2623,7 @@ alias = "together-llama"
             MAX_REQUEST_BYTES,
             &|_| None,
             None,
+            Catalog::For(ClientKind::Codex),
         )
         .await
         .unwrap();
@@ -2399,6 +2695,7 @@ alias = "together-llama"
             max_request_bytes,
             &environment,
             search,
+            Catalog::For(client_kind),
         )
         .await
         .unwrap();
@@ -2625,6 +2922,7 @@ env_key = "ALPHA_KEY"
                 1 << 20,
                 &environment,
                 None,
+                Catalog::For(ClientKind::Codex),
             ),
         )
         .await
@@ -2642,11 +2940,9 @@ env_key = "ALPHA_KEY"
         // The barrier needs two waiters and only one request arrives, so
         // discovery never answers on its own.
         let mock = spawn_mock_behavior(Behavior {
-            catalog_pages: Default::default(),
             models: Ok(models_body(&["discovered"])),
             catalog_barrier: Some(tokio::sync::Barrier::new(2)),
-            redirect: None,
-            responses_error: None,
+            ..Behavior::default()
         })
         .await;
         let environment = |name: &str| (name == "ALPHA_KEY").then(|| "alpha-secret".to_owned());
@@ -2661,6 +2957,7 @@ env_key = "ALPHA_KEY"
                 1 << 20,
                 &environment,
                 None,
+                Catalog::For(ClientKind::Codex),
             ),
         )
         .await
@@ -2688,7 +2985,7 @@ env_key = "ALPHA_KEY"
                     }))),
                     ("scope=public&after_id=loop".to_owned(), final_page)
                 ].into(),
-                catalog_barrier: None, redirect: None, responses_error: None,
+                ..Behavior::default()
             }).await;
             let config = format!(
                 "{}models_url = \"{}/models?scope=public\"\n",
@@ -2732,9 +3029,7 @@ env_key = "ALPHA_KEY"
             catalog_pages: (0..64)
                 .map(|n| (format!("after_id=m{n}"), Ok(page(n + 1))))
                 .collect(),
-            catalog_barrier: None,
-            redirect: None,
-            responses_error: None,
+            ..Behavior::default()
         })
         .await;
         let relay = start_relay(
@@ -2749,14 +3044,142 @@ env_key = "ALPHA_KEY"
         assert_eq!(mock.hits_len(), 32);
     }
 
+    fn discovery_vendor(base: &str, models_url: &str) -> provider::Vendor {
+        provider::Vendor {
+            key: "openrouter".to_owned(),
+            name: "OpenRouter".to_owned(),
+            base_url: reqwest::Url::parse(base).unwrap(),
+            models_url: reqwest::Url::parse(models_url).unwrap(),
+            env_key: None,
+            wire: provider::Wire::Responses,
+            discovery: true,
+            models: Vec::new(),
+            openrouter_provider: None,
+            max_output_tokens: None,
+            anthropic: provider::AnthropicOptions::default(),
+            chat: provider::ChatOptions::default(),
+        }
+    }
+
+    #[test]
+    fn openrouter_discovery_asks_the_keyed_endpoint_for_the_launched_client() {
+        let vendor = discovery_vendor(
+            "https://eu.openrouter.ai/api/v1",
+            "https://eu.openrouter.ai/api/v1/models/user?scope=team",
+        );
+        assert_eq!(
+            discovery_url(&vendor, Some(ClientKind::Codex)).as_str(),
+            "https://eu.openrouter.ai/api/v1/models/user?scope=team&output_modalities=text&client=codex"
+        );
+        assert_eq!(
+            discovery_url(&vendor, Some(ClientKind::Claude)).as_str(),
+            "https://eu.openrouter.ai/api/v1/models/user?scope=team&output_modalities=text&client=claude_code"
+        );
+        // A gateway that serves both clients asks for every usable model.
+        assert_eq!(
+            discovery_url(&vendor, None).as_str(),
+            "https://eu.openrouter.ai/api/v1/models/user?scope=team&output_modalities=text"
+        );
+        // Every other provider keeps exactly the URL it configured.
+        let vendor = discovery_vendor("http://127.0.0.1:9/v1", "http://127.0.0.1:9/v1/models");
+        assert_eq!(
+            discovery_url(&vendor, Some(ClientKind::Codex)).as_str(),
+            "http://127.0.0.1:9/v1/models"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_uses_the_keyed_catalog_over_the_network() {
+        let mock = spawn_mock(Ok(models_body(&["gpt-6.1-sol"])), None).await;
+        let vendor = discovery_vendor(
+            "https://openrouter.ai/api/v1",
+            &format!("{}/models/user", mock.base),
+        );
+        let key = SecretKey::new("sk-or-test".to_owned());
+        let models = discover(
+            &test_client(),
+            &vendor,
+            &key,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Some(ClientKind::Claude),
+        )
+        .await
+        .expect("the keyed catalog");
+        assert_eq!(crate::catalog::merge_models(Some(models), &[]).len(), 1);
+
+        let hits = mock.hits.lock().unwrap().clone();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/v1/models/user");
+        let query = hits[0].query.as_deref().unwrap_or_default();
+        assert!(query.contains("client=claude_code"), "{query}");
+        assert!(query.contains("output_modalities=text"), "{query}");
+        assert_eq!(
+            hits[0].authorization.as_deref(),
+            Some("Bearer sk-or-test"),
+            "the keyed catalog must carry the account key"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_openrouter_route_says_which_data_boundary_it_uses() {
+        for (host, suffix, label) in [
+            ("eu", " · EU", "EU in-region"),
+            ("us", " · US", "US in-region"),
+        ] {
+            let config = format!(
+                r#"
+[providers.openrouter]
+name = "OpenRouter"
+base_url = "https://{host}.openrouter.ai/api/v1"
+env_key = "OPENROUTER_API_KEY"
+discovery = false
+
+[[providers.openrouter.models]]
+id = "openai/gpt-6.1-sol"
+name = "GPT-6.1 Sol"
+"#
+            );
+            let relay =
+                start_relay(&config, &[("OPENROUTER_API_KEY", "sk-or-test")], 1 << 20).await;
+            let catalog = get_models(&relay).await;
+            let row = &catalog["models"][0];
+            assert_eq!(row["slug"], "openrouter/openai/gpt-6.1-sol");
+            assert_eq!(row["display_name"], format!("GPT-6.1 Sol{suffix}"));
+            assert!(
+                row["description"].as_str().unwrap().contains(label),
+                "{}",
+                row["description"]
+            );
+        }
+
+        let config = r#"
+[providers.openrouter]
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+env_key = "OPENROUTER_API_KEY"
+discovery = false
+
+[[providers.openrouter.models]]
+id = "openai/gpt-6.1-sol"
+name = "GPT-6.1 Sol"
+"#;
+        let relay = start_relay(config, &[("OPENROUTER_API_KEY", "sk-or-test")], 1 << 20).await;
+        let catalog = get_models(&relay).await;
+        assert_eq!(catalog["models"][0]["display_name"], "GPT-6.1 Sol");
+        assert!(
+            catalog["models"][0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("· global")
+        );
+    }
+
     #[tokio::test]
     async fn discovery_runs_for_multiple_vendors_concurrently() {
         let mock = spawn_mock_behavior(Behavior {
-            catalog_pages: Default::default(),
             models: Ok(models_body(&["discovered"])),
             catalog_barrier: Some(tokio::sync::Barrier::new(2)),
-            redirect: None,
-            responses_error: None,
+            ..Behavior::default()
         })
         .await;
         let config = two_vendor_config(&mock.base, &mock.base);
@@ -3217,6 +3640,376 @@ env_key = "BETA_KEY"
         assert_eq!(
             text, r#"{"error":{"message":"provider returned HTTP 500"}}"#,
             "an oversized error body contributes no text at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mandatory_reasoning_model_never_receives_effort_none() {
+        let mock = spawn_mock(
+            Ok(json!({"data": [{
+                "id": "gpt-6.1-sol",
+                "name": "GPT-6.1 Sol",
+                "context_length": 1_050_000,
+                "reasoning": {
+                    "mandatory": true,
+                    "supported_efforts": ["high", "medium", "low"],
+                    "default_effort": "high"
+                }
+            }]})),
+            None,
+        )
+        .await;
+        let relay = start_relay(
+            &one_vendor_config(&mock.base),
+            &[("ALPHA_KEY", "alpha-secret")],
+            1 << 20,
+        )
+        .await;
+
+        // Codex can still send the global default from an earlier model choice.
+        let response = post(
+            &relay,
+            json!({
+                "model": "alpha/gpt-6.1-sol",
+                "input": [],
+                "reasoning": {"effort": "none", "summary": "auto"},
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+
+        let hits = mock.responses_hits();
+        assert_eq!(hits.len(), 1);
+        let body = hits[0].body.as_ref().expect("the relay sends a JSON body");
+        assert_eq!(body["model"], "gpt-6.1-sol");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+    }
+
+    #[tokio::test]
+    async fn a_model_that_supports_it_keeps_effort_none() {
+        let mock = spawn_mock(
+            Ok(json!({"data": [{
+                "id": "gpt-5.4-mini",
+                "reasoning": {
+                    "mandatory": false,
+                    "supported_efforts": ["high", "low", "none"],
+                    "default_effort": "medium"
+                }
+            }]})),
+            None,
+        )
+        .await;
+        let relay = start_relay(
+            &one_vendor_config(&mock.base),
+            &[("ALPHA_KEY", "alpha-secret")],
+            1 << 20,
+        )
+        .await;
+
+        let response = post(
+            &relay,
+            json!({
+                "model": "alpha/gpt-5.4-mini",
+                "input": [],
+                "reasoning": {"effort": "none"},
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let hits = mock.responses_hits();
+        assert_eq!(
+            hits[0].body.as_ref().unwrap()["reasoning"]["effort"],
+            "none"
+        );
+    }
+
+    fn static_vendor_config(base: &str) -> String {
+        format!(
+            r#"
+[providers.alpha]
+name = "Alpha"
+base_url = "{base}"
+env_key = "ALPHA_KEY"
+discovery = false
+
+[[providers.alpha.models]]
+id = "gpt"
+"#
+        )
+    }
+
+    fn chat_vendor_config(base: &str) -> String {
+        format!(
+            r#"
+[providers.alpha]
+name = "Alpha"
+base_url = "{base}"
+env_key = "ALPHA_KEY"
+discovery = false
+wire_api = "chat_completions"
+chat_reasoning_effort = "forward"
+
+[[providers.alpha.models]]
+id = "gpt"
+"#
+        )
+    }
+
+    const CHAT_STREAM: &str = concat!(
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+
+    #[tokio::test]
+    async fn a_rejected_field_is_dropped_and_the_request_retried_once() {
+        let mock = spawn_mock_with_responses(
+            models_body(&[]),
+            vec![(
+                400,
+                json!({"error": {"message": "Reasoning is mandatory for this endpoint and cannot be disabled."}}),
+            )],
+        )
+        .await;
+        let relay = start_relay(
+            &static_vendor_config(&mock.base),
+            &[("ALPHA_KEY", "alpha-secret")],
+            1 << 20,
+        )
+        .await;
+
+        let response = post(
+            &relay,
+            json!({
+                "model": "alpha/gpt",
+                "input": [],
+                "reasoning": {"effort": "none", "summary": "auto"},
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let hits = mock.inference_hits();
+        assert_eq!(hits.len(), 2, "one rejection and one retry");
+        assert!(hits[0].body.as_ref().unwrap().get("reasoning").is_some());
+        let retried = hits[1].body.as_ref().unwrap();
+        // Only the disabling value goes; the requested summary is preserved.
+        assert!(retried["reasoning"].get("effort").is_none(), "{retried}");
+        assert_eq!(retried["reasoning"]["summary"], "auto");
+        assert_eq!(retried["input"], json!([]), "nothing else is removed");
+    }
+
+    #[tokio::test]
+    async fn a_learned_rule_is_applied_before_the_next_request() {
+        let mock = spawn_mock_with_responses(
+            models_body(&[]),
+            vec![(
+                400,
+                json!({"error": {"message": "Reasoning is mandatory for this endpoint and cannot be disabled."}}),
+            )],
+        )
+        .await;
+        let relay = start_relay(
+            &static_vendor_config(&mock.base),
+            &[("ALPHA_KEY", "alpha-secret")],
+            1 << 20,
+        )
+        .await;
+        let body = json!({
+            "model": "alpha/gpt",
+            "input": [],
+            "reasoning": {"effort": "none"},
+        });
+        assert_eq!(post(&relay, body.clone()).await.status(), 200);
+        assert_eq!(post(&relay, body).await.status(), 200);
+
+        let hits = mock.inference_hits();
+        assert_eq!(hits.len(), 3, "the second turn must not repeat the 400");
+        assert!(hits[2].body.as_ref().unwrap().get("reasoning").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_named_unsupported_parameter_is_dropped() {
+        let mock = spawn_mock_with_responses(
+            models_body(&[]),
+            vec![(
+                400,
+                json!({"error": {"message": "Unsupported parameter: 'cache_control' is not supported with this model."}}),
+            )],
+        )
+        .await;
+        let relay = start_relay(
+            &static_vendor_config(&mock.base),
+            &[("ALPHA_KEY", "alpha-secret")],
+            1 << 20,
+        )
+        .await;
+        let response = post(
+            &relay,
+            json!({
+                "model": "alpha/gpt",
+                "input": [],
+                "cache_control": {"type": "ephemeral"},
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let hits = mock.inference_hits();
+        assert_eq!(hits.len(), 2);
+        assert!(
+            hits[1]
+                .body
+                .as_ref()
+                .unwrap()
+                .get("cache_control")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stateless_refusal_strips_store_but_keeps_a_conversation_reference() {
+        // `store` alone is a preference, so a retry without it is safe.
+        let mock = spawn_mock_with_responses(
+            models_body(&[]),
+            vec![(
+                400,
+                json!({"error": {"message": "Requests that set store: true are rejected"}}),
+            )],
+        )
+        .await;
+        let relay = start_relay(
+            &static_vendor_config(&mock.base),
+            &[("ALPHA_KEY", "alpha-secret")],
+            1 << 20,
+        )
+        .await;
+        let response = post(
+            &relay,
+            json!({"model": "alpha/gpt", "input": [], "store": true}),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        let hits = mock.inference_hits();
+        assert_eq!(hits.len(), 2);
+        assert!(hits[1].body.as_ref().unwrap().get("store").is_none());
+
+        // Removing a non-null `previous_response_id` would drop the only link
+        // to earlier turns, so the provider error must reach the user.
+        let mock = spawn_mock_with_responses(
+            models_body(&[]),
+            vec![(
+                400,
+                json!({"error": {"message": "a previous_response_id is rejected"}}),
+            )],
+        )
+        .await;
+        let relay = start_relay(
+            &static_vendor_config(&mock.base),
+            &[("ALPHA_KEY", "alpha-secret")],
+            1 << 20,
+        )
+        .await;
+        let response = post(
+            &relay,
+            json!({
+                "model": "alpha/gpt",
+                "input": [],
+                "store": true,
+                "previous_response_id": "resp_1",
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), 400);
+        assert_eq!(mock.inference_hits().len(), 1, "no unsafe retry");
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_or_an_unrelated_error_is_not_retried() {
+        for (status, message) in [(429, "slow down"), (400, "the prompt is invalid")] {
+            let mock = spawn_mock_with_responses(
+                models_body(&[]),
+                vec![(status, json!({"error": {"message": message}}))],
+            )
+            .await;
+            let relay = start_relay(
+                &static_vendor_config(&mock.base),
+                &[("ALPHA_KEY", "alpha-secret")],
+                1 << 20,
+            )
+            .await;
+            let response = post(
+                &relay,
+                json!({
+                    "model": "alpha/gpt",
+                    "input": [],
+                    "reasoning": {"effort": "none"},
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), status, "{message}");
+            assert_eq!(mock.inference_hits().len(), 1, "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_translated_route_recovers_and_learns_too() {
+        let mock = spawn_mock_with_responses(
+            models_body(&[]),
+            vec![
+                (
+                    400,
+                    json!({"error": {"message": "This model does not support 'none' for reasoning_effort"}}),
+                ),
+                (200, json!(CHAT_STREAM)),
+                (200, json!(CHAT_STREAM)),
+            ],
+        )
+        .await;
+        let relay = start_relay(
+            &chat_vendor_config(&mock.base),
+            &[("ALPHA_KEY", "alpha-secret")],
+            1 << 20,
+        )
+        .await;
+        let request = json!({
+            "model": "alpha/gpt",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "hi"}
+            ]}],
+            "reasoning": {"effort": "none"},
+            "stream": true,
+        });
+        let response = post(&relay, request.clone()).await;
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        assert_eq!(status, 200, "{text}");
+        assert!(text.contains("response.completed"), "{text}");
+        let hits = mock.inference_hits();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].body.as_ref().unwrap()["reasoning_effort"], "none");
+        assert!(
+            hits[1]
+                .body
+                .as_ref()
+                .unwrap()
+                .get("reasoning_effort")
+                .is_none(),
+            "{:?}",
+            hits[1].body
+        );
+
+        // The learned rule applies before the second turn is translated.
+        let response = post(&relay, request).await;
+        assert_eq!(response.status(), 200);
+        let hits = mock.inference_hits();
+        assert_eq!(hits.len(), 3);
+        assert!(
+            hits[2]
+                .body
+                .as_ref()
+                .unwrap()
+                .get("reasoning_effort")
+                .is_none()
         );
     }
 

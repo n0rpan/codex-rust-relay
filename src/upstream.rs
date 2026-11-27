@@ -54,6 +54,8 @@ pub struct Translation<'a> {
     pub upstream_model: &'a str,
     pub requested_model: &'a str,
     pub secrets: Arc<Vec<String>>,
+    pub adapt: &'a crate::adapt::Memory,
+    pub reasoning: &'a crate::provider::ReasoningPolicy,
 }
 
 /// Translate, send, and stream one request to a translated vendor.
@@ -67,8 +69,13 @@ pub async fn translated(
         Ok(prepared) => prepared,
         Err(message) => return bad_request(&message),
     };
-    let (body, map) = prepared;
+    let (mut body, map) = prepared;
     drop(payload);
+    // Rules learned from an earlier rejection in this process apply before the
+    // request leaves, so a repeated turn does not pay the same 400 again.
+    translation
+        .adapt
+        .apply_known(vendor.key.as_str(), translation.upstream_model, &mut body);
 
     let mut headers = match vendor.inference_headers(translation.key, translation.incoming) {
         Ok(headers) => headers,
@@ -76,36 +83,63 @@ pub async fn translated(
     };
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
-    let encoded = body.to_string();
-    drop(body);
-
-    let upstream = client
-        .post(vendor.endpoint())
-        .headers(headers)
-        .body(encoded)
-        .send()
-        .await;
-    let upstream = match upstream {
-        Ok(response) => response,
-        Err(_) => return bad_gateway("the upstream request failed"),
+    let upstream = {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let upstream = client
+                .post(vendor.endpoint())
+                .headers(headers.clone())
+                .body(body.to_string())
+                .send()
+                .await;
+            let upstream = match upstream {
+                Ok(response) => response,
+                Err(_) => return bad_gateway("the upstream request failed"),
+            };
+            if upstream.status().is_success() {
+                break upstream;
+            }
+            let status = upstream.status();
+            let retry_after = upstream
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u32>().ok());
+            let error_body = read_error_body(upstream).await;
+            let action = error_body
+                .as_ref()
+                .and_then(extract_error_message)
+                .and_then(|message| crate::adapt::classify(status.as_u16(), message, &body));
+            if attempt < crate::adapt::MAX_ATTEMPTS
+                && let Some(action) = action
+                && crate::adapt::apply(action, &mut body)
+            {
+                if translation
+                    .adapt
+                    .learn(vendor.key.as_str(), translation.upstream_model, action)
+                {
+                    eprintln!(
+                        "ox: provider {:?}: model {:?}: {} because the provider rejected it\n  fix: {}",
+                        vendor.key,
+                        translation.upstream_model,
+                        action.label(),
+                        action.advice()
+                    );
+                }
+                continue;
+            }
+            let message =
+                upstream_error(status.as_u16(), error_body.as_ref(), &translation.secrets);
+            return upstream_failure(status, retry_after, &message, &translation.secrets);
+        }
     };
-    let status = upstream.status();
     let content_type = upstream
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_owned();
-    if !status.is_success() {
-        let retry_after = upstream
-            .headers()
-            .get(RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u32>().ok());
-        let body = read_error_body(upstream).await;
-        let message = upstream_error(status.as_u16(), body.as_ref(), &translation.secrets);
-        return upstream_failure(status, retry_after, &message, &translation.secrets);
-    }
     if !content_type.starts_with("text/event-stream") {
         let body = read_error_body(upstream).await;
         let detail = body
@@ -207,6 +241,22 @@ fn prepare_body(
     body.as_object_mut()
         .ok_or("the translated request must be a JSON object")?;
     vendor.add_cache_hints(&mut body);
+    // The Chat Completions translator forwards a fixed field list, so the
+    // OpenRouter extensions OX added to the canonical request are copied here.
+    if vendor.is_openrouter()
+        && let Some(object) = body.as_object_mut()
+    {
+        if let Some(preferences) = &vendor.openrouter_provider {
+            object
+                .entry("provider")
+                .or_insert_with(|| preferences.clone());
+        }
+        if let Some(session) = payload.get("session_id") {
+            object
+                .entry("session_id")
+                .or_insert_with(|| session.clone());
+        }
+    }
     Ok((body, normalized.map))
 }
 
@@ -524,7 +574,7 @@ impl SseState {
     }
 }
 
-async fn read_error_body(response: reqwest::Response) -> Option<Value> {
+pub(crate) async fn read_error_body(response: reqwest::Response) -> Option<Value> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_ERROR_BODY as u64)
@@ -543,7 +593,7 @@ async fn read_error_body(response: reqwest::Response) -> Option<Value> {
     serde_json::from_slice(&buffer).ok()
 }
 
-fn upstream_error(status: u16, body: Option<&Value>, secrets: &[String]) -> String {
+pub(crate) fn upstream_error(status: u16, body: Option<&Value>, secrets: &[String]) -> String {
     let detail = body
         .and_then(extract_error_message)
         .map(|message| format!(": {}", truncate(&redact(message, secrets))))
@@ -551,7 +601,7 @@ fn upstream_error(status: u16, body: Option<&Value>, secrets: &[String]) -> Stri
     format!("provider returned HTTP {status}{detail}")
 }
 
-fn extract_error_message(value: &Value) -> Option<&str> {
+pub(crate) fn extract_error_message(value: &Value) -> Option<&str> {
     let message = value
         .get("error")
         .and_then(|error| error.get("message"))
@@ -643,10 +693,22 @@ pub(crate) async fn http_failure(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u32>().ok());
     let body = read_error_body(response).await;
+    http_failure_parts(status, retry_after, body, secrets)
+}
+
+/// Builds the same bounded error response `http_failure` produces, from a body
+/// that was already read. Adaptation needs the body before deciding whether to
+/// retry, and must still return the original error when it does not.
+pub(crate) fn http_failure_parts(
+    status: StatusCode,
+    retry_after: Option<u32>,
+    body: Option<Value>,
+    secrets: &[String],
+) -> Response<crate::RelayBody> {
     let message = upstream_error(status.as_u16(), body.as_ref(), secrets);
     let mut error = json!({ "message": message });
     if let Some(provider_error) = body.as_ref().and_then(|body| body.get("error")) {
-        for field in ["code", "type"] {
+        for field in ["code", "type", "error_type"] {
             let value = provider_error.get(field).and_then(Value::as_str);
             if let Some(value) = value
                 && (1..=128).contains(&value.len())
@@ -658,6 +720,16 @@ pub(crate) async fn http_failure(
                 error[field] = json!(value);
             }
         }
+    }
+    if let Some(error_type) = body.as_ref().and_then(|body| body.get("error_type"))
+        && let Some(value) = error_type.as_str()
+        && (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && !secrets.iter().any(|secret| value.contains(secret))
+    {
+        error["error_type"] = json!(value);
     }
     let mut downstream = crate::json_response(status, json!({ "error": error }));
     forward_retry_after(&mut downstream, status, retry_after, secrets);
@@ -698,6 +770,56 @@ mod tests {
             redact("key sk-12345678 and abc", &secrets),
             "key [redacted] and abc"
         );
+    }
+
+    fn openrouter_vendor(wire: Wire) -> Vendor {
+        let url = reqwest::Url::parse("https://eu.openrouter.ai/api/v1").unwrap();
+        Vendor {
+            key: "openrouter".to_owned(),
+            name: "OpenRouter".to_owned(),
+            base_url: url.clone(),
+            models_url: crate::provider::openrouter_models_url(&url),
+            env_key: None,
+            wire,
+            discovery: false,
+            models: Vec::new(),
+            openrouter_provider: Some(json!({"sort": "throughput"})),
+            max_output_tokens: None,
+            anthropic: crate::provider::AnthropicOptions::default(),
+            chat: ChatOptions::default(),
+        }
+    }
+
+    #[test]
+    fn openrouter_chat_carries_preferences_and_the_session() {
+        let vendor = openrouter_vendor(Wire::ChatCompletions);
+        let mut payload = json!({
+            "model": "alias",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "hi"}
+            ]}],
+            "session_id": "ox_abc",
+            "stream": true,
+        });
+        let (body, _) = prepare_body(&vendor, &mut payload, "upstream-model").unwrap();
+        assert_eq!(body["provider"]["sort"], "throughput");
+        assert_eq!(body["session_id"], "ox_abc");
+
+        // A provider that is not OpenRouter gets neither extension.
+        let mut vendor = openrouter_vendor(Wire::ChatCompletions);
+        vendor.base_url = reqwest::Url::parse("https://alpha.example/v1").unwrap();
+        vendor.openrouter_provider = None;
+        let mut payload = json!({
+            "model": "alias",
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "hi"}
+            ]}],
+            "session_id": "ox_abc",
+            "stream": true,
+        });
+        let (body, _) = prepare_body(&vendor, &mut payload, "upstream-model").unwrap();
+        assert!(body.get("provider").is_none());
+        assert!(body.get("session_id").is_none());
     }
 
     #[tokio::test]

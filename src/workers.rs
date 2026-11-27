@@ -318,6 +318,7 @@ impl Service {
                         MAX_CALL_BYTES,
                         &|name| keys.get(name),
                         None,
+                        crate::Catalog::Shared,
                     )
                     .await
                 }

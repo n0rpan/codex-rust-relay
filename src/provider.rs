@@ -491,6 +491,8 @@ pub struct ModelEntry {
     pub context_window: Option<u64>,
     pub input_modalities: Option<Vec<String>>,
     pub reasoning_efforts: Option<Vec<String>>,
+    pub default_reasoning_effort: Option<String>,
+    pub reasoning_mandatory: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -503,6 +505,10 @@ pub struct Vendor {
     pub wire: Wire,
     pub discovery: bool,
     pub models: Vec<ModelEntry>,
+    /// OpenRouter's per-request provider routing preferences
+    /// (`[providers.<name>.provider]`). Rejected for other providers so a typo
+    /// cannot silently do nothing on an endpoint that has no such field.
+    pub openrouter_provider: Option<serde_json::Value>,
     /// Anthropic Messages request ceiling. Codex does not send
     /// `max_output_tokens`, but Anthropic requires `max_tokens`.
     pub max_output_tokens: Option<u64>,
@@ -547,6 +553,18 @@ impl Vendor {
         };
         value.set_sensitive(true);
         headers.insert(name, value);
+        if self.is_openrouter() {
+            // Optional attribution for app leaderboards, documented in
+            // OpenRouter's quickstart.
+            headers.insert(
+                HeaderName::from_static("http-referer"),
+                HeaderValue::from_static("https://github.com/oxstack/ox"),
+            );
+            headers.insert(
+                HeaderName::from_static("x-openrouter-title"),
+                HeaderValue::from_static("OX"),
+            );
+        }
         if self.wire == Wire::AnthropicMessages {
             headers.insert(
                 HeaderName::from_static("anthropic-version"),
@@ -554,6 +572,104 @@ impl Vendor {
             );
         }
         Ok(headers)
+    }
+
+    /// Applies OpenRouter's request extensions that the stock client does not
+    /// know about: provider routing preferences and a sticky session id.
+    pub(crate) fn decorate_openrouter(&self, body: &mut serde_json::Value, session: Option<&str>) {
+        if !self.is_openrouter() {
+            return;
+        }
+        let Some(body) = body.as_object_mut() else {
+            return;
+        };
+        if let Some(preferences) = &self.openrouter_provider
+            && !body.contains_key("provider")
+        {
+            body.insert("provider".to_owned(), preferences.clone());
+        }
+        if let Some(session) = session
+            && !body.contains_key("session_id")
+        {
+            body.insert("session_id".to_owned(), serde_json::json!(session));
+        }
+    }
+
+    /// Applies every OpenRouter request rule OX knows: routing preferences, a
+    /// sticky session, and the stateless wire contract. Returns true when a
+    /// storage field had to be removed or corrected.
+    pub(crate) fn prepare_openrouter_request(
+        &self,
+        body: &mut serde_json::Value,
+        session: Option<&str>,
+    ) -> bool {
+        if !self.is_openrouter() {
+            return false;
+        }
+        self.decorate_openrouter(body, session);
+        let Some(object) = body.as_object_mut() else {
+            return false;
+        };
+        // A non-null reference is the only link to earlier turns. Keep it so
+        // the provider rejects the request instead of answering from partial
+        // context; the caller must resend the full history.
+        let removed = match object.get("previous_response_id") {
+            Some(serde_json::Value::Null) => object.remove("previous_response_id").is_some(),
+            _ => false,
+        };
+        let corrected = match object.get("store") {
+            None | Some(serde_json::Value::Bool(false)) => false,
+            Some(_) => {
+                object.insert("store".to_owned(), serde_json::json!(false));
+                true
+            }
+        };
+        removed || corrected
+    }
+
+    /// A stable, non-reversible session key for OpenRouter sticky routing.
+    ///
+    /// OpenRouter documents `session_id` as the strongest cache pin: every turn
+    /// of one conversation reaches the same backend endpoint. The raw client
+    /// id never leaves OX; the HMAC is scoped to the provider key, so two
+    /// workspaces with the same thread id do not share a session.
+    pub(crate) fn openrouter_session_id(
+        &self,
+        key: &SecretKey,
+        incoming: Option<&HeaderMap>,
+        payload: &serde_json::Value,
+    ) -> Option<String> {
+        if !self.is_openrouter() {
+            return None;
+        }
+        let session: std::borrow::Cow<'_, str> = match incoming
+            .and_then(openrouter_session_hint)
+            .or_else(|| {
+                payload
+                    .get("prompt_cache_key")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| hint_ok(value))
+            })
+            .or_else(|| {
+                payload
+                    .pointer("/client_metadata/session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| hint_ok(value))
+            }) {
+            Some(session) => session.into(),
+            // A Claude Messages request without a session header names its
+            // session only inside the JSON-encoded `metadata.user_id`. The
+            // Chat Completions translation drops `prompt_cache_key`, so this
+            // is the only sticky-routing hint that route gets.
+            None => payload.get("metadata").and_then(claude_session_id)?.into(),
+        };
+        let hmac = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key.expose().as_bytes());
+        let mut context = ring::hmac::Context::with_key(&hmac);
+        context.update(b"ox-openrouter-session-v1\0");
+        context.update(self.key.as_bytes());
+        context.update(b"\0");
+        context.update(session.as_bytes());
+        Some(format!("ox_{}", hex::encode(context.sign().as_ref())))
     }
 
     pub(crate) fn discovery_headers(&self, key: &SecretKey) -> Result<HeaderMap, RelayError> {
@@ -572,17 +688,17 @@ impl Vendor {
     fn hosted_messages_uses_bearer(&self) -> bool {
         self.base_url.scheme() == "https"
             && self.base_url.port_or_known_default() == Some(443)
-            && matches!(
-                (
-                    self.base_url.host_str(),
-                    self.base_url.path().trim_end_matches('/')
-                ),
-                (Some("openrouter.ai"), "/api/v1")
-                    | (
+            && (is_openrouter_url(&self.base_url)
+                || matches!(
+                    (
+                        self.base_url.host_str(),
+                        self.base_url.path().trim_end_matches('/')
+                    ),
+                    (
                         Some("opencode.ai"),
                         "/inference/anthropic/v1" | "/inference/go/anthropic/v1"
                     )
-            )
+                ))
     }
 
     /// Asks the provider to cache the prompt, where it only does so on
@@ -609,10 +725,20 @@ impl Vendor {
         }
     }
 
-    fn is_openrouter(&self) -> bool {
-        self.base_url.scheme() == "https"
-            && self.base_url.port_or_known_default() == Some(443)
-            && self.base_url.host_str() == Some("openrouter.ai")
+    pub(crate) fn is_openrouter(&self) -> bool {
+        is_openrouter_url(&self.base_url)
+    }
+
+    /// The in-region host this route uses, if it is an OpenRouter one.
+    pub(crate) fn openrouter_region(&self) -> Option<Region> {
+        if !self.is_openrouter() {
+            return None;
+        }
+        match self.base_url.host_str() {
+            Some("eu.openrouter.ai") => Some(Region::Eu),
+            Some("us.openrouter.ai") => Some(Region::Us),
+            _ => Some(Region::Global),
+        }
     }
 
     pub(crate) fn is_direct_anthropic(&self) -> bool {
@@ -714,12 +840,70 @@ fn opencode_session_hint(headers: &HeaderMap) -> Option<&str> {
     ]
     .iter()
     .filter_map(|name| headers.get(*name)?.to_str().ok())
-    .find(|id| {
-        matches!(id.len(), 1..=128)
-            && id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    })
+    .find(|id| hint_ok(id))
+}
+
+fn openrouter_session_hint(headers: &HeaderMap) -> Option<&str> {
+    opencode_session_hint(headers)
+}
+
+/// Claude Code's session ID from Messages `metadata`, when it names a valid one.
+pub(crate) fn claude_session_id(metadata: &serde_json::Value) -> Option<String> {
+    let encoded = metadata.get("user_id")?.as_str()?;
+    let user: serde_json::Value = serde_json::from_str(encoded).ok()?;
+    let session = user.get("session_id")?.as_str()?;
+    let valid = (1..=64).contains(&session.len())
+        && session
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
+    valid.then(|| session.to_owned())
+}
+
+fn hint_ok(id: &str) -> bool {
+    matches!(id.len(), 1..=128)
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// OpenRouter serves the same API on its global and in-region hosts.
+pub(crate) fn is_openrouter_url(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.port_or_known_default() == Some(443)
+        && url
+            .host_str()
+            .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
+        && url.path().trim_end_matches('/').ends_with("/api/v1")
+}
+
+/// Which OpenRouter data boundary a route uses. In-region routing is chosen
+/// per request by hostname and cannot be switched silently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Region {
+    Global,
+    Eu,
+    Us,
+}
+
+impl Region {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Eu => "EU in-region",
+            Self::Us => "US in-region",
+        }
+    }
+}
+
+/// OpenRouter's guardrail- and key-filtered catalog. The public `/models` list
+/// ignores the account, so a restricted key is shown models it cannot call.
+pub(crate) fn openrouter_models_url(base: &Url) -> Url {
+    let mut url = base.clone();
+    url.set_path(&format!(
+        "{}/models/user",
+        base.path().trim_end_matches('/')
+    ));
+    url
 }
 
 /// Default environment variable holding the Brave Search subscription token.
@@ -972,8 +1156,21 @@ fn parse_vendor(key: &str, item: &Item) -> Result<Vendor, RelayError> {
             }
             url
         }
-        None => companion_catalog.unwrap_or_else(|| default_models_url(&base_url)),
+        None => companion_catalog.unwrap_or_else(|| {
+            if is_openrouter_url(&base_url) {
+                openrouter_models_url(&base_url)
+            } else {
+                default_models_url(&base_url)
+            }
+        }),
     };
+    let openrouter_provider = parse_openrouter_provider(key, table)?;
+    if openrouter_provider.is_some() && !is_openrouter_url(&base_url) {
+        return Err(format!(
+            "providers.{key}.provider is an OpenRouter routing setting; remove it or point base_url at an openrouter.ai host"
+        )
+        .into());
+    }
     let env_key = match opt_str(table, "env_key")? {
         Some(name) => {
             if let Some(reason) = credential_env_error(&name) {
@@ -1009,6 +1206,7 @@ fn parse_vendor(key: &str, item: &Item) -> Result<Vendor, RelayError> {
         wire,
         discovery,
         models,
+        openrouter_provider,
         max_output_tokens,
         anthropic,
         chat,
@@ -1161,6 +1359,29 @@ fn parse_models(provider_key: &str, item: &Item) -> Result<Vec<ModelEntry>, Rela
             .into());
         }
         let reasoning_efforts = opt_strings(table, "reasoning_efforts")?;
+        if let Some(efforts) = &reasoning_efforts
+            && let Some(unknown) = efforts
+                .iter()
+                .find(|effort| crate::catalog::reasoning_rank(effort).is_none())
+        {
+            return Err(format!(
+                "providers.{provider_key}.models entry {id:?} has an unknown reasoning effort {unknown:?}; use none, minimal, low, medium, high, xhigh or max"
+            )
+            .into());
+        }
+        let default_reasoning_effort = match opt_str(table, "default_reasoning_effort")? {
+            Some(effort) => {
+                if crate::catalog::reasoning_rank(&effort).is_none() {
+                    return Err(format!(
+                        "providers.{provider_key}.models entry {id:?} has an unknown default_reasoning_effort {effort:?}"
+                    )
+                    .into());
+                }
+                Some(effort)
+            }
+            None => None,
+        };
+        let reasoning_mandatory = opt_bool(table, "reasoning_mandatory")?;
         entries.push(ModelEntry {
             id,
             alias,
@@ -1168,9 +1389,119 @@ fn parse_models(provider_key: &str, item: &Item) -> Result<Vec<ModelEntry>, Rela
             context_window,
             input_modalities,
             reasoning_efforts,
+            default_reasoning_effort,
+            reasoning_mandatory,
         });
     }
     Ok(entries)
+}
+
+/// OpenRouter's request-level routing preferences. Only the documented keys are
+/// accepted, with their documented types, so a typo fails at launch instead of
+/// being ignored upstream.
+fn parse_openrouter_provider(
+    provider_key: &str,
+    table: &dyn TableLike,
+) -> Result<Option<serde_json::Value>, RelayError> {
+    let Some(item) = table.get("provider") else {
+        return Ok(None);
+    };
+    let path = format!("providers.{provider_key}.provider");
+    let settings = item
+        .as_table_like()
+        .ok_or_else(|| format!("{path} must be a table"))?;
+    let mut output = serde_json::Map::new();
+    for (name, value) in settings.iter() {
+        let entry = match name {
+            "allow_fallbacks" | "zdr" | "require_parameters" | "enforce_distillable_text" => {
+                serde_json::Value::Bool(
+                    value
+                        .as_bool()
+                        .ok_or_else(|| format!("{path}.{name} must be true or false"))?,
+                )
+            }
+            "sort" => {
+                let sort = value
+                    .as_str()
+                    .ok_or_else(|| format!("{path}.sort must be a string"))?;
+                if !matches!(sort, "price" | "throughput" | "latency") {
+                    return Err(format!(
+                        "{path}.sort must be \"price\", \"throughput\" or \"latency\""
+                    )
+                    .into());
+                }
+                serde_json::Value::String(sort.to_owned())
+            }
+            "data_collection" => {
+                let policy = value
+                    .as_str()
+                    .ok_or_else(|| format!("{path}.data_collection must be a string"))?;
+                if !matches!(policy, "allow" | "deny") {
+                    return Err(
+                        format!("{path}.data_collection must be \"allow\" or \"deny\"").into(),
+                    );
+                }
+                serde_json::Value::String(policy.to_owned())
+            }
+            "order" | "only" | "ignore" => {
+                let list = value
+                    .as_array()
+                    .ok_or_else(|| format!("{path}.{name} must be a list of provider slugs"))?;
+                let mut slugs = Vec::new();
+                for slug in list.iter() {
+                    let slug = slug
+                        .as_str()
+                        .filter(|slug| {
+                            !slug.is_empty()
+                                && slug.len() <= 128
+                                && slug.bytes().all(|byte| {
+                                    byte.is_ascii_alphanumeric()
+                                        || matches!(byte, b'-' | b'_' | b'.' | b'/')
+                                })
+                        })
+                        .ok_or_else(|| {
+                            format!("{path}.{name} must contain provider slugs such as \"openai\"")
+                        })?;
+                    slugs.push(serde_json::Value::String(slug.to_owned()));
+                }
+                serde_json::Value::Array(slugs)
+            }
+            "max_price" => {
+                let prices = value
+                    .as_table_like()
+                    .ok_or_else(|| format!("{path}.max_price must be a table"))?;
+                let mut limits = serde_json::Map::new();
+                for (kind, amount) in prices.iter() {
+                    if !matches!(
+                        kind,
+                        "prompt" | "completion" | "request" | "image" | "audio"
+                    ) {
+                        return Err(format!(
+                            "{path}.max_price.{kind} is not a recognized price kind"
+                        )
+                        .into());
+                    }
+                    let amount = amount
+                        .as_float()
+                        .or_else(|| amount.as_integer().map(|value| value as f64))
+                        .filter(|amount| *amount >= 0.0)
+                        .ok_or_else(|| {
+                            format!("{path}.max_price.{kind} must be a non-negative number")
+                        })?;
+                    limits.insert(kind.to_owned(), serde_json::json!(amount));
+                }
+                serde_json::Value::Object(limits)
+            }
+            other => {
+                return Err(format!(
+                    "{path}.{other} is not a recognized OpenRouter routing setting"
+                )
+                .into());
+            }
+        };
+        output.insert(name.to_owned(), entry);
+    }
+    Ok(Some(serde_json::Value::Object(output)))
 }
 
 /// Builds a stable alias. Explicit aliases win; otherwise the alias is
@@ -1205,6 +1536,19 @@ pub struct Route {
     pub upstream_model: String,
     pub wire: Wire,
     pub max_output_tokens: Option<u64>,
+    pub reasoning: ReasoningPolicy,
+}
+
+/// What a routed model accepts for reasoning, when the provider says so.
+///
+/// An empty `supported` list means "unknown": OX leaves the caller's choice
+/// alone and lets the provider answer. A non-empty list is authoritative, and
+/// `mandatory` means every way of disabling reasoning is rejected.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReasoningPolicy {
+    pub supported: Vec<String>,
+    pub default: Option<String>,
+    pub mandatory: bool,
 }
 
 impl Route {
@@ -1226,6 +1570,190 @@ impl Route {
         if requested.is_some_and(|requested| requested > limit) {
             payload[field] = limit.into();
         }
+    }
+
+    /// Removes a reasoning setting this model cannot accept.
+    ///
+    /// Codex sends `reasoning.effort: "none"` from its own global default long
+    /// after the user changed models. Providers that treat reasoning as
+    /// mandatory answer that with HTTP 400, so the value is replaced with the
+    /// provider's default (or dropped) before the request leaves OX.
+    ///
+    /// Returns a short description of the change for the one-line notice.
+    pub fn normalize_reasoning(&self, payload: &mut serde_json::Value) -> Option<String> {
+        self.reasoning.normalize_responses(payload)
+    }
+}
+
+impl ReasoningPolicy {
+    /// Removes a reasoning setting a Responses request cannot use.
+    pub fn normalize_responses(&self, payload: &mut serde_json::Value) -> Option<String> {
+        let supported = self.supported.clone();
+        let mandatory = self.mandatory;
+        let reasoning = payload.get_mut("reasoning")?.as_object_mut()?;
+        let requested = reasoning
+            .get("effort")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let disabled = reasoning
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+        if requested.is_none() && !disabled {
+            return None;
+        }
+        let supports_none = supported.iter().any(|level| level == "none");
+        let wants_off = requested.as_deref() == Some("none") || disabled;
+        // Without a published effort list there is nothing to clamp, but an
+        // explicit mandatory policy still forbids disabling reasoning.
+        if !mandatory && supported.is_empty() {
+            return None;
+        }
+        if wants_off && supports_none && !mandatory {
+            return None;
+        }
+        if !wants_off {
+            // An unknown list does not mean every explicit effort is invalid,
+            // and a mandatory policy only forbids turning reasoning off.
+            if supported.is_empty() {
+                return None;
+            }
+            if let Some(effort) = requested.as_deref()
+                && supported.iter().any(|level| level == effort)
+            {
+                return None;
+            }
+        }
+        let replacement = self
+            .default
+            .clone()
+            .filter(|default| supported.is_empty() || supported.contains(default))
+            .or_else(|| {
+                if supported.is_empty() {
+                    return None;
+                }
+                crate::catalog::clamp_reasoning_effort(
+                    requested.as_deref().unwrap_or("none"),
+                    &supported,
+                    None,
+                )
+            });
+        if let Some(replacement) = replacement {
+            if requested.as_deref() == Some(replacement.as_str()) && !disabled {
+                return None;
+            }
+            reasoning.remove("enabled");
+            reasoning.insert(
+                "effort".to_owned(),
+                serde_json::Value::String(replacement.clone()),
+            );
+            let notice = match requested.as_deref() {
+                Some("none") | None => {
+                    format!("reasoning cannot be disabled on this model; using {replacement:?}")
+                }
+                Some(previous) => {
+                    format!("reasoning effort {previous:?} is not supported; using {replacement:?}")
+                }
+            };
+            return Some(notice);
+        }
+        // A mandatory model with no effort list and no default: drop the block
+        // and let the provider apply its own reasoning level.
+        if !mandatory {
+            return None;
+        }
+        payload.as_object_mut()?.remove("reasoning");
+        Some("reasoning cannot be disabled on this model; using its default".to_owned())
+    }
+
+    /// Removes a reasoning setting a native Anthropic Messages request cannot
+    /// use (`thinking` disabled, or an unsupported `output_config.effort`).
+    pub fn normalize_anthropic(&self, payload: &mut serde_json::Value) -> Option<String> {
+        let object = payload.as_object_mut()?;
+        let mut notice = None;
+        if object
+            .get("thinking")
+            .and_then(|thinking| thinking.get("type"))
+            .and_then(serde_json::Value::as_str)
+            == Some("disabled")
+        {
+            let supports_none = self.supported.iter().any(|level| level == "none");
+            if self.mandatory || (!self.supported.is_empty() && !supports_none) {
+                object.remove("thinking");
+                notice = Some(
+                    "reasoning cannot be disabled on this model; using its default".to_owned(),
+                );
+            }
+        }
+        let requested = object
+            .get("output_config")
+            .and_then(|config| config.get("effort"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        if let Some(requested) = requested {
+            let wants_off = requested == "none";
+            let unsupported = !self.supported.is_empty() && !self.supported.contains(&requested);
+            if (wants_off && self.mandatory) || unsupported {
+                let replacement = self
+                    .default
+                    .clone()
+                    .filter(|default| self.supported.is_empty() || self.supported.contains(default))
+                    .or_else(|| {
+                        if self.supported.is_empty() {
+                            return None;
+                        }
+                        crate::catalog::clamp_reasoning_effort(&requested, &self.supported, None)
+                    });
+                if let Some(output) = object
+                    .get_mut("output_config")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    match replacement {
+                        Some(replacement) => {
+                            output.insert(
+                                "effort".to_owned(),
+                                serde_json::Value::String(replacement.clone()),
+                            );
+                            notice = Some(format!(
+                                "reasoning effort is not supported; using {replacement:?}"
+                            ));
+                        }
+                        None => {
+                            // No known level to use: drop only the disabling
+                            // effort and let the provider apply its default.
+                            output.remove("effort");
+                            if output.is_empty() {
+                                object.remove("output_config");
+                            }
+                            notice = Some(
+                                "reasoning cannot be disabled on this model; using its default"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        notice
+    }
+}
+
+/// A static entry can make an already-discovered model mandatory after
+/// discovery filtered its defaults, so the final policy is enforced here:
+/// `none` is neither offered nor used as the default.
+fn reasoning_policy(model: &ModelSpec) -> ReasoningPolicy {
+    let mut supported = model.reasoning_efforts.clone();
+    let mut default = model.default_reasoning_effort.clone();
+    if model.reasoning_mandatory {
+        supported.retain(|effort| effort != "none");
+        if default.as_deref() == Some("none") {
+            default = None;
+        }
+    }
+    ReasoningPolicy {
+        supported,
+        default,
+        mandatory: model.reasoning_mandatory,
     }
 }
 
@@ -1257,6 +1785,7 @@ impl Routes {
                     upstream_model: model.id.clone(),
                     max_output_tokens: model.max_output_tokens,
                     wire: vendor.wire,
+                    reasoning: reasoning_policy(model),
                 };
                 if let Some(previous) = by_alias.insert(alias.clone(), route) {
                     return Err(format!(
@@ -1306,6 +1835,7 @@ impl Routes {
                 upstream_model: rest.to_owned(),
                 max_output_tokens: None,
                 wire: *wire,
+                reasoning: ReasoningPolicy::default(),
             });
         }
         match self.by_upstream.get(requested) {
@@ -1600,7 +2130,412 @@ mod tests {
             max_output_tokens: None,
             input_modalities: vec!["text".to_owned()],
             reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            reasoning_mandatory: false,
+            endpoints: Vec::new(),
+            supports_tools: None,
         }
+    }
+
+    fn openrouter_vendor(base: &str, wire: Wire) -> Vendor {
+        let url = Url::parse(base).unwrap();
+        Vendor {
+            key: "openrouter".to_owned(),
+            name: "OpenRouter".to_owned(),
+            models_url: openrouter_models_url(&url),
+            base_url: url,
+            env_key: None,
+            wire,
+            discovery: false,
+            models: Vec::new(),
+            openrouter_provider: None,
+            max_output_tokens: None,
+            anthropic: AnthropicOptions::default(),
+            chat: ChatOptions::default(),
+        }
+    }
+
+    #[test]
+    fn openrouter_hosts_include_the_in_region_domains() {
+        for (url, region) in [
+            ("https://openrouter.ai/api/v1", Region::Global),
+            ("https://eu.openrouter.ai/api/v1", Region::Eu),
+            ("https://us.openrouter.ai/api/v1", Region::Us),
+        ] {
+            assert!(is_openrouter_url(&Url::parse(url).unwrap()), "{url}");
+            let vendor = openrouter_vendor(url, Wire::Responses);
+            assert_eq!(vendor.openrouter_region(), Some(region), "{url}");
+        }
+        for url in [
+            "https://openrouter.ai.example/api/v1",
+            "https://openrouter.ai/other",
+            "http://openrouter.ai/api/v1",
+        ] {
+            assert!(!is_openrouter_url(&Url::parse(url).unwrap()), "{url}");
+        }
+        assert_eq!(Region::Global.label(), "global");
+        assert_eq!(Region::Eu.label(), "EU in-region");
+        assert_eq!(Region::Us.label(), "US in-region");
+    }
+
+    #[test]
+    fn openrouter_discovers_from_the_keyed_catalog() {
+        let config = CodeoxConfig::load_from_str(
+            r#"
+[providers.openrouter]
+base_url = "https://eu.openrouter.ai/api/v1"
+env_key = "OPENROUTER_API_KEY"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.vendors[0].models_url.as_str(),
+            "https://eu.openrouter.ai/api/v1/models/user"
+        );
+        // An explicit models_url is never rewritten.
+        let config = CodeoxConfig::load_from_str(
+            r#"
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+models_url = "https://openrouter.ai/api/v1/models?scope=public"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.vendors[0].models_url.as_str(),
+            "https://openrouter.ai/api/v1/models?scope=public"
+        );
+    }
+
+    #[test]
+    fn openrouter_provider_preferences_are_validated() {
+        let config = CodeoxConfig::load_from_str(
+            r#"
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+
+[providers.openrouter.provider]
+sort = "throughput"
+zdr = true
+data_collection = "deny"
+only = ["anthropic", "openai"]
+max_price = { prompt = 1.5, completion = 8 }
+"#,
+        )
+        .unwrap();
+        let preferences = config.vendors[0]
+            .openrouter_provider
+            .as_ref()
+            .expect("preferences");
+        assert_eq!(preferences["sort"], "throughput");
+        assert_eq!(preferences["zdr"], true);
+        assert_eq!(
+            preferences["only"],
+            serde_json::json!(["anthropic", "openai"])
+        );
+        assert_eq!(preferences["max_price"]["completion"], 8.0);
+
+        for (extra, expected) in [
+            (
+                "[providers.openrouter.provider]\nsoort = \"price\"\n",
+                "soort",
+            ),
+            (
+                "[providers.openrouter.provider]\nsort = \"fastest\"\n",
+                "sort",
+            ),
+            (
+                "[providers.openrouter.provider]\ndata_collection = \"maybe\"\n",
+                "data_collection",
+            ),
+        ] {
+            let error = CodeoxConfig::load_from_str(&format!(
+                "[providers.openrouter]\nbase_url = \"https://openrouter.ai/api/v1\"\n{extra}"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+
+        // The table is meaningless on another provider, so it is an error.
+        let error = CodeoxConfig::load_from_str(
+            r#"
+[providers.alpha]
+base_url = "https://alpha.example/v1"
+
+[providers.alpha.provider]
+sort = "price"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("OpenRouter"), "{error}");
+    }
+
+    #[test]
+    fn a_claude_session_in_metadata_is_an_openrouter_session_hint() {
+        let vendor = openrouter_vendor("https://openrouter.ai/api/v1", Wire::ChatCompletions);
+        let key = SecretKey::new("sk-openrouter-test".to_owned());
+        let user_id = serde_json::json!({"session_id": "claude-session-1"}).to_string();
+        let claude = serde_json::json!({"metadata": {"user_id": user_id}});
+        let session = vendor
+            .openrouter_session_id(&key, Some(&HeaderMap::new()), &claude)
+            .expect("Claude's metadata names the session");
+        // The same conversation keyed through Codex's field lands on the same
+        // backend, so the two paths agree on one sticky session.
+        let codex = serde_json::json!({"prompt_cache_key": "claude-session-1"});
+        assert_eq!(
+            Some(session),
+            vendor.openrouter_session_id(&key, None, &codex)
+        );
+        // Metadata without a valid session ID gives no hint.
+        let bad = serde_json::json!({"metadata": {"user_id": "not json"}});
+        assert_eq!(vendor.openrouter_session_id(&key, None, &bad), None);
+    }
+
+    #[test]
+    fn openrouter_requests_get_preferences_a_session_and_the_stateless_contract() {
+        let mut vendor = openrouter_vendor("https://eu.openrouter.ai/api/v1", Wire::Responses);
+        vendor.openrouter_provider = Some(serde_json::json!({"sort": "price"}));
+        let key = SecretKey::new("sk-openrouter-test".to_owned());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("thread-123"));
+        let payload = serde_json::json!({"prompt_cache_key": "thread-123"});
+        let session = vendor
+            .openrouter_session_id(&key, Some(&headers), &payload)
+            .expect("a session");
+        assert!(session.starts_with("ox_"), "{session}");
+        assert_eq!(
+            Some(session.clone()),
+            vendor.openrouter_session_id(&key, Some(&headers), &payload)
+        );
+        let other = SecretKey::new("sk-other".to_owned());
+        assert_ne!(
+            Some(session.clone()),
+            vendor.openrouter_session_id(&other, Some(&headers), &payload)
+        );
+
+        let mut body = serde_json::json!({
+            "model": "gpt",
+            "store": true,
+            "previous_response_id": "resp_1",
+            "input": [],
+        });
+        assert!(vendor.prepare_openrouter_request(&mut body, Some(&session)));
+        assert_eq!(body["store"], false);
+        // A real continuation keeps its only reference; OpenRouter rejects it
+        // rather than letting OX answer from incomplete context.
+        assert_eq!(body["previous_response_id"], "resp_1");
+        assert_eq!(body["provider"]["sort"], "price");
+        assert_eq!(body["session_id"], session);
+        assert_eq!(body["input"], serde_json::json!([]));
+
+        // A null reference is not context and can go.
+        let mut body = serde_json::json!({"model": "gpt", "previous_response_id": null});
+        assert!(vendor.prepare_openrouter_request(&mut body, None));
+        assert!(body.get("previous_response_id").is_none());
+    }
+
+    #[test]
+    fn openrouter_requests_carry_optional_attribution() {
+        let vendor = openrouter_vendor("https://openrouter.ai/api/v1", Wire::Responses);
+        let key = SecretKey::new("sk-openrouter-test".to_owned());
+        let headers = vendor.auth_headers(&key).unwrap();
+        assert_eq!(
+            headers.get("http-referer").unwrap(),
+            "https://github.com/oxstack/ox"
+        );
+        assert_eq!(headers.get("x-openrouter-title").unwrap(), "OX");
+
+        let other = openrouter_vendor("https://alpha.example/v1", Wire::Responses);
+        let headers = other.auth_headers(&key).unwrap();
+        assert!(headers.get("http-referer").is_none());
+    }
+
+    fn reasoning_route(supported: &[&str], default: Option<&str>, mandatory: bool) -> Route {
+        Route {
+            vendor: 0,
+            upstream_model: "gpt".to_owned(),
+            wire: Wire::Responses,
+            max_output_tokens: None,
+            reasoning: ReasoningPolicy {
+                supported: supported.iter().map(|level| (*level).to_owned()).collect(),
+                default: default.map(str::to_owned),
+                mandatory,
+            },
+        }
+    }
+
+    #[test]
+    fn a_mandatory_model_never_keeps_effort_none() {
+        let route = reasoning_route(&["low", "medium", "high"], Some("medium"), true);
+        let mut payload = serde_json::json!({
+            "model": "alpha/gpt",
+            "reasoning": {"effort": "none", "summary": "auto"},
+        });
+        let notice = route.normalize_reasoning(&mut payload).expect("a notice");
+        assert_eq!(payload["reasoning"]["effort"], "medium");
+        assert_eq!(payload["reasoning"]["summary"], "auto");
+        assert!(notice.contains("cannot be disabled"), "{notice}");
+
+        // `enabled: false` is the other way a client asks for no reasoning.
+        let mut payload = serde_json::json!({"reasoning": {"enabled": false}});
+        assert!(route.normalize_reasoning(&mut payload).is_some());
+        assert!(payload["reasoning"].get("enabled").is_none());
+        assert_eq!(payload["reasoning"]["effort"], "medium");
+    }
+
+    #[test]
+    fn a_mandatory_model_without_a_default_uses_the_lowest_level() {
+        let route = reasoning_route(&["low", "high"], None, true);
+        let mut payload = serde_json::json!({"reasoning": {"effort": "none"}});
+        assert!(route.normalize_reasoning(&mut payload).is_some());
+        // The closest supported level to "none" is the lowest one.
+        assert_eq!(payload["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn native_messages_reasoning_follows_the_same_policy() {
+        let route = reasoning_route(&["low", "high"], Some("high"), true);
+        let mut payload = serde_json::json!({"thinking": {"type": "disabled"}});
+        assert!(route.reasoning.normalize_anthropic(&mut payload).is_some());
+        assert!(payload.get("thinking").is_none());
+
+        let mut payload = serde_json::json!({
+            "output_config": {"effort": "none"},
+            "messages": [],
+        });
+        assert!(route.reasoning.normalize_anthropic(&mut payload).is_some());
+        assert_eq!(payload["output_config"]["effort"], "high");
+
+        let mut payload = serde_json::json!({"output_config": {"effort": "low"}});
+        assert!(route.reasoning.normalize_anthropic(&mut payload).is_none());
+        assert_eq!(payload["output_config"]["effort"], "low");
+
+        // A mandatory policy with no list still corrects a disabling effort.
+        let route = reasoning_route(&[], Some("high"), true);
+        let mut payload = serde_json::json!({"output_config": {"effort": "none"}});
+        assert!(route.reasoning.normalize_anthropic(&mut payload).is_some());
+        assert_eq!(payload["output_config"]["effort"], "high");
+
+        let route = reasoning_route(&[], None, true);
+        let mut payload = serde_json::json!({"output_config": {"effort": "none"}});
+        assert!(route.reasoning.normalize_anthropic(&mut payload).is_some());
+        assert!(payload.get("output_config").is_none(), "no level to use");
+
+        // An unknown list and no policy leaves the caller's choice alone.
+        let route = reasoning_route(&[], None, false);
+        let mut payload = serde_json::json!({
+            "thinking": {"type": "disabled"},
+            "output_config": {"effort": "none"},
+        });
+        assert!(route.reasoning.normalize_anthropic(&mut payload).is_none());
+        assert_eq!(payload["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn an_override_that_makes_a_model_mandatory_drops_none_from_the_route() {
+        let model = ModelSpec {
+            reasoning_efforts: vec!["none".to_owned(), "low".to_owned(), "high".to_owned()],
+            default_reasoning_effort: Some("none".to_owned()),
+            reasoning_mandatory: true,
+            ..spec("gpt")
+        };
+        let policy = reasoning_policy(&model);
+        assert_eq!(policy.supported, ["low", "high"]);
+        assert_eq!(policy.default, None);
+        let route = Route {
+            vendor: 0,
+            upstream_model: "gpt".to_owned(),
+            wire: Wire::Responses,
+            max_output_tokens: None,
+            reasoning: policy,
+        };
+        let mut payload = serde_json::json!({"reasoning": {"effort": "none"}});
+        assert!(route.normalize_reasoning(&mut payload).is_some());
+        assert_eq!(payload["reasoning"]["effort"], "low");
+    }
+
+    #[test]
+    fn a_mandatory_policy_without_an_effort_list_still_enforces_it() {
+        // A static entry can declare `reasoning_mandatory` without listing the
+        // efforts; the policy, not the list, is what forbids disabling.
+        let route = reasoning_route(&[], Some("high"), true);
+        let mut payload = serde_json::json!({"reasoning": {"effort": "none"}});
+        assert!(route.normalize_reasoning(&mut payload).is_some());
+        assert_eq!(payload["reasoning"]["effort"], "high");
+
+        let route = reasoning_route(&[], None, true);
+        let mut payload = serde_json::json!({"reasoning": {"enabled": false}});
+        assert!(route.normalize_reasoning(&mut payload).is_some());
+        assert!(
+            payload.get("reasoning").is_none(),
+            "no level to use, so drop it"
+        );
+
+        // Without the policy an unknown model keeps the caller's value.
+        let route = reasoning_route(&[], Some("high"), false);
+        let mut payload = serde_json::json!({"reasoning": {"effort": "none"}});
+        assert!(route.normalize_reasoning(&mut payload).is_none());
+        assert_eq!(payload["reasoning"]["effort"], "none");
+    }
+
+    #[test]
+    fn an_unsupported_effort_is_clamped_to_the_provider_default() {
+        let route = reasoning_route(&["low", "medium", "high"], Some("medium"), false);
+        let mut payload = serde_json::json!({"reasoning": {"effort": "max"}});
+        assert!(route.normalize_reasoning(&mut payload).is_some());
+        assert_eq!(payload["reasoning"]["effort"], "medium");
+    }
+
+    #[test]
+    fn supported_choices_are_left_untouched() {
+        let route = reasoning_route(&["none", "low", "high"], Some("low"), false);
+        for effort in ["none", "low", "high"] {
+            let mut payload = serde_json::json!({"reasoning": {"effort": effort}});
+            assert!(
+                route.normalize_reasoning(&mut payload).is_none(),
+                "{effort}"
+            );
+        }
+        // An unknown model keeps the caller's value; the provider decides.
+        let route = reasoning_route(&[], None, false);
+        let mut payload = serde_json::json!({"reasoning": {"effort": "none"}});
+        assert!(route.normalize_reasoning(&mut payload).is_none());
+    }
+
+    #[test]
+    fn static_entries_declare_reasoning_policy() {
+        let config = CodeoxConfig::load_from_str(
+            r#"
+[providers.alpha]
+base_url = "https://alpha.example/v1"
+
+[[providers.alpha.models]]
+id = "gpt"
+reasoning_efforts = ["low", "high"]
+default_reasoning_effort = "high"
+reasoning_mandatory = true
+"#,
+        )
+        .unwrap();
+        let model = &config.vendors[0].models[0];
+        assert_eq!(model.default_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(model.reasoning_mandatory, Some(true));
+
+        let error = CodeoxConfig::load_from_str(
+            r#"
+[providers.alpha]
+base_url = "https://alpha.example/v1"
+
+[[providers.alpha.models]]
+id = "gpt"
+default_reasoning_effort = "extreme"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("default_reasoning_effort"), "{error}");
     }
 
     #[test]
