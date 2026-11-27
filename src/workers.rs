@@ -322,6 +322,7 @@ impl Service {
             let store = ox_memory::MemoryStore::open_default().map_err(|e| e.to_string())?;
             let project = ox_memory::canonical_project_id(&cwd);
             let host = ox_memory::default_host_id();
+            let include_all_scopes = req.scope.as_deref() == Some("all");
             let scope = match req.scope.as_deref() {
                 None | Some("all") => None,
                 Some("global") => Some(ox_memory::Scope::Global),
@@ -346,7 +347,7 @@ impl Service {
                     project: Some(project.clone()),
                     host: Some(host),
                     scope,
-                    include_all_scopes: false,
+                    include_all_scopes,
                     kind,
                     max_sensitivity: ceiling,
                     limit,
