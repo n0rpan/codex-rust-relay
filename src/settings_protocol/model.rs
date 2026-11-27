@@ -30,6 +30,8 @@ keys! {
     ContextWindow => "context_window",
     InputModalities => "input_modalities",
     ReasoningEfforts => "reasoning_efforts",
+    DefaultReasoningEffort => "default_reasoning_effort",
+    ReasoningMandatory => "reasoning_mandatory",
     Enabled => "enabled",
     MaxResults => "max_results",
     TimeoutSeconds => "timeout_seconds",
@@ -60,6 +62,8 @@ pub const MODEL_KEYS: &[Key] = &[
     Key::ContextWindow,
     Key::InputModalities,
     Key::ReasoningEfforts,
+    Key::DefaultReasoningEffort,
+    Key::ReasoningMandatory,
 ];
 pub const SEARCH_KEYS: &[Key] = &[
     Key::Enabled,

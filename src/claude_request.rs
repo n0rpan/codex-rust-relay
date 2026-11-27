@@ -296,14 +296,7 @@ fn insert_sampling(
 /// JSON-encoded `metadata.user_id`, so the same session keeps hitting the
 /// cache it warmed. No session ID, no key.
 fn prompt_cache_key(metadata: &Value) -> Option<String> {
-    let encoded = metadata.get("user_id")?.as_str()?;
-    let user: Value = serde_json::from_str(encoded).ok()?;
-    let session = user.get("session_id")?.as_str()?;
-    let valid = (1..=64).contains(&session.len())
-        && session
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_');
-    valid.then(|| session.to_owned())
+    crate::provider::claude_session_id(metadata)
 }
 
 fn translate_metadata(value: Option<&Value>) -> Result<Option<Value>, String> {
