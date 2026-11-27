@@ -223,11 +223,16 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn process_alive(pid: i32) -> bool {
+        // A killed process is a zombie (Z) until its parent waits for it, then dead (X)
+        // for the instant before its entry goes. Counting X as alive would let a reap
+        // that lands between two looks bring the process back to life.
         fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-            stat.rsplit(')')
-                .next()
-                .and_then(|rest| rest.split_whitespace().next())
-                != Some("Z")
+            !matches!(
+                stat.rsplit(')')
+                    .next()
+                    .and_then(|rest| rest.split_whitespace().next()),
+                Some("Z" | "X")
+            )
         })
     }
 
