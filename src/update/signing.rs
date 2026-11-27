@@ -23,11 +23,11 @@ pub(super) fn running_release() -> bool {
 }
 
 /// Refuse `code` unless every item has the release identity, when the
-/// installation being updated has it.
-pub(super) fn require(release: bool, version: &str, code: &[&Path]) -> Result<(), RelayError> {
+/// installation being updated has it. `what` names the update in the refusal.
+pub(super) fn require(release: bool, what: &str, code: &[&Path]) -> Result<(), RelayError> {
     if release && !code.iter().all(|item| satisfies(item)) {
         return Err(format!(
-            "OX {version} is not signed by the OX release identity. The update was not installed."
+            "{what} is not signed by the OX release identity. The update was not installed."
         )
         .into());
     }
@@ -41,9 +41,9 @@ mod tests {
     #[test]
     fn unsigned_code_is_refused_only_for_a_signed_installation() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        assert!(require(false, "2.0.0", &[file.path()]).is_ok());
-        let refused = require(true, "2.0.0", &[file.path()]).unwrap_err();
+        assert!(require(false, "OX 2.0.0", &[file.path()]).is_ok());
+        let refused = require(true, "OX 2.0.0", &[file.path()]).unwrap_err();
         assert!(refused.to_string().contains("release identity"));
-        assert!(require(true, "2.0.0", &[]).is_ok());
+        assert!(require(true, "OX 2.0.0", &[]).is_ok());
     }
 }

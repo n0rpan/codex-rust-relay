@@ -287,7 +287,7 @@ fn verify_package(root: &Path, version: &str) -> Result<(), RelayError> {
     if cfg!(target_os = "macos") {
         signing::require(
             signing::running_release(),
-            version,
+            &format!("OX {version}"),
             &[
                 &root.join("OX Desktop.app"),
                 &bin.join("ox"),

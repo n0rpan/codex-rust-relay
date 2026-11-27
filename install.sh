@@ -58,6 +58,21 @@ die() {
     exit 1
 }
 
+# macOS: an installation signed with OX's Developer ID only accepts code signed
+# with it, so a replaced download and checksum cannot install anything else.
+# The installed CLI decides: desktop, host and CLI installations all have one,
+# and local, pull request and nightly builds are ad hoc and stay unrestricted.
+release_identity='anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "ZN9XKLHU6J"'
+signed_release() {
+    codesign --verify --strict -R="$release_identity" "$1" 2>/dev/null
+}
+require_release_identity() {
+    [ "$(uname -s)" = Darwin ] || return 0
+    if [ -e "$install_dir/ox" ] && signed_release "$install_dir/ox"; then
+        signed_release "$1" || die "this download is not signed by the OX release identity, unlike the installed ox."
+    fi
+}
+
 cleanup() {
     if [ -n "$desktop_stage" ]; then rm -rf "$desktop_stage"; fi
     if [ -n "$work" ]; then
@@ -270,6 +285,7 @@ prepare_desktop() {
     esac
     for existing in "$packages/$actual".*; do
         if [ -f "$existing/.ready" ] && [ -x "$existing/$binary_subdir/ox-host" ] && [ -x "$existing/$binary_subdir/ox-desktop" ]; then
+            require_release_identity "$existing/OX Desktop.app"
             desktop_binary_dir="$existing/$binary_subdir"
             if [ "$host_only" = 0 ]; then "$desktop_binary_dir/ox-desktop" --version >/dev/null || die_missing_libraries "$desktop_binary_dir/ox-desktop"; fi
             return
@@ -279,14 +295,7 @@ prepare_desktop() {
     if [ "$os" = Darwin ]; then
         ditto -x -k "$work/$asset" "$desktop_stage"
         codesign --verify --strict --deep "$desktop_stage/OX Desktop.app"
-        # An installation signed with OX's Developer ID only accepts packages
-        # signed with it, so a replaced download cannot install other code.
-        release_identity='anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "ZN9XKLHU6J"'
-        if [ -d "$HOME/Applications/OX Desktop.app" ] &&
-            codesign --verify --strict -R="$release_identity" "$HOME/Applications/OX Desktop.app" 2>/dev/null; then
-            codesign --verify --strict -R="$release_identity" "$desktop_stage/OX Desktop.app" ||
-                die "this OX Desktop package is not signed by the OX release identity."
-        fi
+        require_release_identity "$desktop_stage/OX Desktop.app"
     else
         tar -xzf "$work/$asset" -C "$desktop_stage"
     fi
@@ -493,6 +502,7 @@ main() {
         source_binary="$work/unpacked/ox"
         [ -f "$source_binary" ] || die "${asset} does not contain the ox binary."
         chmod 755 "$source_binary"
+        require_release_identity "$source_binary"
         step "Installing to ${install_dir}/ox"
         mkdir -p "$install_dir" || die "could not create ${install_dir}."
         if [ -d "${install_dir}/ox" ]; then
