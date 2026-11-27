@@ -9,7 +9,7 @@ from pathlib import Path
 def lanes(paths, full_ci):
     packaging = (
         "install.sh", "src/update.rs", "src/update/*", "src/managed_install.rs", "desktop/package.sh", "desktop/packaging/*",
-        "desktop/ci/release-assets.sh", "desktop/tests/host_clean_account.sh",
+        "desktop/ci/release-assets.sh", "desktop/ci/macos-*.sh", "desktop/tests/host_clean_account.sh",
         "desktop/tests/host_service.py", ".github/workflows/desktop.yml",
     )
     window_tests = (

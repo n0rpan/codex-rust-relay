@@ -15,6 +15,14 @@ name: OX Desktop
 #     manual run with `intel`).
 # Pushes to feature branches do not run this workflow; their pull request does.
 #
+# macOS signing: the package job signs ad hoc and holds no secrets, because it
+# also installs and runs third-party clients. On a release run (and a manual
+# run with `sign`) the sign-macos job signs the tested bundles again with
+# Developer ID, has Apple notarize them and staples the ticket. Only that job
+# enters the apple-release environment, which holds the certificate and the
+# App Store Connect API key and is limited to main and v* tags. The signed
+# archives are the ones clean-account installs and the release publishes.
+#
 # Flake rule: a window test that fails intermittently is quarantined, not
 # retried and not deleted. Add it to desktop/ci/quarantine.toml with the
 # issue that tracks it (optionally only for the runners where it flakes).
@@ -30,6 +38,10 @@ on:
     inputs:
       intel:
         description: Also build and test on macos-26-intel
+        type: boolean
+        default: false
+      sign:
+        description: Sign and notarize the macOS packages (needs the apple-release environment)
         type: boolean
         default: false
   workflow_call:
@@ -297,8 +309,69 @@ jobs:
             !desktop/target/release/ox-host
           key: ${{ steps.deps.outputs.cache-primary-key }}
 
-  clean-account:
+  sign-macos:
+    name: Sign and notarize macOS packages
     needs: package
+    # Release runs called by ci.yml on main and tags, or a manual run with `sign`.
+    if: >-
+      ${{ !cancelled() && needs.package.result == 'success' &&
+      github.event_name != 'pull_request' && github.event_name != 'schedule' &&
+      (inputs.build_version || inputs.sign) }}
+    runs-on: macos-26
+    environment: apple-release
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: ox-desktop-macos-*
+          path: ${{ runner.temp }}/packaged
+      - name: Import the Developer ID identity
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID || secrets.APPLE_TEAM_ID }}
+        run: desktop/ci/macos-keychain.sh
+      - name: Sign, notarize and staple each architecture
+        id: sign
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          found=0
+          for directory in "$RUNNER_TEMP"/packaged/ox-desktop-macos-*; do
+            runner="${directory##*/ox-desktop-}"
+            archive=("$directory"/ox-desktop-macos-*.zip)
+            (cd "$directory" && shasum -a 256 --check "${archive[0]##*/}.sha256")
+            desktop/ci/macos-notarize.sh "${archive[0]}" "$RUNNER_TEMP/signed/$runner"
+            echo "${runner}=true" >> "$GITHUB_OUTPUT"
+            found=$((found + 1))
+          done
+          [ "$found" -gt 0 ] || { echo "::error::no packaged macOS archive to sign"; exit 1; }
+      - name: Remove the signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/ox-signing.keychain-db" || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ox-desktop-signed-macos-26
+          path: ${{ runner.temp }}/signed/macos-26/ox-desktop-*
+          if-no-files-found: error
+          compression-level: 0
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        # A release run owes both architectures; a manual run may have built one.
+        if: steps.sign.outputs.macos-26-intel == 'true' || inputs.build_version
+        with:
+          name: ox-desktop-signed-macos-26-intel
+          path: ${{ runner.temp }}/signed/macos-26-intel/ox-desktop-*
+          if-no-files-found: error
+          compression-level: 0
+
+  clean-account:
+    needs: [package, sign-macos]
     if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
@@ -316,7 +389,8 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         continue-on-error: ${{ needs.package.result != 'success' }}
         with:
-          name: ox-desktop-${{ matrix.runner }}
+          # On a signing run, macOS installs the archive that ships.
+          name: ox-desktop-${{ startsWith(matrix.runner, 'macos') && needs.sign-macos.result != 'skipped' && 'signed-' || '' }}${{ matrix.runner }}
           path: ${{ runner.temp }}/dist
       - name: No package for this platform
         if: steps.package.outcome != 'success'

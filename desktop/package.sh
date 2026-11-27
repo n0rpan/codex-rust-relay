@@ -40,10 +40,7 @@ case "$(uname -s)" in
         plutil -replace CFBundleShortVersionString -string "${version%%-*}" "$bundle/Contents/Info.plist"
         plutil -replace CFBundleVersion -string "${GITHUB_RUN_NUMBER:-1}" "$bundle/Contents/Info.plist"
         plutil -lint "$bundle/Contents/Info.plist"
-        codesign --force --sign - "$bundle/Contents/MacOS/ox"
-        codesign --force --sign - "$bundle/Contents/MacOS/ox-host"
-        codesign --force --sign - "$bundle"
-        codesign --verify --strict --deep "$bundle"
+        desktop/ci/macos-sign.sh "$bundle"
         ditto -c -k --keepParent "$bundle" "$out/ox-desktop-macos-$arch.zip"
         ;;
     Linux)
