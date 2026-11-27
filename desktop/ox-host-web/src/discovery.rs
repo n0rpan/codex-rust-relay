@@ -8,11 +8,10 @@ use crate::client;
 use serde_json::Value;
 use std::{process::Command, time::Duration};
 
-/// The Serve port OX uses when nobody changed it.
-const DEFAULT_PORT: u16 = 8443;
+use crate::access::DEFAULT_HTTPS_PORT;
 
 /// Peers from `tailscale status --json`, without this machine.
-fn peers() -> Vec<(String, String, Vec<String>)> {
+fn peers(ports: &[u16]) -> Vec<(String, String, Vec<String>)> {
     let Ok(cli) = crate::access::cli() else {
         return Vec::new();
     };
@@ -26,15 +25,15 @@ fn peers() -> Vec<(String, String, Vec<String>)> {
     let Ok(status) = serde_json::from_slice::<Value>(&output.stdout) else {
         return Vec::new();
     };
-    parse_peers(&status)
+    parse_peers(&status, ports)
 }
 
 /// Online peers that name a usable MagicDNS address, as `(origin, name, tags)`.
-fn parse_peers(status: &Value) -> Vec<(String, String, Vec<String>)> {
+fn parse_peers(status: &Value, ports: &[u16]) -> Vec<(String, String, Vec<String>)> {
     if status["BackendState"] != "Running" {
         return Vec::new();
     }
-    status["Peer"]
+    let names = status["Peer"]
         .as_object()
         .into_iter()
         .flat_map(|peers| peers.values())
@@ -48,7 +47,7 @@ fn parse_peers(status: &Value) -> Vec<(String, String, Vec<String>)> {
             {
                 return None;
             }
-            let tags = peer["Tags"]
+            let tags: Vec<String> = peer["Tags"]
                 .as_array()
                 .map(|tags| {
                     tags.iter()
@@ -56,11 +55,15 @@ fn parse_peers(status: &Value) -> Vec<(String, String, Vec<String>)> {
                         .collect()
                 })
                 .unwrap_or_default();
-            Some((
-                format!("https://{dns}:{DEFAULT_PORT}"),
-                dns.to_owned(),
-                tags,
-            ))
+            Some((dns.to_owned(), tags))
+        })
+        .collect::<Vec<_>>();
+    names
+        .into_iter()
+        .flat_map(|(dns, tags)| {
+            ports
+                .iter()
+                .map(move |port| (format!("https://{dns}:{port}"), dns.clone(), tags.clone()))
         })
         .collect()
 }
@@ -68,8 +71,17 @@ fn parse_peers(status: &Value) -> Vec<(String, String, Vec<String>)> {
 /// Ask every online peer, in parallel and with a short deadline, which ones
 /// are waiting for a device. Best effort: an unreachable or older peer is
 /// simply absent.
-pub fn open_hosts() -> Vec<client::OpenHost> {
-    let peers = peers();
+///
+/// `port` is this host's own Tailscale Serve port, which a peer on the same
+/// tailnet usually shares; the OX default is always tried as well.
+pub fn open_hosts(port: Option<u16>) -> Vec<client::OpenHost> {
+    let mut ports = vec![DEFAULT_HTTPS_PORT];
+    if let Some(port) = port
+        && port != DEFAULT_HTTPS_PORT
+    {
+        ports.insert(0, port);
+    }
+    let peers = peers(&ports);
     let Ok(runtime) = client::runtime() else {
         return Vec::new();
     };
@@ -116,7 +128,7 @@ mod tests {
                 "d": {"DNSName": "bad name.tail1234.ts.net.", "Online": true}
             }
         });
-        let found = parse_peers(&status);
+        let found = parse_peers(&status, &[8443]);
         assert_eq!(
             found,
             vec![(
@@ -126,6 +138,17 @@ mod tests {
             )]
         );
         let stopped = json!({"BackendState": "Stopped", "Peer": {}});
-        assert!(parse_peers(&stopped).is_empty());
+        assert!(parse_peers(&stopped, &[8443]).is_empty());
+        // A host that moved off the default port is tried on both.
+        let both = parse_peers(&status, &[7443, 8443]);
+        assert_eq!(
+            both.iter()
+                .map(|(origin, ..)| origin.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "https://lab.tail1234.ts.net:7443",
+                "https://lab.tail1234.ts.net:8443"
+            ]
+        );
     }
 }

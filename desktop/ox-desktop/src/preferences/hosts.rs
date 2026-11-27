@@ -260,7 +260,15 @@ impl Hosts {
     fn add(&mut self, w: &mut Window, cx: &mut Context<Self>) {
         let address = self.address.read(cx).value().to_string();
         let code = self.code.read(cx).value().to_string();
-        let paired = move || hosts::pair(&address, &code, &hosts::device_label());
+        // An address with no code means the other machine is waiting in a
+        // pairing window, so there is nothing to redeem.
+        let paired = move || {
+            if code.trim().is_empty() {
+                hosts::pair_window(&address, &hosts::device_label())
+            } else {
+                hosts::pair(&address, &code, &hosts::device_label())
+            }
+        };
         self.pair(w, cx, paired, true);
     }
     /// Find tailnet peers whose operator is waiting for a device right now.
@@ -271,7 +279,7 @@ impl Hosts {
         self.scanning = true;
         self.notice.clear();
         cx.notify();
-        let task = cx.background_spawn(async move { hosts::open_hosts() });
+        let task = cx.background_spawn(async move { hosts::waiting_hosts() });
         cx.spawn_in(w, async move |this, cx| {
             let found = task.await;
             let _ = this.update_in(cx, |s, _, cx| {
@@ -628,7 +636,7 @@ impl Render for Hosts {
         }
         list = list
             .child(div().text_size(p.text(Step::Title)).child("Add host"))
-            .child("Run ox host pair on the other machine. Add --terminal to allow shells and subscription sign-in from this desktop.")
+            .child("Run ox host pair on the other machine. Add --terminal to allow shells and subscription sign-in from this desktop. Leave the code empty when that host is waiting in a pairing window.")
             .child(Input::new(&self.address))
             .child(Input::new(&self.code))
             .child(button(p,"pair-mode", format!("Mode policy · {}", self.pair_policy.map_or("Use host setting", HostPolicy::label)), false, !self.busy,

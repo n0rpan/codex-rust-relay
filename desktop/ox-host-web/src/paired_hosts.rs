@@ -197,8 +197,7 @@ pub fn pair(address: &str, code: &str, label: &str) -> io::Result<SavedHost> {
 /// Pair with a host that is waiting for a device, using the pairing window its
 /// operator opened instead of an invitation.
 pub fn pair_window(origin: &str, label: &str) -> io::Result<SavedHost> {
-    let origin = crate::serve::origin(origin.trim().trim_end_matches('/'))
-        .ok_or_else(|| io::Error::other("That is not an HTTPS tailnet address."))?;
+    let origin = window_origin(origin)?;
     enroll_window(
         &origin,
         label,
@@ -207,6 +206,24 @@ pub fn pair_window(origin: &str, label: &str) -> io::Result<SavedHost> {
         None,
         |_, _| true,
     )
+}
+/// The origin to ask for a pairing window. A bare host, or one with no port,
+/// is completed the way `ox host pair` prints it.
+pub(crate) fn window_origin(address: &str) -> io::Result<String> {
+    let address = address.trim().trim_end_matches('/');
+    let with_scheme = if address.contains("://") {
+        address.to_owned()
+    } else {
+        format!("https://{address}")
+    };
+    let with_port = if with_scheme.trim_start_matches("https://").contains(':') {
+        with_scheme
+    } else {
+        format!("{with_scheme}:{}", crate::access::DEFAULT_HTTPS_PORT)
+    };
+    crate::serve::origin(&with_port).ok_or_else(|| {
+        io::Error::other("Enter the HTTPS .ts.net address of a host that is waiting.")
+    })
 }
 pub(crate) fn enroll(
     invite: Invitation,

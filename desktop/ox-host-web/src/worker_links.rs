@@ -39,7 +39,7 @@ fn describe(h: &SavedHost) -> Value {
 }
 
 pub(super) fn execute(app: &App, device: Option<&str>, action: Action) -> io::Result<Value> {
-    let (registry, destinations, source_id, name, origin) = {
+    let (registry, destinations, source_id, name, origin, local_https_port) = {
         let s = app.state.lock().unwrap();
         if device.is_some_and(|id| !s.alive(id)) {
             return Err(io::Error::other("This device needs to pair again."));
@@ -50,6 +50,7 @@ pub(super) fn execute(app: &App, device: Option<&str>, action: Action) -> io::Re
             s.host_id()?,
             s.host_profile(None)?.name,
             s.configuration().map(|(origin, _)| origin),
+            s.reply(None).https_port,
         )
     };
     let rows = paired_hosts::worker_links(&registry)?;
@@ -149,7 +150,27 @@ pub(super) fn execute(app: &App, device: Option<&str>, action: Action) -> io::Re
         }
         Action::AddWorkerLink { address, code } => {
             super::background_keychain().map_err(io::Error::other)?;
-            pair(Invitation::parse(&address, &code)?, None)
+            if code.trim().is_empty() {
+                // An address with no code means the host is waiting in a
+                // pairing window, so there is nothing to redeem.
+                let target = paired_hosts::window_origin(&address).map_err(|_| {
+                    io::Error::other(
+                        "Enter the host's HTTPS .ts.net address, or paste its invitation link.",
+                    )
+                })?;
+                on_tailnet(&target)?;
+                let host = paired_hosts::enroll_window(
+                    &target,
+                    &label,
+                    &registry,
+                    true,
+                    Some(&source_id),
+                    |current, new| acceptable(None, current, new),
+                )?;
+                Ok(describe(&host))
+            } else {
+                pair(Invitation::parse(&address, &code)?, None)
+            }
         }
         Action::AddWorkerLinkWindow { origin: target } => {
             super::background_keychain().map_err(io::Error::other)?;
@@ -176,7 +197,7 @@ pub(super) fn execute(app: &App, device: Option<&str>, action: Action) -> io::Re
             Ok(describe(&host))
         }
         Action::NearbyWindowHosts => Ok(json!({
-            "hosts": crate::discovery::open_hosts()
+            "hosts": crate::discovery::open_hosts(local_https_port)
                 .into_iter()
                 .filter(|host| Some(&host.origin) != origin.as_ref())
                 .map(|host| json!({

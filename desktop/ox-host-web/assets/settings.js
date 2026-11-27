@@ -1211,7 +1211,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
       }));
     }
     const address = textField(form, "Worker invitation or host URL", "worker_address");
-    const code = textField(form, "Code (for a host URL)", "worker_code", "password");
+    const code = textField(form, "Code (leave empty while that host is waiting)", "worker_code", "password");
     address.required = true;
     address.spellcheck = false;
     address.setAttribute("autocapitalize", "none");
