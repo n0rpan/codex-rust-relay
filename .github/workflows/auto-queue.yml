@@ -52,15 +52,21 @@ jobs:
     env:
       NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
     steps:
-      # A comment event does not say which repository the pull request's
-      # branch is in. Look that up with the read-only token before any step
-      # that holds the maintainer's.
+      # A pull request event already passed the repository test above; it
+      # needs no lookup, so a failed read cannot stop a push from taking the
+      # pull request out of line. A comment event does not say which
+      # repository the branch is in: look that up with the read-only token
+      # before any step that holds the maintainer's.
       - name: Confirm the pull request's branch is in this repository
         id: own
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = pull_request_target ]; then
+            echo "ok=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
           head="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${NUMBER}" --jq .head.repo.full_name)"
           if [ "${head}" = "${GITHUB_REPOSITORY}" ]; then
             echo "ok=true" >> "${GITHUB_OUTPUT}"
