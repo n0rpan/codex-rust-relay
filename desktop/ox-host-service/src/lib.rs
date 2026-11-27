@@ -465,12 +465,36 @@ mod tests {
         assert!(a.socket.exists());
         drop(new);
     }
+    /// A socket file nobody can be listening on. It is bound and never listens,
+    /// so a connect is refused even while a child forked by another test still
+    /// holds a copy of the descriptor between fork and exec.
+    fn stale_socket(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        unsafe {
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as _;
+            assert!(bytes.len() < addr.sun_path.len());
+            for (to, from) in addr.sun_path.iter_mut().zip(bytes) {
+                *to = *from as _;
+            }
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0);
+            let bound = libc::bind(
+                fd,
+                (&raw const addr).cast(),
+                size_of::<libc::sockaddr_un>() as _,
+            );
+            libc::close(fd);
+            assert_eq!(bound, 0);
+        }
+    }
     #[test]
     fn stale_socket_recovers_while_unrelated_files_and_symlinks_survive() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = fixture(tmp.path());
         paths.prepare().unwrap();
-        drop(UnixListener::bind(&paths.socket).unwrap());
+        stale_socket(&paths.socket);
         drop(SocketGuard::bind(&paths).unwrap());
         fs::write(&paths.socket, "keep").unwrap();
         assert!(SocketGuard::bind(&paths).is_err());
