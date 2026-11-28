@@ -138,6 +138,63 @@ pub(crate) struct Upload {
     directory: PathBuf,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Activation<T> {
+    offer: Offer,
+    commit: T,
+}
+
+pub(crate) struct VerifiedActivation<T> {
+    state: Arc<Mutex<State>>,
+    device: String,
+    binding: Binding,
+    source: String,
+    commit: T,
+}
+
+impl<T: serde::de::DeserializeOwned> VerifiedActivation<T> {
+    pub(crate) fn open(
+        state: Arc<Mutex<State>>,
+        device: &str,
+        request: &str,
+        proof: &Proof,
+    ) -> io::Result<Self> {
+        let Activation { offer, commit }: Activation<T> = serde_json::from_str(request)?;
+        let binding = offer.binding()?;
+        if !state.lock().unwrap().prove_move_admission(
+            device,
+            &proof.nonce,
+            &proof.signature,
+            request,
+            &binding,
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Session move is not approved on this host",
+            ));
+        }
+        Ok(Self {
+            state,
+            binding,
+            device: device.into(),
+            source: offer.source,
+            commit,
+        })
+    }
+
+    /// Called on the destination actor. The same lock guards link and grant
+    /// revocation. The actor checks its Prepared record before acquisition.
+    pub(crate) fn commit<R>(
+        self,
+        activate: impl FnOnce(&str, [u8; 32], T) -> io::Result<R>,
+    ) -> io::Result<R> {
+        let state = self.state.lock().unwrap();
+        state.check_move_admission(&self.device, &self.binding)?;
+        activate(&self.source, self.binding.digest(), self.commit)
+    }
+}
+
 impl Upload {
     /// The transport authenticates `device` from the paired connection, then
     /// passes the raw signed JSON offer and its proof here.
@@ -478,19 +535,19 @@ mod tests {
 
         fn open(&self, offer: &Offer) -> io::Result<Upload> {
             let request = serde_json::to_string(offer)?;
+            let proof = self.proof(&request);
+            Upload::open(self.state.clone(), &self.device, &request, &proof)
+        }
+
+        fn proof(&self, request: &str) -> Proof {
             let nonce = self
                 .state
                 .lock()
                 .unwrap()
                 .challenge(&self.device, Purpose::Worker)
                 .unwrap();
-            let signature = sign(&self.key, &format!("{nonce}.{}", digest(&request)));
-            Upload::open(
-                self.state.clone(),
-                &self.device,
-                &request,
-                &Proof { nonce, signature },
-            )
+            let signature = sign(&self.key, &format!("{nonce}.{}", digest(request)));
+            Proof { nonce, signature }
         }
     }
 
@@ -672,18 +729,12 @@ mod tests {
             let (socket, _) = connect_async(format!("ws://{address}")).await.unwrap();
             let mut socket = Connection::open(socket);
             let request = serde_json::to_string(&f.offer).unwrap();
-            let nonce = f
-                .state
-                .lock()
-                .unwrap()
-                .challenge(&f.device, Purpose::Worker)
-                .unwrap();
-            let signature = sign(&f.key, &format!("{nonce}.{}", digest(&request)));
+            let proof = f.proof(&request);
             socket
                 .send(ClientMessage::text(
                     serde_json::json!({
                         "request": request,
-                        "proof": {"nonce": nonce, "signature": signature},
+                    "proof": {"nonce": proof.nonce, "signature": proof.signature},
                     })
                     .to_string(),
                 ))
@@ -710,6 +761,39 @@ mod tests {
             );
         }
         running.abort();
+    }
+
+    #[test]
+    fn destination_commit_rechecks_the_exact_signed_move_under_the_revocation_lock() {
+        let f = Fixture::approved();
+        let make_request =
+            |commit| serde_json::json!({"offer": f.offer, "commit": commit}).to_string();
+        let request = make_request("source released");
+        let open = |proof: &Proof| {
+            VerifiedActivation::<String>::open(f.state.clone(), &f.device, &request, proof)
+        };
+        assert!(open(&f.proof(&make_request("different operation"))).is_err());
+        let accepted = open(&f.proof(&request)).unwrap();
+        let checked = accepted
+            .commit(|source, digest, commit| {
+                assert_eq!(source, SOURCE);
+                assert_eq!(digest, f.offer.manifest.sha256().unwrap());
+                Ok(commit)
+            })
+            .unwrap();
+        assert_eq!(checked, "source released");
+
+        let accepted = open(&f.proof(&request)).unwrap();
+        f.state
+            .lock()
+            .unwrap()
+            .revoke_move_admission(TRANSFER)
+            .unwrap();
+        let rejected = accepted.commit::<()>(|_, _, _| panic!("revocation must stop activation"));
+        assert_eq!(
+            rejected.unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 
     #[tokio::test]
