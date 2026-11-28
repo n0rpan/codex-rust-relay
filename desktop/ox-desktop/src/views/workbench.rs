@@ -13,6 +13,7 @@ use ox_desk_core::{
 };
 use std::{collections::HashMap, path::PathBuf, time::Instant};
 
+mod browser_preview;
 pub(super) mod empty;
 mod review;
 pub(super) mod thread_menu;
@@ -98,6 +99,7 @@ pub struct Workbench {
     pub(super) pending_local_command: Option<super::terminal_review::Pending>,
     pub(super) enter_sends: bool,
     review: review::ReviewPane,
+    browser_preview: Option<browser_preview::BrowserPreview>,
     pub(super) review_width: u32,
     pub(super) pane_width: Pixels,
     pub(super) host_caption: Option<String>,
@@ -289,6 +291,7 @@ impl Workbench {
                 .enter_sends,
             thread_edit: None,
             review: Default::default(),
+            browser_preview: None,
             review_width: 360,
             pane_width: window.viewport_size().width,
             host_caption: None,
@@ -965,6 +968,7 @@ impl Workbench {
     pub(super) fn set_front(&mut self, front: bool, cx: &mut Context<Self>) {
         if !front {
             self.focus_editor_for = None;
+            self.clear_browser_preview(None, cx);
         }
         self.front = front;
         if let Some(store) = &mut self.store {
@@ -986,6 +990,7 @@ impl Workbench {
     ) {
         if !front {
             self.focus_editor_for = None;
+            self.clear_browser_preview(Some(window), cx);
         }
         self.front = front;
         if let Some(store) = &mut self.store {
@@ -1117,8 +1122,20 @@ impl Workbench {
         }
         let controls = self.thread_menu(cx);
         let review_toggle = self.review_toggle(cx);
+        let preview_toggle = self.browser_preview_toggle(cx);
         let inline_request = self.pane_width < px(825.);
         let asks = self.ask_sheet(inline_request, window, cx);
+        if self.browser_preview.is_some()
+            && (asks.is_some() || self.review.open || !self.browser_preview_is_current())
+        {
+            self.clear_browser_preview(Some(window), cx);
+        }
+        let narrow_preview = self.pane_width < px(500. + browser_preview::WIDTH);
+        let full_preview = self
+            .browser_preview
+            .as_ref()
+            .is_some_and(|preview| narrow_preview || preview.expanded);
+        let preview = self.browser_preview_panel(narrow_preview, cx);
         let launch = self.launch_sheet(window.viewport_size().height * 0.6, cx);
         let usage = self.usage_bar(cx);
         let review = asks.is_none().then(|| self.review_panel(cx)).flatten();
@@ -1126,6 +1143,8 @@ impl Workbench {
         let narrow_review = review.is_some() && self.pane_width - review_width < px(500.);
         let detail_width = if review.is_some() && !narrow_review {
             self.pane_width - review_width
+        } else if preview.is_some() && !full_preview {
+            self.pane_width - px(browser_preview::WIDTH)
         } else if asks.is_some() && !inline_request {
             self.pane_width - px(325.)
         } else {
@@ -1157,7 +1176,7 @@ impl Workbench {
             .size_full()
             .bg(rgb(p.bg))
             .text_color(rgb(p.fg))
-            .when(!narrow_review, |layout| {
+            .when(!narrow_review && !full_preview, |layout| {
                 layout.child(
                     col()
                         .flex_1()
@@ -1288,6 +1307,7 @@ impl Workbench {
                                             },
                                         )
                                         .children(review_toggle)
+                                        .children(preview_toggle)
                                         .children(terminal)
                                         .children(controls),
                                 ),
@@ -1430,6 +1450,7 @@ impl Workbench {
                         .child(pane),
                 )
             })
+            .children(preview)
             .children(side_sheet)
     }
 }
