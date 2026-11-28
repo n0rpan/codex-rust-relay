@@ -302,7 +302,6 @@ const phoneSettings = setupSettings({
     return openPhoneTerminal(`${runtime}-login`);
   },
 });
-$("open-hosts").onclick = () => phoneSettings.openHosts();
 /** The host took a send and then lost it (a resume that failed after the Ack): its text
  * comes back into the composer once per lost message, before anything typed since, as in
  * the desktop replica. */
@@ -2675,6 +2674,7 @@ $("worker-runtime").onchange = () => {
   renderWorkerPermission();
 };
 $("worker-permission").onchange = renderWorkerPermission;
+$("open-hosts").onclick = () => phoneSettings.openHosts();
 $("worker-open-hosts").onclick = () => phoneSettings.openHosts(() => {
   page("conversation");
   $("worker-open-hosts").focus();
@@ -2883,11 +2883,11 @@ $("pair-form").onsubmit = async (e) => {
     if (!/^[A-Za-z0-9_-]{43}$/.test(secret))
       throw new Error("Request a fresh pairing QR in OX Desktop.");
     await pair(secret, $("device-label").value);
-    forgetKnownHosts();
     $("pair-link").value = "";
     code = null;
     key = await deviceKey();
     clearDrafts();
+    forgetKnownHosts();
     start(true);
   } catch (err) {
     if (err.status === 403) {

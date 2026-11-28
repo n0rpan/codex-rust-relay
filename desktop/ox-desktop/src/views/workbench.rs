@@ -1259,9 +1259,9 @@ impl Workbench {
                                         .flex_wrap()
                                         .min_w_0()
                                         .gap(px(SPACE_XS))
-                                        .children(start_worker)
                                         .children(review_toggle)
                                         .children(terminal)
+                                        .children(start_worker)
                                         .children(controls),
                                 ),
                         )

@@ -1790,13 +1790,13 @@ export function setupSettings({ request, open, close, pushStatus, enablePush, lo
     );
   }
   return {
-    openHosts(back, backLabel) {
-      open();
-      return hosts(back, backLabel);
-    },
     openNotifications() {
       open();
       return notificationPreferences(close);
+    },
+    openHosts(back, backLabel) {
+      open();
+      return hosts(back, backLabel);
     },
     reset() {
       pageId++;
