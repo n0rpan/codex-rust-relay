@@ -199,6 +199,19 @@ export function recentDays(entries, now = new Date()) {
   }
   return [...days.values()];
 }
+
+/** @param {{detail?: any}} session */
+export function sessionResult(session) {
+  const result = session?.detail?.last_result;
+  return typeof result?.turn === "string" &&
+    result.turn.length > 0 &&
+    Number.isSafeInteger(result.completed_at) &&
+    result.completed_at > 0 &&
+    ["completed", "failed", "stopped"].includes(result.outcome)
+    ? result
+    : null;
+}
+
 const itemKey = (i) => JSON.stringify([i.turn, i.id]);
 const safeMap = (entries) => Object.assign(Object.create(null), entries);
 export class Projection {

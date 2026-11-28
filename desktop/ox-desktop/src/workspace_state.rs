@@ -1,4 +1,5 @@
 //! Desktop-owned recent projects. Only the OX helper knows where the legacy layout lives.
+use ox_desk_core::host_protocol::{Scope, SessionResult};
 use ox_desk_core::runtime::Billing;
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct ProjectRoute {
@@ -38,6 +39,7 @@ enum WriteTask {
     Host(Option<String>),
     Checkout(String, Checkout),
     Sidebar(String, crate::sidebar_state::SidebarState),
+    SeenResult(String, Scope, String, SessionResult),
     Flush(flume::Sender<()>),
 }
 fn writer() -> &'static std::sync::mpsc::Sender<WriteTask> {
@@ -89,6 +91,20 @@ fn writer() -> &'static std::sync::mpsc::Sender<WriteTask> {
                             eprintln!("Could not save sidebar metadata: {e}")
                         }
                     }
+                    WriteTask::SeenResult(name, scope, thread, result) => {
+                        if let Some(path) = path()
+                            && let Err(e) = update_preference_at(
+                                &path.with_file_name(name),
+                                SeenResults::default,
+                                |mut results| {
+                                    results.record(&scope, &thread, &result);
+                                    results
+                                },
+                            )
+                        {
+                            eprintln!("Could not remember viewed session result: {e}");
+                        }
+                    }
                     WriteTask::Flush(done) => {
                         let _ = done.try_send(());
                     }
@@ -136,6 +152,42 @@ pub fn remember_layout(name: String, layout: crate::views::host::layout::Layout)
 }
 pub fn remember_sidebar(name: String, state: crate::sidebar_state::SidebarState) {
     let _ = writer().send(WriteTask::Sidebar(name, state));
+}
+
+/// The most recent result viewed in each thread on this host and desktop.
+#[derive(Default, Deserialize, Serialize)]
+pub(crate) struct SeenResults(std::collections::BTreeMap<String, SessionResult>);
+
+impl SeenResults {
+    pub(crate) const FILE_NAME: &'static str = "seen-results.json";
+
+    fn key(scope: &Scope, thread: &str) -> String {
+        // Route includes the full API alias, which can differ for identical native IDs.
+        serde_json::to_string(&(scope, thread)).expect("session identity serializes")
+    }
+
+    pub(crate) fn contains(&self, scope: &Scope, thread: &str, result: &SessionResult) -> bool {
+        self.0
+            .get(&Self::key(scope, thread))
+            .is_some_and(|seen| seen.turn == result.turn || seen.completed_at > result.completed_at)
+    }
+
+    pub(crate) fn record(&mut self, scope: &Scope, thread: &str, result: &SessionResult) -> bool {
+        if self.contains(scope, thread, result) {
+            return false;
+        }
+        self.0.insert(Self::key(scope, thread), result.clone());
+        true
+    }
+}
+
+pub(crate) fn remember_seen_result(
+    name: String,
+    scope: Scope,
+    thread: String,
+    result: SessionResult,
+) {
+    let _ = writer().send(WriteTask::SeenResult(name, scope, thread, result));
 }
 pub fn finish_writes(cx: &gpui::App) {
     cx.on_app_quit(|_| {
@@ -226,6 +278,40 @@ impl LastWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ox_desk_core::host_protocol::SessionOutcome;
+
+    #[test]
+    fn viewed_results_survive_reload_and_stay_specific_to_the_turn_and_route() {
+        let scope = Scope {
+            project: "/work".into(),
+            route: Route::codex_api("provider/one".into()),
+        };
+        let other = Scope {
+            route: Route::codex_api("provider/two".into()),
+            ..scope.clone()
+        };
+        let first = SessionResult {
+            turn: "first".into(),
+            completed_at: 100,
+            outcome: SessionOutcome::Failed,
+        };
+        let next = SessionResult {
+            turn: "next".into(),
+            completed_at: 101,
+            outcome: SessionOutcome::Completed,
+        };
+        let mut seen = SeenResults::default();
+        assert!(seen.record(&scope, "session", &first));
+        let mut reloaded: SeenResults =
+            serde_json::from_value(serde_json::to_value(seen).unwrap()).unwrap();
+        assert!(reloaded.contains(&scope, "session", &first));
+        assert!(!reloaded.contains(&other, "session", &first));
+        assert!(!reloaded.contains(&scope, "another", &first));
+        assert!(!reloaded.contains(&scope, "session", &next));
+        assert!(reloaded.record(&scope, "session", &next));
+        assert!(!reloaded.record(&scope, "session", &first));
+    }
+
     #[test]
     fn concurrent_saves_keep_each_project_and_the_migrated_route() {
         let root = tempfile::tempdir().unwrap();

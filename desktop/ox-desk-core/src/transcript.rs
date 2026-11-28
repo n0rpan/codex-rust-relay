@@ -2,6 +2,7 @@
 pub mod item;
 pub mod review;
 use crate::codex::history::TurnPage;
+use crate::host_protocol::{SessionOutcome, SessionResult};
 use item::Item;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -60,6 +61,7 @@ pub struct Transcript {
     // Number of history rows inserted at the front, used to preserve the viewport.
     prepended: usize,
     pub(crate) last_finished: Option<String>,
+    pub(crate) last_result: Option<SessionResult>,
     /// The turn the user asked to stop, so its completion reads as stopped, not done.
     pub(crate) stop_requested: Option<String>,
     /// The last finished turn was interrupted by the user.
@@ -288,6 +290,9 @@ impl Transcript {
     pub fn active_turn(&self) -> Option<&str> {
         self.active_turn.as_deref()
     }
+    pub fn last_finished(&self) -> Option<&str> {
+        self.last_finished.as_deref()
+    }
 
     pub(crate) fn take_remeasure(&mut self) -> Vec<usize> {
         self.remeasure
@@ -337,6 +342,7 @@ impl Transcript {
                 }
                 self.interrupted = interrupted || self.stop_requested.as_ref() == Some(&event.turn);
                 self.stop_requested = None;
+                self.record_result(&event.turn, error.is_some(), self.interrupted);
                 self.last_finished = Some(event.turn);
                 if let Some(error) = error {
                     self.error = Some(error);
@@ -348,6 +354,25 @@ impl Transcript {
             Change::Delta { item, target, text } => {
                 self.observe_delta(event.turn, item, target, text)
             }
+        }
+    }
+    pub(crate) fn record_result(&mut self, turn: &str, failed: bool, stopped: bool) {
+        if self.last_result.as_ref().is_none_or(|r| r.turn != turn) {
+            let outcome = if stopped {
+                SessionOutcome::Stopped
+            } else if failed {
+                SessionOutcome::Failed
+            } else {
+                SessionOutcome::Completed
+            };
+            let completed_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs() as i64);
+            self.last_result = Some(SessionResult {
+                turn: turn.into(),
+                completed_at,
+                outcome,
+            });
         }
     }
     pub(crate) fn observe_item(
@@ -455,6 +480,39 @@ mod tests {
     use super::*;
     use crate::codex::{activity::Activity, names::Notice};
     use serde_json::json;
+
+    #[test]
+    fn only_live_terminal_events_record_a_result() {
+        let mut t = Transcript::default();
+        t.add_history(
+            serde_json::from_value(
+                json!({"data":[{"id":"history","status":"completed","items":[]}]}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(t.last_result.is_none());
+        let terminal = |turn, status| {
+            Activity::decode(
+                Notice::TurnCompleted,
+                json!({"threadId":"a","turn":{"id":turn,"status":status}}),
+            )
+            .unwrap()
+        };
+        for (turn, status, outcome) in [
+            ("one", "completed", SessionOutcome::Completed),
+            ("two", "failed", SessionOutcome::Failed),
+            ("three", "interrupted", SessionOutcome::Stopped),
+        ] {
+            t.apply_activity(terminal(turn, status));
+            let result = t.last_result.clone().unwrap();
+            assert_eq!(result.turn, turn);
+            assert_eq!(result.outcome, outcome);
+            assert!(result.completed_at > 0);
+            t.apply_activity(terminal(turn, status));
+            assert_eq!(t.last_result, Some(result));
+        }
+    }
 
     #[test]
     fn resume_with_live_activity_retains_one_copy_and_remeasures_the_correct_row() {

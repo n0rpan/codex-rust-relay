@@ -4,7 +4,7 @@ use super::*;
 use crate::{
     actions::{Action, Effect},
     asks::Decision,
-    host_protocol::{Change, ScopeState, Server, SessionView, TimelineItem},
+    host_protocol::{Change, ScopeState, Server, SessionResult, SessionView, TimelineItem},
     runtime::{Access, RequestId, Route},
     slash::Capabilities,
     transcript::{DeltaTarget, item::Item},
@@ -42,6 +42,7 @@ pub struct Remote {
     /// requested before the first turn.
     /// Host marks on a session: handoffs from it and its YOLO grant.
     pub(super) marks: HashMap<String, Value>,
+    results: HashMap<String, SessionResult>,
     /// The request that opens the session this client is waiting for. Only its
     /// own `Opened` selects, and only its own `Error` stops the wait.
     pub(super) await_new: Option<String>,
@@ -103,12 +104,20 @@ impl Store {
             unconfirmed: vec![],
             origins: HashMap::new(),
             marks: HashMap::new(),
+            results: HashMap::new(),
         };
         Self::with_link(profile, Link::Host(Box::new(remote)))
     }
     /// The host's immutable lineage stamp for a worker session or its fork.
     pub fn origin(&self, id: &str) -> Option<&crate::origin::Origin> {
         self.remote()?.origins.get(id)
+    }
+    pub fn last_result(&self, id: &str) -> Option<&SessionResult> {
+        if let Some(remote) = self.remote() {
+            remote.results.get(id)
+        } else {
+            self.transcript(id)?.last_result.as_ref()
+        }
     }
     /// The model the runtime itself confirmed for a session, once it has answered.
     /// The launch stamp keeps the requested choice; this is what actually ran.
@@ -662,6 +671,7 @@ impl Store {
                 r.caps.clear();
                 r.origins.clear();
                 r.marks.clear();
+                r.results.clear();
                 r.routes.clear();
                 r.commands.clear();
                 r.options.clear();
@@ -758,6 +768,7 @@ impl Store {
         Ok(())
     }
     fn apply_session(&mut self, s: SessionView) {
+        let result = s.last_result();
         let id = s.id;
         let data = &s.detail;
         if let Some(mut row) = bits::<ThreadRow>(&data["row"]) {
@@ -803,6 +814,11 @@ impl Store {
         }
         let r = self.remote_mut();
         r.caps.insert(id.clone(), s.capabilities);
+        if let Some(result) = result {
+            r.results.insert(id.clone(), result);
+        } else {
+            r.results.remove(&id);
+        }
         if data["changing"] == true {
             r.changing.insert(id.clone());
         } else {

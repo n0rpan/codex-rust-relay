@@ -2,6 +2,7 @@
 //! operation here that creates a project workbench.
 use super::*;
 use crate::sidebar_state::{GroupingMode, ThreadMetaKey};
+use ox_desk_core::host_protocol::{Scope as HostScope, SessionResult};
 use ox_desk_core::origin::{Origin, Relation};
 use ox_desk_core::runtime::Runtime;
 use std::{
@@ -65,6 +66,7 @@ struct Hosted {
     origin: Option<Origin>,
     /// The model the runtime confirmed, once it has answered.
     actual_model: Option<String>,
+    result: Option<SessionResult>,
 }
 impl Hosted {
     fn from_view(
@@ -93,6 +95,7 @@ impl Hosted {
                 .as_str()
                 .or_else(|| view.detail["worker_marks"]["actual_model"].as_str())
                 .map(str::to_owned),
+            result: view.last_result(),
         })
     }
 }
@@ -231,6 +234,7 @@ struct Indexed {
     parent: Option<String>,
     quality: (bool, bool, bool, bool, bool, bool, i64),
     origin: Option<Origin>,
+    result: Option<(HostScope, SessionResult)>,
 }
 
 impl Indexed {
@@ -244,6 +248,13 @@ impl Indexed {
         self.order = order;
         self.parent = self.parent.take().or(incoming.parent);
         self.origin = self.origin.take().or(incoming.origin);
+        if incoming.result.as_ref().is_some_and(|(_, incoming)| {
+            self.result
+                .as_ref()
+                .is_none_or(|(_, current)| incoming.completed_at > current.completed_at)
+        }) {
+            self.result = incoming.result;
+        }
     }
 }
 
@@ -648,6 +659,32 @@ impl Host {
         }
     }
 
+    fn result_at(
+        &self,
+        loc: Location,
+        row: &ThreadRow,
+        cx: &App,
+    ) -> Option<(HostScope, SessionResult)> {
+        let (route, result) = match loc {
+            Location::Live(pane, _) => {
+                let pane = self.panes.get(pane)?.read(cx);
+                (&pane.route, pane.store.as_ref()?.last_result(&row.id)?)
+            }
+            Location::Hosted(index) => {
+                let hosted = self.discovery.hosted.get(index)?;
+                (&hosted.route, hosted.result.as_ref()?)
+            }
+            Location::Saved(_) | Location::PinnedCache(_) => return None,
+        };
+        Some((
+            HostScope {
+                project: row.cwd.clone(),
+                route: route.clone(),
+            },
+            result.clone(),
+        ))
+    }
+
     /// Find a session by its recorded identity, even when a search or status
     /// filter keeps it out of the rendered catalog. Discovery rows cover every
     /// project; open workbenches cover rows a scope has already loaded.
@@ -808,6 +845,7 @@ impl Host {
         let state = (self.discovery.revision, query.clone());
         // `is:running`, `is:waiting` and `is:finished` filter by live status.
         let (status_filter, query) = split_status_filter(&query);
+        let running_only = status_filter == Some(StatusFilter::Running);
         if versions == self.catalog_versions && self.discovery.indexed.as_ref() == Some(&state) {
             return;
         }
@@ -867,20 +905,6 @@ impl Host {
             {
                 continue;
             }
-            if let Some(wanted) = status_filter {
-                let (_, status) = self.project_row_state(project, r, scope, cx);
-                let matches = match (wanted, status) {
-                    (StatusFilter::Running, Some("Running")) => true,
-                    (StatusFilter::Waiting, Some("Needs you")) => true,
-                    (StatusFilter::Finished, Some("Running" | "Needs you")) => false,
-                    (StatusFilter::Finished, _) => true,
-                    (StatusFilter::Pinned, _) => meta.and_then(|m| m.pinned_at).is_some(),
-                    _ => false,
-                };
-                if !matches {
-                    continue;
-                }
-            }
             let custom_title = meta.and_then(|m| m.custom_title.as_deref());
             if !query.is_empty()
                 && !r.title().to_lowercase().contains(&query)
@@ -891,13 +915,32 @@ impl Host {
             {
                 continue;
             }
+            let result = self.result_at(loc, r, cx);
+            if let Some(wanted) = status_filter {
+                let (_, status) = self.project_row_state(project, r, scope, cx);
+                let matches = match (wanted, status) {
+                    (StatusFilter::Running, Some("Running")) => true,
+                    (StatusFilter::Running, _) => result.is_some(),
+                    (StatusFilter::Waiting, Some("Needs you")) => true,
+                    (StatusFilter::Finished, Some("Running" | "Needs you")) => false,
+                    (StatusFilter::Finished, _) => true,
+                    (StatusFilter::Pinned, _) => meta.and_then(|m| m.pinned_at).is_some(),
+                    _ => false,
+                };
+                if !matches {
+                    continue;
+                }
+            }
             let key = (
                 project.to_owned(),
                 scope,
                 r.id.clone(),
                 r.model_provider.clone(),
             );
-            let order = (r.updated_at, r.activity_order);
+            let activity_at = result.as_ref().map_or(r.updated_at, |(_, result)| {
+                r.updated_at.max(result.completed_at)
+            });
+            let order = (activity_at, r.activity_order);
             // Prefer authoritative, richer identity for rendering. Keep the newest
             // positive activity date independently when two catalogs describe the same row.
             let quality = (
@@ -915,6 +958,7 @@ impl Host {
                 parent: r.parent_thread_id.clone(),
                 quality,
                 origin: self.origin_at(loc, cx),
+                result,
             };
             match entries.entry(key) {
                 std::collections::hash_map::Entry::Occupied(mut slot) => {
@@ -936,6 +980,29 @@ impl Host {
                 .then_with(|| a.1.api.cmp(&b.1.api))
                 .then_with(|| a.3.cmp(&b.3))
         });
+        let unseen_results: HashMap<_, _> = entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                let (scope, result) = entry.result.as_ref()?;
+                (!self.seen_results.contains(scope, &key.2, result)
+                    && !matches!(self.status_at(entry.loc, cx), Some("Running" | "Needs you")))
+                .then_some((key, result))
+            })
+            .collect();
+        let mut just_finished = Vec::new();
+        if running_only {
+            ordered.retain(|key| {
+                let status = self.status_at(entries[*key].loc, cx);
+                if status == Some("Running") {
+                    return true;
+                }
+                if let Some(result) = unseen_results.get(key) {
+                    just_finished.push((*key, result.completed_at));
+                }
+                false
+            });
+            just_finished.sort_by_key(|(_, completed_at)| std::cmp::Reverse(*completed_at));
+        }
         let mut roots = Vec::new();
         let mut children = HashMap::new();
         let mut parents: HashMap<(PathBuf, String), (PathBuf, String)> = HashMap::new();
@@ -950,9 +1017,13 @@ impl Host {
             .keys()
             .map(|k| ((k.0.clone(), k.2.clone()), k))
             .collect();
-        for key in &ordered {
-            let entry = &entries[*key];
-            let node = (*key, entry.order.0, entry.loc);
+        for key in ordered
+            .iter()
+            .copied()
+            .chain(just_finished.iter().map(|(key, _)| *key))
+        {
+            let entry = &entries[key];
+            let node = (key, entry.order.0, entry.loc);
             let recorded = entry.origin.as_ref().and_then(ParentLink::from_origin);
             let mut resolved = recorded
                 .as_ref()
@@ -984,7 +1055,14 @@ impl Host {
                         .as_deref()
                         .is_some_and(|id| self.sidebar.sections.iter().any(|s| s.id == id))
             });
-            if !promoted && let Some(parent_key) = resolved.filter(|parent| *parent != *key) {
+            if running_only && self.status_at(entry.loc, cx) != Some("Running") {
+                continue;
+            }
+            if running_only {
+                resolved = resolved
+                    .filter(|parent| self.status_at(entries[*parent].loc, cx) == Some("Running"));
+            }
+            if !promoted && let Some(parent_key) = resolved.filter(|parent| *parent != key) {
                 parents.insert(
                     (node.0.0.clone(), node.0.2.clone()),
                     (parent_key.0.clone(), parent_key.2.clone()),
@@ -1033,23 +1111,29 @@ impl Host {
         });
         let mut catalog = Vec::new();
         let mut ordinal = 0;
-        let push_thread =
-            |catalog: &mut Vec<CatalogEntry>, ordinal: &mut usize, loc, timestamp, depth| {
-                catalog.push(CatalogEntry::Thread {
-                    loc,
-                    timestamp,
-                    ordinal: *ordinal,
-                    depth,
-                });
-                *ordinal += 1;
-            };
+        let push_thread = |catalog: &mut Vec<CatalogEntry>,
+                           ordinal: &mut usize,
+                           key: &Key,
+                           timestamp,
+                           depth,
+                           in_finished_shelf| {
+            catalog.push(CatalogEntry::Thread {
+                loc: entries[key].loc,
+                timestamp,
+                ordinal: *ordinal,
+                depth,
+                result: unseen_results.get(key).map(|result| result.outcome),
+                in_finished_shelf,
+            });
+            *ordinal += 1;
+        };
         let push_tree = |catalog: &mut Vec<CatalogEntry>,
                          children: &mut HashMap<&Key, Vec<(&Key, i64, Location)>>,
                          ordinal: &mut usize,
                          root: (&Key, i64, Location)| {
-            let mut stack = vec![(root.0, root.2, root.1, 0)];
-            while let Some((key, loc, timestamp, depth)) = stack.pop() {
-                push_thread(catalog, ordinal, loc, timestamp, depth);
+            let mut stack = vec![(root.0, root.1, 0)];
+            while let Some((key, timestamp, depth)) = stack.pop() {
+                push_thread(catalog, ordinal, key, timestamp, depth, false);
                 if !filtering
                     && self
                         .discovery
@@ -1062,7 +1146,7 @@ impl Host {
                     stack.extend(
                         next.into_iter()
                             .rev()
-                            .map(|(k, time, loc)| (k, loc, time, depth + 1)),
+                            .map(|(k, time, _)| (k, time, depth + 1)),
                     );
                 }
             }
@@ -1107,7 +1191,7 @@ impl Host {
                     if self.sidebar.grouping == GroupingMode::Folders {
                         push_tree(&mut catalog, &mut children, &mut ordinal, node);
                     } else {
-                        push_thread(&mut catalog, &mut ordinal, node.2, node.1, 0);
+                        push_thread(&mut catalog, &mut ordinal, node.0, node.1, 0, false);
                     }
                 }
             }
@@ -1123,7 +1207,7 @@ impl Host {
                     .map(|key| {
                         let entry = &entries[key];
                         let timestamp = entry.order.0;
-                        (session_day(timestamp), timestamp, entry.loc)
+                        (session_day(timestamp), timestamp, key)
                     })
                     .collect();
                 for rows in recent.chunk_by(|a, b| a.0 == b.0) {
@@ -1135,8 +1219,8 @@ impl Host {
                         folded,
                     });
                     if !folded {
-                        for &(_, timestamp, loc) in rows {
-                            push_thread(&mut catalog, &mut ordinal, loc, timestamp, 0);
+                        for &(_, timestamp, key) in rows {
+                            push_thread(&mut catalog, &mut ordinal, key, timestamp, 0, false);
                         }
                     }
                 }
@@ -1265,6 +1349,18 @@ impl Host {
                     }
                 }
             }
+        }
+        if !just_finished.is_empty() {
+            const VISIBLE_RESULTS: usize = 4;
+            catalog.push(CatalogEntry::JustFinished);
+            for (key, completed_at) in just_finished.iter().take(VISIBLE_RESULTS) {
+                push_thread(&mut catalog, &mut ordinal, key, *completed_at, 0, true);
+            }
+            if just_finished.len() > VISIBLE_RESULTS {
+                catalog.push(CatalogEntry::ViewFinished);
+            }
+        } else if running_only && catalog.is_empty() {
+            catalog.push(CatalogEntry::NoRunning);
         }
         self.catalog = catalog;
     }
@@ -1555,6 +1651,7 @@ mod parent_link_tests {
                         Some("p"),
                     )
                 }),
+                result: None,
             };
             let mut row = candidate(host_first);
             row.merge(candidate(!host_first));
