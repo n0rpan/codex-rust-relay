@@ -65,10 +65,19 @@ impl VerifiedTarget {
                 "The project must be inside its transferred checkout.",
             ));
         }
+        let checkout_name = proposal
+            .source
+            .scope
+            .project
+            .ancestors()
+            .nth(relative.components().count())
+            .and_then(Path::file_name)
+            .unwrap_or_else(|| OsStr::new("project"));
         let mut project = workspace
             .canonicalize()?
             .join(transfer.to_string())
-            .join("1");
+            .join("checkout")
+            .join(checkout_name);
         // The web projection keys scopes by their serialized path. Keep a
         // checkout-root move identical to the path the actor can canonicalize.
         project.extend(relative.components());
@@ -137,7 +146,7 @@ impl VerifiedTarget {
         let project = plan
             .target_scope
             .project
-            .strip_prefix(directory.join("1"))
+            .strip_prefix(directory.join("checkout"))
             .map_err(|_| invalid("The checkout is outside the reserved move directory."))?;
         if !project
             .components()
@@ -145,6 +154,12 @@ impl VerifiedTarget {
         {
             return Err(invalid("The destination checkout path is invalid."));
         }
+        let checkout_name = project
+            .components()
+            .next()
+            .ok_or_else(|| invalid("The destination checkout needs a folder name."))?
+            .as_os_str()
+            .to_owned();
         let saved = Saved {
             bundle,
             manifest_sha256: files.manifest_sha256,
@@ -188,21 +203,30 @@ impl VerifiedTarget {
         )?;
 
         let checkout = verified_file(&files.directory.join(CHECKOUT), &files.manifest.checkout)?;
+        let staged_checkouts = stage.path().join("checkout");
+        fs::create_dir(&staged_checkouts)?;
         let installed = receive_result(
-            stage.path(),
+            &staged_checkouts,
             1,
             checkout,
             &target.saved.bundle.checkout_commit,
         )?;
+        let transient_checkout = staged_checkouts.join("1");
         let relative = installed
-            .strip_prefix(stage.path())
+            .strip_prefix(&transient_checkout)
             .map_err(|_| invalid("The checkout is outside the move directory."))?;
-        if target.directory.join(relative) != target.saved.bundle.plan.target_scope.project {
+        let fixed_checkout = staged_checkouts.join(&checkout_name);
+        let destination_checkout = target.directory.join("checkout").join(checkout_name);
+        if destination_checkout.join(relative) != target.saved.bundle.plan.target_scope.project {
             return Err(invalid(
                 "The checkout project differs from the reserved destination.",
             ));
         }
-        sync_checkout(&stage.path().join("1"))?;
+        if transient_checkout != fixed_checkout {
+            fs::rename(transient_checkout, &fixed_checkout)?;
+        }
+        sync_checkout(&fixed_checkout)?;
+        File::open(staged_checkouts)?.sync_all()?;
         let receipt = File::create_new(stage.path().join("receipt.json"))?;
         serde_json::to_writer(&receipt, &target.saved)?;
         receipt.sync_all()?;

@@ -160,7 +160,9 @@ fn reservation_uses_the_receiving_hosts_route_and_project_directory() {
     assert_eq!(plan.target_scope.route, Route::CODEX_SUBSCRIPTION);
     assert_eq!(
         plan.target_scope.project,
-        state.join(transfer.to_string()).join("1/project")
+        state
+            .join(transfer.to_string())
+            .join("checkout/checkout/project")
     );
     let root_transfer = Uuid::new_v4();
     let root = Reservation {
@@ -174,7 +176,9 @@ fn reservation_uses_the_receiving_hosts_route_and_project_directory() {
     };
     let reply = dispatch(Incoming::Reserve(root)).unwrap();
     let root_plan: Plan = serde_json::from_str(reply.as_str().unwrap()).unwrap();
-    let clean_path = state.join(root_transfer.to_string()).join("1");
+    let clean_path = state
+        .join(root_transfer.to_string())
+        .join("checkout/project");
     assert_eq!(
         root_plan.target_scope.project.as_os_str(),
         clean_path.as_os_str()

@@ -2496,7 +2496,7 @@ function moveDestinations(inventory, route) {
     else if (!row.grant?.may_accept_moves) unavailable = "Accept session moves is off";
     else if (!row.routes?.some((choice) => routesLabel(choice) === routesLabel(route)))
       unavailable = "Runtime or account unavailable";
-    return {id: row.host.id, name: row.host.name, unavailable, detail: routesLabel(route)};
+    return {id: row.host.id, name: row.host.name, unavailable, detail: `New checkout · ${routesLabel(route)}`};
   });
 }
 function workerHostUnavailable(row) {

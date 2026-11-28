@@ -4,7 +4,8 @@ use crate::{
     appearance::Palette,
     kit::{button, col, row, small, toolbar_button},
 };
-use gpui::{AppContext, ClickEvent, Context, Div, ParentElement, Styled, rgb};
+use gpui::{AppContext, ClickEvent, Context, Div, ParentElement, Styled, div, px, rgb};
+use gpui_component::scroll::ScrollableElement;
 use ox_desk_core::{
     actions::{Action, MoveSession},
     host_protocol::Scope,
@@ -46,7 +47,14 @@ impl Workbench {
         self.live_move_mark().is_some_and(|(_, mark)| {
             matches!(
                 mark["phase"].as_str(),
-                Some("preparing" | "closing" | "checking" | "ready" | "failed")
+                Some(
+                    "waiting_for_workers"
+                        | "preparing"
+                        | "closing"
+                        | "checking"
+                        | "ready"
+                        | "failed"
+                )
             )
         })
     }
@@ -195,49 +203,57 @@ impl Workbench {
             };
             let destination = selected.map(|target| target.id.clone());
             let owner = owner.to_owned();
-            panel = panel.child(choices).child(
-                row()
-                    .gap_2()
-                    .justify_end()
-                    .child(toolbar_button(
-                        p,
-                        "manage-move-hosts",
-                        "Manage host links",
-                        true,
-                        cx.listener(|_, _, _, cx| cx.emit(OpenWorkerHosts)),
-                    ))
-                    .child(toolbar_button(
-                        p,
-                        "close-move",
-                        "Cancel",
-                        true,
-                        cx.listener(|s, _, _, cx| {
-                            s.move_picker = None;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(button(
-                        p,
-                        "queue-move",
-                        label,
-                        true,
-                        destination.is_some(),
-                        cx.listener(move |s, _, _, cx| {
-                            if let Some(destination) = &destination {
+            panel = panel
+                .child(
+                    div()
+                        .id("move-host-choices")
+                        .max_h(px(132.))
+                        .overflow_y_scrollbar()
+                        .child(choices),
+                )
+                .child(
+                    row()
+                        .gap_2()
+                        .justify_end()
+                        .child(toolbar_button(
+                            p,
+                            "manage-move-hosts",
+                            "Manage host links",
+                            true,
+                            cx.listener(|_, _, _, cx| cx.emit(OpenWorkerHosts)),
+                        ))
+                        .child(toolbar_button(
+                            p,
+                            "close-move",
+                            "Cancel",
+                            true,
+                            cx.listener(|s, _, _, cx| {
                                 s.move_picker = None;
-                                s.action(
-                                    cx,
-                                    Action::MoveSession(MoveSession {
-                                        thread: owner.clone(),
-                                        destination: destination.clone(),
-                                        operation: Uuid::new_v4().to_string(),
-                                        after_turn: running,
-                                    }),
-                                );
-                            }
-                        }),
-                    )),
-            );
+                                cx.notify();
+                            }),
+                        ))
+                        .child(button(
+                            p,
+                            "queue-move",
+                            label,
+                            true,
+                            destination.is_some(),
+                            cx.listener(move |s, _, _, cx| {
+                                if let Some(destination) = &destination {
+                                    s.move_picker = None;
+                                    s.action(
+                                        cx,
+                                        Action::MoveSession(MoveSession {
+                                            thread: owner.clone(),
+                                            destination: destination.clone(),
+                                            operation: Uuid::new_v4().to_string(),
+                                            after_turn: running,
+                                        }),
+                                    );
+                                }
+                            }),
+                        )),
+                );
             return Some(panel);
         }
 
@@ -253,7 +269,7 @@ impl Workbench {
             ),
             "waiting_for_workers" => (
                 "Waiting for workers".into(),
-                format!("Your move to {host} is queued."),
+                format!("The move to {host} starts after the workers finish."),
             ),
             "preparing" => (
                 format!("Preparing {host}"),

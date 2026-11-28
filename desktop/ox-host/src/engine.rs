@@ -7386,7 +7386,7 @@ mod tests {
                 .canonicalize()
                 .unwrap()
                 .join(plan.id.to_string())
-                .join("1");
+                .join("checkout/project");
             assert_eq!(
                 engine.prepare_source_move(&plan, false).unwrap(),
                 Status::Preparing

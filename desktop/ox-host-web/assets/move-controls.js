@@ -146,7 +146,7 @@ export class MoveControls {
     const source = this.view.source;
     const name = move.destination?.name;
     const link = move.phase === "ready" && destinationLink(move);
-    const locked = ["preparing", "closing", "checking", "ready", "failed"].includes(move.phase);
+    const locked = ["waiting_for_workers", "preparing", "closing", "checking", "ready", "failed"].includes(move.phase);
     const status = {
       waiting: [`Moves to ${name} after this turn`, `Keep ${source} on until the move is ready.`],
       waiting_for_workers: ["Waiting for workers", `The move to ${name} starts after the workers finish.`],

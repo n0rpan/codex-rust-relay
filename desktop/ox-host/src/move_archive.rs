@@ -277,7 +277,7 @@ mod tests {
             .canonicalize()
             .unwrap()
             .join(header.plan.id.to_string())
-            .join("1");
+            .join("checkout/project");
         header.plan.target_scope.project = checkout.clone();
         let plan = &header.plan;
         let mut source = Ledger::open(laptop.path(), plan.source.host).unwrap();
