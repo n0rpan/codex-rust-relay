@@ -1163,6 +1163,14 @@ def run(harness, screenshot=None):
         assert js("return document.activeElement.id==='open-settings'")
         keypress("\ue004")
         assert js("return document.activeElement.id==='start-worker' && document.activeElement.matches(':focus-visible')")
+        keypress("\ue007")
+        assert js("return document.getElementById('worker-sheet').open && document.activeElement.id==='worker-heading'")
+        js("document.getElementById('worker-submit').focus()")
+        keypress("\ue004")
+        assert js("""const sheet=document.getElementById('worker-sheet');
+            return document.activeElement===document.body || sheet.contains(document.activeElement)""")
+        keypress("\ue00c")
+        wait(lambda: js("return !document.getElementById('worker-sheet').open && document.activeElement.id==='start-worker'"))
         keypress("\ue004")
         for _ in range(8):
             if js("return document.activeElement.textContent==='Allow'"): break
