@@ -1,6 +1,6 @@
 //! Project the authoritative store onto the device protocol. Credentials, process
 //! handles and the runtime-specific payload of an approval never leave the owner.
-use super::{Connection, Store, ThreadRow};
+use super::{Connection, Store, ThreadRow, moves::History};
 use crate::{
     changed::Changed,
     host_protocol::*,
@@ -72,15 +72,18 @@ fn item_view(k: &ItemKey, e: &Entry) -> TimelineItem {
         revision: e.revision,
     }
 }
-fn timeline_detail(t: &Transcript) -> Value {
-    json!({"active":t.active_turn(),"last_finished":t.last_finished,"interrupted":t.interrupted,"error":t.error(),"ready":t.is_ready(),"loading":t.is_loading(),"older":t.has_older(),"access":t.access(),"reviews":t.reviews,"usage":t.usage,"command_notice":t.command_notice,"model":t.model,"effort":t.effort,"tier":t.tier,"unread":t.unread()})
+fn timeline_detail(t: &Transcript, prior: Option<&History>) -> Value {
+    let older = t.has_older() || prior.is_some_and(|history| history.previous.is_some());
+    json!({"active":t.active_turn(),"last_finished":t.last_finished,"interrupted":t.interrupted,"error":t.error(),"ready":t.is_ready(),"loading":t.is_loading(),"older":older,"access":t.access(),"reviews":t.reviews,"usage":t.usage,"command_notice":t.command_notice,"model":t.model,"effort":t.effort,"tier":t.tier,"unread":t.unread()})
 }
-fn timeline(t: &Transcript) -> Timeline {
+fn timeline(t: &Transcript, prior: Option<&History>) -> Timeline {
     Timeline {
-        items: keys(t)
-            .filter_map(|k| t.entry(k).map(|e| item_view(k, e)))
+        items: prior
+            .into_iter()
+            .flat_map(|history| history.items.iter().cloned())
+            .chain(keys(t).filter_map(|k| t.entry(k).map(|e| item_view(k, e))))
             .collect(),
-        detail: timeline_detail(t),
+        detail: timeline_detail(t, prior),
     }
 }
 // Send the same top-level completions the desktop composer displays. Individual
@@ -252,9 +255,16 @@ impl Store {
                 "idle"
             }
         };
+        let resume_access = self.resume_access.get(id).copied().or_else(|| {
+            (self.is_session_scoped()
+                && self.moved_history.contains_key(id)
+                && !self.has_live_session(id))
+            .then(|| t.and_then(|transcript| transcript.access()))
+            .flatten()
+        });
         let detail = json!({"row":r,"worker":r.worker,"unread":r.unread,"order":r.activity_order.to_string(),"generated":r.generated_title,
             "owned":t.is_some(),"native_live":self.is_native_live(id).then(||self.native_app()),"changing":self.changing_options(id),"terminal":self.in_terminal(id),"sending":self.sending(Some(id)),
-            "route":self.thread_route(Some(id)),"options":t.map(|_|self.options(Some(id))),"access":self.applied_access(Some(id)),"resume_access":self.resume_access.get(id),"restored_draft":self.restored_drafts.get(id).map(|(message,text)|json!({"message":message,"text":text})),"command_caps":((self.is_session_scoped() || self.is_antigravity()) && t.is_some()).then(||composer_schema(self.command_caps(Some(id))))});
+            "route":self.thread_route(Some(id)),"options":t.map(|_|self.options(Some(id))),"access":self.applied_access(Some(id)),"resume_access":resume_access,"restored_draft":self.restored_drafts.get(id).map(|(message,text)|json!({"message":message,"text":text})),"command_caps":((self.is_session_scoped() || self.is_antigravity()) && t.is_some()).then(||composer_schema(self.command_caps(Some(id))))});
         let mut detail = detail;
         if self.is_antigravity() {
             detail["access_choices"] = json!(self.antigravity_access_choices(id));
@@ -290,13 +300,15 @@ impl Store {
             sessions: self
                 .threads()
                 .iter()
+                .filter(|row| !self.move_writer_is_unpublished(&row.id))
                 .map(|r| self.session_view(r))
                 .collect(),
             asks: self.host_asks(),
             transcripts: self
                 .transcripts
                 .iter()
-                .map(|(id, t)| (id.clone(), timeline(t)))
+                .filter(|(id, _)| !self.move_writer_is_unpublished(id))
+                .map(|(id, t)| (id.clone(), timeline(t, self.moved_history.get(id))))
                 .collect::<BTreeMap<_, _>>(),
             detail: self.host_detail(),
         }
@@ -367,6 +379,7 @@ impl Store {
             let sessions: Vec<_> = self
                 .threads()
                 .iter()
+                .filter(|row| !self.move_writer_is_unpublished(&row.id))
                 .map(|r| {
                     let mut row = self.session_view(r);
                     if let Some(previous) = previous_results.get(&row.id) {
@@ -381,6 +394,13 @@ impl Store {
             }
         }
         for id in changed.dirty_threads() {
+            if self.move_writer_is_unpublished(id) {
+                if state.transcripts.remove(id).is_some() {
+                    out.push(Change::Retired { thread: id.clone() });
+                }
+                continue;
+            }
+            let prior = self.moved_history.get(id);
             let Some(t) = self.transcript(id) else {
                 if state.transcripts.remove(id).is_some() {
                     out.push(Change::Retired { thread: id.clone() });
@@ -399,7 +419,7 @@ impl Store {
                 }
             }
             let Some(previous) = state.transcripts.get_mut(id) else {
-                let timeline = timeline(t);
+                let timeline = timeline(t, prior);
                 state.transcripts.insert(id.clone(), timeline.clone());
                 out.push(Change::Transcript {
                     thread: id.clone(),
@@ -409,7 +429,7 @@ impl Store {
             };
             if changed.replaced_threads().contains(id) {
                 // A reread can correct text with the same message ID and revision.
-                let current = timeline(t);
+                let current = timeline(t, prior);
                 if *previous != current {
                     *previous = current.clone();
                     out.push(Change::Transcript {
@@ -419,7 +439,7 @@ impl Store {
                 }
                 continue;
             }
-            let detail = timeline_detail(t);
+            let detail = timeline_detail(t, prior);
             if previous.detail["last_finished"] != detail["last_finished"]
                 && !detail["last_finished"].is_null()
             {
@@ -441,7 +461,7 @@ impl Store {
                     detail,
                 });
             }
-            let mut count = 0;
+            let mut count = prior.map_or(0, |history| history.items.len());
             let mut reset = false;
             let mut items = Vec::new();
             for k in keys(t) {
@@ -484,7 +504,7 @@ impl Store {
                 count += 1;
             }
             if reset || count < previous.items.len() {
-                let timeline = timeline(t);
+                let timeline = timeline(t, prior);
                 *previous = timeline.clone();
                 out.push(Change::Transcript {
                     thread: id.clone(),
