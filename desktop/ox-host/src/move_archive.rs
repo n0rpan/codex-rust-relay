@@ -287,6 +287,7 @@ mod tests {
             title: "Review the release plan".into(),
             updated_at: 42,
             last_result: None,
+            model_provider: "openai".into(),
         };
         let original_manifest =
             Bundle::capture(laptop.path(), plan, presentation.clone(), &timeline)

@@ -417,7 +417,7 @@ impl Engine {
         // Capture retired approval counts for the recovery snapshot before the
         // new epoch discards the previous runtime's tokens.
         ledger.begin(seq)?;
-        Ok(Self {
+        let engine = Self {
             replacement: None,
             host_id,
             resources: Default::default(),
@@ -461,7 +461,10 @@ impl Engine {
             next_reap: Instant::now() + REAP_EVERY,
             last_mode_policy: HostPolicy::read(dir).ok(),
             schema_reader: Default::default(),
-        })
+        };
+        #[cfg(test)]
+        let engine = engine.recover_move_targets()?;
+        Ok(engine)
     }
     pub(crate) fn serve(&mut self, rx: Receiver<Message>) -> io::Result<()> {
         self.recover_worker_results();
@@ -3458,6 +3461,7 @@ fn catalog_row(view: &wire::SessionView) -> wire::SessionView {
         "worker_model",
         "worker_notice",
         "last_result",
+        "logical_session_id",
     ]
     .into_iter()
     .filter_map(|k| Some((k.to_owned(), view.detail.get(k)?.clone())))
@@ -7022,6 +7026,7 @@ mod tests {
                     title: "Review the release plan".into(),
                     updated_at: 42,
                     last_result: None,
+                    model_provider: "openai".into(),
                 },
                 &timeline,
             )
@@ -7059,7 +7064,7 @@ mod tests {
             receiver.running.insert(plan.target_scope.clone(), live);
             let (reply, prepared) = std::sync::mpsc::channel();
             receiver
-                .prepare_codex_move_target(plan.source.host, target, None, None, reply)
+                .prepare_codex_move_target(plan.source.host, target, None, reply)
                 .unwrap();
             assert!(prepared.try_recv().is_err());
             let opened = serde_json::from_value(json!({
@@ -7120,6 +7125,30 @@ mod tests {
                 receiver.running[&plan.target_scope]
                     .store
                     .can_send(Some("studio-native"))
+            );
+            drop(receiver);
+            drop(source);
+            drop(bundle);
+            laptop.close().unwrap();
+            let (tx, _mailbox) = std::sync::mpsc::sync_channel(32);
+            let receiver = Engine::open(config(studio.path()), studio.path(), tx).unwrap();
+            let sessions = &receiver.cold[&plan.target_scope].sessions;
+            assert_eq!(sessions[0].title, "Review the release plan");
+            assert_eq!(
+                sessions[0].detail["logical_session_id"],
+                plan.session.to_string()
+            );
+            assert!(receiver.running.is_empty());
+            let history = receiver
+                .read_moved_history(&plan.target_scope, "studio-native", None, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(history.1[0].text, "The earlier work");
+            assert!(
+                receiver
+                    .read_moved_history(&plan.target_scope, "another-session", None, None)
+                    .unwrap()
+                    .is_none()
             );
         }
 

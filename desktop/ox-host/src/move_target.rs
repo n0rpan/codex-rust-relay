@@ -5,8 +5,9 @@ use crate::{
     move_ledger::{Ledger, Plan, Prepared, Stage},
 };
 use ox_desk_core::{
-    handoff::{self, HandoffSource},
-    host_protocol::Scope,
+    codex::history::ThreadRow,
+    handoff::{self, HandoffSource, SelectionRefs, SourceHost, SourceItem},
+    host_protocol::{Scope, SessionView},
     modes::Decision,
     runtime::Runtime,
 };
@@ -188,21 +189,42 @@ impl VerifiedTarget {
         let recent = self.history()?.continuation_items()?;
         let selection =
             handoff::select_for_continuation(&recent, window).map_err(io::Error::other)?;
-        let source = HandoffSource {
+        let source = self.history_source(selection.refs.clone());
+        Ok(handoff::codex_items(&source, &selection))
+    }
+
+    fn history_source(&self, selection: SelectionRefs) -> HandoffSource {
+        let plan = self.plan();
+        HandoffSource {
             history_broker: None,
-            host: None,
+            host: Some(SourceHost {
+                id: plan.source.host.to_string(),
+                name: plan.source.host.to_string(),
+            }),
             scope: plan.source.scope.clone(),
             session: plan.session.to_string(),
             native: Some(plan.source.native.clone()),
             title: self.saved.bundle.presentation.title.clone(),
-            runtime: Runtime::Codex,
+            runtime: plan.source.scope.route.runtime,
             route: plan.source.scope.route.clone(),
             source_access: None,
             source_level: None,
             decision: Decision::Inherited,
-            selection: selection.refs.clone(),
-        };
-        Ok(handoff::codex_items(&source, &selection))
+            selection,
+        }
+    }
+
+    pub(crate) fn moved_history_for(
+        &self,
+        ledger: &Ledger,
+        scope: &Scope,
+        native: &str,
+    ) -> io::Result<(HandoffSource, Vec<SourceItem>)> {
+        let items = self
+            .history_for(ledger, scope, native)?
+            .continuation_items()?;
+        let selection = handoff::select_for_continuation(&items, None).map_err(io::Error::other)?;
+        Ok((self.history_source(selection.refs), items))
     }
 
     /// The session resolved by the destination actor must be the one that
@@ -225,6 +247,45 @@ impl VerifiedTarget {
     ) -> io::Result<&Presentation> {
         self.verify_owner(ledger, scope, native)?;
         Ok(&self.saved.bundle.presentation)
+    }
+
+    pub(crate) fn catalog_row_for(
+        &self,
+        ledger: &Ledger,
+        scope: &Scope,
+        native: &str,
+    ) -> io::Result<SessionView> {
+        let presentation = self.presentation_for(ledger, scope, native)?;
+        let row = ThreadRow {
+            worker: false,
+            parent_thread_id: None,
+            agent_nickname: None,
+            id: native.into(),
+            cwd: scope.project.clone(),
+            model_provider: presentation.model_provider.clone(),
+            model: None,
+            name: Some(presentation.title.clone()),
+            preview: String::new(),
+            generated_title: None,
+            updated_at: presentation.updated_at,
+            status: None,
+            unread: false,
+            activity_order: 0,
+        };
+        Ok(SessionView {
+            id: native.into(),
+            title: presentation.title.clone(),
+            parent: None,
+            status: "idle".into(),
+            updated_at: presentation.updated_at,
+            capabilities: vec!["open".into()],
+            detail: serde_json::json!({
+                "row": row,
+                "owned": true,
+                "logical_session_id": self.plan().session,
+                "last_result": presentation.last_result,
+            }),
+        })
     }
 
     fn verify_owner(&self, ledger: &Ledger, scope: &Scope, native: &str) -> io::Result<()> {

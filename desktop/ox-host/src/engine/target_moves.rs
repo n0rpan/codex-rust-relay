@@ -1,10 +1,11 @@
 //! Bind a destination runtime checkpoint to the authenticated staged archive.
-use super::{Engine, Scope};
+use super::{Engine, Scope, ScopeState};
 use crate::{
     move_ledger::{Activated, Commit, Prepared},
     move_target::VerifiedTarget,
 };
 use ox_desk_core::{
+    handoff::{HandoffSource, SourceItem},
     runtime::Access,
     store::{Connection, MoveWriterPreparation},
 };
@@ -24,12 +25,74 @@ struct Pending {
 }
 
 impl Engine {
+    pub(super) fn read_moved_history(
+        &self,
+        scope: &Scope,
+        native: &str,
+        host: Option<&str>,
+        session: Option<&str>,
+    ) -> io::Result<Option<(HandoffSource, Vec<SourceItem>)>> {
+        let ledger = &self.source_moves.ledger;
+        for prepared in ledger.active_receivers()? {
+            let plan = &prepared.plan;
+            if &plan.target_scope == scope
+                && prepared.stage.native == native
+                && host.is_none_or(|id| plan.source.host.to_string() == id)
+                && session
+                    .is_none_or(|id| id == plan.source.native || plan.session.to_string() == id)
+            {
+                return VerifiedTarget::load(&self.state_dir, plan)?
+                    .moved_history_for(ledger, scope, native)
+                    .map(Some);
+            }
+        }
+        Ok(None)
+    }
+
+    pub(super) fn recover_move_targets(mut self) -> io::Result<Self> {
+        for prepared in self.source_moves.ledger.active_receivers()? {
+            let plan = &prepared.plan;
+            let restored = VerifiedTarget::load(&self.state_dir, plan).and_then(|target| {
+                target.catalog_row_for(
+                    &self.source_moves.ledger,
+                    &plan.target_scope,
+                    &prepared.stage.native,
+                )
+            });
+            let row = match restored {
+                Ok(row) => row,
+                Err(error) => {
+                    eprintln!(
+                        "ox host: cannot restore the moved session {}: {error}",
+                        plan.session
+                    );
+                    continue;
+                }
+            };
+            let scope = plan.target_scope.clone();
+            let state = self
+                .cold
+                .entry(scope.clone())
+                .or_insert_with(|| ScopeState {
+                    scope,
+                    connection: "disconnected".into(),
+                    capabilities: Vec::new(),
+                    sessions: Vec::new(),
+                    asks: Vec::new(),
+                    transcripts: Default::default(),
+                    detail: serde_json::json!({}),
+                });
+            state.sessions.retain(|previous| previous.id != row.id);
+            state.sessions.push(row);
+        }
+        Ok(self)
+    }
+
     pub(super) fn prepare_codex_move_target(
         &mut self,
         source: Uuid,
         target: VerifiedTarget,
         access: Option<Access>,
-        window: Option<u64>,
         reply: Sender<io::Result<Prepared>>,
     ) -> io::Result<()> {
         let plan = target.plan();
@@ -71,7 +134,7 @@ impl Engine {
         live.store.prepare_codex_move_writer(
             id.to_string(),
             access,
-            target.codex_checkpoint(window)?,
+            target.codex_checkpoint(None)?,
         )?;
         self.target_moves.pending.insert(
             id,

@@ -277,6 +277,23 @@ impl Ledger {
             .max_by_key(|o| o.generation))
     }
 
+    /// Restore the destination's catalog from its durable ownership records.
+    pub(crate) fn active_receivers(&self) -> io::Result<Vec<Prepared>> {
+        self.healthy()?;
+        let mut active = Vec::new();
+        for record in self.data.moves.values() {
+            if let Phase::TargetActive { stage } = &record.phase
+                && self.owner(record.plan.session)?.as_ref() == Some(&record.owner())
+            {
+                active.push(Prepared {
+                    plan: record.plan.clone(),
+                    stage: stage.clone(),
+                });
+            }
+        }
+        Ok(active)
+    }
+
     /// Check before any route can open a native writer or execute session work.
     /// A temporary loss of disk durability must never open a second writer.
     pub(crate) fn can_write(&self, scope: &Scope, native: &str) -> bool {

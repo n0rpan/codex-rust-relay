@@ -32,6 +32,7 @@ pub(crate) struct Presentation {
     pub(crate) title: String,
     pub(crate) updated_at: i64,
     pub(crate) last_result: Option<SessionResult>,
+    pub(crate) model_provider: String,
 }
 
 impl From<&SessionView> for Presentation {
@@ -40,6 +41,10 @@ impl From<&SessionView> for Presentation {
             title: session.title.chars().take(192).collect(),
             updated_at: session.updated_at,
             last_result: session.last_result(),
+            model_provider: session.detail["row"]["modelProvider"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
         }
     }
 }
