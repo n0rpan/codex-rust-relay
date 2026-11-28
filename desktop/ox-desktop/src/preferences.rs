@@ -55,6 +55,9 @@ struct Legacy {
     initial_model: String,
 }
 
+pub(crate) struct ContinueSetup;
+impl EventEmitter<ContinueSetup> for Preferences {}
+
 pub struct Preferences {
     link: platform::HostLink,
     hosts: Entity<hosts::Hosts>,
@@ -84,6 +87,8 @@ pub struct Preferences {
     scroll: ScrollHandle,
     search_revision: String,
     conflict: Option<(Page, String)>,
+    credential_provider: Option<String>,
+    tested_provider: Option<String>,
 }
 
 impl Preferences {
@@ -128,6 +133,8 @@ impl Preferences {
             scroll: ScrollHandle::new(),
             search_revision: String::new(),
             conflict: None,
+            credential_provider: None,
+            tested_provider: None,
         };
         ui.reload(window, cx);
         ui
@@ -329,6 +336,13 @@ impl Preferences {
             return;
         }
         let page = self.page;
+        let provider = (after == Some(Page::Credentials))
+            .then(|| {
+                let index = self.selected?;
+                let provider = self.registry.as_ref()?.providers.get(index)?;
+                Some(provider.id.read(cx).value().trim().to_owned())
+            })
+            .flatten();
         let link = self.link.clone();
         self.busy = true;
         self.message.clear();
@@ -349,7 +363,13 @@ impl Preferences {
                     Ok(Ok(data)) => {
                         s.conflict = None;
                         s.install(data, Some(page), w, cx);
-                        if let Some(next) = after { s.goto(next, cx); }
+                        if let Some(next) = after {
+                            s.credential_provider = provider;
+                            s.goto(next, cx);
+                        }
+                        if page == Page::Credentials || page == Page::Providers {
+                            s.tested_provider = None;
+                        }
                         if !s.error {
                             let success = if page == Page::Credentials { "Credential updated." } else { "Changes saved." };
                             s.report(Ok(()), success, cx);
@@ -524,21 +544,34 @@ impl Preferences {
         let revision = self.settings.revisions.registry.clone();
         let link = self.link.clone();
         self.busy = true;
+        self.tested_provider = None;
         self.message.clear();
         cx.notify();
         cx.spawn(async move |view, cx| {
-            let result = cx
+            let (id, result) = cx
                 .background_executor()
-                .spawn(async move { link.request::<usize>(Request::TestProvider { id, revision }) })
+                .spawn(async move {
+                    let result = link.request::<usize>(Request::TestProvider {
+                        id: id.clone(),
+                        revision,
+                    });
+                    (id, result)
+                })
                 .await;
             let _ = view.update(cx, |s, cx| {
                 s.busy = false;
                 match result {
-                    Ok(n) => s.report(
-                        Ok(()),
-                        &format!("Connection succeeded. {n} coding models returned."),
-                        cx,
-                    ),
+                    Ok(n) => {
+                        if n > 0 {
+                            s.tested_provider = Some(id);
+                        }
+                        let models = if n == 1 {
+                            "1 coding model available.".to_owned()
+                        } else {
+                            format!("{n} coding models available.")
+                        };
+                        s.report(Ok(()), &format!("Connection succeeded. {models}"), cx);
+                    }
                     Err(e) => s.report(Err(e), "", cx),
                 }
             });
@@ -738,7 +771,7 @@ impl Preferences {
                     "test-provider",
                     "Test saved connection",
                     false,
-                    true,
+                    provider.original.is_some() && matches!(provider.edit(cx), Ok(None)),
                     cx.listener(move |s, _, _, cx| s.test_provider(i, cx)),
                 )));
             match self.section {
@@ -921,6 +954,56 @@ impl Preferences {
     }
     fn credentials_view(&self, p: Palette, cx: &mut Context<Self>) -> Div {
         let mut view = div().flex().flex_col().gap_3();
+        if let Some(id) = &self.credential_provider
+            && let Some(index) = self.registry.as_ref().and_then(|registry| {
+                registry
+                    .providers
+                    .iter()
+                    .position(|provider| provider.original.as_ref() == Some(id))
+            })
+        {
+            let host = self
+                .link
+                .remote()
+                .map_or("this computer", |host| host.name.as_str());
+            view = view.child(
+                crate::kit::col()
+                    .gap_2()
+                    .p_4()
+                    .bg(rgb(p.panel))
+                    .child(
+                        div()
+                            .text_size(p.text(Step::Title))
+                            .child(format!("Connect {id} on {host}")),
+                    )
+                    .child(
+                        "Save the provider's API key below, then check that its catalog responds.",
+                    )
+                    .child(
+                        crate::kit::row()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(crate::kit::button(
+                                p,
+                                "credential-test-provider",
+                                "Test connection",
+                                false,
+                                true,
+                                cx.listener(move |s, _, _, cx| s.test_provider(index, cx)),
+                            ))
+                            .when(self.tested_provider.as_ref() == Some(id), |row| {
+                                row.child(crate::kit::button(
+                                    p,
+                                    "provider-continue",
+                                    "Continue to session",
+                                    true,
+                                    true,
+                                    cx.listener(|_, _, _, cx| cx.emit(ContinueSetup)),
+                                ))
+                            }),
+                    ),
+            );
+        }
         if self.keys.is_empty() {
             return view
                 .child("Save a provider connection to add its API key.")

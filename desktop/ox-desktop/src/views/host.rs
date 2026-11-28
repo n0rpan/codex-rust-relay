@@ -869,9 +869,11 @@ impl Host {
         } else {
             let project = self.panes[self.active].read(cx).project.clone();
             self.before_settings = window.focused(cx);
-            self.preferences = Some(cx.new(|cx| {
+            let view = cx.new(|cx| {
                 crate::preferences::Preferences::new(self.link.clone(), project, window, cx)
-            }));
+            });
+            Self::listen_for_settings_continue(&view, window, cx);
+            self.preferences = Some(view);
         }
         let front = self.preferences.is_none();
         self.panes[self.active].update(cx, |p, cx| p.set_front_in(front, window, cx));
@@ -1208,6 +1210,23 @@ impl Host {
         )
         .detach();
     }
+    fn listen_for_settings_continue(
+        view: &Entity<crate::preferences::Preferences>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.subscribe_in(
+            view,
+            window,
+            |host, owner, _: &crate::preferences::ContinueSetup, window, cx| {
+                if host.preferences.as_ref() == Some(&owner) {
+                    host.show_settings(window, cx);
+                }
+            },
+        )
+        .detach();
+    }
+
     fn open_providers(
         &mut self,
         owner: &Entity<Workbench>,
@@ -1216,9 +1235,11 @@ impl Host {
     ) {
         let project = owner.read(cx).project.clone();
         owner.update(cx, |p, cx| p.set_front(false, cx));
-        self.preferences = Some(cx.new(|cx| {
+        let view = cx.new(|cx| {
             crate::preferences::Preferences::providers(self.link.clone(), project, window, cx)
-        }));
+        });
+        Self::listen_for_settings_continue(&view, window, cx);
+        self.preferences = Some(view);
         cx.notify();
     }
     fn switch(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
