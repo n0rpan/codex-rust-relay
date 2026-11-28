@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{self, DirBuilder, File},
     io::{self, Seek, Write},
-    os::unix::fs::DirBuilderExt,
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -91,6 +91,7 @@ impl Bundle {
         }
         let stage = tempfile::Builder::new()
             .prefix(".move-export-")
+            .permissions(fs::Permissions::from_mode(0o700))
             .tempdir_in(&spool)?;
         let transcript = stage.path().join(TRANSCRIPT);
         let mut file = File::options()

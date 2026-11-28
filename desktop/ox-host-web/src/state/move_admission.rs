@@ -299,6 +299,7 @@ pub(super) mod tests {
         ecdsa::{Signature, SigningKey, signature::Signer as _},
         elliptic_curve::rand_core::OsRng,
     };
+    use std::{fs, os::unix::fs::PermissionsExt};
 
     pub(in crate::state) const SOURCE: &str = "74b2c731-b9f0-4b05-8672-3c42062b190a";
     pub(in crate::state) const TARGET: &str = "06f2bbe4-12bb-4243-ab20-657f19c02d36";
@@ -337,7 +338,10 @@ pub(super) mod tests {
     }
 
     pub(in crate::state) fn fixture() -> (tempfile::TempDir, State, Binding) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         std::fs::write(dir.path().join("host-id"), TARGET).unwrap();
         let mut state = State::load(dir.path()).unwrap();
         state

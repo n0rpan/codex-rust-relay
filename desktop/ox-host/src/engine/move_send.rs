@@ -65,7 +65,7 @@ impl Engine {
                 self.stamp_moved_row(scope, row);
                 if let Some(progress) = self.move_progress(scope, &row.id)? {
                     attach_move_progress(row, progress);
-                } else if row.detail["owned"] == true
+                } else if is_owned_lead(row)
                     && row.detail["native_live"].is_null()
                     && row.detail["terminal"] != true
                     && (scope.route.runtime != ox_desk_core::runtime::Runtime::Claude
@@ -225,15 +225,19 @@ impl Engine {
             .running
             .get(&scope)
             .ok_or_else(|| io::Error::other("Open the session before moving it."))?;
-        if live.store.state() != &Connection::Ready
-            || !live
-                .state
-                .sessions
-                .iter()
-                .any(|view| view.id == action.thread && view.detail["owned"] == true)
-        {
+        if live.store.state() != &Connection::Ready {
             return Err(io::Error::other(
                 "Open the source session before moving it.",
+            ));
+        }
+        if !live
+            .state
+            .sessions
+            .iter()
+            .any(|view| view.id == action.thread && is_owned_lead(view))
+        {
+            return Err(io::Error::other(
+                "Open the lead session to move it after its workers finish.",
             ));
         }
         if live.store.is_native_live(&action.thread) || live.store.in_terminal(&action.thread) {
@@ -464,6 +468,10 @@ fn attach_move_progress(row: &mut ox_desk_core::host_protocol::SessionView, prog
     if !row.capabilities.iter().any(|value| value == "move_session") {
         row.capabilities.push("move_session".into());
     }
+}
+
+fn is_owned_lead(row: &ox_desk_core::host_protocol::SessionView) -> bool {
+    row.detail["owned"] == true && row.parent.is_none() && row.detail["worker"] != true
 }
 
 enum Work {

@@ -16,7 +16,7 @@ use std::{
     fs::{self, File, OpenOptions},
     future::Future,
     io::{self, Read},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -358,6 +358,7 @@ impl Upload {
         File::open(self.directory.parent().expect("state directory"))?.sync_all()?;
         let stage = tempfile::Builder::new()
             .prefix(".incoming-")
+            .permissions(fs::Permissions::from_mode(0o700))
             .tempdir_in(&self.directory)?;
         let bytes = self.offer.manifest.total_bytes()?;
         check_archive_space(&File::open(stage.path())?, bytes).map_err(|e| {

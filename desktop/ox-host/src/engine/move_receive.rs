@@ -118,7 +118,10 @@ fn reservation_uses_the_receiving_hosts_route_and_project_directory() {
     })
     .unwrap();
     let ox = state.join("ox");
-    executable::write(&ox, &format!("#!/bin/sh\nprintf '%s\\n' '{snapshot}'\n"));
+    executable::write(
+        &ox,
+        &format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{snapshot}'\n"),
+    );
     let (mailbox, actor) = mpsc::sync_channel(16);
     let config = RuntimeConfig {
         ox,

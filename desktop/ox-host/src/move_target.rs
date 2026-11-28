@@ -19,6 +19,7 @@ use std::{
     fs::{self, File},
     io,
     os::unix::ffi::OsStrExt,
+    os::unix::fs::PermissionsExt,
     path::{Component, Path, PathBuf},
 };
 use uuid::Uuid;
@@ -187,6 +188,7 @@ impl VerifiedTarget {
         }
         let stage = tempfile::Builder::new()
             .prefix(".receiving-")
+            .permissions(fs::Permissions::from_mode(0o700))
             .tempdir_in(&workspace)?;
         let transcript = stage.path().join(TRANSCRIPT);
         let mut source = verified_file(

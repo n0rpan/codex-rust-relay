@@ -7358,7 +7358,7 @@ mod tests {
             drop(bundle);
             laptop.close().unwrap();
             let (tx, _mailbox) = std::sync::mpsc::sync_channel(32);
-            let receiver = Engine::open(config(studio.path()), studio.path(), tx).unwrap();
+            let mut receiver = Engine::open(config(studio.path()), studio.path(), tx).unwrap();
             let sessions = &receiver.cold[&plan.target_scope].sessions;
             assert_eq!(sessions[0].title, "Review the release plan");
             assert_eq!(
@@ -7377,6 +7377,57 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
+
+            // An acknowledgement of the first move may still be in flight when
+            // a second move advances the same logical session to another host.
+            let ledger = &mut receiver.source_moves.ledger;
+            let (session, owner) = ledger
+                .source_identity(&plan.target_scope, "studio-native")
+                .unwrap();
+            let onward = crate::move_ledger::Plan {
+                id: uuid::Uuid::new_v4(),
+                session,
+                source: owner,
+                target_host: uuid::Uuid::new_v4(),
+                target_scope: plan.source.scope.clone(),
+            };
+            ledger.prepare_source(&onward).unwrap();
+            let second_archive = ArchivePin {
+                manifest: [8; 32],
+                transcript: [9; 32],
+            };
+            ledger
+                .bind_source_manifest(&onward, second_archive)
+                .unwrap();
+            ledger
+                .fence_source(
+                    onward.target_host,
+                    &crate::move_ledger::Prepared {
+                        plan: onward.clone(),
+                        stage: crate::move_ledger::Stage {
+                            digest: second_archive.manifest,
+                            native: "other-native".into(),
+                        },
+                    },
+                )
+                .unwrap();
+            ledger.writer_released(&onward).unwrap();
+            ledger.commit_source(&onward).unwrap();
+            let historical = receiver
+                .activate_move_target(plan.source.host, &commit)
+                .unwrap();
+            assert_eq!(historical.commit, commit);
+            assert_eq!(
+                receiver
+                    .source_moves
+                    .ledger
+                    .owner(plan.session)
+                    .unwrap()
+                    .unwrap()
+                    .host,
+                onward.target_host
+            );
+            assert!(receiver.running.is_empty());
         }
 
         #[test]

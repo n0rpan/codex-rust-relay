@@ -1911,7 +1911,8 @@ function conversation() {
     ready: Boolean(detailLink?.ready),
     supported: Boolean(id && (caps.includes("move_session") ||
       (detailLink?.sessionMoves && ["codex", "claude"].includes(scope.route.runtime) &&
-        row?.detail?.owned && !row.detail.native_live && !row.detail.terminal && caps.includes("open") &&
+        row?.detail?.owned && !row.parent && !row.detail.worker &&
+        !row.detail.native_live && !row.detail.terminal && caps.includes("open") &&
         (scope.route.runtime !== "claude" || caps.includes("end"))))),
     running: caps.includes("stop"),
     move,

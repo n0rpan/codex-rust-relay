@@ -376,9 +376,19 @@ impl Engine {
     ) -> io::Result<Activated> {
         let plan = &commit.prepared.plan;
         let native = &commit.prepared.stage.native;
+        let ledger = &mut self.source_moves.ledger;
+        if ledger.status(plan.id)? == Some(crate::move_ledger::Status::Active)
+            && ledger
+                .owner(plan.session)?
+                .is_some_and(|owner| owner.generation > plan.source.generation.saturating_add(1))
+        {
+            // This receipt was durable before a later move took ownership. It
+            // remains retrievable without touching the previous writer or checkout.
+            return ledger.activate_receiver(source, commit);
+        }
         let target = VerifiedTarget::load(&self.state_dir, plan)?;
         target.check_activation(&commit.prepared)?;
-        let activated = self.source_moves.ledger.activate_receiver(source, commit)?;
+        let activated = ledger.activate_receiver(source, commit)?;
         let row = target.catalog_row_for(&self.source_moves.ledger, &plan.target_scope, native)?;
         self.remember_moved_row(&plan.target_scope, &row);
         let logical = &row.detail["logical_session_id"];
