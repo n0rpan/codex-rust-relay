@@ -23,6 +23,10 @@ impl Binding {
             plan_digest: Sha256::digest(plan).into(),
         }
     }
+
+    pub(super) fn digest(&self) -> [u8; 32] {
+        self.plan_digest
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -159,7 +163,7 @@ impl State {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::{
         admin::DeviceClass,
@@ -171,19 +175,19 @@ mod tests {
         elliptic_curve::rand_core::OsRng,
     };
 
-    const SOURCE: &str = "74b2c731-b9f0-4b05-8672-3c42062b190a";
-    const TARGET: &str = "06f2bbe4-12bb-4243-ab20-657f19c02d36";
-    const TRANSFER: &str = "ddcba183-5073-4e9a-9825-e8730784ce5e";
+    pub(in crate::state) const SOURCE: &str = "74b2c731-b9f0-4b05-8672-3c42062b190a";
+    pub(in crate::state) const TARGET: &str = "06f2bbe4-12bb-4243-ab20-657f19c02d36";
+    pub(in crate::state) const TRANSFER: &str = "ddcba183-5073-4e9a-9825-e8730784ce5e";
     const OTHER_TRANSFER: &str = "9686915e-959f-4306-9811-67ca77da16a3";
     const LOGIN: &str = "owner@example.test";
     const PLAN: &[u8] = b"the exact proposed move plan";
 
-    fn sign(key: &SigningKey, text: &str) -> String {
+    pub(in crate::state) fn sign(key: &SigningKey, text: &str) -> String {
         let signature: Signature = key.sign(text.as_bytes());
         B64.encode(signature.to_bytes())
     }
 
-    fn pair(state: &mut State, source: &str) -> (String, SigningKey) {
+    pub(in crate::state) fn pair(state: &mut State, source: &str) -> (String, SigningKey) {
         let key = SigningKey::random(&mut OsRng);
         let public = B64.encode(key.verifying_key().to_encoded_point(false).as_bytes());
         let code = state
@@ -207,7 +211,7 @@ mod tests {
         (state.identity(LOGIN, &token).unwrap(), key)
     }
 
-    fn fixture() -> (tempfile::TempDir, State, Binding) {
+    pub(in crate::state) fn fixture() -> (tempfile::TempDir, State, Binding) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("host-id"), TARGET).unwrap();
         let mut state = State::load(dir.path()).unwrap();

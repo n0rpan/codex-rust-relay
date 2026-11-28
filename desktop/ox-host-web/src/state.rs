@@ -27,6 +27,8 @@ use tokio::sync::watch;
 // The receiving move actor will use this alongside the signed worker transport.
 #[allow(dead_code)]
 pub(crate) mod move_admission;
+#[allow(dead_code)]
+pub(crate) mod move_staging;
 
 /// A paired device that is not used for this long is forgotten.
 pub(crate) const INACTIVE: i64 = 30 * 24 * 3600;
