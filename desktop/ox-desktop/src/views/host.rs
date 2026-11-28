@@ -871,9 +871,11 @@ impl Host {
         } else {
             let project = self.panes[self.active].read(cx).project.clone();
             self.before_settings = window.focused(cx);
-            self.preferences = Some(cx.new(|cx| {
+            let view = cx.new(|cx| {
                 crate::preferences::Preferences::new(self.link.clone(), project, window, cx)
-            }));
+            });
+            Self::listen_for_settings_continue(&view, window, cx);
+            self.preferences = Some(view);
         }
         let front = self.preferences.is_none();
         self.panes[self.active].update(cx, |p, cx| p.set_front_in(front, window, cx));
@@ -950,7 +952,7 @@ impl Host {
                     crate::kit::nav_row(
                         "running-toggle",
                         format!(
-                            "{running_count} running, {}",
+                            "{running_count} open sessions, {}",
                             if running_open { "hide" } else { "show" }
                         ),
                         crate::kit::ICON_SIZE,
@@ -966,12 +968,12 @@ impl Host {
                     .child(
                         row()
                             .gap(px(SPACE_S))
-                            .child(div().size(px(6.)).rounded_full().bg(rgb(p.success)))
+                            .child(div().size(px(6.)).rounded_full().bg(rgb(p.muted)))
                             .child(
                                 div()
                                     .text_size(p.text(Step::Meta))
                                     .text_color(rgb(p.muted))
-                                    .child(format!("{running_count} running")),
+                                    .child(format!("{running_count} open")),
                             )
                             .child(
                                 div()
@@ -1079,6 +1081,24 @@ impl Host {
             window,
             |s, _, _: &super::workbench::empty::OpenProject, window, cx| {
                 s.pick_project(window, cx);
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            pane,
+            window,
+            |s, _, event: &super::workbench::OpenOnPhone, window, cx| {
+                s.show_remote(window, cx);
+                if let Some(view) = &s.preferences {
+                    view.update(cx, |view, cx| {
+                        view.open_session_on_phone(
+                            &event.scope,
+                            &event.thread,
+                            event.title.clone(),
+                            cx,
+                        )
+                    });
+                }
             },
         )
         .detach();
@@ -1238,6 +1258,33 @@ impl Host {
         )
         .detach();
     }
+    fn listen_for_settings_continue(
+        view: &Entity<crate::preferences::Preferences>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.subscribe_in(
+            view,
+            window,
+            |host, owner, event: &crate::preferences::ContinueSetup, window, cx| {
+                if host.preferences.as_ref() == Some(owner) {
+                    host.provider_onboarding = None;
+                    host.show_settings(window, cx);
+                    if let Some(model) = &event.0 {
+                        let pane = host.panes[host.active].read(cx);
+                        host.open(
+                            pane.project.clone(),
+                            pane.api_route(model.clone()),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            },
+        )
+        .detach();
+    }
+
     fn open_providers(
         &mut self,
         owner: &Entity<Workbench>,
@@ -1246,9 +1293,11 @@ impl Host {
     ) {
         let project = owner.read(cx).project.clone();
         owner.update(cx, |p, cx| p.set_front(false, cx));
-        self.preferences = Some(cx.new(|cx| {
+        let view = cx.new(|cx| {
             crate::preferences::Preferences::providers(self.link.clone(), project, window, cx)
-        }));
+        });
+        Self::listen_for_settings_continue(&view, window, cx);
+        self.preferences = Some(view);
         cx.notify();
     }
     fn switch(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {

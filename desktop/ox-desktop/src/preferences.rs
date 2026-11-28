@@ -6,6 +6,7 @@ pub mod behavior;
 mod forms;
 mod hosts;
 mod key_field;
+mod memory;
 pub(crate) use hosts::{HostDirectory, Hosts};
 mod remote;
 mod sessions;
@@ -37,6 +38,7 @@ enum Page {
     Credentials,
     Legacy,
     Sessions,
+    Memory,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -56,6 +58,9 @@ struct Legacy {
     initial_model: String,
 }
 
+pub(crate) struct ContinueSetup(pub Option<String>);
+impl EventEmitter<ContinueSetup> for Preferences {}
+
 pub struct Preferences {
     link: platform::HostLink,
     hosts: Entity<hosts::Hosts>,
@@ -63,6 +68,7 @@ pub struct Preferences {
     about: Entity<about::About>,
     remote: Option<Entity<remote::Remote>>,
     advanced: Option<advanced::Advanced>,
+    memory: Option<Entity<memory::Library>>,
     project: PathBuf,
     prefer_providers: bool,
     settings: Settings,
@@ -85,6 +91,8 @@ pub struct Preferences {
     scroll: ScrollHandle,
     search_revision: String,
     conflict: Option<(Page, String)>,
+    credential_provider: Option<String>,
+    tested_provider: Option<(String, Option<String>)>,
 }
 
 impl Preferences {
@@ -106,6 +114,7 @@ impl Preferences {
             hosts: cx.new(|cx| hosts::Hosts::new(window, cx)),
             focus,
             advanced: None,
+            memory: None,
             about: cx.new(about::About::new),
             remote: None,
             project,
@@ -129,6 +138,8 @@ impl Preferences {
             scroll: ScrollHandle::new(),
             search_revision: String::new(),
             conflict: None,
+            credential_provider: None,
+            tested_provider: None,
         };
         ui.reload(window, cx);
         ui
@@ -144,6 +155,19 @@ impl Preferences {
         view
     }
 
+    pub(crate) fn open_session_on_phone(
+        &mut self,
+        scope: &ox_desk_core::host_protocol::Scope,
+        thread: &str,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_remote(cx);
+        if let Some(remote) = &self.remote {
+            remote.update(cx, |view, cx| view.set_session(scope, thread, title, cx));
+        }
+    }
+
     /// Show the Remote access page (the sidebar's phone control).
     pub fn open_remote(&mut self, cx: &mut Context<Self>) {
         // Stay here when the first load lands, instead of jumping to Accounts.
@@ -152,6 +176,17 @@ impl Preferences {
             self.goto(Page::Remote, cx);
         }
     }
+    pub(crate) fn open_memory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.link.remote().is_some() {
+            return;
+        }
+        self.prefer_providers = true;
+        if self.memory.is_none() {
+            self.memory = Some(cx.new(|cx| memory::Library::new(self.project.clone(), window, cx)));
+        }
+        self.goto(Page::Memory, cx);
+    }
+
     fn goto(&mut self, page: Page, cx: &mut Context<Self>) {
         let page = if page == Page::Remote && self.link.remote().is_some() {
             Page::Hosts
@@ -345,6 +380,13 @@ impl Preferences {
             return;
         }
         let page = self.page;
+        let provider = (after == Some(Page::Credentials))
+            .then(|| {
+                let index = self.selected?;
+                let provider = self.registry.as_ref()?.providers.get(index)?;
+                Some(provider.id.read(cx).value().trim().to_owned())
+            })
+            .flatten();
         let link = self.link.clone();
         self.busy = true;
         self.message.clear();
@@ -365,7 +407,13 @@ impl Preferences {
                     Ok(Ok(data)) => {
                         s.conflict = None;
                         s.install(data, Some(page), w, cx);
-                        if let Some(next) = after { s.goto(next, cx); }
+                        if let Some(next) = after {
+                            s.credential_provider = provider;
+                            s.goto(next, cx);
+                        }
+                        if page == Page::Credentials || page == Page::Providers {
+                            s.tested_provider = None;
+                        }
                         if !s.error {
                             let success = if page == Page::Credentials { "Credential updated." } else { "Changes saved." };
                             s.report(Ok(()), success, cx);
@@ -418,7 +466,8 @@ impl Preferences {
             | Page::Behavior
             | Page::Notifications
             | Page::Advanced
-            | Page::Sessions => {
+            | Page::Sessions
+            | Page::Memory => {
                 return String::new();
             }
         }
@@ -540,22 +589,45 @@ impl Preferences {
         }
         let revision = self.settings.revisions.registry.clone();
         let link = self.link.clone();
+        let continuing = self.credential_provider.as_ref() == Some(&id);
         self.busy = true;
+        self.tested_provider = None;
         self.message.clear();
         cx.notify();
         cx.spawn(async move |view, cx| {
-            let result = cx
+            let (id, result, model) = cx
                 .background_executor()
-                .spawn(async move { link.request::<usize>(Request::TestProvider { id, revision }) })
+                .spawn(async move {
+                    let result = link.request::<usize>(Request::TestProvider {
+                        id: id.clone(),
+                        revision,
+                    });
+                    let model = (continuing && result.as_ref().is_ok_and(|n| *n > 0))
+                        .then(|| {
+                            link.request::<Vec<String>>(Request::ProviderModels { id: id.clone() })
+                                .ok()
+                                .and_then(|models| models.into_iter().next())
+                        })
+                        .flatten();
+                    (id, result, model)
+                })
                 .await;
             let _ = view.update(cx, |s, cx| {
                 s.busy = false;
                 match result {
-                    Ok(n) => s.report(
-                        Ok(()),
-                        &format!("Connection succeeded. {n} coding models returned."),
-                        cx,
-                    ),
+                    Ok(n) => {
+                        let models = if continuing && n > 0 && model.is_none() {
+                            "Choose one of this provider's models from the workbench.".to_owned()
+                        } else if n == 1 {
+                            "1 coding model available.".to_owned()
+                        } else {
+                            format!("{n} coding models available.")
+                        };
+                        if continuing && n > 0 {
+                            s.tested_provider = Some((id, model));
+                        }
+                        s.report(Ok(()), &format!("Connection succeeded. {models}"), cx);
+                    }
                     Err(e) => s.report(Err(e), "", cx),
                 }
             });
@@ -786,7 +858,7 @@ impl Preferences {
                     "test-provider",
                     "Test saved connection",
                     false,
-                    true,
+                    provider.original.is_some() && matches!(provider.edit(cx), Ok(None)),
                     cx.listener(move |s, _, _, cx| s.test_provider(i, cx)),
                 )));
             match self.section {
@@ -969,6 +1041,69 @@ impl Preferences {
     }
     fn credentials_view(&self, p: Palette, cx: &mut Context<Self>) -> Div {
         let mut view = div().flex().flex_col().gap_3();
+        if let Some(id) = &self.credential_provider
+            && let Some(index) = self.registry.as_ref().and_then(|registry| {
+                registry
+                    .providers
+                    .iter()
+                    .position(|provider| provider.original.as_ref() == Some(id))
+            })
+        {
+            let host = self
+                .link
+                .remote()
+                .map_or("this computer", |host| host.name.as_str());
+            view = view.child(
+                crate::kit::col()
+                    .gap_2()
+                    .p_4()
+                    .bg(rgb(p.panel))
+                    .child(
+                        div()
+                            .text_size(p.text(Step::Title))
+                            .child(format!("Connect {id} on {host}")),
+                    )
+                    .child(
+                        "Save the provider's API key below, then check that its catalog responds.",
+                    )
+                    .child(
+                        crate::kit::row()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(crate::kit::button(
+                                p,
+                                "credential-test-provider",
+                                "Test connection",
+                                false,
+                                true,
+                                cx.listener(move |s, _, _, cx| s.test_provider(index, cx)),
+                            ))
+                            .when_some(
+                                self.tested_provider
+                                    .as_ref()
+                                    .filter(|(tested, _)| tested == id),
+                                |row, (_, model)| {
+                                    let label = if model.is_some() {
+                                        "Continue to session"
+                                    } else {
+                                        "Back to workbench"
+                                    };
+                                    let model = model.clone();
+                                    row.child(crate::kit::button(
+                                        p,
+                                        "provider-continue",
+                                        label,
+                                        true,
+                                        true,
+                                        cx.listener(move |_, _, _, cx| {
+                                            cx.emit(ContinueSetup(model.clone()))
+                                        }),
+                                    ))
+                                },
+                            ),
+                    ),
+            );
+        }
         if self.keys.is_empty() {
             return view
                 .child("Save a provider connection to add its API key.")
@@ -1248,9 +1383,13 @@ impl Preferences {
             (Page::Sessions, "Sessions"),
             (Page::Legacy, "Legacy Codex provider"),
             (Page::Advanced, "Advanced configuration"),
+            (Page::Memory, "Memory"),
         ] {
             if self.link.remote().is_some()
-                && matches!(page, Page::Behavior | Page::Sessions | Page::Remote)
+                && matches!(
+                    page,
+                    Page::Behavior | Page::Sessions | Page::Remote | Page::Memory
+                )
             {
                 continue;
             }
@@ -1266,6 +1405,8 @@ impl Preferences {
                 cx.listener(move |s, _, w, cx| {
                     if page == Page::Advanced {
                         s.open_advanced(w, cx)
+                    } else if page == Page::Memory {
+                        s.open_memory(w, cx)
                     } else {
                         s.goto(page, cx)
                     }
@@ -1299,6 +1440,7 @@ impl Preferences {
                 Page::Behavior => self.behavior_page(p, cx),
                 Page::Notifications => self.notification_page(p, cx),
                 Page::Sessions => self.sessions_page(p, cx),
+                Page::Memory => div().children(self.memory.clone()),
                 Page::Providers => self.providers_view(p, cx),
                 Page::Credentials => self.credentials_view(p, cx),
                 Page::Favorites => self.favorites_view(p, cx),

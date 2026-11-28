@@ -4799,6 +4799,7 @@ dependencies = [
  "ox-desk-core",
  "ox-host-service",
  "ox-host-web",
+ "ox-memory",
  "ox-pty",
  "raw-window-handle",
  "serde",

@@ -13,7 +13,7 @@ import {
   mentionInput,
   forgetComposer,
 } from "./composer-tools.js";
-import { pairingCode, setupCamera } from "./pair-camera.js";
+import { pairingInvitation, setupCamera } from "./pair-camera.js";
 import { ActivityLine } from "./activity.js";
 import * as wire from "./wire.js";
 import { SessionControls } from "./controls.js";
@@ -137,8 +137,9 @@ function page(id) {
 }
 const hash = new URLSearchParams(location.hash.slice(1));
 const notificationTarget = new NotificationTarget();
-notificationTarget.request(hash.get("thread"));
 let code = hash.get("pair");
+let pairingTarget = code ? hash.get("thread") : null;
+notificationTarget.request(code ? null : hash.get("thread"));
 if (location.hash) history.replaceState(null, "", location.pathname);
 // Whether the host has an OX API provider: then every catalog alias is a route for both
 // runtimes, even when the first Hello (before discovery finished) listed none.
@@ -307,6 +308,14 @@ const phoneSettings = setupSettings({
     return openPhoneTerminal(`${runtime}-login`);
   },
 });
+$("open-memory").onclick = () => {
+  if (!selected) return;
+  const current = selected;
+  closeActionMenus();
+  page("settings");
+  void phoneSettings.memory(current.scope.project, () => open(current.scope, current.id));
+};
+
 /** The host took a send and then lost it (a resume that failed after the Ack): its text
  * comes back into the composer once per lost message, before anything typed since, as in
  * the desktop replica. */
@@ -408,6 +417,7 @@ class Link {
             $(id).replaceChildren();
           $("draft").value = "";
           syncDraftHeight();
+          phoneSettings.reset();
           pairingPage();
         }
       } else this.lost();
@@ -854,6 +864,7 @@ function open(scope, id) {
   controls.reset();
   detailLink?.close();
   selected = { scope, id, revealLatest: Boolean(id), openingResult: Boolean(id) };
+  $("worker-results").open = false;
   pendingVisibleResult = null;
   setComposerOwner(keyOf(scope, id), repaint, notice);
   pendingNew = null;
@@ -1751,6 +1762,9 @@ function commandSuggestions(command) {
   }));
 }
 function updateComposerState() {
+  const draftHasText = Boolean($("draft").value.trim());
+  $("worker-review-starter").disabled = draftHasText;
+  $("project-setup-starter").disabled = draftHasText;
   if (!selected) return;
   const { scope, id } = selected,
     k = scopeKey(scope);
@@ -1794,6 +1808,70 @@ function updateComposerState() {
   $("stop").onclick = () => detailLink?.act({ stop: id });
   $("menu-stop").disabled = $("stop").disabled;
   $("menu-stop").hidden = !id;
+}
+
+const workerReviewPrompt = "Ask one independent read-only worker to review the result so far. Summarize its findings here.";
+function suggestPrompt(text) {
+  const draft = $("draft");
+  if (!selected || !detailLink?.ready || draft.value.trim()) return;
+  draft.value = text;
+  draft.oninput();
+  draft.focus();
+}
+$("worker-review-starter").onclick = () => {
+  if (selected?.id) suggestPrompt(workerReviewPrompt);
+};
+$("project-setup-starter").onclick = () => {
+  if (selected && !selected.id)
+    suggestPrompt("Help me set up this project. Read its setup instructions, check the prerequisites, and explain the next steps. Ask before changing my machine or installing anything.");
+};
+
+let workerResultsKey;
+function renderWorkerResults(scope, id, row) {
+  const list = $("worker-results-list");
+  $("project-setup-starter").hidden = Boolean(id) || !detailLink?.ready;
+  if (!id) {
+    $("worker-results").hidden = true;
+    $("worker-review-starter").hidden = true;
+    return;
+  }
+  const parentKey = keyOf(scope, id);
+  const rows = entries();
+  const findParent = catalogParentResolver(rows);
+  const workers = rows.filter(entry => {
+    const { session } = entry;
+    const origin = session.detail?.origin;
+    return (origin?.relation === "worker" && !origin.linked || !origin && session.detail?.worker) &&
+      findParent(entry)?.key === parentKey &&
+      !global.scopes.get(scopeKey(entry.scope))?.detail?.archived?.includes(session.id);
+  });
+  const key = JSON.stringify([parentKey, workers.map(entry => [
+    entry.scope, entry.session.id, entry.session.title, entry.session.status,
+    sessionResult(entry.session)?.outcome,
+    entry.session.detail?.worker_model, entry.session.detail?.origin?.ceiling
+  ])]);
+  $("worker-results").hidden = !workers.length;
+  $("worker-review-starter").hidden = workers.length !== 0 || row?.detail?.origin ||
+    !["codex", "claude"].includes(scope.route.runtime) || !row?.capabilities?.includes("open") ||
+    !detailLink?.ready || row?.status === "running" || row?.status === "needs_input" ||
+    sessionResult(row)?.outcome !== "completed";
+  if (workerResultsKey === key) return;
+  workerResultsKey = key;
+  $("worker-results-title").textContent = `Workers (${workers.length})`;
+  list.replaceChildren(...workers.map(entry => {
+    const { session } = entry;
+    const status = ({
+      running: "Running", needs_input: "Needs you", queued: "Queued",
+      failed: "Failed", interrupted: "Interrupted"
+    })[session.status] || ({completed: "Completed", failed: "Failed", stopped: "Stopped"})[sessionResult(session)?.outcome] || "Open";
+    const ceiling = ceilingLabels[session.detail?.origin?.ceiling];
+    const result = button(session.title || "Worker session", () => open(entry.scope, session.id));
+    const metadata = [status, routesLabel(entry.scope.route), ceiling && `${ceiling} ceiling`]
+      .filter(Boolean).join(" · ") + workerModel(session.detail?.worker_model);
+    const item = el("div", "worker-result-row");
+    item.append(result, el("div", "meta", metadata));
+    return item;
+  }));
 }
 
 function conversation() {
@@ -1874,7 +1952,14 @@ function conversation() {
       $("context").append(document.createTextNode(" · Lead on another host"));
     }
   }
+  const memory = row?.detail?.memory_attachment;
+  if (Number.isSafeInteger(memory?.entries) && memory.entries > 0) {
+    const amount = memory.entries === 1 ? "1 pinned memory" : `${memory.entries} pinned memories`;
+    $("context").append(el("div", "meta", amount + (memory.from_parent_host
+      ? " attached from the parent host" : " attached at session start")));
+  }
   handoffMarks(row);
+  renderWorkerResults(scope, id, row);
   if (
     pendingGrant?.id === id &&
     scopeKey(pendingGrant.scope) === k &&
@@ -2926,8 +3011,9 @@ $("composer").onsubmit = (e) => {
   }
   repaint();
 };
-const closeCamera = setupCamera((secret) => {
-  code = secret;
+const closeCamera = setupCamera((invitation) => {
+  code = invitation.code;
+  pairingTarget = invitation.thread;
   $("pair-link").value = "";
   notice();
   pairingPage();
@@ -2943,12 +3029,16 @@ $("pair-form").onsubmit = async (e) => {
   e.preventDefault();
   try {
     closeCamera();
-    const secret = code ?? pairingCode($("pair-link").value, location.origin);
-    if (!/^[A-Za-z0-9_-]{43}$/.test(secret))
+    const invitation = code
+      ? { code, thread: pairingTarget }
+      : pairingInvitation($("pair-link").value, location.origin);
+    if (!/^[A-Za-z0-9_-]{43}$/.test(invitation.code))
       throw new Error("Request a fresh pairing QR in OX Desktop.");
-    await pair(secret, $("device-label").value);
+    await pair(invitation.code, $("device-label").value);
+    if (invitation.thread) notificationTarget.request(invitation.thread);
     $("pair-link").value = "";
     code = null;
+    pairingTarget = null;
     key = await deviceKey();
     clearDrafts();
     forgetKnownHosts();
@@ -2956,6 +3046,7 @@ $("pair-form").onsubmit = async (e) => {
   } catch (err) {
     if (err.status === 403) {
       code = null;
+      pairingTarget = null;
       pairingPage();
       notice(
         "Pairing was refused. Get a fresh code in OX Desktop for this Tailscale account.",

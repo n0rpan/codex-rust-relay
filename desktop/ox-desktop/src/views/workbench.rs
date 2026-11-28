@@ -96,6 +96,7 @@ pub struct Workbench {
     pub(super) link: HostLink,
     workers: Entity<super::host::WorkerIndex>,
     pub(super) pending_local_command: Option<super::terminal_review::Pending>,
+    worker_results_open: Option<String>,
     pub(super) enter_sends: bool,
     review: review::ReviewPane,
     pub(super) review_width: u32,
@@ -163,6 +164,13 @@ impl EventEmitter<CatalogChanged> for Workbench {}
 /// the id so the target is reachable across checkouts and billing routes.
 pub(super) struct OpenThread(pub super::host::ParentLink);
 impl EventEmitter<OpenThread> for Workbench {}
+
+pub(super) struct OpenOnPhone {
+    pub scope: ox_desk_core::host_protocol::Scope,
+    pub thread: String,
+    pub title: String,
+}
+impl EventEmitter<OpenOnPhone> for Workbench {}
 
 #[derive(Default)]
 pub(super) struct Stats {
@@ -279,6 +287,7 @@ impl Workbench {
             handoff_pending: None,
             link,
             workers,
+            worker_results_open: None,
             enter_sends: cx
                 .global::<crate::preferences::behavior::Active>()
                 .enter_sends,
@@ -1260,6 +1269,24 @@ impl Workbench {
                                         .when(status != "Connected", |view| {
                                             view.child(crate::small(p, status.clone()))
                                         })
+                                        .when_some(
+                                            self.store.as_ref().and_then(|store| {
+                                                serde_json::from_value::<
+                                                    ox_desk_core::memory::Attachment,
+                                                >(
+                                                    store
+                                                        .session_mark(
+                                                            store.selected()?,
+                                                            "memory_attachment",
+                                                        )?
+                                                        .clone(),
+                                                )
+                                                .ok()
+                                            }),
+                                            |view, attachment| {
+                                                view.child(crate::small(p, attachment.label()))
+                                            },
+                                        )
                                         .when_some(self.worker_crumb(p, cx), |view, crumb| {
                                             view.child(crumb)
                                         }),
@@ -1269,6 +1296,36 @@ impl Workbench {
                                         .flex_wrap()
                                         .min_w_0()
                                         .gap(px(SPACE_XS))
+                                        .when_some(
+                                            self.store
+                                                .as_ref()
+                                                .and_then(|store| store.selected())
+                                                .filter(|_| self.link.remote().is_none())
+                                                .map(str::to_owned),
+                                            |tools, thread| {
+                                                let title = title
+                                                    .clone()
+                                                    .unwrap_or_else(|| "this session".to_owned());
+                                                tools.child(crate::kit::button(
+                                                    p,
+                                                    "session-open-on-phone",
+                                                    "Open on phone",
+                                                    false,
+                                                    true,
+                                                    cx.listener(move |s, _, _, cx| {
+                                                        cx.emit(OpenOnPhone {
+                                                            scope:
+                                                                ox_desk_core::host_protocol::Scope {
+                                                                    project: s.project.clone(),
+                                                                    route: s.route.clone(),
+                                                                },
+                                                            thread: thread.clone(),
+                                                            title: title.clone(),
+                                                        })
+                                                    }),
+                                                ))
+                                            },
+                                        )
                                         .children(review_toggle)
                                         .children(terminal)
                                         .children(start_worker)

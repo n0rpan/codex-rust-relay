@@ -1795,7 +1795,45 @@ export function setupSettings({ request, open, close, pushStatus, enablePush, lo
       feedback,
     );
   }
+  async function memory(project, back) {
+    const id = screen("OX Memory", back);
+    const name = project.split("/").filter(Boolean).pop() || project;
+    body.append(
+      node("p", `Saved preferences for ${name} on ${location.hostname}.`),
+      node("p", "Local-only entries can be viewed on the host."),
+    );
+    const list = node("div");
+    function render(value) {
+      list.replaceChildren();
+      if (!value.entries.length)
+        list.append(node("p", "No saved memories here yet."));
+      for (const entry of value.entries) {
+        const card = node("div", undefined, "phone-settings-card");
+        const scope = {project: "This project", global: "All projects", host: "This host"}[entry.scope] || entry.scope;
+        card.append(
+          node("p", entry.text),
+          node("p", [scope, entry.sensitivity, entry.pinned ? "Pinned" : null, entry.saved_here ? "Saved on this host" : null].filter(Boolean).join(" · ")),
+        );
+        list.append(card);
+      }
+    }
+    const form = node("form");
+    const input = textField(form, "Add a project preference", "memory");
+    input.maxLength = 500;
+    input.required = true;
+    submit(form, "Save for this project", async () => {
+      const value = await request({action: "add_project_memory", project, text: input.value});
+      if (id !== pageId || panel.hidden) return;
+      input.value = "";
+      render(value);
+    });
+    const initial = await readPage(id, {action: "read_project_memory", project});
+    if (!initial) return;
+    render(initial);
+    body.append(form, list);
+  }
   return {
+    memory,
     openNotifications() {
       open();
       return notificationPreferences(close);

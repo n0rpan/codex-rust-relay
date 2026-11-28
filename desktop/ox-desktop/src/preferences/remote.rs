@@ -20,6 +20,7 @@ pub(super) struct Remote {
     /// Completed status operations; lets a window test wait for the one it started.
     finished: u64,
     qr: Option<Arc<Image>>,
+    session: Option<(String, String)>,
     expiry: Option<Task<()>>,
     /// Device whose terminal grant awaits a second click.
     confirm_grant: Option<String>,
@@ -34,12 +35,33 @@ impl Remote {
             busy: false,
             finished: 0,
             qr: None,
+            session: None,
             expiry: None,
             confirm_grant: None,
             port_field: None,
         };
         view.submit(Operation::Status, cx);
         view
+    }
+    pub(super) fn set_session(
+        &mut self,
+        scope: &ox_desk_core::host_protocol::Scope,
+        thread: &str,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
+        match ox_host_web::phone_link::session_target(scope, thread) {
+            Ok(target) => {
+                self.session = Some((title, target));
+                self.qr = None;
+                self.expiry = None;
+                if let Some(report) = &mut self.report {
+                    report.access.host.pairing = None;
+                }
+            }
+            Err(err) => self.message = Some(err.to_string()),
+        }
+        cx.notify();
     }
     fn enable(&mut self, cx: &mut Context<Self>) {
         if let Some(field) = &self.port_field {
@@ -95,7 +117,16 @@ impl Remote {
                 match result {
                     Ok(mut r) => {
                         s.message = r.access.notice.take();
-                        if let Some(pair) = &r.access.host.pairing {
+                        if let Some(pair) = &mut r.access.host.pairing {
+                            if let Some((_, target)) = &s.session {
+                                match ox_host_web::phone_link::invitation_link(&pair.url, target) {
+                                    Ok((url, svg)) => {
+                                        pair.url = url;
+                                        pair.qr_svg = svg;
+                                    }
+                                    Err(error) => s.message = Some(format!("Could not add the session to this pairing code: {error}")),
+                                }
+                            }
                             s.qr = Some(Arc::new(Image::from_bytes(
                                 ImageFormat::Svg,
                                 pair.qr_svg.as_bytes().to_vec(),
@@ -258,6 +289,12 @@ impl Render for Remote {
         if self.busy {
             view = view.child("Checking remote access…");
         }
+        if let Some((title, _)) = &self.session {
+            view = view
+                .child(div().text_size(p.text(Step::Title)).child("Open on your phone"))
+                .child(title.clone())
+                .child("Connect the phone to your tailnet. Open OX there, then scan a pairing code to go directly to this session.");
+        }
         let mut buttons = div().flex().flex_wrap().gap_2();
         buttons = buttons.child(self.action(p, "remote-refresh", "Refresh", Operation::Status, cx));
         if let Some(report) = &self.report {
@@ -281,13 +318,31 @@ impl Render for Remote {
                     buttons = buttons.child(self.action(
                         p,
                         "remote-pair",
-                        "Pair a device",
+                        if self.session.is_some() {
+                            "Pair phone and open session"
+                        } else {
+                            "Pair a device"
+                        },
                         Operation::Pair {
                             terminal: false,
                             login: None,
                         },
                         cx,
                     ));
+                    if let Some((_, target)) = &self.session
+                        && let Ok(url) = ox_host_web::phone_link::session_url(&node.origin, target)
+                    {
+                        buttons = buttons.child(button(
+                            p,
+                            "remote-copy-session-link",
+                            "Copy session link for a paired phone",
+                            false,
+                            true,
+                            move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(url.clone()))
+                            },
+                        ));
+                    }
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map_or(0, |d| d.as_secs() as i64);
@@ -453,13 +508,17 @@ impl Render for Remote {
             }
             if let (Some(image), Some(pair)) = (&self.qr, &report.access.host.pairing) {
                 let url = pair.url.clone();
-                if let Some(code) = &pair.short_code {
+                if self.session.is_none()
+                    && let Some(code) = &pair.short_code
+                {
                     view = view.child(format!("Desktop pairing code · {code}"));
                 }
                 view = view
-                    .child(
-                        "Scan on your phone or paste the pairing link in Add host on your desktop.",
-                    )
+                    .child(if self.session.is_some() {
+                        "Scan in OX on your phone to pair and open this session."
+                    } else {
+                        "Scan on your phone or paste the pairing link in Add host on your desktop."
+                    })
                     .child(img(image.clone()).size(px(224.)).bg(white()))
                     .child(button(
                         p,

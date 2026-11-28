@@ -271,6 +271,37 @@ impl MemoryStore {
         Ok(saved)
     }
 
+    /// Edit text without changing scope, sensitivity, or a newer revision of the entry.
+    pub fn edit_text(
+        &self,
+        id: &str,
+        expected_seq: u64,
+        text: &str,
+        source_host: &str,
+    ) -> Result<MemoryEntry, MemoryError> {
+        let text = normalize_text(text)?;
+        let _lock = self.lock_exclusive()?;
+        let mut file = self.read_unlocked()?;
+        let seq = file.alloc_seq();
+        let entry = file
+            .entries
+            .iter_mut()
+            .find(|e| e.id == id && !e.deleted)
+            .ok_or_else(|| MemoryError::NotFound("This memory is no longer available.".into()))?;
+        if entry.seq != expected_seq {
+            return Err(MemoryError::InvalidInput(
+                "This memory changed on the host. Refresh it before editing.".into(),
+            ));
+        }
+        entry.text = text;
+        entry.seq = seq;
+        entry.updated_at_ms = now_ms().max(entry.updated_at_ms.saturating_add(1));
+        entry.source_host = source_host.to_owned();
+        let saved = entry.clone();
+        self.write_unlocked(&file)?;
+        Ok(saved)
+    }
+
     /// Pin or unpin an active memory entry.
     pub fn set_pin(
         &self,
@@ -323,6 +354,24 @@ impl MemoryStore {
                 .then_with(|| a.id.cmp(&b.id))
         });
         Ok(items)
+    }
+
+    /// Active memories available to the project or this host, without other projects.
+    pub fn list_for_project(
+        &self,
+        project: &Path,
+        host: &str,
+        max_sensitivity: Sensitivity,
+    ) -> Result<Vec<MemoryEntry>, MemoryError> {
+        let project_scope = Scope::Project(crate::canonical_project_id(project));
+        let host_scope = Scope::Host(host.to_owned());
+        let mut entries = self.list(None, None, max_sensitivity)?;
+        entries.retain(|entry| {
+            entry.scope == Scope::Global
+                || entry.scope == project_scope
+                || entry.scope == host_scope
+        });
+        Ok(entries)
     }
 
     /// Rank and recall memories matching `query`.
@@ -570,6 +619,43 @@ impl Drop for FileLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_edits_preserve_scope_and_reject_stale_revisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = MemoryStore::open(temp.path().join("memory.json"));
+        let initial = store
+            .upsert(new_mem(
+                "Test in the sandbox.",
+                Scope::Project("payments".into()),
+                Kind::Preference,
+                Sensitivity::LocalOnly,
+                true,
+            ))
+            .unwrap();
+        let initial = initial.entry();
+        let updated = store
+            .edit_text(
+                &initial.id,
+                initial.seq,
+                "Keep tests in the sandbox.",
+                "host-a",
+            )
+            .unwrap();
+        assert_eq!(updated.scope, initial.scope);
+        assert_eq!(updated.sensitivity, Sensitivity::LocalOnly);
+        assert_eq!(updated.tags, initial.tags);
+        assert!(updated.pin);
+        assert!(
+            store
+                .edit_text(&initial.id, initial.seq, "Stale change.", "host-b")
+                .is_err()
+        );
+        assert_eq!(
+            store.list(None, None, Sensitivity::LocalOnly).unwrap(),
+            vec![updated]
+        );
+    }
 
     fn new_mem(
         text: &str,

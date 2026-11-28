@@ -65,6 +65,7 @@ pub(super) struct Submit {
     inject: Vec<serde_json::Value>,
     /// The sender statement for this message, fixed when the host accepted it.
     context: Option<String>,
+    memory_attachment: Option<crate::memory::Attachment>,
     worker_notice: Option<u64>,
 }
 
@@ -142,18 +143,36 @@ impl Store {
     }
     /// Sender context plus the budgeted Tier-1 pinned memory brief, attached once on
     /// the first turn of a new session or worker so subsequent turns stay cache-stable.
-    pub(super) fn first_turn_context(&self) -> Option<String> {
+    pub(super) fn first_turn_context(&self) -> (Option<String>, Option<crate::memory::Attachment>) {
         let sender = self.sender_context();
-        let brief = self.memory.as_ref().and_then(|cfg| {
-            crate::memory::first_turn_brief(cfg, &self.profile.project, &self.profile.route)
-        });
-        match (sender, brief) {
-            (Some(s), Some(b)) => Some(format!("{s}\n\n{b}")),
-            (Some(s), None) => Some(s),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
+        if let Some(config) = &self.memory
+            && let Some(brief) =
+                crate::memory::first_turn_brief(config, &self.profile.project, &self.profile.route)
+        {
+            let entries = brief.lines().filter(|line| line.starts_with("- [")).count();
+            let attachment = (entries > 0).then(|| crate::memory::Attachment {
+                entries,
+                from_parent_host: config
+                    .brief_override
+                    .as_deref()
+                    .is_some_and(|brief| !brief.trim().is_empty()),
+            });
+            let context = match sender {
+                Some(sender) => format!("{sender}\n\n{brief}"),
+                None => brief,
+            };
+            (Some(context), attachment)
+        } else {
+            (sender, None)
         }
     }
+
+    /// Record an acknowledged startup brief or restore its saved metadata without opening a thread.
+    pub fn remember_memory_attachment(&mut self, id: &str, attachment: crate::memory::Attachment) {
+        self.memory_attachments.insert(id.to_owned(), attachment);
+        self.changed.mark(Changed::THREADS);
+    }
+
     pub fn new_session(&mut self) {
         if self.remote().is_some() {
             if let Err(e) = self.dispatch_remote(crate::actions::Action::NewDraft) {
@@ -472,6 +491,11 @@ impl Store {
                 },
             )
         });
+        let (context, memory_attachment) = if id.is_none() {
+            self.first_turn_context()
+        } else {
+            (self.sender_context(), None)
+        };
         let submit = Submit {
             opening_preset: self.next_preset,
             options: if let Some(id) = id {
@@ -490,11 +514,8 @@ impl Store {
             } else {
                 vec![]
             },
-            context: if id.is_none() {
-                self.first_turn_context()
-            } else {
-                self.sender_context()
-            },
+            context,
+            memory_attachment,
             worker_notice: self.worker_notice_id(),
         };
         if id.is_none() {
@@ -927,10 +948,11 @@ impl Store {
                     self.worker_notice_receipts
                         .push(WorkerNoticeReceipt::Accepted(id));
                 }
-                let t = self
-                    .transcripts
-                    .get_mut(s.owner.as_deref().unwrap())
-                    .unwrap();
+                let id = s.owner.as_deref().unwrap();
+                if let Some(attachment) = s.memory_attachment {
+                    self.remember_memory_attachment(id, attachment);
+                }
+                let t = self.transcripts.get_mut(id).unwrap();
                 if turn.status == "inProgress" && t.last_finished.as_ref() != Some(&turn.id) {
                     t.active_turn = Some(turn.id);
                 }
@@ -1112,6 +1134,7 @@ mod tests {
             command: None,
             inject: vec![],
             context: None,
+            memory_attachment: None,
             worker_notice: None,
         };
         // While the thread opens, the new-chat composer gets text and an image; the operator
@@ -1934,7 +1957,15 @@ mod tests {
             surface: crate::surface::Surface::Desktop,
         });
 
-        let turn1 = store.first_turn_context().unwrap();
+        let (turn1, attachment) = store.first_turn_context();
+        let turn1 = turn1.unwrap();
+        assert_eq!(
+            attachment,
+            Some(crate::memory::Attachment {
+                entries: 1,
+                from_parent_host: false
+            })
+        );
         assert!(turn1.contains("OX Desktop"));
         assert!(turn1.contains("Use Claude subscription for confidential work."));
 

@@ -188,6 +188,7 @@
               <section class="menu-section" aria-label="Settings and terminal">
                 <p class="menu-heading">Settings and terminal</p>
                 <button type="button" id="menu-settings" hidden>Session settings</button>
+                <button type="button" id="open-memory">OX Memory</button>
                 <button type="button" id="operator-project">Project terminal</button>
                 <button type="button" id="operator-session" hidden>Open session in terminal</button>
               </section>
@@ -220,6 +221,16 @@
           </form>
         </dialog>
         <div id="handoff-marks" class="handoff-marks" hidden></div>
+        <details id="worker-results" class="worker-results" hidden>
+          <summary id="worker-results-title">Workers</summary>
+          <div id="worker-results-list"></div>
+        </details>
+        <button id="project-setup-starter" class="quiet" type="button" hidden>
+          Get project setup help
+        </button>
+        <button id="worker-review-starter" class="quiet" type="button" hidden>
+          Ask for a second opinion
+        </button>
         <button id="older" class="quiet" hidden>Load earlier messages</button
         >
         <div id="session-controls" hidden>

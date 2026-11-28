@@ -5,8 +5,9 @@ use super::{OpenThread, Workbench};
 use crate::appearance::Palette;
 use crate::appearance::Step;
 use crate::views::host::ParentLink;
-use crate::{activity, row};
+use crate::{activity, col, kit::button, row};
 use gpui::{prelude::FluentBuilder, *};
+use ox_desk_core::host_protocol::{Scope, SessionOutcome};
 
 impl Workbench {
     /// The recorded parent of an open worker. The launch stamp carries the
@@ -168,6 +169,100 @@ impl Workbench {
     pub(super) fn workers_line(&self, p: Palette, cx: &mut Context<Self>) -> Option<AnyElement> {
         let store = self.store.as_ref()?;
         let id = store.selected()?;
+        let scope = Scope {
+            project: self.project.clone(),
+            route: self.route.clone(),
+        };
+        let owner = id.to_owned();
+        let index = self.workers.read(cx);
+        if let Some(workers) = index.results.get(&(scope, owner.clone())) {
+            let is_open = self.worker_results_open.as_deref() == Some(id);
+            let label = format!(
+                "Workers ({}) {}",
+                workers.len(),
+                if is_open { "▾" } else { "▸" }
+            );
+            let mut panel = col().gap_1().child(row().child(button(
+                p,
+                "worker-results-toggle",
+                label,
+                false,
+                true,
+                cx.listener(move |s, _, _, cx| {
+                    s.worker_results_open = (!is_open).then(|| owner.clone());
+                    cx.notify();
+                }),
+            )));
+            if is_open {
+                let mut list = col()
+                    .id("worker-results")
+                    .max_h(px(160.))
+                    .overflow_y_scroll()
+                    .p_2()
+                    .gap_1()
+                    .bg(rgb(p.panel))
+                    .border_1()
+                    .border_color(rgb(p.line));
+                for (position, worker) in workers.iter().enumerate() {
+                    let target = worker.target.clone();
+                    let title = target
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "Worker session".into());
+                    let mut meta = format!(
+                        "{} · {} · {} ceiling",
+                        worker.status, worker.billing, worker.access
+                    );
+                    if let Some(model) = &worker.model {
+                        meta.push_str(&format!(" · {model}"));
+                    }
+                    list = list.child(
+                        col()
+                            .gap_1()
+                            .child(row().child(button(
+                                p,
+                                ("worker-result", position),
+                                title,
+                                false,
+                                true,
+                                cx.listener(move |_, _, _, cx| cx.emit(OpenThread(target.clone()))),
+                            )))
+                            .child(crate::small(p, meta)),
+                    );
+                }
+                panel = panel.child(list);
+            }
+            return Some(panel.into_any_element());
+        }
+        if store.is_host_client()
+            && self.route.runtime.supports_workers()
+            && store.origin(id).is_none()
+            && store.draft(Some(id)).is_empty()
+            && store
+                .transcript(id)
+                .is_some_and(|transcript| transcript.active_turn().is_none())
+            && store
+                .last_result(id)
+                .is_some_and(|res| res.outcome == SessionOutcome::Completed)
+        {
+            return Some(row().child(button(
+                p,
+                "worker-review-starter",
+                "Ask for a second opinion",
+                false,
+                true,
+                cx.listener(move |s, _, _, cx| {
+                    if let Some(store) = s.store.as_mut()
+                        && store.selected() == Some(owner.as_str())
+                        && store.draft(Some(&owner)).is_empty()
+                    {
+                        store.edit(Some(&owner), "Ask one independent read-only worker to review the result so far. Summarize its findings here.".into());
+                        s.focus_editor_for = Some(Some(owner.clone()));
+                        cx.notify();
+                    }
+                }),
+            )).into_any_element());
+        }
         let tree = self
             .workers
             .read(cx)

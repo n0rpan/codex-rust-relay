@@ -852,6 +852,7 @@ impl Store {
             "yolo_grant_expires",
             "yolo_children",
             "worker_model",
+            "memory_attachment",
             "move",
         ]
         .into_iter()
