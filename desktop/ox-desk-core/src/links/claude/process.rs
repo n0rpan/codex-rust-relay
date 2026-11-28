@@ -14,6 +14,7 @@ use std::{
 };
 
 pub(super) struct Process {
+    pub(super) group: u32,
     write: mpsc::Sender<Value>,
     close: mpsc::Sender<String>,
     reaped: ReapStatus,
@@ -41,6 +42,7 @@ impl Process {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+        let group = child.id();
         let (write, messages) = mpsc::channel::<Value>();
         let (close, ends) = mpsc::channel::<String>();
         let mut out = BufReader::new(child.stdout.take().expect("piped stdout"));
@@ -137,6 +139,7 @@ impl Process {
             closed(reason, needs_login);
         });
         Ok(Self {
+            group,
             write,
             close,
             reaped,

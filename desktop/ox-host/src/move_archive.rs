@@ -331,7 +331,9 @@ mod tests {
                 },
             )
             .unwrap();
-        source.fence_source(plan.target_host, &staged).unwrap();
+        source
+            .fence_source(plan.target_host, &staged, None)
+            .unwrap();
         source.writer_released(plan).unwrap();
         let proof = source.commit_source(plan).unwrap();
         let activated = receiver

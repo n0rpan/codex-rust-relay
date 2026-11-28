@@ -262,6 +262,9 @@ impl Link {
     pub(crate) fn reap_status(&self) -> ReapStatus {
         self.process.reap_status()
     }
+    pub(crate) fn process_group(&self) -> u32 {
+        self.process.group
+    }
     /// Sends a user message without a known submitting interface; the model is
     /// told the interface is unknown.
     pub fn send_user(&self, uuid: &str, content: Vec<Value>) -> io::Result<()> {

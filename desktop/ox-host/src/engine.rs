@@ -7330,7 +7330,9 @@ mod tests {
                     },
                 )
                 .unwrap();
-            source.fence_source(plan.target_host, &prepared).unwrap();
+            source
+                .fence_source(plan.target_host, &prepared, None)
+                .unwrap();
             source.writer_released(&plan).unwrap();
             let commit = source.commit_source(&plan).unwrap();
             receiver
@@ -7409,6 +7411,7 @@ mod tests {
                             native: "other-native".into(),
                         },
                     },
+                    None,
                 )
                 .unwrap();
             ledger.writer_released(&onward).unwrap();
@@ -7428,6 +7431,61 @@ mod tests {
                 onward.target_host
             );
             assert!(receiver.running.is_empty());
+        }
+
+        #[test]
+        fn a_restarted_source_waits_for_its_fenced_writer_group_to_exit() {
+            use crate::{
+                move_ledger::{ArchivePin, Prepared, Stage, Status},
+                move_writer::WriterGroup,
+            };
+            use std::os::unix::process::CommandExt;
+
+            let root = tempfile::tempdir().unwrap();
+            let (scope, _) = scopes(root.path());
+            let (tx, _mailbox) = std::sync::mpsc::sync_channel(32);
+            let mut source = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let plan = move_plan(&source, &scope, "lead");
+            let mut child = std::process::Command::new("sleep")
+                .arg("10")
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let group = WriterGroup::record(child.id()).unwrap();
+            let archive = ArchivePin {
+                manifest: [8; 32],
+                transcript: [9; 32],
+            };
+            let prepared = Prepared {
+                plan: plan.clone(),
+                stage: Stage {
+                    digest: archive.manifest,
+                    native: "other-native".into(),
+                },
+            };
+            let ledger = &mut source.source_moves.ledger;
+            ledger.prepare_source(&plan).unwrap();
+            ledger.bind_source_manifest(&plan, archive).unwrap();
+            ledger
+                .fence_source(plan.target_host, &prepared, Some(group))
+                .unwrap();
+            drop(source);
+
+            let (tx, _mailbox) = std::sync::mpsc::sync_channel(32);
+            let mut recovered = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            assert!(recovered.running.is_empty());
+            recovered.advance_source_moves().unwrap();
+            let still_fenced = recovered.source_moves.ledger.status(plan.id).unwrap();
+            child.kill().unwrap();
+            child.wait().unwrap();
+            assert_eq!(still_fenced, Some(Status::Fenced));
+            recovered.advance_source_moves().unwrap();
+            assert_eq!(
+                recovered.source_moves.ledger.status(plan.id).unwrap(),
+                Some(Status::Committed)
+            );
+            assert!(recovered.running.is_empty());
+            assert!(!recovered.source_moves.ledger.can_write(&scope, "lead"));
         }
 
         #[test]

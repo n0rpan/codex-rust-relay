@@ -526,6 +526,15 @@ impl Store {
         p.link.take();
         Ok(())
     }
+    pub(super) fn claude_move_writer_group(&self, id: &str) -> Option<u32> {
+        self.claude()
+            .sessions
+            .get(id)?
+            .link
+            .as_ref()
+            .map(|link| link.process_group())
+    }
+
     pub(super) fn release_claude_writer_for_move(&mut self, id: &str) -> io::Result<()> {
         if self.transcripts.keys().any(|child| {
             child

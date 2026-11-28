@@ -12,6 +12,7 @@ mod move_archive;
 mod move_bundle;
 mod move_ledger;
 mod move_target;
+mod move_writer;
 mod pairing;
 mod policy;
 mod projects;

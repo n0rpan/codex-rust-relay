@@ -1,6 +1,7 @@
 //! Durable ownership transitions for an operator-requested session move.
 //! The host actor validates peer proofs, stages files, and releases the native
 //! writer. This ledger binds those effects to the same move on every retry.
+use crate::move_writer::WriterGroup;
 use ox_desk_core::host_protocol::Scope;
 use ox_desk_core::store::MoveWriterRelease;
 use serde::{Deserialize, Serialize};
@@ -109,6 +110,8 @@ enum Phase {
     SourceFenced {
         stage: Stage,
         released: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writer: Option<WriterGroup>,
     },
     SourceCommitted {
         stage: Stage,
@@ -633,6 +636,7 @@ impl Ledger {
         &mut self,
         authenticated_target: Uuid,
         prepared: &Prepared,
+        writer: Option<WriterGroup>,
     ) -> io::Result<Status> {
         let plan = &prepared.plan;
         self.check_hosts(plan, self.data.host, authenticated_target)?;
@@ -648,6 +652,7 @@ impl Ledger {
                     Phase::SourceFenced {
                         stage: prepared.stage.clone(),
                         released: false,
+                        writer,
                     },
                 )?;
                 Ok(Status::Fenced)
@@ -663,18 +668,31 @@ impl Ledger {
         }
     }
 
-    /// Call after Codex acknowledges unsubscribe or Claude's process has exited.
+    pub(crate) fn fenced_writer(&self, plan: &Plan) -> io::Result<Option<&WriterGroup>> {
+        Ok(match self.require(plan)? {
+            Phase::SourceFenced {
+                writer,
+                released: false,
+                ..
+            } => writer.as_ref(),
+            _ => None,
+        })
+    }
+
+    /// Record a confirmed runtime release or the exit of the fenced process group.
     pub(crate) fn writer_released(&mut self, plan: &Plan) -> io::Result<()> {
         self.check_hosts(plan, self.data.host, plan.target_host)?;
         match self.require(plan)? {
             Phase::SourceFenced {
                 stage,
                 released: false,
+                ..
             } => self.set(
                 plan,
                 Phase::SourceFenced {
                     stage: stage.clone(),
                     released: true,
+                    writer: None,
                 },
             ),
             Phase::SourceFenced { released: true, .. } | Phase::SourceCommitted { .. } => Ok(()),
@@ -714,6 +732,7 @@ impl Ledger {
             Phase::SourceFenced {
                 stage,
                 released: true,
+                ..
             } => {
                 let stage = stage.clone();
                 self.set(
@@ -997,7 +1016,9 @@ mod tests {
         source
             .bind_source_manifest(&plan, archive(&prepared))
             .unwrap();
-        source.fence_source(plan.target_host, &prepared).unwrap();
+        source
+            .fence_source(plan.target_host, &prepared, None)
+            .unwrap();
 
         let release = |thread: &str, result| MoveWriterRelease {
             thread: thread.into(),
@@ -1099,16 +1120,30 @@ mod tests {
         assert!(target().prepared_receiver(Uuid::new_v4(), &plan).is_err());
         assert_eq!(target().status(plan.id).unwrap(), Some(Status::Prepared));
         assert!(!target().can_write(&plan.target_scope, "studio-native"));
-        assert!(source().fence_source(plan.target_host, &prepared).is_err());
+        assert!(
+            source()
+                .fence_source(plan.target_host, &prepared, None)
+                .is_err()
+        );
         source()
             .bind_source_manifest(&plan, archive(&prepared))
             .unwrap();
         let mut different = prepared.clone();
         different.stage.digest[0] ^= 1;
-        assert!(source().fence_source(plan.target_host, &different).is_err());
-        assert!(source().fence_source(Uuid::new_v4(), &prepared).is_err());
+        assert!(
+            source()
+                .fence_source(plan.target_host, &different, None)
+                .is_err()
+        );
+        assert!(
+            source()
+                .fence_source(Uuid::new_v4(), &prepared, None)
+                .is_err()
+        );
         assert_eq!(
-            source().fence_source(plan.target_host, &prepared).unwrap(),
+            source()
+                .fence_source(plan.target_host, &prepared, None)
+                .unwrap(),
             Status::Fenced
         );
         assert!(source().cancel_source(&plan).is_err());
@@ -1176,7 +1211,7 @@ mod tests {
         a.prepare_source(&first).unwrap();
         a.bind_source_manifest(&first, archive(&prepared)).unwrap();
         b.prepare_receiver(first.source.host, &prepared).unwrap();
-        a.fence_source(first.target_host, &prepared).unwrap();
+        a.fence_source(first.target_host, &prepared, None).unwrap();
         a.writer_released(&first).unwrap();
         let original = a.commit_source(&first).unwrap();
         b.activate_receiver(first.source.host, &original).unwrap();
@@ -1200,7 +1235,7 @@ mod tests {
                 .is_err()
         );
         a.prepare_receiver(back.source.host, &prepared).unwrap();
-        b.fence_source(back.target_host, &prepared).unwrap();
+        b.fence_source(back.target_host, &prepared, None).unwrap();
         b.writer_released(&back).unwrap();
         let grant = b.commit_source(&back).unwrap();
         a.activate_receiver(back.source.host, &grant).unwrap();
@@ -1253,7 +1288,11 @@ mod tests {
         let cancelled = source.cancel_source(&plan).unwrap();
         assert_eq!(source.cancel_source(&plan).unwrap(), cancelled);
         assert!(source.can_write(&plan.source.scope, "local"));
-        assert!(source.fence_source(plan.target_host, &prepared).is_err());
+        assert!(
+            source
+                .fence_source(plan.target_host, &prepared, None)
+                .is_err()
+        );
         target
             .cancel_receiver(plan.source.host, &cancelled)
             .unwrap();

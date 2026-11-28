@@ -4,6 +4,7 @@ use super::{Action, Connection, Engine, Scope};
 use crate::{
     move_archive::Archive,
     move_ledger::{Activated, ArchivePin, Commit, Ledger, Plan, Prepared, Status},
+    move_writer::WriterGroup,
 };
 use ox_desk_core::host_protocol::Timeline;
 use std::{collections::HashMap, io, path::Path};
@@ -137,7 +138,7 @@ impl Engine {
         prepared: &Prepared,
     ) -> io::Result<Status> {
         let plan = &prepared.plan;
-        if self.source_moves.ledger.status(plan.id)? == Some(Status::Preparing) {
+        let writer = if self.source_moves.ledger.status(plan.id)? == Some(Status::Preparing) {
             let fingerprint = Archive::fingerprint(plan, self.move_source_timeline(plan)?)?;
             if !self
                 .source_moves
@@ -149,11 +150,20 @@ impl Engine {
                     "The source history changed before the move was committed.",
                 ));
             }
-        }
-        let phase = self
-            .source_moves
-            .ledger
-            .fence_source(authenticated_target, prepared)?;
+            let group = self.running[&plan.source.scope]
+                .store
+                .move_writer_group(&plan.source.native)
+                .ok_or_else(|| {
+                    io::Error::other("Could not identify the source session’s writer.")
+                })?;
+            Some(WriterGroup::record(group)?)
+        } else {
+            None
+        };
+        let phase =
+            self.source_moves
+                .ledger
+                .fence_source(authenticated_target, prepared, writer)?;
         if phase == Status::Fenced {
             self.source_moves.retry_refused_release(plan.id);
             self.begin_move_writer_release(plan);
@@ -298,7 +308,28 @@ impl Engine {
                         self.source_moves.ledger.start_queued(&plan)?;
                     }
                 }
-                Status::Fenced => self.begin_move_writer_release(&plan),
+                Status::Fenced => {
+                    let awaiting_native_receipt =
+                        self.running.get(&plan.source.scope).is_some_and(|live| {
+                            live.store.state() == &Connection::Ready
+                                && self.source_moves.releases.get(&plan.id)
+                                    == Some(&ReleaseAttempt::Awaiting(live.generation))
+                        });
+                    if !awaiting_native_receipt
+                        && self
+                            .source_moves
+                            .ledger
+                            .fenced_writer(&plan)?
+                            .is_some_and(WriterGroup::retired)
+                    {
+                        self.source_moves.ledger.writer_released(&plan)?;
+                        self.source_moves.ledger.commit_source(&plan)?;
+                        self.source_moves.releases.remove(&plan.id);
+                        self.move_send.errors.remove(&plan.id);
+                    } else {
+                        self.begin_move_writer_release(&plan);
+                    }
+                }
                 Status::Released => {
                     self.source_moves.ledger.commit_source(&plan)?;
                 }

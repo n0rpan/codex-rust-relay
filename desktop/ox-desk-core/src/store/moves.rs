@@ -55,6 +55,14 @@ pub(super) struct History {
 }
 
 impl Store {
+    /// The owning helper starts in a private process group with its stock runtime.
+    pub fn move_writer_group(&self, thread: &str) -> Option<u32> {
+        match &self.link {
+            crate::links::Link::Codex(link) => Some(link.process_group()),
+            crate::links::Link::Claude(_) => self.claude_move_writer_group(thread),
+            _ => None,
+        }
+    }
     pub fn move_writer_is_unpublished(&self, thread: &str) -> bool {
         self.unpublished_move_writers.contains(thread)
     }
