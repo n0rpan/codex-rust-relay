@@ -201,11 +201,41 @@ mod tests {
     }
 
     #[test]
-    fn the_completed_move_retains_full_history_after_source_storage_goes_away() {
-        let (header, timeline) = fixture();
-        let plan = &header.plan;
+    fn the_completed_move_retains_history_and_working_files_without_the_source() {
+        use ox_host_service::checkout::{Snapshot, receive_result};
+        let (mut header, timeline) = fixture();
         let laptop = tempfile::tempdir().unwrap();
         let studio = tempfile::tempdir().unwrap();
+        let project = laptop.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let git = |args: &[&str]| {
+            let run = std::process::Command::new("git")
+                .current_dir(&project)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                run.status.success(),
+                "{}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(project.join("tracked"), "committed").unwrap();
+        git(&["add", "tracked"]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "-qm",
+            "Base",
+        ]);
+        std::fs::write(project.join("tracked"), "working edit").unwrap();
+        std::fs::write(project.join("scratch"), "untracked input").unwrap();
+        header.plan.source.scope.project = project;
+        let plan = &header.plan;
         let mut source = Ledger::open(laptop.path(), plan.source.host).unwrap();
         let mut receiver = Ledger::open(studio.path(), plan.target_host).unwrap();
         source.prepare_source(plan).unwrap();
@@ -220,10 +250,19 @@ mod tests {
         let digest = Archive::write(&mut file, &header, &timeline).unwrap();
         std::fs::copy(original, &copy).unwrap();
         Archive::open(File::open(&copy).unwrap(), &header, digest).unwrap();
+        let snapshot = Snapshot::capture(laptop.path(), &plan.source.scope.project, &[]).unwrap();
+        let checkout_digest = checksum(&mut snapshot.open().unwrap()).unwrap();
+        let jobs = studio.path().join("moves");
+        std::fs::create_dir(&jobs).unwrap();
+        let checkout =
+            receive_result(&jobs, 1, snapshot.open().unwrap(), &snapshot.commit).unwrap();
+        let mut bundle_digest = Sha256::new();
+        bundle_digest.update(digest);
+        bundle_digest.update(checkout_digest);
         let staged = Prepared {
             plan: plan.clone(),
             stage: Stage {
-                digest,
+                digest: bundle_digest.finalize().into(),
                 native: "target-thread".into(),
             },
         };
@@ -239,6 +278,7 @@ mod tests {
         source.confirm_source(plan.target_host, &activated).unwrap();
         drop(source);
         drop(file);
+        drop(snapshot);
         laptop.close().unwrap();
 
         let receiver = Ledger::open(studio.path(), plan.target_host).unwrap();
@@ -247,6 +287,14 @@ mod tests {
         assert_eq!(
             archive.previous(None, timeline.items.len()).unwrap(),
             (timeline.items, None)
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("tracked")).unwrap(),
+            "working edit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("scratch")).unwrap(),
+            "untracked input"
         );
     }
 }
