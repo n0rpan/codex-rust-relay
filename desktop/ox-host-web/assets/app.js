@@ -160,8 +160,6 @@ let cold = new Map(),
   handoffStamp = "",
   // Message and images sent from a composer whose Ack has not come back, by owner.
   unacked = new Map(),
-  // The last `restored_draft.message` applied per owner, so each host restore lands once.
-  restoredSeen = new Map(),
   foldedProjects = new Set(),
   starredProjects = new Map(),
   projectOrder = new Map(),
@@ -170,6 +168,41 @@ let cold = new Map(),
   pinnedThreads = new Map(),
   threadColors = new Map(),
   visibleRows = 200;
+
+// Store text only, under this host's origin and the exact composer owner.
+const DRAFT_KEY = "ox-phone-draft-v1:";
+function draftRecord(owner) {
+  if (drafts.has(owner)) return drafts.get(owner);
+  try {
+    const saved = key && JSON.parse(localStorage.getItem(DRAFT_KEY + owner));
+    if (typeof saved?.text === "string") return saved;
+  } catch {}
+  return { text: "" };
+}
+function draftText(owner) {
+  return draftRecord(owner).text;
+}
+function setDraftText(owner, text, restored = draftRecord(owner).restored) {
+  const record = { text, restored };
+  try {
+    if (key && (text.trim() || restored))
+      localStorage.setItem(DRAFT_KEY + owner, JSON.stringify(record));
+    else localStorage.removeItem(DRAFT_KEY + owner);
+    drafts.delete(owner);
+  } catch {
+    // The current page can still keep its draft if storage is disabled or full.
+    drafts.set(owner, record);
+  }
+}
+function clearDrafts() {
+  drafts.clear();
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const name = localStorage.key(i);
+      if (name?.startsWith(DRAFT_KEY)) localStorage.removeItem(name);
+    }
+  } catch {}
+}
 
 const SIDEBAR_META_KEY = "ox-phone-sidebar-v1";
 const SEEN_RESULTS_KEY = "ox-phone-seen-results-v1";
@@ -274,15 +307,14 @@ function restoreHostDrafts(model) {
       const r = session.detail?.restored_draft;
       if (typeof r?.message !== "string" || typeof r.text !== "string") continue;
       const owner = keyOf(s.scope, session.id);
-      if (restoredSeen.get(owner) === r.message) continue;
-      restoredSeen.set(owner, r.message);
+      if (draftRecord(owner).restored === r.message) continue;
       // An Ack still on its way must not clear the restored text.
       const sent = unacked.get(owner);
       if (sent) sent.restored = true;
-      const current = drafts.get(owner) || "";
+      const current = draftText(owner);
       const text =
         !current || current === r.text ? r.text : `${r.text}\n${current}`;
-      drafts.set(owner, text);
+      setDraftText(owner, text, r.message);
       if (selected && keyOf(selected.scope, selected.id) === owner) {
         $("draft").value = text;
         syncDraftHeight();
@@ -357,8 +389,7 @@ class Link {
           global.scopes.clear();
           global.cursor = null;
           cold.clear();
-          drafts.clear();
-          restoredSeen.clear();
+          clearDrafts();
           timelineRows.clear();
           pickedProjects.clear();
           forgetComposer();
@@ -429,11 +460,11 @@ class Link {
         // Opened can land before or after the Ack. What is in the provisional
         // composer now is the user's own newer text unless it is still exactly the
         // message just sent (its Ack has not arrived to clear it).
-        const typed = drafts.get(old),
+        const typed = draftText(old),
           sent = unacked.get(old);
-        drafts.delete(old);
+        setDraftText(old, "");
         const fresh = keyOf(msg.scope, msg.thread);
-        if (typed?.trim() && typed !== sent?.content) drafts.set(fresh, typed);
+        if (typed.trim() && typed !== sent?.content) setDraftText(fresh, typed);
         moveImages(old, fresh, sent?.images);
         open(msg.scope, msg.thread);
       }
@@ -816,7 +847,7 @@ function open(scope, id) {
   jumpLatest.reset();
   $("asks").replaceChildren();
   $("timeline").replaceChildren();
-  $("draft").value = drafts.get(keyOf(scope, id)) || "";
+  $("draft").value = draftText(keyOf(scope, id));
   page("conversation");
   syncDraftHeight();
   notice();
@@ -2695,7 +2726,7 @@ $("worker-form").onsubmit = (e) => {
 $("draft").oninput = () => {
   mentionInput();
   if (selected)
-    drafts.set(keyOf(selected.scope, selected.id), $("draft").value);
+    setDraftText(keyOf(selected.scope, selected.id), $("draft").value);
   syncDraftHeight();
   updateComposerState();
 };
@@ -2757,7 +2788,7 @@ $("composer").onsubmit = (e) => {
       pendingNew = null;
       if (ok && !sentNow.restored) {
         clearImages(owner, images);
-        if (drafts.get(owner) === content) drafts.delete(owner);
+        if (draftText(owner) === content) setDraftText(owner, "");
         if (
           keyOf(selected?.scope || scope, selected?.id) === owner &&
           $("draft").value === content
@@ -2799,6 +2830,7 @@ $("pair-form").onsubmit = async (e) => {
     $("pair-link").value = "";
     code = null;
     key = await deviceKey();
+    clearDrafts();
     start(true);
   } catch (err) {
     if (err.status === 403) {
@@ -2899,6 +2931,7 @@ function pairingPage() {
   page("pair");
   net("Pair device");
   const scanned = Boolean(code);
+  $("pair-install").hidden = !ios || standalone;
   $("step-scan").toggleAttribute("aria-current", !scanned);
   $("step-name").toggleAttribute("aria-current", scanned);
   $("scan-pair").hidden = scanned;
@@ -2953,6 +2986,7 @@ navigator.serviceWorker?.addEventListener("message", (e) => {
 });
 try {
   key = await deviceKey();
+  if (!key) clearDrafts();
   if (code || !key) pairingPage();
   else start();
 } catch {
