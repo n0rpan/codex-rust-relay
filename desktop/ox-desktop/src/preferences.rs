@@ -144,14 +144,6 @@ impl Preferences {
         view
     }
 
-    /// Show the Remote access page (the sidebar's phone control).
-    pub fn open_remote(&mut self, cx: &mut Context<Self>) {
-        // Stay here when the first load lands, instead of jumping to Accounts.
-        self.prefer_providers = true;
-        if self.page != Page::Remote {
-            self.goto(Page::Remote, cx);
-        }
-    }
     pub(crate) fn open_session_on_phone(
         &mut self,
         scope: &ox_desk_core::host_protocol::Scope,
@@ -165,6 +157,14 @@ impl Preferences {
         }
     }
 
+    /// Show the Remote access page (the sidebar's phone control).
+    pub fn open_remote(&mut self, cx: &mut Context<Self>) {
+        // Stay here when the first load lands, instead of jumping to Accounts.
+        self.prefer_providers = true;
+        if self.page != Page::Remote {
+            self.goto(Page::Remote, cx);
+        }
+    }
     fn goto(&mut self, page: Page, cx: &mut Context<Self>) {
         let page = if page == Page::Remote && self.link.remote().is_some() {
             Page::Hosts
