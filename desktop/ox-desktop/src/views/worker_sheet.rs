@@ -220,8 +220,9 @@ impl Workbench {
         let store = self.store.as_ref()?;
         let owner = store.selected()?;
         (store.state() == &Connection::Ready
-            && !store.in_terminal(owner)
-            && store.profile().route.runtime.supports_workers()).then(|| {
+            && store.profile().route.runtime.supports_workers()
+            && !store.in_terminal(owner))
+        .then(|| {
             crate::kit::toolbar_button(
                 p,
                 "start-worker",

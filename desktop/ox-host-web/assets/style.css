@@ -435,15 +435,6 @@ h1 {
 }
 #conversation h1 {
   margin: 0.25rem 0 0.55rem;
-}
-.conversation-heading {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 0.5rem;
-}
-.conversation-heading h1 {
-  min-width: 0;
   overflow-wrap: anywhere;
 }
 #start-worker {

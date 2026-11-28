@@ -4,7 +4,9 @@ use crate::{
     appearance::Palette,
     kit::{button, col, row, small, toolbar_button},
 };
-use gpui::{AppContext, ClickEvent, Context, Div, ParentElement, Styled, div, px, rgb};
+use gpui::{
+    AppContext, ClickEvent, Context, Div, InteractiveElement, ParentElement, Styled, div, px, rgb,
+};
 use gpui_component::scroll::ScrollableElement;
 use ox_desk_core::{
     actions::{Action, MoveSession},

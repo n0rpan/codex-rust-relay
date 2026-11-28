@@ -1158,11 +1158,11 @@ def run(harness, screenshot=None):
         keypress("\ue00c")
         assert js("return !document.querySelector('#conversation .action-menu').open && document.activeElement.matches('.action-menu > summary')")
         keypress("\ue004")
-        assert js("return document.activeElement.id==='start-worker' && document.activeElement.matches(':focus-visible')")
-        keypress("\ue004")
         assert js("return document.activeElement.id==='access-mode' && document.activeElement.matches(':focus-visible')")
         keypress("\ue004")
         assert js("return document.activeElement.id==='open-settings'")
+        keypress("\ue004")
+        assert js("return document.activeElement.id==='start-worker' && document.activeElement.matches(':focus-visible')")
         keypress("\ue004")
         for _ in range(8):
             if js("return document.activeElement.textContent==='Allow'"): break
