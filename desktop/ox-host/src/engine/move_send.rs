@@ -403,6 +403,16 @@ impl Engine {
             }
             let work = match phase {
                 Status::Preparing => {
+                    // A client can send to a moved session without opening its
+                    // timeline first. Carry the existing archive on every hop.
+                    match self.load_moved_history(&plan.source.scope, &plan.source.native, false) {
+                        Ok(true) => self.process_scope(&plan.source.scope, vec![], true)?,
+                        Ok(false) => {}
+                        Err(error) => {
+                            self.move_send.errors.insert(plan.id, error.to_string());
+                            continue;
+                        }
+                    }
                     let Ok(timeline) = self.move_source_timeline(&plan) else {
                         continue;
                     };

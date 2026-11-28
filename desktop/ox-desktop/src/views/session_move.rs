@@ -258,7 +258,9 @@ impl Workbench {
             ),
             MovePhase::Closing => (
                 format!("Closing on {current}"),
-                format!("Keep {current} on until {host} confirms the move."),
+                format!(
+                    "Closing can take a minute. Keep {current} on until {host} confirms the move."
+                ),
             ),
             MovePhase::Ready if ready.is_some() => (
                 format!("Ready on {host}"),

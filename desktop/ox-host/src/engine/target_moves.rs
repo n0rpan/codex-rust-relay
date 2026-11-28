@@ -6,8 +6,9 @@ use crate::{
 };
 use ox_desk_core::{
     handoff::{HandoffSource, SourceItem},
+    host_policy::HostPolicy,
     host_protocol::SessionView,
-    runtime::Access,
+    modes::Level,
     store::{Connection, MoveWriterPreparation},
 };
 use std::{collections::HashMap, io, sync::mpsc::Sender};
@@ -28,7 +29,6 @@ struct MoveDisplay {
 struct Warming {
     destination: VerifiedTarget,
     source: Uuid,
-    access: Option<Access>,
     reply: Sender<io::Result<Prepared>>,
 }
 
@@ -56,6 +56,8 @@ impl Engine {
         };
         let operation = owned.plan.id.to_string();
         let live = self.running.get_mut(scope).expect("live scope");
+        live.store
+            .use_host_policy(HostPolicy::read(&self.state_dir)?);
         match live.store.prepare_claude_move_writer(&operation) {
             Ok(native) if native == thread => (),
             Ok(_) => return Err(io::Error::other("The reserved Claude writer changed.")),
@@ -217,7 +219,6 @@ impl Engine {
         &mut self,
         source: Uuid,
         target: VerifiedTarget,
-        access: Option<Access>,
         reply: Sender<io::Result<Prepared>>,
     ) -> io::Result<()> {
         let plan = target.plan();
@@ -256,7 +257,6 @@ impl Engine {
                 Warming {
                     destination: target,
                     source,
-                    access,
                     reply,
                 },
             );
@@ -286,6 +286,20 @@ impl Engine {
                 return Ok(());
             }
         }
+        let policy = HostPolicy::read(&self.state_dir)?;
+        live.store.use_host_policy(policy);
+        let runtime = scope.route.runtime;
+        let access = match live.store.move_start_access(None) {
+            Some(mode)
+                if policy == HostPolicy::YoloAsksEveryTime
+                    && Level::of(runtime, mode) == Some(Level::Yolo) =>
+            {
+                // No operator is present on this host during reservation.
+                // The session's mode control can request YOLO after arrival.
+                Some(Level::Yolo.below_yolo().preset(runtime))
+            }
+            access => access,
+        };
         live.store.prepare_codex_move_writer(
             id.to_string(),
             access,
@@ -322,7 +336,6 @@ impl Engine {
                     && let Err(error) = self.prepare_move_target(
                         request.source,
                         request.destination,
-                        request.access,
                         request.reply.clone(),
                     )
                 {

@@ -352,6 +352,24 @@ mod tests {
     }
 
     #[test]
+    fn incoming_mode_uses_destination_settings_without_consuming_the_draft() {
+        use crate::host_policy::HostPolicy;
+
+        let (_root, mut store) = fixture();
+        store.set_start_mode(|_| None);
+        store.set_next_access(Access::Yolo);
+        assert_eq!(store.move_start_access(None), None);
+        assert_eq!(store.next_access(), Some(Access::Yolo));
+
+        store.set_start_mode(|_| Some(Access::Workspace));
+        assert_eq!(store.move_start_access(None), Some(Access::Workspace));
+        store.use_host_policy(HostPolicy::AlwaysRead);
+        assert_eq!(store.move_start_access(None), Some(Access::ReadOnly));
+        store.use_host_policy(HostPolicy::AlwaysWrite);
+        assert_eq!(store.move_start_access(None), Some(Access::Workspace));
+    }
+
+    #[test]
     fn staging_a_codex_writer_checkpoints_context_without_sending_a_turn() {
         let (_root, mut store) = fixture();
         let items = vec![

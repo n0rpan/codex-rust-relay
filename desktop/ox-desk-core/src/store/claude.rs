@@ -707,8 +707,8 @@ impl Store {
             return Err(io::Error::other("The reserved Claude writer changed."));
         }
         let thread = row.id.clone();
-        let access = crate::modes::Level::Read.preset(self.profile.route.runtime);
-        self.restore_ended(&thread, row.title(), row.updated_at, Some(access));
+        let access = self.move_start_access(Some(&thread));
+        self.restore_ended(&thread, row.title(), row.updated_at, None);
         self.adopt_catalog_row(row)?;
         self.selected = Some(thread.clone());
         let transcript = self.transcripts.entry(thread.clone()).or_default();
@@ -716,7 +716,7 @@ impl Store {
         transcript.verified = true;
         transcript.loading = false;
         transcript.error = None;
-        transcript.access = Some(access);
+        transcript.access = access;
         self.changed.replace_transcript(&thread);
         self.changed.mark(Changed::THREADS);
         Ok(())

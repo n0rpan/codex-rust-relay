@@ -1811,9 +1811,12 @@ impl Engine {
             });
             if (opens || resume.is_some()) && policy == HostPolicy::YoloAsksEveryTime {
                 let level = if let Some(t) = resume {
-                    live.store
-                        .claude_resume_access(t)
-                        .and_then(|mode| ox_desk_core::modes::Level::of(scope.route.runtime, mode))
+                    let access = if first_moved_input.is_some() {
+                        live.store.move_start_access(Some(t))
+                    } else {
+                        live.store.claude_resume_access(t)
+                    };
+                    access.and_then(|mode| Level::of(scope.route.runtime, mode))
                 } else if fork {
                     (!live.store.is_session_scoped())
                         .then(|| live.store.applied_ceiling(target.as_deref()))
@@ -1861,12 +1864,9 @@ impl Engine {
             }
         }
         let sent = if let Some((move_id, native, request)) = first_moved_input {
-            live.store.start_claude_move_turn(
-                &move_id.to_string(),
-                &native,
-                request,
-                Some(Level::Read.preset(scope.route.runtime)),
-            )?;
+            let access = live.store.claude_resume_access(&native);
+            live.store
+                .start_claude_move_turn(&move_id.to_string(), &native, request, access)?;
             live.store.edit(Some(&native), String::new());
             Ok(ox_desk_core::actions::Effect::Applied)
         } else {
@@ -7283,7 +7283,7 @@ mod tests {
             receiver.running.insert(plan.target_scope.clone(), live);
             let (reply, prepared) = std::sync::mpsc::channel();
             receiver
-                .prepare_move_target(plan.source.host, target, None, reply)
+                .prepare_move_target(plan.source.host, target, reply)
                 .unwrap();
             assert!(prepared.try_recv().is_err());
             let opened = serde_json::from_value(json!({
@@ -7549,7 +7549,7 @@ mod tests {
                 warm_claude_in(studio.path(), &plan.target_scope.project);
             let (reply, prepared) = std::sync::mpsc::channel();
             receiver
-                .prepare_move_target(plan.source.host, target, None, reply)
+                .prepare_move_target(plan.source.host, target, reply)
                 .unwrap();
             let prepared = prepared.try_recv().unwrap().unwrap();
             let native = &prepared.stage.native;

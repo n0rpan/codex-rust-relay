@@ -544,11 +544,19 @@ impl Ledger {
         if let Some(record) = self.record(plan)? {
             return Ok(record.phase.status());
         }
-        self.check_new(plan)?;
-        if self.owner(plan.session)?.is_none() && plan.source.generation != 0 {
-            return Err(io::Error::other(
-                "This host has no record of owning that session generation.",
-            ));
+        self.check_no_pending_move(plan)?;
+        match self.owner(plan.session)? {
+            Some(owner) if owner != plan.source => {
+                return Err(io::Error::other(
+                    "The move does not start at the last known owner.",
+                ));
+            }
+            None if plan.source.generation != 0 => {
+                return Err(io::Error::other(
+                    "This host has no record of owning that session generation.",
+                ));
+            }
+            _ => {}
         }
         if !self.can_write(&plan.source.scope, &plan.source.native)
             || self.data.moves.values().any(|record| {
@@ -586,7 +594,7 @@ impl Ledger {
                 "The destination move was cancelled or its staging changed.",
             ));
         }
-        self.check_new(plan)?;
+        self.check_new_receiver(plan)?;
         if !valid_native(&prepared.stage.native)
             || self
                 .data
@@ -624,7 +632,7 @@ impl Ledger {
             }
             Some(_) => Err(io::Error::other("The destination move was cancelled.")),
             None => {
-                self.check_new(plan)?;
+                self.check_new_receiver(plan)?;
                 Ok(None)
             }
         }
@@ -849,15 +857,34 @@ impl Ledger {
         self.set(plan, Phase::TargetCancelled { stage })
     }
 
-    fn check_new(&self, plan: &Plan) -> io::Result<()> {
-        if self
-            .owner(plan.session)?
-            .is_some_and(|owner| owner != plan.source)
-        {
-            return Err(io::Error::other(
-                "The move does not start at the last known owner.",
-            ));
+    fn check_new_receiver(&self, plan: &Plan) -> io::Result<()> {
+        self.check_no_pending_move(plan)?;
+        let Some(known) = self.owner(plan.session)? else {
+            return Ok(());
+        };
+        if known == plan.source {
+            return Ok(());
         }
+        // The authenticated sender can be ahead of our last known owner
+        // after an onward move. Reconcile only when our own earlier transfer
+        // already closed the local writer. Receiving still needs a new
+        // native mapping and an authenticated commit for this exact plan.
+        if plan.source.generation > known.generation
+            && self.data.moves.values().any(|record| {
+                record.plan.session == plan.session
+                    && record.plan.source.host == self.data.host
+                    && matches!(record.phase, Phase::SourceCommitted { .. })
+                    && record.owner() == known
+            })
+        {
+            return Ok(());
+        }
+        Err(io::Error::other(
+            "The move does not start at the last known owner.",
+        ))
+    }
+
+    fn check_no_pending_move(&self, plan: &Plan) -> io::Result<()> {
         if self
             .data
             .moves
@@ -1201,12 +1228,15 @@ mod tests {
     }
 
     #[test]
-    fn an_old_activation_receipt_does_not_reopen_a_session_that_moved_back() {
+    fn a_session_can_circle_back_without_reopening_any_previous_writer() {
         let laptop = tempfile::tempdir().unwrap();
         let studio = tempfile::tempdir().unwrap();
+        let office = tempfile::tempdir().unwrap();
         let first = plan(Uuid::new_v4(), Uuid::new_v4());
         let mut a = Ledger::open(laptop.path(), first.source.host).unwrap();
         let mut b = Ledger::open(studio.path(), first.target_host).unwrap();
+        let office_id = Uuid::new_v4();
+        let mut c = Ledger::open(office.path(), office_id).unwrap();
         let prepared = prepare(&first, "studio-native");
         a.prepare_source(&first).unwrap();
         a.bind_source_manifest(&first, archive(&prepared)).unwrap();
@@ -1220,6 +1250,25 @@ mod tests {
             .source_identity(&first.target_scope, "studio-native")
             .unwrap();
         assert_eq!(session, first.session);
+        let onward = Plan {
+            id: Uuid::new_v4(),
+            session,
+            source,
+            target_host: office_id,
+            target_scope: scope("/office/ox"),
+        };
+        let prepared = prepare(&onward, "office-native");
+        b.prepare_source(&onward).unwrap();
+        b.bind_source_manifest(&onward, archive(&prepared)).unwrap();
+        c.prepare_receiver(onward.source.host, &prepared).unwrap();
+        b.fence_source(onward.target_host, &prepared, None).unwrap();
+        b.writer_released(&onward).unwrap();
+        let grant = b.commit_source(&onward).unwrap();
+        c.activate_receiver(onward.source.host, &grant).unwrap();
+
+        let (session, source) = c
+            .source_identity(&onward.target_scope, "office-native")
+            .unwrap();
         let back = Plan {
             id: Uuid::new_v4(),
             session,
@@ -1228,22 +1277,52 @@ mod tests {
             target_scope: first.source.scope.clone(),
         };
         let prepared = prepare(&back, "laptop-native-2");
-        b.prepare_source(&back).unwrap();
-        b.bind_source_manifest(&back, archive(&prepared)).unwrap();
+        assert_eq!(a.owner(session).unwrap().unwrap().generation, 1);
+        assert_eq!(back.source.generation, 2);
+        assert!(
+            a.prepared_receiver(back.source.host, &back)
+                .unwrap()
+                .is_none()
+        );
+        let stale = Plan {
+            source: Owner {
+                generation: 1,
+                ..back.source.clone()
+            },
+            ..back.clone()
+        };
+        assert!(a.prepared_receiver(stale.source.host, &stale).is_err());
+        assert!(a.prepared_receiver(onward.source.host, &back).is_err());
+        c.prepare_source(&back).unwrap();
+        c.bind_source_manifest(&back, archive(&prepared)).unwrap();
         assert!(
             a.prepare_receiver(back.source.host, &prepare(&back, "local"))
                 .is_err()
         );
         a.prepare_receiver(back.source.host, &prepared).unwrap();
-        b.fence_source(back.target_host, &prepared, None).unwrap();
-        b.writer_released(&back).unwrap();
-        let grant = b.commit_source(&back).unwrap();
+        assert!(!a.can_write(&back.target_scope, "laptop-native-2"));
+        c.fence_source(back.target_host, &prepared, None).unwrap();
+        c.writer_released(&back).unwrap();
+        let grant = c.commit_source(&back).unwrap();
         a.activate_receiver(back.source.host, &grant).unwrap();
         b.activate_receiver(first.source.host, &original).unwrap();
-        assert_eq!(a.owner(first.session).unwrap().unwrap().generation, 2);
+        assert_eq!(a.owner(first.session).unwrap().unwrap().generation, 3);
         assert!(a.can_write(&first.source.scope, "laptop-native-2"));
         assert!(!a.can_write(&first.source.scope, "local"));
         assert!(!b.can_write(&first.target_scope, "studio-native"));
+        assert!(!c.can_write(&onward.target_scope, "office-native"));
+        let jumps_a_live_owner = Plan {
+            id: Uuid::new_v4(),
+            source: Owner {
+                generation: 4,
+                ..back.source.clone()
+            },
+            ..back
+        };
+        assert!(
+            a.prepared_receiver(jumps_a_live_owner.source.host, &jumps_a_live_owner)
+                .is_err()
+        );
         assert!(
             b.source_identity(&first.target_scope, "studio-native")
                 .is_err()

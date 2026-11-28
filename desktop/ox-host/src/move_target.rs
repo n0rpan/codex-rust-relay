@@ -11,7 +11,7 @@ use ox_desk_core::{
     modes::Decision,
     runtime::Runtime,
 };
-use ox_host_service::checkout::receive_result;
+use ox_host_service::checkout::receive_move;
 use ox_host_web::move_manifest::{CHECKOUT, Manifest, PLAN, TRANSCRIPT};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -207,7 +207,7 @@ impl VerifiedTarget {
         let checkout = verified_file(&files.directory.join(CHECKOUT), &files.manifest.checkout)?;
         let staged_checkouts = stage.path().join("checkout");
         fs::create_dir(&staged_checkouts)?;
-        let installed = receive_result(
+        let installed = receive_move(
             &staged_checkouts,
             1,
             checkout,

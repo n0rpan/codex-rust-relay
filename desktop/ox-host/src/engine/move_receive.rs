@@ -4,7 +4,6 @@ use crate::{
     move_ledger::{Activated, Cancelled, Commit, Ledger, Plan, Prepared, Proposal},
     move_target::{Files, VerifiedTarget},
 };
-use ox_desk_core::modes::Level;
 use ox_host_web::move_transport::{
     Incoming, Receiver, Reservation, VerifiedActivation, VerifiedCancellation,
 };
@@ -211,10 +210,7 @@ impl Engine {
                 target,
                 reply,
             } => {
-                let access = Level::Read.preset(target.plan().target_scope.route.runtime);
-                if let Err(error) =
-                    self.prepare_move_target(source, *target, Some(access), reply.clone())
-                {
+                if let Err(error) = self.prepare_move_target(source, *target, reply.clone()) {
                     let _ = reply.send(Err(error));
                 }
             }

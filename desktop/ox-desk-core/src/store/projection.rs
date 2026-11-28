@@ -255,9 +255,16 @@ impl Store {
                 "idle"
             }
         };
+        let resume_access = self.resume_access.get(id).copied().or_else(|| {
+            (self.is_session_scoped()
+                && self.moved_history.contains_key(id)
+                && !self.has_live_session(id))
+            .then(|| t.and_then(|transcript| transcript.access()))
+            .flatten()
+        });
         let detail = json!({"row":r,"worker":r.worker,"unread":r.unread,"order":r.activity_order.to_string(),"generated":r.generated_title,
             "owned":t.is_some(),"native_live":self.is_native_live(id).then(||self.native_app()),"changing":self.changing_options(id),"terminal":self.in_terminal(id),"sending":self.sending(Some(id)),
-            "route":self.thread_route(Some(id)),"options":t.map(|_|self.options(Some(id))),"access":self.applied_access(Some(id)),"resume_access":self.resume_access.get(id),"restored_draft":self.restored_drafts.get(id).map(|(message,text)|json!({"message":message,"text":text})),"command_caps":((self.is_session_scoped() || self.is_antigravity()) && t.is_some()).then(||composer_schema(self.command_caps(Some(id))))});
+            "route":self.thread_route(Some(id)),"options":t.map(|_|self.options(Some(id))),"access":self.applied_access(Some(id)),"resume_access":resume_access,"restored_draft":self.restored_drafts.get(id).map(|(message,text)|json!({"message":message,"text":text})),"command_caps":((self.is_session_scoped() || self.is_antigravity()) && t.is_some()).then(||composer_schema(self.command_caps(Some(id))))});
         let mut detail = detail;
         if self.is_antigravity() {
             detail["access_choices"] = json!(self.antigravity_access_choices(id));

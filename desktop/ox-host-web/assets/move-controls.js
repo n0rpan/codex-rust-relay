@@ -151,7 +151,7 @@ export class MoveControls {
       waiting: [`Moves to ${name} after this turn`, `Keep ${source} on until the move is ready.`],
       waiting_for_workers: ["Waiting for workers", `The move to ${name} starts after the workers finish.`],
       preparing: [`Preparing ${name}`, `Copying the conversation and working files. Keep ${source} on.`],
-      closing: [`Closing on ${source}`, `Keep ${source} on until ${name} confirms the move.`],
+      closing: [`Closing on ${source}`, `Closing can take a minute. Keep ${source} on until ${name} confirms the move.`],
       checking: ["Confirming the move", `Keep ${source} on while OX checks whether ${name} can continue.`],
       ready: link
         ? [`Ready on ${name}`, `You can shut down ${source}.`]
