@@ -212,7 +212,7 @@ class Host(socketserver.StreamRequestHandler):
                         "sessions": f.sessions,
                         "asks": [] if f.answered else [ask],
                         "transcripts": {"parent": {"items": [item], "detail": {}},
-                                        "disk-report": {"items": f.report_items, "detail": {}},
+                                        "disk-report": {"items": f.report_items, "detail": {"ready": True}},
                                         "handoff-target": {"items": f.handoff_items, "detail": {}},
                                         "typed-block": {"items": f.handoff_items[2:], "detail": {}}},
                         "detail": f.detail,
@@ -888,6 +888,23 @@ def run(harness, screenshot=None):
         js("location.reload()")
         wait(lambda: js("""return document.querySelector('[data-view=folders]').ariaPressed==='true' &&
             !!document.querySelector('.session.nested')"""))
+
+        report = next(row for row in host.sessions if row["id"] == "disk-report")
+        report["detail"]["last_result"] = {"turn": "follow", "completed_at": now, "outcome": "completed"}
+        js("location.reload()")
+        wait(lambda: js("""return document.querySelector('[data-thread-id=disk-report] .result-badge')
+            ?.textContent==='New result'"""))
+        js("document.querySelector('[data-filter=active]').click()")
+        wait(lambda: js("""return document.querySelector('.just-finished [data-thread-id=disk-report] .result-badge')
+            ?.textContent==='Turn done'"""))
+        js("document.querySelector('.just-finished [data-thread-id=disk-report]').click()")
+        wait(lambda: js("""return !document.querySelector('#conversation').hidden &&
+            document.querySelector('#timeline').innerText.includes('Both workspaces fit') &&
+            Object.values(JSON.parse(localStorage.getItem('ox-phone-seen-results-v1') || '{}')).includes('follow')"""))
+        js("location.reload()")
+        wait(lambda: js("""return !!document.querySelector('[data-thread-id=disk-report]') &&
+            !document.querySelector('[data-thread-id=disk-report] .result-badge')"""))
+        del report["detail"]["last_result"]
 
         from notification_browser import check_notification_links
         check_notification_links(js, wait, host.scope)

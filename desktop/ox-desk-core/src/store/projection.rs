@@ -7,7 +7,7 @@ use crate::{
     transcript::{Entry, ItemKey, Row, Transcript, item::Item},
 };
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 fn keys(t: &Transcript) -> impl Iterator<Item = &ItemKey> {
     (0..t.len())
@@ -256,6 +256,9 @@ impl Store {
             }
             parent = parent.or_else(|| nest.clone());
         }
+        if let Some(result) = t.and_then(|t| t.last_result.as_ref()) {
+            detail["last_result"] = json!(result);
+        }
         SessionView {
             id: r.id.clone(),
             title: r.title().into(),
@@ -342,10 +345,21 @@ impl Store {
         let refresh_sessions =
             changed.affects_catalog() || self.threads().len() != state.sessions.len();
         if refresh_sessions {
+            let previous_results: HashMap<_, _> = state
+                .sessions
+                .iter()
+                .filter_map(|row| row.detail.get("last_result").map(|r| (&row.id, r)))
+                .collect();
             let sessions: Vec<_> = self
                 .threads()
                 .iter()
-                .map(|r| self.session_view(r))
+                .map(|r| {
+                    let mut row = self.session_view(r);
+                    if let Some(previous) = previous_results.get(&row.id) {
+                        carry_result(&mut row, previous);
+                    }
+                    row
+                })
                 .collect();
             if sessions != state.sessions {
                 out.extend(session_changes(&state.sessions, &sessions));
@@ -363,7 +377,8 @@ impl Store {
                 && let Some(row) = self.catalog_row(id)
                 && let Some(prev) = state.sessions.iter_mut().find(|r| r.id == *id)
             {
-                let next = self.session_view(row);
+                let mut next = self.session_view(row);
+                carry_result(&mut next, &prev.detail["last_result"]);
                 if next != *prev {
                     *prev = next.clone();
                     out.push(Change::Session { session: next });
@@ -481,6 +496,17 @@ impl Store {
     }
 }
 
+// A reopen can replace the runtime's transcript while the catalog remains live.
+// Retain the last result and its original timestamp across catalog refreshes.
+fn carry_result(row: &mut SessionView, previous: &Value) {
+    if !previous.is_null()
+        && (row.detail["last_result"].is_null()
+            || row.detail["last_result"]["turn"] == previous["turn"])
+    {
+        row.detail["last_result"] = previous.clone();
+    }
+}
+
 /// The changes that turn `old` into `new`. A page of older threads only appends
 /// rows, so when every old row keeps its place, send just the appended and
 /// edited rows: each client inserts an unknown row at the end, in order. Any
@@ -523,6 +549,21 @@ mod session_change_tests {
             capabilities: vec![],
             detail: serde_json::Value::Null,
         }
+    }
+
+    #[test]
+    fn a_catalog_refresh_keeps_a_result_until_a_different_turn_finishes() {
+        let mut next = row("a", "A");
+        next.detail = json!({});
+        let saved = json!({"turn":"first","completed_at":12,"outcome":"completed"});
+        carry_result(&mut next, &saved);
+        assert_eq!(next.detail["last_result"], saved);
+        next.detail["last_result"]["completed_at"] = 13.into();
+        carry_result(&mut next, &saved);
+        assert_eq!(next.detail["last_result"], saved);
+        next.detail["last_result"] = json!({"turn":"second","completed_at":14,"outcome":"failed"});
+        carry_result(&mut next, &saved);
+        assert_eq!(next.last_result().unwrap().turn, "second");
     }
 
     #[test]

@@ -13,6 +13,8 @@ use gpui_component::button::Button;
 use gpui_component::text::{TextView, TextViewState};
 use gpui_component::{ActiveTheme, menu::ContextMenuExt};
 use ox_desk_core::actions::Action as DeskAction;
+use ox_desk_core::host_protocol::{Scope, SessionResult};
+use ox_desk_core::store::Connection;
 use ox_desk_core::{
     transcript::item::Item,
     transcript::{ItemKey, Row},
@@ -54,9 +56,18 @@ pub(super) struct TranscriptView {
     far: bool,
     /// Items that existed the last time the view was at (or near) the bottom.
     seen: usize,
+    reported_result: Option<String>,
     document_height: Pixels,
     markdown: std::collections::VecDeque<CachedMessage>,
 }
+
+pub(super) struct ResultViewed {
+    pub scope: Scope,
+    pub thread: String,
+    pub result: SessionResult,
+}
+
+impl EventEmitter<ResultViewed> for Workbench {}
 
 impl TranscriptView {
     pub(super) fn invalidate_messages(&mut self) {
@@ -183,6 +194,12 @@ fn glide_to_end(list: ListState, motion: bool, cx: &mut Context<Workbench>) {
 }
 
 impl Workbench {
+    pub(super) fn reveal_latest_result(&self, id: &str) {
+        if let Some(view) = self.transcript_views.get(id) {
+            view.list.scroll_to_end();
+        }
+    }
+
     pub(super) fn transcript_panel(&mut self, cx: &mut Context<Self>) -> Div {
         let p = Palette::get(cx);
         let Some(store) = &mut self.store else {
@@ -243,6 +260,7 @@ impl Workbench {
                 following: true,
                 far: false,
                 seen: count,
+                reported_result: None,
                 document_height: px(360.),
                 markdown: Default::default(),
             }
@@ -289,6 +307,37 @@ impl Workbench {
         let motion = p.motion;
         let list_state = view.list.clone();
         let jump_state = view.list.clone();
+        let viewed = store
+            .last_result(&id)
+            .filter(|result| {
+                self.front
+                    && store.state() == &Connection::Ready
+                    && transcript.is_ready()
+                    && transcript.active_turn().is_none()
+                    && view.reported_result.as_deref() != Some(&result.turn)
+                    && (transcript.last_finished() == Some(&result.turn)
+                        || count == 0
+                        || transcript.row(count - 1).is_some_and(|row| match row {
+                            Row::Message(key) => key.turn == result.turn,
+                            Row::Tools(keys) => {
+                                keys.back().is_some_and(|key| key.turn == result.turn)
+                            }
+                        }))
+            })
+            .map(|result| {
+                (
+                    ResultViewed {
+                        scope: Scope {
+                            project: self.project.clone(),
+                            route: self.route.clone(),
+                        },
+                        thread: id.clone(),
+                        result: result.clone(),
+                    },
+                    list_state.clone(),
+                    cx.weak_entity(),
+                )
+            });
         let find_bar = tools::find_bar(view, &id, p, cx);
         let banner = handoff_banner(store, &id, p, cx);
         col()
@@ -340,6 +389,41 @@ impl Workbench {
                     )
                     .when(far, |d| {
                         d.child(jump_to_latest(p, jump_state, unseen, motion, cx))
+                    })
+                    .when_some(viewed, |d, (viewed, list, owner)| {
+                        d.child(
+                            canvas(
+                                |_, _, _| (),
+                                move |bounds, _, window, cx| {
+                                    let visible = bounds.size.height > px(0.)
+                                        && (count == 0
+                                            || list.is_following_tail()
+                                            || list.bounds_for_item(count - 1).is_some_and(
+                                                |item| {
+                                                    item.top() < bounds.bottom()
+                                                        && item.bottom() > bounds.top()
+                                                },
+                                            ));
+                                    if window.is_window_active() && window.is_visible() && visible {
+                                        cx.defer(move |cx| {
+                                            let _ = owner.update(cx, |s, cx| {
+                                                if let Some(view) =
+                                                    s.transcript_views.get_mut(&viewed.thread)
+                                                    && view.reported_result.as_deref()
+                                                        != Some(&viewed.result.turn)
+                                                {
+                                                    view.reported_result =
+                                                        Some(viewed.result.turn.clone());
+                                                    cx.emit(viewed);
+                                                }
+                                            });
+                                        });
+                                    }
+                                },
+                            )
+                            .absolute()
+                            .size_full(),
+                        )
                     }),
             )
     }

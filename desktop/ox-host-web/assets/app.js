@@ -26,6 +26,7 @@ import {
   catalogTree,
   catalogParentResolver,
   recentDays,
+  sessionResult,
 } from "./model.js";
 import {
   deviceKey,
@@ -168,6 +169,24 @@ let cold = new Map(),
   visibleRows = 200;
 
 const SIDEBAR_META_KEY = "ox-phone-sidebar-v1";
+const SEEN_RESULTS_KEY = "ox-phone-seen-results-v1";
+const RESULT_LABEL = { completed: "Turn done", failed: "Failed", stopped: "Stopped" };
+const RESULT_PREVIEW_COUNT = 4;
+const seenResults = new Map();
+try {
+  const saved = JSON.parse(localStorage.getItem(SEEN_RESULTS_KEY) || "{}");
+  for (const [thread, turn] of Object.entries(saved))
+    if (typeof turn === "string") seenResults.set(thread, turn);
+} catch {}
+
+function seeResult(thread, turn) {
+  if (seenResults.get(thread) === turn) return;
+  seenResults.set(thread, turn);
+  try {
+    localStorage.setItem(SEEN_RESULTS_KEY, JSON.stringify(Object.fromEntries(seenResults)));
+  } catch {}
+}
+
 const ACCENT_COLORS = ["cobalt", "amber", "emerald", "coral", "violet", "cyan"];
 function loadSidebarMeta() {
   try {
@@ -768,7 +787,7 @@ function open(scope, id) {
   $("worker-form").hidden = true;
   controls.reset();
   detailLink?.close();
-  selected = { scope, id, revealLatest: Boolean(id) };
+  selected = { scope, id, revealLatest: Boolean(id), openingResult: Boolean(id) };
   setComposerOwner(keyOf(scope, id), repaint, notice);
   pendingNew = null;
   visibleRows = 200;
@@ -833,6 +852,7 @@ function catalog() {
   }
   const needle = $("find-sessions").value.trim().toLocaleLowerCase();
   const visible = [];
+  const justFinished = [];
   for (const row of rows) {
     const { scope, session } = row,
       s = global.scopes.get(scopeKey(scope)),
@@ -855,6 +875,11 @@ function catalog() {
       ].some((v) => v?.toLocaleLowerCase().includes(needle))
     )
       continue;
+    const result = sessionResult(session);
+    const running = needsInput || ["running", "needs_input"].includes(session.status);
+    const newResult = !running && result && seenResults.get(keyOf(scope, session.id)) !== result.turn
+      ? result : null;
+    if (filter === "active" && newResult) justFinished.push({ ...row, needsInput, newResult });
     if (
       (filter === "requests" && !needsInput) ||
       // "Running" is the desktop chip: a live turn that is not waiting on you.
@@ -864,7 +889,7 @@ function catalog() {
         (needsInput || ["running", "needs_input"].includes(session.status)))
     )
       continue;
-    visible.push({ ...row, needsInput });
+    visible.push({ ...row, needsInput, newResult });
   }
   counts.requests += drafts.length;
   for (const b of $("filters").children) {
@@ -878,6 +903,7 @@ function catalog() {
   // in a review checkout on another route. A filtered-out parent still leaves a
   // navigable reference on the child.
   const tree = catalogTree(visible, rows);
+  const resultParent = justFinished.length ? catalogParentResolver(rows) : null;
   const filtering = Boolean(needle) || filter !== "all";
   const pinnedList = [];
   const remaining = [];
@@ -904,17 +930,17 @@ function catalog() {
     }
   }
   const names = new Map();
-  for (const project of new Set(visible.map((entry) => entry.scope.project)))
+  for (const project of new Set([...visible, ...justFinished].map((entry) => entry.scope.project)))
     names.set(leaf(project), (names.get(leaf(project)) || 0) + 1);
   const projectLabel = (project) =>
     names.get(leaf(project)) === 1 ? leaf(project) : project;
   const done = new Set();
-  const renderEntry = (entry, depth, showProjectTag) => {
-    const { scope, session, needsInput } = entry,
+  const renderEntry = (entry, depth, showProjectTag, resultSection) => {
+    const { scope, session, needsInput, newResult } = entry,
       key = keyOf(scope, session.id);
     if (done.has(key)) return;
     done.add(key);
-    const recorded = tree.links.get(key),
+    const recorded = resultSection ? resultParent(entry) : tree.links.get(key),
       elsewhere = recorded && recorded.project !== scope.project,
       model = actualModel(session),
       isPinned = pinnedThreads.has(key),
@@ -941,7 +967,10 @@ function catalog() {
       (isPinned ? "★ " : "") + (session.title || "Untitled session");
     head.append(
       el("span", "session-name", titleText),
-      el("span", "status", statusText(session, needsInput)),
+      el("span", newResult ? "status result-badge" : "status",
+        newResult
+          ? (resultSection ? RESULT_LABEL[newResult.outcome] : "New result")
+          : statusText(session, needsInput)),
     );
     let meta = depth ? "↳ " : "";
     if (showProjectTag || (depth && elsewhere))
@@ -953,7 +982,7 @@ function catalog() {
     if (session.updated_at > 0 && nowSec >= session.updated_at)
       meta += ` · ${ago(nowSec - session.updated_at)}`;
     b.append(head, el("div", "meta", meta));
-    if (catalogView === "recent" && recorded) {
+    if (recorded && (catalogView === "recent" || resultSection)) {
       const isWorker =
         session.parent || session.detail?.worker || session.detail?.origin?.relation === "worker";
       const relation = isWorker ? "Worker for" : "From";
@@ -969,8 +998,8 @@ function catalog() {
           `Worker #${worker.job_id} · ${worker.status.replaceAll("_", " ")}${worker.host ? " on " + worker.host : ""}`,
         ),
       );
-    frag.append(b);
-    if (catalogView === "folders") {
+    (resultSection || frag).append(b);
+    if (catalogView === "folders" && !resultSection) {
       for (const child of tree.children.get(key) || [])
         if (!pinnedThreads.has(keyOf(child.scope, child.session.id)))
           renderEntry(child, depth + 1, false);
@@ -1018,6 +1047,25 @@ function catalog() {
               : "No sessions found.",
       ),
     );
+  if (justFinished.length) {
+    justFinished.sort((a, b) => b.newResult.completed_at - a.newResult.completed_at ||
+      keyOf(a.scope, a.session.id).localeCompare(keyOf(b.scope, b.session.id)));
+    const section = el("section", "just-finished");
+    const heading = el("h2", "catalog-day", "Just finished");
+    heading.id = "just-finished-heading";
+    section.setAttribute("aria-labelledby", heading.id);
+    section.append(heading);
+    for (const entry of justFinished.slice(0, RESULT_PREVIEW_COUNT))
+      renderEntry(entry, 0, true, section);
+    if (justFinished.length > RESULT_PREVIEW_COUNT)
+      section.append(button("View finished sessions", () => {
+        const finished = $("filters").querySelector('[data-filter="finished"]');
+        finished.click();
+        finished.focus({ preventScroll: true });
+      }));
+    if (visible.length) frag.append(section);
+    else frag.prepend(section);
+  }
   listElement.replaceChildren(frag);
   focusedRow?.focus({ preventScroll: true });
   $("new").disabled = !globalLink?.ready || !(routes.length || apiProvider);
@@ -1814,6 +1862,14 @@ function conversation() {
         );
       }
     }
+  }
+  if (id && detailLink?.ready && timeline?.detail?.ready && !document.hidden) {
+    const result = sessionResult(s?.sessions.find((session) => session.id === id));
+    if (result && (selected.openingResult || pinnedBottom) &&
+        (timeline.detail.last_finished === result.turn || tail?.turn === result.turn)) {
+      seeResult(keyOf(scope, id), result.turn);
+    }
+    selected.openingResult = false;
   }
   // A running turn that waits on an approval still gets the session terminal, so the
   // person can review the command there (the desktop offers the same path).
@@ -2832,6 +2888,7 @@ document.addEventListener("visibilitychange", () => {
 });
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && key && !$("catalog").hidden) notificationSetup(false);
+  if (!document.hidden && !$("conversation").hidden) repaint();
 });
 navigator.serviceWorker?.addEventListener("message", (e) => {
   if (typeof e.data?.openThread === "string") {

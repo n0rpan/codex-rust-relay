@@ -414,8 +414,14 @@ impl Store {
                     self.claude_child(owner, &display, child, tool);
                     if completed {
                         let t = self.transcripts.entry(child.into()).or_default();
-                        if let Some(turn) = t.active_turn.take() {
-                            t.last_finished = Some(turn);
+                        let turn = t.active_turn.take();
+                        t.record_result(
+                            turn.as_deref().unwrap_or(&id),
+                            status == "failed",
+                            matches!(status, "stopped" | "interrupted"),
+                        );
+                        if turn.is_some() {
+                            t.last_finished = turn;
                         }
                         if status == "failed" {
                             t.error = output.clone();
@@ -468,7 +474,10 @@ impl Store {
                 let t = self.transcripts.entry(owner.into()).or_default();
                 let finished = t.active_turn.take();
                 t.interrupted = finished.is_some() && finished == t.stop_requested.take();
-                t.last_finished = finished.or_else(|| t.last_finished.clone());
+                if let Some(turn) = finished {
+                    t.record_result(&turn, r.is_error, t.interrupted);
+                    t.last_finished = Some(turn);
+                }
                 let interrupted = t.interrupted;
                 if r.is_error && !interrupted {
                     t.error = Some(if r.errors.is_empty() {
@@ -912,6 +921,40 @@ mod tests {
             .pop()
             .unwrap()
     }
+
+    #[test]
+    fn a_confirmed_claude_result_reaches_the_catalog_and_replica() {
+        use crate::host_protocol::{Cursor, Scope, Server, SessionOutcome};
+        let (mut host, a, _) = fixture();
+        let scope = Scope {
+            project: host.profile.project.clone(),
+            route: host.profile.route.clone(),
+        };
+        let user = decode(
+            json!({"type":"user","session_id":A,"uuid":"prompt","message":{"content":"start"}}),
+        );
+        update(&mut host, &a, 2, Data::Stock(pipe::Event::Frame(user))).unwrap();
+        let mut state = host.host_snapshot(&scope);
+        assert!(state.sessions.iter().all(|row| row.last_result().is_none()));
+        let result =
+            decode(json!({"type":"result","subtype":"success","is_error":false,"session_id":A}));
+        update(&mut host, &a, 2, Data::Stock(pipe::Event::Frame(result))).unwrap();
+        host.host_project(&scope, &host.changed, &mut state);
+        let mut replica = Store::remote_client(host.profile.clone(), |_, _| unreachable!());
+        replica
+            .apply_host(Server::Snapshot {
+                cursor: Cursor {
+                    epoch: "result".into(),
+                    seq: 1,
+                },
+                scopes: vec![state],
+            })
+            .unwrap();
+        let result = replica.last_result(&a).unwrap();
+        assert_eq!(result.turn, "prompt");
+        assert_eq!(result.outcome, SessionOutcome::Completed);
+    }
+
     /// The replica clears its composer when the host acknowledges a resume send. When the
     /// native startup then fails, the host restores the text; that restore must reach
     /// the replica (by delta and by a later full snapshot) instead of leaving it empty.
@@ -1192,6 +1235,7 @@ mod tests {
         update(&mut s, &a, 1, Data::Failed("stale close".into())).unwrap();
         assert_eq!(s.asks.len(), 2);
         update(&mut s, &a, 2, Data::Failed("real close".into())).unwrap();
+        assert!(s.transcript(&a).unwrap().last_result.is_none());
         assert_eq!(s.asks.len(), 1);
         assert_eq!(s.asks[0].thread.as_deref(), Some(b.as_str()));
         assert_eq!(
@@ -1247,7 +1291,12 @@ mod tests {
             s.catalog_row(&child).unwrap().parent_thread_id.as_deref(),
             Some(a.as_str())
         );
-        assert!(s.transcript(&child).unwrap().active_turn().is_none());
+        let transcript = s.transcript(&child).unwrap();
+        assert!(transcript.active_turn().is_none());
+        assert_eq!(
+            transcript.last_result.as_ref().unwrap().outcome,
+            crate::host_protocol::SessionOutcome::Completed
+        );
         let t = s.transcript(&a).unwrap();
         let first = t
             .entry(&crate::transcript::ItemKey {
