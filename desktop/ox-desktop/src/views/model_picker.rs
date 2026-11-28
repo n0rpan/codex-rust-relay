@@ -454,7 +454,11 @@ impl ModelPicker {
 
     /// Show the "Run with" control, starting on `runtime`.
     pub(super) fn with_runtime(mut self, runtime: Runtime) -> Self {
-        self.runtime = Some(runtime);
+        self.runtime = Some(if runtime.supports_api() {
+            runtime
+        } else {
+            Runtime::Codex
+        });
         self
     }
 

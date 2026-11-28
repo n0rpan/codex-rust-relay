@@ -49,11 +49,7 @@ impl Store {
     }
     /// The stock client that has the session open outside OX.
     pub fn native_app(&self) -> &'static str {
-        if self.profile.route.runtime == crate::runtime::Runtime::Codex {
-            "Codex"
-        } else {
-            "Claude Code"
-        }
+        self.profile.route.runtime.name()
     }
     pub fn native_live_hint(&self) -> String {
         HINT.replace("Claude Code", self.native_app())

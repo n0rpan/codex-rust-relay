@@ -3,6 +3,7 @@
 pub enum Cartridge {
     Codex,
     Claude,
+    Antigravity,
     Api,
     Worker,
 }
@@ -15,6 +16,9 @@ impl Cartridge {
             ],
             Self::Claude => [
                 0b0001000, 0b0101010, 0b0011100, 0b1111111, 0b0011100, 0b0101010, 0b0001000,
+            ],
+            Self::Antigravity => [
+                0b0000110, 0b0011001, 0b0100010, 0b1010101, 0b0100010, 0b1001100, 0b0110000,
             ],
             Self::Api => [
                 0b0001000, 0b0011100, 0b0110110, 0b1100011, 0b0110110, 0b0011100, 0b0001000,

@@ -86,6 +86,17 @@ pub fn launch_login(runtime: ox_desk_core::runtime::Runtime, project: &Path) -> 
     match runtime {
         Runtime::Codex => launch_chatgpt_login(project),
         Runtime::Claude => launch_claude_login(project),
+        Runtime::Antigravity => {
+            let path = child_path();
+            let program = find(runtime.executable(), &path)
+                .ok_or_else(|| "Install Antigravity CLI and add agy to PATH.".to_owned())?;
+            open_program_in_terminal(
+                project,
+                program,
+                vec!["acp".into(), "--login".into()],
+                &path,
+            )
+        }
     }
 }
 

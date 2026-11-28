@@ -27,6 +27,11 @@
     <main>
       <section id="pair" hidden>
         <h1>Pair this device</h1>
+        <p id="pair-install" hidden>
+          Want OX on your Home Screen? In Safari, tap <strong>Share</strong> →
+          <strong>Add to Home Screen</strong>, then open OX from its icon before
+          pairing. You can also pair here to use OX in Safari.
+        </p>
         <ol class="pair-steps" aria-label="Pairing steps">
           <li id="step-scan" aria-current="step"><span class="pix-num">1</span> Scan</li>
           <li id="step-name"><span class="pix-num">2</span> Name</li>
@@ -79,7 +84,7 @@
             <summary aria-label="More session list actions">•••</summary>
             <div>
               <button type="button" id="open-running">Manage processes</button>
-              <button type="button" id="open-notifications" hidden>Session alerts</button>
+              <button type="button" id="open-notifications">Notifications</button>
               <button type="button" id="operator-home">Host terminal</button>
               <button id="open-phone-settings" type="button">Settings</button>
             </div>
@@ -304,6 +309,7 @@
           <select id="handoff-runtime">
             <option value="codex">Codex</option>
             <option value="claude">Claude Code</option>
+            <option value="antigravity">Antigravity</option>
           </select>
           <label for="handoff-route">Model</label>
           <select id="handoff-route"></select>
@@ -342,6 +348,11 @@
             </button>
           </div>
           <p id="composer-status" role="status" hidden></p>
+          <div id="antigravity-sign-in-required" class="native-live" hidden>
+            <p>Sign in to Antigravity with Google on the host to continue.</p>
+            <button id="antigravity-sign-in" type="button">Open sign-in on host</button>
+            <button id="antigravity-reconnect" type="button">Check connection</button>
+          </div>
           <div id="slash-choices" aria-label="Command suggestions" role="group" hidden></div>
           <label class="sr" for="draft">Message</label
           ><textarea

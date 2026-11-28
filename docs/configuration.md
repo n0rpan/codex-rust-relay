@@ -940,16 +940,25 @@ When the parent reconnects, its job status shows the local result ref, commit, d
 
 ### Continue a session in another runtime, route or model
 
-In OX Desktop, type `/handoff codex:<alias> <request>` or `/handoff claude[:<alias>]
-<request>` in a session, or choose **Continue in…** in the command palette. On
-the phone, use **Continue in…** in the session menu. The new native session
-starts with a budgeted selection of the real earlier messages, not a summary,
-then your request. It links back to the source, and its agent can read the
-rest of the source with `read_ox_thread`. It starts in the source's permission
-mode unless you choose another with `--mode` or in the sheet. A Claude session
-cannot move between billing routes, so switching from the Claude subscription
-to an API alias is also a handoff. The source must be idle with no pending
-requests. Before a conversation goes to a different provider, OX says which one.
+In OX Desktop, use **Continue in…** in the command palette or type one of these commands in the source session.
+
+```text
+/handoff codex:<alias> <request>
+/handoff claude[:<alias>] <request>
+/handoff antigravity <request>
+```
+
+On the phone, use **Continue in…** in the session menu. The new session receives a budgeted selection of the source's messages and most recent visible plan, followed by your request. Codex and Claude Code can use `read_ox_thread` for remaining source context. The target inherits a supported permission mode from its source unless you choose another with `--mode` or in the sheet. The source must be idle with no pending requests. OX identifies the receiving provider before sending a conversation to it.
+
+#### Antigravity
+
+Install the official Antigravity CLI 1.5.15 or later on the OX host. Use 1.5.19 or later when available. Run `agy acp --login` on that host to sign in with Google. Choose **Antigravity** when starting a session or continuing a plan. For example, `/handoff antigravity --mode plan Review this approach` opens the new session in Plan mode. Use **Accept edits** when you want Antigravity to apply edits without asking about each one.
+
+OX launches `agy acp` over standard input and output for interactive sessions on your Google account. Antigravity handles sign-in, model availability and conversation history. OX indexes sessions it starts so you can reopen them from the sidebar, then reads their conversation through ACP. [Antigravity CLI and ACP setup](https://antigravity.google/docs/cli/acp/)
+
+Choose **YOLO** before starting a session or handoff to launch with Antigravity's `--dangerously-skip-permissions` option. It auto-approves tool permission requests for that process. Antigravity's implementation-plan review still applies when running in Plan mode. [Antigravity ACP flags](https://antigravity.google/docs/ide/extensions/acp/#flags)
+
+On a new session's first turn, OX includes its sender context and eligible pinned OX memory when the CLI advertises ACP embedded context. OX applies its existing project, host and size limits. Antigravity's Google account route can receive at most `private` memory. Antigravity manages its own conversation history alongside this attached context. [ACP prompt content](https://agentclientprotocol.com/protocol/prompt-turn)
 
 ### Upgrade from the original single-provider relay
 

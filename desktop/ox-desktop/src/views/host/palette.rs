@@ -381,7 +381,9 @@ impl Host {
             && store.state() == &Connection::Ready
             && !store.in_terminal(owner)
         {
-            if let Some(result) = crate::views::compose::typed_launch(owner, query) {
+            if let Some(result) =
+                crate::views::compose::typed_launch(owner, query, active.route.runtime)
+            {
                 let pane = self.active;
                 let target = match query {
                     "/worker" => Target::Worker {
@@ -425,17 +427,19 @@ impl Host {
                     online,
                 }];
             }
-            add(
-                "Start worker…".into(),
-                "Run a task in a worker under this session · /worker [@host] codex[:<model>] [--mode <mode>] [--goal] <task>".into(),
-                Target::Worker {
-                    pane: self.active,
-                    owner: owner.to_owned(),
-                },
-            );
+            if active.route.runtime.supports_workers() {
+                add(
+                    "Start worker…".into(),
+                    "Run a task in a worker under this session · /worker [@host] codex[:<model>] [--mode <mode>] [--goal] <task>".into(),
+                    Target::Worker {
+                        pane: self.active,
+                        owner: owner.to_owned(),
+                    },
+                );
+            }
             add(
                 "Continue in…".into(),
-                "Hand off this conversation to another runtime, billing route or model · /handoff <codex|claude>[:<alias>] [--mode <mode>] <request>".into(),
+                "Hand off this conversation to another runtime, billing route or model · /handoff <codex|claude|antigravity> [--mode <mode>] <request>".into(),
                 Target::Handoff {
                     pane: self.active,
                     owner: owner.to_owned(),
@@ -458,6 +462,7 @@ impl Host {
         }
         if let Some(store) = &active.store
             && store.state() == &Connection::Ready
+            && active.route.runtime != ox_desk_core::runtime::Runtime::Antigravity
             && !store.selected().is_some_and(|id| store.in_terminal(id))
         {
             for (cmd, hint) in store.command_caps(store.selected()).choices() {
@@ -808,16 +813,15 @@ impl Host {
                 });
             }
             Target::TypedLaunch { pane, owner, text } => {
-                if let Some(Ok(action)) = crate::views::compose::typed_launch(&owner, &text)
-                    && self
-                        .panes
-                        .get(pane)
-                        .and_then(|p| p.read(cx).store.as_ref())
-                        .is_some_and(|store| {
-                            store.selected() == Some(&owner)
-                                && !store.in_terminal(&owner)
-                                && store.state() == &Connection::Ready
-                        })
+                if let Some(store) = self.panes.get(pane).and_then(|p| p.read(cx).store.as_ref())
+                    && store.selected() == Some(&owner)
+                    && !store.in_terminal(&owner)
+                    && store.state() == &Connection::Ready
+                    && let Some(Ok(action)) = crate::views::compose::typed_launch(
+                        &owner,
+                        &text,
+                        store.profile().route.runtime,
+                    )
                 {
                     self.close_palette(window, cx);
                     self.panes[pane].update(cx, |p, cx| p.action(cx, action));

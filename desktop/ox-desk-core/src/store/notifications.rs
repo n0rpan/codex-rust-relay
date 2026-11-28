@@ -9,7 +9,9 @@ impl Store {
                 .and_then(|id| remote.access.get(id).copied())
                 .or_else(|| id.is_none().then_some(remote.draft_access).flatten());
         }
-        if self.is_session_scoped() {
+        if self.is_antigravity() {
+            self.antigravity_access(id)
+        } else if self.is_session_scoped() {
             self.claude_applied_access(id)
         } else {
             self.transcript(id?).and_then(|t| t.access())
@@ -21,7 +23,7 @@ impl Store {
     pub fn applied_ceiling(&self, id: Option<&str>) -> Option<crate::modes::Level> {
         let runtime = self.profile.route.runtime;
         let preset = |access| crate::modes::Level::of(runtime, access);
-        if self.remote().is_some() || self.is_session_scoped() {
+        if self.remote().is_some() || self.is_session_scoped() || self.is_antigravity() {
             return self.applied_access(id).and_then(preset);
         }
         let t = self.transcript(id?)?;
@@ -134,6 +136,9 @@ impl Store {
         if let Some(remote) = self.remote() {
             return remote.can(id, "access");
         }
+        if self.is_antigravity() {
+            return self.can_send(Some(id)) && !self.antigravity_access_choices(id).is_empty();
+        }
         (self.can_send(Some(id))
             || self.can_configure_saved_claude(id)
             || (self.resume_held(id)
@@ -156,6 +161,9 @@ impl Store {
             return Err(io::Error::other(
                 "Permissions cannot be changed for this thread right now",
             ));
+        }
+        if self.is_antigravity() {
+            return self.antigravity_set_access(id, preset);
         }
         if self.is_session_scoped() {
             if self.can_configure_saved_claude(id) {
@@ -180,6 +188,15 @@ impl Store {
         match notice {
             Notification::Started(row) => self.observed_row(*row),
             Notification::Status { thread, status } => self.activity_status(&thread, status),
+            Notification::Goal {
+                thread,
+                turn,
+                complete,
+            } => {
+                if let Some(t) = self.transcripts.get_mut(&thread) {
+                    t.update_goal(turn, complete);
+                }
+            }
             Notification::Settings { thread, settings } => {
                 let pending_model=self.pending.values().any(|(_,p)|matches!(p,super::Pending::Options(owner,o) if owner==&thread && o.model==settings.model));
                 let mismatch = self

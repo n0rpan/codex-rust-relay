@@ -1,6 +1,6 @@
-//! Budgeted Tier-1 memory injection for first turns of Codex and Claude sessions/workers.
+//! Budgeted Tier-1 memory injection for first turns of native sessions and workers.
 
-use crate::runtime::Route;
+use crate::runtime::{Route, Runtime};
 pub use ox_memory::store_path_for;
 use ox_memory::{DEFAULT_BRIEF_CHARS, MemoryStore, Sensitivity, canonical_project_id};
 use std::path::{Path, PathBuf};
@@ -16,25 +16,30 @@ pub struct MemoryConfig {
 
 /// Safe sensitivity ceiling for a resolved runtime/billing route.
 ///
-/// Defaults to `Private` (never trusts a provider alias prefix to prove local inference).
-/// Set `OX_MEMORY_ALLOW_LOCAL_ONLY=1` on a truly local inference host to include `LocalOnly`
-/// memories. If `OX_MEMORY_MAX_SENSITIVITY` is set, it can only tighten (never raise) the ceiling.
-pub fn route_sensitivity_ceiling(_route: &Route) -> Sensitivity {
-    let base = if std::env::var("OX_MEMORY_ALLOW_LOCAL_ONLY")
+/// Defaults to `Private`. `OX_MEMORY_ALLOW_LOCAL_ONLY=1` allows `LocalOnly` on a
+/// local inference host. The Antigravity account route always uses Google inference.
+/// `OX_MEMORY_MAX_SENSITIVITY` can tighten the ceiling further.
+pub fn route_sensitivity_ceiling(route: &Route) -> Sensitivity {
+    let allow_local_only = std::env::var("OX_MEMORY_ALLOW_LOCAL_ONLY")
         .ok()
-        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
-    {
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+    let cap = std::env::var("OX_MEMORY_MAX_SENSITIVITY")
+        .ok()
+        .and_then(|v| Sensitivity::parse(&v).ok());
+    sensitivity_ceiling(route.runtime, allow_local_only, cap)
+}
+
+fn sensitivity_ceiling(
+    runtime: Runtime,
+    allow_local_only: bool,
+    cap: Option<Sensitivity>,
+) -> Sensitivity {
+    let base = if allow_local_only && runtime != Runtime::Antigravity {
         Sensitivity::LocalOnly
     } else {
         Sensitivity::Private
     };
-    match std::env::var("OX_MEMORY_MAX_SENSITIVITY")
-        .ok()
-        .and_then(|v| Sensitivity::parse(&v).ok())
-    {
-        Some(env_cap) => base.min(env_cap),
-        None => base,
-    }
+    cap.map_or(base, |cap| base.min(cap))
 }
 
 /// Maximum UTF-8 bytes for the rendered Tier-1 brief body so that
@@ -106,36 +111,38 @@ fn fit_utf8_bytes(text: &str, max_bytes: usize) -> String {
 ///
 /// Returns `None` if no eligible pinned memories exist or if the store cannot be read.
 pub fn first_turn_brief(config: &MemoryConfig, project: &Path, route: &Route) -> Option<String> {
-    if let Some(override_brief) = config
-        .brief_override
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+    let brief = if route.runtime.supports_workers()
+        && let Some(override_brief) = config
+            .brief_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     {
-        let char_capped: String = override_brief.chars().take(DEFAULT_BRIEF_CHARS).collect();
-        let byte_capped = fit_utf8_bytes(&char_capped, MAX_BRIEF_BYTES);
-        return Some(format!("{byte_capped}\n{RECALL_HINT}"));
+        override_brief.chars().take(DEFAULT_BRIEF_CHARS).collect()
+    } else {
+        let store = MemoryStore::open(&config.store_path);
+        let project_id = canonical_project_id(project);
+        let ceiling = route_sensitivity_ceiling(route);
+        store
+            .tier1_brief(
+                Some(&project_id),
+                Some(&config.host_id),
+                ceiling,
+                DEFAULT_BRIEF_CHARS,
+            )
+            .ok()??
+    };
+    let text = fit_utf8_bytes(&brief, MAX_BRIEF_BYTES);
+    if route.runtime == Runtime::Antigravity {
+        Some(text)
+    } else {
+        Some(format!("{text}\n{RECALL_HINT}"))
     }
-
-    let store = MemoryStore::open(&config.store_path);
-    let project_id = canonical_project_id(project);
-    let ceiling = route_sensitivity_ceiling(route);
-    let brief = store
-        .tier1_brief(
-            Some(&project_id),
-            Some(&config.host_id),
-            ceiling,
-            DEFAULT_BRIEF_CHARS,
-        )
-        .ok()??;
-    let byte_capped = fit_utf8_bytes(&brief, MAX_BRIEF_BYTES);
-    Some(format!("{byte_capped}\n{RECALL_HINT}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::Runtime;
     use ox_memory::{Kind, NewMemory, Scope};
 
     #[test]
@@ -155,6 +162,22 @@ mod tests {
         assert_eq!(
             route_sensitivity_ceiling(&Route::codex_api("local/llama".into())),
             Sensitivity::Private
+        );
+    }
+
+    #[test]
+    fn antigravity_stays_below_local_only_even_when_the_host_allows_local_inference() {
+        assert_eq!(
+            sensitivity_ceiling(Runtime::Antigravity, true, None),
+            Sensitivity::Private
+        );
+        assert_eq!(
+            sensitivity_ceiling(Runtime::Antigravity, true, Some(Sensitivity::Public)),
+            Sensitivity::Public
+        );
+        assert_eq!(
+            sensitivity_ceiling(Runtime::Codex, true, None),
+            Sensitivity::LocalOnly
         );
     }
 
@@ -199,6 +222,13 @@ mod tests {
             first_turn_brief(&cfg, dir.path(), &Route::codex_api("ollama/qwen3".into())).unwrap();
         assert!(brief.contains("Use Claude subscription for private work."));
         assert!(!brief.contains("Local-only GPU calibration note."));
+        assert!(brief.ends_with(RECALL_HINT));
+
+        let antigravity =
+            first_turn_brief(&cfg, dir.path(), &Runtime::Antigravity.route(None)).unwrap();
+        assert!(antigravity.contains("Use Claude subscription for private work."));
+        assert!(!antigravity.contains("Local-only GPU calibration note."));
+        assert!(!antigravity.contains(RECALL_HINT));
 
         // Brief override takes precedence (used by remote worker jobs)
         let override_cfg = MemoryConfig {
@@ -208,6 +238,10 @@ mod tests {
         let brief =
             first_turn_brief(&override_cfg, dir.path(), &Route::CODEX_SUBSCRIPTION).unwrap();
         assert!(brief.contains("Custom brief."));
+        let antigravity =
+            first_turn_brief(&override_cfg, dir.path(), &Runtime::Antigravity.route(None)).unwrap();
+        assert!(antigravity.contains("Use Claude subscription for private work."));
+        assert!(!antigravity.contains("Custom brief."));
     }
 
     #[test]

@@ -77,7 +77,7 @@ if final and legacy:
 app = desktop / "ox-desktop/src"
 for source in app.rglob("*.rs"):
     relative = str(source.relative_to(app))
-    if relative.startswith("views/") and re.search(r"\b(?:codex|claude)\s*::", source.read_text()):
+    if relative.startswith("views/") and re.search(r"\b(?:antigravity|codex|claude)\s*::", source.read_text()):
         raise SystemExit(f"{relative} must use the runtime-neutral workbench interface")
     if source.name == "tests.rs":
         parent = source.parent.with_suffix(".rs")
@@ -95,6 +95,10 @@ for source in app.rglob("*.rs"):
     if '"codeox.toml"' in code:
         raise SystemExit(f"{relative} must edit provider settings through OX")
 
+runtime_ports = {
+    "links/antigravity.rs", "links/codex.rs", "links/claude.rs",
+    "ports/ox.rs", "native_catalog.rs", "codex/installed.rs",
+}
 for source in (desktop / "ox-desk-core/src").rglob("*.rs"):
     relative = str(source.relative_to(desktop / "ox-desk-core/src"))
     code = source.read_text().split("#[cfg(test)]", 1)[0]
@@ -103,7 +107,7 @@ for source in (desktop / "ox-desk-core/src").rglob("*.rs"):
     paths_code = code.replace('.env("CODEX_HOME", home)', '') if relative == "native_catalog.rs" else code
     if re.search(r'["\'](?:CODEX_HOME|\.codex|auth\.json)', paths_code):
         raise SystemExit(f"{relative} may not open a Codex-owned path")
-    if "Command::new(" in code and relative not in ("links/codex.rs", "links/claude.rs", "ports/ox.rs", "native_catalog.rs", "codex/installed.rs"):
+    if "Command::new(" in code and relative not in runtime_ports:
         raise SystemExit(f"{relative} must invoke a typed OX port or runtime link")
 
 from claude_catalog_contract import check as check_claude_catalog

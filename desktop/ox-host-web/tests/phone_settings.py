@@ -87,14 +87,17 @@ def exercise(js, wait):
     js("window.fixtureAccountButton=document.querySelector('#settings button'); window.dispatchEvent(new CustomEvent('ox-native-login-finished'))")
     wait(lambda: js("return !fixtureAccountButton.isConnected && [...document.querySelectorAll('#settings button')].some(b=>b.textContent==='Sign in with Claude')"))
     wait(lambda: js("return !!document.querySelector('#settings [name=worker_approvals]')"))
+    assert js("return [...document.querySelectorAll('#settings button')].some(b=>b.disabled && b.textContent==='Sign in with Google')")
+    assert js("return document.querySelector('#settings [name=antigravity_start]').value===''")
     assert js("return document.querySelector('#settings [name=claude_start]').value===''")
     fill("worker_approvals", "operator")
     fill("claude_start", "auto")
+    fill("antigravity_start", "plan")
     go("Save agent settings")
     saved()
     agents = settings({"action": "read_behavior"})["behavior"]
     assert agents["worker_approvals"] == "operator" and agents["claude_start"] == "auto", agents
-    assert agents["codex_start"] is None and agents["font_size"] == 18, agents
+    assert agents["codex_start"] is None and agents["font_size"] == 18 and agents["antigravity_start"] == "plan", agents
     go("← Settings")
     go("Remote access")
     go("Host mode policy")
@@ -114,7 +117,33 @@ def exercise(js, wait):
        return window.jsQR(p.data,p.width,p.height).data.startsWith(location.origin+'/#pair=');})""")
     assert js("return document.querySelector('#settings').innerText.includes('Managed in OX Desktop') && document.documentElement.scrollWidth<=innerWidth")
     go("← Settings")
-    go("Install & notifications")
-    go("Set up notifications")
-    wait(lambda: js("return document.querySelector('#notification-setup').open && !document.querySelector('#catalog').hidden"))
-    print("PASS authenticated phone Settings forms, scoped key, provider/static model, favorites/search, phone/desktop appearance, agent settings, device grant, new QR and notification navigation", flush=True)
+    go("Install OX")
+    assert js("return document.querySelector('#settings h1').textContent==='Install OX'")
+    go("← Settings")
+    go("Notifications")
+    wait(lambda: js("""return document.querySelectorAll('#settings [role=switch]').length===6 &&
+        document.querySelector('#settings').innerText.includes('Browser permission')"""))
+    assert settings({"action": "push_preferences"})["preferences"] == {
+        "enabled": True, "approval": True, "question": True, "finished": True,
+        "goal_reached": False, "failed": True,
+    }
+    go("Turn done")
+    go("Goal reached")
+    wait(lambda: js("return !document.querySelector('#settings [role=switch][aria-disabled=true]')"))
+    go("Push notifications")
+    wait(lambda: js("return !document.querySelector('#settings [role=switch][aria-disabled=true]')"))
+    expected = {
+        "enabled": False, "approval": True, "question": True, "finished": False,
+        "goal_reached": True, "failed": True,
+    }
+    assert settings({"action": "push_preferences"})["preferences"] == expected
+    js("document.querySelector('#home').click()")
+    js("document.querySelector('#catalog .action-menu > summary').click()")
+    js("document.querySelector('#open-notifications').click()")
+    wait(lambda: js("""return document.querySelector('#settings h1').textContent==='Notifications' &&
+        document.querySelectorAll('#settings [role=switch][aria-checked=false]').length===2"""))
+    go("Push notifications")
+    wait(lambda: js("return !document.querySelector('#settings [role=switch][aria-disabled=true]')"))
+    assert settings({"action": "push_preferences"})["preferences"] == dict(expected, enabled=True)
+    go("← Sessions")
+    print("PASS authenticated phone Settings forms, scoped key, providers, favorites/search, appearance, agent settings, device grant, new QR and per-device notification preferences", flush=True)

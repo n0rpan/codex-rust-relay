@@ -9,6 +9,7 @@ pub(super) fn stylesheet() -> &'static [u8] {
         for (name, kind) in [
             ("codex", Cartridge::Codex),
             ("claude", Cartridge::Claude),
+            ("antigravity", Cartridge::Antigravity),
             ("api", Cartridge::Api),
             ("worker", Cartridge::Worker),
         ] {

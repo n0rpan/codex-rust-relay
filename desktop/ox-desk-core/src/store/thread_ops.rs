@@ -29,14 +29,15 @@ impl Store {
         if let Some(remote) = self.remote() {
             return remote.scope_caps.iter().any(|x| x == "edit_metadata");
         }
-        !self.is_session_scoped()
+        !self.is_session_scoped() && !self.is_antigravity()
     }
     pub fn can_manage_thread(&self, id: &str) -> bool {
         if let Some(remote) = self.remote() {
             return remote.can(id, "fork");
         }
         // A session another client is running can still be forked into a new OX one.
-        (self.can_change_access(id) || self.is_native_live(id))
+        !self.is_antigravity()
+            && (self.can_change_access(id) || self.is_native_live(id))
             && self.catalog.get(id).is_some_and(|r| !r.worker)
             && !self
                 .pending
