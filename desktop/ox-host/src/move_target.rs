@@ -4,7 +4,12 @@ use crate::{
     move_bundle::{BundlePlan, Presentation, verified_file},
     move_ledger::{Ledger, Plan, Prepared, Stage},
 };
-use ox_desk_core::host_protocol::Scope;
+use ox_desk_core::{
+    handoff::{self, HandoffSource},
+    host_protocol::Scope,
+    modes::Decision,
+    runtime::Runtime,
+};
 use ox_host_service::checkout::receive_result;
 use ox_host_web::move_manifest::{CHECKOUT, Manifest, PLAN, TRANSCRIPT};
 use serde::{Deserialize, Serialize};
@@ -159,6 +164,36 @@ impl VerifiedTarget {
             &self.saved.bundle.plan,
             self.saved.transcript_sha256,
         )
+    }
+
+    /// Build the checkpoint input for a fresh Codex writer in the verified checkout.
+    /// The bounded items are injected before the operator submits the next turn.
+    pub(crate) fn codex_checkpoint(
+        &self,
+        window: Option<u64>,
+    ) -> io::Result<Vec<serde_json::Value>> {
+        let plan = &self.saved.bundle.plan;
+        if plan.target_scope.route.runtime != Runtime::Codex {
+            return Err(invalid("Codex context requires the verified Codex route."));
+        }
+        let recent = self.history()?.continuation_items()?;
+        let selection =
+            handoff::select_for_continuation(&recent, window).map_err(io::Error::other)?;
+        let source = HandoffSource {
+            history_broker: None,
+            host: None,
+            scope: plan.source.scope.clone(),
+            session: plan.session.to_string(),
+            native: Some(plan.source.native.clone()),
+            title: self.saved.bundle.presentation.title.clone(),
+            runtime: Runtime::Codex,
+            route: plan.source.scope.route.clone(),
+            source_access: None,
+            source_level: None,
+            decision: Decision::Inherited,
+            selection: selection.refs.clone(),
+        };
+        Ok(handoff::codex_items(&source, &selection))
     }
 
     /// The session resolved by the destination actor must be the one that

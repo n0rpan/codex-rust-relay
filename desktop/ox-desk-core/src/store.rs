@@ -25,7 +25,7 @@ mod projection;
 pub mod replica;
 mod titles;
 pub use crate::runtime::Route;
-pub use moves::MoveWriterRelease;
+pub use moves::{MoveWriterPreparation, MoveWriterRelease};
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Profile {
@@ -52,6 +52,7 @@ enum Pending {
     Discover(commands::Discovery),
     LeaveForTerminal(commands::Handoff),
     LeaveForMove(String),
+    PrepareMoveWriter(moves::PrepareWriter),
     /// Best-effort release of a thread this client ended.
     Unsubscribe,
     Descendants(workers::Discovery),
@@ -107,6 +108,8 @@ pub struct Store {
     moving_threads: HashSet<String>,
     pending_codex_moves: HashMap<String, moves::CodexRelease>,
     move_writer_releases: Vec<MoveWriterRelease>,
+    move_writer_preparations: Vec<MoveWriterPreparation>,
+    prepared_move_writers: HashMap<String, String>,
     terminal_threads: HashSet<String>,
     /// Threads whose live process this client ended. Cleared lazily: a thread
     /// that is live again is not reported as ended.
@@ -238,6 +241,8 @@ impl Store {
             moving_threads: HashSet::new(),
             pending_codex_moves: HashMap::new(),
             move_writer_releases: Vec::new(),
+            move_writer_preparations: Vec::new(),
+            prepared_move_writers: HashMap::new(),
             terminal_threads: Default::default(),
             ended_threads: Default::default(),
             resume_sends: Default::default(),
@@ -589,6 +594,9 @@ impl Store {
                 self.notice = Some(message);
             }
             Pending::LeaveForMove(id) => self.complete_move_writer_release(&id, Err(message)),
+            Pending::PrepareMoveWriter(operation) => {
+                self.finish_move_writer_preparation(operation.id(), Err(message));
+            }
             Pending::Unsubscribe => (),
             Pending::Discover(stage) => self.discovery_failed(stage, message),
             Pending::Compose(op) => self.compose_failed(op, message),
@@ -635,7 +643,7 @@ impl Store {
                 }
             }
             Pending::ThreadOp(_) => self.changed.mark(Changed::THREADS),
-            Pending::Unsubscribe => (),
+            Pending::Unsubscribe | Pending::PrepareMoveWriter(_) => (),
             Pending::Initialize | Pending::Account | Pending::RefreshAccount => {
                 self.changed.mark(Changed::CONNECTION)
             }
@@ -753,6 +761,9 @@ impl Store {
                     }
                     (Pending::LeaveForMove(id), Reply::Unsubscribed(reply)) => {
                         self.acknowledge_codex_move_release(&id, reply.status);
+                    }
+                    (Pending::PrepareMoveWriter(operation), reply) => {
+                        self.apply_move_writer_reply(operation, reply);
                     }
                     (Pending::Unsubscribe, _) => (),
                     (Pending::ThreadOp(op), reply) => self.finish_thread_op(op, reply)?,

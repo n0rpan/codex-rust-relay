@@ -1,6 +1,11 @@
 //! Release the native writer for one already-fenced session.
 use super::{Call, Connection, Pending, Store};
-use crate::{changed::Changed, codex::commands::UnsubscribeStatus};
+use crate::{
+    changed::Changed,
+    codex::{commands::UnsubscribeStatus, history::ResumedThread, reply::Reply},
+    runtime::{Access, Billing},
+};
+use serde_json::Value;
 use std::io;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -10,6 +15,33 @@ pub struct MoveWriterRelease {
     pub result: Result<(), String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct MoveWriterPreparation {
+    pub operation: String,
+    /// The target's durable native thread ID, usable after activation.
+    pub result: Result<String, String>,
+}
+
+#[derive(Debug)]
+pub(super) enum PrepareWriter {
+    Open {
+        operation: String,
+        items: Vec<Value>,
+    },
+    Inject {
+        operation: String,
+        thread: String,
+    },
+}
+
+impl PrepareWriter {
+    pub(super) fn id(&self) -> &str {
+        match self {
+            Self::Open { operation, .. } | Self::Inject { operation, .. } => operation,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct CodexRelease {
     acknowledged: bool,
@@ -17,6 +49,126 @@ pub(super) struct CodexRelease {
 }
 
 impl Store {
+    /// Reserve a Codex thread in the chosen target checkout and checkpoint the
+    /// transferred context. No inference turn starts during this reservation.
+    pub fn prepare_codex_move_writer(
+        &mut self,
+        operation: String,
+        access: Option<Access>,
+        items: Vec<Value>,
+    ) -> io::Result<()> {
+        if self.is_host_client()
+            || self.is_session_scoped()
+            || self.state != Connection::Ready
+            || items.is_empty()
+        {
+            return Err(io::Error::other(
+                "Open the target Codex route before preparing a move.",
+            ));
+        }
+        if self.pending.values().any(|(_, pending)| {
+            matches!(pending, Pending::PrepareMoveWriter(active) if active.id() == operation)
+        }) {
+            return Ok(());
+        }
+        if let Some(thread) = self.prepared_move_writers.get(&operation).cloned() {
+            self.finish_move_writer_preparation(&operation, Ok(thread));
+            return Ok(());
+        }
+        let model = match &self.profile.route.billing {
+            Billing::Api(alias) => Some(alias.clone()),
+            Billing::Subscription => None,
+        };
+        self.request(
+            Call::New {
+                preset: access,
+                project: self.profile.project.clone(),
+                model,
+            },
+            Pending::PrepareMoveWriter(PrepareWriter::Open { operation, items }),
+        )
+    }
+
+    pub fn take_move_writer_preparations(&mut self) -> Vec<MoveWriterPreparation> {
+        std::mem::take(&mut self.move_writer_preparations)
+    }
+
+    /// The host calls this only after recording confirmed destination ownership.
+    pub fn enable_prepared_move_writer(&mut self, operation: &str, id: &str) -> bool {
+        if self
+            .prepared_move_writers
+            .get(operation)
+            .map(String::as_str)
+            != Some(id)
+        {
+            return false;
+        }
+        self.prepared_move_writers.remove(operation);
+        self.moving_threads.remove(id);
+        self.changed.transcript(id);
+        self.changed.mark(Changed::THREADS);
+        true
+    }
+
+    pub(super) fn apply_move_writer_reply(&mut self, pending: PrepareWriter, reply: Reply) {
+        match (pending, reply) {
+            (PrepareWriter::Open { operation, items }, Reply::Opened(opened)) => {
+                if let Err(error) = self.checkpoint_move_writer(operation.clone(), items, *opened) {
+                    self.finish_move_writer_preparation(&operation, Err(error.to_string()));
+                }
+            }
+            (PrepareWriter::Inject { operation, thread }, Reply::Acknowledged) => {
+                self.prepared_move_writers
+                    .insert(operation.clone(), thread.clone());
+                self.finish_move_writer_preparation(&operation, Ok(thread));
+            }
+            (pending, _) => self.finish_move_writer_preparation(
+                pending.id(),
+                Err("Unexpected Codex reply while preparing the move.".into()),
+            ),
+        }
+    }
+
+    fn checkpoint_move_writer(
+        &mut self,
+        operation: String,
+        items: Vec<Value>,
+        reply: ResumedThread,
+    ) -> io::Result<()> {
+        let thread = reply.thread.id.clone();
+        self.moving_threads.insert(thread.clone());
+        self.verify_opened(&thread, &reply)?;
+        let mut row = reply.thread;
+        row.model = Some(reply.model.clone());
+        self.record_row(row);
+        let transcript = self.transcripts.entry(thread.clone()).or_default();
+        transcript.model = Some(reply.model);
+        transcript.tier = reply.service_tier;
+        transcript.effort = reply.reasoning_effort;
+        transcript.access = Some(reply.permissions.access);
+        transcript.ceiling = reply.permissions.ceiling;
+        transcript.ready = true;
+        transcript.verified = true;
+        self.request(
+            Call::Inject {
+                thread: thread.clone(),
+                items,
+            },
+            Pending::PrepareMoveWriter(PrepareWriter::Inject { operation, thread }),
+        )
+    }
+
+    pub(super) fn finish_move_writer_preparation(
+        &mut self,
+        operation: &str,
+        result: Result<String, String>,
+    ) {
+        self.move_writer_preparations.push(MoveWriterPreparation {
+            operation: operation.into(),
+            result,
+        });
+    }
+
     /// Starts release of an idle native writer. The host keeps its durable move
     /// fence in force while it waits for the asynchronous result.
     pub fn release_writer_for_move(&mut self, id: &str) -> io::Result<()> {
@@ -107,7 +259,10 @@ impl Store {
 mod tests {
     use super::*;
     use crate::{
-        codex::{frame::Frame, names::Method},
+        codex::{
+            frame::{Frame, RequestId},
+            names::Method,
+        },
         links::LinkEvent,
         runtime::Route,
         store::Profile,
@@ -147,6 +302,54 @@ mod tests {
         store.apply(LinkEvent::Frame(
             Frame::decode(&serde_json::to_vec(&frame).unwrap(), |_| None).unwrap(),
         ));
+    }
+
+    #[test]
+    fn staging_a_codex_writer_checkpoints_context_without_sending_a_turn() {
+        let (_root, mut store) = fixture();
+        let items = vec![
+            json!({"type":"message","role":"user","content":[{"type":"input_text","text":"Earlier work"}]}),
+        ];
+        store
+            .prepare_codex_move_writer("move".into(), None, items.clone())
+            .unwrap();
+        let started = store.seq;
+        store
+            .prepare_codex_move_writer("move".into(), None, items.clone())
+            .unwrap();
+        assert_eq!(store.seq, started);
+        let opened = serde_json::from_value(json!({
+            "thread":{"id":"studio","modelProvider":"openai","cwd":store.profile.project},
+            "modelProvider":"openai","model":"stock-model",
+            "sandbox":{"type":"dangerFullAccess"},"approvalPolicy":"on-request",
+            "approvalsReviewer":"user","activePermissionProfile":null,
+        }))
+        .unwrap();
+        store.apply(LinkEvent::Frame(Frame::Reply {
+            id: RequestId::Number(started),
+            result: Ok(Reply::Opened(opened)),
+        }));
+        assert_ne!(store.seq, started);
+        assert!(store.take_move_writer_preparations().is_empty());
+        assert!(!store.can_send(Some("studio")));
+        assert!(store.can_send(Some("first")));
+        assert!(!store.enable_prepared_move_writer("move", "studio"));
+        let checkpoint = store.seq;
+        store.apply(LinkEvent::Frame(Frame::Reply {
+            id: RequestId::Number(checkpoint),
+            result: Ok(Reply::Acknowledged),
+        }));
+        assert_eq!(store.seq, checkpoint);
+        let prepared = MoveWriterPreparation {
+            operation: "move".into(),
+            result: Ok("studio".into()),
+        };
+        assert_eq!(store.take_move_writer_preparations(), [prepared]);
+        assert!(!store.has_pending_turn());
+        assert!(!store.can_send(Some("studio")));
+        assert!(!store.enable_prepared_move_writer("other operation", "studio"));
+        assert!(store.enable_prepared_move_writer("move", "studio"));
+        assert!(store.can_send(Some("studio")));
     }
 
     #[test]

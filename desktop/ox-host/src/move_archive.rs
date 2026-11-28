@@ -1,5 +1,6 @@
 //! The destination's portable, paged copy of a moved session's readable history.
 use crate::move_ledger::Plan;
+use ox_desk_core::handoff::{self, SourceItem};
 use ox_desk_core::host_protocol::{Timeline, TimelineItem};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -125,6 +126,20 @@ impl Archive {
             page.push(serde_json::from_str(&line)?);
         }
         Ok((page, (start > 0).then_some(start)))
+    }
+
+    pub(crate) fn continuation_items(&mut self) -> io::Result<Vec<SourceItem>> {
+        let mut cursor = Some(self.offsets.len());
+        let mut pages = Vec::new();
+        while let Some(before) = cursor {
+            let (items, previous) = self.previous(Some(before), 128)?;
+            pages.push(handoff::items(&Timeline {
+                items,
+                detail: serde_json::Value::Null,
+            }));
+            cursor = previous;
+        }
+        Ok(pages.into_iter().rev().flatten().collect())
     }
 }
 
@@ -325,6 +340,18 @@ mod tests {
         let receiver = Ledger::open(studio.path(), plan.target_host).unwrap();
         assert!(receiver.can_write(&plan.target_scope, "target-thread"));
         let target = VerifiedTarget::load(&jobs, plan).unwrap();
+        let checkpoint = target.codex_checkpoint(None).unwrap();
+        assert!(
+            checkpoint[0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(&plan.session.to_string())
+        );
+        assert!(
+            checkpoint
+                .iter()
+                .any(|item| item["content"][0]["text"] == "Original reply 5\n")
+        );
         assert_eq!(
             target
                 .presentation_for(&receiver, &plan.target_scope, "target-thread")
