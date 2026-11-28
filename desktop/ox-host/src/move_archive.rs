@@ -64,7 +64,12 @@ impl Archive {
         serde_json::to_writer(&mut file, &header)?;
         file.write_all(b"\n")?;
         for item in &timeline.items {
-            serde_json::to_writer(&mut file, item)?;
+            // Reopening a stock journal restores final items directly, so
+            // its per-connection streaming revision can differ from the live
+            // timeline. The archived item is immutable on either path.
+            let mut settled = item.clone();
+            settled.revision = 1;
+            serde_json::to_writer(&mut file, &settled)?;
             file.write_all(b"\n")?;
         }
         Ok(())
@@ -217,6 +222,23 @@ mod tests {
         let (first, before) = archive.previous(before, 4).unwrap();
         assert_eq!(first, timeline.items[..2]);
         assert_eq!(before, None);
+    }
+
+    #[test]
+    fn live_and_reopened_items_have_the_same_archive_fingerprint() {
+        let (header, mut timeline) = fixture();
+        let original = Archive::fingerprint(&header.plan, &timeline).unwrap();
+        timeline.items[0].revision = 17;
+        timeline.items[1].revision = 0;
+        assert_eq!(
+            Archive::fingerprint(&header.plan, &timeline).unwrap(),
+            original
+        );
+        timeline.items[0].text.push('!');
+        assert_ne!(
+            Archive::fingerprint(&header.plan, &timeline).unwrap(),
+            original
+        );
     }
 
     #[test]

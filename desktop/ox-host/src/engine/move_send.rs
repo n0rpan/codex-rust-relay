@@ -2,7 +2,7 @@
 use super::{Change, Engine, Message, Scope, Server};
 use crate::{
     move_bundle::{Bundle, Presentation},
-    move_ledger::{Activated, ArchivePin, Commit, Plan, Prepared, Proposal, Status},
+    move_ledger::{Activated, ArchivePin, Cancelled, Commit, Plan, Prepared, Proposal, Status},
 };
 use ox_desk_core::{
     actions::{Action, MoveSession},
@@ -22,6 +22,7 @@ use std::{
     os::unix::ffi::OsStrExt,
     path::Path,
     thread,
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -29,7 +30,14 @@ use uuid::Uuid;
 pub(super) struct Outgoing {
     reserving: HashMap<Uuid, Request>,
     transferring: HashSet<Uuid>,
+    reopening: HashMap<Uuid, u64>,
+    cancellations: HashMap<Uuid, CancellationDelivery>,
     pub(super) errors: HashMap<Uuid, String>,
+}
+
+enum CancellationDelivery {
+    Sending,
+    RetryAfter(Instant),
 }
 
 struct Request {
@@ -44,6 +52,7 @@ pub(crate) enum Outcome {
     Reserved(Uuid, io::Result<Plan>),
     Prepared(Plan, io::Result<(ArchivePin, Prepared)>),
     Activated(Plan, io::Result<Activated>),
+    Cancelled(Cancelled, io::Result<()>),
 }
 
 impl Engine {
@@ -267,6 +276,13 @@ impl Engine {
             .source_moves
             .ledger
             .source_identity(&scope, &action.thread)?;
+        let earlier_cancellations: Vec<_> = self
+            .source_moves
+            .ledger
+            .pending_cancellations()?
+            .into_iter()
+            .filter(|entry| entry.plan.session == session && entry.plan.target_host == destination)
+            .collect();
         let state = self.state_dir.clone();
         let actor = self.tx.clone();
         self.move_send.reserving.insert(
@@ -282,6 +298,15 @@ impl Engine {
         thread::spawn(move || {
             let result = (|| {
                 let destination = linked_host(&state, destination)?;
+                // Clear an earlier reservation before asking the same host to
+                // accept this session again. Delivery is idempotent.
+                for entry in earlier_cancellations {
+                    deliver_cancellation(&destination, &entry)?;
+                    let _ = actor.send(Message::MoveSend(Box::new(Outcome::Cancelled(
+                        entry,
+                        Ok(()),
+                    ))));
+                }
                 let (_, relative) = project_location(&source.scope.project)?;
                 reserve(
                     &destination,
@@ -312,30 +337,15 @@ impl Engine {
             .filter(|plan| &plan.source.scope == scope)
             .ok_or_else(|| io::Error::other("This move belongs to another session."))?;
         if matches!(command, Action::CancelMove(_)) {
-            let cancelled = self.source_moves.ledger.cancel_source(&plan)?;
-            let state = self.state_dir.clone();
-            thread::spawn(move || {
-                let result = (|| {
-                    let plan = &cancelled.plan;
-                    let destination = linked_host(&state, plan.target_host)?;
-                    Sender {
-                        destination: &destination,
-                    }
-                    .cancel(&Cancellation {
-                        source: plan.source.host.to_string(),
-                        target: plan.target_host.to_string(),
-                        transfer: plan.id.to_string(),
-                        cancelled_plan: serde_json::to_string(plan)?,
-                    })
-                })();
-                if let Err(error) = result {
-                    ox_host_service::errlog::record(&format!(
-                        "move cancellation could not reach the destination: {error}"
-                    ));
-                }
-            });
+            self.source_moves.ledger.cancel_source(&plan)?;
         }
         self.move_send.errors.remove(&id);
+        self.move_send.reopening.remove(&id);
+        if matches!(command, Action::RetryMove(_))
+            && self.source_moves.ledger.source_status(&plan)? == Status::Preparing
+        {
+            self.ensure(scope, None)?;
+        }
         if matches!(command, Action::CheckMove(_)) {
             self.source_moves.retry_refused_release(id);
             self.advance_source_moves()?;
@@ -346,6 +356,26 @@ impl Engine {
 
     pub(super) fn move_outcome(&mut self, outcome: Outcome) -> io::Result<()> {
         let (plan, result) = match outcome {
+            Outcome::Cancelled(cancelled, result) => {
+                let id = cancelled.plan.id;
+                match result {
+                    Ok(()) => {
+                        self.source_moves.ledger.confirm_cancellation(&cancelled)?;
+                        self.move_send.cancellations.remove(&id);
+                    }
+                    Err(error) => {
+                        if let Some(delivery) = self.move_send.cancellations.get_mut(&id) {
+                            *delivery = CancellationDelivery::RetryAfter(
+                                Instant::now() + Duration::from_secs(30),
+                            );
+                            ox_host_service::errlog::record(&format!(
+                                "move cancellation could not reach the destination: {error}"
+                            ));
+                        }
+                    }
+                }
+                return Ok(());
+            }
             Outcome::Reserved(id, result) => {
                 let Some(request) = self.move_send.reserving.remove(&id) else {
                     return Ok(());
@@ -394,6 +424,7 @@ impl Engine {
     }
 
     pub(super) fn drive_move_transfers(&mut self) -> io::Result<()> {
+        self.drive_move_cancellations()?;
         for (plan, phase) in self.source_moves.ledger.pending_sources()? {
             self.publish_move_progress(&plan.source.scope, &plan.source.native)?;
             if self.move_send.transferring.contains(&plan.id)
@@ -403,6 +434,14 @@ impl Engine {
             }
             let work = match phase {
                 Status::Preparing => {
+                    match self.reopen_source_move_history(&plan) {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => {
+                            self.move_send.errors.insert(plan.id, error.to_string());
+                            continue;
+                        }
+                    }
                     // A client can send to a moved session without opening its
                     // timeline first. Carry the existing archive on every hop.
                     match self.load_moved_history(&plan.source.scope, &plan.source.native, false) {
@@ -471,6 +510,81 @@ impl Engine {
         }
         Ok(())
     }
+
+    fn reopen_source_move_history(&mut self, plan: &Plan) -> io::Result<bool> {
+        let scope = &plan.source.scope;
+        let thread = &plan.source.native;
+        if !self.running.contains_key(scope) {
+            self.ensure(scope, None)?;
+        }
+        let live = self.running.get_mut(scope).expect("source route opened");
+        match live.store.state() {
+            Connection::Connecting => return Ok(false),
+            Connection::Ready => {}
+            _ => {
+                return Err(io::Error::other(
+                    "Reconnect the source runtime and retry the move.",
+                ));
+            }
+        }
+        if live.store.is_native_live(thread) {
+            return Err(io::Error::other(
+                "Close the session in the other runtime before moving it.",
+            ));
+        }
+        let transcript = live.store.transcript(thread);
+        if transcript.is_some_and(|view| view.is_loading()) {
+            return Ok(false);
+        }
+        if transcript.is_some_and(|view| view.is_ready())
+            && live.store.move_writer_group(thread).is_some()
+        {
+            self.move_send.reopening.remove(&plan.id);
+            return Ok(true);
+        }
+        if self.move_send.reopening.get(&plan.id) == Some(&live.generation) {
+            return Err(io::Error::other(
+                transcript
+                    .and_then(|view| view.error())
+                    .unwrap_or("The source history could not be reopened."),
+            ));
+        }
+        if live.store.catalog_row(thread).is_none()
+            && let Some(row) = live.recovered.iter().find(|row| row.id == *thread)
+        {
+            live.store
+                .adopt_catalog_row(serde_json::from_value(row.detail["row"].clone())?)?;
+        }
+        live.store.reopen_move_source_writer(thread)?;
+        self.move_send.reopening.insert(plan.id, live.generation);
+        Ok(false)
+    }
+
+    fn drive_move_cancellations(&mut self) -> io::Result<()> {
+        for entry in self.source_moves.ledger.pending_cancellations()? {
+            let id = entry.plan.id;
+            if match self.move_send.cancellations.get(&id) {
+                Some(CancellationDelivery::Sending) => true,
+                Some(CancellationDelivery::RetryAfter(at)) => *at > Instant::now(),
+                None => false,
+            } {
+                continue;
+            }
+            self.move_send
+                .cancellations
+                .insert(id, CancellationDelivery::Sending);
+            let state = self.state_dir.clone();
+            let actor = self.tx.clone();
+            thread::spawn(move || {
+                let result = linked_host(&state, entry.plan.target_host)
+                    .and_then(|destination| deliver_cancellation(&destination, &entry));
+                let _ = actor.send(Message::MoveSend(Box::new(Outcome::Cancelled(
+                    entry, result,
+                ))));
+            });
+        }
+        Ok(())
+    }
 }
 
 fn attach_move_progress(row: &mut ox_desk_core::host_protocol::SessionView, progress: Value) {
@@ -487,6 +601,22 @@ fn is_owned_lead(row: &ox_desk_core::host_protocol::SessionView) -> bool {
 enum Work {
     Prepare(Presentation, Timeline),
     Activate(Commit),
+}
+
+fn deliver_cancellation(destination: &SavedHost, cancelled: &Cancelled) -> io::Result<()> {
+    let plan = &cancelled.plan;
+    let receipt = Sender { destination }.cancel(&Cancellation {
+        source: plan.source.host.to_string(),
+        target: plan.target_host.to_string(),
+        transfer: plan.id.to_string(),
+        cancelled_plan: serde_json::to_string(plan)?,
+    })?;
+    if receipt["cancelled"] != true {
+        return Err(io::Error::other(
+            "The destination did not acknowledge the cancellation.",
+        ));
+    }
+    Ok(())
 }
 
 fn linked_host(state: &Path, id: Uuid) -> io::Result<SavedHost> {

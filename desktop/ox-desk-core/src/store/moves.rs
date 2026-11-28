@@ -55,6 +55,20 @@ pub(super) struct History {
 }
 
 impl Store {
+    /// Restore an idle source's history after its host stopped during preparation.
+    /// The actor holds its write fence and no input is sent to the runtime.
+    pub fn reopen_move_source_writer(&mut self, id: &str) -> io::Result<()> {
+        if self.is_session_scoped() {
+            let row = self
+                .catalog
+                .get(id)
+                .ok_or_else(|| io::Error::other("The source session is outside this catalog."))?;
+            self.check_route(row)?;
+            return self.claude_resume(id, false);
+        }
+        self.select(id)
+    }
+
     /// The owning helper starts in a private process group with its stock runtime.
     pub fn move_writer_group(&self, thread: &str) -> Option<u32> {
         match &self.link {

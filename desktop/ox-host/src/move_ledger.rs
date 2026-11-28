@@ -117,7 +117,10 @@ enum Phase {
         stage: Stage,
         confirmed: bool,
     },
-    SourceCancelled,
+    SourceCancelled {
+        #[serde(default)]
+        delivered: bool,
+    },
     TargetPrepared {
         stage: Stage,
     },
@@ -144,7 +147,7 @@ impl Phase {
             Self::SourceCommitted {
                 confirmed: true, ..
             } => Status::Confirmed,
-            Self::SourceCancelled | Self::TargetCancelled { .. } => Status::Cancelled,
+            Self::SourceCancelled { .. } | Self::TargetCancelled { .. } => Status::Cancelled,
             Self::TargetPrepared { .. } => Status::Prepared,
             Self::TargetActive { .. } => Status::Active,
         }
@@ -228,7 +231,7 @@ impl Ledger {
                 | Phase::SourcePreparing { .. }
                 | Phase::SourceFenced { .. }
                 | Phase::SourceCommitted { .. }
-                | Phase::SourceCancelled => record.plan.source.host,
+                | Phase::SourceCancelled { .. } => record.plan.source.host,
                 _ => record.plan.target_host,
             };
             if *id != record.plan.id
@@ -366,7 +369,7 @@ impl Ledger {
                         && plan.source.native == native
                         && !matches!(
                             record.phase,
-                            Phase::SourceCancelled | Phase::SourceQueued { .. }
+                            Phase::SourceCancelled { .. } | Phase::SourceQueued { .. }
                         );
                 }
                 &plan.target_scope == scope
@@ -829,12 +832,37 @@ impl Ledger {
         self.check_hosts(plan, self.data.host, plan.target_host)?;
         match self.require(plan)? {
             Phase::SourceQueued { .. } | Phase::SourcePreparing { .. } => {
-                self.set(plan, Phase::SourceCancelled)?
+                self.set(plan, Phase::SourceCancelled { delivered: false })?
             }
-            Phase::SourceCancelled => {}
+            Phase::SourceCancelled { .. } => {}
             _ => return Err(io::Error::other("The move has already fenced the source.")),
         }
         Ok(Cancelled { plan: plan.clone() })
+    }
+
+    pub(crate) fn pending_cancellations(&self) -> io::Result<Vec<Cancelled>> {
+        self.healthy()?;
+        Ok(self
+            .data
+            .moves
+            .values()
+            .filter(|record| matches!(record.phase, Phase::SourceCancelled { delivered: false }))
+            .map(|record| Cancelled {
+                plan: record.plan.clone(),
+            })
+            .collect())
+    }
+
+    pub(crate) fn confirm_cancellation(&mut self, cancelled: &Cancelled) -> io::Result<()> {
+        let plan = &cancelled.plan;
+        self.check_hosts(plan, self.data.host, plan.target_host)?;
+        match self.require(plan)? {
+            Phase::SourceCancelled { delivered: false } => {
+                self.set(plan, Phase::SourceCancelled { delivered: true })
+            }
+            Phase::SourceCancelled { delivered: true } => Ok(()),
+            _ => Err(io::Error::other("This move was not cancelled.")),
+        }
     }
 
     pub(crate) fn cancel_receiver(
@@ -1366,6 +1394,8 @@ mod tests {
         );
         let cancelled = source.cancel_source(&plan).unwrap();
         assert_eq!(source.cancel_source(&plan).unwrap(), cancelled);
+        let mut source = Ledger::open(laptop.path(), plan.source.host).unwrap();
+        assert_eq!(source.pending_cancellations().unwrap(), [cancelled.clone()]);
         assert!(source.can_write(&plan.source.scope, "local"));
         assert!(
             source
@@ -1375,6 +1405,15 @@ mod tests {
         target
             .cancel_receiver(plan.source.host, &cancelled)
             .unwrap();
+        source.confirm_cancellation(&cancelled).unwrap();
+        source.confirm_cancellation(&cancelled).unwrap();
+        let source_after_delivery = Ledger::open(laptop.path(), plan.source.host).unwrap();
+        assert!(
+            source_after_delivery
+                .pending_cancellations()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(target.status(plan.id).unwrap(), Some(Status::Cancelled));
         assert!(!target.can_write(&plan.target_scope, "stage"));
         assert!(

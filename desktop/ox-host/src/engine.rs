@@ -476,6 +476,7 @@ impl Engine {
     }
     pub(crate) fn serve(&mut self, rx: Receiver<Message>) -> io::Result<()> {
         self.recover_worker_results();
+        self.drive_move_transfers()?;
         // Mailbox messages served in a row while a timer was already overdue.
         let mut overdue_streak = 0u32;
         loop {
@@ -7570,7 +7571,7 @@ mod tests {
             let changed = {
                 let live = engine.running.get_mut(&scope).unwrap();
                 let item = &mut live.state.transcripts.get_mut(&lead).unwrap().items[0];
-                item.revision += 1;
+                item.text.push('!');
                 item.id.clone()
             };
             assert!(
@@ -7578,19 +7579,23 @@ mod tests {
                     .stage_source_move(plan.target_host, &prepared)
                     .is_err()
             );
-            engine
-                .running
-                .get_mut(&scope)
-                .unwrap()
-                .state
-                .transcripts
-                .get_mut(&lead)
-                .unwrap()
-                .items
-                .iter_mut()
-                .find(|item| item.id == changed)
-                .unwrap()
-                .revision -= 1;
+            assert_eq!(
+                engine
+                    .running
+                    .get_mut(&scope)
+                    .unwrap()
+                    .state
+                    .transcripts
+                    .get_mut(&lead)
+                    .unwrap()
+                    .items
+                    .iter_mut()
+                    .find(|item| item.id == changed)
+                    .unwrap()
+                    .text
+                    .pop(),
+                Some('!')
+            );
             assert_eq!(
                 engine
                     .stage_source_move(plan.target_host, &prepared)
