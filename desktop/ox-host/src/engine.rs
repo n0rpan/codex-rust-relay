@@ -234,6 +234,9 @@ struct Live {
     /// thread/start. Its launcher hears the outcome only once they do.
     confirming: Option<Confirming>,
     opening: Option<(u64, String)>,
+    /// Existing Codex turns waiting for native admission, keyed by thread. The
+    /// original connection gets the receipt. Draft text stays with the client.
+    awaiting_input: HashMap<String, (u64, String)>,
     terminal: Option<(u64, String)>,
     schema_started: bool,
     recovered: Vec<wire::SessionView>,
@@ -1099,6 +1102,9 @@ impl Engine {
                             *owner = id;
                             return Ok(());
                         }
+                        if self.reclaim_waiting_input(&scope, &key, id) {
+                            return Ok(());
+                        }
                         if let Some(thread) = receipt.opened {
                             self.reply(
                                 id,
@@ -1144,7 +1150,9 @@ impl Engine {
                 let accepted = matches!(result, Server::Ack { .. });
                 // Only accepted actions are receipts. A refusal is often transient, so a corrected
                 // retry with the same key must run again rather than replay the refusal.
-                let waiting = accepted && self.waiting_open_client(&scope, &key).is_some();
+                let waiting = accepted
+                    && (self.waiting_open_client(&scope, &key).is_some()
+                        || self.input_delivery_pending(&scope, &key));
                 if accepted {
                     self.receipts
                         .insert(scope.clone(), key, generation, hash, result.clone());
@@ -1444,6 +1452,7 @@ impl Engine {
                 fork_origin: None,
                 confirming: None,
                 opening: None,
+                awaiting_input: Default::default(),
                 terminal: None,
                 schema_started: false,
                 recovered,
@@ -1459,6 +1468,30 @@ impl Engine {
         self.broadcast(scope, changes)?;
         Ok(true)
     }
+    fn input_delivery_pending(&self, scope: &Scope, key: &str) -> bool {
+        self.running.get(scope).is_some_and(|live| {
+            live.awaiting_input
+                .values()
+                .any(|(_, action)| action == key)
+        })
+    }
+
+    /// The receipt lookup checked scope, runtime generation, action ID and digest.
+    /// A reconnect can take the original connection's reply without replaying the input.
+    fn reclaim_waiting_input(&mut self, scope: &Scope, key: &str, client: u64) -> bool {
+        let Some((original, _)) = self.running.get_mut(scope).and_then(|live| {
+            live.awaiting_input
+                .values_mut()
+                .find(|(_, action)| action == key)
+        }) else {
+            return false;
+        };
+        if !self.clients.contains_key(original) {
+            *original = client;
+        }
+        true
+    }
+
     fn act(
         &mut self,
         id: u64,
@@ -1801,6 +1834,12 @@ impl Engine {
         let live = self.running.get_mut(scope).expect("validated live scope");
         if let Some(t) = &target {
             live.tracker.touch(t);
+            if operator_turn
+                && scope.route.runtime == ox_desk_core::runtime::Runtime::Codex
+                && live.store.track_codex_input(t)
+            {
+                live.awaiting_input.insert(t.clone(), (id, key.into()));
+            }
         }
         if terminal {
             live.terminal = Some((id, key.into()));
@@ -2144,6 +2183,24 @@ impl Engine {
             });
         }
         let mut created = Vec::new();
+        live.awaiting_input.retain(|thread, (client, key)| {
+            let Some(result) = live.store.take_codex_input_delivery(thread) else {
+                return true;
+            };
+            let frame = match result {
+                Ok(()) => Server::Ack { id: key.clone() },
+                Err(message) => {
+                    let frame = Server::Error {
+                        id: Some(key.clone()),
+                        message,
+                    };
+                    self.receipts.finish(scope, key, frame.clone());
+                    frame
+                }
+            };
+            created.push((*client, frame));
+            false
+        });
         let antigravity = scope.route.runtime == ox_desk_core::runtime::Runtime::Antigravity;
         if let Some(thread) = opened
             && let Some((id, key)) = live.opening.take()
@@ -3858,6 +3915,7 @@ mod tests {
                 fork_origin: None,
                 confirming: None,
                 opening: None,
+                awaiting_input: Default::default(),
                 terminal: None,
                 schema_started: true,
                 recovered: vec![],
@@ -3941,6 +3999,7 @@ mod tests {
                     fork_origin: None,
                     confirming: None,
                     opening: None,
+                    awaiting_input: Default::default(),
                     terminal: None,
                     schema_started: true,
                     recovered: vec![],
@@ -4034,6 +4093,7 @@ mod tests {
                 fork_origin: None,
                 confirming: None,
                 opening: None,
+                awaiting_input: Default::default(),
                 terminal: None,
                 schema_started: true,
                 recovered: vec![],
@@ -4540,6 +4600,7 @@ mod tests {
                     fork_origin: None,
                     confirming: None,
                     opening: None,
+                    awaiting_input: Default::default(),
                     terminal: None,
                     schema_started: true,
                     recovered: vec![],
@@ -6824,6 +6885,7 @@ mod tests {
                 fork_origin: None,
                 confirming: None,
                 opening: None,
+                awaiting_input: Default::default(),
                 terminal: None,
                 schema_started: true,
                 recovered: vec![],
