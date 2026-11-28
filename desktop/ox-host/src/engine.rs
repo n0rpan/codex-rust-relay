@@ -1839,6 +1839,9 @@ impl Engine {
         for event in events {
             let previous = live.store.asks().len();
             live.store.apply(event);
+            #[cfg(test)]
+            self.source_moves
+                .observe_native_results(scope, &live.store)?;
             if let Some(report) = live.store.usage.worker_report.take() {
                 self.subscription_limits.record(&scope.route, report);
             }
@@ -4585,13 +4588,13 @@ mod tests {
                 engine.source_move_status(plan.id).unwrap(),
                 Some(Status::Queued)
             );
-            assert!(engine.check_source_move_action(&scope, &send()).is_err());
+            assert!(engine.check_source_move_action(&scope, &send()).is_ok());
             assert!(
                 engine
                     .check_source_move_action(&other_route, &send())
                     .is_ok()
             );
-            update(&mut engine, 4, None, "t1");
+            update(&mut engine, 4, None, "native-busy");
             assert_eq!(
                 engine.source_move_status(plan.id).unwrap(),
                 Some(Status::Preparing)

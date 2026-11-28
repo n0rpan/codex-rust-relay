@@ -81,14 +81,30 @@ pub(crate) enum Status {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 enum Phase {
-    SourceQueued { turn: String },
+    SourceQueued {
+        turn: String,
+        #[serde(default)]
+        finished: bool,
+    },
     SourcePreparing,
-    SourceFenced { stage: Stage, released: bool },
-    SourceCommitted { stage: Stage, confirmed: bool },
+    SourceFenced {
+        stage: Stage,
+        released: bool,
+    },
+    SourceCommitted {
+        stage: Stage,
+        confirmed: bool,
+    },
     SourceCancelled,
-    TargetPrepared { stage: Stage },
-    TargetActive { stage: Stage },
-    TargetCancelled { stage: Option<Stage> },
+    TargetPrepared {
+        stage: Stage,
+    },
+    TargetActive {
+        stage: Stage,
+    },
+    TargetCancelled {
+        stage: Option<Stage>,
+    },
 }
 
 impl Phase {
@@ -287,20 +303,26 @@ impl Ledger {
             return Err(io::Error::other("The current turn is not known."));
         }
         if let Some(record) = self.record(plan)?
-            && let Phase::SourceQueued { turn: existing } = &record.phase
+            && let Phase::SourceQueued { turn: existing, .. } = &record.phase
             && existing != turn
         {
             return Err(io::Error::other(
                 "The move is already waiting for a different turn.",
             ));
         }
-        self.record_source(plan, Phase::SourceQueued { turn: turn.into() })
+        self.record_source(
+            plan,
+            Phase::SourceQueued {
+                turn: turn.into(),
+                finished: false,
+            },
+        )
     }
 
     pub(crate) fn queued_turn(&self, plan: &Plan) -> io::Result<Option<&str>> {
         self.check_hosts(plan, self.data.host, plan.target_host)?;
         Ok(match self.record(plan)?.map(|record| &record.phase) {
-            Some(Phase::SourceQueued { turn }) => Some(turn.as_str()),
+            Some(Phase::SourceQueued { turn, .. }) => Some(turn.as_str()),
             _ => None,
         })
     }
@@ -313,15 +335,45 @@ impl Ledger {
             })
     }
 
-    /// The actor calls this only after a terminal native event for this turn.
-    pub(crate) fn start_queued(&mut self, plan: &Plan, completed_turn: &str) -> io::Result<Status> {
+    /// Remember the terminal event even if a worker notice or native goal
+    /// continuation later updates the live row's most recent result.
+    pub(crate) fn observe_queued_result(
+        &mut self,
+        plan: &Plan,
+        completed_turn: &str,
+    ) -> io::Result<()> {
+        self.check_hosts(plan, self.data.host, plan.target_host)?;
+        if let Phase::SourceQueued {
+            turn,
+            finished: false,
+        } = self.require(plan)?
+            && turn == completed_turn
+        {
+            self.set(
+                plan,
+                Phase::SourceQueued {
+                    turn: turn.clone(),
+                    finished: true,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn queued_result_seen(&self, plan: &Plan) -> io::Result<bool> {
+        self.check_hosts(plan, self.data.host, plan.target_host)?;
+        Ok(matches!(
+            self.require(plan)?,
+            Phase::SourceQueued { finished: true, .. }
+        ))
+    }
+
+    /// The actor also ensures that the runtime and its worker graph are idle.
+    pub(crate) fn start_queued(&mut self, plan: &Plan) -> io::Result<()> {
         self.check_hosts(plan, self.data.host, plan.target_host)?;
         match self.require(plan)? {
-            Phase::SourceQueued { turn } if turn == completed_turn => {
-                self.set(plan, Phase::SourcePreparing)?;
-                Ok(Status::Preparing)
-            }
-            Phase::SourcePreparing => Ok(Status::Preparing),
+            Phase::SourceQueued { finished: true, .. } => self.set(plan, Phase::SourcePreparing),
+            Phase::SourcePreparing => Ok(()),
             _ => Err(io::Error::other(
                 "The move is still waiting for its requested turn.",
             )),
@@ -830,15 +882,19 @@ mod tests {
         assert!(!source().can_start_turn(&plan.source.scope, "local"));
         assert!(source().can_start_turn(&plan.source.scope, "other"));
         assert!(source().queue_source(&plan, "different").is_err());
-        assert!(source().start_queued(&plan, "older").is_err());
+        source().observe_queued_result(&plan, "older").unwrap();
+        assert!(source().start_queued(&plan).is_err());
         assert_eq!(
             source().pending_sources().unwrap(),
             [(plan.clone(), Status::Queued)]
         );
-        assert_eq!(
-            source().start_queued(&plan, "current").unwrap(),
-            Status::Preparing
-        );
+        source().observe_queued_result(&plan, "current").unwrap();
+        source()
+            .observe_queued_result(&plan, "worker-notice")
+            .unwrap();
+        assert!(source().queued_result_seen(&plan).unwrap());
+        source().start_queued(&plan).unwrap();
+        assert_eq!(source().status(plan.id).unwrap(), Some(Status::Preparing));
         assert!(!source().can_write(&plan.source.scope, "local"));
         assert_eq!(source().queued_turn(&plan).unwrap(), None);
         source().cancel_source(&plan).unwrap();

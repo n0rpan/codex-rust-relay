@@ -24,6 +24,22 @@ impl SourceMoves {
             releases: HashMap::new(),
         })
     }
+
+    pub(super) fn observe_native_results(
+        &mut self,
+        scope: &Scope,
+        store: &ox_desk_core::store::Store,
+    ) -> io::Result<()> {
+        for (plan, status) in self.ledger.pending_sources()? {
+            if status == Status::Queued
+                && &plan.source.scope == scope
+                && let Some(result) = store.last_result(&plan.source.native)
+            {
+                self.ledger.observe_queued_result(&plan, &result.turn)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 enum Effect<'a> {
@@ -160,22 +176,24 @@ impl Engine {
     pub(super) fn advance_source_moves(&mut self) -> io::Result<()> {
         for (plan, phase) in self.source_moves.ledger.pending_sources()? {
             match phase {
-                Status::Queued if self.move_source_quiescent(&plan) => {
+                Status::Queued => {
                     let thread = &plan.source.native;
                     let scope = &plan.source.scope;
-                    let live = &self.running[scope];
-                    let result = live.store.last_result(thread).cloned().or_else(|| {
+                    if let Some(result) = self.running.get(scope).and_then(|live| {
                         live.state
                             .sessions
                             .iter()
                             .find(|row| &row.id == thread)?
                             .last_result()
-                    });
-                    if let Some(result) = result
-                        && self.source_moves.ledger.queued_turn(&plan)?
-                            == Some(result.turn.as_str())
+                    }) {
+                        self.source_moves
+                            .ledger
+                            .observe_queued_result(&plan, &result.turn)?;
+                    }
+                    if self.source_moves.ledger.queued_result_seen(&plan)?
+                        && self.move_source_quiescent(&plan)
                     {
-                        self.source_moves.ledger.start_queued(&plan, &result.turn)?;
+                        self.source_moves.ledger.start_queued(&plan)?;
                     }
                 }
                 Status::Fenced => self.begin_move_writer_release(&plan),
@@ -312,6 +330,30 @@ impl Engine {
         Ok(())
     }
 
+    pub(super) fn can_deliver_move_worker_notice(
+        &self,
+        scope: &Scope,
+        thread: &str,
+    ) -> io::Result<bool> {
+        let ledger = &self.source_moves.ledger;
+        if !ledger.can_write(scope, thread) {
+            return Ok(false);
+        }
+        if ledger.can_start_turn(scope, thread) {
+            return Ok(true);
+        }
+        for (plan, status) in ledger.pending_sources()? {
+            if status == Status::Queued
+                && &plan.source.scope == scope
+                && plan.source.native == thread
+            {
+                // Settle already-owned children before copying the conversation.
+                return ledger.queued_result_seen(&plan);
+            }
+        }
+        Ok(false)
+    }
+
     fn check_move_effect(&self, scope: &Scope, thread: &str, effect: Effect<'_>) -> io::Result<()> {
         let ledger = &self.source_moves.ledger;
         if !ledger.can_write(scope, thread) {
@@ -333,9 +375,10 @@ impl Engine {
                             && &plan.source.scope == scope
                             && plan.source.native == thread
                     })
-                    && let Some(expected) = ledger.queued_turn(&plan)?
-                    && transcript.and_then(|t| t.active_turn()) == Some(expected)
-                    && ask_turn.is_none_or(|turn| turn == expected)
+                    && let Some(active) = transcript.and_then(|t| t.active_turn())
+                    && (ledger.queued_turn(&plan)? == Some(active)
+                        || ledger.queued_result_seen(&plan)?)
+                    && ask_turn.is_none_or(|turn| turn == active)
                 {
                     return Ok(());
                 }
