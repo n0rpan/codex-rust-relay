@@ -888,6 +888,18 @@ model. If a mode fails, check the job status. You can also run it directly in
 [Codex Goal mode](https://learn.chatgpt.com/docs/long-running-work) ·
 [Claude Code workflows](https://code.claude.com/docs/en/workflows)
 
+### Remember project preferences
+
+Open **Settings → Memory** or search for **Open OX Memory** in the desktop command palette.
+Save a project preference, find a saved note, or edit, pin, and forget existing entries.
+Pinning makes an entry eligible for the budgeted memory brief on a new session.
+Agents can recall other eligible memories with the OX tools.
+
+In a paired phone conversation, open the session menu and choose **OX Memory**.
+It shows shareable memories for that project and host, and can save a project preference.
+Local-only entries can be managed on the host desktop.
+A worker's launch brief and the separate host memory sync grant are independent.
+
 ### Choose a worker host
 
 Open **Start worker** on desktop or in the web UI. **Same as parent** is the default. Choose a linked host by name, or choose **Auto** and optionally enter minimum memory in GB, CPU count, GPU and OS. The model picker includes API routes configured on the target. Pair worker hosts under **Settings → Hosts → Worker host links** and register the repository on the receiver with `ox host project add DIR`.

@@ -212,8 +212,17 @@ def run(gui, codex, root, drop_probe=None, fleet_harness=None):
             key("Tab")
         key("Return")
         time.sleep(.15)
-        for _ in range(4):
+        # Tab to the alias input. Check focus by typing and selecting a
+        # sentinel so new Settings tabs can appear before the input.
+        for _ in range(12):
             key("Tab")
+            command("wl-copy", "--clear")
+            command("wtype", "ox-ime-focus")
+            if copy_selected() == "ox-ime-focus":
+                key("BackSpace")
+                break
+        else:
+            raise AssertionError("Tab did not reach the model alias field")
         compose_chinese("beijing","北京")
         key("comma", "ctrl")
         key("b", "ctrl")

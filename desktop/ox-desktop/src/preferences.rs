@@ -6,6 +6,7 @@ pub mod behavior;
 mod forms;
 mod hosts;
 mod key_field;
+mod memory;
 pub(crate) use hosts::{HostDirectory, Hosts};
 mod remote;
 mod sessions;
@@ -36,6 +37,7 @@ enum Page {
     Credentials,
     Legacy,
     Sessions,
+    Memory,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -62,6 +64,7 @@ pub struct Preferences {
     about: Entity<about::About>,
     remote: Option<Entity<remote::Remote>>,
     advanced: Option<advanced::Advanced>,
+    memory: Option<Entity<memory::Library>>,
     project: PathBuf,
     prefer_providers: bool,
     settings: Settings,
@@ -105,6 +108,7 @@ impl Preferences {
             hosts: cx.new(|cx| hosts::Hosts::new(window, cx)),
             focus,
             advanced: None,
+            memory: None,
             about: cx.new(about::About::new),
             remote: None,
             project,
@@ -151,6 +155,17 @@ impl Preferences {
             self.goto(Page::Remote, cx);
         }
     }
+    pub(crate) fn open_memory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.link.remote().is_some() {
+            return;
+        }
+        self.prefer_providers = true;
+        if self.memory.is_none() {
+            self.memory = Some(cx.new(|cx| memory::Library::new(self.project.clone(), window, cx)));
+        }
+        self.goto(Page::Memory, cx);
+    }
+
     fn goto(&mut self, page: Page, cx: &mut Context<Self>) {
         let page = if page == Page::Remote && self.link.remote().is_some() {
             Page::Hosts
@@ -401,7 +416,8 @@ impl Preferences {
             | Page::Accounts
             | Page::Behavior
             | Page::Advanced
-            | Page::Sessions => {
+            | Page::Sessions
+            | Page::Memory => {
                 return String::new();
             }
         }
@@ -1199,9 +1215,13 @@ impl Preferences {
             (Page::Sessions, "Sessions"),
             (Page::Legacy, "Legacy Codex provider"),
             (Page::Advanced, "Advanced configuration"),
+            (Page::Memory, "Memory"),
         ] {
             if self.link.remote().is_some()
-                && matches!(page, Page::Behavior | Page::Sessions | Page::Remote)
+                && matches!(
+                    page,
+                    Page::Behavior | Page::Sessions | Page::Remote | Page::Memory
+                )
             {
                 continue;
             }
@@ -1217,6 +1237,8 @@ impl Preferences {
                 cx.listener(move |s, _, w, cx| {
                     if page == Page::Advanced {
                         s.open_advanced(w, cx)
+                    } else if page == Page::Memory {
+                        s.open_memory(w, cx)
                     } else {
                         s.goto(page, cx)
                     }
@@ -1249,6 +1271,7 @@ impl Preferences {
                 Page::Advanced => self.advanced_page(p, cx),
                 Page::Behavior => self.behavior_page(p, cx),
                 Page::Sessions => self.sessions_page(p, cx),
+                Page::Memory => div().children(self.memory.clone()),
                 Page::Providers => self.providers_view(p, cx),
                 Page::Credentials => self.credentials_view(p, cx),
                 Page::Favorites => self.favorites_view(p, cx),

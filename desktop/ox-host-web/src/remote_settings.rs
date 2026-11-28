@@ -68,6 +68,55 @@ enum BehaviorAction {
         behavior: ox_desk_core::desktop_behavior::Behavior,
     },
 }
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum MemoryAction {
+    ReadProjectMemory { project: PathBuf },
+    AddProjectMemory { project: PathBuf, text: String },
+}
+impl MemoryAction {
+    fn apply(self, path: PathBuf, host: &str) -> Result<Value, ox_memory::MemoryError> {
+        use ox_memory::{Kind, MemoryStore, NewMemory, Scope, Sensitivity};
+
+        let (project, text) = match self {
+            Self::ReadProjectMemory { project } => (project, None),
+            Self::AddProjectMemory { project, text } => (project, Some(text)),
+        };
+        if !project.is_absolute() {
+            return Err(ox_memory::MemoryError::InvalidInput(
+                "Open a project before using OX Memory.".into(),
+            ));
+        }
+        let store = MemoryStore::open(path);
+        if let Some(text) = text {
+            store.upsert(NewMemory {
+                id: None,
+                scope: Scope::Project(ox_memory::canonical_project_id(&project)),
+                kind: Kind::Preference,
+                sensitivity: Sensitivity::Private,
+                text,
+                tags: Vec::new(),
+                pin: false,
+                source_host: host.to_owned(),
+            })?;
+        }
+        let entries = store.list_for_project(&project, host, Sensitivity::Private)?;
+        let count = entries.len();
+        let entries: Vec<_> = entries
+            .into_iter()
+            .take(100)
+            .map(|entry| {
+                json!({
+                    "text": entry.text, "scope": entry.scope.short_label(),
+                    "kind": entry.kind.as_str(), "sensitivity": entry.sensitivity.as_str(),
+                    "pinned": entry.pin, "saved_here": entry.source_host == host,
+                })
+            })
+            .collect();
+        Ok(json!({"entries": entries, "total": count}))
+    }
+}
+
 pub(super) async fn settings(
     Extract(app): Extract<App>,
     headers: HeaderMap,
@@ -220,6 +269,35 @@ pub(super) async fn settings(
             .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
         return super::project_picker::apply(&app, &id, action).await;
     }
+    if let Ok(memory) = serde_json::from_str::<MemoryAction>(text) {
+        let slot = HELPERS
+            .try_acquire()
+            .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+        let active = app.state.clone();
+        let requester = id.clone();
+        let data = tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            let (path, host) = {
+                let state = active.lock().unwrap();
+                if !state.alive(&requester) {
+                    return Err(DENY);
+                }
+                let host = state
+                    .host_id()
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                (state.memory_path(), host)
+            };
+            Ok(memory
+                .apply(path, &host)
+                .unwrap_or_else(|err| json!({"error":safe_error(&err.to_string())})))
+        })
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+        if !app.state.lock().unwrap().alive(&id) {
+            return Err(DENY);
+        }
+        return Ok(Json(data));
+    }
     let behavior = serde_json::from_str::<BehaviorAction>(text).ok();
     let request = if behavior.is_some() {
         None
@@ -332,5 +410,66 @@ fn safe_error(message: &str) -> &'static str {
         "Check the provider and model settings on the laptop."
     } else {
         "The laptop could not apply this request. Review the settings and try again."
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    use ox_memory::{Kind, MemoryStore, NewMemory, Scope, Sensitivity};
+
+    #[test]
+    fn paired_memory_excludes_local_only_and_other_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("memory.json");
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let store = MemoryStore::open(&path);
+        for (scope, sensitivity, text) in [
+            (Scope::Global, Sensitivity::LocalOnly, "Local-only fixture"),
+            (
+                Scope::Project("different-project".into()),
+                Sensitivity::Public,
+                "Other project fixture",
+            ),
+            (Scope::Global, Sensitivity::Private, "Shared fixture"),
+        ] {
+            store
+                .upsert(NewMemory {
+                    id: None,
+                    scope,
+                    kind: Kind::Fact,
+                    sensitivity,
+                    text: text.into(),
+                    tags: Vec::new(),
+                    pin: false,
+                    source_host: "fixture".into(),
+                })
+                .unwrap();
+        }
+        let result = MemoryAction::AddProjectMemory {
+            project: project.clone(),
+            text: "Use the staging API".into(),
+        }
+        .apply(path.clone(), "fixture")
+        .unwrap();
+        let entries = result["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry["text"] == "Shared fixture")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry["text"] == "Use the staging API" && entry["scope"] == "project")
+        );
+        assert_eq!(
+            MemoryAction::ReadProjectMemory { project }
+                .apply(path, "fixture")
+                .unwrap(),
+            result
+        );
     }
 }
