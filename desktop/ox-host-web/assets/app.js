@@ -17,6 +17,7 @@ import { pairingCode, setupCamera } from "./pair-camera.js";
 import { ActivityLine } from "./activity.js";
 import * as wire from "./wire.js";
 import { SessionControls } from "./controls.js";
+import { MoveControls } from "./move-controls.js";
 import { forgetKnownHosts, setupSettings } from "./settings.js";
 import {
   scopeKey,
@@ -107,6 +108,7 @@ function page(id) {
   if (id !== "catalog" && id !== "pair") notificationTarget.request(null);
   if (id !== "settings") phoneSettings?.reset?.();
   if (id !== "running") stopRunning();
+  if (id !== "conversation") moveControls.update(null);
   clearConfirm($("confirm-slot"));
   clearConfirm($("running-confirm"));
   const returningToCatalog = id === "catalog" && $("catalog").hidden;
@@ -240,6 +242,7 @@ function saveSidebarMeta() {
 loadSidebarMeta();
 const global = new Projection(true);
 const controls = new SessionControls();
+const moveControls = new MoveControls();
 function connectedHostName() {
   return globalLink?.hostName || location.hostname.split(".")[0];
 }
@@ -1855,6 +1858,18 @@ function conversation() {
   $("start-worker").hidden = !id || !caps.includes("open");
   $("start-worker").disabled = !detailLink?.ready;
   $("continue-in").hidden = !id || !caps.includes("open");
+  moveControls.update({
+    owner: keyOf(scope, id),
+    thread: id,
+    source: connectedHostName(),
+    ready: Boolean(detailLink?.ready),
+    supported: Boolean(id && caps.includes("move_session")),
+    running: caps.includes("stop"),
+    move: row?.detail?.move,
+    targets: row?.detail?.move_destinations,
+    act: (action, reply) => detailLink?.act(action, null, reply),
+    notice,
+  });
   showAsks(asks);
   // The activity line only trusts a live link: a reconnect must not look like a finished turn.
   if (detailLink?.ready && s) {

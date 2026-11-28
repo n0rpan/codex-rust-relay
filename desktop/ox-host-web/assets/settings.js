@@ -151,7 +151,7 @@ function fields(parent, specs, base = {}, isNew = false) {
   return { inputs, changes };
 }
 
-function registeredHostOrigin(value) {
+export function registeredHostOrigin(value) {
   try {
     const url = new URL(value);
     if (

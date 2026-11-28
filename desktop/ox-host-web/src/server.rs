@@ -466,6 +466,15 @@ fn start_listener(app: App, origin: String, listener: TcpListener) -> Listener {
             get(|| async { asset("text/javascript", include_bytes!("../assets/controls.js")) }),
         )
         .route(
+            "/move-controls.js",
+            get(|| async {
+                asset(
+                    "text/javascript",
+                    include_bytes!("../assets/move-controls.js"),
+                )
+            }),
+        )
+        .route(
             "/model.js",
             get(|| async { asset("text/javascript", include_bytes!("../assets/model.js")) }),
         )
