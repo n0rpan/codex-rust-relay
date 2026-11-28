@@ -19,6 +19,7 @@ enum Target {
     },
     Refresh,
     LocalTerminal,
+    Memory,
     Project(PathBuf, Route),
     Route(PathBuf, Route),
     Command {
@@ -361,6 +362,13 @@ impl Host {
             format!("Local shell · {}", project.display()),
             Target::LocalTerminal,
         );
+        if self.link.remote().is_none() {
+            add(
+                "Open OX Memory".into(),
+                "Review saved project preferences and memories on this computer".into(),
+                Target::Memory,
+            );
+        }
         if self.discovery.pending == 0 {
             add(
                 "Refresh sessions".into(),
@@ -772,6 +780,15 @@ impl Host {
                 if let Err(error) = self.link.open_shell(project, cx) {
                     self.message = Some(error);
                     cx.notify();
+                }
+            }
+            Target::Memory => {
+                self.close_palette(window, cx);
+                if self.preferences.is_none() {
+                    self.show_settings(window, cx);
+                }
+                if let Some(view) = &self.preferences {
+                    view.update(cx, |view, cx| view.open_memory(window, cx));
                 }
             }
             Target::Refresh => {

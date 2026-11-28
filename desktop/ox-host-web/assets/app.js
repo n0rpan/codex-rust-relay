@@ -298,6 +298,14 @@ const phoneSettings = setupSettings({
     return openPhoneTerminal(`${runtime}-login`);
   },
 });
+$("open-memory").onclick = () => {
+  if (!selected) return;
+  const current = selected;
+  closeActionMenus();
+  page("settings");
+  void phoneSettings.memory(current.scope.project, () => open(current.scope, current.id));
+};
+
 /** The host took a send and then lost it (a resume that failed after the Ack): its text
  * comes back into the composer once per lost message, before anything typed since, as in
  * the desktop replica. */
@@ -399,6 +407,7 @@ class Link {
             $(id).replaceChildren();
           $("draft").value = "";
           syncDraftHeight();
+          phoneSettings.reset();
           pairingPage();
         }
       } else this.lost();

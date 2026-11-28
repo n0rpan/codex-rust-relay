@@ -15,6 +15,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 gpui.workspace = true
 gpui_platform.workspace = true
 ox-desk-core = { path = "../ox-desk-core" }
+ox-memory = { path = "../ox-memory" }
 gpui-component.workspace = true
 # The default icon bundle gpui-component draws (lucide subset); no new crate in the tree.
 gpui-kit-assets = "=0.10.0"
