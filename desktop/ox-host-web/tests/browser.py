@@ -10,6 +10,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import socket
 import socketserver
@@ -50,6 +51,65 @@ class ThreadedTCP(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
+def forward_upgrade(client, upstream):
+    """Drive both directions of one TLS socket on the same thread."""
+    client.setblocking(False)
+    upstream.setblocking(False)
+    to_client = b""
+    to_upstream = b""
+    upstream_open = True
+    client_open = True
+    read_needs_write = False
+    write_needs_read = False
+    while upstream_open or to_client:
+        read_client = client_open and not to_upstream
+        receive_buffered = (read_client and isinstance(client, ssl.SSLSocket)
+                            and client.pending() > 0 and not read_needs_write)
+        read = []
+        write = []
+        if (read_client and not read_needs_write) or (to_client and write_needs_read):
+            read.append(client)
+        if (read_client and read_needs_write) or (to_client and not write_needs_read):
+            write.append(client)
+        if upstream_open and not to_client:
+            read.append(upstream)
+        if to_upstream:
+            write.append(upstream)
+        readable, writable, _ = select.select(read, write, [], 0 if receive_buffered else None)
+
+        if to_client and client in (readable if write_needs_read else writable):
+            try:
+                sent = client.send(to_client)
+                to_client = to_client[sent:]
+                write_needs_read = False
+            except ssl.SSLWantReadError:
+                write_needs_read = True
+            except (ssl.SSLWantWriteError, BlockingIOError):
+                write_needs_read = False
+        if read_client and (receive_buffered or client in (writable if read_needs_write else readable)):
+            try:
+                to_upstream = client.recv(65536)
+                client_open = bool(to_upstream)
+                read_needs_write = False
+                if not client_open:
+                    upstream.shutdown(socket.SHUT_WR)
+            except ssl.SSLWantWriteError:
+                read_needs_write = True
+            except (ssl.SSLWantReadError, BlockingIOError):
+                read_needs_write = False
+        if upstream in readable:
+            try:
+                to_client = upstream.recv(65536)
+                upstream_open = bool(to_client)
+            except BlockingIOError:
+                pass
+        if upstream in writable:
+            try:
+                to_upstream = to_upstream[upstream.send(to_upstream):]
+            except BlockingIOError:
+                pass
+
+
 class Forward(socketserver.StreamRequestHandler):
     """TLS-to-loopback proxy, accepting no client-supplied identity."""
 
@@ -86,25 +146,13 @@ class Forward(socketserver.StreamRequestHandler):
                 + f"Connection: {connection}\r\nTailscale-User-Login: phone@example.test\r\n\r\n".encode()
                 + body
             )
-            upstream.settimeout(None)
-            if upgrade:
-
-                def back():
-                    try:
-                        while data := self.request.recv(65536):
-                            upstream.sendall(data)
-                    except OSError:
-                        pass
-                    finally:
-                        try:
-                            upstream.shutdown(socket.SHUT_WR)
-                        except OSError:
-                            pass
-
-                threading.Thread(target=back, daemon=True).start()
             try:
-                while data := upstream.recv(65536):
-                    self.request.sendall(data)
+                if upgrade:
+                    forward_upgrade(self.request, upstream)
+                else:
+                    upstream.settimeout(None)
+                    while data := upstream.recv(65536):
+                        self.request.sendall(data)
             except OSError:
                 pass
 
