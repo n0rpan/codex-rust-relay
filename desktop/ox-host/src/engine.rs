@@ -7065,7 +7065,7 @@ mod tests {
             receiver.running.insert(plan.target_scope.clone(), live);
             let (reply, prepared) = std::sync::mpsc::channel();
             receiver
-                .prepare_codex_move_target(plan.source.host, target, None, reply)
+                .prepare_move_target(plan.source.host, target, None, reply)
                 .unwrap();
             assert!(prepared.try_recv().is_err());
             let opened = serde_json::from_value(json!({
@@ -7165,6 +7165,7 @@ mod tests {
             let studio = tempfile::tempdir().unwrap();
             let (scope, lead, mut engine, rx) = warm_claude_in(root.path(), &project);
             let mut plan = move_plan(&engine, &scope, &lead);
+            plan.target_host = crate::identity::load(studio.path()).unwrap();
             plan.target_scope.project = studio
                 .path()
                 .canonicalize()
@@ -7196,7 +7197,7 @@ mod tests {
                 transcript: bundle.manifest.transcript.sha256,
             };
             engine.bind_move_manifest(&plan, archive).unwrap();
-            let mut ledger = Ledger::open(studio.path(), plan.target_host).unwrap();
+            let ledger = Ledger::open(studio.path(), plan.target_host).unwrap();
             let target = VerifiedTarget::install(
                 studio.path(),
                 &ledger,
@@ -7209,9 +7210,19 @@ mod tests {
                 },
             )
             .unwrap();
-            let prepared = target
-                .prepare(&mut ledger, plan.source.host, "studio-native".into())
+            let (_, _, mut receiver, _studio_events) =
+                warm_claude_in(studio.path(), &plan.target_scope.project);
+            let (reply, prepared) = std::sync::mpsc::channel();
+            receiver
+                .prepare_move_target(plan.source.host, target, None, reply)
                 .unwrap();
+            let prepared = prepared.try_recv().unwrap().unwrap();
+            let native = &prepared.stage.native;
+            assert!(
+                !receiver.running[&plan.target_scope]
+                    .store
+                    .has_live_session(native)
+            );
             assert!(
                 engine
                     .stage_source_move(uuid::Uuid::new_v4(), &prepared)
@@ -7262,10 +7273,13 @@ mod tests {
             });
             assert!(!engine.running[&scope].store.has_live_session(&lead));
             let commit = engine.committed_move(&plan).unwrap();
-            let activated = ledger.activate_receiver(plan.source.host, &commit).unwrap();
+            let activated = receiver
+                .activate_move_target(plan.source.host, &commit)
+                .unwrap();
             engine.confirm_move(plan.target_host, &activated).unwrap();
+            let target = VerifiedTarget::load(studio.path(), &plan).unwrap();
             let mut history = target
-                .history_for(&ledger, &plan.target_scope, "studio-native")
+                .history_for(&receiver.source_moves.ledger, &plan.target_scope, native)
                 .unwrap();
             assert!(
                 history
@@ -7280,6 +7294,32 @@ mod tests {
                 "laptop draft"
             );
             drop(engine);
+            let continued = target
+                .claude_request(
+                    &receiver.source_moves.ledger,
+                    &plan.target_scope,
+                    native,
+                    "Continue on Studio",
+                )
+                .unwrap();
+            assert!(continued.contains("lead first turn"));
+            assert!(continued.ends_with("Continue on Studio"));
+            let live = receiver.running.get_mut(&plan.target_scope).unwrap();
+            assert!(!live.store.has_live_session(native));
+            live.store
+                .start_claude_move_turn(&plan.id.to_string(), native, continued, None)
+                .unwrap();
+            assert!(live.store.has_live_session(native));
+            assert!(
+                live.store
+                    .start_claude_move_turn(
+                        &plan.id.to_string(),
+                        native,
+                        "Do not repeat".into(),
+                        None
+                    )
+                    .is_err()
+            );
 
             let (tx, _mailbox) = std::sync::mpsc::sync_channel(32);
             let engine = Engine::open(config(root.path()), root.path(), tx).unwrap();

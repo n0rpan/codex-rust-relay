@@ -199,6 +199,26 @@ impl VerifiedTarget {
         Ok(handoff::codex_items(&source, &selection))
     }
 
+    pub(crate) fn claude_request(
+        &self,
+        ledger: &Ledger,
+        scope: &Scope,
+        native: &str,
+        request: &str,
+    ) -> io::Result<String> {
+        if scope.route.runtime != Runtime::Claude {
+            return Err(invalid(
+                "Claude context requires the verified Claude route.",
+            ));
+        }
+        let items = self
+            .history_for(ledger, scope, native)?
+            .continuation_items()?;
+        let selection = handoff::select(&items, request, None).map_err(io::Error::other)?;
+        let source = self.history_source(selection.refs.clone());
+        Ok(handoff::claude_turn(&source, &selection, request))
+    }
+
     fn history_source(&self, selection: SelectionRefs) -> HandoffSource {
         let plan = self.plan();
         HandoffSource {

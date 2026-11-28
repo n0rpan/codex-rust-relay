@@ -88,7 +88,7 @@ impl Engine {
         Ok(self)
     }
 
-    pub(super) fn prepare_codex_move_target(
+    pub(super) fn prepare_move_target(
         &mut self,
         source: Uuid,
         target: VerifiedTarget,
@@ -116,10 +116,16 @@ impl Engine {
         if live.store.state() != &Connection::Ready {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "Waiting for the target Codex route.",
+                "Waiting for the target runtime.",
             ));
         }
         let id = plan.id;
+        if live.store.is_session_scoped() {
+            let native = live.store.prepare_claude_move_writer(&id.to_string())?;
+            let prepared = target.prepare(&mut self.source_moves.ledger, source, native)?;
+            let _ = reply.send(Ok(prepared));
+            return Ok(());
+        }
         if let Some(pending) = self.target_moves.pending.get_mut(&id) {
             if pending.destination.plan() != plan || pending.source != source {
                 return Err(io::Error::other(

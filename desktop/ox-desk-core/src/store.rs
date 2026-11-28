@@ -97,6 +97,7 @@ pub struct Store {
     context_windows: Vec<(Option<String>, u64)>,
     /// The next new Claude session's first turn is a handoff block plus request.
     claude_handoff: bool,
+    claude_move_session: Option<String>,
     host_annotations: HashMap<String, (Option<String>, serde_json::Value)>,
     naming: Option<titles::Service>,
     authorized_models: HashMap<String, String>,
@@ -230,6 +231,7 @@ impl Store {
             handoff_items: None,
             context_windows: Vec::new(),
             claude_handoff: false,
+            claude_move_session: None,
             host_annotations: Default::default(),
             naming: None,
             authorized_models: Default::default(),
