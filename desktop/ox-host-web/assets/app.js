@@ -25,6 +25,7 @@ import {
   emptyScope,
   catalogTree,
   catalogParentResolver,
+  recentDays,
 } from "./model.js";
 import {
   deviceKey,
@@ -139,6 +140,7 @@ let key,
   detailLink,
   selected = null,
   filter = "all",
+  catalogView = "recent",
   routes = [],
   projects = [],
   scheduled = false;
@@ -172,6 +174,7 @@ function loadSidebarMeta() {
     const raw = localStorage.getItem(SIDEBAR_META_KEY);
     if (!raw) return;
     const parsed = JSON.parse(raw);
+    if (parsed.view === "folders") catalogView = "folders";
     for (const [k, ts] of Object.entries(parsed.pinned || {}))
       if (typeof ts === "number") pinnedThreads.set(k, ts);
     for (const [k, c] of Object.entries(parsed.colors || {}))
@@ -191,6 +194,7 @@ function saveSidebarMeta() {
     localStorage.setItem(
       SIDEBAR_META_KEY,
       JSON.stringify({
+        view: catalogView,
         pinned: Object.fromEntries(pinnedThreads),
         colors: Object.fromEntries(threadColors),
         foldedProjects: [...foldedProjects],
@@ -797,6 +801,11 @@ function entries() {
   return [...map.values()];
 }
 function catalog() {
+  const listElement = $("list");
+  const focusedKey = listElement.contains(document.activeElement)
+    ? document.activeElement.dataset.sessionKey
+    : null;
+  let focusedRow;
   const rows = entries();
   const drafts = [];
   for (const state of global.scopes.values()) {
@@ -871,10 +880,11 @@ function catalog() {
   const tree = catalogTree(visible, rows);
   const filtering = Boolean(needle) || filter !== "all";
   const pinnedList = [];
-  const byProject = new Map();
+  const remaining = [];
   for (const entry of visible) {
     const k = keyOf(entry.scope, entry.session.id);
     if (pinnedThreads.has(k)) pinnedList.push(entry);
+    else remaining.push(entry);
   }
   pinnedList.sort(
     (a, b) =>
@@ -882,12 +892,6 @@ function catalog() {
         (pinnedThreads.get(keyOf(a.scope, a.session.id)) || 0) ||
       b.session.updated_at - a.session.updated_at,
   );
-  for (const entry of tree.roots) {
-    if (pinnedThreads.has(keyOf(entry.scope, entry.session.id))) continue;
-    const list = byProject.get(entry.scope.project) ?? [];
-    list.push(entry);
-    byProject.set(entry.scope.project, list);
-  }
   const frag = document.createDocumentFragment();
   if (filter === "all" || filter === "requests") {
     for (const {scope} of drafts) {
@@ -900,8 +904,10 @@ function catalog() {
     }
   }
   const names = new Map();
-  for (const project of byProject.keys())
+  for (const project of new Set(visible.map((entry) => entry.scope.project)))
     names.set(leaf(project), (names.get(leaf(project)) || 0) + 1);
+  const projectLabel = (project) =>
+    names.get(leaf(project)) === 1 ? leaf(project) : project;
   const done = new Set();
   const renderEntry = (entry, depth, showProjectTag) => {
     const { scope, session, needsInput } = entry,
@@ -925,6 +931,8 @@ function catalog() {
       !needsInput && ["saved", "idle"].includes(session.status),
     );
     b.dataset.threadId = session.id;
+    b.dataset.sessionKey = key;
+    if (key === focusedKey) focusedRow = b;
     if (isPinned) b.dataset.pinned = "true";
     if (accent) b.dataset.accent = accent;
     b.className = "session" + (depth ? " nested" : "");
@@ -937,7 +945,7 @@ function catalog() {
     );
     let meta = depth ? "↳ " : "";
     if (showProjectTag || (depth && elsewhere))
-      meta += leaf(scope.project) + " · ";
+      meta += projectLabel(scope.project) + " · ";
     else if (!depth && recorded)
       meta += `↳ ${recorded.title || leaf(recorded.project)} · `;
     meta += routesLabel(scope.route);
@@ -945,6 +953,13 @@ function catalog() {
     if (session.updated_at > 0 && nowSec >= session.updated_at)
       meta += ` · ${ago(nowSec - session.updated_at)}`;
     b.append(head, el("div", "meta", meta));
+    if (catalogView === "recent" && recorded) {
+      const isWorker =
+        session.parent || session.detail?.worker || session.detail?.origin?.relation === "worker";
+      const relation = isWorker ? "Worker for" : "From";
+      const parent = recorded.title || `a session in ${leaf(recorded.project)}`;
+      b.append(el("div", "meta", `${relation} ${parent}`));
+    }
     const worker = session.detail?.worker_notice;
     if (worker?.status)
       b.append(
@@ -955,9 +970,11 @@ function catalog() {
         ),
       );
     frag.append(b);
-    for (const child of tree.children.get(key) || [])
-      if (!pinnedThreads.has(keyOf(child.scope, child.session.id)))
-        renderEntry(child, depth + 1, false);
+    if (catalogView === "folders") {
+      for (const child of tree.children.get(key) || [])
+        if (!pinnedThreads.has(keyOf(child.scope, child.session.id)))
+          renderEntry(child, depth + 1, false);
+    }
   };
   if (pinnedList.length) {
     const pinKey = "__pinned__";
@@ -977,6 +994,41 @@ function catalog() {
     if (!folded) {
       for (const entry of pinnedList) renderEntry(entry, 0, true);
     }
+  }
+
+  if (catalogView === "recent") {
+    for (const day of recentDays(remaining)) {
+      frag.append(el("h2", "catalog-day", day.label));
+      for (const entry of day.entries) renderEntry(entry, 0, true);
+    }
+  } else {
+    renderFolders(frag, tree, filtering, projectLabel, renderEntry);
+  }
+  if (!frag.childNodes.length)
+    frag.append(
+      el(
+        "p",
+        "empty",
+        filter === "requests"
+          ? "Nothing needs you."
+          : filter === "active"
+            ? "No running sessions."
+            : filter === "finished"
+              ? "No finished sessions."
+              : "No sessions found.",
+      ),
+    );
+  listElement.replaceChildren(frag);
+  focusedRow?.focus({ preventScroll: true });
+  $("new").disabled = !globalLink?.ready || !(routes.length || apiProvider);
+}
+function renderFolders(frag, tree, filtering, projectLabel, renderEntry) {
+  const byProject = new Map();
+  for (const entry of tree.roots) {
+    if (pinnedThreads.has(keyOf(entry.scope, entry.session.id))) continue;
+    const list = byProject.get(entry.scope.project) ?? [];
+    list.push(entry);
+    byProject.set(entry.scope.project, list);
   }
   const latestReplyIn = (list) => {
     let max = 0;
@@ -1038,8 +1090,7 @@ function catalog() {
     repaint();
   };
   sortedProjects.forEach(([project, list], projectIdx) => {
-    const name = leaf(project);
-    const label = names.get(name) === 1 ? name : project;
+    const label = projectLabel(project);
     const folded = !filtering && foldedProjects.has(project);
     const starred = starredProjects.has(project);
     const folderColor = projectColors.get(project) || null;
@@ -1145,22 +1196,6 @@ function catalog() {
       for (const entry of list) renderEntry(entry, 0, false);
     }
   });
-  if (!frag.childNodes.length)
-    frag.append(
-      el(
-        "p",
-        "empty",
-        filter === "requests"
-          ? "Nothing needs you."
-          : filter === "active"
-            ? "No running sessions."
-            : filter === "finished"
-              ? "No finished sessions."
-            : "No sessions found.",
-      ),
-    );
-  $("list").replaceChildren(frag);
-  $("new").disabled = !globalLink?.ready || !(routes.length || apiProvider);
 }
 function showAsks(asks) {
   const stamp = JSON.stringify(asks);
@@ -1834,6 +1869,17 @@ $("home").onclick = () => {
 };
 document.querySelectorAll(".back").forEach((b) => (b.onclick = home));
 $("find-sessions").oninput = repaint;
+for (const b of $("catalog-view").children) {
+  b.setAttribute("aria-pressed", String(b.dataset.view === catalogView));
+  b.onclick = () => {
+    if (catalogView === b.dataset.view) return;
+    catalogView = b.dataset.view;
+    for (const choice of $("catalog-view").children)
+      choice.setAttribute("aria-pressed", String(choice === b));
+    saveSidebarMeta();
+    repaint();
+  };
+}
 $("filters").onclick = (e) => {
   if (!e.target.dataset.filter) return;
   filter = e.target.dataset.filter;

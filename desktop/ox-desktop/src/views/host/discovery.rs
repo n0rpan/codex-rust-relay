@@ -1033,12 +1033,8 @@ impl Host {
         });
         let mut catalog = Vec::new();
         let mut ordinal = 0;
-        let push_tree = |catalog: &mut Vec<CatalogEntry>,
-                         children: &mut HashMap<&Key, Vec<(&Key, i64, Location)>>,
-                         ordinal: &mut usize,
-                         root: (&Key, i64, Location)| {
-            let mut stack = vec![(root.0, root.2, root.1, 0)];
-            while let Some((key, loc, timestamp, depth)) = stack.pop() {
+        let push_thread =
+            |catalog: &mut Vec<CatalogEntry>, ordinal: &mut usize, loc, timestamp, depth| {
                 catalog.push(CatalogEntry::Thread {
                     loc,
                     timestamp,
@@ -1046,6 +1042,14 @@ impl Host {
                     depth,
                 });
                 *ordinal += 1;
+            };
+        let push_tree = |catalog: &mut Vec<CatalogEntry>,
+                         children: &mut HashMap<&Key, Vec<(&Key, i64, Location)>>,
+                         ordinal: &mut usize,
+                         root: (&Key, i64, Location)| {
+            let mut stack = vec![(root.0, root.2, root.1, 0)];
+            while let Some((key, loc, timestamp, depth)) = stack.pop() {
+                push_thread(catalog, ordinal, loc, timestamp, depth);
                 if !filtering
                     && self
                         .discovery
@@ -1084,7 +1088,13 @@ impl Host {
         let tree_snapshot = self.workers.read(cx).trees.clone();
         if !pinned_roots.is_empty() {
             let nodes: Vec<_> = pinned_roots.iter().map(|(_, _, r)| *r).collect();
-            let (running, waiting) = node_rollup(&nodes, &tree_snapshot);
+            let empty_tree = HashMap::new();
+            let rollup = if self.sidebar.grouping == GroupingMode::Folders {
+                &tree_snapshot
+            } else {
+                &empty_tree
+            };
+            let (running, waiting) = node_rollup(&nodes, rollup);
             let folded = !filtering && self.sidebar.pinned_collapsed;
             catalog.push(CatalogEntry::Pinned {
                 count: nodes.len(),
@@ -1094,30 +1104,40 @@ impl Host {
             });
             if !folded {
                 for node in nodes {
-                    push_tree(&mut catalog, &mut children, &mut ordinal, node);
+                    if self.sidebar.grouping == GroupingMode::Folders {
+                        push_tree(&mut catalog, &mut children, &mut ordinal, node);
+                    } else {
+                        push_thread(&mut catalog, &mut ordinal, node.2, node.1, 0);
+                    }
                 }
             }
         }
         match self.sidebar.grouping {
             GroupingMode::Timeline => {
-                let mut previous = None;
-                let mut per_day: HashMap<Option<chrono::NaiveDate>, usize> = HashMap::new();
-                for (_, timestamp, _) in &unpinned_roots {
-                    *per_day.entry(session_day(*timestamp)).or_default() += 1;
-                }
-                for root in unpinned_roots {
-                    let day = session_day(root.1);
+                // A worker belongs on the day it did the work, even when its
+                // parent is older, folded or pinned.
+                let pinned: HashSet<_> = pinned_roots.iter().map(|(_, _, node)| node.0).collect();
+                let recent: Vec<_> = ordered
+                    .into_iter()
+                    .filter(|key| !pinned.contains(key))
+                    .map(|key| {
+                        let entry = &entries[key];
+                        let timestamp = entry.order.0;
+                        (session_day(timestamp), timestamp, entry.loc)
+                    })
+                    .collect();
+                for rows in recent.chunk_by(|a, b| a.0 == b.0) {
+                    let day = rows[0].0;
                     let folded = !filtering && self.discovery.folded_days.contains(&day);
-                    if previous != Some(day) {
-                        catalog.push(CatalogEntry::Day {
-                            day,
-                            count: per_day.get(&day).copied().unwrap_or_default(),
-                            folded,
-                        });
-                    }
-                    previous = Some(day);
+                    catalog.push(CatalogEntry::Day {
+                        day,
+                        count: rows.len(),
+                        folded,
+                    });
                     if !folded {
-                        push_tree(&mut catalog, &mut children, &mut ordinal, root);
+                        for &(_, timestamp, loc) in rows {
+                            push_thread(&mut catalog, &mut ordinal, loc, timestamp, 0);
+                        }
                     }
                 }
             }

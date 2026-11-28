@@ -81,6 +81,16 @@ def run(gui, codex, claude, root, failure_image=None):
                 window.wait(lambda s: s["connected"], "active project")
                 window.word("Larch")
                 window.word("Willow")
+                folder = f"project-folder-{beta}"
+                window.control(folder)
+                window.press("threads-recent")
+                window.wait(lambda s: any(c["id"].startswith("day-") for c in s["layout"])
+                            and all(c["id"] != folder for c in s["layout"]),
+                            "sessions grouped by activity day")
+                window.word("Larch")
+                window.word("Willow")
+                window.press("threads-folders")
+                window.control(folder)
                 # Import another terminal session created while Desktop is already running.
                 seed([claude, "-p", "--name", "Maple history", "--model", "demo", "Summarize the orchard"],
                      beta, native_env)
