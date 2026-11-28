@@ -110,6 +110,8 @@ pub struct Workbench {
     thread_edit: Option<thread_menu::ThreadEdit>,
     pub(super) launch_request: Option<super::worker_sheet::LaunchKind>,
     pub(super) launch: Option<super::worker_sheet::Launch>,
+    #[cfg(test)]
+    pub(super) move_preview: super::move_preview::Preview,
     pub(super) launch_picker: Option<(
         super::worker_sheet::LaunchKind,
         Entity<super::model_picker::ModelPicker>,
@@ -293,6 +295,8 @@ impl Workbench {
             picker_dismissed: None,
             launch_request: None,
             launch: None,
+            #[cfg(test)]
+            move_preview: super::move_preview::Preview::default(),
             launch_picker: None,
             front,
             query: String::new(),
@@ -1114,12 +1118,26 @@ impl Workbench {
         if self.pending_row_action.is_some() {
             self.finish_pending_row_action(window, cx);
         }
-        let controls = self.thread_menu(cx);
-        let start_worker = self.start_worker_button(p, cx);
+        #[cfg(test)]
+        let (move_button, move_panel, source_fenced) = (
+            self.move_preview_button(p, cx),
+            self.move_preview_panel(p, cx),
+            self.move_source_fenced(),
+        );
+        #[cfg(not(test))]
+        let source_fenced = false;
+        let controls = (!source_fenced).then(|| self.thread_menu(cx)).flatten();
+        let start_worker = (!source_fenced)
+            .then(|| self.start_worker_button(p, cx))
+            .flatten();
         let review_toggle = self.review_toggle(cx);
         let inline_request = self.pane_width < px(825.);
-        let asks = self.ask_sheet(inline_request, window, cx);
-        let launch = self.launch_sheet(window.viewport_size().height * 0.6, cx);
+        let asks = (!source_fenced)
+            .then(|| self.ask_sheet(inline_request, window, cx))
+            .flatten();
+        let launch = (!source_fenced)
+            .then(|| self.launch_sheet(window.viewport_size().height * 0.6, cx))
+            .flatten();
         let usage = self.usage_bar(cx);
         let review = asks.is_none().then(|| self.review_panel(cx)).flatten();
         let review_width = px(self.review_width as f32 + 5.);
@@ -1132,7 +1150,7 @@ impl Workbench {
             self.pane_width
         };
         let composer = self.composer(detail_width, window, cx);
-        let terminal = (status == "Connected").then(|| {
+        let terminal = (status == "Connected" && !source_fenced).then(|| {
             let project = self.project.clone();
             crate::kit::icon(
                 p,
@@ -1258,6 +1276,11 @@ impl Workbench {
                                         .min_w_0()
                                         .gap(px(SPACE_XS))
                                         .children(start_worker)
+                                        .map(|actions| {
+                                            #[cfg(test)]
+                                            let actions = actions.children(move_button);
+                                            actions
+                                        })
                                         .children(review_toggle)
                                         .children(terminal)
                                         .children(controls),
@@ -1340,7 +1363,7 @@ impl Workbench {
                                 .w_full()
                                 .max_w(px(if ready { 680. } else { 760. }))
                                 .gap(px(SPACE_S))
-                                .children(activity_status)
+                                .children(activity_status.filter(|_| !source_fenced))
                                 .children(self.workers_line(p, cx))
                                 .when_some(self.worker_update.as_deref(), |line, update| {
                                     line.child(crate::platform::layout_probe::mark_element(
@@ -1351,8 +1374,13 @@ impl Workbench {
                                     ))
                                 })
                                 .children(launch)
+                                .map(|dock| {
+                                    #[cfg(test)]
+                                    let dock = dock.children(move_panel);
+                                    dock
+                                })
                                 .children(inline_sheet)
-                                .child(composer)
+                                .when(!source_fenced, |dock| dock.child(composer))
                                 .children(usage);
                             let dock = row().w_full().justify_center().child(dock);
                             if ready {

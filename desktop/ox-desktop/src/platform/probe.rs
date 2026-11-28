@@ -14,6 +14,8 @@ pub enum Input {
     Press(String),
     /// `key <keystroke>`: a GPUI keystroke such as `escape` or `ctrl-n`.
     Key(String),
+    #[cfg(test)]
+    MovePreview(String),
 }
 pub struct Sample {
     pub input: Option<Input>,
@@ -66,6 +68,10 @@ impl Socket {
                         }
                         Some(("key", k)) if !k.trim().is_empty() => {
                             (false, true, Some(Input::Key(k.trim().into())))
+                        }
+                        #[cfg(test)]
+                        Some(("move-preview", phase)) => {
+                            (false, true, Some(Input::MovePreview(phase.into())))
                         }
                         _ => continue,
                     },
