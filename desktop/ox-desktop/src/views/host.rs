@@ -952,7 +952,7 @@ impl Host {
                     crate::kit::nav_row(
                         "running-toggle",
                         format!(
-                            "{running_count} running, {}",
+                            "{running_count} open sessions, {}",
                             if running_open { "hide" } else { "show" }
                         ),
                         crate::kit::ICON_SIZE,
@@ -968,12 +968,12 @@ impl Host {
                     .child(
                         row()
                             .gap(px(SPACE_S))
-                            .child(div().size(px(6.)).rounded_full().bg(rgb(p.success)))
+                            .child(div().size(px(6.)).rounded_full().bg(rgb(p.muted)))
                             .child(
                                 div()
                                     .text_size(p.text(Step::Meta))
                                     .text_color(rgb(p.muted))
-                                    .child(format!("{running_count} running")),
+                                    .child(format!("{running_count} open")),
                             )
                             .child(
                                 div()
