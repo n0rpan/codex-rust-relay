@@ -1,25 +1,19 @@
 //! Destination-owned checkout and transcript, verified before fencing the source.
 use crate::{
-    move_archive::{Archive, checksum},
+    move_archive::Archive,
+    move_bundle::{BundlePlan, verified_file},
     move_ledger::{Ledger, Plan, Prepared, Stage},
 };
 use ox_desk_core::host_protocol::Scope;
 use ox_host_service::checkout::receive_result;
-use ox_host_web::move_manifest::{CHECKOUT, FileSpec, Manifest, PLAN, TRANSCRIPT};
+use ox_host_web::move_manifest::{CHECKOUT, Manifest, PLAN, TRANSCRIPT};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
-    io::{self, Seek},
+    io,
     path::{Component, Path, PathBuf},
 };
 use uuid::Uuid;
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct BundlePlan {
-    pub(crate) plan: Plan,
-    pub(crate) checkout_commit: String,
-}
 
 /// Received from the authenticated upload adapter. A receipt for these bytes
 /// allows verification here, but confers no native write authority.
@@ -222,15 +216,6 @@ impl VerifiedTarget {
         }
         Err(invalid("The reserved destination checkout has moved."))
     }
-}
-
-fn verified_file(path: &Path, spec: &FileSpec) -> io::Result<File> {
-    let mut file = File::open(path)?;
-    if file.metadata()?.len() != spec.bytes || checksum(&mut file)? != spec.sha256 {
-        return Err(invalid("A move file failed its integrity check."));
-    }
-    file.rewind()?;
-    Ok(file)
 }
 
 // Keep directory entries as well as file contents durable before replying.

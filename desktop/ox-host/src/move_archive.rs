@@ -268,7 +268,12 @@ mod tests {
         let mut source = Ledger::open(laptop.path(), plan.source.host).unwrap();
         let mut receiver = Ledger::open(studio.path(), plan.target_host).unwrap();
         source.prepare_source(plan).unwrap();
+        let original_manifest = Bundle::capture(laptop.path(), plan, &timeline)
+            .unwrap()
+            .manifest;
+        std::fs::write(plan.source.scope.project.join("tracked"), "later edit").unwrap();
         let bundle = Bundle::capture(laptop.path(), plan, &timeline).unwrap();
+        assert_eq!(bundle.manifest, original_manifest);
         let manifest_sha256 = bundle.manifest.sha256().unwrap();
         let files = || Files {
             directory: bundle.directory(),
