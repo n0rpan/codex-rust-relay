@@ -788,7 +788,7 @@ def antigravity_phone(host, js):
     js("document.getElementById('home').click()")
     wait(lambda: js("return !!document.querySelector('[data-thread-id=parent]')"))
     js("document.querySelector('[data-thread-id=parent]').click()")
-    wait(lambda: js("return !document.getElementById('continue-in').hidden"))
+    wait(lambda: js("return !document.getElementById('continue-in').hidden && !document.getElementById('menu-settings').hidden"))
     js("document.getElementById('continue-in').click(); const r=document.getElementById('handoff-runtime');"
        "r.value='antigravity'; r.dispatchEvent(new Event('change'))")
     assert js("""const route=document.getElementById('handoff-route'), modes=[...document.getElementById('handoff-mode').options];
