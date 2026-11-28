@@ -96,6 +96,7 @@ pub struct Workbench {
     pub(super) link: HostLink,
     workers: Entity<super::host::WorkerIndex>,
     pub(super) pending_local_command: Option<super::terminal_review::Pending>,
+    worker_results_open: Option<String>,
     pub(super) enter_sends: bool,
     review: review::ReviewPane,
     pub(super) review_width: u32,
@@ -277,6 +278,7 @@ impl Workbench {
             handoff_pending: None,
             link,
             workers,
+            worker_results_open: None,
             enter_sends: cx
                 .global::<crate::preferences::behavior::Active>()
                 .enter_sends,

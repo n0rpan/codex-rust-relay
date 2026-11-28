@@ -2,7 +2,7 @@
 //! operation here that creates a project workbench.
 use super::*;
 use crate::sidebar_state::{GroupingMode, ThreadMetaKey};
-use ox_desk_core::host_protocol::{Scope as HostScope, SessionResult};
+use ox_desk_core::host_protocol::{Scope as HostScope, SessionOutcome, SessionResult};
 use ox_desk_core::origin::{Origin, Relation};
 use ox_desk_core::runtime::Runtime;
 use std::{
@@ -139,6 +139,31 @@ pub(crate) struct Tree {
 pub(crate) struct WorkerIndex {
     pub trees: HashMap<(PathBuf, String), Tree>,
     pub parents: HashMap<(PathBuf, String), ParentLink>,
+    pub results: HashMap<(HostScope, String), Vec<WorkerRow>>,
+}
+
+pub(crate) struct WorkerRow {
+    pub target: ParentLink,
+    pub status: &'static str,
+    pub billing: String,
+    pub access: String,
+    pub model: Option<String>,
+}
+
+fn worker_status(status: &str, result: Option<&SessionResult>) -> &'static str {
+    match status {
+        "needs_input" => "Needs you",
+        "running" => "Running",
+        "queued" => "Queued",
+        "failed" => "Failed",
+        "interrupted" => "Interrupted",
+        _ => match result.map(|result| result.outcome) {
+            Some(SessionOutcome::Completed) => "Completed",
+            Some(SessionOutcome::Failed) => "Failed",
+            Some(SessionOutcome::Stopped) => "Stopped",
+            None => "Open",
+        },
+    }
 }
 
 /// Where a worker's recorded parent lives. The origin stamp carries the parent's
@@ -412,6 +437,48 @@ impl Discovery {
             _ => None,
         };
         Some((h.route.clone(), status))
+    }
+
+    fn worker_results(&self) -> HashMap<(HostScope, String), Vec<WorkerRow>> {
+        let mut workers = HashMap::<_, Vec<_>>::new();
+        let mut ordered: Vec<_> = self.hosted.iter().collect();
+        ordered.sort_by(|a, b| {
+            b.saved
+                .row
+                .updated_at
+                .cmp(&a.saved.row.updated_at)
+                .then_with(|| a.saved.row.id.cmp(&b.saved.row.id))
+        });
+        for worker in ordered {
+            let Some(origin) = worker
+                .origin
+                .as_ref()
+                .filter(|origin| origin.relation == Relation::Worker && origin.linked.is_none())
+            else {
+                continue;
+            };
+            let (Some(parent), Some(session)) = (&origin.parent.scope, &origin.parent.session)
+            else {
+                continue;
+            };
+            let row = &worker.saved.row;
+            workers
+                .entry((parent.clone(), session.clone()))
+                .or_default()
+                .push(WorkerRow {
+                    target: ParentLink {
+                        project: row.cwd.clone(),
+                        route: Some(worker.route.clone()),
+                        title: Some(row.title().to_owned()),
+                        id: row.id.clone(),
+                    },
+                    status: worker_status(&worker.status, worker.result.as_ref()),
+                    billing: worker.route.label(),
+                    access: origin.ceiling.label(origin.runtime).to_owned(),
+                    model: worker.actual_model.clone(),
+                });
+        }
+        workers
     }
 
     fn replace(&mut self, source: Option<bool>, rows: Vec<ThreadRow>) {
@@ -1081,7 +1148,9 @@ impl Host {
         for (key, _, _) in &roots {
             self.walk_tree(key, &children, cx, &mut tree);
         }
+        let worker_results = self.discovery.worker_results();
         self.workers.update(cx, |index, _| {
+            index.results = worker_results;
             index.trees = tree;
             index.parents = links;
         });

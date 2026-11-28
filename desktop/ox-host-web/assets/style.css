@@ -1737,3 +1737,19 @@ main:has(#conversation:not([hidden])) {
   overflow: auto;
   white-space: pre-wrap;
 }
+
+.worker-results {
+  margin: 0.5rem 0;
+  border-block: 1px solid var(--line);
+}
+.worker-results > summary {
+  padding: 0.75rem 0;
+  cursor: pointer;
+}
+.worker-result-row {
+  padding: 0 0 0.75rem;
+}
+.worker-result-row > button {
+  min-height: 44px;
+  text-align: left;
+}

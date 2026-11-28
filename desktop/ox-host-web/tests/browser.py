@@ -1078,6 +1078,13 @@ def run(harness, screenshot=None):
         keypress("\ue00c")
         assert js("return !document.querySelector('#conversation .action-menu').open && document.activeElement.matches('.action-menu > summary')")
         keypress("\ue004")
+        assert js("""return document.activeElement.id==='worker-results-title' &&
+            document.activeElement.textContent==='Workers (1)'""")
+        keypress("\ue007")
+        assert js("""return document.getElementById('worker-results').open &&
+            document.getElementById('worker-results-list').innerText.includes('Investigate connection pool')""")
+        keypress("\ue007")  # Collapse the list before moving to the session controls.
+        keypress("\ue004")
         assert js("return document.activeElement.id==='access-mode' && document.activeElement.matches(':focus-visible')")
         keypress("\ue004")
         assert js("return document.activeElement.id==='open-settings'")
