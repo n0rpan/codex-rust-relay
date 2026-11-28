@@ -32,6 +32,15 @@ pub(super) struct ModeRequest {
 
 impl Engine {
     pub(super) fn waiting_open_client(&mut self, scope: &Scope, key: &str) -> Option<&mut u64> {
+        if scope.route.runtime == ox_desk_core::runtime::Runtime::Antigravity
+            && let Some((client, pending)) = self
+                .running
+                .get_mut(scope)
+                .and_then(|live| live.opening.as_mut())
+            && pending == key
+        {
+            return Some(client);
+        }
         self.mode_requests
             .values_mut()
             .find_map(|r| match &mut r.activation {
@@ -342,6 +351,12 @@ impl Engine {
                     None,
                     Some((level, sender)),
                 );
+                if result.is_ok()
+                    && scope.route.runtime == ox_desk_core::runtime::Runtime::Antigravity
+                {
+                    // ACP startup still needs to confirm the native session.
+                    return Ok(());
+                }
                 self.finish_open_request(
                     scope,
                     owner,

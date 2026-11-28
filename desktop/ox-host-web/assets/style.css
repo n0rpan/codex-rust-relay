@@ -373,6 +373,9 @@ h1 {
 .session[data-source="claude"]:before {
   color: var(--amber);
 }
+.session[data-source="antigravity"]:before {
+  color: color-mix(in srgb, var(--accent), var(--ink) 32%);
+}
 .session[data-source="api"]:before {
   color: color-mix(in srgb, var(--ink), var(--accent) 48%);
 }

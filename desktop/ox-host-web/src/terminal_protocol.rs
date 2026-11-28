@@ -13,6 +13,18 @@ pub enum OpenTerminal {
     },
     CodexLogin,
     ClaudeLogin,
+    AntigravityLogin,
+}
+
+impl OpenTerminal {
+    pub fn login(runtime: ox_desk_core::runtime::Runtime) -> Self {
+        use ox_desk_core::runtime::Runtime;
+        match runtime {
+            Runtime::Codex => Self::CodexLogin,
+            Runtime::Claude => Self::ClaudeLogin,
+            Runtime::Antigravity => Self::AntigravityLogin,
+        }
+    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]

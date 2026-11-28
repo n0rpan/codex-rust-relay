@@ -8,7 +8,7 @@ pub fn installer(
     runtime: ox_desk_core::runtime::Runtime,
     update: bool,
 ) -> Option<(String, Vec<OsString>)> {
-    if runtime == ox_desk_core::runtime::Runtime::Claude {
+    if runtime != ox_desk_core::runtime::Runtime::Codex {
         return None;
     }
     let path = child_path();
@@ -114,16 +114,31 @@ fn signed_in(runtime: ox_desk_core::runtime::Runtime) -> bool {
                     std::fs::read_to_string(p).is_ok_and(|t| t.contains("\"oauthAccount\""))
                 })
         }
+        // The Antigravity ACP process reports sign-in state through its public protocol.
+        Runtime::Antigravity => false,
     }
 }
-/// A fresh install uses Codex until the operator selects another runtime.
-pub fn initial_route(codex: Probe, first_api_model: impl FnOnce() -> Option<String>) -> Route {
-    if !codex.ready()
-        && let Some(alias) = first_api_model()
-    {
-        return Route::codex_api(alias);
+/// Choose a first route from the installed clients and locally saved sign-in state.
+pub fn initial_route(
+    codex: Probe,
+    claude: Probe,
+    first_api_model: impl FnOnce() -> Option<String>,
+) -> Route {
+    use ox_desk_core::runtime::Runtime;
+
+    if codex.ready() {
+        return Route::CODEX_SUBSCRIPTION;
     }
-    Route::CODEX_SUBSCRIPTION
+    if claude.ready() {
+        return Runtime::Claude.route(None);
+    }
+
+    let runtime = if !codex.installed && claude.installed {
+        Runtime::Claude
+    } else {
+        Runtime::Codex
+    };
+    runtime.route(first_api_model())
 }
 /// Whether `project` is the user's home directory.
 pub fn is_home(project: &Path) -> bool {
@@ -148,15 +163,31 @@ mod tests {
         signed_in: false,
     };
     #[test]
-    fn first_launch_keeps_codex_even_if_its_cli_is_missing() {
-        assert_eq!(initial_route(NONE, || None), Route::CODEX_SUBSCRIPTION);
+    fn first_launch_prefers_known_connections() {
         assert_eq!(
-            initial_route(READY, || Some("alias".into())),
+            initial_route(NONE, NONE, || None),
             Route::CODEX_SUBSCRIPTION
         );
         assert_eq!(
-            initial_route(OUT, || Some("alias".into())),
+            initial_route(READY, READY, || panic!("already signed in")),
+            Route::CODEX_SUBSCRIPTION
+        );
+        assert_eq!(
+            initial_route(OUT, NONE, || Some("alias".into())),
             Route::codex_api("alias".into())
+        );
+        use ox_desk_core::runtime::Runtime;
+        assert_eq!(
+            initial_route(NONE, READY, || panic!("already signed in")),
+            Runtime::Claude.route(None)
+        );
+        assert_eq!(
+            initial_route(NONE, OUT, || None),
+            Runtime::Claude.route(None)
+        );
+        assert_eq!(
+            initial_route(NONE, OUT, || Some("alias".into())),
+            Runtime::Claude.route(Some("alias".into()))
         );
     }
 }

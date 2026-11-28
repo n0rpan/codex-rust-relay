@@ -2,10 +2,12 @@
 use crate::codex::frame::Frame;
 use std::io;
 
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 
 pub enum Link {
+    Antigravity(Box<crate::store::antigravity::Project>),
     Host(Box<crate::store::replica::Remote>),
     Codex(codex::Link),
     Claude(Box<crate::store::claude::Project>),
@@ -19,7 +21,7 @@ impl Link {
     pub(crate) fn codex(&self) -> io::Result<&codex::Link> {
         match self {
             Self::Codex(link) => Ok(link),
-            Self::Claude(_) | Self::Host(_) => Err(io::Error::new(
+            Self::Antigravity(_) | Self::Claude(_) | Self::Host(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "This operation requires a Codex session",
             )),
@@ -28,7 +30,7 @@ impl Link {
     pub(crate) fn forget(&self, seq: i64) {
         match self {
             Self::Codex(link) => link.forget(seq),
-            Self::Claude(_) | Self::Host(_) => (),
+            Self::Antigravity(_) | Self::Claude(_) | Self::Host(_) => (),
         }
     }
 }
@@ -42,6 +44,7 @@ pub enum LinkEvent {
     },
     SignInRequired,
     Frame(Frame),
+    Antigravity(crate::store::antigravity::Event),
     Claude(crate::store::claude::Update),
     Closed {
         reason: String,
@@ -85,6 +88,9 @@ impl LinkEvent {
         if let Self::Host(frame) = self {
             use crate::host_protocol::{Change, Server};
             return !matches!(frame.as_ref(),Server::Delta{changes,..} if changes.iter().all(|c| matches!(c,Change::Append{..}|Change::Items{..}|Change::TimelineState{..})));
+        }
+        if let Self::Antigravity(event) = self {
+            return event.unblocks();
         }
         if let Self::Claude(update) = self {
             return update.unblocks();

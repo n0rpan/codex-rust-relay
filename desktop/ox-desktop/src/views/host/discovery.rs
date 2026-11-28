@@ -33,6 +33,9 @@ impl Scope {
                 .filter(|m| aliases.contains(m))
                 .cloned()
                 .map(Route::codex_api),
+            Runtime::Antigravity if !self.api && row.model_provider == "antigravity" => {
+                Some(Runtime::Antigravity.route(None))
+            }
             _ => None,
         }
     }
@@ -404,22 +407,20 @@ impl Discovery {
             "running" => Some("Running"),
             "failed" => Some("Error"),
             "interrupted" => Some("Interrupted"),
-            "native_live" => Some(if h.route.runtime == Runtime::Codex {
-                "Live in Codex"
-            } else {
-                "Live in Claude Code"
+            "native_live" => Some(match h.route.runtime {
+                Runtime::Codex => "Live in Codex",
+                Runtime::Claude => "Live in Claude Code",
+                Runtime::Antigravity => "Live in Antigravity",
             }),
             _ => None,
         };
         Some((h.route.clone(), status))
     }
 
-    fn replace(&mut self, source: Option<bool>, rows: Vec<ThreadRow>) {
+    fn replace(&mut self, runtime: Runtime, api: Option<bool>, rows: Vec<ThreadRow>) {
         self.rows.retain(|saved| {
-            let belongs = match source {
-                None => saved.scope.runtime == Runtime::Claude,
-                Some(api) => saved.scope.runtime == Runtime::Codex && saved.scope.api == api,
-            };
+            let belongs =
+                saved.scope.runtime == runtime && api.is_none_or(|api| saved.scope.api == api);
             if belongs {
                 self.removed
                     .entry(saved.scope)
@@ -431,15 +432,9 @@ impl Discovery {
             !belongs
         });
         for row in rows.into_iter().filter(|r| r.cwd.is_absolute()) {
-            let scope = match source {
-                Some(api) => Scope {
-                    runtime: Runtime::Codex,
-                    api,
-                },
-                None => Scope {
-                    runtime: Runtime::Claude,
-                    api: row.saved_claude_api().unwrap_or(false),
-                },
+            let scope = Scope {
+                runtime,
+                api: api.unwrap_or_else(|| row.saved_claude_api().unwrap_or(false)),
             };
             if let Some(ids) = self
                 .removed
@@ -524,28 +519,25 @@ impl Host {
                         {
                             s.message = None;
                         }
-                        let mut groups = [vec![], vec![], vec![]];
+                        let mut groups = HashMap::<(Runtime, Option<bool>), Vec<ThreadRow>>::new();
                         for (scope, row) in rows {
-                            let index = match (scope.route.runtime, scope.route.is_api()) {
-                                (Runtime::Claude, _) => 0,
-                                (_, false) => 1,
-                                (_, true) => 2,
-                            };
-                            groups[index].push(row);
+                            let runtime = scope.route.runtime;
+                            let api = (runtime != Runtime::Claude).then_some(scope.route.is_api());
+                            groups.entry((runtime, api)).or_default().push(row);
                         }
-                        for (source, mut page) in
-                            [None, Some(false), Some(true)].into_iter().zip(groups)
-                        {
+                        let sources = [
+                            (Runtime::Claude, None),
+                            (Runtime::Codex, Some(false)),
+                            (Runtime::Codex, Some(true)),
+                            (Runtime::Antigravity, Some(false)),
+                        ];
+                        for (runtime, api) in sources {
+                            let mut page = groups.remove(&(runtime, api)).unwrap_or_default();
                             // A failed source must not erase previously visible histories.
                             if !errors.is_empty() {
                                 for saved in &s.discovery.rows {
-                                    let belongs = match source {
-                                        None => saved.scope.runtime == Runtime::Claude,
-                                        Some(api) => {
-                                            saved.scope.runtime == Runtime::Codex
-                                                && saved.scope.api == api
-                                        }
-                                    };
+                                    let belongs = saved.scope.runtime == runtime
+                                        && api.is_none_or(|api| saved.scope.api == api);
                                     if belongs
                                         && !page
                                             .iter()
@@ -555,7 +547,7 @@ impl Host {
                                     }
                                 }
                             }
-                            s.discovery.replace(source, page);
+                            s.discovery.replace(runtime, api, page);
                         }
                         for message in errors {
                             eprintln!("Could not discover saved sessions: {message}");
@@ -1511,7 +1503,7 @@ mod tests {
             Some((route.clone(), Some("Needs you")))
         );
         assert_eq!(library.waiting_count(project, &route), 1);
-        library.replace(Some(true), vec![]);
+        library.replace(Runtime::Codex, Some(true), vec![]);
         assert_eq!(library.all().count(), 1);
         assert!(library.live_event(CatalogEvent::Replace(origin, vec![])));
         assert_eq!(library.all().count(), 0);
@@ -1536,13 +1528,13 @@ mod tests {
             )
             .unwrap()
         };
-        library.replace(Some(false), vec![row()]);
-        library.replace(Some(true), vec![row()]);
-        library.replace(Some(false), vec![]);
+        library.replace(Runtime::Codex, Some(false), vec![row()]);
+        library.replace(Runtime::Codex, Some(true), vec![row()]);
+        library.replace(Runtime::Codex, Some(false), vec![]);
         assert_eq!(library.rows.len(), 1);
         assert!(library.removed(project, native, "duplicate"));
         assert!(!library.removed(project, relay, "duplicate"));
-        library.replace(Some(false), vec![row()]);
+        library.replace(Runtime::Codex, Some(false), vec![row()]);
         assert!(!library.removed(project, native, "duplicate"));
         assert_eq!(library.rows.len(), 2);
     }

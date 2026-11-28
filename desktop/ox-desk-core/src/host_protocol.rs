@@ -9,8 +9,9 @@ use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf};
 
 pub const IDLE_UPDATE: &str = "idle_update";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MIN_VERSION: u32 = 1;
+const ANTIGRAVITY_VERSION: u32 = 2;
 
 /// The hello advertises a maximum. Clients check the selected version against
 /// their own floor before sending any actions. Features are capability gated.
@@ -20,6 +21,45 @@ pub fn negotiate(client_max: u32) -> Option<u32> {
 }
 pub fn supported(selected: u32) -> bool {
     (MIN_VERSION..=VERSION).contains(&selected)
+}
+
+pub fn supports_runtime(version: u32, runtime: crate::runtime::Runtime) -> bool {
+    runtime != crate::runtime::Runtime::Antigravity || version >= ANTIGRAVITY_VERSION
+}
+
+pub fn supports_route(version: u32, route: &Route) -> bool {
+    supports_runtime(version, route.runtime)
+}
+
+fn handoff_runtimes_supported(version: u32, packet: &crate::handoff::HandoffTransfer) -> bool {
+    supports_runtime(version, packet.start.runtime)
+        && supports_runtime(version, packet.source.runtime)
+        && packet
+            .source
+            .selection
+            .earlier
+            .iter()
+            .all(|earlier| supports_runtime(version, earlier.runtime))
+}
+
+/// Keep the plan text readable on hosts that only recognize the original transfer item kinds.
+pub fn project_handoff_transfer(
+    version: u32,
+    packet: &mut crate::handoff::HandoffTransfer,
+) -> bool {
+    if !handoff_runtimes_supported(version, packet) {
+        return false;
+    }
+    if version < 2 {
+        use crate::handoff::Kind;
+        for item in &mut packet.carried {
+            if item.kind == Kind::Plan {
+                item.kind = Kind::Outcome;
+                item.text.insert_str(0, "[Plan from the source session]\n");
+            }
+        }
+    }
+    true
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -133,6 +173,44 @@ pub enum Client {
         caller: crate::origin::ExternalCaller,
         call: crate::origin::ParentCall,
     },
+}
+impl Client {
+    pub fn supported_by(&self, version: u32) -> bool {
+        let scope = match self {
+            Self::Act { scope, action, .. } => {
+                if let Action::StartHandoff(start) = action
+                    && !supports_runtime(version, start.runtime)
+                {
+                    return false;
+                }
+                Some(scope)
+            }
+            Self::Subscribe { scope, .. } => scope.as_ref(),
+            Self::PrepareRemoteHandoff { scope, start, .. } => {
+                if !supports_runtime(version, start.runtime) {
+                    return false;
+                }
+                Some(scope)
+            }
+            Self::ReceiveRemoteHandoff { scope, packet, .. } => {
+                if !handoff_runtimes_supported(version, packet)
+                    || (version < 2
+                        && packet
+                            .carried
+                            .iter()
+                            .any(|item| item.kind == crate::handoff::Kind::Plan))
+                {
+                    return false;
+                }
+                Some(scope)
+            }
+            Self::ReadHandoffPage { scope, .. }
+            | Self::InspectHandoffTarget { scope, .. }
+            | Self::TerminalPreview { scope, .. } => Some(scope),
+            _ => None,
+        };
+        scope.is_none_or(|scope| supports_route(version, &scope.route))
+    }
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -324,7 +402,7 @@ pub enum Server {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ProcessView {
-    /// `claude`, `codex` or `worker` (every thread of the process is a host-owned worker).
+    /// `antigravity`, `claude`, `codex` or `worker` (every thread of the last kind is host-owned).
     pub kind: String,
     pub scope: Scope,
     pub project: PathBuf,

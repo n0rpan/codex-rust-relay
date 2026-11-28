@@ -623,7 +623,7 @@ impl Engine {
         let Some(timeline) = live.state.transcripts.get(&start.source) else {
             fail!("The session's history is not loaded. Open it and try again.".into());
         };
-        let mut items = handoff::items(timeline);
+        let mut items = handoff::handoff_items(timeline);
         if let Some((target, id)) = &export_to
             && let Err(e) =
                 self.restore_export_boundary(*id, target, &src, &start.source, &mut items)
@@ -697,7 +697,7 @@ impl Engine {
                         .into()
                 );
             };
-            let packet = handoff::HandoffTransfer {
+            let mut packet = handoff::HandoffTransfer {
                 id: transfer.to_string(),
                 target_host,
                 repository,
@@ -706,6 +706,15 @@ impl Engine {
                 carried: selection.carried,
                 child_ceiling: src_origin.as_ref().and_then(Origin::limits_children),
             };
+            if let Replier::Client(client, _) = &reply
+                && let Some(version) = self.clients.get(client).and_then(|client| client.version)
+                && !wire::project_handoff_transfer(version, &mut packet)
+            {
+                fail!(
+                    "Update this client to transfer a conversation with Antigravity history."
+                        .into()
+                );
+            }
             if let Err(e) = self.record_export(&packet) {
                 fail!(e.to_string());
             }
@@ -728,11 +737,7 @@ impl Engine {
                 modes::ModeRequest::Level(requested) => requested.min(fixed),
             }
             .min(ceiling);
-            modes::Resolved {
-                level: start_level,
-                access: start_level.preset(start.runtime),
-                decision: Decision::HostPolicy,
-            }
+            modes::Resolved::new(start_level, start.runtime, Decision::HostPolicy)
         } else {
             match modes::resolve_operator(level, start.mode, start.runtime) {
                 Ok(r) => r,
@@ -819,6 +824,10 @@ impl Engine {
             ),
             ox_desk_core::runtime::Runtime::Claude => (
                 handoff::claude_turn(&source, &selection, &start.request),
+                vec![],
+            ),
+            ox_desk_core::runtime::Runtime::Antigravity => (
+                handoff::context_turn(&source, &selection, &start.request, false),
                 vec![],
             ),
         };
@@ -1292,7 +1301,11 @@ fn read_source_page(
     args: &ReadArgs,
     frozen: bool,
 ) -> Result<Value, String> {
-    let mut items = handoff::items(timeline);
+    let mut items = if src.selection.includes_plans {
+        handoff::handoff_items(timeline)
+    } else {
+        handoff::items(timeline)
+    };
     if frozen {
         freeze(&mut items, src)?;
     }
