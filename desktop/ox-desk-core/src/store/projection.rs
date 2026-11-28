@@ -121,7 +121,8 @@ impl Store {
         if schema.methods.contains("fuzzyFileSearch") {
             caps.push("mention".into());
         }
-        if !self.is_session_scoped()
+        if !self.is_antigravity()
+            && !self.is_session_scoped()
             && schema
                 .models
                 .get(&self.options(id).model)
@@ -215,6 +216,12 @@ impl Store {
                     caps.push("model_options".into());
                 }
             }
+            if self.is_antigravity()
+                && self.can_send(Some(id))
+                && !self.command_caps(Some(id)).models.is_empty()
+            {
+                caps.push("model_options".into());
+            }
             if r.parent_thread_id.is_none() && self.can_change_access(id) {
                 caps.push("access".into());
             }
@@ -247,8 +254,11 @@ impl Store {
         };
         let detail = json!({"row":r,"worker":r.worker,"unread":r.unread,"order":r.activity_order.to_string(),"generated":r.generated_title,
             "owned":t.is_some(),"native_live":self.is_native_live(id).then(||self.native_app()),"changing":self.changing_options(id),"terminal":self.in_terminal(id),"sending":self.sending(Some(id)),
-            "route":self.thread_route(Some(id)),"options":t.map(|_|self.options(Some(id))),"access":self.applied_access(Some(id)),"resume_access":self.resume_access.get(id),"restored_draft":self.restored_drafts.get(id).map(|(message,text)|json!({"message":message,"text":text})),"command_caps":(self.is_session_scoped() && t.is_some()).then(||composer_schema(self.command_caps(Some(id))))});
+            "route":self.thread_route(Some(id)),"options":t.map(|_|self.options(Some(id))),"access":self.applied_access(Some(id)),"resume_access":self.resume_access.get(id),"restored_draft":self.restored_drafts.get(id).map(|(message,text)|json!({"message":message,"text":text})),"command_caps":((self.is_session_scoped() || self.is_antigravity()) && t.is_some()).then(||composer_schema(self.command_caps(Some(id))))});
         let mut detail = detail;
+        if self.is_antigravity() {
+            detail["access_choices"] = json!(self.antigravity_access_choices(id));
+        }
         let mut parent = r.parent_thread_id.clone();
         if let Some((nest, extra)) = self.host_annotations.get(id) {
             if let (Some(target), Some(fields)) = (detail.as_object_mut(), extra.as_object()) {
@@ -335,6 +345,7 @@ impl Store {
                             } else {
                                 NotificationKind::Question
                             },
+                            false,
                         ));
                     }
                 }
@@ -409,13 +420,15 @@ impl Store {
             if previous.detail["last_finished"] != detail["last_finished"]
                 && !detail["last_finished"].is_null()
             {
+                let event = if t.error().is_some() {
+                    NotificationKind::Failed
+                } else {
+                    NotificationKind::Finished
+                };
                 out.push(self.note(
                     id,
-                    if t.error().is_some() {
-                        NotificationKind::Failed
-                    } else {
-                        NotificationKind::Finished
-                    },
+                    event,
+                    event == NotificationKind::Finished && t.finished_goal(),
                 ));
             }
             if detail != previous.detail {
@@ -483,7 +496,7 @@ impl Store {
         }
         out
     }
-    fn note(&self, thread: &str, event: NotificationKind) -> Change {
+    fn note(&self, thread: &str, event: NotificationKind, goal_reached: bool) -> Change {
         let title = self
             .catalog_row(thread)
             .and_then(|r| r.name.as_ref().or(r.generated_title.as_ref()))
@@ -492,6 +505,7 @@ impl Store {
             thread: thread.into(),
             title: title.into(),
             event,
+            goal_reached,
         }
     }
 }
@@ -588,5 +602,98 @@ mod session_change_tests {
         let removed = vec![row("a", "A")];
         assert_eq!(ids(session_changes(&first, &removed)), ["all:1"]);
         assert_eq!(ids(session_changes(&[], &first)), ["all:2"]);
+    }
+
+    #[test]
+    fn only_a_confirmed_goal_on_the_matching_successful_turn_changes_the_alert() {
+        use crate::{codex::frame::Frame, links::codex, runtime::Route, store::Profile};
+        let scope = Scope {
+            project: "/test".into(),
+            route: Route::CODEX_SUBSCRIPTION,
+        };
+        let link =
+            codex::Link::from_command(std::process::Command::new("/bin/cat"), |_| {}).unwrap();
+        let mut store = Store::open(
+            Profile {
+                project: scope.project.clone(),
+                route: scope.route.clone(),
+                provider: "openai".into(),
+            },
+            link,
+        )
+        .unwrap();
+        let t = store.transcripts.entry("thread".into()).or_default();
+        t.verified = true;
+        t.ready = true;
+        let mut state = store.host_snapshot(&scope);
+        let mut notices = |events: Vec<Value>| {
+            for event in events {
+                let frame = Frame::decode(&serde_json::to_vec(&event).unwrap(), |_| None).unwrap();
+                store.apply(codex::LinkEvent::Frame(frame));
+            }
+            store
+                .host_project(&scope, &store.changed, &mut state)
+                .into_iter()
+                .filter_map(|change| match change {
+                    Change::Notification {
+                        event,
+                        goal_reached,
+                        ..
+                    } => Some((event, goal_reached)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let update = |turn: Option<&str>, status: &str| json!({"method":"thread/goal/updated","params":{"threadId":"thread","turnId":turn,"goal":{"status":status}}});
+        let clear = || json!({"method":"thread/goal/cleared","params":{"threadId":"thread"}});
+        let complete = |turn: &str, status: &str| json!({"method":"turn/completed","params":{"threadId":"thread","turn":{"id":turn,"status":status}}});
+        use NotificationKind::{Failed, Finished};
+        assert_eq!(
+            notices(vec![
+                update(None, "complete"),
+                complete("resume", "completed")
+            ]),
+            [(Finished, false)]
+        );
+        assert!(notices(vec![clear(), update(Some("goal"), "complete")]).is_empty());
+        assert_eq!(
+            notices(vec![
+                update(Some("goal"), "complete"),
+                complete("goal", "completed")
+            ]),
+            [(Finished, true)]
+        );
+        assert!(notices(vec![complete("goal", "completed")]).is_empty());
+        assert_eq!(
+            notices(vec![
+                update(Some("later"), "complete"),
+                complete("later", "completed")
+            ]),
+            [(Finished, false)],
+        );
+        assert_eq!(
+            notices(vec![
+                clear(),
+                update(Some("another"), "complete"),
+                complete("unrelated", "completed")
+            ]),
+            [(Finished, false)],
+        );
+        assert_eq!(
+            notices(vec![
+                clear(),
+                update(Some("stop"), "complete"),
+                complete("stop", "interrupted")
+            ]),
+            [(Finished, false)],
+        );
+        assert_eq!(
+            notices(vec![
+                update(None, "active"),
+                update(Some("failed"), "complete"),
+                complete("failed", "failed")
+            ]),
+            [(Failed, false)],
+        );
     }
 }

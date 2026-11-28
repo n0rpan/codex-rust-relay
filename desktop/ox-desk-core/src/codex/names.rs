@@ -38,6 +38,7 @@ wire_names!(Notice {
     ThreadStarted => "thread/started", ThreadStatus => "thread/status/changed",
     ThreadClosed => "thread/closed", ThreadArchived => "thread/archived",
     ThreadName => "thread/name/updated", ThreadSettings => "thread/settings/updated",
+    GoalUpdated => "thread/goal/updated", GoalCleared => "thread/goal/cleared",
     TurnStarted => "turn/started", TurnCompleted => "turn/completed",
     Diff => "turn/diff/updated", Plan => "turn/plan/updated", Tokens => "thread/tokenUsage/updated",
     RateLimits => "account/rateLimits/updated", Account => "account/updated",

@@ -745,6 +745,9 @@
             "event": {
               "$ref": "#/$defs/NotificationKind"
             },
+            "goal_reached": {
+              "type": "boolean"
+            },
             "kind": {
               "const": "notification",
               "type": "string"
@@ -1496,7 +1499,7 @@
         },
         {
           "const": "capped",
-          "description": "The operator answered a YOLO acceptance with the highest non-YOLO level.",
+          "description": "Use the highest available level allowed under the request or runtime.",
           "type": "string"
         }
       ]
@@ -1694,7 +1697,7 @@
           "default": "inherit"
         },
         "model": {
-          "description": "An OX API alias, or none for the runtime's subscription.",
+          "description": "An OX API alias, or none for the runtime's native account.",
           "type": [
             "string",
             "null"
@@ -1953,7 +1956,8 @@
         {
           "enum": [
             "user",
-            "assistant"
+            "assistant",
+            "plan"
           ],
           "type": "string"
         },
@@ -2278,7 +2282,7 @@
           "type": "boolean"
         },
         "kind": {
-          "description": "`claude`, `codex` or `worker` (every thread of the process is a host-owned worker).",
+          "description": "`antigravity`, `claude`, `codex` or `worker` (every thread of the last kind is host-owned).",
           "type": "string"
         },
         "last_activity": {
@@ -2521,7 +2525,8 @@
     "Runtime": {
       "enum": [
         "codex",
-        "claude"
+        "claude",
+        "antigravity"
       ],
       "type": "string"
     },
@@ -2612,6 +2617,10 @@
             "$ref": "#/$defs/Earlier"
           },
           "type": "array"
+        },
+        "includes_plans": {
+          "description": "The selection and its source IDs include visible plans.",
+          "type": "boolean"
         },
         "items": {
           "description": "Carried item IDs in order.",

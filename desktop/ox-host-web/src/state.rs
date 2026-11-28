@@ -1,7 +1,7 @@
 pub(crate) use crate::serve::origin;
 use crate::{
     admin::{Device, DeviceClass, Pairing, Reply},
-    push::Subscription,
+    push::{Event, PreferenceEdit, PreferenceState, Preferences, Subscription},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use p256::{
@@ -75,6 +75,8 @@ pub(crate) struct Registered {
     token_hash: String,
     key: String,
     pub push: Option<Subscription>,
+    #[serde(default, skip_serializing_if = "Preferences::is_default")]
+    push_preferences: Preferences,
 }
 impl Registered {
     fn current(&self) -> bool {
@@ -800,6 +802,7 @@ impl State {
             token_hash: digest(&t),
             key: key.into(),
             push: None,
+            push_preferences: Preferences::default(),
         };
         if self
             .disk
@@ -1037,6 +1040,37 @@ impl State {
     pub fn is_subscribed(&self, id: &str, subscription: &Subscription) -> bool {
         self.alive(id)
             && self.disk.devices.get(id).and_then(|r| r.push.as_ref()) == Some(subscription)
+    }
+    pub(crate) fn push_preferences(
+        &mut self,
+        id: &str,
+        change: Option<PreferenceEdit>,
+    ) -> io::Result<PreferenceState> {
+        if !self.alive(id) {
+            return Err(io::Error::other("Device expired"));
+        }
+        let registration = &self.disk.devices[id];
+        let subscribed = registration.push.is_some();
+        let mut preferences = registration.push_preferences;
+        if let Some(change) = change {
+            preferences.set(change);
+            if preferences != registration.push_preferences {
+                self.update(|disk| {
+                    disk.devices.get_mut(id).unwrap().push_preferences = preferences;
+                })?;
+                self.signal();
+            }
+        }
+        Ok(PreferenceState {
+            preferences,
+            subscribed,
+        })
+    }
+    pub(crate) fn allows_push(&self, id: &str, event: Event) -> bool {
+        self.disk
+            .devices
+            .get(id)
+            .is_some_and(|registration| registration.push_preferences.allows(event))
     }
     pub fn subscriptions(&self) -> Vec<(String, Subscription)> {
         self.disk

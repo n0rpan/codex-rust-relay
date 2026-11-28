@@ -51,13 +51,6 @@ pub(super) fn extras(issue: &Issue, other_installed: bool) -> Extras {
         },
     }
 }
-fn other(runtime: Runtime) -> Runtime {
-    match runtime {
-        Runtime::Codex => Runtime::Claude,
-        Runtime::Claude => Runtime::Codex,
-    }
-}
-
 pub(super) enum Issue {
     Missing,
     Old(String),
@@ -67,7 +60,12 @@ pub(super) enum Issue {
 impl Workbench {
     /// Keep the runtime the user selected when switching billing routes.
     pub(super) fn api_route(&self, model: String) -> Route {
-        self.route.runtime.route(Some(model))
+        let runtime = self.route.runtime;
+        if runtime.supports_api() {
+            runtime.route(Some(model))
+        } else {
+            Route::codex_api(model)
+        }
     }
     pub(super) fn first_run_issue(&self) -> Option<Issue> {
         if self.connecting {
@@ -97,6 +95,14 @@ impl Workbench {
                 return Some(Issue::Provider);
             }
         }
+        if self.route.runtime == Runtime::Antigravity
+            && self.link.remote().is_some()
+            && self
+                .visible_error()
+                .is_some_and(|e| e.contains("Install the official Antigravity CLI"))
+        {
+            return Some(Issue::Missing);
+        }
         if self.link.remote().is_none() && platform::onboarding::missing(self.route.runtime) {
             return Some(Issue::Missing);
         }
@@ -109,6 +115,7 @@ impl Workbench {
         let name = runtime.name();
         if let Some(host) = self.link.remote().cloned() {
             let login = matches!(issue, Issue::SignIn);
+            let install = matches!(issue, Issue::Missing);
             let notice = match issue {
                 Issue::Old(e) => e,
                 Issue::Provider => format!("Configure this provider on {}.", host.name),
@@ -121,6 +128,16 @@ impl Workbench {
                 .size_full()
                 .gap_2()
                 .child(small(p, notice))
+                .when(install, |d| {
+                    d.child(button(
+                        p,
+                        "remote-runtime-guide",
+                        format!("Open {name} installation guide ↗"),
+                        true,
+                        true,
+                        cx.listener(move |_, _, _, cx| cx.open_url(runtime.install_guide())),
+                    ))
+                })
                 .when(login, |d| {
                     d.child(button(
                         p,
@@ -132,11 +149,7 @@ impl Workbench {
                             s.awaiting_login = true;
                             s.launch_error = crate::terminal::open_remote(
                                 host.clone(),
-                                if runtime == Runtime::Codex {
-                                    ox_host_web::terminal_protocol::OpenTerminal::CodexLogin
-                                } else {
-                                    ox_host_web::terminal_protocol::OpenTerminal::ClaudeLogin
-                                },
+                                ox_host_web::terminal_protocol::OpenTerminal::login(runtime),
                                 cx,
                             )
                             .err();
@@ -156,9 +169,7 @@ impl Workbench {
         let (title, note) = match &issue {
             Issue::Missing => (
                 format!("Install {name}"),
-                format!(
-                    "OX runs the official {name} CLI locally on your computer, also for API models. Install it to open a session."
-                ),
+                format!("Install the official {name} CLI to open a session in OX."),
             ),
             Issue::Old(v) => (format!("Update {name}"), v.clone()),
             Issue::Provider => (
@@ -167,14 +178,13 @@ impl Workbench {
             ),
             Issue::SignIn => (
                 format!("Connect {name}"),
-                format!(
-                    "Sign in to your {} account so the official {name} CLI can run here — or use your own API key.",
-                    runtime.account()
-                ),
+                format!("Sign in to your {} account to use {name} in OX.", runtime.account()),
             ),
         };
-        let other_installed = !platform::onboarding::missing(other(runtime));
-        let extras = extras(&issue, other_installed);
+        let other = Runtime::ALL
+            .into_iter()
+            .find(|&other| other != runtime && !platform::onboarding::missing(other));
+        let extras = extras(&issue, other.is_some());
         let api_active = self.route.is_api();
         let segment = |id: &'static str, label: &'static str, active: bool, to: Option<Route>| {
             button(
@@ -197,18 +207,22 @@ impl Workbench {
             .child(
                 row()
                     .gap_2()
-                    .child(segment(
-                        "route-codex",
-                        "Codex",
-                        !api_active && runtime == Runtime::Codex,
-                        Some(Route::CODEX_SUBSCRIPTION),
-                    ))
-                    .child(segment(
-                        "route-claude",
-                        "Claude Code",
-                        !api_active && runtime == Runtime::Claude,
-                        Some(Runtime::Claude.route(None)),
-                    ))
+                    .flex_wrap()
+                    .children(
+                        [
+                            ("route-codex", Runtime::Codex),
+                            ("route-claude", Runtime::Claude),
+                            ("route-antigravity", Runtime::Antigravity),
+                        ]
+                        .map(|(id, candidate)| {
+                            segment(
+                                id,
+                                candidate.name(),
+                                !api_active && runtime == candidate,
+                                Some(candidate.route(None)),
+                            )
+                        }),
+                    )
                     .child(segment("route-api", "API key", api_active, None)),
             )
             .child(activity::ox(p, 0, 3.))
@@ -272,8 +286,9 @@ impl Workbench {
                 cx.listener(|_, _, _, cx| cx.emit(ConfigureProvider)),
             ));
         }
-        if extras.use_other {
-            let target = other(runtime);
+        if extras.use_other
+            && let Some(target) = other
+        {
             panel = panel.child(button(
                 p,
                 "use-other-runtime",
@@ -331,14 +346,19 @@ impl Workbench {
     pub(super) fn poll_ready(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let runtime = self.route.runtime;
         let api = self.route.is_api();
+        let ready = move || {
+            if runtime == Runtime::Antigravity {
+                !platform::onboarding::missing(runtime)
+            } else {
+                platform::onboarding::ready(runtime, api)
+            }
+        };
         cx.spawn_in(window, async move |view, cx| {
             let start = Instant::now();
-            let mut was_ready = platform::onboarding::ready(runtime, api);
+            let mut was_ready = ready();
             while start.elapsed() < POLL_FOR {
                 cx.background_executor().timer(POLL_EVERY).await;
-                let now = cx
-                    .background_spawn(async move { platform::onboarding::ready(runtime, api) })
-                    .await;
+                let now = cx.background_spawn(async move { ready() }).await;
                 let keep = view.update_in(cx, |s, w, cx| {
                     if !s.awaiting_login {
                         return false;
@@ -357,10 +377,12 @@ impl Workbench {
         .detach();
     }
     fn start_sign_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.poll_ready(window, cx);
         let project = self.project.clone();
         self.awaiting_login = true;
         let runtime = self.route.runtime;
+        if runtime != Runtime::Antigravity {
+            self.poll_ready(window, cx);
+        }
         let login = cx.background_spawn(async move { platform::launch_login(runtime, &project) });
         cx.spawn(async move |view, cx| {
             let result = login.await;
@@ -399,6 +421,5 @@ mod tests {
         assert_eq!(extras(&Issue::Old("x".into()), false), both(true, false));
         assert_eq!(extras(&Issue::SignIn, true), both(true, false));
         assert_eq!(extras(&Issue::Provider, true), both(false, false));
-        assert_eq!(other(Runtime::Codex), Runtime::Claude);
     }
 }

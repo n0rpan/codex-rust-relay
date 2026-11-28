@@ -553,7 +553,9 @@ impl Host {
     /// models, so the full catalog comes from the same request the Favorites page refreshes with.
     fn open_all_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active = self.panes[self.active].read(cx).route.runtime;
-        self.model_runtime = if active == Runtime::Claude && self.models.read(cx).is_empty() {
+        self.model_runtime = if !active.supports_api()
+            || (active == Runtime::Claude && self.models.read(cx).is_empty())
+        {
             Runtime::Codex
         } else {
             active
@@ -1120,6 +1122,15 @@ impl Host {
                         "Wait for image attachment preparation to finish before switching models."
                             .into(),
                     );
+                    cx.notify();
+                    return;
+                }
+                if event.0.runtime == Runtime::Antigravity
+                    && owner.read(cx).store.as_ref().is_some_and(|store| {
+                        store.selected().is_none() && !store.draft_images(None).is_empty()
+                    })
+                {
+                    s.message = Some("Remove draft attachments before switching to Antigravity, or start an Antigravity session from the sidebar.".into());
                     cx.notify();
                     return;
                 }
@@ -2451,11 +2462,11 @@ impl Host {
             )
         });
         let archive_disabled =
-            native_live.is_some() || scope.runtime == Runtime::Claude || row.worker;
+            native_live.is_some() || scope.runtime != Runtime::Codex || row.worker;
         let archive_label = if let Some(app) = native_live {
             format!("Archive — {app}")
-        } else if scope.runtime == Runtime::Claude {
-            "Archive — unavailable in Claude Code".to_owned()
+        } else if scope.runtime != Runtime::Codex {
+            format!("Archive — unavailable in {}", scope.runtime.name())
         } else if row.worker {
             "Archive — worker thread".to_owned()
         } else {
@@ -3081,10 +3092,12 @@ impl Host {
                 activity::Cartridge::Worker
             } else if api {
                 activity::Cartridge::Api
-            } else if scope.runtime == ox_desk_core::runtime::Runtime::Claude {
-                activity::Cartridge::Claude
             } else {
-                activity::Cartridge::Codex
+                match scope.runtime {
+                    Runtime::Codex => activity::Cartridge::Codex,
+                    Runtime::Claude => activity::Cartridge::Claude,
+                    Runtime::Antigravity => activity::Cartridge::Antigravity,
+                }
             };
             let project_name = project
                 .file_name()

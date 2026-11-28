@@ -30,6 +30,7 @@ enum Page {
     Accounts,
     Advanced,
     Behavior,
+    Notifications,
     Providers,
     Search,
     Favorites,
@@ -420,6 +421,7 @@ impl Preferences {
             | Page::Remote
             | Page::Accounts
             | Page::Behavior
+            | Page::Notifications
             | Page::Advanced
             | Page::Sessions => {
                 return String::new();
@@ -700,6 +702,37 @@ impl Preferences {
                             },
                         );
                         s.report(result, "Complete Claude Code sign-in in the terminal.", cx);
+                    }),
+                ))),
+            )
+            .child(
+                card(
+                    "Antigravity",
+                    "Use your Google account with the official Antigravity CLI.",
+                )
+                .child(div().child(crate::kit::button(
+                    p,
+                    "antigravity-sign-in",
+                    "Sign in with Google",
+                    false,
+                    true,
+                    cx.listener(|s, _, _, cx| {
+                        let result = s.link.remote().map_or_else(
+                            || {
+                                platform::launch_login(
+                                    ox_desk_core::runtime::Runtime::Antigravity,
+                                    &s.project,
+                                )
+                            },
+                            |h| {
+                                crate::terminal::open_remote(
+                                    h.clone(),
+                                    ox_host_web::terminal_protocol::OpenTerminal::AntigravityLogin,
+                                    cx,
+                                )
+                            },
+                        );
+                        s.report(result, "Complete Antigravity sign-in in the terminal.", cx);
                     }),
                 ))),
             )
@@ -1279,6 +1312,7 @@ impl Preferences {
             (Page::Search, "Web search"),
             (Page::Favorites, "Starred models"),
             (Page::Behavior, "Appearance & input"),
+            (Page::Notifications, "Notifications"),
             (Page::Sessions, "Sessions"),
             (Page::Legacy, "Legacy Codex provider"),
             (Page::Advanced, "Advanced configuration"),
@@ -1331,6 +1365,7 @@ impl Preferences {
                 Page::Accounts => self.account_view(p, cx),
                 Page::Advanced => self.advanced_page(p, cx),
                 Page::Behavior => self.behavior_page(p, cx),
+                Page::Notifications => self.notification_page(p, cx),
                 Page::Sessions => self.sessions_page(p, cx),
                 Page::Providers => self.providers_view(p, cx),
                 Page::Credentials => self.credentials_view(p, cx),

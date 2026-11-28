@@ -4356,9 +4356,31 @@ env_key = "BRAVE_SEARCH_API_KEY"
         assert_eq!(response.status(), 401);
         assert!(brave_hits(&brave).is_empty());
 
-        let oversized = vec![b' '; standalone_search::MAX_REQUEST_BYTES + 1];
-        let response = post_search(&relay, &oversized, true).await;
-        assert_eq!(response.status(), 413);
+        // Let the relay reject the advertised body size before sending it.
+        // Writing a full body while the relay responds and closes can race
+        // with the TCP reset from unread bytes on macOS.
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let authority = relay
+            .base
+            .trim_start_matches("http://")
+            .trim_end_matches("/v1");
+        let mut socket = tokio::net::TcpStream::connect(authority).await.unwrap();
+        let headers = format!(
+            "POST {} HTTP/1.1\r\nHost: {authority}\r\nAuthorization: Bearer {RELAY_TOKEN}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nExpect: 100-continue\r\n\r\n",
+            standalone_search::ENDPOINT_PATH,
+            standalone_search::MAX_REQUEST_BYTES + 1,
+        );
+        socket.write_all(headers.as_bytes()).await.unwrap();
+        let mut status = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            BufReader::new(socket).read_line(&mut status),
+        )
+        .await
+        .expect("relay should reject the request before reading the body")
+        .unwrap();
+        assert!(status.starts_with("HTTP/1.1 413 "), "{status:?}");
         assert!(brave_hits(&brave).is_empty());
 
         let mut blocked = search_body("rust book");
