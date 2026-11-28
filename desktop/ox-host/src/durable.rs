@@ -699,6 +699,7 @@ mod tests {
                 completed_at: 41,
                 outcome: SessionOutcome::Completed,
             }),
+            memory_attachment: None,
         };
         let saved = |scope: &Scope, sessions| SavedScope {
             scope: scope.clone(),
