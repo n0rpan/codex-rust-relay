@@ -16,6 +16,16 @@ use std::{
 pub(super) struct Process {
     write: mpsc::Sender<Value>,
     close: mpsc::Sender<String>,
+    reaped: ReapStatus,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ReapStatus(Arc<AtomicBool>);
+
+impl ReapStatus {
+    pub(crate) fn confirmed(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 impl Process {
@@ -37,6 +47,8 @@ impl Process {
         let mut input = BufWriter::new(child.stdin.take().expect("piped stdin"));
         let stderr = child.stderr.take().expect("piped stderr");
         let eof = close.clone();
+        let reaped = ReapStatus::default();
+        let child_reaped = reaped.clone();
         thread::spawn(move || {
             let mut line = Vec::new();
             let result = (|| -> io::Result<()> {
@@ -118,11 +130,20 @@ impl Process {
             unsafe {
                 libc::kill(group, libc::SIGKILL);
             }
-            let _ = child.wait();
+            child_reaped
+                .0
+                .store(child.wait().is_ok(), Ordering::Release);
             let needs_login = diagnostics.join().unwrap_or_default();
             closed(reason, needs_login);
         });
-        Ok(Self { write, close })
+        Ok(Self {
+            write,
+            close,
+            reaped,
+        })
+    }
+    pub(super) fn reap_status(&self) -> ReapStatus {
+        self.reaped.clone()
     }
     /// A handle the reader can use to answer a request without going through the link.
     pub(super) fn writer(&self) -> mpsc::Sender<Value> {

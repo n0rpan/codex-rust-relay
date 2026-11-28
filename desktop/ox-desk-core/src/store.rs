@@ -20,10 +20,12 @@ use std::{
 };
 
 pub mod claude;
+mod moves;
 mod projection;
 pub mod replica;
 mod titles;
 pub use crate::runtime::Route;
+pub use moves::MoveWriterRelease;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Profile {
@@ -49,6 +51,7 @@ enum Pending {
     Limits(u64, u64, Option<crate::usage::reported::Reporter>),
     Discover(commands::Discovery),
     LeaveForTerminal(commands::Handoff),
+    LeaveForMove(String),
     /// Best-effort release of a thread this client ended.
     Unsubscribe,
     Descendants(workers::Discovery),
@@ -101,6 +104,9 @@ pub struct Store {
     archived_threads: HashSet<String>,
     commands: commands::Catalog,
     handoff_ready: Option<commands::Handoff>,
+    moving_threads: HashSet<String>,
+    pending_codex_moves: HashMap<String, moves::CodexRelease>,
+    move_writer_releases: Vec<MoveWriterRelease>,
     terminal_threads: HashSet<String>,
     /// Threads whose live process this client ended. Cleared lazily: a thread
     /// that is live again is not reported as ended.
@@ -229,6 +235,9 @@ impl Store {
             archived_threads: Default::default(),
             commands: Default::default(),
             handoff_ready: None,
+            moving_threads: HashSet::new(),
+            pending_codex_moves: HashMap::new(),
+            move_writer_releases: Vec::new(),
             terminal_threads: Default::default(),
             ended_threads: Default::default(),
             resume_sends: Default::default(),
@@ -328,6 +337,7 @@ impl Store {
         }
         self.child_threads = std::mem::take(&mut previous.child_threads);
         self.terminal_threads = std::mem::take(&mut previous.terminal_threads);
+        self.moving_threads = std::mem::take(&mut previous.moving_threads);
         self.ended_threads = previous.ended_threads.clone();
         self.resume_access = std::mem::take(&mut previous.resume_access);
         self.resume_models = std::mem::take(&mut previous.resume_models);
@@ -353,6 +363,7 @@ impl Store {
             .map(|(id, _)| id.clone())
             .collect();
         self.reopen.extend(std::mem::take(&mut previous.reopen));
+        self.reopen.retain(|id| !self.moving_threads.contains(id));
         self.reopen.sort_unstable();
         self.reopen.dedup();
         self.drafts = std::mem::take(&mut previous.drafts);
@@ -577,6 +588,7 @@ impl Store {
                 }
                 self.notice = Some(message);
             }
+            Pending::LeaveForMove(id) => self.complete_move_writer_release(&id, Err(message)),
             Pending::Unsubscribe => (),
             Pending::Discover(stage) => self.discovery_failed(stage, message),
             Pending::Compose(op) => self.compose_failed(op, message),
@@ -632,6 +644,7 @@ impl Store {
             | Pending::List { .. }
             | Pending::Descendants(_) => self.changed.mark(Changed::THREADS),
             Pending::Options(id, _)
+            | Pending::LeaveForMove(id)
             | Pending::Access(id)
             | Pending::Read(id)
             | Pending::Resume(id)
@@ -680,6 +693,9 @@ impl Store {
                 self.changed.mark(Changed::CONNECTION | Changed::ASK);
                 for (_, (_, pending)) in std::mem::take(&mut self.pending) {
                     self.failed(pending, reason.clone());
+                }
+                for id in std::mem::take(&mut self.pending_codex_moves).into_keys() {
+                    self.complete_move_writer_release(&id, Err(reason.clone()));
                 }
                 self.state = if sign_in {
                     Connection::SignInRequired
@@ -734,6 +750,9 @@ impl Store {
                 match (pending, value) {
                     (Pending::LeaveForTerminal(handoff), Reply::Unsubscribed(_)) => {
                         self.handoff_ready = Some(handoff);
+                    }
+                    (Pending::LeaveForMove(id), Reply::Unsubscribed(reply)) => {
+                        self.acknowledge_codex_move_release(&id, reply.status);
                     }
                     (Pending::Unsubscribe, _) => (),
                     (Pending::ThreadOp(op), reply) => self.finish_thread_op(op, reply)?,

@@ -16,6 +16,7 @@ use std::{
 
 pub mod context;
 mod process;
+pub(crate) use process::ReapStatus;
 pub const INIT_ID: &str = "ox-init";
 
 pub struct Launch {
@@ -257,6 +258,9 @@ impl Link {
     }
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+    pub(crate) fn reap_status(&self) -> ReapStatus {
+        self.process.reap_status()
     }
     /// Sends a user message without a known submitting interface; the model is
     /// told the interface is unknown.

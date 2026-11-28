@@ -279,6 +279,9 @@ impl Store {
                 }
             }
             Notification::Closed(id) => {
+                if self.observe_codex_move_close(&id) {
+                    return Ok(());
+                }
                 if let Some(row) = self.catalog.get_mut(&id) {
                     row.status = None;
                 }

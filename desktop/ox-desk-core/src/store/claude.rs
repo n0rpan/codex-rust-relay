@@ -63,6 +63,7 @@ struct Process {
     generation: u64,
     events: events::EventState,
     handoff: Option<super::commands::Handoff>,
+    move_release: Option<pipe::ReapStatus>,
     link: Option<pipe::Link>,
     initialized: bool,
     limit_reporter: Option<crate::usage::reported::Reporter>,
@@ -523,6 +524,40 @@ impl Store {
             .ok_or_else(|| io::Error::other("Open the Claude session before handing it off"))?;
         p.handoff = Some(handoff);
         p.link.take();
+        Ok(())
+    }
+    pub(super) fn release_claude_writer_for_move(&mut self, id: &str) -> io::Result<()> {
+        if self.transcripts.keys().any(|child| {
+            child
+                .strip_prefix(id)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+                && self.thread_busy(child)
+        }) {
+            return Err(io::Error::other(
+                "Wait for this session's Claude subagents to finish.",
+            ));
+        }
+        let p = self
+            .claude_mut()
+            .sessions
+            .get_mut(id)
+            .filter(|p| p.initialized && p.viewer.is_none() && p.handoff.is_none())
+            .ok_or_else(|| {
+                io::Error::other("This Claude session does not have an owned writer.")
+            })?;
+        if p.move_release.is_some() {
+            return Ok(());
+        }
+        if !p.controls.is_empty() || p.first.is_some() || p.deferred_command.is_some() {
+            return Err(io::Error::other(
+                "Wait for Claude Code to finish its pending request.",
+            ));
+        }
+        let link = p.link.take().ok_or_else(|| {
+            io::Error::other("This Claude session does not have a running process.")
+        })?;
+        p.move_release = Some(link.reap_status());
+        drop(link);
         Ok(())
     }
     fn finish_claude_handoff(&mut self, id: &str) -> bool {
