@@ -10,7 +10,7 @@ use std::{collections::HashMap, io, path::Path};
 use uuid::Uuid;
 
 pub(super) struct SourceMoves {
-    ledger: Ledger,
+    pub(super) ledger: Ledger,
     /// The store generation which took responsibility for a native release.
     releases: HashMap<Uuid, ReleaseAttempt>,
 }

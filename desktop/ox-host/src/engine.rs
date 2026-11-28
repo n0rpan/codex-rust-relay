@@ -326,6 +326,8 @@ pub(crate) struct Engine {
     ledger: Ledger,
     #[cfg(test)]
     source_moves: source_moves::SourceMoves,
+    #[cfg(test)]
+    target_moves: target_moves::TargetMoves,
     replay: Replay,
     tx: SyncSender<Message>,
     clients: BTreeMap<u64, ClientState>,
@@ -370,6 +372,8 @@ mod mode_requests;
 mod notices;
 #[cfg(test)]
 mod source_moves;
+#[cfg(test)]
+mod target_moves;
 
 impl Drop for Engine {
     fn drop(&mut self) {
@@ -424,6 +428,8 @@ impl Engine {
             ledger,
             #[cfg(test)]
             source_moves: source_moves::SourceMoves::open(dir, host_id)?,
+            #[cfg(test)]
+            target_moves: target_moves::TargetMoves::default(),
             replay: Replay::new(seq, nonce()?),
             tx,
             clients: Default::default(),
@@ -1823,6 +1829,7 @@ impl Engine {
         #[cfg(test)]
         {
             self.collect_source_move_releases(scope)?;
+            self.collect_target_move_preparations(scope);
             self.advance_source_moves()?;
         }
         self.advance_flows()
@@ -6938,15 +6945,8 @@ mod tests {
             (scope, lead, engine, rx)
         }
 
-        #[test]
-        fn a_staged_source_move_waits_for_the_native_release_before_commit() {
-            use crate::{
-                move_bundle::{Bundle, Presentation},
-                move_ledger::{ArchivePin, Ledger, Status},
-                move_target::{Files, VerifiedTarget},
-            };
-            let root = tempfile::tempdir().unwrap();
-            let project = root.path().join("project");
+        fn move_checkout(root: &Path) -> PathBuf {
+            let project = root.join("project");
             std::fs::create_dir(&project).unwrap();
             let git = |args: &[&str]| {
                 let result = std::process::Command::new("git")
@@ -6972,6 +6972,166 @@ mod tests {
                 "Initial",
             ]);
             std::fs::write(project.join("notes"), "laptop draft").unwrap();
+            project.canonicalize().unwrap()
+        }
+
+        #[test]
+        fn a_codex_destination_issues_prepared_only_after_a_native_checkpoint() {
+            use crate::{
+                move_bundle::{Bundle, Presentation},
+                move_ledger::{ArchivePin, Ledger, Status},
+                move_target::{Files, VerifiedTarget},
+            };
+            use ox_desk_core::codex::{
+                frame::{Frame, RequestId},
+                reply::Reply,
+            };
+            let laptop = tempfile::tempdir().unwrap();
+            let studio = tempfile::tempdir().unwrap();
+            let (tx, _mailbox) = std::sync::mpsc::sync_channel(32);
+            let mut receiver = Engine::open(config(studio.path()), studio.path(), tx).unwrap();
+            let scope = Scope {
+                project: move_checkout(laptop.path()),
+                route: Route::CODEX_SUBSCRIPTION,
+            };
+            let (tx, _mailbox) = std::sync::mpsc::sync_channel(32);
+            let source = Engine::open(config(laptop.path()), laptop.path(), tx).unwrap();
+            let mut plan = move_plan(&source, &scope, "laptop-native");
+            drop(source);
+            plan.target_host = receiver.host_id;
+            plan.target_scope.project = studio
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join(plan.id.to_string())
+                .join("1");
+            let timeline = Timeline {
+                detail: json!({"ready":true}),
+                items: vec![
+                    serde_json::from_value(json!({
+                        "turn":"done", "id":"first", "role":"user", "text":"The earlier work",
+                        "revision":1, "detail":null
+                    }))
+                    .unwrap(),
+                ],
+            };
+            let bundle = Bundle::capture(
+                laptop.path(),
+                &plan,
+                Presentation {
+                    title: "Review the release plan".into(),
+                    updated_at: 42,
+                    last_result: None,
+                },
+                &timeline,
+            )
+            .unwrap();
+            let manifest = bundle.manifest.sha256().unwrap();
+            let target = VerifiedTarget::install(
+                studio.path(),
+                &receiver.source_moves.ledger,
+                plan.source.host,
+                Files {
+                    directory: bundle.directory(),
+                    manifest: &bundle.manifest,
+                    manifest_sha256: manifest,
+                },
+            )
+            .unwrap();
+            let frame = |id, reply| {
+                LinkEvent::Frame(Frame::Reply {
+                    id: RequestId::Number(id),
+                    result: Ok(reply),
+                })
+            };
+            let mut live = local_live(&plan.target_scope);
+            live.store.apply(frame(1, Reply::Acknowledged));
+            live.store.apply(frame(
+                2,
+                Reply::Account(
+                    serde_json::from_value(json!({
+                        "account": {"type":"chatgpt","email":"fixture@example.test"}
+                    }))
+                    .unwrap(),
+                ),
+            ));
+            assert_eq!(live.store.state(), &Connection::Ready);
+            receiver.running.insert(plan.target_scope.clone(), live);
+            let (reply, prepared) = std::sync::mpsc::channel();
+            receiver
+                .prepare_codex_move_target(plan.source.host, target, None, None, reply)
+                .unwrap();
+            assert!(prepared.try_recv().is_err());
+            let opened = serde_json::from_value(json!({
+                "thread":{"id":"studio-native","modelProvider":"openai","cwd":plan.target_scope.project},
+                "modelProvider":"openai","model":"stock-model",
+                "sandbox":{"type":"dangerFullAccess"},"approvalPolicy":"on-request",
+                "approvalsReviewer":"user","activePermissionProfile":null,
+            })).unwrap();
+            receiver
+                .process(
+                    &plan.target_scope,
+                    vec![frame(4, Reply::Opened(opened))],
+                    false,
+                )
+                .unwrap();
+            assert!(prepared.try_recv().is_err());
+            receiver
+                .process(
+                    &plan.target_scope,
+                    vec![frame(5, Reply::Acknowledged)],
+                    false,
+                )
+                .unwrap();
+            let prepared = prepared.try_recv().unwrap().unwrap();
+            assert_eq!(prepared.stage.native, "studio-native");
+            assert_eq!(prepared.stage.digest, manifest);
+            assert_eq!(
+                receiver.source_moves.ledger.status(plan.id).unwrap(),
+                Some(Status::Prepared)
+            );
+            assert!(
+                !receiver.running[&plan.target_scope]
+                    .store
+                    .can_send(Some("studio-native"))
+            );
+            let mut source = Ledger::open(laptop.path(), plan.source.host).unwrap();
+            source.prepare_source(&plan).unwrap();
+            source
+                .bind_source_manifest(
+                    &plan,
+                    ArchivePin {
+                        manifest,
+                        transcript: bundle.manifest.transcript.sha256,
+                    },
+                )
+                .unwrap();
+            source.fence_source(plan.target_host, &prepared).unwrap();
+            source.writer_released(&plan).unwrap();
+            let commit = source.commit_source(&plan).unwrap();
+            receiver
+                .activate_move_target(plan.source.host, &commit)
+                .unwrap();
+            assert_eq!(
+                receiver.source_moves.ledger.status(plan.id).unwrap(),
+                Some(Status::Active)
+            );
+            assert!(
+                receiver.running[&plan.target_scope]
+                    .store
+                    .can_send(Some("studio-native"))
+            );
+        }
+
+        #[test]
+        fn a_staged_source_move_waits_for_the_native_release_before_commit() {
+            use crate::{
+                move_bundle::{Bundle, Presentation},
+                move_ledger::{ArchivePin, Ledger, Status},
+                move_target::{Files, VerifiedTarget},
+            };
+            let root = tempfile::tempdir().unwrap();
+            let project = move_checkout(root.path());
             let studio = tempfile::tempdir().unwrap();
             let (scope, lead, mut engine, rx) = warm_claude_in(root.path(), &project);
             let mut plan = move_plan(&engine, &scope, &lead);

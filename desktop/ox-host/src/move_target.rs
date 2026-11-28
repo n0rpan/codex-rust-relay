@@ -43,6 +43,15 @@ pub(crate) struct VerifiedTarget {
 }
 
 impl VerifiedTarget {
+    pub(crate) fn plan(&self) -> &Plan {
+        &self.saved.bundle.plan
+    }
+
+    pub(crate) fn matches_prepared(&self, prepared: &Prepared) -> bool {
+        prepared.plan == self.saved.bundle.plan
+            && prepared.stage.digest == self.saved.manifest_sha256
+    }
+
     /// Each move receives a fresh checkout in the destination state directory.
     /// The host actor serializes this step and reserves the scope in preflight.
     pub(crate) fn install(
