@@ -1121,15 +1121,14 @@ impl Workbench {
         let move_button = self.live_move_button(p, cx);
         let move_panel = self.live_move_panel(p, cx);
         let source_reserved = self.live_move_locked();
-        let controls = (!source_reserved).then(|| self.thread_menu(cx)).flatten();
-        let start_worker = (!source_reserved)
+        let move_pending = self.live_move_pending();
+        let controls = (!move_pending).then(|| self.thread_menu(cx)).flatten();
+        let start_worker = (!move_pending)
             .then(|| self.start_worker_button(p, cx))
             .flatten();
         let review_toggle = self.review_toggle(cx);
         let inline_request = self.pane_width < px(825.);
-        let asks = (!source_reserved)
-            .then(|| self.ask_sheet(inline_request, window, cx))
-            .flatten();
+        let asks = self.ask_sheet(inline_request, window, cx);
         let launch = (!source_reserved)
             .then(|| self.launch_sheet(window.viewport_size().height * 0.6, cx))
             .flatten();

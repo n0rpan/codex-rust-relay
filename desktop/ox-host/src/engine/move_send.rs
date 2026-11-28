@@ -66,6 +66,13 @@ impl Engine {
                 if let Some(progress) = self.move_progress(scope, &row.id)? {
                     attach_move_progress(row, progress);
                 } else if row.detail["owned"] == true
+                    && row.detail["native_live"].is_null()
+                    && row.detail["terminal"] != true
+                    && (scope.route.runtime != ox_desk_core::runtime::Runtime::Claude
+                        || row
+                            .capabilities
+                            .iter()
+                            .any(|capability| capability == "end"))
                     && row
                         .capabilities
                         .iter()
@@ -146,6 +153,36 @@ impl Engine {
         self.broadcast(scope, vec![change])
     }
 
+    pub(super) fn view_source_move_status(
+        &mut self,
+        scope: &Scope,
+        action: &Action,
+    ) -> io::Result<bool> {
+        let native = match action {
+            Action::SelectThread(thread) => thread,
+            Action::OpenCatalogRow(row) => &row.id,
+            _ => return Ok(false),
+        };
+        let showing_only_status = self
+            .source_moves
+            .ledger
+            .source_move_at(scope, native)?
+            .is_some_and(|(_, phase, _)| {
+                matches!(
+                    phase,
+                    Status::Preparing
+                        | Status::Fenced
+                        | Status::Released
+                        | Status::Committed
+                        | Status::Confirmed
+                )
+            });
+        if showing_only_status {
+            self.publish_move_progress(scope, native)?;
+        }
+        Ok(showing_only_status)
+    }
+
     pub(super) fn start_move(
         &mut self,
         client: u64,
@@ -198,6 +235,16 @@ impl Engine {
             return Err(io::Error::other(
                 "Open the source session before moving it.",
             ));
+        }
+        if live.store.is_native_live(&action.thread) || live.store.in_terminal(&action.thread) {
+            return Err(io::Error::other(
+                "Close the session’s terminal before moving it.",
+            ));
+        }
+        if scope.route.runtime == ox_desk_core::runtime::Runtime::Claude
+            && !live.store.has_live_session(&action.thread)
+        {
+            return Err(io::Error::other("Run this session in OX before moving it."));
         }
         let turn = if action.after_turn {
             Some(

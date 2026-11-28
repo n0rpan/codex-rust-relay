@@ -1539,19 +1539,30 @@ impl Engine {
         approval: Option<String>,
         approved_mode: Option<(ox_desk_core::modes::Level, Sender)>,
     ) -> io::Result<()> {
+        if self.view_source_move_status(scope, &action)? {
+            return Ok(());
+        }
         self.check_source_move_action(scope, &action)?;
         match &action {
             Action::LoadOlder(thread) if self.load_moved_history(scope, thread, true)? => {
                 return Ok(());
             }
-            Action::SelectThread(thread)
-            | Action::SendText(Some(thread), _)
+            Action::SelectThread(thread) => {
+                self.load_moved_history(scope, thread, false)?;
+                if self.view_reserved_claude_move(scope, thread)? {
+                    return Ok(());
+                }
+            }
+            Action::SendText(Some(thread), _)
             | Action::SendImages(Some(thread), _, _)
             | Action::Submit(Some(thread)) => {
                 self.load_moved_history(scope, thread, false)?;
             }
             Action::OpenCatalogRow(row) => {
                 self.load_moved_history(scope, &row.id, false)?;
+                if self.view_reserved_claude_move(scope, &row.id)? {
+                    return Ok(());
+                }
             }
             _ => (),
         }

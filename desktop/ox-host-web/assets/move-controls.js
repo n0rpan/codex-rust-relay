@@ -74,7 +74,7 @@ export class MoveControls {
     this.targets = Array.isArray(view?.targets) ? view.targets : [];
     this.launcher.hidden = !view?.supported;
     this.launcher.disabled = !view?.ready || Boolean(this.submitting) ||
-      (this.move && !["failed", "cancelled"].includes(this.move.phase));
+      (this.move && this.move.phase !== "cancelled");
     if (this.dialog.open) this.updateChoice();
     const key = JSON.stringify([this.move, view?.ready, view?.source]);
     if (this.renderKey === key) return;

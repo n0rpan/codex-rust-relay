@@ -692,6 +692,27 @@ impl Store {
         }
     }
 
+    /// Display an activated move's archive before Claude has written its first journal.
+    pub fn show_reserved_claude_move(&mut self, operation: &str, row: ThreadRow) -> io::Result<()> {
+        if self.prepare_claude_move_writer(operation)? != row.id {
+            return Err(io::Error::other("The reserved Claude writer changed."));
+        }
+        let thread = row.id.clone();
+        let access = crate::modes::Level::Read.preset(self.profile.route.runtime);
+        self.restore_ended(&thread, row.title(), row.updated_at, Some(access));
+        self.adopt_catalog_row(row)?;
+        self.selected = Some(thread.clone());
+        let transcript = self.transcripts.entry(thread.clone()).or_default();
+        transcript.ready = true;
+        transcript.verified = true;
+        transcript.loading = false;
+        transcript.error = None;
+        transcript.access = Some(access);
+        self.changed.replace_transcript(&thread);
+        self.changed.mark(Changed::THREADS);
+        Ok(())
+    }
+
     /// Send the operator's first explicit input to the already activated move.
     /// If the first turn created a journal, use ordinary resume on later sends.
     pub fn start_claude_move_turn(

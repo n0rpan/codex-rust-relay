@@ -1896,9 +1896,12 @@ function conversation() {
   );
   $("older").hidden = !timeline?.detail?.older;
   $("older").onclick = () => detailLink.act({ load_older: id });
-  $("start-worker").hidden = !id || !caps.includes("open") || scope.route.runtime === "antigravity";
+  const move = row?.detail?.move;
+  const moving = Boolean(move && move.phase !== "cancelled");
+  if (moving) $("session-controls").hidden = true;
+  $("start-worker").hidden = moving || !id || !caps.includes("open") || scope.route.runtime === "antigravity";
   $("start-worker").disabled = !detailLink?.ready;
-  $("continue-in").hidden = !id || !caps.includes("open");
+  $("continue-in").hidden = moving || !id || !caps.includes("open");
   moveControls.update({
     owner: keyOf(scope, id),
     thread: id,
@@ -1906,9 +1909,10 @@ function conversation() {
     ready: Boolean(detailLink?.ready),
     supported: Boolean(id && (caps.includes("move_session") ||
       (detailLink?.sessionMoves && ["codex", "claude"].includes(scope.route.runtime) &&
-        row?.detail?.owned && caps.includes("open")))),
+        row?.detail?.owned && !row.detail.native_live && !row.detail.terminal && caps.includes("open") &&
+        (scope.route.runtime !== "claude" || caps.includes("end"))))),
     running: caps.includes("stop"),
-    move: row?.detail?.move,
+    move,
     targets: detailLink?.hostInventory
       ? moveDestinations(detailLink.hostInventory, scope.route)
       : row?.detail?.move_destinations,
@@ -1981,6 +1985,7 @@ function conversation() {
   const awaitingApproval =
     caps.includes("stop") && (s?.asks || []).some((a) => a.thread === id);
   $("operator-session").hidden =
+    moving ||
     !id ||
     scope.route.runtime === "antigravity" ||
     !!row?.parent ||
@@ -1988,7 +1993,7 @@ function conversation() {
     !(caps.includes("send") || awaitingApproval);
   updateComposerState();
   $("menu-session").hidden = !id;
-  $("menu-workers").hidden = !id || !caps.includes("open");
+  $("menu-workers").hidden = moving || !id || !caps.includes("open");
   $("menu-settings").hidden = $("session-controls").hidden;
 }
 function render() {

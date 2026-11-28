@@ -45,6 +45,12 @@ impl Workbench {
         Some((thread, store.session_mark(thread, "move")?))
     }
 
+    pub(super) fn live_move_pending(&self) -> bool {
+        self.live_move_mark()
+            .and_then(|(_, mark)| mark["phase"].as_str())
+            .is_some_and(|phase| phase != "cancelled")
+    }
+
     pub(super) fn live_move_locked(&self) -> bool {
         self.live_move_mark().is_some_and(|(_, mark)| {
             matches!(
@@ -69,13 +75,7 @@ impl Workbench {
         let store = self.store.as_ref()?;
         let thread = store.selected()?;
         if !store.can_move_session(thread)
-            || self.live_move_locked()
-            || self.live_move_mark().is_some_and(|(_, mark)| {
-                matches!(
-                    mark["phase"].as_str(),
-                    Some("waiting" | "waiting_for_workers")
-                )
-            })
+            || self.live_move_pending()
             || self
                 .move_picker
                 .as_ref()

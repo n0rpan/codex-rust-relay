@@ -40,6 +40,35 @@ struct Pending {
 }
 
 impl Engine {
+    pub(super) fn view_reserved_claude_move(
+        &mut self,
+        scope: &Scope,
+        thread: &str,
+    ) -> io::Result<bool> {
+        if scope.route.runtime != ox_desk_core::runtime::Runtime::Claude {
+            return Ok(false);
+        }
+        let ledger = &self.source_moves.ledger;
+        let Some(owned) = ledger.active_receivers()?.into_iter().find(|prepared| {
+            &prepared.plan.target_scope == scope && prepared.stage.native == thread
+        }) else {
+            return Ok(false);
+        };
+        let operation = owned.plan.id.to_string();
+        let live = self.running.get_mut(scope).expect("live scope");
+        match live.store.prepare_claude_move_writer(&operation) {
+            Ok(native) if native == thread => (),
+            Ok(_) => return Err(io::Error::other("The reserved Claude writer changed.")),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        let row = VerifiedTarget::load(&self.state_dir, &owned.plan)?
+            .catalog_row_for(ledger, scope, thread)?;
+        let row = serde_json::from_value(row.detail["row"].clone())?;
+        live.store.show_reserved_claude_move(&operation, row)?;
+        Ok(true)
+    }
+
     pub(super) fn stamp_moved_row(&self, scope: &Scope, row: &mut SessionView) {
         let Some(display) = self
             .target_moves
