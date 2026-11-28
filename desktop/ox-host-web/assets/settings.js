@@ -904,9 +904,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
         field.spellcheck = false;
         field.setAttribute("autocapitalize", "none");
         submit(form, key.saved ? "Replace key" : "Save key", async () => {
-          const value = field.value;
-          field.value = "";
-          await save(req(value), credentials);
+          await save(req(field.value), credentials);
         });
       }
       if (key.saved)

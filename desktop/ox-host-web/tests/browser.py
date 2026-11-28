@@ -937,6 +937,21 @@ def run(harness, screenshot=None):
         wait(lambda: js("""return document.querySelector('[data-view=folders]').ariaPressed==='true' &&
             !!document.querySelector('.session.nested')"""))
 
+        # A phone relaunch keeps only the draft for the exact session, without submitting it.
+        js("document.querySelector('[data-thread-id=child]').click()")
+        wait(lambda: js("return !document.getElementById('conversation').hidden"))
+        js("""const d=document.getElementById('draft');
+            d.value='Check the pool limits first'; d.dispatchEvent(new Event('input')); location.reload();""")
+        wait(lambda: js("return !!document.querySelector('[data-thread-id=parent]')"))
+        js("document.querySelector('[data-thread-id=parent]').click()")
+        assert js("return !document.getElementById('draft').value")
+        js("document.querySelector('#conversation .back').click(); document.querySelector('[data-thread-id=child]').click()")
+        assert js("return document.getElementById('draft').value==='Check the pool limits first'")
+        assert {"send_text": ["child", "Check the pool limits first"]} not in host.actions
+        js("""const d=document.getElementById('draft');
+            d.value=''; d.dispatchEvent(new Event('input'));
+            document.querySelector('#conversation .back').click();""")
+
         report = next(row for row in host.sessions if row["id"] == "disk-report")
         report["detail"]["last_result"] = {"turn": "follow", "completed_at": now, "outcome": "completed"}
         js("location.reload()")
