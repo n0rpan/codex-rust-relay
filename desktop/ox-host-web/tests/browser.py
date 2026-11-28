@@ -1263,9 +1263,13 @@ def run(harness, screenshot=None):
             "return g.includes('Subscriptions') && g.includes('All models') && "
             "['codex','claude'].every(r=>o.some(t=>t.toLowerCase().includes(r)&&t.includes('orchard')))"
         ))
-        js(
-            "document.getElementById('home').click();document.getElementById('new').click();document.getElementById('new-form').requestSubmit()"
-        )
+        # The picker remembers Antigravity. The remaining draft and native command checks use Claude.
+        def continue_on_claude():
+            js("""const route=document.getElementById('route');
+                route.value=[...route.options].find(o=>o.text==='Claude subscription').value;
+                document.getElementById('new-form').requestSubmit();""")
+
+        continue_on_claude()
         wait(
             lambda: js(
                 "return document.getElementById('network').innerText==='Connected' && document.getElementById('title').innerText==='New session'"
@@ -1292,7 +1296,8 @@ def run(harness, screenshot=None):
         # real thread's Opened must keep it, whichever of Ack and Opened comes first.
         def new_thread(first):
             host.release.clear()
-            js("document.getElementById('home').click();document.getElementById('new').click();document.getElementById('new-form').requestSubmit()")
+            js("document.getElementById('home').click();document.getElementById('new').click()")
+            continue_on_claude()
             wait(lambda: js("return document.getElementById('network').innerText==='Connected' && document.getElementById('title').innerText==='New session'"))
             type_draft(first)
             js("document.getElementById('composer').requestSubmit()")
