@@ -515,7 +515,15 @@ fn start_listener(app: App, origin: String, listener: TcpListener) -> Listener {
         )
         .route(
             "/sw.js",
-            get(|| async { asset("text/javascript", include_bytes!("../assets/sw.js")) }),
+            get(|| async {
+                const SCRIPT: &str = concat!(
+                    "const shell = \"ox-remote-shell-",
+                    env!("OX_PHONE_SHELL_REVISION"),
+                    "\";\n",
+                    include_str!("../assets/sw.js"),
+                );
+                asset("text/javascript", SCRIPT.as_bytes())
+            }),
         )
         .route(
             "/marquee.png",
