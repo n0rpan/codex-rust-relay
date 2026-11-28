@@ -1,7 +1,11 @@
 //! Source-side move transitions. The transport supplies authenticated staging
 //! receipts. The actor retains the next turn and releases the native writer.
 use super::{Action, Connection, Engine, Scope};
-use crate::move_ledger::{Ledger, Plan, Prepared, Status};
+use crate::{
+    move_archive::Archive,
+    move_ledger::{Activated, ArchivePin, Commit, Ledger, Plan, Prepared, Status},
+};
+use ox_desk_core::host_protocol::Timeline;
 use std::{collections::HashMap, io, path::Path};
 use uuid::Uuid;
 
@@ -97,12 +101,18 @@ impl Engine {
         prepared: &Prepared,
     ) -> io::Result<Status> {
         let plan = &prepared.plan;
-        if self.source_moves.ledger.status(plan.id)? == Some(Status::Preparing)
-            && !self.move_source_quiescent(plan)
-        {
-            return Err(io::Error::other(
-                "Wait for the source session and its workers to finish.",
-            ));
+        if self.source_moves.ledger.status(plan.id)? == Some(Status::Preparing) {
+            let fingerprint = Archive::fingerprint(plan, self.move_source_timeline(plan)?)?;
+            if !self
+                .source_moves
+                .ledger
+                .source_archive(plan)?
+                .is_some_and(|archive| archive.transcript == fingerprint)
+            {
+                return Err(io::Error::other(
+                    "The source history changed before the move was committed.",
+                ));
+            }
         }
         let phase = self
             .source_moves
@@ -120,15 +130,57 @@ impl Engine {
         Ok(phase)
     }
 
-    pub(super) fn bind_move_manifest(&mut self, plan: &Plan, digest: [u8; 32]) -> io::Result<()> {
+    pub(super) fn move_source_timeline(&self, plan: &Plan) -> io::Result<&Timeline> {
+        if self.source_moves.ledger.status(plan.id)? != Some(Status::Preparing) {
+            return Err(io::Error::other("The session is not ready to move."));
+        }
         if !self.move_source_quiescent(plan) {
             return Err(io::Error::other("The source session is still active."));
         }
-        self.source_moves.ledger.bind_source_manifest(plan, digest)
+        self.running[&plan.source.scope]
+            .state
+            .transcripts
+            .get(&plan.source.native)
+            .ok_or_else(|| io::Error::other("Open the source session's history before moving."))
+    }
+
+    pub(super) fn bind_move_manifest(
+        &mut self,
+        plan: &Plan,
+        archive: ArchivePin,
+    ) -> io::Result<()> {
+        if Archive::fingerprint(plan, self.move_source_timeline(plan)?)? != archive.transcript {
+            return Err(io::Error::other(
+                "The source history changed while preparing the move.",
+            ));
+        }
+        self.source_moves.ledger.bind_source_manifest(plan, archive)
     }
 
     pub(super) fn source_move_status(&self, id: Uuid) -> io::Result<Option<Status>> {
         self.source_moves.ledger.status(id)
+    }
+
+    pub(super) fn committed_move(&mut self, plan: &Plan) -> io::Result<Commit> {
+        if !matches!(
+            self.source_move_status(plan.id)?,
+            Some(Status::Committed | Status::Confirmed)
+        ) {
+            return Err(io::Error::other(
+                "Wait for the source's native writer to close.",
+            ));
+        }
+        self.source_moves.ledger.commit_source(plan)
+    }
+
+    pub(super) fn confirm_move(
+        &mut self,
+        authenticated_target: Uuid,
+        receipt: &Activated,
+    ) -> io::Result<()> {
+        self.source_moves
+            .ledger
+            .confirm_source(authenticated_target, receipt)
     }
 
     pub(super) fn hold_move_source_scope(&self, scope: &Scope) -> io::Result<bool> {

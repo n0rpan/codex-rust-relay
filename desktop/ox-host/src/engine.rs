@@ -6870,11 +6870,23 @@ mod tests {
             Engine,
             std::sync::mpsc::Receiver<ox_desk_core::links::LinkEvent>,
         ) {
+            warm_claude_in(root, root)
+        }
+
+        fn warm_claude_in(
+            root: &Path,
+            project: &Path,
+        ) -> (
+            Scope,
+            String,
+            Engine,
+            std::sync::mpsc::Receiver<ox_desk_core::links::LinkEvent>,
+        ) {
             use ox_desk_core::store::claude::{Launcher, SUBSCRIPTION_PROVIDER};
             // The fixture's journal records the real cwd; macOS temp dirs sit behind /var -> /private/var.
             let root = &root.canonicalize().unwrap();
             let scope = Scope {
-                project: root.to_owned(),
+                project: project.canonicalize().unwrap(),
                 route: Runtime::Claude.route(None),
             };
             let (etx, rx) = std::sync::mpsc::channel();
@@ -6928,24 +6940,77 @@ mod tests {
 
         #[test]
         fn a_staged_source_move_waits_for_the_native_release_before_commit() {
-            use crate::move_ledger::{Prepared, Stage, Status};
+            use crate::{
+                move_bundle::Bundle,
+                move_ledger::{ArchivePin, Ledger, Status},
+                move_target::{Files, VerifiedTarget},
+            };
             let root = tempfile::tempdir().unwrap();
-            let (scope, lead, mut engine, rx) = warm_claude(root.path());
-            let plan = move_plan(&engine, &scope, &lead);
+            let project = root.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let git = |args: &[&str]| {
+                let result = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&project)
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            };
+            git(&["init", "-q"]);
+            git(&[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.test",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "Initial",
+            ]);
+            std::fs::write(project.join("notes"), "laptop draft").unwrap();
+            let studio = tempfile::tempdir().unwrap();
+            let (scope, lead, mut engine, rx) = warm_claude_in(root.path(), &project);
+            let mut plan = move_plan(&engine, &scope, &lead);
+            plan.target_scope.project = studio
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join(plan.id.to_string())
+                .join("1");
             assert_eq!(
                 engine.prepare_source_move(&plan, false).unwrap(),
                 Status::Preparing
             );
             assert!(engine.running[&scope].store.has_live_session(&lead));
-            let prepared = Prepared {
-                plan: plan.clone(),
-                stage: Stage {
-                    digest: [8; 32],
-                    native: "studio-native".into(),
-                },
+            let bundle = Bundle::capture(
+                root.path(),
+                &plan,
+                engine.move_source_timeline(&plan).unwrap(),
+            )
+            .unwrap();
+            let archive = ArchivePin {
+                manifest: bundle.manifest.sha256().unwrap(),
+                transcript: bundle.manifest.transcript.sha256,
             };
-            engine
-                .bind_move_manifest(&plan, prepared.stage.digest)
+            engine.bind_move_manifest(&plan, archive).unwrap();
+            let mut ledger = Ledger::open(studio.path(), plan.target_host).unwrap();
+            let target = VerifiedTarget::install(
+                studio.path(),
+                &ledger,
+                plan.source.host,
+                Files {
+                    directory: bundle.directory(),
+                    manifest: &bundle.manifest,
+                    manifest_sha256: archive.manifest,
+                },
+            )
+            .unwrap();
+            let prepared = target
+                .prepare(&mut ledger, plan.source.host, "studio-native".into())
                 .unwrap();
             assert!(
                 engine
@@ -6956,6 +7021,30 @@ mod tests {
                 engine.source_move_status(plan.id).unwrap(),
                 Some(Status::Preparing)
             );
+            let changed = {
+                let live = engine.running.get_mut(&scope).unwrap();
+                let item = &mut live.state.transcripts.get_mut(&lead).unwrap().items[0];
+                item.revision += 1;
+                item.id.clone()
+            };
+            assert!(
+                engine
+                    .stage_source_move(plan.target_host, &prepared)
+                    .is_err()
+            );
+            engine
+                .running
+                .get_mut(&scope)
+                .unwrap()
+                .state
+                .transcripts
+                .get_mut(&lead)
+                .unwrap()
+                .items
+                .iter_mut()
+                .find(|item| item.id == changed)
+                .unwrap()
+                .revision -= 1;
             assert_eq!(
                 engine
                     .stage_source_move(plan.target_host, &prepared)
@@ -6967,17 +7056,36 @@ mod tests {
                 Some(Status::Fenced)
             );
             assert!(engine.running[&scope].store.has_live_session(&lead));
+            assert!(engine.committed_move(&plan).is_err());
             pump_engine(&mut engine, &scope, &rx, &|engine| {
                 engine.source_move_status(plan.id).unwrap() == Some(Status::Committed)
             });
             assert!(!engine.running[&scope].store.has_live_session(&lead));
+            let commit = engine.committed_move(&plan).unwrap();
+            let activated = ledger.activate_receiver(plan.source.host, &commit).unwrap();
+            engine.confirm_move(plan.target_host, &activated).unwrap();
+            let mut history = target
+                .history_for(&ledger, &plan.target_scope, "studio-native")
+                .unwrap();
+            assert!(
+                history
+                    .previous(None, 100)
+                    .unwrap()
+                    .0
+                    .iter()
+                    .any(|item| item.text.contains("lead first turn"))
+            );
+            assert_eq!(
+                std::fs::read_to_string(plan.target_scope.project.join("notes")).unwrap(),
+                "laptop draft"
+            );
             drop(engine);
 
             let (tx, _mailbox) = std::sync::mpsc::sync_channel(32);
             let engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
             assert_eq!(
                 engine.source_move_status(plan.id).unwrap(),
-                Some(Status::Committed)
+                Some(Status::Confirmed)
             );
             assert!(
                 engine

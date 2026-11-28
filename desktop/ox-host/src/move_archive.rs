@@ -25,18 +25,25 @@ impl Archive {
         plan: &Plan,
         timeline: &Timeline,
     ) -> io::Result<[u8; 32]> {
-        Self::write(
-            file,
-            &Header {
-                plan: plan.clone(),
-                items: timeline.items.len(),
-            },
-            timeline,
-        )
+        if file.metadata()?.len() != 0 {
+            return Err(io::Error::other(
+                "The transfer archive already contains data.",
+            ));
+        }
+        file.rewind()?;
+        Self::write(&mut *file, plan, timeline)?;
+        file.sync_all()?;
+        checksum(file)
+    }
+
+    pub(crate) fn fingerprint(plan: &Plan, timeline: &Timeline) -> io::Result<[u8; 32]> {
+        let mut hash = Sha256::new();
+        Self::write(&mut hash, plan, timeline)?;
+        Ok(hash.finalize().into())
     }
 
     /// Capture the complete projection without carrying live approval or runtime state.
-    fn write(file: &mut File, header: &Header, timeline: &Timeline) -> io::Result<[u8; 32]> {
+    fn write(mut file: impl Write, plan: &Plan, timeline: &Timeline) -> io::Result<()> {
         if timeline.detail["ready"] != true
             || timeline.detail["older"] == true
             || timeline.detail["loading"] == true
@@ -46,26 +53,20 @@ impl Archive {
                 "Wait for the full session history and current turn.",
             ));
         }
-        if header.items != timeline.items.len()
-            || header.plan.source.native.is_empty()
-            || header.plan.source.host == header.plan.target_host
-        {
+        if plan.source.native.is_empty() || plan.source.host == plan.target_host {
             return Err(io::Error::other("The transcript does not match the move."));
         }
-        if file.metadata()?.len() != 0 {
-            return Err(io::Error::other(
-                "The transfer archive already contains data.",
-            ));
-        }
-        file.rewind()?;
-        serde_json::to_writer(&mut *file, header)?;
+        let header = Header {
+            plan: plan.clone(),
+            items: timeline.items.len(),
+        };
+        serde_json::to_writer(&mut file, &header)?;
         file.write_all(b"\n")?;
         for item in &timeline.items {
-            serde_json::to_writer(&mut *file, item)?;
+            serde_json::to_writer(&mut file, item)?;
             file.write_all(b"\n")?;
         }
-        file.sync_all()?;
-        checksum(file)
+        Ok(())
     }
 
     /// Verify the staged bytes and their binding before making the archive readable.
@@ -143,7 +144,7 @@ pub(crate) fn checksum(file: &mut File) -> io::Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::move_ledger::{Ledger, Owner};
+    use crate::move_ledger::{ArchivePin, Ledger, Owner};
     use ox_desk_core::host_protocol::Scope;
     use ox_desk_core::runtime::Route;
     use serde_json::json;
@@ -194,7 +195,7 @@ mod tests {
     fn history_pages_need_only_the_destination_file() {
         let (header, timeline) = fixture();
         let mut file = tempfile::tempfile().unwrap();
-        let digest = Archive::write(&mut file, &header, &timeline).unwrap();
+        let digest = Archive::capture(&mut file, &header.plan, &timeline).unwrap();
         let mut archive = Archive::open(file, &header.plan, digest).unwrap();
         let (last, before) = archive.previous(None, 4).unwrap();
         assert_eq!(last, timeline.items[2..]);
@@ -208,9 +209,9 @@ mod tests {
         let (mut header, mut timeline) = fixture();
         let mut file = tempfile::tempfile().unwrap();
         timeline.detail["older"] = true.into();
-        assert!(Archive::write(&mut file, &header, &timeline).is_err());
+        assert!(Archive::capture(&mut file, &header.plan, &timeline).is_err());
         timeline.detail["older"] = false.into();
-        let digest = Archive::write(&mut file, &header, &timeline).unwrap();
+        let digest = Archive::capture(&mut file, &header.plan, &timeline).unwrap();
         assert!(Archive::open(file.try_clone().unwrap(), &header.plan, [0; 32]).is_err());
         header.plan.target_host = Uuid::new_v4();
         assert!(Archive::open(file, &header.plan, digest).is_err());
@@ -290,7 +291,15 @@ mod tests {
                 .history_for(&receiver, &plan.target_scope, "target-thread")
                 .is_err()
         );
-        source.bind_source_manifest(plan, manifest_sha256).unwrap();
+        source
+            .bind_source_manifest(
+                plan,
+                ArchivePin {
+                    manifest: manifest_sha256,
+                    transcript: bundle.manifest.transcript.sha256,
+                },
+            )
+            .unwrap();
         source.fence_source(plan.target_host, &staged).unwrap();
         source.writer_released(plan).unwrap();
         let proof = source.commit_source(plan).unwrap();

@@ -45,6 +45,12 @@ pub(crate) struct Prepared {
     pub stage: Stage,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ArchivePin {
+    pub(crate) manifest: [u8; 32],
+    pub(crate) transcript: [u8; 32],
+}
+
 /// Sent over the authenticated source-host connection only after the fence
 /// and native writer release have been recorded.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,7 +94,7 @@ enum Phase {
     },
     SourcePreparing {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        manifest: Option<[u8; 32]>,
+        archive: Option<ArchivePin>,
     },
     SourceFenced {
         stage: Stage,
@@ -297,7 +303,7 @@ impl Ledger {
     /// The actor checks ownership of the native thread before the first move.
     /// Preparing blocks new writes while the actor snapshots the idle source.
     pub(crate) fn prepare_source(&mut self, plan: &Plan) -> io::Result<Status> {
-        self.record_source(plan, Phase::SourcePreparing { manifest: None })
+        self.record_source(plan, Phase::SourcePreparing { archive: None })
     }
 
     /// Queuing keeps the current turn writable and reserves its next turn.
@@ -376,7 +382,7 @@ impl Ledger {
         self.check_hosts(plan, self.data.host, plan.target_host)?;
         match self.require(plan)? {
             Phase::SourceQueued { finished: true, .. } => {
-                self.set(plan, Phase::SourcePreparing { manifest: None })
+                self.set(plan, Phase::SourcePreparing { archive: None })
             }
             Phase::SourcePreparing { .. } => Ok(()),
             _ => Err(io::Error::other(
@@ -386,22 +392,34 @@ impl Ledger {
     }
 
     /// The signed destination preparation must match the files frozen here.
-    pub(crate) fn bind_source_manifest(&mut self, plan: &Plan, digest: [u8; 32]) -> io::Result<()> {
+    pub(crate) fn bind_source_manifest(
+        &mut self,
+        plan: &Plan,
+        archive: ArchivePin,
+    ) -> io::Result<()> {
         self.check_hosts(plan, self.data.host, plan.target_host)?;
         match self.require(plan)? {
-            Phase::SourcePreparing { manifest: None } => self.set(
+            Phase::SourcePreparing { archive: None } => self.set(
                 plan,
                 Phase::SourcePreparing {
-                    manifest: Some(digest),
+                    archive: Some(archive),
                 },
             ),
             Phase::SourcePreparing {
-                manifest: Some(saved),
-            } if *saved == digest => Ok(()),
+                archive: Some(saved),
+            } if *saved == archive => Ok(()),
             _ => Err(io::Error::other(
                 "This move is already bound to a different transfer.",
             )),
         }
+    }
+
+    pub(crate) fn source_archive(&self, plan: &Plan) -> io::Result<Option<ArchivePin>> {
+        self.check_hosts(plan, self.data.host, plan.target_host)?;
+        Ok(match self.require(plan)? {
+            Phase::SourcePreparing { archive } => *archive,
+            _ => None,
+        })
     }
 
     fn record_source(&mut self, plan: &Plan, phase: Phase) -> io::Result<Status> {
@@ -506,8 +524,8 @@ impl Ledger {
         }
         match self.require(plan)? {
             Phase::SourcePreparing {
-                manifest: Some(digest),
-            } if *digest == prepared.stage.digest => {
+                archive: Some(saved),
+            } if saved.manifest == prepared.stage.digest => {
                 self.set(
                     plan,
                     Phase::SourceFenced {
@@ -845,6 +863,13 @@ mod tests {
         }
     }
 
+    fn archive(prepared: &Prepared) -> ArchivePin {
+        ArchivePin {
+            manifest: prepared.stage.digest,
+            transcript: [8; 32],
+        }
+    }
+
     #[test]
     fn a_native_release_cannot_commit_an_unrelated_or_failed_move() {
         let laptop = tempfile::tempdir().unwrap();
@@ -853,7 +878,7 @@ mod tests {
         source.prepare_source(&plan).unwrap();
         let prepared = prepare(&plan, "studio");
         source
-            .bind_source_manifest(&plan, prepared.stage.digest)
+            .bind_source_manifest(&plan, archive(&prepared))
             .unwrap();
         source.fence_source(plan.target_host, &prepared).unwrap();
 
@@ -959,7 +984,7 @@ mod tests {
         assert!(!target().can_write(&plan.target_scope, "studio-native"));
         assert!(source().fence_source(plan.target_host, &prepared).is_err());
         source()
-            .bind_source_manifest(&plan, prepared.stage.digest)
+            .bind_source_manifest(&plan, archive(&prepared))
             .unwrap();
         let mut different = prepared.clone();
         different.stage.digest[0] ^= 1;
@@ -1032,8 +1057,7 @@ mod tests {
         let mut b = Ledger::open(studio.path(), first.target_host).unwrap();
         let prepared = prepare(&first, "studio-native");
         a.prepare_source(&first).unwrap();
-        a.bind_source_manifest(&first, prepared.stage.digest)
-            .unwrap();
+        a.bind_source_manifest(&first, archive(&prepared)).unwrap();
         b.prepare_receiver(first.source.host, &prepared).unwrap();
         a.fence_source(first.target_host, &prepared).unwrap();
         a.writer_released(&first).unwrap();
@@ -1049,8 +1073,7 @@ mod tests {
         };
         let prepared = prepare(&back, "laptop-native-2");
         b.prepare_source(&back).unwrap();
-        b.bind_source_manifest(&back, prepared.stage.digest)
-            .unwrap();
+        b.bind_source_manifest(&back, archive(&prepared)).unwrap();
         assert!(
             a.prepare_receiver(back.source.host, &prepare(&back, "local"))
                 .is_err()
