@@ -157,7 +157,7 @@ impl ParentLink {
     /// A launch stamp names its parent. Handoffs record a source rather than a
     /// worker parent and keep their existing presentation.
     fn from_origin(origin: &Origin) -> Option<Self> {
-        if origin.relation == Relation::Handoff {
+        if origin.relation == Relation::Handoff || origin.linked.is_some() {
             return None;
         }
         let id = origin.parent.session.clone()?;
@@ -1030,6 +1030,10 @@ impl Host {
                 .and_then(|parent| resolve_parent_key(parent, &by_scope, &by_project));
             // Native subagent rows carry only a parent thread id in the same project.
             if recorded.is_none()
+                && entry
+                    .origin
+                    .as_ref()
+                    .is_none_or(|origin| origin.linked.is_none())
                 && let Some(parent) = &entry.parent
             {
                 resolved = by_scope
@@ -1748,5 +1752,24 @@ mod parent_link_tests {
             ))
             .is_none()
         );
+    }
+
+    #[test]
+    fn a_linked_workers_lead_is_never_resolved_in_the_receiving_hosts_catalog() {
+        let mut worker = origin(
+            Relation::Worker,
+            "/work/parent",
+            Some(hosted_parent()),
+            Some("p"),
+        );
+        worker.linked = Some(Box::new(ox_desk_core::origin::LinkedParent {
+            host: "source-host".into(),
+            device: "source-registration".into(),
+            request_id: "worker-request".into(),
+            parent: worker.parent.clone(),
+            verified_level: ox_desk_core::modes::Level::Read,
+            link_ceiling: ox_desk_core::modes::Level::Read,
+        }));
+        assert!(ParentLink::from_origin(&worker).is_none());
     }
 }

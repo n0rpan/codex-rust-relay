@@ -51,7 +51,18 @@ impl Workbench {
         let store = self.store.as_ref()?;
         let id = store.selected()?;
         let origin = store.origin(id)?;
-        let parent = self.parent_link(id, cx);
+        let parent = origin
+            .linked
+            .is_none()
+            .then(|| self.parent_link(id, cx))
+            .flatten();
+        let linked_lead = origin.linked.as_ref().map(|lead| {
+            self.workspace
+                .as_ref()
+                .and_then(WeakEntity::upgrade)
+                .and_then(|workspace| workspace.read(cx).linked_worker_lead(lead, cx))
+                .unwrap_or_else(|| ("Lead on another host".into(), None))
+        });
         let parent_label = parent.as_ref().map(|parent| {
             let name = parent
                 .title
@@ -72,7 +83,15 @@ impl Workbench {
         let parent_path = parent
             .as_ref()
             .map(|parent| parent.project.to_string_lossy().into_owned());
-        let job = format!("Worker {}", origin.job_id);
+        let job = if self.host_caption.is_some() {
+            format!("Worker {}", origin.job_id)
+        } else {
+            let host = self
+                .link
+                .remote()
+                .map_or("this computer", |host| host.name.as_str());
+            format!("Worker {} on {host}", origin.job_id)
+        };
         let ceiling = format!("Ceiling {}", origin.ceiling.label(origin.runtime));
         let checkout = self.project.display().to_string();
         // Who pays and the model that answered; "(pending)" until the runtime confirms it.
@@ -87,6 +106,28 @@ impl Workbench {
                 .items_center()
                 .text_size(p.text(Step::Ui))
                 .text_color(rgb(p.fg))
+                .when_some(linked_lead, |line, (label, destination)| {
+                    if let Some(destination) = destination {
+                        let workspace = self.workspace.clone();
+                        line.child(crate::kit::toolbar_button(
+                            p,
+                            "linked-worker-lead",
+                            label,
+                            true,
+                            move |_, window, cx| {
+                                if let Some(workspace) =
+                                    workspace.as_ref().and_then(WeakEntity::upgrade)
+                                {
+                                    workspace.update(cx, |s, cx| {
+                                        s.open_destination(&destination, window, cx)
+                                    });
+                                }
+                            },
+                        ))
+                    } else {
+                        line.child(crate::small(p, label))
+                    }
+                })
                 .when_some(
                     parent.zip(parent_label).zip(parent_path),
                     |line, ((parent, label), path)| {
