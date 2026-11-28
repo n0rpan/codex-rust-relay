@@ -29,6 +29,8 @@ pub mod linked_jobs;
 #[cfg(feature = "server")]
 pub mod memory_sync;
 #[cfg(feature = "server")]
+pub mod move_manifest;
+#[cfg(feature = "server")]
 pub mod worker_result;
 
 #[cfg(all(test, feature = "server"))]

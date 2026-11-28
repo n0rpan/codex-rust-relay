@@ -1,6 +1,7 @@
 //! Stages one authenticated move's files without interpreting or activating them.
 use super::{State, move_admission::Binding, private_dir, read_registry, write_registry};
 use crate::{
+    move_manifest::{CHECKOUT, FileSpec, Manifest, PLAN, TRANSCRIPT},
     server::Proof,
     worker_checkout::{
         ArchiveChunks, CHUNK,
@@ -22,25 +23,7 @@ use std::{
 use tokio::time::timeout;
 
 const DIRECTORY: &str = "move-staging";
-const PLAN: &str = "plan.json";
-const TRANSCRIPT: &str = "transcript.archive";
-const CHECKOUT: &str = "checkout.bundle";
 const RECEIPT: &str = "receipt.json";
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct FileSpec {
-    pub bytes: u64,
-    pub sha256: [u8; 32],
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Manifest {
-    pub plan: FileSpec,
-    pub transcript: FileSpec,
-    pub checkout: FileSpec,
-}
 
 impl Manifest {
     fn files(&self) -> [(&str, &FileSpec); 3] {

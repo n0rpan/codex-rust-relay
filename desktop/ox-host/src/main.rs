@@ -11,6 +11,8 @@ mod lease;
 #[cfg(test)]
 mod move_archive;
 #[cfg(test)]
+mod move_bundle;
+#[cfg(test)]
 mod move_ledger;
 #[cfg(test)]
 mod move_target;

@@ -6944,6 +6944,9 @@ mod tests {
                     native: "studio-native".into(),
                 },
             };
+            engine
+                .bind_move_manifest(&plan, prepared.stage.digest)
+                .unwrap();
             assert!(
                 engine
                     .stage_source_move(uuid::Uuid::new_v4(), &prepared)

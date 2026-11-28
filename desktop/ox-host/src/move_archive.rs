@@ -20,6 +20,21 @@ pub(crate) struct Archive {
 }
 
 impl Archive {
+    pub(crate) fn capture(
+        file: &mut File,
+        plan: &Plan,
+        timeline: &Timeline,
+    ) -> io::Result<[u8; 32]> {
+        Self::write(
+            file,
+            &Header {
+                plan: plan.clone(),
+                items: timeline.items.len(),
+            },
+            timeline,
+        )
+    }
+
     /// Capture the complete projection without carrying live approval or runtime state.
     fn write(file: &mut File, header: &Header, timeline: &Timeline) -> io::Result<[u8; 32]> {
         if timeline.detail["ready"] != true
@@ -203,8 +218,11 @@ mod tests {
 
     #[test]
     fn the_completed_move_retains_history_and_working_files_without_the_source() {
-        use crate::move_target::{BundlePlan, Files, VerifiedTarget};
-        use ox_host_service::checkout::Snapshot;
+        use crate::{
+            move_bundle::Bundle,
+            move_target::{Files, VerifiedTarget},
+        };
+        use ox_host_web::move_manifest::TRANSCRIPT;
         let (mut header, timeline) = fixture();
         let laptop = tempfile::tempdir().unwrap();
         let studio = tempfile::tempdir().unwrap();
@@ -249,56 +267,30 @@ mod tests {
         let mut source = Ledger::open(laptop.path(), plan.source.host).unwrap();
         let mut receiver = Ledger::open(studio.path(), plan.target_host).unwrap();
         source.prepare_source(plan).unwrap();
-        let original = laptop.path().join("history");
-        let mut file = File::options()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&original)
-            .unwrap();
-        let digest = Archive::write(&mut file, &header, &timeline).unwrap();
-        let snapshot = Snapshot::capture(laptop.path(), &plan.source.scope.project, &[]).unwrap();
-        let snapshot_file = laptop.path().join("snapshot");
-        snapshot.retain_archive(&snapshot_file).unwrap();
-        let checkout_digest = checksum(&mut snapshot.open().unwrap()).unwrap();
-        let mut bundle_digest = Sha256::new();
-        bundle_digest.update(digest);
-        bundle_digest.update(checkout_digest);
-        let manifest_sha256 = bundle_digest.finalize().into();
-        let bundle = BundlePlan {
-            plan: plan.clone(),
-            checkout_commit: snapshot.commit.clone(),
-        };
-        let files = |transcript_sha256| Files {
-            transcript: &original,
-            transcript_sha256,
-            checkout: &snapshot_file,
-            checkout_sha256: checkout_digest,
+        let bundle = Bundle::capture(laptop.path(), plan, &timeline).unwrap();
+        let manifest_sha256 = bundle.manifest.sha256().unwrap();
+        let files = || Files {
+            directory: bundle.directory(),
+            manifest: &bundle.manifest,
             manifest_sha256,
         };
-        assert!(
-            VerifiedTarget::install(
-                &jobs,
-                &receiver,
-                plan.source.host,
-                bundle.clone(),
-                files([0; 32])
-            )
-            .is_err()
-        );
+        let transcript = bundle.directory().join(TRANSCRIPT);
+        let transcript_bytes = std::fs::read(&transcript).unwrap();
+        std::fs::write(&transcript, b"changed during upload").unwrap();
+        assert!(VerifiedTarget::install(&jobs, &receiver, plan.source.host, files()).is_err());
         assert!(!checkout.exists());
-        let target = VerifiedTarget::install(
-            &jobs,
-            &receiver,
-            plan.source.host,
-            bundle.clone(),
-            files(digest),
-        )
-        .unwrap();
+        std::fs::write(transcript, transcript_bytes).unwrap();
+        let target = VerifiedTarget::install(&jobs, &receiver, plan.source.host, files()).unwrap();
         let staged = target
             .prepare(&mut receiver, plan.source.host, "target-thread".into())
             .unwrap();
         assert!(!receiver.can_write(&plan.target_scope, "target-thread"));
+        assert!(
+            target
+                .history_for(&receiver, &plan.target_scope, "target-thread")
+                .is_err()
+        );
+        source.bind_source_manifest(plan, manifest_sha256).unwrap();
         source.fence_source(plan.target_host, &staged).unwrap();
         source.writer_released(plan).unwrap();
         let proof = source.commit_source(plan).unwrap();
@@ -307,16 +299,25 @@ mod tests {
             .unwrap();
         source.confirm_source(plan.target_host, &activated).unwrap();
         drop(source);
-        drop(file);
-        drop(snapshot);
+        drop(bundle);
         laptop.close().unwrap();
 
         let receiver = Ledger::open(studio.path(), plan.target_host).unwrap();
         assert!(receiver.can_write(&plan.target_scope, "target-thread"));
-        let target =
-            VerifiedTarget::install(&jobs, &receiver, plan.source.host, bundle, files(digest))
-                .unwrap();
-        let mut archive = target.history().unwrap();
+        let target = VerifiedTarget::load(&jobs, plan).unwrap();
+        assert!(
+            target
+                .history_for(&receiver, &plan.target_scope, "another-thread")
+                .is_err()
+        );
+        assert!(
+            target
+                .history_for(&receiver, &plan.source.scope, "target-thread")
+                .is_err()
+        );
+        let mut archive = target
+            .history_for(&receiver, &plan.target_scope, "target-thread")
+            .unwrap();
         assert_eq!(
             archive.previous(None, timeline.items.len()).unwrap(),
             (timeline.items, None)

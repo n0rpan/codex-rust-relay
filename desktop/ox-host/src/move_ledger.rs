@@ -86,7 +86,10 @@ enum Phase {
         #[serde(default)]
         finished: bool,
     },
-    SourcePreparing,
+    SourcePreparing {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manifest: Option<[u8; 32]>,
+    },
     SourceFenced {
         stage: Stage,
         released: bool,
@@ -111,7 +114,7 @@ impl Phase {
     fn status(&self) -> Status {
         match self {
             Self::SourceQueued { .. } => Status::Queued,
-            Self::SourcePreparing => Status::Preparing,
+            Self::SourcePreparing { .. } => Status::Preparing,
             Self::SourceFenced {
                 released: false, ..
             } => Status::Fenced,
@@ -132,7 +135,7 @@ impl Phase {
         matches!(
             self,
             Self::SourceQueued { .. }
-                | Self::SourcePreparing
+                | Self::SourcePreparing { .. }
                 | Self::SourceFenced { .. }
                 | Self::TargetPrepared { .. }
         )
@@ -203,7 +206,7 @@ impl Ledger {
             validate(&record.plan)?;
             let expected = match record.phase {
                 Phase::SourceQueued { .. }
-                | Phase::SourcePreparing
+                | Phase::SourcePreparing { .. }
                 | Phase::SourceFenced { .. }
                 | Phase::SourceCommitted { .. }
                 | Phase::SourceCancelled => record.plan.source.host,
@@ -294,7 +297,7 @@ impl Ledger {
     /// The actor checks ownership of the native thread before the first move.
     /// Preparing blocks new writes while the actor snapshots the idle source.
     pub(crate) fn prepare_source(&mut self, plan: &Plan) -> io::Result<Status> {
-        self.record_source(plan, Phase::SourcePreparing)
+        self.record_source(plan, Phase::SourcePreparing { manifest: None })
     }
 
     /// Queuing keeps the current turn writable and reserves its next turn.
@@ -372,10 +375,31 @@ impl Ledger {
     pub(crate) fn start_queued(&mut self, plan: &Plan) -> io::Result<()> {
         self.check_hosts(plan, self.data.host, plan.target_host)?;
         match self.require(plan)? {
-            Phase::SourceQueued { finished: true, .. } => self.set(plan, Phase::SourcePreparing),
-            Phase::SourcePreparing => Ok(()),
+            Phase::SourceQueued { finished: true, .. } => {
+                self.set(plan, Phase::SourcePreparing { manifest: None })
+            }
+            Phase::SourcePreparing { .. } => Ok(()),
             _ => Err(io::Error::other(
                 "The move is still waiting for its requested turn.",
+            )),
+        }
+    }
+
+    /// The signed destination preparation must match the files frozen here.
+    pub(crate) fn bind_source_manifest(&mut self, plan: &Plan, digest: [u8; 32]) -> io::Result<()> {
+        self.check_hosts(plan, self.data.host, plan.target_host)?;
+        match self.require(plan)? {
+            Phase::SourcePreparing { manifest: None } => self.set(
+                plan,
+                Phase::SourcePreparing {
+                    manifest: Some(digest),
+                },
+            ),
+            Phase::SourcePreparing {
+                manifest: Some(saved),
+            } if *saved == digest => Ok(()),
+            _ => Err(io::Error::other(
+                "This move is already bound to a different transfer.",
             )),
         }
     }
@@ -481,7 +505,9 @@ impl Ledger {
             return Err(io::Error::other("Invalid destination native session."));
         }
         match self.require(plan)? {
-            Phase::SourcePreparing => {
+            Phase::SourcePreparing {
+                manifest: Some(digest),
+            } if *digest == prepared.stage.digest => {
                 self.set(
                     plan,
                     Phase::SourceFenced {
@@ -640,7 +666,7 @@ impl Ledger {
     pub(crate) fn cancel_source(&mut self, plan: &Plan) -> io::Result<Cancelled> {
         self.check_hosts(plan, self.data.host, plan.target_host)?;
         match self.require(plan)? {
-            Phase::SourceQueued { .. } | Phase::SourcePreparing => {
+            Phase::SourceQueued { .. } | Phase::SourcePreparing { .. } => {
                 self.set(plan, Phase::SourceCancelled)?
             }
             Phase::SourceCancelled => {}
@@ -825,9 +851,11 @@ mod tests {
         let plan = plan(Uuid::new_v4(), Uuid::new_v4());
         let mut source = Ledger::open(laptop.path(), plan.source.host).unwrap();
         source.prepare_source(&plan).unwrap();
+        let prepared = prepare(&plan, "studio");
         source
-            .fence_source(plan.target_host, &prepare(&plan, "studio"))
+            .bind_source_manifest(&plan, prepared.stage.digest)
             .unwrap();
+        source.fence_source(plan.target_host, &prepared).unwrap();
 
         let release = |thread: &str, result| MoveWriterRelease {
             thread: thread.into(),
@@ -929,6 +957,13 @@ mod tests {
         assert!(target().prepared_receiver(Uuid::new_v4(), &plan).is_err());
         assert_eq!(target().status(plan.id).unwrap(), Some(Status::Prepared));
         assert!(!target().can_write(&plan.target_scope, "studio-native"));
+        assert!(source().fence_source(plan.target_host, &prepared).is_err());
+        source()
+            .bind_source_manifest(&plan, prepared.stage.digest)
+            .unwrap();
+        let mut different = prepared.clone();
+        different.stage.digest[0] ^= 1;
+        assert!(source().fence_source(plan.target_host, &different).is_err());
         assert!(source().fence_source(Uuid::new_v4(), &prepared).is_err());
         assert_eq!(
             source().fence_source(plan.target_host, &prepared).unwrap(),
@@ -997,6 +1032,8 @@ mod tests {
         let mut b = Ledger::open(studio.path(), first.target_host).unwrap();
         let prepared = prepare(&first, "studio-native");
         a.prepare_source(&first).unwrap();
+        a.bind_source_manifest(&first, prepared.stage.digest)
+            .unwrap();
         b.prepare_receiver(first.source.host, &prepared).unwrap();
         a.fence_source(first.target_host, &prepared).unwrap();
         a.writer_released(&first).unwrap();
@@ -1012,6 +1049,8 @@ mod tests {
         };
         let prepared = prepare(&back, "laptop-native-2");
         b.prepare_source(&back).unwrap();
+        b.bind_source_manifest(&back, prepared.stage.digest)
+            .unwrap();
         assert!(
             a.prepare_receiver(back.source.host, &prepare(&back, "local"))
                 .is_err()

@@ -120,6 +120,13 @@ impl Engine {
         Ok(phase)
     }
 
+    pub(super) fn bind_move_manifest(&mut self, plan: &Plan, digest: [u8; 32]) -> io::Result<()> {
+        if !self.move_source_quiescent(plan) {
+            return Err(io::Error::other("The source session is still active."));
+        }
+        self.source_moves.ledger.bind_source_manifest(plan, digest)
+    }
+
     pub(super) fn source_move_status(&self, id: Uuid) -> io::Result<Option<Status>> {
         self.source_moves.ledger.status(id)
     }

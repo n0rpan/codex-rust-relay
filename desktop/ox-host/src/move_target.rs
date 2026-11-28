@@ -3,7 +3,9 @@ use crate::{
     move_archive::{Archive, checksum},
     move_ledger::{Ledger, Plan, Prepared, Stage},
 };
+use ox_desk_core::host_protocol::Scope;
 use ox_host_service::checkout::receive_result;
+use ox_host_web::move_manifest::{CHECKOUT, FileSpec, Manifest, PLAN, TRANSCRIPT};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
@@ -22,10 +24,8 @@ pub(crate) struct BundlePlan {
 /// Received from the authenticated upload adapter. A receipt for these bytes
 /// allows verification here, but confers no native write authority.
 pub(crate) struct Files<'a> {
-    pub(crate) transcript: &'a Path,
-    pub(crate) transcript_sha256: [u8; 32],
-    pub(crate) checkout: &'a Path,
-    pub(crate) checkout_sha256: [u8; 32],
+    pub(crate) directory: &'a Path,
+    pub(crate) manifest: &'a Manifest,
     pub(crate) manifest_sha256: [u8; 32],
 }
 
@@ -50,9 +50,15 @@ impl VerifiedTarget {
         workspace: &Path,
         ledger: &Ledger,
         authenticated_source: Uuid,
-        bundle: BundlePlan,
         files: Files<'_>,
     ) -> io::Result<Self> {
+        if files.manifest.sha256()? != files.manifest_sha256 {
+            return Err(invalid("The files do not match the staged manifest."));
+        }
+        let bundle: BundlePlan = serde_json::from_reader(verified_file(
+            &files.directory.join(PLAN),
+            &files.manifest.plan,
+        )?)?;
         let plan = &bundle.plan;
         let prepared = ledger.prepared_receiver(authenticated_source, plan)?;
         if prepared
@@ -79,8 +85,8 @@ impl VerifiedTarget {
         let saved = Saved {
             bundle,
             manifest_sha256: files.manifest_sha256,
-            transcript_sha256: files.transcript_sha256,
-            checkout_sha256: files.checkout_sha256,
+            transcript_sha256: files.manifest.transcript.sha256,
+            checkout_sha256: files.manifest.checkout.sha256,
         };
         let target = Self { directory, saved };
         match target.directory.symlink_metadata() {
@@ -104,22 +110,21 @@ impl VerifiedTarget {
         let stage = tempfile::Builder::new()
             .prefix(".receiving-")
             .tempdir_in(&workspace)?;
-        let transcript = stage.path().join("transcript.archive");
-        let mut source = File::open(files.transcript)?;
+        let transcript = stage.path().join(TRANSCRIPT);
+        let mut source = verified_file(
+            &files.directory.join(TRANSCRIPT),
+            &files.manifest.transcript,
+        )?;
         let mut retained = File::create_new(&transcript)?;
         io::copy(&mut source, &mut retained)?;
         retained.sync_all()?;
         Archive::open(
             File::open(transcript)?,
             &target.saved.bundle.plan,
-            files.transcript_sha256,
+            target.saved.transcript_sha256,
         )?;
 
-        let mut checkout = File::open(files.checkout)?;
-        if checksum(&mut checkout)? != files.checkout_sha256 {
-            return Err(invalid("The checkout failed its integrity check."));
-        }
-        checkout.rewind()?;
+        let checkout = verified_file(&files.directory.join(CHECKOUT), &files.manifest.checkout)?;
         let installed = receive_result(
             stage.path(),
             1,
@@ -144,12 +149,49 @@ impl VerifiedTarget {
         Ok(target)
     }
 
-    pub(crate) fn history(&self) -> io::Result<Archive> {
+    pub(crate) fn load(workspace: &Path, plan: &Plan) -> io::Result<Self> {
+        let directory = workspace.canonicalize()?.join(plan.id.to_string());
+        let saved =
+            serde_json::from_reader::<_, Saved>(File::open(directory.join("receipt.json"))?)?;
+        if saved.bundle.plan != *plan {
+            return Err(invalid("The archive belongs to another session move."));
+        }
+        Ok(Self { directory, saved })
+    }
+
+    fn history(&self) -> io::Result<Archive> {
         Archive::open(
-            File::open(self.directory.join("transcript.archive"))?,
+            File::open(self.directory.join(TRANSCRIPT))?,
             &self.saved.bundle.plan,
             self.saved.transcript_sha256,
         )
+    }
+
+    /// The session resolved by the destination actor must be the one that
+    /// owns this exact continuation. A verified upload alone cannot read it.
+    pub(crate) fn history_for(
+        &self,
+        ledger: &Ledger,
+        scope: &Scope,
+        native: &str,
+    ) -> io::Result<Archive> {
+        let plan = &self.saved.bundle.plan;
+        let allowed = ledger.owner(plan.session)?.is_some_and(|owner| {
+            owner.host == plan.target_host
+                && owner.generation == plan.source.generation + 1
+                && owner.scope == *scope
+                && owner.native == native
+        });
+        let verified = ledger
+            .prepared_receiver(plan.source.host, plan)?
+            .is_some_and(|receipt| receipt.stage.digest == self.saved.manifest_sha256);
+        if !allowed || !verified {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "The move history belongs to another session or has not arrived.",
+            ));
+        }
+        self.history()
     }
 
     /// Call after reserving an idle native session in the verified checkout.
@@ -180,6 +222,15 @@ impl VerifiedTarget {
         }
         Err(invalid("The reserved destination checkout has moved."))
     }
+}
+
+fn verified_file(path: &Path, spec: &FileSpec) -> io::Result<File> {
+    let mut file = File::open(path)?;
+    if file.metadata()?.len() != spec.bytes || checksum(&mut file)? != spec.sha256 {
+        return Err(invalid("A move file failed its integrity check."));
+    }
+    file.rewind()?;
+    Ok(file)
 }
 
 // Keep directory entries as well as file contents durable before replying.
