@@ -492,7 +492,9 @@ impl Workbench {
                                     view.invalidate_messages();
                                 }
                             }
-                            if store.profile().route == Route::CODEX_SUBSCRIPTION
+                            if (store.profile().route == Route::CODEX_SUBSCRIPTION
+                                || store.profile().route.runtime
+                                    == ox_desk_core::runtime::Runtime::Antigravity)
                                 && store.state() == &Connection::Ready
                             {
                                 s.awaiting_login = false;

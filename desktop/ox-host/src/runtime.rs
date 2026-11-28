@@ -133,7 +133,7 @@ impl RuntimeConfig {
             .collect()
     }
     pub(crate) fn installed_runtimes(&self) -> Vec<Runtime> {
-        [Runtime::Codex, Runtime::Claude]
+        Runtime::ALL
             .into_iter()
             .filter(|r| {
                 env::split_paths(&self.path).any(|p| {
@@ -158,6 +158,9 @@ impl RuntimeConfig {
                     || match r.runtime {
                         Runtime::Codex => s.chatgpt_account.is_some(),
                         Runtime::Claude => s.claude_account,
+                        Runtime::Antigravity => {
+                            ox_desk_core::links::antigravity::executable(&self.path).is_some()
+                        }
                     }
             })
             .collect();
@@ -205,6 +208,11 @@ impl RuntimeConfig {
         prepared: Option<Prepared>,
         receive: impl Fn(LinkEvent) + Send + Sync + 'static,
     ) -> io::Result<Store> {
+        if scope.route.is_api() && !scope.route.runtime.supports_api() {
+            return Err(io::Error::other(
+                "Antigravity uses its native Google account.",
+            ));
+        }
         let settings = if scope.route.is_api() || scope.route.runtime == Runtime::Claude {
             Some(match prepared.filter(|s| s.current()) {
                 Some(s) => s,
@@ -305,7 +313,29 @@ impl RuntimeConfig {
                     move |e| deliver(e),
                 )
             }
+            Runtime::Antigravity => {
+                use ox_desk_core::{links::antigravity, store::antigravity::PROVIDER};
+                if antigravity::executable(&self.path).is_none() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "Install the official Antigravity CLI on this host, then check the connection.",
+                    ));
+                }
+                Store::open_antigravity(
+                    Profile {
+                        project,
+                        route,
+                        provider: PROVIDER.into(),
+                    },
+                    self.path.clone(),
+                    self.desktop.join("antigravity-sessions.json"),
+                    move |e| deliver(e),
+                )
+            }
         }?;
+        if scope.route.runtime == Runtime::Antigravity {
+            return Ok(store);
+        }
         store.enable_naming(
             ox_desk_core::titles::Launcher {
                 ox: self.ox.clone(),

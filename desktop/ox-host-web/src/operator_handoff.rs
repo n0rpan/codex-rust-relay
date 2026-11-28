@@ -140,9 +140,9 @@ async fn hello(peer: &mut Peer) -> io::Result<Hello> {
         Server::Hello {
             projects,
             routes,
-            version: VERSION,
+            version,
             ..
-        } => Ok(Hello { projects, routes }),
+        } if ox_desk_core::host_protocol::supported(version) => Ok(Hello { projects, routes }),
         _ => Err(io::Error::other("Incompatible host")),
     }
 }

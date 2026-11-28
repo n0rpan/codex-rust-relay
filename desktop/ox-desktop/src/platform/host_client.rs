@@ -30,7 +30,7 @@ pub(crate) enum HostLink {
     Local,
     Remote(super::hosts::SavedHost),
 }
-type StreamHello = (BufReader<UnixStream>, UnixStream, Vec<String>);
+type StreamHello = (BufReader<UnixStream>, UnixStream, Vec<String>, u32);
 
 impl HostLink {
     pub fn remote(&self) -> Option<&super::hosts::SavedHost> {
@@ -93,7 +93,7 @@ impl HostLink {
         }
     }
     pub(crate) fn worker_hosts(&self, project: PathBuf) -> io::Result<Option<serde_json::Value>> {
-        let (mut input, mut socket, caps) = self.handshake()?;
+        let (mut input, mut socket, caps, _) = self.handshake()?;
         if !caps.iter().any(|c| c == "worker_placement") {
             return Ok(None);
         }
@@ -180,6 +180,12 @@ impl HostLink {
                 "The source or destination checkout changed. Choose the destination again.",
             ));
         }
+        if !ox_desk_core::host_protocol::project_handoff_transfer(target_connection.3, &mut packet)
+        {
+            return Err(io::Error::other(
+                "Update the destination host to use Antigravity handoffs.",
+            ));
+        }
         packet.source.history_broker = Some(history::binding(&to.link)?);
         let receipt = history::record(self, &to.link, &packet)?;
         let request = Client::ReceiveRemoteHandoff {
@@ -218,13 +224,13 @@ impl HostLink {
         Ok((target, session.to_owned()))
     }
     fn handoff_connection(&self) -> io::Result<StreamHello> {
-        let (reader, socket, caps) = self.handshake()?;
+        let (reader, socket, caps, version) = self.handshake()?;
         if !caps.iter().any(|c| c == "remote_handoff") {
             return Err(io::Error::other(
                 "Update this host to use cross-host handoffs.",
             ));
         }
-        Ok((reader, socket, caps))
+        Ok((reader, socket, caps, version))
     }
     fn handshake(&self) -> io::Result<StreamHello> {
         self.named_handshake().map(|(stream, _)| stream)
@@ -290,11 +296,16 @@ impl PendingTransfer {
     }
 }
 fn handoff_call(
-    (reader, socket, _): &mut StreamHello,
+    (reader, socket, _, version): &mut StreamHello,
     request: Client,
     key: &str,
     mut on_approval: impl FnMut(),
 ) -> io::Result<serde_json::Value> {
+    if !request.supported_by(*version) {
+        return Err(io::Error::other(
+            "Update this host to use Antigravity handoffs.",
+        ));
+    }
     let timeout = if key == "history" { 60 } else { 300 };
     socket.set_read_timeout(Some(Duration::from_secs(timeout)))?;
     write_frame(socket, &request)?;
@@ -347,7 +358,7 @@ pub(crate) fn reserve_idle_update(store: &std::path::Path) -> io::Result<Option<
     if !is_running(&paths)? {
         return Ok(ox_host_service::reserve_stopped_host(&paths)?.map(IdleReservation::Stopped));
     }
-    let (mut input, mut socket, caps) = open_handshake(&paths)?;
+    let (mut input, mut socket, caps, _) = open_handshake(&paths)?;
     if !caps
         .iter()
         .any(|c| c == ox_desk_core::host_protocol::IDLE_UPDATE)
@@ -379,9 +390,9 @@ fn connect_existing(paths: &Paths) -> io::Result<BufReader<UnixStream>> {
             HOST_NOT_RUNNING,
         ));
     }
-    open_handshake(paths).map(|(input, _, _)| input)
+    open_handshake(paths).map(|(input, _, _, _)| input)
 }
-fn open_handshake(paths: &Paths) -> io::Result<(BufReader<UnixStream>, UnixStream, Vec<String>)> {
+fn open_handshake(paths: &Paths) -> io::Result<StreamHello> {
     handshake_stream(UnixStream::connect(&paths.socket)?, None).map(|(stream, _)| stream)
 }
 fn handshake_stream(
@@ -391,7 +402,7 @@ fn handshake_stream(
     socket.set_read_timeout(Some(Duration::from_secs(15)))?;
     write_frame(&mut socket, &Client::Hello { version: VERSION })?;
     let mut input = BufReader::new(socket.try_clone()?);
-    let (caps, name) = match read_frame(&mut input)? {
+    let (caps, name, version) = match read_frame(&mut input)? {
         Server::Hello {
             version,
             capabilities,
@@ -405,7 +416,7 @@ fn handshake_stream(
                     "Host identity changed. Pair this host again.",
                 ));
             }
-            (capabilities, host.and_then(|h| h.name))
+            (capabilities, host.and_then(|h| h.name), version)
         }
         Server::Hello { version, .. } => {
             return Err(io::Error::new(
@@ -425,7 +436,7 @@ fn handshake_stream(
     if remote_id.is_none() {
         declare_surface(&mut socket, &caps)?;
     }
-    Ok(((input, socket, caps), name))
+    Ok(((input, socket, caps, version), name))
 }
 /// Tell a host that negotiates it that a person on OX Desktop uses this connection. An
 /// older host rejects the frame, so it is sent only when the hello lists the capability.
@@ -469,7 +480,12 @@ impl HostLink {
             project: project.clone(),
             route: route.clone(),
         };
-        let (mut input, mut socket, caps) = self.handshake()?;
+        let (mut input, mut socket, caps, version) = self.handshake()?;
+        if !ox_desk_core::host_protocol::supports_route(version, &scope.route) {
+            return Err(io::Error::other(
+                "Update this OX host to open Antigravity sessions.",
+            ));
+        }
         let placement = caps.iter().any(|c| c == "worker_placement");
         write_frame(
             &mut socket,
@@ -565,7 +581,7 @@ impl HostLink {
         &self,
         path: &std::path::Path,
     ) -> io::Result<ox_desk_core::host_protocol::ProjectDirectory> {
-        let (mut input, mut stream, caps) = self.handshake()?;
+        let (mut input, mut stream, caps, _) = self.handshake()?;
         if !caps.iter().any(|c| c == "project_directory") {
             return Err(io::Error::other("Update the host to use shared projects."));
         }
@@ -595,7 +611,7 @@ impl HostLink {
         self.discover_rows(false)
     }
     pub(crate) fn discover_rows(&self, available_only: bool) -> io::Result<CatalogResult> {
-        let (mut input, mut socket, _) = self.handshake()?;
+        let (mut input, mut socket, _, _) = self.handshake()?;
         write_frame(
             &mut socket,
             &Client::Discover {
@@ -640,7 +656,7 @@ impl ProcessMonitor {
     pub(crate) fn list(&self, link: &HostLink) -> io::Result<Vec<ProcessView>> {
         self.poll(|| match link {
             HostLink::Local => connect_existing(&Paths::discover()?),
-            HostLink::Remote(_) => link.handshake().map(|(input, _, _)| input),
+            HostLink::Remote(_) => link.handshake().map(|(input, _, _, _)| input),
         })
     }
 
@@ -700,7 +716,7 @@ impl HostLink {
         if threads.is_empty() {
             return Ok(());
         }
-        let (mut input, mut socket, _) = self.handshake()?;
+        let (mut input, mut socket, _, _) = self.handshake()?;
         write_frame(
             &mut socket,
             &Client::Subscribe {
@@ -815,7 +831,7 @@ mod process_monitor_tests {
                 ));
                 writeln!(host, "{}", serde_json::json!({"type":"snapshot","cursor":{"epoch":"e","seq":0},"scopes":[]})).unwrap();
             });
-            let ((mut input, mut out, _), _) = handshake_stream(client, id).unwrap();
+            let ((mut input, mut out, _, _), _) = handshake_stream(client, id).unwrap();
             write_frame(
                 &mut out,
                 &Client::Subscribe {

@@ -192,11 +192,7 @@ impl Engine {
                 modes::ModeRequest::Inherit => fixed,
             }
             .min(packet.child_ceiling.unwrap_or(Level::Yolo));
-            modes::Resolved {
-                level,
-                access: level.preset(packet.start.runtime),
-                decision: Decision::HostPolicy,
-            }
+            modes::Resolved::new(level, packet.start.runtime, Decision::HostPolicy)
         } else {
             match modes::resolve_operator(
                 packet.source.source_level,

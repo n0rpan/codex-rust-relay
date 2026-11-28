@@ -5,8 +5,8 @@
 //! source through its origin stamp (`relation: handoff`). Only references to the
 //! selection (item IDs, counts and omitted ranges) are ever stored. The carried
 //! text itself goes only to the target runtime: Codex receives raw Responses
-//! message items through `thread/inject_items`; Claude Code, which has no history
-//! injection, receives one delimited context block in its first user turn.
+//! message items through `thread/inject_items`. Claude Code and Antigravity
+//! receive a delimited context block in their first user turn.
 //!
 //! Selection rules, independent of the runtime:
 //! - The budget is the target model's context window from OX's model catalog, or
@@ -15,11 +15,11 @@
 //!   least [`MIN_WORKING`]) for working space, and the new request's own size.
 //! - Sizes are estimated at one token per three bytes, which overestimates
 //!   ordinary text.
-//! - The first user request and the most recent exchange always come along, in
+//! - The first user request, latest plan and most recent exchange always come along, in
 //!   their original order and roles. Earlier exchanges are added newest first
 //!   while they fit. An exchange is a user message and everything up to the next.
 //! - Commands and tools become short attributed outcomes: the command, its exit
-//!   status, and changed paths. Reasoning, plans, tool-call internals and
+//!   status, and changed paths. Reasoning, tool-call internals and
 //!   attachments are dropped.
 //! - An item above [`ITEM_CAP`] tokens (or an eighth of the budget, if smaller)
 //!   is cut and ends with a reference to the full item.
@@ -42,7 +42,7 @@ pub const RUNTIME_RESERVE: u64 = 24_000;
 pub const MIN_WORKING: u64 = 8_000;
 /// The most one carried item may use before it is cut.
 pub const ITEM_CAP: u64 = 4_000;
-/// The tag that delimits carried context in a Claude Code first turn.
+/// The tag that delimits carried context in the target's first turn.
 pub const CLAUDE_TAG: &str = "ox-handoff";
 /// The longest new request a handoff accepts, independent of the budget.
 pub const MAX_REQUEST: usize = 64 * 1024;
@@ -57,6 +57,7 @@ pub fn tokens(text: &str) -> u64 {
 pub enum Kind {
     User,
     Assistant,
+    Plan,
     /// A command or tool result as short attributed text.
     Outcome,
 }
@@ -74,6 +75,79 @@ pub struct SourceItem {
 /// Reduce a host timeline to carryable items, in order. Drops reasoning, plans
 /// and tool internals; names attachments by path without carrying them; turns commands and file changes into outcomes.
 pub fn items(timeline: &Timeline) -> Vec<SourceItem> {
+    timeline_items(timeline, false)
+}
+
+/// The handoff source includes visible plans. A plan exposed by the review panel
+/// is carried once, and only if the turn has no explicit plan item.
+pub fn handoff_items(timeline: &Timeline) -> Vec<SourceItem> {
+    let items = timeline_items(timeline, true);
+    let Some(reviews) = timeline.detail["reviews"]["turns"].as_object() else {
+        return items;
+    };
+    let mut turns_with_plans: std::collections::HashSet<&str> = items
+        .iter()
+        .filter(|i| i.kind == Kind::Plan)
+        .map(|i| i.turn.as_str())
+        .collect();
+    let mut supplemental = Vec::new();
+    for (index, item) in items.iter().enumerate().rev() {
+        if !turns_with_plans.insert(&item.turn) {
+            continue;
+        }
+        if let Some(text) = reviews.get(&item.turn).and_then(review_plan) {
+            supplemental.push((
+                index,
+                SourceItem {
+                    id: format!("ox-plan:{}", item.turn),
+                    turn: item.turn.clone(),
+                    kind: Kind::Plan,
+                    text,
+                },
+            ));
+        }
+    }
+    let mut supplemental = supplemental.into_iter().rev().peekable();
+    items
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, item)| {
+            let plan = supplemental
+                .next_if(|(i, _)| *i == index)
+                .map(|(_, plan)| plan);
+            std::iter::once(item).chain(plan)
+        })
+        .collect()
+}
+
+fn review_plan(review: &Value) -> Option<String> {
+    if let Some(plan) = review["plan_text"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(plan.to_owned());
+    }
+    let mut parts: Vec<_> = review["explanation"]
+        .as_str()
+        .map(str::to_owned)
+        .into_iter()
+        .collect();
+    parts.extend(
+        review["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|step| {
+                let status = step["status"].as_str()?;
+                let text = step["text"].as_str()?;
+                Some(format!("- [{status}] {text}"))
+            }),
+    );
+    let text = parts.join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn timeline_items(timeline: &Timeline, include_plans: bool) -> Vec<SourceItem> {
     timeline
         .items
         .iter()
@@ -84,6 +158,7 @@ pub fn items(timeline: &Timeline) -> Vec<SourceItem> {
                     user_text(&i.detail).unwrap_or_else(|| i.text.clone()),
                 ),
                 "assistant" => (Kind::Assistant, i.text.clone()),
+                "plan" if include_plans => (Kind::Plan, i.text.clone()),
                 "tool" => (Kind::Outcome, outcome(&i.text, &i.detail)?),
                 _ => return None,
             };
@@ -223,6 +298,9 @@ pub struct SelectionRefs {
     /// carried as content, only named by path in the message text.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub attachments: u32,
+    /// The selection and its source IDs include visible plans.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub includes_plans: bool,
     /// Carried item IDs in order.
     pub items: Vec<String>,
     /// Carried items that were cut. Their full text is in the source.
@@ -242,6 +320,10 @@ pub struct SelectionRefs {
 
 fn is_zero(n: &u32) -> bool {
     *n == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// A host-local session or path is meaningful only on its owning machine.
@@ -264,7 +346,7 @@ pub struct Earlier {
     pub route: Route,
 }
 
-/// A Claude handoff target's first user message is the carried `<ox-handoff>`
+/// A Claude Code or Antigravity handoff target's first message is the carried `<ox-handoff>`
 /// block plus its request. When that session is handed off again, keep only
 /// the request, so carried context never nests. Codex sources need nothing:
 /// injected items are not listed by thread/read. Returns the stripped item.
@@ -307,7 +389,7 @@ fn cut(item: &SourceItem, cap: u64) -> Carried {
         let keep = &item.text[..item.text.floor_char_boundary(cap_bytes.saturating_sub(160))];
         (
             format!(
-                "{keep}\n[… cut {} of {} bytes. read_ox_thread item {} returns the full item.]",
+                "{keep}\n[… cut {} of {} bytes. See source item {} for the full text.]",
                 item.text.len() - keep.len(),
                 item.text.len(),
                 item.id
@@ -387,9 +469,19 @@ pub fn select(
         used += cost(last, &keep);
         keep[last.clone()].iter_mut().for_each(|k| *k = true);
     }
+    let latest_plan = items.iter().rposition(|item| item.kind == Kind::Plan);
+    if let Some(plan) = latest_plan.filter(|&plan| !keep[plan]) {
+        used += tokens(&carried[plan].text) + 8;
+        keep[plan] = true;
+    }
     if used > budget.available {
+        let minimum = if latest_plan.is_some() {
+            "the first message, the latest reply, and the latest plan"
+        } else {
+            "the first message and the latest reply"
+        };
         return Err(format!(
-            "This request does not fit the target model's {}-token context, even with the first message and the latest reply kept (about {used} tokens). Shorten the request or choose a model with a larger context.",
+            "This request does not fit the target model's {}-token context with {minimum} kept (about {used} tokens). Shorten the request or choose a model with a larger context.",
             budget.window
         ));
     }
@@ -431,6 +523,7 @@ pub fn select(
             .iter()
             .map(|i| i.text.matches(ATTACHMENT_NOTE).count() as u32)
             .sum(),
+        includes_plans: latest_plan.is_some(),
         items: selected.iter().map(|c| c.id.clone()).collect(),
         cut: selected
             .iter()
@@ -473,7 +566,7 @@ pub struct HandoffSource {
 }
 
 impl HandoffSource {
-    fn preamble(&self) -> String {
+    fn preamble(&self, history_tool: bool) -> String {
         let r = &self.selection;
         let omitted = if r.omitted == 0 {
             "Nothing was omitted.".to_owned()
@@ -500,7 +593,7 @@ impl HandoffSource {
             String::new()
         } else {
             format!(
-                " That session itself continued {}; the context carried into it is not repeated here. read_ox_thread with that session ID reads it.",
+                " That session itself continued {}. The messages below start with the source session’s own request.",
                 r.earlier
                     .iter()
                     .map(|e| {
@@ -525,8 +618,13 @@ impl HandoffSource {
             .as_ref()
             .map(|h| format!(" Source host {} ({}).", h.name, h.id))
             .unwrap_or_default();
+        let history = if history_tool {
+            " Use the read_ox_thread tool with the source session ID to read earlier, omitted or cut items."
+        } else {
+            ""
+        };
         format!(
-            "OX handoff: this session continues \"{}\" (session {}, {}, {}). The messages that follow are real earlier messages from it, in order, not a summary: {} of {} carried. {omitted}{attachments}{chain}{host} Use the read_ox_thread tool to read the source session's omitted or cut items by ID. Answer the request after them.",
+            "OX handoff: this session continues \"{}\" (session {}, {}, {}). The following items carry earlier messages, tool outcomes and plans in order. Carried {} of {}. {omitted}{attachments}{chain}{host}{history} Answer the request after them.",
             self.title.replace('"', "'"),
             self.session,
             self.runtime.name(),
@@ -549,13 +647,17 @@ pub fn codex_items(source: &HandoffSource, selection: &Selection) -> Vec<Value> 
     };
     let mut out = vec![message(
         "user",
-        format!("<{CLAUDE_TAG}>{}</{CLAUDE_TAG}>", source.preamble()),
+        format!("<{CLAUDE_TAG}>{}</{CLAUDE_TAG}>", source.preamble(true)),
     )];
     for c in &selection.carried {
         out.push(match c.kind {
             Kind::User => message("user", c.text.clone()),
             Kind::Assistant => message("assistant", c.text.clone()),
             Kind::Outcome => message("assistant", format!("[{}]", c.text)),
+            Kind::Plan => message(
+                "assistant",
+                format!("[Plan from the source session]\n{}", c.text),
+            ),
         });
     }
     out
@@ -565,15 +667,24 @@ fn escape(text: &str) -> String {
     text.replace(&format!("</{CLAUDE_TAG}"), &format!("<\\/{CLAUDE_TAG}"))
 }
 
-/// Claude Code: the whole first user turn, a delimited and attributed context
-/// block followed by the new request.
-pub fn claude_turn(source: &HandoffSource, selection: &Selection, request: &str) -> String {
-    let mut block = format!("<{CLAUDE_TAG}>\n{}\n", escape(&source.preamble()));
+/// The first user turn for a runtime without history injection. It carries a
+/// delimited, attributed context block followed by the new request.
+pub fn context_turn(
+    source: &HandoffSource,
+    selection: &Selection,
+    request: &str,
+    history_tool: bool,
+) -> String {
+    let mut block = format!(
+        "<{CLAUDE_TAG}>\n{}\n",
+        escape(&source.preamble(history_tool))
+    );
     for c in &selection.carried {
         let who = match c.kind {
             Kind::User => "user",
             Kind::Assistant => "assistant",
             Kind::Outcome => "outcome",
+            Kind::Plan => "plan",
         };
         block.push_str(&format!(
             "\n<message role=\"{who}\" id=\"{}\">\n{}\n</message>\n",
@@ -585,7 +696,11 @@ pub fn claude_turn(source: &HandoffSource, selection: &Selection, request: &str)
     block
 }
 
-/// Split a Claude first turn into its carried block and the user's request, so
+pub fn claude_turn(source: &HandoffSource, selection: &Selection, request: &str) -> String {
+    context_turn(source, selection, request, true)
+}
+
+/// Split the first turn into its carried block and the user's request, so
 /// clients can fold the block under the handoff marker.
 pub fn split_claude_turn(text: &str) -> Option<(&str, &str)> {
     let open = format!("<{CLAUDE_TAG}>\n");
@@ -606,6 +721,7 @@ pub fn provider(route: &Route) -> String {
         (crate::runtime::Billing::Subscription, Runtime::Claude) => {
             "Anthropic (Claude subscription)".into()
         }
+        (crate::runtime::Billing::Subscription, Runtime::Antigravity) => "Google".into(),
         // A qualified alias names its provider. A bare one does not, so say only
         // which route receives it rather than inventing a provider name.
         (crate::runtime::Billing::Api(alias), _) => match alias.split_once('/') {
@@ -635,6 +751,9 @@ pub fn marker(origin: &crate::origin::Origin) -> Option<String> {
         Some(Decision::Lowered) => "lowered",
         Some(Decision::Operator) => "chosen by the operator",
         Some(Decision::HostPolicy) => "set by the host policy",
+        Some(Decision::Capped) if origin.runtime == Runtime::Antigravity => {
+            "capped at a supported mode"
+        }
         Some(Decision::Capped) => "capped below YOLO",
         None => "unknown",
     };
@@ -690,7 +809,7 @@ pub struct HandoffStart {
     pub host: Option<String>,
     pub source: String,
     pub runtime: Runtime,
-    /// An OX API alias, or none for the runtime's subscription.
+    /// An OX API alias, or none for the runtime's native account.
     pub model: Option<String>,
     #[serde(default)]
     pub mode: crate::modes::ModeRequest,
@@ -718,13 +837,13 @@ impl HandoffStart {
     pub fn route(&self) -> Route {
         self.runtime.route(self.model.clone())
     }
-    /// The composer form: `/handoff [@host] <codex|claude>[:<alias>] [--mode <mode>] <request>`.
+    /// The composer form: `/handoff [@host] <codex|claude|antigravity>[:<alias>] [--mode <mode>] <request>`.
     pub fn parse_command(source: &str, text: &str) -> Option<Result<Self, String>> {
         let rest = text.trim_start().strip_prefix("/handoff")?;
         if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
             return None;
         }
-        let usage = "Use /handoff [@host] <codex|claude>[:<alias>] [--mode <mode>] <request>.";
+        let usage = "Use /handoff [@host] <codex|claude|antigravity> [--mode <mode>] <request>. Codex and Claude also accept :<alias>.";
         let rest = rest.trim_start();
         let (host, rest) = if let Some(named) = rest.strip_prefix('@') {
             let Some((host, rest)) = named.split_once(char::is_whitespace) else {
@@ -748,6 +867,7 @@ impl HandoffStart {
         let runtime = match runtime {
             "codex" => Runtime::Codex,
             "claude" => Runtime::Claude,
+            "antigravity" => Runtime::Antigravity,
             _ => return Some(Err(usage.into())),
         };
         let mut request = words.next().unwrap_or("").trim_start();
@@ -790,8 +910,11 @@ impl HandoffStart {
         {
             return Err("Provide an ox model alias of up to 256 bytes.".into());
         }
-        if self.runtime == Runtime::Codex && self.model.is_none() {
-            // The ChatGPT subscription is a valid Codex route; nothing to refuse.
+        if !self.runtime.supports_api() && self.model.is_some() {
+            return Err(
+                "Choose Antigravity’s Google account route, then select a model in the session."
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -873,7 +996,7 @@ mod tests {
         let cut = s.carried.iter().find(|c| c.id == "i3").unwrap();
         assert!(cut.cut);
         assert!(cut.text.len() <= (ITEM_CAP * 3) as usize + 100);
-        assert!(cut.text.contains("read_ox_thread item i3"));
+        assert!(cut.text.contains("source item i3"));
         assert_eq!(s.refs.cut, vec!["i3".to_owned()]);
     }
 
@@ -984,6 +1107,86 @@ mod tests {
                 (Kind::Assistant, "partial answer that was interr"),
             ]
         );
+        let carried = handoff_items(&timeline);
+        assert_eq!(carried[2].kind, Kind::Plan);
+        assert_eq!(carried[2].text, "1. do");
+    }
+
+    #[test]
+    fn handoff_keeps_the_latest_plan_from_a_review_panel_and_attributes_it() {
+        use crate::host_protocol::TimelineItem;
+        use crate::transcript::review::{Reviews, Step};
+        let mut reviews = Reviews::default();
+        let review = reviews.turn("planning", false);
+        review.explanation = Some("Start with the migration".into());
+        review.steps = vec![Step {
+            text: "Add the index".into(),
+            status: "pending".into(),
+        }];
+        let timeline = Timeline {
+            items: vec![
+                TimelineItem {
+                    turn: "planning".into(),
+                    id: "u1".into(),
+                    role: "user".into(),
+                    text: "Plan the migration".into(),
+                    detail: Value::Null,
+                    revision: 0,
+                },
+                TimelineItem {
+                    turn: "later".into(),
+                    id: "u2".into(),
+                    role: "user".into(),
+                    text: "Review it".into(),
+                    detail: Value::Null,
+                    revision: 0,
+                },
+            ],
+            detail: json!({"reviews":reviews}),
+        };
+        assert_eq!(items(&timeline).len(), 2);
+        let carried = handoff_items(&timeline);
+        assert_eq!(carried[1].id, "ox-plan:planning");
+        assert_eq!(carried[1].kind, Kind::Plan);
+        let selection = select(&carried, "Implement the plan", None).unwrap();
+        assert!(selection.refs.includes_plans);
+        let turn = context_turn(
+            &source(selection.refs.clone()),
+            &selection,
+            "Implement the plan",
+            false,
+        );
+        let (block, prompt) = split_claude_turn(&turn).unwrap();
+        assert!(block.contains("<message role=\"plan\" id=\"ox-plan:planning\">\nStart with the migration\n- [pending] Add the index"));
+        assert!(!block.contains("read_ox_thread"));
+        assert_eq!(prompt, "Implement the plan");
+    }
+
+    #[test]
+    fn the_latest_plan_survives_when_the_exchange_that_contains_it_cannot_fit() {
+        let mut source = vec![item(0, Kind::User, 32), item(1, Kind::Plan, 128)];
+        source.extend((2..11).map(|n| item(n, Kind::Assistant, 16_000)));
+        source.extend([item(11, Kind::User, 32), item(12, Kind::Assistant, 64)]);
+        let selection = select(&source, "Implement the plan", None).unwrap();
+        assert_eq!(selection.refs.items, ["i0", "i1", "i11", "i12"]);
+        assert_eq!(selection.refs.omitted, 9);
+    }
+
+    #[test]
+    fn the_antigravity_handoff_command_uses_the_native_account() {
+        let start = HandoffStart::parse_command(
+            "origin",
+            "/handoff antigravity --mode plan Continue this plan",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(start.route(), Runtime::Antigravity.route(None));
+        assert_eq!(start.mode, crate::modes::ModeRequest::Level(Level::Read));
+        assert!(
+            HandoffStart::parse_command("origin", "/handoff antigravity:ox/alias Continue")
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[test]
@@ -991,17 +1194,21 @@ mod tests {
         let with = items_with_attachment();
         let s = select(&with, "next", Some(200_000)).unwrap();
         assert_eq!(s.refs.attachments, 1);
-        let text = source(s.refs).preamble();
+        let text = source(s.refs).preamble(true);
         assert!(text.contains("1 attachment(s)"), "{text}");
         let plain = select(&history(1, 10), "next", Some(200_000)).unwrap();
         assert_eq!(plain.refs.attachments, 0);
         let mut stamped = source(plain.refs);
-        assert!(!stamped.preamble().contains("attachment"));
+        assert!(!stamped.preamble(true).contains("attachment"));
         stamped.host = Some(SourceHost {
             id: "host-a".into(),
             name: "studio".into(),
         });
-        assert!(stamped.preamble().contains("Source host studio (host-a)"));
+        assert!(
+            stamped
+                .preamble(true)
+                .contains("Source host studio (host-a)")
+        );
     }
 
     fn items_with_attachment() -> Vec<SourceItem> {
@@ -1097,8 +1304,8 @@ mod tests {
             selection: selection.refs.clone(),
         };
         let (sent, first) = match to {
-            Runtime::Claude => {
-                let turn = claude_turn(&source, &selection, request);
+            Runtime::Claude | Runtime::Antigravity => {
+                let turn = context_turn(&source, &selection, request, to == Runtime::Claude);
                 (turn.clone(), turn)
             }
             Runtime::Codex => (

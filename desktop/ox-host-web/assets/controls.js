@@ -275,7 +275,7 @@ export class SessionControls {
     const withinCeiling = (x) =>
       !ceiling || (levelOf(x) >= 0 && levelOf(x) <= order.indexOf(ceiling));
     $("yolo-grant-row").hidden = draft || !bypass($("permission").value);
-    this.allowed = (detail.access_choices ?? []).filter(
+    this.allowed = (own.access_choices ?? detail.access_choices ?? []).filter(
       (x) => Object.hasOwn(modes, x) && withinCeiling(x),
     );
     // Thread actions live in the conversation menu, so they render whether or not settings are open.

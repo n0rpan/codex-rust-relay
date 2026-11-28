@@ -14,29 +14,187 @@ use std::{
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum Events {
+enum LegacyEvents {
     Off,
     Attention,
     #[default]
     All,
 }
-#[derive(Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
+struct StoredSettings {
+    events: LegacyEvents,
+    enabled: Option<bool>,
+    approval: Option<bool>,
+    question: Option<bool>,
+    finished: Option<bool>,
+    failed: Option<bool>,
+    goal: bool,
+    titles: bool,
+}
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(from = "StoredSettings", into = "StoredSettings")]
 pub(crate) struct Settings {
-    pub events: Events,
+    pub enabled: bool,
+    approval: bool,
+    question: bool,
+    finished: bool,
+    failed: bool,
+    pub goal: bool,
     pub titles: bool,
+}
+impl From<StoredSettings> for Settings {
+    fn from(saved: StoredSettings) -> Self {
+        Self {
+            enabled: saved.enabled.unwrap_or(saved.events != LegacyEvents::Off),
+            approval: saved.approval.unwrap_or(true),
+            question: saved.question.unwrap_or(true),
+            finished: saved
+                .finished
+                .unwrap_or(saved.events != LegacyEvents::Attention),
+            failed: saved.failed.unwrap_or(true),
+            goal: saved.goal,
+            titles: saved.titles,
+        }
+    }
+}
+impl From<Settings> for StoredSettings {
+    fn from(settings: Settings) -> Self {
+        // An older desktop can still restore the nearest subset of the
+        // enabled alerts from the same file.
+        let events =
+            if settings.enabled && settings.approval && settings.question && settings.failed {
+                if settings.finished {
+                    LegacyEvents::All
+                } else {
+                    LegacyEvents::Attention
+                }
+            } else {
+                LegacyEvents::Off
+            };
+        Self {
+            events,
+            enabled: Some(settings.enabled),
+            approval: Some(settings.approval),
+            question: Some(settings.question),
+            finished: Some(settings.finished),
+            failed: Some(settings.failed),
+            goal: settings.goal,
+            titles: settings.titles,
+        }
+    }
+}
+impl Default for Settings {
+    fn default() -> Self {
+        StoredSettings::default().into()
+    }
 }
 impl Global for Settings {}
 impl Settings {
+    pub(crate) fn selected(self, kind: NotificationKind) -> bool {
+        match kind {
+            NotificationKind::Approval => self.approval,
+            NotificationKind::Question => self.question,
+            NotificationKind::Finished => self.finished,
+            NotificationKind::Failed => self.failed,
+        }
+    }
+    pub(crate) fn set(&mut self, kind: NotificationKind, value: bool) {
+        match kind {
+            NotificationKind::Approval => self.approval = value,
+            NotificationKind::Question => self.question = value,
+            NotificationKind::Finished => self.finished = value,
+            NotificationKind::Failed => self.failed = value,
+        }
+    }
+    fn headline(self, kind: NotificationKind, goal_reached: bool) -> Option<&'static str> {
+        if !self.enabled {
+            return None;
+        }
+        if kind == NotificationKind::Finished && goal_reached && self.goal {
+            return Some("Goal reached");
+        }
+        self.selected(kind).then_some(match kind {
+            NotificationKind::Finished => "Turn finished",
+            NotificationKind::Failed => "Turn failed",
+            NotificationKind::Approval => "Approval needed",
+            NotificationKind::Question => "Question from agent",
+        })
+    }
     pub(crate) fn save(self, cx: &mut App) -> std::io::Result<()> {
         let dir = ox_desk_core::desktop_behavior::directory()
             .ok_or_else(|| std::io::Error::other("Desktop settings directory unavailable"))?;
         crate::workspace_state::write_json(&dir.join("notifications.json"), &self)?;
+        let hide_titles = cx.default_global::<Self>().titles && !self.titles;
         cx.set_global(self);
-        if self.events == Events::Off || !self.titles {
+        if !self.enabled || hide_titles {
             dismiss_where(cx, |_| true);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_desktop_alert_presets_keep_their_meaning() {
+        let all: Settings = serde_json::from_str(r#"{"events":"all"}"#).unwrap();
+        assert!(all.enabled && all.selected(NotificationKind::Finished));
+
+        let attention: Settings =
+            serde_json::from_str(r#"{"events":"attention","titles":true}"#).unwrap();
+        assert!(attention.enabled && attention.titles);
+        assert!(attention.selected(NotificationKind::Approval));
+        assert!(attention.selected(NotificationKind::Question));
+        assert!(attention.selected(NotificationKind::Failed));
+        assert!(!attention.selected(NotificationKind::Finished));
+
+        let off: Settings = serde_json::from_str(r#"{"events":"off"}"#).unwrap();
+        assert!(!off.enabled);
+    }
+
+    #[test]
+    fn switching_off_preserves_selected_events_on_disk() {
+        let mut current = Settings {
+            enabled: false,
+            ..Settings::default()
+        };
+        current.set(NotificationKind::Question, false);
+        let saved = serde_json::to_value(current).unwrap();
+        assert_eq!(saved["events"], "off");
+        let restored: Settings = serde_json::from_value(saved).unwrap();
+        assert!(!restored.enabled);
+        assert!(!restored.selected(NotificationKind::Question));
+        assert!(restored.selected(NotificationKind::Approval));
+    }
+
+    #[test]
+    fn a_completed_goal_uses_one_enabled_headline() {
+        let mut settings = Settings::default();
+        assert_eq!(
+            settings.headline(NotificationKind::Finished, true),
+            Some("Turn finished")
+        );
+        settings.goal = true;
+        assert_eq!(
+            settings.headline(NotificationKind::Finished, true),
+            Some("Goal reached")
+        );
+        settings.set(NotificationKind::Finished, false);
+        assert_eq!(
+            settings.headline(NotificationKind::Finished, true),
+            Some("Goal reached")
+        );
+        assert_eq!(settings.headline(NotificationKind::Finished, false), None);
+        assert_eq!(
+            settings.headline(NotificationKind::Failed, true),
+            Some("Turn failed")
+        );
+        settings.enabled = false;
+        assert_eq!(settings.headline(NotificationKind::Finished, true), None);
     }
 }
 #[derive(Clone)]
@@ -47,6 +205,7 @@ pub(crate) struct Notice {
     pub thread: String,
     pub title: String,
     pub kind: NotificationKind,
+    pub goal_reached: bool,
 }
 #[derive(Clone)]
 struct Target {
@@ -101,11 +260,9 @@ impl Notifications {
 impl Notice {
     pub(crate) fn show(&self, link: &HostLink, cx: &mut App) {
         let settings = *cx.default_global::<Settings>();
-        if settings.events == Events::Off
-            || (settings.events == Events::Attention && self.kind == NotificationKind::Finished)
-        {
+        let Some(event) = settings.headline(self.kind, self.goal_reached) else {
             return;
-        }
+        };
         let Some(tag) = cx.default_global::<Notifications>().remember(link, self) else {
             return;
         };
@@ -117,12 +274,6 @@ impl Notice {
             .as_deref()
             .or_else(|| link.remote().map(|h| h.name.as_str()))
             .unwrap_or("This computer");
-        let event = match self.kind {
-            NotificationKind::Finished => "Turn finished",
-            NotificationKind::Failed => "Turn failed",
-            NotificationKind::Approval => "Approval needed",
-            NotificationKind::Question => "Question from agent",
-        };
         let clean = |s: &str| {
             s.chars()
                 .filter(|c| !c.is_control())

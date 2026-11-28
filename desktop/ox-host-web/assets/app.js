@@ -51,11 +51,14 @@ const button = (text, fn) => {
   return b;
 };
 // Same wording as the desktop's Route::label (ox-desk-core runtime.rs).
+const subscriptionLabels = {
+  codex: "ChatGPT subscription",
+  claude: "Claude subscription",
+  antigravity: "Google Antigravity",
+};
 const routesLabel = (r) =>
   r.billing === "subscription"
-    ? r.runtime === "codex"
-      ? "ChatGPT subscription"
-      : "Claude subscription"
+    ? subscriptionLabels[r.runtime] ?? r.runtime
     : r.runtime.replace(/^./, (x) => x.toUpperCase()) + " · " + r.billing.api;
 // Desktop status words (views/host/discovery.rs route_status, views/host.rs).
 // Same wording as the desktop (ox-desk-core store/claude/native.rs); `app` is the host's
@@ -158,8 +161,6 @@ let cold = new Map(),
   handoffStamp = "",
   // Message and images sent from a composer whose Ack has not come back, by owner.
   unacked = new Map(),
-  // The last `restored_draft.message` applied per owner, so each host restore lands once.
-  restoredSeen = new Map(),
   foldedProjects = new Set(),
   starredProjects = new Map(),
   projectOrder = new Map(),
@@ -168,6 +169,41 @@ let cold = new Map(),
   pinnedThreads = new Map(),
   threadColors = new Map(),
   visibleRows = 200;
+
+// Store text only, under this host's origin and the exact composer owner.
+const DRAFT_KEY = "ox-phone-draft-v1:";
+function draftRecord(owner) {
+  if (drafts.has(owner)) return drafts.get(owner);
+  try {
+    const saved = key && JSON.parse(localStorage.getItem(DRAFT_KEY + owner));
+    if (typeof saved?.text === "string") return saved;
+  } catch {}
+  return { text: "" };
+}
+function draftText(owner) {
+  return draftRecord(owner).text;
+}
+function setDraftText(owner, text, restored = draftRecord(owner).restored) {
+  const record = { text, restored };
+  try {
+    if (key && (text.trim() || restored))
+      localStorage.setItem(DRAFT_KEY + owner, JSON.stringify(record));
+    else localStorage.removeItem(DRAFT_KEY + owner);
+    drafts.delete(owner);
+  } catch {
+    // The current page can still keep its draft if storage is disabled or full.
+    drafts.set(owner, record);
+  }
+}
+function clearDrafts() {
+  drafts.clear();
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const name = localStorage.key(i);
+      if (name?.startsWith(DRAFT_KEY)) localStorage.removeItem(name);
+    }
+  } catch {}
+}
 
 const SIDEBAR_META_KEY = "ox-phone-sidebar-v1";
 const SEEN_RESULTS_KEY = "ox-phone-seen-results-v1";
@@ -250,15 +286,17 @@ const phoneSettings = setupSettings({
   request: (operation) => settingsRequest(key, operation),
   open: () => page("settings"),
   close: home,
-  notifications: () => {
-    home();
-    $("notification-setup").open = true;
-    $("notification-summary").focus();
+  pushStatus: () => {
+    const blocked = pushBlockReason();
+    return { blocked, granted: !blocked && Notification.permission === "granted" };
+  },
+  enablePush: async () => {
+    const enabled = await notifications(key, true);
+    if (enabled) $("notification-banner").hidden = true;
+    return enabled;
   },
   login: async (runtime) => {
-    return openPhoneTerminal(
-      runtime === "codex" ? "codex-login" : "claude-login",
-    );
+    return openPhoneTerminal(`${runtime}-login`);
   },
 });
 /** The host took a send and then lost it (a resume that failed after the Ack): its text
@@ -270,15 +308,14 @@ function restoreHostDrafts(model) {
       const r = session.detail?.restored_draft;
       if (typeof r?.message !== "string" || typeof r.text !== "string") continue;
       const owner = keyOf(s.scope, session.id);
-      if (restoredSeen.get(owner) === r.message) continue;
-      restoredSeen.set(owner, r.message);
+      if (draftRecord(owner).restored === r.message) continue;
       // An Ack still on its way must not clear the restored text.
       const sent = unacked.get(owner);
       if (sent) sent.restored = true;
-      const current = drafts.get(owner) || "";
+      const current = draftText(owner);
       const text =
         !current || current === r.text ? r.text : `${r.text}\n${current}`;
-      drafts.set(owner, text);
+      setDraftText(owner, text, r.message);
       if (selected && keyOf(selected.scope, selected.id) === owner) {
         $("draft").value = text;
         syncDraftHeight();
@@ -353,8 +390,7 @@ class Link {
           global.scopes.clear();
           global.cursor = null;
           cold.clear();
-          drafts.clear();
-          restoredSeen.clear();
+          clearDrafts();
           timelineRows.clear();
           pickedProjects.clear();
           forgetComposer();
@@ -372,7 +408,7 @@ class Link {
   /** @param {Server} msg */
   receive(msg) {
     if (msg.type === "hello") {
-      if (msg.version !== 1) {
+      if (!wire.supports(msg.version)) {
         this.close();
         notice("This host requires a newer client.");
         return;
@@ -425,11 +461,11 @@ class Link {
         // Opened can land before or after the Ack. What is in the provisional
         // composer now is the user's own newer text unless it is still exactly the
         // message just sent (its Ack has not arrived to clear it).
-        const typed = drafts.get(old),
+        const typed = draftText(old),
           sent = unacked.get(old);
-        drafts.delete(old);
+        setDraftText(old, "");
         const fresh = keyOf(msg.scope, msg.thread);
-        if (typed?.trim() && typed !== sent?.content) drafts.set(fresh, typed);
+        if (typed.trim() && typed !== sent?.content) setDraftText(fresh, typed);
         moveImages(old, fresh, sent?.images);
         open(msg.scope, msg.thread);
       }
@@ -658,7 +694,7 @@ const ago = (seconds) => {
   if (s < 86400) return Math.floor(s / 3600) + "h";
   return Math.floor(s / 86400) + "d";
 };
-const kindLabels = { claude: "Claude", codex: "Codex", worker: "Worker" };
+const kindLabels = { claude: "Claude", codex: "Codex", antigravity: "Antigravity", worker: "Worker" };
 function refreshRunning() {
   globalLink?.listProcesses((ok, value) => {
     if (!ok) {
@@ -812,7 +848,7 @@ function open(scope, id) {
   jumpLatest.reset();
   $("asks").replaceChildren();
   $("timeline").replaceChildren();
-  $("draft").value = drafts.get(keyOf(scope, id)) || "";
+  $("draft").value = draftText(keyOf(scope, id));
   page("conversation");
   syncDraftHeight();
   notice();
@@ -962,7 +998,7 @@ function catalog() {
       accent = threadColors.get(key) || projectColors.get(scope.project);
     const b = button("", () => open(scope, session.id));
     b.dataset.source =
-      session.parent || session.detail?.worker || session.detail?.origin
+      session.parent || session.detail?.worker || session.detail?.origin?.relation === "worker"
         ? "worker"
         : scope.route.billing !== "subscription"
           ? "api"
@@ -1652,6 +1688,9 @@ new IntersectionObserver(([entry]) => {
 // An absolute path such as /home/oscar/project is still an ordinary message.
 function composerCommand(content) {
   const text = content.trim();
+  if (selected?.scope.route.runtime === "antigravity") {
+    return localCommands.has(text) && text !== "/terminal" ? text : null;
+  }
   const name = text.split(/\s/, 1)[0];
   if (name.startsWith("/") && Object.hasOwn(controls.schema.session_commands ?? {}, name)) return text;
   return /^\/[^\s/]*(?:\s|$)/.test(text) ? text : null;
@@ -1715,6 +1754,7 @@ function updateComposerState() {
   );
   $("native-live-fork").hidden = !caps.includes("fork");
   $("native-live-fork").onclick = () => detailLink?.act({ fork_thread: id });
+  $("antigravity-sign-in-required").hidden = scope.route.runtime !== "antigravity" || s?.connection !== "sign_in_required";
   $("draft").disabled = nativeLive;
   const canSend = id
     ? caps.some((c) => c === "send" || c === "steer")
@@ -1839,7 +1879,7 @@ function conversation() {
   );
   $("older").hidden = !timeline?.detail?.older;
   $("older").onclick = () => detailLink.act({ load_older: id });
-  $("start-worker").hidden = !id || !caps.includes("open");
+  $("start-worker").hidden = !id || !caps.includes("open") || scope.route.runtime === "antigravity";
   $("continue-in").hidden = !id || !caps.includes("open");
   showAsks(asks);
   // The activity line only trusts a live link: a reconnect must not look like a finished turn.
@@ -1900,6 +1940,7 @@ function conversation() {
     caps.includes("stop") && (s?.asks || []).some((a) => a.thread === id);
   $("operator-session").hidden =
     !id ||
+    scope.route.runtime === "antigravity" ||
     !!row?.parent ||
     !!origin ||
     !(caps.includes("send") || awaitingApproval);
@@ -2102,9 +2143,11 @@ const bypassMode = (m) => m === "yolo" || m === "bypass_permissions";
 const provider = (route) =>
   route.billing?.api
     ? `the ${route.billing.api.split("/")[0]} API provider`
-    : route.runtime === "codex"
-      ? "OpenAI (ChatGPT subscription)"
-      : "Anthropic (Claude subscription)";
+    : ({
+        codex: "OpenAI (ChatGPT subscription)",
+        claude: "Anthropic (Claude subscription)",
+        antigravity: "Google",
+      })[route.runtime];
 function linkCard({ label, title, meta, tone = "", action }) {
   const card = el("article", "link-card " + tone);
   const body = el("div", "link-card-body");
@@ -2145,7 +2188,7 @@ function handoffMarks(row) {
         lowered: "lowered",
         operator: "chosen by you",
         host_policy: "set by the host policy",
-        capped: "capped below YOLO",
+        capped: origin.runtime === "antigravity" ? "adjusted to Antigravity’s supported modes" : "capped below YOLO",
       }[origin.decided] ?? "unknown";
     nodes.push(
       linkCard({
@@ -2241,7 +2284,7 @@ const handoffTarget = () => {
   const route = index === "" ? undefined : routes[+index];
   return route?.runtime === $("handoff-runtime").value ? route : undefined;
 };
-const runtimeName = (r) => (r === "codex" ? "ChatGPT/Codex" : "Claude");
+const runtimeName = (r) => ({ codex: "ChatGPT/Codex", claude: "Claude", antigravity: "Antigravity" })[r];
 function handoffNotice() {
   const target = handoffTarget(),
     source = selected?.scope?.route;
@@ -2253,13 +2296,24 @@ function handoffNotice() {
     line.textContent = `This handoff sends the carried conversation to ${provider(target)} (${routesLabel(target)}).`;
     line.hidden = false;
   } else line.hidden = true;
-  $("handoff-grant-row").hidden = $("handoff-mode").value !== "yolo";
   labelPermissions(
     $("handoff-mode"),
     $("handoff-runtime").value,
     $("handoff-permission-note"),
   );
+  $("handoff-grant-row").hidden = $("handoff-mode").value !== "yolo";
 }
+$("antigravity-sign-in").onclick = () => openPhoneTerminal("antigravity-login");
+$("antigravity-reconnect").onclick = () => {
+  if (selected) open(selected.scope, selected.id);
+};
+window.addEventListener("ox-native-login-finished", (event) => {
+  if (
+    event.detail?.preset === "antigravity-login" &&
+    !$("conversation").hidden &&
+    !$("antigravity-sign-in-required").hidden
+  ) $("antigravity-reconnect").click();
+});
 $("continue-in").onclick = () => {
   // Starts on the session's own runtime and route, as the desktop handoff sheet does.
   const from = selected?.scope?.route;
@@ -2553,10 +2607,20 @@ const permissionPresets = {
     classifier: ["Auto", "Let Claude Code’s classifier review tool actions before they run."],
     yolo: ["YOLO · bypass permissions", "Run Claude Code tools without permission prompts."],
   },
+  antigravity: {
+    read: ["Plan mode", "Let Antigravity explore and plan before making changes."],
+    write: ["Accept edits", "Let Antigravity apply edits without asking about each edit."],
+    yolo: ["YOLO", "Antigravity skips its standard permission prompts. Protected actions may still require review."],
+  },
 };
 function labelPermissions(select, runtime, note) {
   const table = permissionPresets[runtime] ?? permissionPresets.codex;
-  for (const o of select.options) if (table[o.value]) o.textContent = table[o.value][0];
+  for (const o of select.options) {
+    const mode = table[o.value];
+    o.hidden = o.disabled = o.value !== "inherit" && !mode;
+    if (mode) o.textContent = mode[0];
+  }
+  if (select.selectedOptions[0]?.disabled) select.value = "inherit";
   note.textContent =
     select.value === "inherit"
       ? "Uses this session's current permission mode."
@@ -2663,7 +2727,7 @@ $("worker-form").onsubmit = (e) => {
 $("draft").oninput = () => {
   mentionInput();
   if (selected)
-    drafts.set(keyOf(selected.scope, selected.id), $("draft").value);
+    setDraftText(keyOf(selected.scope, selected.id), $("draft").value);
   syncDraftHeight();
   updateComposerState();
 };
@@ -2725,7 +2789,7 @@ $("composer").onsubmit = (e) => {
       pendingNew = null;
       if (ok && !sentNow.restored) {
         clearImages(owner, images);
-        if (drafts.get(owner) === content) drafts.delete(owner);
+        if (draftText(owner) === content) setDraftText(owner, "");
         if (
           keyOf(selected?.scope || scope, selected?.id) === owner &&
           $("draft").value === content
@@ -2772,6 +2836,7 @@ $("pair-form").onsubmit = async (e) => {
     code = null;
     pairingTarget = null;
     key = await deviceKey();
+    clearDrafts();
     start(true);
   } catch (err) {
     if (err.status === 403) {
@@ -2805,42 +2870,40 @@ function setAlertsDismissed(on) {
     // Private windows may refuse storage; the banner then simply returns.
   }
 }
+function pushBlockReason() {
+  const supportsPush =
+    "serviceWorker" in navigator &&
+    "Notification" in window &&
+    "PushManager" in window;
+  if (ios && !standalone)
+    return "On iPhone, tap Share → Add to Home Screen in Safari. Turn on Open as Web App if shown. Open OX from its icon, scan a fresh pairing QR, then enable notifications there.";
+  if (!supportsPush)
+    return "This browser cannot receive session notifications. On iPhone, use the Home Screen app on iOS 16.4 or later.";
+  if (Notification.permission === "denied")
+    return ios
+      ? "Notifications are off. In iPhone Settings → Notifications, choose the name of this web app and turn on Allow Notifications. Then return to OX."
+      : "Allow notifications for this site in your browser settings, then return to OX.";
+  return null;
+}
 function notificationSetup(justPaired) {
   if (justPaired) {
     setAlertsDismissed(false);
     $("notification-setup").open = true;
   }
-  const supportsPush =
-    "serviceWorker" in navigator &&
-    "Notification" in window &&
-    "PushManager" in window;
-  if (ios && !standalone) {
-    notificationGuide(
-      "On iPhone, tap Share → Add to Home Screen in Safari. Turn on Open as Web App if shown. Open OX from its icon, scan a fresh pairing QR, then enable notifications there.",
-    );
-  } else if (!supportsPush) {
-    notificationGuide(
-      "This browser cannot receive session notifications. On iPhone, use the Home Screen app on iOS 16.4 or later.",
-    );
-  } else if (Notification.permission === "denied") {
-    notificationGuide(
-      ios
-        ? "Notifications are off. In iPhone Settings → Notifications, choose the name of this web app and turn on Allow Notifications. Then return to OX."
-        : "Allow notifications for this site in your browser settings, then return to OX.",
-    );
-  } else {
+  const blocked = pushBlockReason();
+  if (blocked) notificationGuide(blocked);
+  else {
     notificationGuide(
       "Get alerts when a session needs approval or an answer, finishes a turn, or fails. Tap Enable notifications, then Allow.",
       "Enable notifications",
     );
     if (Notification.permission === "granted") registerNotifications(false);
   }
-  // One-time banner until alerts are on or the user dismisses it; then it lives in the menu.
+  // One-time setup banner. Preferences are always in the Sessions menu.
   const granted =
     "Notification" in window && Notification.permission === "granted";
   const dismissed = alertsDismissed();
   $("notification-banner").hidden = granted || dismissed;
-  $("open-notifications").hidden = granted || !dismissed;
 }
 $("notification-dismiss").onclick = () => {
   setAlertsDismissed(true);
@@ -2848,9 +2911,7 @@ $("notification-dismiss").onclick = () => {
 };
 $("open-notifications").onclick = () => {
   closeActionMenus();
-  setAlertsDismissed(false);
-  notificationSetup(false);
-  $("notification-setup").open = true;
+  phoneSettings.openNotifications();
 };
 let registering = false;
 async function registerNotifications(explicit) {
@@ -2877,6 +2938,7 @@ function pairingPage() {
   page("pair");
   net("Pair device");
   const scanned = Boolean(code);
+  $("pair-install").hidden = !ios || standalone;
   $("step-scan").toggleAttribute("aria-current", !scanned);
   $("step-name").toggleAttribute("aria-current", scanned);
   $("scan-pair").hidden = scanned;
@@ -2931,6 +2993,7 @@ navigator.serviceWorker?.addEventListener("message", (e) => {
 });
 try {
   key = await deviceKey();
+  if (!key) clearDrafts();
   if (code || !key) pairingPage();
   else start();
 } catch {

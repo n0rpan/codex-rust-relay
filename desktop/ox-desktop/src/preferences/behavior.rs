@@ -25,6 +25,10 @@ fn start_choices(runtime: Runtime, b: Behavior) -> Vec<(&'static str, Behavior)>
             codex_start: start,
             ..b
         },
+        Runtime::Antigravity => Behavior {
+            antigravity_start: start,
+            ..b
+        },
     };
     std::iter::once(("Same as terminal", with(None)))
         .chain(Access::choices(runtime).iter().map(|&mode| {
@@ -178,11 +182,18 @@ impl Preferences {
                 p,
                 cx,
             ))
+            .child(self.preference_choices(
+                "New Antigravity sessions",
+                &start_choices(Runtime::Antigravity, b),
+                b,
+                p,
+                cx,
+            ))
             .child(
                 div()
                     .text_size(p.text(Step::Meta))
                     .text_color(rgb(p.muted))
-                    .child("Same as terminal starts a new session the way `claude` or `codex` starts in your terminal, using your own Claude Code and Codex settings. A mode you pick in the composer still applies to that one session."),
+                    .child("Same as terminal uses the agent’s own permissions. A mode you pick in the composer applies to that one session."),
             )
             .child(self.preference_choices(
                 "Worker requests",
@@ -213,59 +224,106 @@ impl Preferences {
                     .child("A parent agent answers its workers' questions, and approves their actions when its own mode runs without asking you (Auto, Auto-review or YOLO). Read-only workers and mode changes always ask you. You can still answer any request yourself."),
             )
     }
-    fn notification_controls(&self, p: Palette, cx: &mut Context<Self>) -> Div {
-        use crate::app::notifications::{Events, Settings};
+    pub(super) fn notification_page(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        use crate::app::notifications::Settings;
+        use gpui_component::switch::Switch;
+        use ox_desk_core::host_protocol::NotificationKind;
+
         let current = *cx.default_global::<Settings>();
-        let mut controls = div().flex().gap_1().flex_wrap();
-        for (label, mode) in [
-            ("Off", Events::Off),
-            ("Needs attention", Events::Attention),
-            ("All activity", Events::All),
-        ] {
-            controls = controls.child(crate::kit::button(
-                p,
-                SharedString::from(format!("desktop-notices-{label}")),
-                label,
-                current.events == mode,
-                true,
-                cx.listener(move |s, _, _, cx| {
-                    s.save_notifications(
-                        Settings {
-                            events: mode,
-                            ..current
-                        },
-                        cx,
-                    )
-                }),
-            ));
-        }
-        controls = controls.child(crate::kit::button(
-            p,
-            "notification-titles",
-            "Include thread titles",
-            current.titles,
-            current.events != Events::Off,
-            cx.listener(move |s, _, _, cx| {
-                s.save_notifications(
-                    Settings {
-                        titles: !current.titles,
-                        ..current
-                    },
-                    cx,
-                )
-            }),
-        ));
         div()
             .flex()
-            .items_center()
-            .gap_3()
+            .flex_col()
+            .gap_4()
             .child(
                 div()
-                    .w(px(162.))
-                    .text_size(p.text(Step::Ui))
+                    .text_size(p.text(Step::Title))
                     .child("Desktop notifications"),
             )
-            .child(controls)
+            .child(
+                div()
+                    .text_size(p.text(Step::Ui))
+                    .text_color(rgb(p.muted))
+                    .child("Alerts from connected hosts appear on this computer when OX is in the background."),
+            )
+            .child(
+                Switch::new("desktop-alerts-enabled")
+                    .label("Receive desktop notifications")
+                    .checked(current.enabled)
+                    .color(rgb(p.accent))
+                    .on_change(cx.listener(|s, checked: &bool, _, cx| {
+                        let mut settings = *cx.default_global::<Settings>();
+                        settings.enabled = *checked;
+                        s.save_notifications(settings, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .border_t_1()
+                    .border_color(rgb(p.line))
+                    .pt_4()
+                    .children([
+                        ("desktop-alert-approval", "Approval needed", NotificationKind::Approval),
+                        ("desktop-alert-question", "Question asked", NotificationKind::Question),
+                        ("desktop-alert-finished", "Turn done", NotificationKind::Finished),
+                        ("desktop-alert-failed", "Failed", NotificationKind::Failed),
+                    ].into_iter().map(|(id, label, kind)| {
+                        Switch::new(id)
+                            .label(label)
+                            .checked(current.selected(kind))
+                            .color(rgb(p.accent))
+                            .on_change(cx.listener(move |s, checked: &bool, _, cx| {
+                                let mut settings = *cx.default_global::<Settings>();
+                                settings.set(kind, *checked);
+                                s.save_notifications(settings, cx);
+                            }))
+                    }))
+                    .child(
+                        Switch::new("desktop-alert-goal")
+                            .label("Goal reached")
+                            .checked(current.goal)
+                            .color(rgb(p.accent))
+                            .on_change(cx.listener(|s, checked: &bool, _, cx| {
+                                let mut settings = *cx.default_global::<Settings>();
+                                settings.goal = *checked;
+                                s.save_notifications(settings, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(p.text(Step::Meta))
+                            .text_color(rgb(p.muted))
+                            .child("When Codex completes a goal and a turn together, OX sends one alert."),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(rgb(p.line))
+                    .pt_4()
+                    .child(
+                        Switch::new("desktop-alert-titles")
+                            .label("Include thread titles")
+                            .checked(current.titles)
+                            .color(rgb(p.accent))
+                            .on_change(cx.listener(|s, checked: &bool, _, cx| {
+                                let mut settings = *cx.default_global::<Settings>();
+                                settings.titles = *checked;
+                                s.save_notifications(settings, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(p.text(Step::Meta))
+                            .text_color(rgb(p.muted))
+                            .child("Titles may appear on your lock screen."),
+                    ),
+            )
     }
     fn save_notifications(
         &mut self,
@@ -284,7 +342,6 @@ impl Preferences {
             .flex()
             .flex_col()
             .gap_4()
-            .child(self.notification_controls(p,cx))
             .child(self.preference_choices(
                 "Send messages",
                 &[

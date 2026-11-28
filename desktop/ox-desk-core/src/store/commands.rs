@@ -174,6 +174,8 @@ impl Store {
             if let Some(caps) = id.and_then(|id| remote.commands.get(id)) {
                 return caps.clone();
             }
+        } else if self.is_antigravity() {
+            return self.antigravity_caps(id);
         } else if self.is_session_scoped() {
             return self.claude_caps(id);
         }
@@ -189,6 +191,9 @@ impl Store {
     /// An unknown command on a cold Claude route can be an installed project skill.
     /// Only its submission asks the runtime which commands this session supports.
     pub fn parse_command(&self, id: Option<&str>, text: &str) -> Option<crate::slash::Action> {
+        if self.profile.route.runtime == crate::runtime::Runtime::Antigravity {
+            return None;
+        }
         let caps = self.command_caps(id);
         let action = crate::slash::parse(text, &caps)?;
         if action == Action::Terminal
@@ -372,6 +377,11 @@ pub struct Handoff {
 
 impl Store {
     pub fn handoff_argv(&self, thread: Option<&str>) -> io::Result<Vec<String>> {
+        if self.profile.route.runtime == crate::runtime::Runtime::Antigravity {
+            return Err(io::Error::other(
+                "This Antigravity session runs through ACP.",
+            ));
+        }
         let mut route = self.thread_route(thread);
         if self.is_session_scoped()
             && let crate::runtime::Billing::Api(alias) = &mut route.billing

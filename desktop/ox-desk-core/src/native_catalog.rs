@@ -48,6 +48,7 @@ pub fn discover(
             index.decorate(&mut row);
             let known_in = |aliases: &[String]| match runtime {
                 Runtime::Claude => row.saved_runtime_route(aliases),
+                Runtime::Antigravity => Some(Runtime::Antigravity.route(None)),
                 Runtime::Codex if !api && row.model_provider == "openai" => {
                     Some(Route::CODEX_SUBSCRIPTION)
                 }
@@ -76,6 +77,18 @@ pub fn discover(
         }
         groups.into_iter().all(|(scope, rows)| emit(scope, rows))
     };
+    if crate::links::antigravity::executable(path).is_some() {
+        match crate::store::antigravity::saved_rows(
+            &claude_index.with_file_name("antigravity-sessions.json"),
+        ) {
+            Ok(rows) => {
+                if !publish(Runtime::Antigravity, false, rows) {
+                    return errors;
+                }
+            }
+            Err(e) => errors.push(e.to_string()),
+        }
+    }
     match ox::request::<protocol::ClaudeProfiles>(ox, path, protocol::Request::ClaudeProfiles)
         .and_then(|cfg| {
             saved_rows(

@@ -151,7 +151,7 @@ function fields(parent, specs, base = {}, isNew = false) {
   return { inputs, changes };
 }
 
-export function setupSettings({ request, open, close, notifications, login }) {
+export function setupSettings({ request, open, close, pushStatus, enablePush, login }) {
   const panel = node("section");
   panel.id = "settings";
   panel.hidden = true;
@@ -160,8 +160,10 @@ export function setupSettings({ request, open, close, notifications, login }) {
     pageId = 0,
     accountsPage,
     installPrompt,
+    refreshPushPermission,
     inviteTimer,
     pendingTimer = null;
+  const pushEdits = new Set();
   const localDefaults = {
     theme: "dark",
     font_size: 16,
@@ -237,8 +239,12 @@ export function setupSettings({ request, open, close, notifications, login }) {
     e.preventDefault();
     installPrompt = e;
   });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refreshPushPermission?.();
+  });
   function screen(title, back = menu) {
     pageId++;
+    refreshPushPermission = null;
     clearTimeout(inviteTimer);
     clearInterval(pendingTimer);
     pendingTimer = null;
@@ -373,7 +379,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
           [
             "Models & accounts",
             [
-              ["Accounts", "ChatGPT, Claude Code & agent start modes", accounts],
+              ["Accounts", "ChatGPT, Claude Code, Antigravity and agent start modes", accounts],
               ["Starred models", "Browse catalog, star & reorder models", favorites],
               ["Providers & models", "API endpoints & static models", providers],
               ["API keys", "Manage & copy provider credentials", credentials],
@@ -395,10 +401,11 @@ export function setupSettings({ request, open, close, notifications, login }) {
             () => behaviorForm(true),
           ],
           [
-            "Install & notifications",
-            "Home Screen app & session alerts",
-            phone,
+            "Notifications",
+            "Choose which session alerts this device receives",
+            () => notificationPreferences(),
           ],
+          ["Install OX", "Add OX to your Home Screen", phone],
         ],
       ],
       [
@@ -475,14 +482,16 @@ export function setupSettings({ request, open, close, notifications, login }) {
           "To sign in from this phone, enable terminal access for this device in OX Desktop → Settings → Remote access.",
         ),
       );
-    for (const [runtime, name, account, cmd] of [
+    for (const [runtime, name, identity, account, cmd] of [
       [
         "codex",
         "Codex · ChatGPT",
+        "ChatGPT",
         snapshot.chatgpt_account,
         "ox login chatgpt --device-auth",
       ],
-      ["claude", "Claude Code", snapshot.claude_account, "ox login claude"],
+      ["claude", "Claude Code", "Claude", snapshot.claude_account, "ox login claude"],
+      ["antigravity", "Antigravity", "Google", "Uses the Antigravity CLI’s Google sign-in.", "agy acp --login"],
     ]) {
       const detail = node("div", undefined, "phone-settings-card");
       detail.append(
@@ -497,7 +506,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
         ),
       );
       const launch = action(
-        "Sign in with " + (runtime === "codex" ? "ChatGPT" : "Claude"),
+        "Sign in with " + identity,
         () => login(runtime),
       );
       launch.disabled = !granted;
@@ -558,10 +567,17 @@ export function setupSettings({ request, open, close, notifications, login }) {
       ["Auto-review", "auto_review"],
       ["YOLO", "yolo"],
     ]);
+    choice("New Antigravity sessions", "antigravity_start", [
+      terminal,
+      ["Ask before edits", "default"],
+      ["Accept edits", "accept_edits"],
+      ["Plan mode", "plan"],
+      ["YOLO", "yolo"],
+    ]);
     form.append(
       node(
         "p",
-        "Same as terminal starts a new session the way claude or codex starts in your terminal, with your own Claude Code and Codex settings.",
+        "Same as terminal uses the agent’s own permissions.",
       ),
     );
     choice("Worker requests", "worker_approvals", [
@@ -904,9 +920,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
         field.spellcheck = false;
         field.setAttribute("autocapitalize", "none");
         submit(form, key.saved ? "Replace key" : "Save key", async () => {
-          const value = field.value;
-          field.value = "";
-          await save(req(value), credentials);
+          await save(req(field.value), credentials);
         });
       }
       if (key.saved)
@@ -1552,7 +1566,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
     body.append(form);
   }
   function phone() {
-    screen("Install & notifications");
+    screen("Install OX");
     const installed =
       navigator.standalone === true ||
       matchMedia("(display-mode: standalone)").matches;
@@ -1586,14 +1600,127 @@ export function setupSettings({ request, open, close, notifications, login }) {
           ),
         ),
       );
+    body.append(action("Pair another device", remote));
+  }
+  async function notificationPreferences(back = menu) {
+    const id = screen("Notifications", back);
+    const current = () => id === pageId && !panel.hidden;
+    status.textContent = "Loading notification settings…";
+    // A quick return to this page still reads the result of a prior edit.
+    await Promise.allSettled(pushEdits);
+    if (!current()) return;
+    const record = await readPage(id, { action: "push_preferences" });
+    if (!current()) return;
+    if (!record) {
+      body.append(button("Try again", () => notificationPreferences(back)));
+      return;
+    }
+    status.textContent = "";
+    const prefs = record.preferences;
+    const permission = node("section", undefined, "phone-settings-card phone-push-permission");
+    const events = node("fieldset", undefined, "phone-notification-events");
+    const feedback = node("p", "", "phone-notification-feedback");
+    feedback.setAttribute("role", "status");
+    events.append(node("legend", "Notify me when"));
+    let pending = 0;
+    let saveError = "";
+    let enrolling = false;
+    function toggle(name, label) {
+      const control = button(label, async () => {
+        if (control.getAttribute("aria-disabled") === "true") return;
+        const value = !prefs[name];
+        control.setAttribute("aria-checked", String(value));
+        control.setAttribute("aria-disabled", "true");
+        pending++;
+        saveError = "";
+        feedback.textContent = "Saving…";
+        const edit = request({
+          action: "push_preferences",
+          change: { event: name, value },
+        });
+        pushEdits.add(edit);
+        try {
+          const updated = await edit;
+          prefs[name] = updated.preferences[name];
+        } catch {
+          saveError = `Could not save “${label}”. Try again.`;
+        } finally {
+          pushEdits.delete(edit);
+          pending--;
+          if (current()) {
+            control.removeAttribute("aria-disabled");
+            control.setAttribute("aria-checked", String(prefs[name]));
+            feedback.textContent = saveError || (pending ? "Saving…" : "Saved.");
+          }
+        }
+      }, "phone-notification-switch");
+      control.setAttribute("role", "switch");
+      control.setAttribute("aria-label", label);
+      control.setAttribute("aria-checked", String(prefs[name]));
+      return control;
+    }
+    const master = toggle("enabled", "Push notifications");
+    for (const [name, label] of [
+      ["approval", "Approval needed"],
+      ["question", "Question asked"],
+      ["finished", "Turn done"],
+      ["goal_reached", "Goal reached"],
+      ["failed", "Failed"],
+    ])
+      events.append(toggle(name, label));
+    function showPermission() {
+      if (enrolling) return;
+      const focused = document.activeElement === permission.querySelector("button");
+      const { blocked, granted } = pushStatus();
+      const available = granted && record.subscribed;
+      permission.replaceChildren(
+        node("h2", "Browser permission"),
+        node("p", blocked || (available
+          ? "Allowed on this device."
+          : granted
+            ? "The browser allows notifications. Finish setting up push delivery."
+            : "Allow notifications in this browser to receive your selected alerts.")),
+      );
+      if (blocked || available) {
+        if (focused) master.focus({ preventScroll: true });
+        return;
+      }
+      const enable = button(granted ? "Set up push delivery" : "Enable on this device", async () => {
+        if (enrolling) return;
+        enrolling = true;
+        enable.setAttribute("aria-disabled", "true");
+        status.textContent = "Setting up push delivery…";
+        try {
+          record.subscribed = await enablePush();
+          if (current()) status.textContent = "";
+        } catch (err) {
+          if (current()) status.textContent = pushStatus().blocked ? "" : err.message;
+        } finally {
+          enrolling = false;
+          if (current()) showPermission();
+        }
+      }, "primary");
+      permission.append(enable);
+      if (focused) enable.focus({ preventScroll: true });
+    }
+    refreshPushPermission = showPermission;
+    showPermission();
     body.append(
-      action("Pair another device", remote),
-      button("Set up notifications", notifications),
+      permission,
+      master,
+      events,
+      node("p", "When Codex completes a goal and a turn together, OX sends one alert."),
+      feedback,
     );
   }
   return {
+    openNotifications() {
+      open();
+      return notificationPreferences(close);
+    },
     reset() {
       pageId++;
+      refreshPushPermission = null;
       clearTimeout(inviteTimer);
       snapshot = null;
       status.textContent = "";

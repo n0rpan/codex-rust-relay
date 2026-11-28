@@ -118,6 +118,7 @@ pub(crate) fn merge(
                 thread: thread.clone(),
                 title: title.into(),
                 event: NotificationKind::Approval,
+                goal_reached: false,
             });
         }
     }

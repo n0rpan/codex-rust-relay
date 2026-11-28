@@ -43,7 +43,7 @@ impl HostLink {
             .name("ox-host-catalog".into())
             .spawn(move || {
                 let read = || -> io::Result<()> {
-                    let ((mut input, mut stream, caps), host_name) = link.named_handshake()?;
+                    let ((mut input, mut stream, caps, _), host_name) = link.named_handshake()?;
                     {
                         let mut active = connection.lock().unwrap();
                         if cancelled.try_recv() != Err(mpsc::TryRecvError::Empty) {
@@ -166,6 +166,7 @@ impl HostLink {
                                             thread,
                                             title,
                                             event,
+                                            goal_reached,
                                         } => emit(CatalogEvent::Notice(
                                             crate::app::notifications::Notice {
                                                 host_name: host_name.clone(),
@@ -174,6 +175,7 @@ impl HostLink {
                                                 thread,
                                                 title,
                                                 kind: event,
+                                                goal_reached,
                                             },
                                         ))?,
                                         Change::Sessions { sessions } => {
