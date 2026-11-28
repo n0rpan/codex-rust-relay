@@ -338,6 +338,7 @@ pub fn cartridge(p: Palette, kind: Cartridge, vivid: bool) -> impl IntoElement {
     let color = match kind {
         Cartridge::Codex => p.accent,
         Cartridge::Claude => p.warning,
+        Cartridge::Antigravity => crate::appearance::mix(p.accent, p.fg, 32),
         Cartridge::Api => crate::appearance::mix(p.fg, p.accent, 48),
         Cartridge::Worker => p.muted,
     };

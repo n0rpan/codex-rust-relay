@@ -99,6 +99,7 @@ fn session(route: &Route) -> String {
     match (&route.billing, route.runtime) {
         (Billing::Subscription, Runtime::Codex) => format!("{runtime} on the ChatGPT subscription"),
         (Billing::Subscription, Runtime::Claude) => format!("{runtime} on the Claude subscription"),
+        (Billing::Subscription, Runtime::Antigravity) => format!("{runtime} on the Google account"),
         (Billing::Api(alias), _) => format!("{runtime} on the OX API route {alias}"),
     }
 }

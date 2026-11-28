@@ -84,6 +84,7 @@ impl Workbench {
         let can_end = store.can_end_session(&id);
         let can_launch =
             store.state() == &ox_desk_core::store::Connection::Ready && !store.in_terminal(&id);
+        let can_launch_worker = can_launch && store.profile().route.runtime.supports_workers();
         if !manage && !can_end && !can_launch {
             self.thread_edit = None;
             return None;
@@ -215,7 +216,7 @@ impl Workbench {
                         });
                     }),
                 ))
-                .when(can_launch, |menu| menu.item(
+                .when(can_launch_worker, |menu| menu.item(
                     crate::kit::menu_item("Start worker…").on_click(move |_, _, cx| {
                         let _ = worker.update(cx, |s, cx| s.request_launch(LaunchKind::Worker, cx));
                     }),

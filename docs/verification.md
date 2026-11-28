@@ -119,6 +119,16 @@ Codex used the Alibaba route and Claude Code used the Anthropic route. These
 checks ran with disposable client homes and private local credentials. CI
 uses loopback vendors and Brave fixtures.
 
+### Antigravity ACP
+
+The official Linux x86_64 Antigravity CLI 1.5.19 advertised its stdio server with `agy acp --help` and accepted ACP `initialize` using OX’s client identity. The signed-out probe used an isolated temporary profile. Session creation, listing, loading and resume returned `Authentication required`. Authenticated requests require a Google sign-in on the host. [Google's ACP documentation](https://antigravity.google/docs/cli/acp/)
+
+The host fixture exercises a Claude Code plan handoff, mode selection, permission replies, cancellation, and history replay over ACP. Pass the Linux Antigravity CLI as the third argument to exercise the real signed-out launch through `ox-host` as well.
+
+```sh
+python3 desktop/tests/host_antigravity_session.py /path/to/ox-host /path/to/ox /path/to/agy
+```
+
 ## Client updates
 
 ox launches the `codex` or `claude` executable on `PATH` with its launch-scoped
