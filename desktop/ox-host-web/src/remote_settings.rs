@@ -242,6 +242,7 @@ pub(super) async fn settings(
                 | Request::EditKey { .. }
                 | Request::ImportKeys { .. }
                 | Request::Models
+                | Request::ProviderModels { .. }
                 | Request::TestProvider { .. }
         ) {
             return Err(DENY);
@@ -316,7 +317,7 @@ fn helper(request: Request) -> Result<Value, String> {
             let result: protocol::model::Outcome = ox::request(&companion, &path, request)?;
             encode(serde_json::to_value(result))
         }
-        Request::Models => {
+        Request::Models | Request::ProviderModels { .. } => {
             let models: Vec<String> = ox::request(&companion, &path, request)?;
             Ok(json!(models))
         }

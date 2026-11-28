@@ -56,7 +56,7 @@ struct Legacy {
     initial_model: String,
 }
 
-pub(crate) struct ContinueSetup;
+pub(crate) struct ContinueSetup(pub Option<String>);
 impl EventEmitter<ContinueSetup> for Preferences {}
 
 pub struct Preferences {
@@ -89,7 +89,7 @@ pub struct Preferences {
     search_revision: String,
     conflict: Option<(Page, String)>,
     credential_provider: Option<String>,
-    tested_provider: Option<String>,
+    tested_provider: Option<(String, Option<String>)>,
 }
 
 impl Preferences {
@@ -545,33 +545,43 @@ impl Preferences {
         }
         let revision = self.settings.revisions.registry.clone();
         let link = self.link.clone();
+        let continuing = self.credential_provider.as_ref() == Some(&id);
         self.busy = true;
         self.tested_provider = None;
         self.message.clear();
         cx.notify();
         cx.spawn(async move |view, cx| {
-            let (id, result) = cx
+            let (id, result, model) = cx
                 .background_executor()
                 .spawn(async move {
                     let result = link.request::<usize>(Request::TestProvider {
                         id: id.clone(),
                         revision,
                     });
-                    (id, result)
+                    let model = (continuing && result.as_ref().is_ok_and(|n| *n > 0))
+                        .then(|| {
+                            link.request::<Vec<String>>(Request::ProviderModels { id: id.clone() })
+                                .ok()
+                                .and_then(|models| models.into_iter().next())
+                        })
+                        .flatten();
+                    (id, result, model)
                 })
                 .await;
             let _ = view.update(cx, |s, cx| {
                 s.busy = false;
                 match result {
                     Ok(n) => {
-                        if n > 0 {
-                            s.tested_provider = Some(id);
-                        }
-                        let models = if n == 1 {
+                        let models = if continuing && n > 0 && model.is_none() {
+                            "Choose one of this provider's models from the workbench.".to_owned()
+                        } else if n == 1 {
                             "1 coding model available.".to_owned()
                         } else {
                             format!("{n} coding models available.")
                         };
+                        if continuing && n > 0 {
+                            s.tested_provider = Some((id, model));
+                        }
                         s.report(Ok(()), &format!("Connection succeeded. {models}"), cx);
                     }
                     Err(e) => s.report(Err(e), "", cx),
@@ -1024,16 +1034,29 @@ impl Preferences {
                                 true,
                                 cx.listener(move |s, _, _, cx| s.test_provider(index, cx)),
                             ))
-                            .when(self.tested_provider.as_ref() == Some(id), |row| {
-                                row.child(crate::kit::button(
-                                    p,
-                                    "provider-continue",
-                                    "Continue to session",
-                                    true,
-                                    true,
-                                    cx.listener(|_, _, _, cx| cx.emit(ContinueSetup)),
-                                ))
-                            }),
+                            .when_some(
+                                self.tested_provider
+                                    .as_ref()
+                                    .filter(|(tested, _)| tested == id),
+                                |row, (_, model)| {
+                                    let label = if model.is_some() {
+                                        "Continue to session"
+                                    } else {
+                                        "Back to workbench"
+                                    };
+                                    let model = model.clone();
+                                    row.child(crate::kit::button(
+                                        p,
+                                        "provider-continue",
+                                        label,
+                                        true,
+                                        true,
+                                        cx.listener(move |_, _, _, cx| {
+                                            cx.emit(ContinueSetup(model.clone()))
+                                        }),
+                                    ))
+                                },
+                            ),
                     ),
             );
         }

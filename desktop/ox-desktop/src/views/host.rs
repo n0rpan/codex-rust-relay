@@ -1229,9 +1229,19 @@ impl Host {
         cx.subscribe_in(
             view,
             window,
-            |host, owner, _: &crate::preferences::ContinueSetup, window, cx| {
+            |host, owner, event: &crate::preferences::ContinueSetup, window, cx| {
                 if host.preferences.as_ref() == Some(owner) {
+                    host.provider_onboarding = None;
                     host.show_settings(window, cx);
+                    if let Some(model) = &event.0 {
+                        let pane = host.panes[host.active].read(cx);
+                        host.open(
+                            pane.project.clone(),
+                            pane.api_route(model.clone()),
+                            window,
+                            cx,
+                        );
+                    }
                 }
             },
         )
