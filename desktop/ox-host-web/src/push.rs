@@ -407,10 +407,7 @@ async fn notifications(
     bridge::write(&mut w, &Client::Hello { version: VERSION }).await?;
     if !matches!(
         serde_json::from_slice::<Server>(&bridge::line(&mut r, &mut buf).await?)?,
-        Server::Hello {
-            version: VERSION,
-            ..
-        }
+        Server::Hello { version, .. } if ox_desk_core::host_protocol::supported(version)
     ) {
         return Err(io::Error::other("Host version mismatch"));
     }

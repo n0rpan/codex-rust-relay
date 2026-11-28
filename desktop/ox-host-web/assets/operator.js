@@ -26,7 +26,9 @@ export async function openPhoneTerminal(
     shell: "Host terminal",
     "codex-login": "Sign in to ChatGPT",
     "claude-login": "Sign in to Claude",
+    "antigravity-login": "Sign in to Antigravity",
   };
+  const nativeLogin = ["codex-login", "claude-login", "antigravity-login"].includes(preset);
   el("operator-title").textContent = title[preset] || "Terminal";
   el("operator-state").textContent = "Verifying terminal access…";
   const visibility = el("operator-visibility");
@@ -227,7 +229,7 @@ export async function openPhoneTerminal(
         }
         screen.textContent = f.screen;
         screen.scrollTop = screen.scrollHeight;
-        if (["codex-login", "claude-login"].includes(preset)) {
+        if (nativeLogin) {
           for (const m of f.screen.matchAll(/https:\/\/[^\s<>"']+/g)) {
             let url;
             try {
@@ -239,7 +241,10 @@ export async function openPhoneTerminal(
               preset === "codex-login"
                 ? url.origin === "https://auth.openai.com" &&
                   url.pathname === "/codex/device"
-                : [
+                : preset === "antigravity-login"
+                  ? url.origin === "https://accounts.google.com" &&
+                    ["/o/oauth2/v2/auth", "/o/oauth2/auth"].includes(url.pathname)
+                  : [
                     "https://claude.ai",
                     "https://platform.claude.com",
                     "https://console.anthropic.com",
@@ -261,11 +266,8 @@ export async function openPhoneTerminal(
           "Process exited" +
             (f.exit === null ? "" : " with status " + f.exit) +
             ".";
-        if (
-          f.exit === 0 &&
-          (preset === "claude-login" || preset === "codex-login")
-        )
-          window.dispatchEvent(new Event("ox-native-login-finished"));
+        if (f.exit === 0 && nativeLogin)
+          window.dispatchEvent(new CustomEvent("ox-native-login-finished", { detail: { preset } }));
       }
     };
     ws.onclose = () => {

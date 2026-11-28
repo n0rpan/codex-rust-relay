@@ -153,7 +153,7 @@ class Host(socketserver.StreamRequestHandler):
                         {
                             "type": "hello",
                             "version": 1,
-                            "routes": [f.scope["route"]],
+                            "routes": [f.scope["route"], f.antigravity_scope["route"]],
                             "projects": [f.scope["project"]],
                             "capabilities": ["snapshot", "resume", "actions", "worker_placement"],
                         }
@@ -177,6 +177,12 @@ class Host(socketserver.StreamRequestHandler):
                         }
                     )
                     send({"type": "discovered_end", "id": frame["id"], "errors": []})
+                elif frame["type"] == "subscribe" and frame.get("scope") == f.antigravity_scope:
+                    send({"type": "snapshot", "cursor": {"epoch": "fixture", "seq": 10}, "scopes": [{
+                        "scope": f.antigravity_scope, "connection": "ready", "capabilities": ["start", "access"],
+                        "sessions": [f.antigravity_session] if f.antigravity_session else [], "asks": [], "transcripts": {},
+                        "detail": {"access_choices": ["default", "plan", "accept_edits", "yolo"]},
+                    }]})
                 elif frame["type"] == "subscribe":
                     f.connections.append(self.request)
                     f.resumes.append(frame.get("after"))
@@ -243,6 +249,23 @@ class Host(socketserver.StreamRequestHandler):
                                 "changes": [change],
                             }
                         )
+                elif frame["type"] == "act" and frame["scope"] == f.antigravity_scope:
+                    action = frame["action"]
+                    if "send_text" in action:
+                        assert action["send_text"] == [None, "/inspect this plan"]
+                        if not f.antigravity_signed_in:
+                            send({"type": "delta", "scope": f.antigravity_scope, "cursor": {"epoch": "fixture", "seq": sequence},
+                                  "changes": [{"kind": "state", "connection": "sign_in_required", "capabilities": [], "detail": {}}]})
+                            send({"type": "error", "id": frame["id"], "message": "Sign in to Antigravity on this host."})
+                            continue
+                        f.antigravity_session = {"id": "antigravity:resume", "title": "Check the plan", "parent": None,
+                            "status": "idle", "updated_at": 0, "capabilities": ["open", "send", "access", "model_options"],
+                            "detail": {"access": "plan", "access_choices": ["plan"], "options": {"model": "gemini-fixture"},
+                                "command_caps": {"models": {"gemini-fixture": {"label": "Gemini Fixture"}, "gemini-alt": {"label": "Gemini Alt"}}}}}
+                        send({"type": "opened", "id": frame["id"], "scope": f.antigravity_scope, "thread": f.antigravity_session["id"]})
+                    else:
+                        assert action == {"select_thread": f.antigravity_session["id"]}, action
+                    send({"type": "ack", "id": frame["id"]})
                 elif frame["type"] == "act":
                     assert frame["scope"] == f.scope
                     if "answer_ask" in frame["action"]:
@@ -761,6 +784,41 @@ def phone_report(js, port, base, keypress, capture, screenshot):
     print("PASS narrow phone catalog, independent disclosures for long commands, semantic Markdown report, and reachable composer", flush=True)
 
 
+def antigravity_phone(host, js):
+    js("document.getElementById('home').click()")
+    wait(lambda: js("return !!document.querySelector('[data-thread-id=parent]')"))
+    js("document.querySelector('[data-thread-id=parent]').click()")
+    wait(lambda: js("return !document.getElementById('continue-in').hidden"))
+    js("document.getElementById('continue-in').click(); const r=document.getElementById('handoff-runtime');"
+       "r.value='antigravity'; r.dispatchEvent(new Event('change'))")
+    assert js("""const route=document.getElementById('handoff-route'), modes=[...document.getElementById('handoff-mode').options];
+        return [...route.options].map(o=>o.text).join('')==='Google Antigravity' &&
+            modes.filter(o=>!o.disabled).map(o=>o.value).join(',')==='inherit,read,write,yolo' &&
+            document.getElementById('handoff-provider').textContent.includes('Google');""")
+    js("document.getElementById('handoff-mode').value='read'; document.getElementById('handoff-request').value='Continue in Plan mode';"
+       "document.getElementById('handoff-form').requestSubmit()")
+    wait(lambda: any(isinstance(a, dict) and a.get("start_handoff", {}).get("runtime") == "antigravity" and
+                     a["start_handoff"]["mode"] == "read" and a["start_handoff"]["model"] is None for a in host.actions))
+    js("document.getElementById('home').click()")
+    # A native Google route has no API alias. Retrying sign-in keeps the typed ACP prompt.
+    js("document.getElementById('new').click(); const r=document.getElementById('route');"
+       "r.value=[...r.options].find(o=>o.text==='Google Antigravity').value; document.getElementById('new-form').requestSubmit()")
+    js("const draft=document.getElementById('draft'); draft.value='/inspect this plan'; draft.dispatchEvent(new Event('input'))")
+    wait(lambda: js("return !document.getElementById('send').disabled"))
+    js("document.getElementById('composer').requestSubmit()")
+    wait(lambda: js("return !document.getElementById('antigravity-sign-in-required').hidden"))
+    assert js("return document.getElementById('draft').value==='/inspect this plan' && document.getElementById('send').disabled")
+    host.antigravity_signed_in = True
+    js("document.getElementById('antigravity-reconnect').click()")
+    wait(lambda: js("return !document.getElementById('send').disabled"))
+    js("document.getElementById('composer').requestSubmit()")
+    wait(lambda: js("return document.getElementById('title').textContent==='Check the plan' && document.getElementById('composer-model')?.value==='gemini-fixture'"))
+    assert js("return document.getElementById('start-worker').hidden && document.getElementById('attach-label').hidden && document.getElementById('operator-session').hidden")
+    js("document.getElementById('access-mode').click()")
+    assert js("return [...document.getElementById('permission').options].map(o=>o.value).join(',')==='plan'")
+    print("PASS Chromium Antigravity handoff, sign-in retry, draft retention and model projection", flush=True)
+
+
 def run(harness, screenshot=None):
     with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
         d = Path(tmp)
@@ -770,6 +828,9 @@ def run(harness, screenshot=None):
             "project": str(d / "fixture"),
             "route": {"runtime": "claude", "billing": "subscription"},
         }
+        host.antigravity_scope = dict(host.scope, route={"runtime": "antigravity", "billing": "subscription"})
+        host.antigravity_signed_in = False
+        host.antigravity_session = None
         Path(host.scope["project"]).mkdir()
         host.caps = ["start", "access", "model_options", "native_commands"]
         host.allow_status_ack = threading.Event()
@@ -1166,8 +1227,9 @@ def run(harness, screenshot=None):
         assert typed and not typed[0][0] and typed[0][1].startswith("<ox-handoff>"), typed
         assert js("return document.getElementById('handoff-marks').hidden")
         phone_report(js, port, base, keypress, capture, screenshot)
-        # Cold discovery through the real New action: the Hello listed one Claude subscription
-        # route and no API route, and the connected tab never refreshes. The unstarred provider
+        antigravity_phone(host, js)
+        # Cold discovery through the real New action: the Hello listed native subscriptions
+        # and no API route, and the connected tab never refreshes. The unstarred provider
         # alias must still be offered for BOTH runtimes once its catalog lands.
         js("document.getElementById('home').click();document.getElementById('new').click()")
         wait(lambda: js(

@@ -274,6 +274,9 @@ impl Workbench {
         paths: &[PathBuf],
         cx: &mut Context<Self>,
     ) {
+        if self.route.runtime == ox_desk_core::runtime::Runtime::Antigravity {
+            return;
+        }
         let project = self.project.clone();
         let Some(store) = &mut self.store else {
             return;
@@ -399,10 +402,11 @@ impl Workbench {
         clip: &ClipboardItem,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self
-            .store
-            .as_ref()
-            .is_none_or(|s| s.selected() != owner.as_deref())
+        if self.route.runtime == ox_desk_core::runtime::Runtime::Antigravity
+            || self
+                .store
+                .as_ref()
+                .is_none_or(|s| s.selected() != owner.as_deref())
         {
             return false;
         }
@@ -549,12 +553,13 @@ pub(super) fn composer_input(
     let dest = owner.clone();
     let pasted = owner.clone();
     let dragging_owner = owner.clone();
+    let can_attach = store.profile().route.runtime != ox_desk_core::runtime::Runtime::Antigravity;
     let mut panel = col()
         .relative()
         .gap_1()
         .on_drag_move::<ExternalPaths>(cx.listener(
             move |s, event: &DragMoveEvent<ExternalPaths>, _, cx| {
-                let inside = event.bounds.contains(&event.event.position);
+                let inside = can_attach && event.bounds.contains(&event.event.position);
                 if inside {
                     let files = event.drag(cx).paths();
                     if s.file_hover

@@ -61,6 +61,7 @@ enum Preset {
     Shell,
     CodexLogin,
     ClaudeLogin,
+    AntigravityLogin,
     NativeSession,
 }
 use crate::terminal_protocol::Input;
@@ -180,6 +181,11 @@ async fn operator(app: App, id: String, mut ws: WebSocket) {
             };
             let cmd = if shell {
                 TerminalCommand::line_input_shell()
+            } else if matches!(mode, Preset::AntigravityLogin) {
+                TerminalCommand {
+                    program: "agy".into(),
+                    args: vec!["acp".into(), "--login".into()],
+                }
             } else {
                 let Ok(binary) = remote_settings::binary() else {
                     return;

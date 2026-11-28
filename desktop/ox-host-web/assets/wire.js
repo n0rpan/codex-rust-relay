@@ -3,8 +3,11 @@
 /** @typedef {import('../../ox-host-protocol/generated/host-v1').Scope} Scope */
 /** @typedef {import('../../ox-host-protocol/generated/host-v1').Cursor} Cursor */
 /** @typedef {import('../../ox-host-protocol/generated/host-v1').Action} Action */
+const version = 2;
 /** @returns {Client} */
-export const hello = () => ({ type: "hello", version: 1 });
+export const hello = () => ({ type: "hello", version });
+/** @param {number} selected */
+export const supports = (selected) => selected >= 1 && selected <= version;
 /** @param {string} id @returns {Client} */
 export const discover = (id) => ({ type: "discover", id });
 /** @param {Scope|null} scope @param {Cursor|null} after @returns {Client} */

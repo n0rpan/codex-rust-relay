@@ -3,7 +3,7 @@ use crate::{
     receipts::{Receipts, digest},
     replay::Replay,
     runtime::{RuntimeConfig, canonical_scope},
-    transport::{Peer, encode},
+    transport::{Peer, encode, encode_for},
     workers::{Caller, Registry},
 };
 use ox_desk_core::{
@@ -209,7 +209,7 @@ struct ReadArgs {
 struct ClientState {
     update_lease: Option<tokio::sync::RwLockWriteGuard<'static, ()>>,
     peer: Peer,
-    hello: bool,
+    version: Option<u32>,
     prepared: Option<crate::runtime::Prepared>,
     subscription: Option<Option<Scope>>,
     catalog: bool,
@@ -219,6 +219,12 @@ struct ClientState {
     /// The interface this connection declared after its hello. None for an older
     /// client or a relay-only consumer: their sends are stamped `Sender::Unknown`.
     surface: Option<ox_desk_core::surface::Surface>,
+}
+impl ClientState {
+    fn supports_scope(&self, scope: &Scope) -> bool {
+        self.version
+            .is_some_and(|version| wire::supports_route(version, &scope.route))
+    }
 }
 struct Live {
     launching: Option<Launching>,
@@ -628,7 +634,7 @@ impl Engine {
                         ClientState {
                             update_lease: None,
                             peer,
-                            hello: false,
+                            version: None,
                             prepared: None,
                             subscription: None,
                             catalog: false,
@@ -710,7 +716,8 @@ impl Engine {
     }
     fn reply(&mut self, id: u64, frame: Server) -> io::Result<()> {
         if let Some(client) = self.clients.get(&id)
-            && !client.peer.send(encode(&frame)?)
+            && let Some(packet) = encode_for(frame, client.version.unwrap_or(wire::MIN_VERSION))?
+            && !client.peer.send(packet)
         {
             self.clients.remove(&id);
         }
@@ -720,7 +727,11 @@ impl Engine {
         let Some(client) = self.clients.get(&id) else {
             return Ok(());
         };
-        if !client.hello && !matches!(message, Client::Hello { .. }) {
+        if let Some(version) = client.version {
+            if !message.supported_by(version) {
+                return Err(io::Error::other("Antigravity requires OX host protocol 2"));
+            }
+        } else if !matches!(message, Client::Hello { .. }) {
             return Err(io::Error::other("Send a protocol hello first"));
         }
         match message {
@@ -750,6 +761,11 @@ impl Engine {
                 self.reply(id, Server::IdleUpdate { ready })
             }
             Client::Hello { version } => {
+                if client.version.is_some() {
+                    return Err(io::Error::other(
+                        "This connection already sent a protocol hello",
+                    ));
+                }
                 let Some(version) = wire::negotiate(version) else {
                     let message = wire::version_mismatch(wire::VERSION, version);
                     let _ = self.reply(
@@ -798,13 +814,14 @@ impl Engine {
                     self.config
                         .installed_runtimes()
                         .iter()
+                        .filter(|runtime| runtime.supports_workers())
                         .map(|runtime| format!("worker_runtime_{}", runtime.executable())),
                 );
                 if prepared.as_ref().is_some_and(|s| s.has_api_provider()) {
                     capabilities.push("worker_api_provider".into());
                 }
                 let client = self.clients.get_mut(&id).unwrap();
-                client.hello = true;
+                client.version = Some(version);
                 client.prepared = prepared;
                 let projects =
                     crate::projects::known(&self.config, &self.state_dir, self.scope_projects());
@@ -1258,7 +1275,11 @@ impl Engine {
         if !fresh
             && same_subscription
             && let Some(cursor) = after
-            && let Some(mut frames) = self.replay.after(scope.as_ref(), &cursor)
+            && let Some(mut frames) = self.replay.after(
+                scope.as_ref(),
+                &cursor,
+                client.version.expect("negotiated subscription"),
+            )
         {
             replayed = Some(frames.all(|p| client.peer.send_for(p, "replay")));
         }
@@ -1665,7 +1686,8 @@ impl Engine {
         }
         // The stamp describes who sent this message. It is fixed here, at acceptance, and
         // travels with the message; it never enters the digest or an authorization check.
-        if let Action::SetAccess(owner, mode) = &action
+        if scope.route.runtime != ox_desk_core::runtime::Runtime::Antigravity
+            && let Action::SetAccess(owner, mode) = &action
             && self.stage_mode_change(scope, owner, *mode, approved_mode.is_some())?
         {
             return Ok(());
@@ -2035,6 +2057,7 @@ impl Engine {
             && let Some(l) = live.launching.take()
         {
             live.store.drop_claude_worker();
+            live.store.drop_antigravity_handoff();
             launched = Some(Finished::new(l, Err(error), None));
         }
         annotate(
@@ -2115,21 +2138,38 @@ impl Engine {
                 asks: live.state.asks.clone(),
             });
         }
-        let created = opened.and_then(|thread| {
-            live.opening.take().map(|(id, key)| {
-                self.receipts.opened(scope, &key, &thread);
-                (
-                    id,
-                    Server::Opened {
-                        id: key,
-                        scope: scope.clone(),
-                        thread,
-                    },
-                )
-            })
-        });
-        if live.opening.is_some() && !live.store.opening_thread() {
-            live.opening = None;
+        let mut created = Vec::new();
+        let antigravity = scope.route.runtime == ox_desk_core::runtime::Runtime::Antigravity;
+        if let Some(thread) = opened
+            && let Some((id, key)) = live.opening.take()
+        {
+            self.receipts.opened(scope, &key, &thread);
+            if antigravity {
+                created.push((id, Server::Ack { id: key.clone() }));
+            }
+            created.push((
+                id,
+                Server::Opened {
+                    id: key,
+                    scope: scope.clone(),
+                    thread,
+                },
+            ));
+        }
+        if !live.store.opening_thread()
+            && let Some((id, key)) = live.opening.take()
+            && antigravity
+        {
+            let frame = Server::Error {
+                id: Some(key.clone()),
+                message: live
+                    .store
+                    .notice()
+                    .unwrap_or("Antigravity could not open a session.")
+                    .into(),
+            };
+            self.receipts.finish(scope, &key, frame.clone());
+            created.push((id, frame));
         }
         if live.opening.is_none() {
             live.fork_origin = None;
@@ -2138,7 +2178,7 @@ impl Engine {
             if let Some((id, frame)) = handoff {
                 self.reply(id, frame)?;
             }
-            if let Some((id, frame)) = created {
+            for (id, frame) in created {
                 self.reply(id, frame)?;
             }
             return self.finish_launch(scope, launched);
@@ -2185,7 +2225,7 @@ impl Engine {
         if let Some((id, frame)) = handoff {
             self.reply(id, frame)?;
         }
-        if let Some((id, frame)) = created {
+        for (id, frame) in created {
             self.reply(id, frame)?;
         }
         self.finish_launch(scope, launched)?;
@@ -2999,8 +3039,8 @@ impl Engine {
     /// The process rows for one route's live threads: one per Claude session, one per Codex scope.
     fn scope_rows(&self, scope: &Scope, live: &Live, threads: Vec<String>) -> Vec<ProcessView> {
         let mut out = Vec::new();
-        let claude = scope.route.runtime == ox_desk_core::runtime::Runtime::Claude;
-        let groups: Vec<Vec<String>> = if claude {
+        let runtime = scope.route.runtime;
+        let groups: Vec<Vec<String>> = if runtime != ox_desk_core::runtime::Runtime::Codex {
             threads.into_iter().map(|t| vec![t]).collect()
         } else {
             vec![threads]
@@ -3023,10 +3063,12 @@ impl Engine {
             out.push(ProcessView {
                 kind: if worker {
                     "worker"
-                } else if claude {
-                    "claude"
                 } else {
-                    "codex"
+                    match runtime {
+                        ox_desk_core::runtime::Runtime::Codex => "codex",
+                        ox_desk_core::runtime::Runtime::Claude => "claude",
+                        ox_desk_core::runtime::Runtime::Antigravity => "antigravity",
+                    }
                 }
                 .into(),
                 scope: scope.clone(),
@@ -3039,7 +3081,7 @@ impl Engine {
                 started_at: started,
                 last_activity: last,
                 running: group.iter().any(|t| self.thread_busy(scope, t)),
-                draft: claude && group.iter().all(|t| live.store.is_draft(t)),
+                draft: group.iter().all(|t| live.store.is_draft(t)),
                 threads: group,
             });
         }
@@ -3344,7 +3386,9 @@ impl Engine {
                     changes: catalog,
                 })?;
                 self.clients.retain(|_, c| {
-                    !catalog_only(c) || c.peer.send_for(packet.clone(), "catalog watch")
+                    !catalog_only(c)
+                        || !c.supports_scope(scope)
+                        || c.peer.send_for(packet.clone(), "catalog watch")
                 });
             }
         }
@@ -3355,10 +3399,13 @@ impl Engine {
         })?;
         self.replay.append(scope.clone(), packet.clone());
         let what = format!("{} {}", scope.project.display(), scope.route.label());
-        self.clients.retain(|_, c| match c.subscription.as_ref() {
-            Some(Some(s)) if s == scope => c.peer.send_for(packet.clone(), &what),
-            Some(None) if !c.catalog => c.peer.send_for(packet.clone(), &what),
-            _ => true,
+        self.clients.retain(|_, c| {
+            !c.supports_scope(scope)
+                || match c.subscription.as_ref() {
+                    Some(Some(s)) if s == scope => c.peer.send_for(packet.clone(), &what),
+                    Some(None) if !c.catalog => c.peer.send_for(packet.clone(), &what),
+                    _ => true,
+                }
         });
         Ok(())
     }
@@ -3901,7 +3948,7 @@ mod tests {
             ClientState {
                 update_lease: None,
                 peer,
-                hello: true,
+                version: Some(wire::VERSION),
                 prepared: None,
                 subscription: None,
                 catalog: false,
@@ -3999,7 +4046,7 @@ mod tests {
             ClientState {
                 update_lease: None,
                 peer,
-                hello: true,
+                version: Some(wire::VERSION),
                 prepared: None,
                 subscription: Some(Some(scope.clone())),
                 catalog: false,
@@ -4029,6 +4076,93 @@ mod tests {
     }
 
     #[test]
+    fn v1_subscriptions_keep_codex_and_claude_across_antigravity_activity() {
+        use ox_desk_core::runtime::Runtime;
+        let root = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig {
+            ox: "/usr/bin/false".into(),
+            path: "/bin".into(),
+            desktop: root.path().into(),
+        };
+        let (tx, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut engine = Engine::open(config, root.path(), tx).unwrap();
+        let mut listeners = vec![];
+        for (id, version) in [(1, 1), (2, wire::VERSION)] {
+            let (peer, frames) = crate::transport::test_peer();
+            engine.clients.insert(
+                id,
+                ClientState {
+                    update_lease: None,
+                    peer,
+                    version: None,
+                    prepared: None,
+                    subscription: None,
+                    catalog: false,
+                    watch_resources: false,
+                    terminal: false,
+                    surface: None,
+                },
+            );
+            engine.request(id, Client::Hello { version }).unwrap();
+            let hello = serde_json::from_slice::<Server>(&frames.try_recv().unwrap()).unwrap();
+            assert!(matches!(hello, Server::Hello { version: got, .. } if got == version));
+            engine
+                .request(
+                    id,
+                    Client::Subscribe {
+                        scope: None,
+                        after: None,
+                        terminal: false,
+                    },
+                )
+                .unwrap();
+            let snapshot = serde_json::from_slice::<Server>(&frames.try_recv().unwrap()).unwrap();
+            let Server::Snapshot { cursor, .. } = snapshot else {
+                panic!("expected snapshot")
+            };
+            listeners.push((id, cursor, frames));
+        }
+        for runtime in [Runtime::Codex, Runtime::Antigravity, Runtime::Claude] {
+            let scope = Scope {
+                project: root.path().into(),
+                route: runtime.route(None),
+            };
+            engine.broadcast(&scope, vec![]).unwrap();
+        }
+        for (id, cursor, frames) in listeners {
+            let expected = if id == 1 {
+                vec![Runtime::Codex, Runtime::Claude]
+            } else {
+                vec![Runtime::Codex, Runtime::Antigravity, Runtime::Claude]
+            };
+            let received = || {
+                frames
+                    .try_iter()
+                    .map(|packet| {
+                        let frame = serde_json::from_slice::<Server>(&packet).unwrap();
+                        let Server::Delta { scope, .. } = frame else {
+                            panic!("expected delta")
+                        };
+                        scope.route.runtime
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(received(), expected);
+            engine
+                .request(
+                    id,
+                    Client::Subscribe {
+                        scope: None,
+                        after: Some(cursor),
+                        terminal: false,
+                    },
+                )
+                .unwrap();
+            assert_eq!(received(), expected);
+        }
+    }
+
+    #[test]
     fn a_connection_declares_its_surface_once_after_a_hello_that_offers_it() {
         use ox_desk_core::surface::{CAPABILITY, Surface};
         let root = tempfile::tempdir().unwrap();
@@ -4047,7 +4181,7 @@ mod tests {
                 ClientState {
                     update_lease: None,
                     peer,
-                    hello: false,
+                    version: None,
                     prepared: None,
                     subscription: None,
                     catalog: false,
@@ -4157,7 +4291,7 @@ mod tests {
                 ClientState {
                     update_lease: None,
                     peer,
-                    hello: true,
+                    version: Some(wire::VERSION),
                     prepared: None,
                     subscription,
                     catalog,
@@ -4891,7 +5025,7 @@ mod tests {
                     ClientState {
                         update_lease: None,
                         peer,
-                        hello: true,
+                        version: Some(wire::VERSION),
                         prepared: None,
                         subscription: Some(Some(worker.clone())),
                         catalog: false,
@@ -7774,7 +7908,7 @@ mod tests {
                 ClientState {
                     update_lease: None,
                     peer,
-                    hello: true,
+                    version: Some(wire::VERSION),
                     prepared: None,
                     subscription: Some(Some(scope.clone())),
                     catalog: false,
@@ -8055,7 +8189,7 @@ mod tests {
                     ClientState {
                         update_lease: None,
                         peer,
-                        hello: true,
+                        version: Some(wire::VERSION),
                         prepared: None,
                         subscription: None,
                         catalog: false,
@@ -8117,7 +8251,7 @@ mod tests {
                 ClientState {
                     update_lease: None,
                     peer,
-                    hello: true,
+                    version: Some(wire::VERSION),
                     prepared: None,
                     subscription: None,
                     catalog: false,

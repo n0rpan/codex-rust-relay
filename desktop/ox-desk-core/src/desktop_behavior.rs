@@ -45,6 +45,10 @@ pub struct Behavior {
     /// The preset a new Codex session starts in. `None` uses the Codex config,
     /// as `codex` does in a terminal.
     pub codex_start: Option<Access>,
+    /// The mode a new Antigravity session starts in, including startup-only YOLO.
+    /// `None` uses Antigravity's configured default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub antigravity_start: Option<Access>,
 }
 impl Default for Behavior {
     fn default() -> Self {
@@ -58,6 +62,7 @@ impl Default for Behavior {
             worker_approvals: WorkerApprovals::Parent,
             claude_start: None,
             codex_start: None,
+            antigravity_start: None,
         }
     }
 }
@@ -104,6 +109,7 @@ pub fn start_mode(runtime: Runtime) -> Option<Access> {
     let chosen = match runtime {
         Runtime::Claude => behavior.claude_start,
         Runtime::Codex => behavior.codex_start,
+        Runtime::Antigravity => behavior.antigravity_start,
     }?;
     Access::choices(runtime).contains(&chosen).then_some(chosen)
 }
@@ -123,6 +129,7 @@ fn write_at(path: &Path, expected: &str, next: Behavior) -> io::Result<Outcome> 
     for (runtime, start) in [
         (Runtime::Claude, next.claude_start),
         (Runtime::Codex, next.codex_start),
+        (Runtime::Antigravity, next.antigravity_start),
     ] {
         if start.is_some_and(|a| !Access::choices(runtime).contains(&a)) {
             return Err(io::Error::other(format!(
@@ -156,6 +163,9 @@ fn write_at(path: &Path, expected: &str, next: Behavior) -> io::Result<Outcome> 
         unreachable!()
     };
     object.extend(fields);
+    if next.antigravity_start.is_none() {
+        object.remove("antigravity_start");
+    }
     let mut temp = tempfile::NamedTempFile::new_in(dir)?;
     serde_json::to_writer(&mut temp, &doc)?;
     temp.flush()?;
@@ -190,14 +200,16 @@ mod tests {
     fn start_modes_default_to_the_terminal_and_stay_within_their_runtime() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("preferences.json");
-        // A file saved before these settings existed starts both runtimes as a terminal does.
+        // A file saved before these settings existed starts every runtime in its own default.
         fs::write(&path, r#"{"font_size":18}"#).unwrap();
         let before = snapshot(document(&path).unwrap()).unwrap().behavior;
         assert_eq!((before.claude_start, before.codex_start), (None, None));
+        assert_eq!(before.antigravity_start, None);
         assert_eq!(before.worker_approvals, WorkerApprovals::Parent);
         let auto = Behavior {
             claude_start: Some(Access::Auto),
             codex_start: Some(Access::Yolo),
+            antigravity_start: Some(Access::Plan),
             ..before
         };
         assert!(matches!(
@@ -212,11 +224,34 @@ mod tests {
             ),
             (Some("auto"), Some("yolo"))
         );
+        assert_eq!(saved["antigravity_start"], "plan");
         // A preset of the other runtime is refused.
         let crossed = Behavior {
             codex_start: Some(Access::Plan),
             ..auto
         };
         assert!(write_at(&path, &revision(auto), crossed).is_err());
+        let crossed = Behavior {
+            antigravity_start: Some(Access::AutoReview),
+            ..auto
+        };
+        assert!(write_at(&path, &revision(auto), crossed).is_err());
+        let yolo = Behavior {
+            antigravity_start: Some(Access::Yolo),
+            ..auto
+        };
+        assert!(matches!(
+            write_at(&path, &revision(auto), yolo).unwrap(),
+            Outcome::Applied
+        ));
+        let reset = Behavior {
+            antigravity_start: None,
+            ..auto
+        };
+        assert!(matches!(
+            write_at(&path, &revision(yolo), reset).unwrap(),
+            Outcome::Applied
+        ));
+        assert_eq!(snapshot(document(&path).unwrap()).unwrap().behavior, reset);
     }
 }

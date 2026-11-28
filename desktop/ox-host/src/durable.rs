@@ -1,6 +1,8 @@
 use ox_desk_core::host_protocol::{Scope, ScopeState, SessionView};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, BufReader, Write},
     os::unix::fs::OpenOptionsExt,
@@ -238,6 +240,137 @@ impl SavedScope {
 /// The session ledger file in the host state directory.
 pub(crate) const LEDGER: &str = "ownership-v1.json";
 
+/// Keep the original ledger readable by a rolled-back host. It ignores the optional
+/// extension, and its next write can discard that metadata. Antigravity's session
+/// index and its native history live separately and survive such a rollback.
+const ANTIGRAVITY: &str = "antigravity";
+
+#[derive(Default, Serialize, Deserialize)]
+struct AntigravityRecords {
+    /// JSON pointers into the original ledger and the positions of extracted records.
+    /// The parent list sorts before paths to lists in its restored records.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    arrays: BTreeMap<String, Vec<(usize, Value)>>,
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    forwarded: Map<String, Value>,
+}
+
+fn references_antigravity(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => {
+            fields.get("runtime").and_then(Value::as_str) == Some(ANTIGRAVITY)
+                || fields.values().any(references_antigravity)
+        }
+        Value::Array(values) => values.iter().any(references_antigravity),
+        _ => false,
+    }
+}
+
+impl AntigravityRecords {
+    fn extract(
+        &mut self,
+        records: &mut Vec<Value>,
+        path: String,
+        matches: impl Fn(&Value) -> bool,
+    ) {
+        let mut index = 0;
+        let mut extracted = Vec::new();
+        records.retain_mut(|record| {
+            let keep = !matches(record);
+            if !keep {
+                extracted.push((index, record.take()));
+            }
+            index += 1;
+            keep
+        });
+        if !extracted.is_empty() {
+            self.arrays.insert(path, extracted);
+        }
+    }
+
+    fn restore(self, data: &mut Value) -> io::Result<()> {
+        for (path, records) in self.arrays {
+            let list = data
+                .pointer_mut(&path)
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| io::Error::other("Invalid Antigravity ledger collection"))?;
+            for (index, record) in records {
+                if index > list.len() {
+                    return Err(io::Error::other(
+                        "Invalid Antigravity ledger record position",
+                    ));
+                }
+                list.insert(index, record);
+            }
+        }
+        if !self.forwarded.is_empty() {
+            let forwarded = data["forwarded"]
+                .as_object_mut()
+                .ok_or_else(|| io::Error::other("Invalid Antigravity ledger forwarded jobs"))?;
+            forwarded.extend(self.forwarded);
+        }
+        Ok(())
+    }
+}
+
+fn encode_owned(data: &Owned) -> io::Result<Vec<u8>> {
+    let mut json = serde_json::to_value(data)?;
+    let mut extra = AntigravityRecords::default();
+    let scopes = json["scopes"].as_array_mut().expect("serialized scopes");
+    for (index, scope) in scopes.iter_mut().enumerate() {
+        if !references_antigravity(&scope["scope"]) {
+            extra.extract(
+                scope["sessions"]
+                    .as_array_mut()
+                    .expect("serialized sessions"),
+                format!("/scopes/{index}/sessions"),
+                references_antigravity,
+            );
+        }
+    }
+    extra.extract(scopes, "/scopes".into(), |scope| {
+        references_antigravity(&scope["scope"])
+    });
+    for path in [
+        "/grants",
+        "/asking",
+        "/outcomes",
+        "/handoffs",
+        "/windows",
+        "/worker_notices/pending",
+        "/worker_notices/latest",
+    ] {
+        if let Some(records) = json.pointer_mut(path).and_then(Value::as_array_mut) {
+            extra.extract(records, path.into(), references_antigravity);
+        }
+    }
+    if let Some(jobs) = json.get_mut("forwarded").and_then(Value::as_object_mut) {
+        jobs.retain(|id, job| {
+            if references_antigravity(job) {
+                extra.forwarded.insert(id.clone(), job.take());
+                false
+            } else {
+                true
+            }
+        });
+    }
+    if !extra.arrays.is_empty() || !extra.forwarded.is_empty() {
+        json[ANTIGRAVITY] = serde_json::to_value(extra)?;
+    }
+    Ok(serde_json::to_vec(&json)?)
+}
+
+fn decode_owned(reader: impl io::Read) -> io::Result<Owned> {
+    let mut json: Value = serde_json::from_reader(reader)?;
+    if let Some(extra) = json
+        .as_object_mut()
+        .and_then(|data| data.remove(ANTIGRAVITY))
+    {
+        serde_json::from_value::<AntigravityRecords>(extra)?.restore(&mut json)?;
+    }
+    Ok(serde_json::from_value(json)?)
+}
+
 pub(crate) struct Ledger {
     failed: bool,
     path: PathBuf,
@@ -247,7 +380,7 @@ impl Ledger {
     pub(crate) fn open(dir: &Path) -> io::Result<Self> {
         let path = dir.join(LEDGER);
         let data = match File::open(&path) {
-            Ok(f) => serde_json::from_reader(BufReader::new(f))?,
+            Ok(f) => decode_owned(BufReader::new(f))?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => Owned::default(),
             Err(e) => return Err(e),
         };
@@ -371,7 +504,7 @@ impl Ledger {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp)?;
-        let bytes = serde_json::to_vec(&self.data)?;
+        let bytes = encode_owned(&self.data)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         fs::rename(tmp, &self.path)?;
@@ -488,8 +621,125 @@ mod tests {
     use super::*;
     use ox_desk_core::{
         host_protocol::{AskView, Timeline, TimelineItem},
-        runtime::{RequestId, Route},
+        modes::Level,
+        origin::{Origin, ParentRef, Relation, WorkerMode},
+        runtime::{RequestId, Route, Runtime},
     };
+    #[test]
+    fn an_old_host_can_read_and_write_the_ledger_after_antigravity_use() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = Ledger::open(tmp.path()).unwrap();
+        let scope = |runtime: Runtime| Scope {
+            project: "/project".into(),
+            route: runtime.route(None),
+        };
+        let agy = scope(Runtime::Antigravity);
+        let codex = scope(Runtime::Codex);
+        let claude = scope(Runtime::Claude);
+        let origin = Origin {
+            linked: None,
+            relation: Relation::Handoff,
+            parent: ParentRef {
+                project: agy.project.clone(),
+                scope: Some(agy.clone()),
+                session: Some("antigravity:native".into()),
+                runtime: Some(Runtime::Antigravity),
+            },
+            launch: "operator".into(),
+            by_operator: true,
+            runtime: Runtime::Codex,
+            route: codex.route.clone(),
+            mode: WorkerMode::Session,
+            job_id: 0,
+            requested: Level::Read,
+            ceiling: Level::Read,
+            source: None,
+            started: None,
+            decided: None,
+            yolo: None,
+            handoff: None,
+            requested_model: None,
+            pinned_model: None,
+        };
+        let session = |id: &str, origin| SavedSession {
+            id: id.into(),
+            title: id.into(),
+            parent: None,
+            updated_at: 42,
+            active: false,
+            origin,
+            marks: None,
+            access: None,
+        };
+        let saved = |scope: &Scope, sessions| SavedScope {
+            scope: scope.clone(),
+            sessions,
+            pending: vec![],
+        };
+        let codex_row = session("existing-codex", None);
+        let claude_row = session("existing-claude", None);
+        for state in [
+            saved(&agy, vec![session("antigravity:native", None)]),
+            saved(
+                &codex,
+                vec![
+                    session("continued", Some(origin.clone())),
+                    codex_row.clone(),
+                ],
+            ),
+            saved(&claude, vec![claude_row.clone()]),
+        ] {
+            db.update(state).unwrap();
+        }
+        db.change(|data| {
+            data.handoffs.push(HandoffRecord {
+                id: "from-antigravity".into(),
+                target: codex.clone(),
+                origin,
+                status: "failed".into(),
+                message: None,
+            });
+            for scope in [&codex, &agy, &claude] {
+                data.windows.push(Window {
+                    route: scope.route.clone(),
+                    model: None,
+                    tokens: 64_000,
+                });
+            }
+        })
+        .unwrap();
+        db.reserve(80).unwrap();
+        let initial = db.data.clone();
+        let path = tmp.path().join(LEDGER);
+        let raw = fs::read(&path).unwrap();
+        let mut legacy_json: Value = serde_json::from_slice(&raw).unwrap();
+        assert!(
+            legacy_json
+                .as_object_mut()
+                .unwrap()
+                .remove(ANTIGRAVITY)
+                .is_some()
+        );
+        assert!(!references_antigravity(&legacy_json));
+        // The old ledger deserializes exactly these fields and ignores the extension.
+        let mut legacy: Owned = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(legacy.reserved, initial.reserved);
+        assert_eq!(legacy.scopes.len(), 2);
+        assert!(legacy.scopes[0] == saved(&codex, vec![codex_row]));
+        assert!(legacy.scopes[1] == saved(&claude, vec![claude_row]));
+        assert_eq!(
+            legacy.windows,
+            [initial.windows[0].clone(), initial.windows[2].clone()]
+        );
+        assert!(legacy.handoffs.is_empty());
+        assert!(Ledger::open(tmp.path()).unwrap().data == initial);
+
+        // A write from the rolled-back binary can drop the optional metadata.
+        // The next upgrade still sees the updated legacy watermark and rows.
+        legacy.reserved += 4096;
+        fs::write(path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(Ledger::open(tmp.path()).unwrap().data == legacy);
+    }
     #[test]
     fn a_publication_at_the_exact_block_boundary_survives_host_restart() {
         let tmp = tempfile::tempdir().unwrap();

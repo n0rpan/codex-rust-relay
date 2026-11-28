@@ -670,6 +670,37 @@ impl Preferences {
                     }),
                 ))),
             )
+            .child(
+                card(
+                    "Antigravity",
+                    "Use your Google account with the official Antigravity CLI.",
+                )
+                .child(div().child(crate::kit::button(
+                    p,
+                    "antigravity-sign-in",
+                    "Sign in with Google",
+                    false,
+                    true,
+                    cx.listener(|s, _, _, cx| {
+                        let result = s.link.remote().map_or_else(
+                            || {
+                                platform::launch_login(
+                                    ox_desk_core::runtime::Runtime::Antigravity,
+                                    &s.project,
+                                )
+                            },
+                            |h| {
+                                crate::terminal::open_remote(
+                                    h.clone(),
+                                    ox_host_web::terminal_protocol::OpenTerminal::AntigravityLogin,
+                                    cx,
+                                )
+                            },
+                        );
+                        s.report(result, "Complete Antigravity sign-in in the terminal.", cx);
+                    }),
+                ))),
+            )
             .child(self.agents_card(p, cx))
             .when(self.link.remote().is_none(), |v| {
                 v.child(self.about.clone())

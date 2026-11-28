@@ -249,6 +249,8 @@ jobs:
           python3 desktop/tests/host_interruptions.py desktop/target/debug/ox-host desktop/target/debug/ox "$RUNNER_TEMP/stock/node_modules/.bin/claude"
       - name: Handoff into stock Claude Code
         run: python3 desktop/tests/host_handoff_session.py desktop/target/debug/ox-host desktop/target/debug/ox "$RUNNER_TEMP/stock/node_modules/.bin/claude"
+      - name: Hand off a plan through Antigravity ACP
+        run: python3 desktop/tests/host_antigravity_session.py desktop/target/debug/ox-host desktop/target/debug/ox
       - name: Upgrade the host in the middle of a turn
         run: python3 desktop/tests/host_upgrade_session.py desktop/target/debug/ox-host desktop/target/debug/ox "$RUNNER_TEMP/stock/node_modules/.bin/claude"
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
