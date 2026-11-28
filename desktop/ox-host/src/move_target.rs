@@ -65,11 +65,13 @@ impl VerifiedTarget {
                 "The project must be inside its transferred checkout.",
             ));
         }
-        let project = workspace
+        let mut project = workspace
             .canonicalize()?
             .join(transfer.to_string())
-            .join("1")
-            .join(relative);
+            .join("1");
+        // The web projection keys scopes by their serialized path. Keep a
+        // checkout-root move identical to the path the actor can canonicalize.
+        project.extend(relative.components());
         let route = proposal.source.scope.route.clone();
         let plan = Plan {
             id: transfer,

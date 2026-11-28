@@ -62,6 +62,7 @@ impl Engine {
                 _ => continue,
             };
             for row in rows {
+                self.stamp_moved_row(scope, row);
                 if let Some(progress) = self.move_progress(scope, &row.id)? {
                     attach_move_progress(row, progress);
                 } else if row.detail["owned"] == true

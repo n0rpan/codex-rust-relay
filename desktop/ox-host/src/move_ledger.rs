@@ -335,6 +335,23 @@ impl Ledger {
         Ok(active)
     }
 
+    pub(crate) fn unpublished_writers<'a>(
+        &'a self,
+        scope: &'a Scope,
+    ) -> impl Iterator<Item = (Uuid, &'a str)> + 'a {
+        self.data.moves.values().filter_map(move |record| {
+            if &record.plan.target_scope != scope {
+                return None;
+            }
+            match &record.phase {
+                Phase::TargetPrepared { stage } | Phase::TargetCancelled { stage: Some(stage) } => {
+                    Some((record.plan.id, stage.native.as_str()))
+                }
+                _ => None,
+            }
+        })
+    }
+
     /// Check before any route can open a native writer or execute session work.
     /// A temporary loss of disk durability must never open a second writer.
     pub(crate) fn can_write(&self, scope: &Scope, native: &str) -> bool {

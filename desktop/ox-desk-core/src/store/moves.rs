@@ -55,6 +55,16 @@ pub(super) struct History {
 }
 
 impl Store {
+    pub fn move_writer_is_unpublished(&self, thread: &str) -> bool {
+        self.unpublished_move_writers.contains(thread)
+    }
+
+    pub fn recover_prepared_move_writer(&mut self, operation: String, thread: &str) {
+        self.moving_threads.insert(thread.into());
+        self.unpublished_move_writers.insert(thread.into());
+        self.prepared_move_writers.insert(operation, thread.into());
+    }
+
     /// `Some(None)` means the full archive is already visible.
     pub fn moved_history_cursor(&self, thread: &str) -> Option<Option<usize>> {
         self.moved_history
@@ -132,6 +142,7 @@ impl Store {
         }
         self.prepared_move_writers.remove(operation);
         self.moving_threads.remove(id);
+        self.unpublished_move_writers.remove(id);
         self.changed.transcript(id);
         self.changed.mark(Changed::THREADS);
         true
@@ -164,6 +175,7 @@ impl Store {
     ) -> io::Result<()> {
         let thread = reply.thread.id.clone();
         self.moving_threads.insert(thread.clone());
+        self.unpublished_move_writers.insert(thread.clone());
         self.verify_opened(&thread, &reply)?;
         let mut row = reply.thread;
         row.model = Some(reply.model.clone());

@@ -280,12 +280,14 @@ impl Store {
             sessions: self
                 .threads()
                 .iter()
+                .filter(|row| !self.move_writer_is_unpublished(&row.id))
                 .map(|r| self.session_view(r))
                 .collect(),
             asks: self.host_asks(),
             transcripts: self
                 .transcripts
                 .iter()
+                .filter(|(id, _)| !self.move_writer_is_unpublished(id))
                 .map(|(id, t)| (id.clone(), timeline(t, self.moved_history.get(id))))
                 .collect::<BTreeMap<_, _>>(),
             detail: self.host_detail(),
@@ -357,6 +359,7 @@ impl Store {
             let sessions: Vec<_> = self
                 .threads()
                 .iter()
+                .filter(|row| !self.move_writer_is_unpublished(&row.id))
                 .map(|r| {
                     let mut row = self.session_view(r);
                     if let Some(previous) = previous_results.get(&row.id) {
@@ -371,6 +374,12 @@ impl Store {
             }
         }
         for id in changed.dirty_threads() {
+            if self.move_writer_is_unpublished(id) {
+                if state.transcripts.remove(id).is_some() {
+                    out.push(Change::Retired { thread: id.clone() });
+                }
+                continue;
+            }
             let prior = self.moved_history.get(id);
             let Some(t) = self.transcript(id) else {
                 if state.transcripts.remove(id).is_some() {

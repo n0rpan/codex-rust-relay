@@ -241,6 +241,18 @@ impl Engine {
             || live.store.changing_options(thread)
             || self.thread_busy(scope, thread)
             || active_native_descendant(&live.store, thread)
+            || self
+                .workers
+                .children_of(scope, thread)
+                .any(|(scope, child)| {
+                    self.running.contains_key(scope) && self.thread_busy(scope, child)
+                })
+            || self.running.values().any(|worker| {
+                worker.launching.as_ref().is_some_and(|start| {
+                    start.origin.parent.scope.as_ref() == Some(scope)
+                        && start.origin.parent.session.as_deref() == Some(thread)
+                })
+            })
         {
             return false;
         }
@@ -428,7 +440,12 @@ impl Engine {
         thread: &str,
     ) -> io::Result<bool> {
         let ledger = &self.source_moves.ledger;
-        if !ledger.can_write(scope, thread) {
+        if !ledger.can_write(scope, thread)
+            || self
+                .running
+                .get(scope)
+                .is_some_and(|live| live.store.move_writer_is_unpublished(thread))
+        {
             return Ok(false);
         }
         if ledger.can_start_turn(scope, thread) {
@@ -448,7 +465,12 @@ impl Engine {
 
     fn check_move_effect(&self, scope: &Scope, thread: &str, effect: Effect<'_>) -> io::Result<()> {
         let ledger = &self.source_moves.ledger;
-        if !ledger.can_write(scope, thread) {
+        if !ledger.can_write(scope, thread)
+            || self
+                .running
+                .get(scope)
+                .is_some_and(|live| live.store.move_writer_is_unpublished(thread))
+        {
             return Err(io::Error::other(
                 "This session's writer belongs to a host move.",
             ));

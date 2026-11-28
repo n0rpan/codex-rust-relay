@@ -1420,6 +1420,9 @@ impl Engine {
         if let Some(previous) = previous {
             store.recover_from(&mut previous.store);
         }
+        for (operation, native) in self.source_moves.ledger.unpublished_writers(scope) {
+            store.recover_prepared_move_writer(operation.to_string(), native);
+        }
         annotate(
             &self.host_id.to_string(),
             &self.workers,
@@ -2258,7 +2261,7 @@ impl Engine {
                 }
             }
         }
-        if changes.iter().any(|c| {
+        let save_scope = changes.iter().any(|c| {
             matches!(
                 c,
                 Change::Asks { .. }
@@ -2266,9 +2269,7 @@ impl Engine {
                     | Change::Sessions { .. }
                     | Change::Retired { .. }
             )
-        }) {
-            self.ledger.update(SavedScope::from_state(&live.state))?;
-        }
+        });
         let worker_state_changed = changes.iter().any(|c| {
             matches!(
                 c,
@@ -2280,6 +2281,10 @@ impl Engine {
             )
         });
         self.annotate_move_changes(scope, &mut changes)?;
+        if save_scope {
+            self.ledger
+                .update(SavedScope::from_state(&self.running[scope].state))?;
+        }
         self.broadcast(scope, changes)?;
         if let Some((id, frame)) = handoff {
             self.reply(id, frame)?;

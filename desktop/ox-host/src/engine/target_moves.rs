@@ -6,6 +6,7 @@ use crate::{
 };
 use ox_desk_core::{
     handoff::{HandoffSource, SourceItem},
+    host_protocol::SessionView,
     runtime::Access,
     store::{Connection, MoveWriterPreparation},
 };
@@ -16,6 +17,12 @@ use uuid::Uuid;
 pub(super) struct TargetMoves {
     warming: HashMap<Uuid, Warming>,
     pending: HashMap<Uuid, Pending>,
+    displayed: HashMap<Scope, HashMap<String, MoveDisplay>>,
+}
+
+struct MoveDisplay {
+    logical: serde_json::Value,
+    title: String,
 }
 
 struct Warming {
@@ -33,6 +40,37 @@ struct Pending {
 }
 
 impl Engine {
+    pub(super) fn stamp_moved_row(&self, scope: &Scope, row: &mut SessionView) {
+        let Some(display) = self
+            .target_moves
+            .displayed
+            .get(scope)
+            .and_then(|rows| rows.get(&row.id))
+        else {
+            return;
+        };
+        row.detail["logical_session_id"] = display.logical.clone();
+        row.detail["owned"] = serde_json::Value::Bool(true);
+        if row.detail["row"]["name"].is_null() {
+            row.title.clone_from(&display.title);
+            if let Some(runtime_row) = row.detail["row"].as_object_mut() {
+                runtime_row.insert("name".into(), serde_json::json!(display.title));
+            }
+        }
+    }
+
+    fn remember_moved_row(&mut self, scope: &Scope, row: &SessionView) {
+        self.target_moves
+            .displayed
+            .entry(scope.clone())
+            .or_default()
+            .entry(row.id.clone())
+            .or_insert_with(|| MoveDisplay {
+                logical: row.detail["logical_session_id"].clone(),
+                title: row.title.clone(),
+            });
+    }
+
     /// Load the destination's saved page into the same timeline as new turns.
     pub(super) fn load_moved_history(
         &mut self,
@@ -108,7 +146,7 @@ impl Engine {
                     &prepared.stage.native,
                 )
             });
-            let row = match restored {
+            let mut row = match restored {
                 Ok(row) => row,
                 Err(error) => {
                     eprintln!(
@@ -123,7 +161,7 @@ impl Engine {
                 .cold
                 .entry(scope.clone())
                 .or_insert_with(|| ScopeState {
-                    scope,
+                    scope: scope.clone(),
                     connection: "disconnected".into(),
                     capabilities: Vec::new(),
                     sessions: Vec::new(),
@@ -131,8 +169,17 @@ impl Engine {
                     transcripts: Default::default(),
                     detail: serde_json::json!({}),
                 });
-            state.sessions.retain(|previous| previous.id != row.id);
-            state.sessions.push(row);
+            if let Some(previous) = state
+                .sessions
+                .iter_mut()
+                .find(|previous| previous.id == row.id)
+            {
+                previous.detail["logical_session_id"] = row.detail["logical_session_id"].clone();
+                row.title.clone_from(&previous.title);
+            } else {
+                state.sessions.push(row.clone());
+            }
+            self.remember_moved_row(&scope, &row);
         }
         Ok(self)
     }
@@ -304,6 +351,7 @@ impl Engine {
         target.check_activation(&commit.prepared)?;
         let activated = self.source_moves.ledger.activate_receiver(source, commit)?;
         let row = target.catalog_row_for(&self.source_moves.ledger, &plan.target_scope, native)?;
+        self.remember_moved_row(&plan.target_scope, &row);
         let logical = &row.detail["logical_session_id"];
         let session;
         if let Some(live) = self.running.get_mut(&plan.target_scope) {
@@ -331,6 +379,8 @@ impl Engine {
         {
             session.sessions.retain(|saved| saved.id != row.id);
             session.sessions.push(row.clone());
+            self.ledger
+                .update(crate::durable::SavedScope::from_state(session))?;
             self.broadcast(&plan.target_scope, vec![Change::Session { session: row }])?;
         }
         Ok(activated)

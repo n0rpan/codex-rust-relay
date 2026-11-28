@@ -162,6 +162,23 @@ fn reservation_uses_the_receiving_hosts_route_and_project_directory() {
         plan.target_scope.project,
         state.join(transfer.to_string()).join("1/project")
     );
+    let root_transfer = Uuid::new_v4();
+    let root = Reservation {
+        transfer: root_transfer.to_string(),
+        proposal: serde_json::to_string(&Proposal {
+            project_in_checkout: Vec::new(),
+            ..proposal
+        })
+        .unwrap(),
+        ..reservation.clone()
+    };
+    let reply = dispatch(Incoming::Reserve(root)).unwrap();
+    let root_plan: Plan = serde_json::from_str(reply.as_str().unwrap()).unwrap();
+    let clean_path = state.join(root_transfer.to_string()).join("1");
+    assert_eq!(
+        root_plan.target_scope.project.as_os_str(),
+        clean_path.as_os_str()
+    );
     let other = Reservation {
         source: Uuid::new_v4().to_string(),
         ..reservation
