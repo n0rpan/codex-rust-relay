@@ -256,6 +256,9 @@ impl Store {
             }
             parent = parent.or_else(|| nest.clone());
         }
+        if let Some(attachment) = t.and_then(|t| t.memory_attachment.as_ref()) {
+            detail["memory_attachment"] = json!(attachment);
+        }
         if let Some(result) = t.and_then(|t| t.last_result.as_ref()) {
             detail["last_result"] = json!(result);
         }

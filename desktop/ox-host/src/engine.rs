@@ -3757,6 +3757,7 @@ fn restore_row(row: &mut wire::SessionView, saved: &wire::SessionView) {
         "origin",
         "worker_notice",
         "last_result",
+        "memory_attachment",
     ] {
         if row.detail[key].is_null() && !saved.detail[key].is_null() {
             row.detail[key] = saved.detail[key].clone();

@@ -1239,6 +1239,24 @@ impl Workbench {
                                         .when(status != "Connected", |view| {
                                             view.child(crate::small(p, status.clone()))
                                         })
+                                        .when_some(
+                                            self.store.as_ref().and_then(|store| {
+                                                serde_json::from_value::<
+                                                    ox_desk_core::memory::Attachment,
+                                                >(
+                                                    store
+                                                        .session_mark(
+                                                            store.selected()?,
+                                                            "memory_attachment",
+                                                        )?
+                                                        .clone(),
+                                                )
+                                                .ok()
+                                            }),
+                                            |view, attachment| {
+                                                view.child(crate::small(p, attachment.label()))
+                                            },
+                                        )
                                         .when_some(self.worker_crumb(p, cx), |view, crumb| {
                                             view.child(crumb)
                                         }),

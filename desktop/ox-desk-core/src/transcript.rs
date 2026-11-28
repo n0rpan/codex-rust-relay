@@ -62,6 +62,7 @@ pub struct Transcript {
     prepended: usize,
     pub(crate) last_finished: Option<String>,
     pub(crate) last_result: Option<SessionResult>,
+    pub(crate) memory_attachment: Option<crate::memory::Attachment>,
     /// The turn the user asked to stop, so its completion reads as stopped, not done.
     pub(crate) stop_requested: Option<String>,
     /// The last finished turn was interrupted by the user.

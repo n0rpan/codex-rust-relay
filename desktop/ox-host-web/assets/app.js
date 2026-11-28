@@ -1814,6 +1814,12 @@ function conversation() {
       $("context").append(document.createTextNode(" · "), link);
     }
   }
+  const memory = row?.detail?.memory_attachment;
+  if (Number.isSafeInteger(memory?.entries) && memory.entries > 0) {
+    const amount = memory.entries === 1 ? "1 pinned memory" : `${memory.entries} pinned memories`;
+    $("context").append(el("div", "meta", amount + (memory.from_parent_host
+      ? " attached from the parent host" : " attached at session start")));
+  }
   handoffMarks(row);
   if (
     pendingGrant?.id === id &&
