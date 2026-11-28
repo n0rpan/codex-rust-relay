@@ -77,9 +77,15 @@ impl Relay {
         command.args(mcp);
         command.args(args);
         crate::exempt_loopback_proxy(&mut command);
-        eprintln!(
-            "ox: Workers and OX Memory enabled. Ask for a second opinion or save a project preference."
-        );
+        if gateway.service.app.get().is_some() || CodeoxConfig::path(home).is_file() {
+            eprintln!(
+                "ox: API workers enabled. Ask for the ox model list or name an API model to delegate to."
+            );
+        } else {
+            eprintln!(
+                "ox: Workers and OX Memory enabled. Ask for a second opinion or save a project preference."
+            );
+        }
         tokio::select! {
             result = crate::native::launch(command) => result,
             result = gateway.serve() => Err(result),
