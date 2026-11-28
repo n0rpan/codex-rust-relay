@@ -176,6 +176,14 @@ class Host(socketserver.StreamRequestHandler):
                             "id": frame["id"],
                         }
                     )
+                    send(
+                        {
+                            "type": "discovered",
+                            "scope": f.other_scope,
+                            "rows": f.other_sessions,
+                            "id": frame["id"],
+                        }
+                    )
                     send({"type": "discovered_end", "id": frame["id"], "errors": []})
                 elif frame["type"] == "subscribe" and frame.get("scope") == f.antigravity_scope:
                     send({"type": "snapshot", "cursor": {"epoch": "fixture", "seq": 10}, "scopes": [{
@@ -831,6 +839,7 @@ def run(harness, screenshot=None):
         host.antigravity_scope = dict(host.scope, route={"runtime": "antigravity", "billing": "subscription"})
         host.antigravity_signed_in = False
         host.antigravity_session = None
+        now = int(time.time())
         Path(host.scope["project"]).mkdir()
         host.caps = ["start", "access", "model_options", "native_commands"]
         host.allow_status_ack = threading.Event()
@@ -847,7 +856,7 @@ def run(harness, screenshot=None):
                 "title": "Database connection timeouts",
                 "parent": None,
                 "status": "active",
-                "updated_at": 2,
+                "updated_at": now - 2 * 86400,
                 "capabilities": ["open", "send", "steer", "stop", "access", "model_options", "native_commands", "attach_image", "mention"],
                 "detail": {"access":"default", "options":{"model":"demo","effort":"low"}},
             },
@@ -856,7 +865,7 @@ def run(harness, screenshot=None):
                 "parent": "parent",
                 "title": "Investigate connection pool",
                 "status": "running",
-                "updated_at": 1,
+                "updated_at": now,
                 "capabilities": ["open", "steer", "stop"],
                 "detail": {"worker": True, "origin": {"relation": "worker", "job_id": 7, "ceiling": "read",
                     "requested": "read", "runtime": "claude", "mode": "session", "by_operator": False,
@@ -867,6 +876,8 @@ def run(harness, screenshot=None):
         ]
         host.sessions.append(dict(host.sessions[0], id="disk-report", title="Rust build disk usage",
                                   status="idle", updated_at=0, capabilities=["open", "send", "attach_image"], detail={"access": "default"}))
+        host.other_scope = dict(host.scope, project=str(d / "other-project"))
+        host.other_sessions = [dict(host.sessions[-1], id="another-project", title="Another project", updated_at=now - 1)]
         # A catalog longer than the viewport can inherit a conversation's deep scroll.
         saved = host.sessions[-1]
         host.sessions.extend(dict(saved, id=f"saved-{i}", title=f"Earlier session {i}",
@@ -923,9 +934,21 @@ def run(harness, screenshot=None):
         stack.callback(service.terminate)
         wait(lambda: (d / "remote-admin.sock").exists())
         js, port, base = paired_browser(d, d, stack, camera=True)
-        assert js(
-            "return !location.hash && document.cookie==='' && !!document.querySelector('.session.nested')"
-        )
+        wait(lambda: js("""return !location.hash && document.cookie==='' &&
+            document.querySelector('[data-view=recent]').ariaPressed==='true' &&
+            [...document.querySelectorAll('#list .session')].slice(0,3)
+                .map(row=>row.dataset.threadId).join(',')==='child,another-project,parent' &&
+            document.querySelector('[data-thread-id=child]').innerText.includes('Worker for Database connection timeouts') &&
+            document.querySelector('[data-thread-id=another-project]').innerText.includes('other-project') &&
+            !!document.querySelector('#list .catalog-day') &&
+            !document.querySelector('.session.nested')"""))
+        js("document.querySelector('[data-filter=active]').click();document.querySelector('[data-view=folders]').click()")
+        wait(lambda: js("""return document.querySelector('[data-view=folders]').ariaPressed==='true' &&
+            document.querySelector('[data-filter=active]').ariaPressed==='true' &&
+            !document.querySelector('[data-thread-id=another-project]')"""))
+        js("location.reload()")
+        wait(lambda: js("""return document.querySelector('[data-view=folders]').ariaPressed==='true' &&
+            !!document.querySelector('.session.nested')"""))
 
         from notification_browser import check_notification_links
         check_notification_links(js, wait, host.scope)
@@ -973,7 +996,9 @@ def run(harness, screenshot=None):
             "return document.activeElement===document.getElementById('new') && document.activeElement.matches(':focus-visible')"
         ), js("return {focused:document.activeElement.id, visible:document.activeElement.matches(':focus-visible'), catalog:!document.querySelector('#catalog').hidden}")
         assert js(
-            "return document.getElementById('new').getBoundingClientRect().height>=44 && document.documentElement.scrollWidth<=innerWidth"
+            """return document.getElementById('new').getBoundingClientRect().height>=44 &&
+            [...document.querySelectorAll('#catalog-view button')].every(b=>b.getBoundingClientRect().height>=44) &&
+            document.documentElement.scrollWidth<=innerWidth"""
         )
         if screenshot:
             s = Path(screenshot)

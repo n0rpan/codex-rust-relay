@@ -158,6 +158,47 @@ export function catalogTree(entries, catalog = entries) {
   }
   return { roots, children, links, byKey };
 }
+const recentDateFormat = new Intl.DateTimeFormat(undefined, {
+  year: "numeric",
+  month: "short",
+  day: "numeric",
+});
+/**
+ * Sort each session by its own activity, even when its parent is in another day.
+ * @template {{scope: Scope, session: {id: string, updated_at: number}}} Entry
+ * @param {Entry[]} entries
+ * @param {Date} [now]
+ */
+export function recentDays(entries, now = new Date()) {
+  const today = now.toDateString();
+  const previous = new Date(now);
+  previous.setDate(previous.getDate() - 1);
+  const yesterday = previous.toDateString();
+  const sorted = entries.map((entry) => {
+    const seconds = entry.session.updated_at;
+    const date = seconds > 0 ? new Date(seconds * 1000) : null;
+    const timestamp = date?.getTime() || 0;
+    return { entry, date, timestamp, key: sessionKey(entry.scope, entry.session.id) };
+  });
+  sorted.sort((a, b) => b.timestamp - a.timestamp || a.key.localeCompare(b.key));
+  /** @type {Map<string, {label: string, entries: Entry[]}>} */
+  const days = new Map();
+  for (const { entry, date, timestamp } of sorted) {
+    const day = timestamp && date ? date.toDateString() : "";
+    let group = days.get(day);
+    if (!group) {
+      const label =
+        day === today ? "Today"
+          : day === yesterday ? "Yesterday"
+          : day && date ? recentDateFormat.format(date)
+          : "Date unknown";
+      group = { label, entries: [] };
+      days.set(day, group);
+    }
+    group.entries.push(entry);
+  }
+  return [...days.values()];
+}
 const itemKey = (i) => JSON.stringify([i.turn, i.id]);
 const safeMap = (entries) => Object.assign(Object.create(null), entries);
 export class Projection {

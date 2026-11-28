@@ -722,6 +722,14 @@ main:has(#conversation:not([hidden])) {
   #filters [aria-pressed="true"] {
     border-bottom: 2px solid Highlight;
   }
+  #catalog-view [aria-pressed="true"] {
+    outline: 1px solid Highlight;
+    outline-offset: -1px;
+  }
+  #catalog-view button:focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+  }
   .wordmark img,
   .session:before {
     forced-color-adjust: none;
@@ -1137,15 +1145,43 @@ main:has(#conversation:not([hidden])) {
 #filters {
   border-radius: 0.8rem;
 }
+#catalog-view {
+  display: flex;
+  gap: 0.25rem;
+  margin-top: 0.55rem;
+}
+#catalog-view button {
+  padding: 0.38rem 0.9rem;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 0.65rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+#catalog-view [aria-pressed="true"] {
+  border-color: var(--line);
+  background: var(--raised);
+  color: var(--ink);
+}
+.catalog-day {
+  margin: 1.3rem 0 0.15rem;
+  color: var(--muted);
+  font: 600 0.86rem/1.4 system-ui, sans-serif;
+}
+.session .meta {
+  overflow-wrap: anywhere;
+}
 #filters {
   margin-block: 0.6rem 1.2rem;
+  flex-wrap: wrap;
   gap: 0;
   padding: 3px;
   background: var(--nav);
   border: 1px solid var(--line);
 }
 #filters button {
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 44px;
   border-radius: 0.6rem;
 }
 #filters [aria-pressed="true"] {
