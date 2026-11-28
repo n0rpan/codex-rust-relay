@@ -16,7 +16,6 @@ pub(super) struct Library {
     text: Entity<InputState>,
     filter: Entity<InputState>,
     editing: Option<MemoryEntry>,
-    pending_removal: Option<String>,
     loading: bool,
     error: Option<String>,
 }
@@ -78,7 +77,6 @@ impl Library {
             ),
             filter,
             editing: None,
-            pending_removal: None,
             loading: false,
             error: None,
         };
@@ -168,7 +166,6 @@ impl Render for Library {
             }
             matches += 1;
             let remove_id = entry.id.clone();
-            let cancel_id = entry.id.clone();
             let edit = entry.clone();
             let pin = entry.clone();
             let scope = match &entry.scope {
@@ -187,7 +184,6 @@ impl Render for Library {
             } else {
                 format!("Last saved on host {}", entry.source_host)
             };
-            let removing = self.pending_removal.as_deref() == Some(&entry.id);
             view = view.child(
                 col()
                     .p_3()
@@ -230,38 +226,13 @@ impl Render for Library {
                             .child(button(
                                 p,
                                 ("memory-forget", matches),
-                                if removing {
-                                    "Forget this memory"
-                                } else {
-                                    "Forget…"
-                                },
+                                "Forget",
                                 false,
                                 !self.loading,
                                 cx.listener(move |s, _, window, cx| {
-                                    if s.pending_removal.as_deref() == Some(&remove_id) {
-                                        s.pending_removal = None;
-                                        s.change(Change::Forget(remove_id.clone()), window, cx);
-                                    } else {
-                                        s.pending_removal = Some(remove_id.clone());
-                                        cx.notify();
-                                    }
+                                    s.change(Change::Forget(remove_id.clone()), window, cx);
                                 }),
-                            ))
-                            .when(removing, |r| {
-                                r.child(button(
-                                    p,
-                                    ("memory-keep", matches),
-                                    "Keep memory",
-                                    false,
-                                    !self.loading,
-                                    cx.listener(move |s, _, _, cx| {
-                                        if s.pending_removal.as_deref() == Some(&cancel_id) {
-                                            s.pending_removal = None;
-                                            cx.notify();
-                                        }
-                                    }),
-                                ))
-                            }),
+                            )),
                     ),
             );
         }
