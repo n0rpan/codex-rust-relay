@@ -87,8 +87,9 @@ const actualModel = (session) =>
   session?.detail?.worker_marks?.actual_model ??
   null;
 function notice(s = "") {
-  $("message").hidden = !s;
-  $("message").textContent = s;
+  const target = $("worker-sheet").open ? $("worker-message") : $("message");
+  target.hidden = !s;
+  target.textContent = s;
 }
 function closeActionMenus(except) {
   for (const menu of document.querySelectorAll(".action-menu[open]")) {
@@ -108,6 +109,7 @@ document.addEventListener("keydown", (event) => {
   }
 });
 function page(id) {
+  if (id !== "conversation") $("worker-sheet").close();
   if (id !== "catalog" && id !== "pair") notificationTarget.request(null);
   if (id !== "settings") phoneSettings?.reset?.();
   if (id !== "running") stopRunning();
@@ -848,7 +850,7 @@ function home() {
   repaint();
 }
 function open(scope, id) {
-  $("worker-form").hidden = true;
+  closeWorkerForm();
   controls.reset();
   detailLink?.close();
   selected = { scope, id, revealLatest: Boolean(id), openingResult: Boolean(id) };
@@ -2727,12 +2729,15 @@ $("worker-permission").onchange = renderWorkerPermission;
 $("open-hosts").onclick = () => phoneSettings.openHosts();
 $("worker-open-hosts").onclick = () => phoneSettings.openHosts(() => {
   page("conversation");
+  if ($("worker-form").hidden) return;
+  $("worker-sheet").showModal();
   $("worker-open-hosts").focus();
   requestWorkerHosts();
   repaint();
 }, "← Start worker");
 $("start-worker").onclick = () => {
   if (!$("worker-form").hidden) {
+    $("worker-sheet").showModal();
     $("worker-heading").focus();
     return;
   }
@@ -2757,16 +2762,24 @@ $("start-worker").onclick = () => {
   renderWorkerMode();
   renderWorkerPermission();
   $("worker-form").hidden = false;
+  $("worker-sheet").showModal();
   requestWorkerHosts();
   $("worker-heading").focus();
   loadModelChoices();
 };
 function closeWorkerForm() {
-  const form = $("worker-form");
-  const restoreFocus = form.contains(document.activeElement);
-  form.hidden = true;
+  const sheet = $("worker-sheet");
+  const restoreFocus = sheet.open;
+  sheet.close();
+  $("worker-form").hidden = true;
+  $("worker-message").hidden = true;
+  $("worker-message").textContent = "";
   if (restoreFocus) $("start-worker").focus({ preventScroll: true });
 }
+$("worker-sheet").oncancel = (event) => {
+  event.preventDefault();
+  closeWorkerForm();
+};
 $("worker-cancel").onclick = closeWorkerForm;
 $("worker-form").onsubmit = (e) => {
   e.preventDefault();

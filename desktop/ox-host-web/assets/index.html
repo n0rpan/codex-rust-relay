@@ -237,7 +237,7 @@
             >
               Session settings
             </button>
-            <button type="button" id="start-worker" class="quiet" aria-controls="worker-form" hidden>Start worker</button>
+            <button type="button" id="start-worker" class="quiet" aria-controls="worker-sheet" aria-haspopup="dialog" hidden>Start worker</button>
           </div>
           <section id="session-settings" hidden aria-label="Session settings">
             <form id="permissions-form">
@@ -274,7 +274,8 @@
           <summary>Changes &amp; plan</summary>
           <div id="review-content"></div>
         </details>
-        <form id="worker-form" class="sheet" hidden aria-label="Start worker">
+        <dialog id="worker-sheet" aria-labelledby="worker-heading">
+        <form id="worker-form" class="sheet" hidden>
           <div class="worker-sheet-body">
             <h2 class="sheet-title" id="worker-heading" tabindex="-1">Start worker</h2>
             <div id="worker-placement" hidden>
@@ -324,11 +325,13 @@
             <p id="worker-permission-note" class="note"></p>
             <p id="worker-warning" class="warning-line" hidden></p>
           </div>
+          <p id="worker-message" class="warning-line" role="status" hidden></p>
           <div class="actions worker-sheet-actions">
             <button type="button" id="worker-cancel" class="quiet">Cancel</button
             ><button class="primary" id="worker-submit">Start worker</button>
           </div>
         </form>
+        </dialog>
         <form id="handoff-form" class="sheet" hidden aria-label="Continue in another runtime">
           <h2 class="sheet-title">Continue in another runtime</h2>
           <label for="handoff-runtime">Runtime</label>

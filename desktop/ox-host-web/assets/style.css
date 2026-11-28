@@ -1667,7 +1667,7 @@ main:has(#conversation:not([hidden])) {
   color: var(--warning);
 }
 
-#worker-form,
+#worker-sheet,
 #handoff-form {
   position: fixed;
   right: 0;
@@ -1683,11 +1683,31 @@ main:has(#conversation:not([hidden])) {
   border-top: 2px solid var(--line-strong);
   box-shadow: none;
 }
+#worker-sheet {
+  top: auto;
+  width: 100%;
+  max-width: none;
+  overflow: hidden;
+  padding: 0;
+  border-inline: 0;
+  border-bottom: 0;
+  color: var(--ink);
+}
+#worker-sheet::backdrop {
+  background: color-mix(in srgb, var(--nav) 60%, transparent);
+}
 #worker-form:not([hidden]) {
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  max-height: calc(80dvh - 2px);
+  margin: 0;
   padding: 0;
+  border: 0;
+  box-shadow: none;
+}
+#worker-message {
+  margin: 0;
+  padding: 0.35rem 16px;
 }
 .worker-sheet-body {
   min-height: 0;
