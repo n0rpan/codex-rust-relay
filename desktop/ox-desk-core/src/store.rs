@@ -19,6 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod antigravity;
 pub mod claude;
 mod projection;
 pub mod replica;
@@ -204,7 +205,8 @@ impl Store {
         if let Some(remote) = self.remote() {
             return remote.await_new.is_some();
         }
-        self.opening_claude_command()
+        self.antigravity_opening()
+            || self.opening_claude_command()
             || self.pending.values().any(|(_, p)| {
                 matches!(p, Pending::Compose(compose::Operation::New(_)))
                     || matches!(p,Pending::ThreadOp(op) if op.is_fork())
@@ -363,6 +365,9 @@ impl Store {
         self.front = previous.front;
         self.catalog_revision = previous.catalog_revision + 1;
         self.query = previous.query.clone();
+        if self.is_antigravity() {
+            self.antigravity_reopen();
+        }
         if self.is_session_scoped() && self.state == Connection::Ready {
             self.reopen_claude_history();
         }
@@ -409,7 +414,9 @@ impl Store {
             .get(index)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Decision unavailable"))?;
         let answer = answer.answer.clone();
-        if matches!(self.link, Link::Claude(_)) {
+        if self.is_antigravity() {
+            self.antigravity_answer(id, answer.0)?
+        } else if matches!(self.link, Link::Claude(_)) {
             self.claude_response(id, answer.0)?
         } else {
             self.link.codex()?.answer(id.clone(), answer)?
@@ -454,6 +461,7 @@ impl Store {
             .values()
             .map(|(when, _)| *when)
             .chain(self.native_deadline())
+            .chain(self.antigravity_deadline())
             .min()
     }
 
@@ -502,6 +510,9 @@ impl Store {
         if self.remote().is_some() {
             return self.forward(crate::actions::Action::MoreThreads);
         }
+        if self.is_antigravity() {
+            return self.antigravity_list();
+        }
         if matches!(self.link, Link::Claude(_)) {
             self.claude_list();
             return Ok(());
@@ -526,6 +537,10 @@ impl Store {
 
     pub fn tick(&mut self, now: Instant) {
         if self.remote().is_some() {
+            return;
+        }
+        if self.is_antigravity() {
+            self.antigravity_tick(now);
             return;
         }
         self.refresh_native(now, false);
@@ -667,6 +682,7 @@ impl Store {
                 self.generated_title(key, name);
                 return Ok(());
             }
+            LinkEvent::Antigravity(event) => return self.antigravity_event(event),
             LinkEvent::Claude(update) => return self.claude_event(update),
             LinkEvent::SignInRequired => {
                 self.state = Connection::SignInRequired;

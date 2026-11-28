@@ -221,7 +221,8 @@ impl Store {
     }
     /// Includes the interval between accepting a send and receiving turn/started.
     pub fn has_pending_turn(&self) -> bool {
-        !self.resume_sends.is_empty()
+        self.antigravity_opening()
+            || !self.resume_sends.is_empty()
             || self.drafts.values().any(|d| d.sent.is_some())
             || self
                 .pending
@@ -250,6 +251,7 @@ impl Store {
     }
     pub(super) fn ready_to_send(&self, id: Option<&str>) -> bool {
         self.state == Connection::Ready
+            && (!self.is_antigravity() || self.antigravity_can_submit(id))
             && (!self.is_session_scoped() || self.claude_can_submit(id))
             && id.is_none_or(|thread| !self.changing_options(thread))
             && id.is_none_or(|id| {
@@ -299,7 +301,7 @@ impl Store {
             }
             return self.claude_resume_send(id, None);
         }
-        if text.trim_start().starts_with('/') {
+        if !self.is_antigravity() && text.trim_start().starts_with('/') {
             return Err(io::Error::other("Open this command in stock Codex"));
         }
         self.ended_threads.remove(id);
@@ -405,8 +407,11 @@ impl Store {
     /// through thread/inject_items before the first turn; a Claude `text`
     /// already carries its context block, so `items` must be empty there.
     pub fn start_handoff(&mut self, text: String, items: Vec<serde_json::Value>) -> io::Result<()> {
-        if self.is_session_scoped() && !items.is_empty() {
+        if (self.is_session_scoped() || self.is_antigravity()) && !items.is_empty() {
             return Err(io::Error::other("This runtime has no history injection"));
+        }
+        if self.is_antigravity() {
+            return self.antigravity_handoff(text);
         }
         self.handoff_items = (!items.is_empty()).then_some(items);
         self.claude_handoff = self.is_session_scoped();
@@ -425,6 +430,9 @@ impl Store {
             && self.can_resume_send(thread)
         {
             return self.resume_and_send(thread);
+        }
+        if self.is_antigravity() {
+            return self.antigravity_submit(id);
         }
         if self.is_session_scoped() {
             return self.claude_submit(id, None);
@@ -610,6 +618,9 @@ impl Store {
         if self.remote().is_some() {
             return self.forward(crate::actions::Action::Stop(id.into()));
         }
+        if self.is_antigravity() {
+            return self.antigravity_stop(id);
+        }
         if self.is_session_scoped() {
             return self.claude_stop(id);
         }
@@ -640,6 +651,9 @@ impl Store {
     pub fn end_session(&mut self, id: &str) -> io::Result<()> {
         if self.remote().is_some() {
             return self.forward(crate::actions::Action::EndSession(id.into()));
+        }
+        if self.is_antigravity() {
+            return self.antigravity_end(id);
         }
         if self.is_session_scoped() {
             self.claude_end(id)?;
@@ -698,6 +712,9 @@ impl Store {
     pub fn live_threads(&self) -> Vec<String> {
         if self.remote().is_some() {
             return vec![];
+        }
+        if self.is_antigravity() {
+            return self.antigravity_live();
         }
         if self.is_session_scoped() {
             return self.claude_live();
@@ -763,7 +780,7 @@ impl Store {
         if let Some(access) = access {
             self.resume_access.insert(id.into(), access);
         }
-        if !self.is_session_scoped() && self.catalog.get(id).is_none() {
+        if !self.is_session_scoped() && !self.is_antigravity() && self.catalog.get(id).is_none() {
             self.catalog.insert(crate::codex::history::ThreadRow {
                 worker: false,
                 parent_thread_id: None,
@@ -797,6 +814,9 @@ impl Store {
     pub fn has_live_session(&self, id: &str) -> bool {
         if self.remote().is_some() {
             return false;
+        }
+        if self.is_antigravity() {
+            return self.antigravity_has_live(id);
         }
         if self.is_session_scoped() {
             return self.claude_has_live(id);

@@ -244,6 +244,7 @@ impl WorkerStart {
         let runtime = match runtime {
             "codex" => Runtime::Codex,
             "claude" => Runtime::Claude,
+            "antigravity" => Runtime::Antigravity,
             _ => return Some(Err(usage.into())),
         };
         let mut task = words.next().unwrap_or("").trim_start();
@@ -288,6 +289,11 @@ impl WorkerStart {
     }
     /// The checks the standalone OX gateway applies, shared by every launcher.
     pub fn validate(&self) -> Result<(), String> {
+        if !self.runtime.supports_workers() {
+            return Err(
+                "Antigravity sessions start from the composer or an operator handoff.".into(),
+            );
+        }
         if self
             .host
             .as_ref()

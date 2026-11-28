@@ -53,7 +53,7 @@ impl Store {
                 .unwrap_or(&self.profile.route)
                 .clone();
         }
-        if self.is_session_scoped() {
+        if self.is_session_scoped() || self.is_antigravity() {
             return self.profile.route.clone();
         }
         let Billing::Api(alias) = &self.profile.route.billing else {
@@ -129,6 +129,9 @@ impl Store {
             return r.changing.contains(id)
                 || r.unconfirmed_options.values().any(|thread| thread == id);
         }
+        if self.is_antigravity() {
+            return self.antigravity_configuring(id);
+        }
         self.pending
             .values()
             .any(|(_, p)| matches!(p,Pending::Options(owner,_) if owner==id))
@@ -146,6 +149,9 @@ impl Store {
             || owner.is_some_and(|id| self.changing_options(id))
         {
             return Err(io::Error::other("Wait for the pending thread settings."));
+        }
+        if self.is_antigravity() {
+            return self.antigravity_choose(owner, choice);
         }
         if self.is_session_scoped() {
             return self.claude_choose(owner, choice);

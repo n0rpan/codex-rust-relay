@@ -165,6 +165,9 @@ impl Store {
                 "Reconnect to open this thread",
             ));
         }
+        if self.is_antigravity() {
+            return self.antigravity_open(id);
+        }
         if self.is_session_scoped() {
             return self.claude_open_alias(id, confirm_alias);
         }

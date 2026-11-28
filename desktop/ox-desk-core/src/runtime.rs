@@ -8,19 +8,28 @@ pub enum Runtime {
     #[default]
     Codex,
     Claude,
+    Antigravity,
 }
 
 impl Runtime {
+    pub const ALL: [Self; 3] = [Self::Codex, Self::Claude, Self::Antigravity];
+
     pub fn routes(aliases: &[String]) -> impl Iterator<Item = Route> + '_ {
-        [Self::Codex, Self::Claude]
-            .into_iter()
-            .flat_map(move |runtime| {
-                std::iter::once(runtime.route(None)).chain(
-                    aliases
-                        .iter()
-                        .map(move |alias| runtime.route(Some(alias.clone()))),
-                )
-            })
+        Self::ALL.into_iter().flat_map(move |runtime| {
+            let aliases = if runtime.supports_api() { aliases } else { &[] };
+            std::iter::once(runtime.route(None)).chain(
+                aliases
+                    .iter()
+                    .map(move |alias| runtime.route(Some(alias.clone()))),
+            )
+        })
+    }
+    pub fn supports_api(self) -> bool {
+        self != Self::Antigravity
+    }
+    /// Antigravity's native account integration is for interactive work initiated by a user.
+    pub fn supports_workers(self) -> bool {
+        self != Self::Antigravity
     }
     pub fn route(self, alias: Option<String>) -> Route {
         Route {
@@ -32,24 +41,28 @@ impl Runtime {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Antigravity => "agy",
         }
     }
     pub fn account(self) -> &'static str {
         match self {
             Self::Codex => "ChatGPT",
             Self::Claude => "Claude",
+            Self::Antigravity => "Google",
         }
     }
     pub fn install_guide(self) -> &'static str {
         match self {
             Self::Codex => "https://developers.openai.com/codex/cli/",
             Self::Claude => "https://code.claude.com/docs/en/setup",
+            Self::Antigravity => "https://antigravity.google/docs/cli/",
         }
     }
     pub fn name(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
             Self::Claude => "Claude Code",
+            Self::Antigravity => "Antigravity",
         }
     }
 }
@@ -99,8 +112,10 @@ impl Route {
         match (&self.billing, self.runtime) {
             (Billing::Subscription, Runtime::Codex) => "ChatGPT subscription".into(),
             (Billing::Subscription, Runtime::Claude) => "Claude subscription".into(),
+            (Billing::Subscription, Runtime::Antigravity) => "Google Antigravity".into(),
             (Billing::Api(alias), Runtime::Codex) => format!("OX API · {alias}"),
             (Billing::Api(alias), Runtime::Claude) => format!("Claude Code · OX API · {alias}"),
+            (Billing::Api(_), Runtime::Antigravity) => "Antigravity · unsupported route".into(),
         }
     }
 }
@@ -145,6 +160,7 @@ impl Access {
                 Self::Plan,
                 Self::BypassPermissions,
             ],
+            Runtime::Antigravity => &[Self::Default, Self::Plan, Self::AcceptEdits, Self::Yolo],
         }
     }
     pub fn bypasses_permissions(self) -> bool {
@@ -167,10 +183,10 @@ impl Access {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Default => "Use Claude Code’s default permission prompts.",
+            Self::Default => "Use the agent’s default permission prompts.",
             Self::Auto => "Let Claude Code’s classifier review tool actions before they run.",
-            Self::AcceptEdits => "Let Claude Code apply edits without asking about each edit.",
-            Self::Plan => "Let Claude Code explore and plan before making changes.",
+            Self::AcceptEdits => "Let the agent apply edits without asking about each edit.",
+            Self::Plan => "Let the agent explore and plan before making changes.",
             Self::BypassPermissions => "Run Claude Code tools without permission prompts.",
             Self::ReadOnly => "Read files. Ask before writing or running outside the sandbox.",
             Self::Workspace => "Edit the workspace. Ask you before leaving the sandbox.",
@@ -183,6 +199,9 @@ impl Access {
 
 /// Stock CLI arguments, with the verified provider and native session identity.
 pub fn terminal_args(route: &Route, provider: &str, thread: Option<&str>) -> Vec<String> {
+    if route.runtime == Runtime::Antigravity {
+        return vec![route.runtime.executable().into()];
+    }
     if route.runtime == Runtime::Claude {
         let mut args = vec!["claude".into()];
         match &route.billing {
@@ -201,4 +220,20 @@ pub fn terminal_args(route: &Route, provider: &str, thread: Option<&str>) -> Vec
         args.extend(["resume".into(), "--".into(), id.into()]);
     }
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn antigravity_has_one_native_account_route() {
+        let routes: Vec<_> = Runtime::routes(&["test/model".into()]).collect();
+        assert_eq!(routes.len(), 5);
+        assert_eq!(routes[4], Runtime::Antigravity.route(None));
+        assert_eq!(
+            serde_json::to_value(Runtime::Antigravity).unwrap(),
+            "antigravity"
+        );
+    }
 }

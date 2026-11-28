@@ -66,6 +66,15 @@ impl Store {
         {
             return Ok(());
         }
+        if self.is_antigravity() {
+            let filter = query.to_lowercase();
+            for row in self.antigravity_catalog()? {
+                if row.title().to_lowercase().contains(&filter) {
+                    self.palette_search.rows.insert(row);
+                }
+            }
+            return Ok(());
+        }
         if self.is_session_scoped() {
             let rows = self.claude_palette(query);
             for row in rows {

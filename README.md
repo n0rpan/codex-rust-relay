@@ -1,8 +1,8 @@
 # OX
 
-**Run stock Codex and Claude Code side by side, on your subscriptions or any model API, from your desk or your phone.**
+**Run Codex, Claude Code, and Antigravity from your desk or phone. Continue a plan across runtimes when you’re ready to switch.**
 
-OX does not replace either client. It starts the official `codex` and `claude` CLIs, points them at the billing route you pick, and keeps their sessions running in a small per-user host so you can close the window, follow a turn from your phone, and pick it up again. Plain `codex` and `claude` keep working exactly as before.
+OX starts the official CLIs on a per-user host so you can close the window, follow a turn from your phone, and pick it up again. Codex and Claude Code use your subscription or an OX API route. Antigravity uses the Google account signed in on the host.
 
 ## Install and first run
 
@@ -15,15 +15,16 @@ curl -fsSL https://raw.githubusercontent.com/oxstack/ox/main/install.sh | sh -s 
 cd ~/Work/my-project && ox desktop .
 ```
 
-OX Desktop opens on the project folder you pass (launched from the application menu it opens your home directory and offers **Choose project folder…**). On first launch it checks which official CLI is installed and signed in, and starts on that one. OX runs the official `codex` and `claude` CLIs on your computer, also for API models, so install at least one:
+OX Desktop opens on the project folder you pass. If launched from the application menu, it opens your home directory and offers **Choose project folder…**. Install the official CLI for the route you want to use.
 
 | You have | Install the CLI | Then |
 | --- | --- | --- |
 | ChatGPT plan | `npm install -g @openai/codex@latest` (Codex 0.171.0 or later; the same command upgrades it) | `codex login`, or **Sign in** in the app |
 | Claude plan | `curl -fsSL https://claude.ai/install.sh \| bash` (Claude Code 2.1.331 or later; `claude update` upgrades it) | `claude`, then `/login`, or **Sign in** in the app |
-| Any model through an API key | One of the two CLIs above | `ox setup` (Anthropic, OpenAI, OpenRouter or a local server), then pick the model in OX |
+| Google account | [Antigravity CLI](https://antigravity.google/docs/cli/) 1.5.15 or later | `agy acp --login`, or **Sign in** in the app |
+| Any model through an API key | Codex or Claude Code | `ox setup` (Anthropic, OpenAI, OpenRouter or a local server), then pick the model in OX |
 
-The desktop can install or update Codex for you from its first-run card, and links to the Claude Code guide. If a CLI is missing or signed out, the card also lets you switch to the other one or add an API provider. Details: [Codex](https://developers.openai.com/codex/cli/), [Claude Code](https://code.claude.com/docs/en/quickstart).
+The first-run card can install or update Codex and links to setup for Claude Code and Antigravity. You can switch to an installed runtime or add an API provider.
 
 ### macOS notes
 
@@ -35,7 +36,7 @@ The same installer adds **OX Desktop** to your application launcher. It runs on 
 
 ### First session
 
-1. **Connect.** The first-run card has a Codex, Claude Code and API key switch. It checks again by itself while you install or sign in. Later, choose the runtime and billing route in the header. To add an API model, open **Settings → Accounts → Configure provider**, or run `ox setup`. A saved provider becomes the active route. Run `ox help settings` for the desktop and phone screens, file paths and checks.
+1. **Connect.** Choose Codex, Claude Code, Antigravity or an API key on the first-run card. It checks again while you install or sign in. Later, choose the runtime and billing route in the header. To add an API model, open **Settings → Accounts → Configure provider**, or run `ox setup`. A saved provider becomes the active route. Run `ox help settings` for the desktop and phone screens, file paths and checks.
 2. **Send a prompt.** Choose **New session**, type, press Enter. Existing Codex and Claude Code sessions from your terminal appear in the sidebar.
 3. **Keep it running.** Run `ox host install` so the session host starts at login. Close the window during a turn; reopen it and the turn is still there.
 4. **Check the setup.** `ox host doctor` checks the host, Tailscale Serve, paired devices and the stock client versions, and names the fix for anything that blocks.
@@ -43,11 +44,11 @@ The same installer adds **OX Desktop** to your application launcher. It runs on 
 ## What OX is
 
 - **The relay (`ox`).** One small binary between the stock clients and your model provider. Add a provider key once and both clients get the same models, picker and web search. Any model in either client: a Claude model in Codex, a GPT model in Claude Code, OpenRouter or a self-hosted model in both. [Relay and CLI](docs/relay.md)
-- **OX Desktop (`ox-desktop`).** A native Linux and macOS workbench for Codex and Claude Code sessions across projects and billing routes: ChatGPT or Claude subscription, or an OX API alias. [Desktop guide](desktop/README.md)
+- **OX Desktop (`ox-desktop`).** A native Linux and macOS workbench for Codex, Claude Code and Antigravity sessions across projects and billing routes. [Desktop guide](desktop/README.md)
 - **The session host (`ox-host`).** A per-user background process that owns every session, its approvals and its workers. Closing the desktop does not stop a turn. It starts on demand, or at login with `ox host install`. [Host design](docs/design/desktop/host-notes.md)
 - **The phone.** A web app served by the host over your private Tailscale network. Pair it with a QR code, then follow turns, answer approvals and questions, start sessions and get notifications. Nothing is exposed to the internet: OX refuses Tailscale Funnel.
 - **Workers.** A session can start a background Codex goal, Claude Code workflow or plain session as a separate job, on an API model or a subscription. Workers appear under their parent on both screens. Without the session host, workers start read-only unless the main agent asks for write, and classifier or YOLO workers are refused.
-- **Handoffs.** Continue a conversation in another runtime, billing route, model or paired host. Use **Continue in…** to choose a checkout, or type `/handoff @studio claude:<alias> …`. The new session receives selected messages. While the desktop that made a cross-host handoff is connected to both hosts, the session can use `read_ox_thread` to read earlier messages from the source.
+- **Handoffs.** Continue a conversation in another runtime, billing route, model or paired host. Use **Continue in…** to choose where it goes, or type `/handoff antigravity --mode plan Review this approach`. The new session receives selected messages and the latest visible plan. [Handoff setup](docs/configuration.md#continue-a-session-in-another-runtime-route-or-model)
 - **One mode model.** Every permission preset maps to one of four levels: read (Codex Read only, Claude Plan), write (Workspace, Accept edits), classifier (Auto-review, Auto) and YOLO (YOLO, bypass permissions). Workers and handoffs start at their source's level or lower. Agents can lower a child's mode but never raise it. An agent-launched worker inherits a verified YOLO parent without another prompt. Explicit YOLO requests and handoffs use the operator confirmation or a stored grant. [Mode model](docs/design/desktop/host-notes.md#permission-modes-for-workers-and-handoffs)
 
 ### Pair a phone

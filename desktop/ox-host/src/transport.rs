@@ -1,6 +1,6 @@
 //! A slow subscriber can reconnect from its cursor. It never blocks another client or a runtime.
 use crate::engine::Message;
-use ox_desk_core::host_protocol::{Client, Server};
+use ox_desk_core::host_protocol::{Client, Server, supports_route};
 use std::{
     io::{self, BufRead, BufReader, BufWriter, Read, Write},
     net::Shutdown,
@@ -22,6 +22,37 @@ pub(crate) fn encode(frame: &Server) -> io::Result<Packet> {
     let mut bytes = serde_json::to_vec(frame)?;
     bytes.push(b'\n');
     Ok(bytes.into())
+}
+
+pub(crate) fn encode_for(mut frame: Server, version: u32) -> io::Result<Option<Packet>> {
+    match &mut frame {
+        Server::Hello { routes, .. } => routes.retain(|route| supports_route(version, route)),
+        Server::Snapshot { scopes, .. } => {
+            scopes.retain(|state| supports_route(version, &state.scope.route));
+        }
+        Server::DiscoveredEnd {
+            directory: Some(directory),
+            ..
+        } => {
+            directory
+                .routes
+                .retain(|route| supports_route(version, route));
+        }
+        Server::Processes { processes, .. } => {
+            processes.retain(|process| supports_route(version, &process.scope.route));
+        }
+        Server::Opened { scope, .. }
+        | Server::Discovered { scope, .. }
+        | Server::Delta { scope, .. }
+        | Server::TerminalPreview { scope, .. }
+        | Server::Handoff { scope, .. }
+            if !supports_route(version, &scope.route) =>
+        {
+            return Ok(None);
+        }
+        _ => (),
+    }
+    encode(&frame).map(Some)
 }
 
 pub(crate) struct Peer {
@@ -176,6 +207,10 @@ pub(crate) fn test_peer() -> (Peer, mpsc::Receiver<Packet>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ox_desk_core::{
+        host_protocol::{Cursor, ProjectDirectory, Scope, ScopeState},
+        runtime::{Route, Runtime},
+    };
 
     #[test]
     fn a_subscriber_that_never_reads_is_evicted_at_the_frame_limit() {
@@ -185,5 +220,76 @@ mod tests {
             assert!(peer.send_for(packet.clone(), "test"));
         }
         assert!(!peer.send_for(packet, "test"), "frame 257 evicts");
+    }
+
+    #[test]
+    fn v1_replies_omit_antigravity_routes_and_scopes() {
+        let codex = Route::CODEX_SUBSCRIPTION;
+        let antigravity = Runtime::Antigravity.route(None);
+        let cursor = Cursor {
+            epoch: "boot".into(),
+            seq: 0,
+        };
+        let scope = |route| Scope {
+            project: "/project".into(),
+            route,
+        };
+        let state = |route| ScopeState {
+            scope: scope(route),
+            connection: "ready".into(),
+            capabilities: vec![],
+            sessions: vec![],
+            asks: vec![],
+            transcripts: Default::default(),
+            detail: serde_json::Value::Null,
+        };
+        let routes = vec![codex.clone(), antigravity.clone()];
+        let reply = |frame, version| {
+            let packet = encode_for(frame, version).unwrap().unwrap();
+            serde_json::from_slice::<Server>(&packet).unwrap()
+        };
+
+        let hello = Server::Hello {
+            version: 1,
+            capabilities: vec![],
+            routes: routes.clone(),
+            projects: vec![],
+            host: None,
+        };
+        assert!(
+            matches!(reply(hello, 1), Server::Hello { routes, .. } if routes == [codex.clone()])
+        );
+
+        let snapshot = Server::Snapshot {
+            cursor: cursor.clone(),
+            scopes: routes.iter().cloned().map(state).collect(),
+        };
+        assert!(
+            matches!(reply(snapshot.clone(), 1), Server::Snapshot { scopes, .. }
+            if scopes.len() == 1 && scopes[0].scope.route == codex)
+        );
+        assert!(matches!(reply(snapshot, 2), Server::Snapshot { scopes, .. }
+            if scopes.len() == 2 && scopes[1].scope.route == antigravity));
+
+        let directory = Server::DiscoveredEnd {
+            id: "directory".into(),
+            errors: vec![],
+            directory: Some(ProjectDirectory {
+                checkouts: vec![],
+                routes,
+            }),
+        };
+        assert!(
+            matches!(reply(directory, 1), Server::DiscoveredEnd { directory: Some(directory), .. }
+            if directory.routes == [codex])
+        );
+
+        let delta = Server::Delta {
+            cursor,
+            scope: scope(antigravity),
+            changes: vec![],
+        };
+        assert!(encode_for(delta.clone(), 1).unwrap().is_none());
+        assert!(encode_for(delta, 2).unwrap().is_some());
     }
 }

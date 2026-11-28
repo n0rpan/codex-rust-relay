@@ -373,7 +373,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
           [
             "Models & accounts",
             [
-              ["Accounts", "ChatGPT, Claude Code & agent start modes", accounts],
+              ["Accounts", "ChatGPT, Claude Code, Antigravity and agent start modes", accounts],
               ["Starred models", "Browse catalog, star & reorder models", favorites],
               ["Providers & models", "API endpoints & static models", providers],
               ["API keys", "Manage & copy provider credentials", credentials],
@@ -475,14 +475,16 @@ export function setupSettings({ request, open, close, notifications, login }) {
           "To sign in from this phone, enable terminal access for this device in OX Desktop → Settings → Remote access.",
         ),
       );
-    for (const [runtime, name, account, cmd] of [
+    for (const [runtime, name, identity, account, cmd] of [
       [
         "codex",
         "Codex · ChatGPT",
+        "ChatGPT",
         snapshot.chatgpt_account,
         "ox login chatgpt --device-auth",
       ],
-      ["claude", "Claude Code", snapshot.claude_account, "ox login claude"],
+      ["claude", "Claude Code", "Claude", snapshot.claude_account, "ox login claude"],
+      ["antigravity", "Antigravity", "Google", "Uses the Antigravity CLI’s Google sign-in.", "agy acp --login"],
     ]) {
       const detail = node("div", undefined, "phone-settings-card");
       detail.append(
@@ -497,7 +499,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
         ),
       );
       const launch = action(
-        "Sign in with " + (runtime === "codex" ? "ChatGPT" : "Claude"),
+        "Sign in with " + identity,
         () => login(runtime),
       );
       launch.disabled = !granted;
@@ -558,10 +560,17 @@ export function setupSettings({ request, open, close, notifications, login }) {
       ["Auto-review", "auto_review"],
       ["YOLO", "yolo"],
     ]);
+    choice("New Antigravity sessions", "antigravity_start", [
+      terminal,
+      ["Ask before edits", "default"],
+      ["Accept edits", "accept_edits"],
+      ["Plan mode", "plan"],
+      ["YOLO", "yolo"],
+    ]);
     form.append(
       node(
         "p",
-        "Same as terminal starts a new session the way claude or codex starts in your terminal, with your own Claude Code and Codex settings.",
+        "Same as terminal uses the agent’s own permissions.",
       ),
     );
     choice("Worker requests", "worker_approvals", [

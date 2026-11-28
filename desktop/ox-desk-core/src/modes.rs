@@ -4,12 +4,12 @@
 //! permissive. An agent can lower that level and never raise it. YOLO and bypass
 //! always need a person: an explicit acceptance or a grant on an ancestor.
 //!
-//! | Level        | Codex       | Claude Code              |
-//! | ------------ | ----------- | ------------------------ |
-//! | `read`       | Read only   | Plan (Default also reads) |
-//! | `write`      | Workspace   | Accept edits             |
-//! | `classifier` | Auto-review | Auto                     |
-//! | `yolo`       | YOLO        | bypass permissions       |
+//! | Level        | Codex       | Claude Code              | Antigravity              |
+//! | ------------ | ----------- | ------------------------ | ------------------------ |
+//! | `read`       | Read only   | Plan (Default also reads) | Plan (Default also reads) |
+//! | `write`      | Workspace   | Accept edits             | Accept edits             |
+//! | `classifier` | Auto-review | Auto                     |                          |
+//! | `yolo`       | YOLO        | bypass permissions       | skip tool permissions    |
 //!
 //! A preset of the other runtime, or no confirmed preset, is unverified and
 //! grants nothing. A Codex thread shown as `Configured` still has a ceiling
@@ -43,12 +43,20 @@ impl Level {
             (Runtime::Codex, Access::Workspace) => Self::Write,
             (Runtime::Codex, Access::AutoReview) => Self::Classifier,
             (Runtime::Codex, Access::Yolo) => Self::Yolo,
-            (Runtime::Claude, Access::Plan | Access::Default) => Self::Read,
-            (Runtime::Claude, Access::AcceptEdits) => Self::Write,
+            (Runtime::Claude | Runtime::Antigravity, Access::Plan | Access::Default) => Self::Read,
+            (Runtime::Claude | Runtime::Antigravity, Access::AcceptEdits) => Self::Write,
             (Runtime::Claude, Access::Auto) => Self::Classifier,
             (Runtime::Claude, Access::BypassPermissions) => Self::Yolo,
+            (Runtime::Antigravity, Access::Yolo) => Self::Yolo,
             _ => return None,
         })
+    }
+    /// Map a level to the closest supported preset at or below it.
+    pub fn for_runtime(self, runtime: Runtime) -> Self {
+        match (runtime, self) {
+            (Runtime::Antigravity, Self::Classifier) => Self::Write,
+            _ => self,
+        }
     }
     /// The preset a child of this level starts in on `runtime`.
     pub fn preset(self, runtime: Runtime) -> Access {
@@ -61,6 +69,9 @@ impl Level {
             (Runtime::Claude, Self::Write) => Access::AcceptEdits,
             (Runtime::Claude, Self::Classifier) => Access::Auto,
             (Runtime::Claude, Self::Yolo) => Access::BypassPermissions,
+            (Runtime::Antigravity, Self::Read) => Access::Plan,
+            (Runtime::Antigravity, Self::Yolo) => Access::Yolo,
+            (Runtime::Antigravity, _) => Access::AcceptEdits,
         }
     }
     /// Whether a native preset stays within this level. Unverified presets never do.
@@ -156,7 +167,7 @@ pub enum Decision {
     Lowered,
     /// An operator chose this level in a client sheet.
     Operator,
-    /// The operator answered a YOLO acceptance with the highest non-YOLO level.
+    /// Use the highest available level allowed under the request or runtime.
     Capped,
 }
 
@@ -188,6 +199,21 @@ pub struct Resolved {
     pub decision: Decision,
 }
 
+impl Resolved {
+    pub fn new(level: Level, runtime: Runtime, decision: Decision) -> Self {
+        let supported = level.for_runtime(runtime);
+        Self {
+            level: supported,
+            access: supported.preset(runtime),
+            decision: if supported == level {
+                decision
+            } else {
+                Decision::Capped
+            },
+        }
+    }
+}
+
 /// Resolve an agent's request against the source's level. Refuses an
 /// unverified source and any request above it before anything starts.
 pub fn resolve(
@@ -209,11 +235,7 @@ pub fn resolve(
         ModeRequest::Level(l) if l == ceiling => (l, Decision::Inherited),
         ModeRequest::Level(l) => (l, Decision::Lowered),
     };
-    Ok(Resolved {
-        level,
-        access: level.preset(target),
-        decision,
-    })
+    Ok(Resolved::new(level, target, decision))
 }
 
 /// Resolve an operator's choice. A person may raise as well as lower; YOLO
@@ -225,15 +247,15 @@ pub fn resolve_operator(
 ) -> Result<Resolved, String> {
     match request {
         ModeRequest::Inherit => resolve(source, request, target),
-        ModeRequest::Level(level) => Ok(Resolved {
+        ModeRequest::Level(level) => Ok(Resolved::new(
             level,
-            access: level.preset(target),
-            decision: if Some(level) == source {
+            target,
+            if Some(level) == source {
                 Decision::Inherited
             } else {
                 Decision::Operator
             },
-        }),
+        )),
     }
 }
 
@@ -273,7 +295,7 @@ mod tests {
             Access::ReadOnly
         );
         // Every preset of each runtime is at or below its own level and no other.
-        for runtime in [Codex, Claude] {
+        for runtime in Runtime::ALL {
             for access in Access::choices(runtime) {
                 let level = Level::of(runtime, *access).expect("every choice is verified");
                 for other in Level::ALL {
@@ -282,6 +304,24 @@ mod tests {
                 assert!(Level::of(runtime, level.preset(runtime)) == Some(level));
             }
         }
+    }
+
+    #[test]
+    fn antigravity_starts_only_in_its_supported_modes() {
+        let runtime = Runtime::Antigravity;
+        let plan = resolve(Some(Level::Read), ModeRequest::Inherit, runtime).unwrap();
+        assert_eq!(plan.access, Access::Plan);
+        let capped = resolve(Some(Level::Classifier), ModeRequest::Inherit, runtime).unwrap();
+        assert_eq!(capped.level, Level::Write);
+        assert_eq!(capped.access, Access::AcceptEdits);
+        assert_eq!(capped.decision, Decision::Capped);
+        assert!(!capped.level.needs_person());
+        let yolo = resolve_operator(None, ModeRequest::Level(Level::Yolo), runtime).unwrap();
+        assert_eq!(yolo.level, Level::Yolo);
+        assert_eq!(yolo.access, Access::Yolo);
+        assert!(yolo.level.needs_person());
+        assert!(Level::of(runtime, Access::BypassPermissions).is_none());
+        assert!(resolve(Some(Level::Read), ModeRequest::Level(Level::Write), runtime).is_err());
     }
 
     #[test]
