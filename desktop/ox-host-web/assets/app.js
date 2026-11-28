@@ -1865,9 +1865,14 @@ function conversation() {
   }
   if (id && detailLink?.ready && timeline?.detail?.ready && !document.hidden) {
     const result = sessionResult(s?.sessions.find((session) => session.id === id));
-    if (result && (selected.openingResult || pinnedBottom) &&
+    const thread = keyOf(scope, id);
+    if (result && !timeline.detail.active && seenResults.get(thread) !== result.turn &&
         (timeline.detail.last_finished === result.turn || tail?.turn === result.turn)) {
-      seeResult(keyOf(scope, id), result.turn);
+      const last = $("timeline").lastElementChild?.getBoundingClientRect();
+      const visible = last &&
+        last.bottom > document.querySelector(".conversation-nav").getBoundingClientRect().bottom &&
+        last.top < Math.min(innerHeight, $("composer").getBoundingClientRect().top);
+      if (selected.openingResult || visible) seeResult(thread, result.turn);
     }
     selected.openingResult = false;
   }
