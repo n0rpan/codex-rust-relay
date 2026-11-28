@@ -1,0 +1,37 @@
+# Verify a local app with OX Browser
+
+Run this on the host serving your development app. OX installs its browser component on request and uses an existing Chrome or Chromium executable when available. If the host needs Chrome for Testing, OX downloads it during installation. Linux ARM64 requires a system Chromium installation. You can choose an installed executable with `OX_BROWSER_EXECUTABLE=/absolute/path/to/chromium`.
+
+```sh
+ox browser install
+ox browser open http://localhost:3000
+ox browser preview
+ox browser snapshot
+```
+
+Open the printed preview link in your browser to watch the same page the agent is using. Snapshots identify controls with references such as `@e1`. Use the references from your own snapshot for the next action.
+
+For integrations, `ox browser preview` prints one loopback URL on success. Exit status 2 means the component needs installation. Status 3 means there's no connected browser for the current session.
+
+```sh
+ox browser fill @e1 'Issue title'
+ox browser click @e2
+ox browser snapshot
+ox browser screenshot verified.png
+ox browser close
+```
+
+Take another snapshot after the page changes. For scripts use `ox browser snapshot --json`. Pass `--session NAME` before each command to run two independent browser sessions in the same Git worktree. Within the same worktree and session name, commands from its subdirectories use the same browser. Outside Git, use the same directory throughout.
+
+`ox browser open` starts the session. If the browser has closed, run it again before asking for a snapshot, interaction, or screenshot.
+
+This workflow supports HTTP and HTTPS on `localhost`, `127.0.0.1`, and `[::1]`. The browser's network scope is those hosts on any port, so a local app can talk to another local service. Each session uses a fresh browser profile. A session closes after ten minutes without browser activity or when you run `ox browser close`. The preview listens on the local host and can accept input.
+
+## Check the verification flow
+
+The opt-in fixture serves a local issue tracker, checks form validation, submits a repair, and verifies the saved record, isolation, preview, screenshot, and close/reopen behavior.
+
+```sh
+cargo build --locked
+python3 tests/fixtures/browser_verification.py target/debug/ox --artifacts /tmp/ox-browser-results
+```
