@@ -406,6 +406,8 @@ pub enum Change {
         thread: String,
         title: String,
         event: NotificationKind,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        goal_reached: bool,
     },
     Session {
         session: SessionView,
@@ -453,6 +455,47 @@ pub enum NotificationKind {
     Failed,
     Approval,
     Question,
+}
+
+#[cfg(test)]
+#[test]
+fn goal_reached_is_additive_to_the_v1_finished_notification() {
+    #[derive(Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum LegacyChange {
+        Notification {
+            thread: String,
+            title: String,
+            event: NotificationKind,
+        },
+    }
+    let legacy = serde_json::json!({"kind":"notification","thread":"t","title":"Example","event":"finished"});
+    let parsed: Change = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(matches!(
+        parsed,
+        Change::Notification {
+            goal_reached: false,
+            ..
+        }
+    ));
+    assert_eq!(serde_json::to_value(parsed).unwrap(), legacy);
+    let next = serde_json::to_value(Change::Notification {
+        thread: "t".into(),
+        title: "Example".into(),
+        event: NotificationKind::Finished,
+        goal_reached: true,
+    })
+    .unwrap();
+    assert_eq!(next["goal_reached"], true);
+    let LegacyChange::Notification {
+        thread,
+        title,
+        event,
+    } = serde_json::from_value(next).unwrap();
+    assert_eq!(
+        (thread.as_str(), title.as_str(), event),
+        ("t", "Example", NotificationKind::Finished)
+    );
 }
 
 use std::io::{self, BufRead as _};

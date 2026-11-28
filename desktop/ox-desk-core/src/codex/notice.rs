@@ -73,6 +73,11 @@ pub enum Notification {
         thread: String,
         settings: EffectiveSettings,
     },
+    Goal {
+        thread: String,
+        turn: Option<String>,
+        complete: bool,
+    },
     Resolved(RequestId),
     Diff {
         thread: String,
@@ -132,6 +137,16 @@ impl Notification {
             Notice::ThreadSettings => Self::Settings {
                 thread: take(&mut p, "threadId")?,
                 settings: EffectiveSettings::decode(&p["threadSettings"]),
+            },
+            Notice::GoalUpdated => Self::Goal {
+                thread: take(&mut p, "threadId")?,
+                turn: take(&mut p, "turnId")?,
+                complete: take::<String>(&mut p["goal"], "status")? == "complete",
+            },
+            Notice::GoalCleared => Self::Goal {
+                thread: take(&mut p, "threadId")?,
+                turn: None,
+                complete: false,
             },
             Notice::Resolved => Self::Resolved(take(&mut p, "requestId")?),
             Notice::Diff => Self::Diff {

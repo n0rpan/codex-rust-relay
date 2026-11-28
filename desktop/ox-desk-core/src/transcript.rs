@@ -60,6 +60,8 @@ pub struct Transcript {
     // Number of history rows inserted at the front, used to preserve the viewport.
     prepended: usize,
     pub(crate) last_finished: Option<String>,
+    goal_complete: bool,
+    goal_reached_turn: Option<String>,
     /// The turn the user asked to stop, so its completion reads as stopped, not done.
     pub(crate) stop_requested: Option<String>,
     /// The last finished turn was interrupted by the user.
@@ -287,6 +289,19 @@ impl Transcript {
     }
     pub fn active_turn(&self) -> Option<&str> {
         self.active_turn.as_deref()
+    }
+    pub(crate) fn update_goal(&mut self, turn: Option<String>, complete: bool) {
+        // Resuming a thread also sends a turn-less snapshot of its current goal.
+        // It establishes the baseline without announcing a historical result.
+        if complete && !self.goal_complete && turn.is_some() {
+            self.goal_reached_turn = turn;
+        }
+        self.goal_complete = complete;
+    }
+    pub(crate) fn finished_goal(&self) -> bool {
+        !self.interrupted
+            && self.goal_reached_turn.is_some()
+            && self.goal_reached_turn == self.last_finished
     }
 
     pub(crate) fn take_remeasure(&mut self) -> Vec<usize> {
