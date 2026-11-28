@@ -914,16 +914,30 @@ def run(harness, screenshot=None):
             document.querySelector('#timeline').innerText.includes('A short reply') &&
             scrollY===0"""))
         report["detail"]["last_result"] = {"turn": "short-result", "completed_at": now + 1, "outcome": "completed"}
-        delta = {"type": "delta", "scope": host.scope, "cursor": {"epoch": "fixture", "seq": 100},
-                 "changes": [{"kind": "session", "session": report}]}
-        with WRITE:
-            for connection in list(host.connections):
-                try:
-                    connection.sendall(json.dumps(delta).encode() + b"\n")
-                except OSError:
-                    continue
+        def publish_result(sequence, extra=()):
+            delta = {"type": "delta", "scope": host.scope, "cursor": {"epoch": "fixture", "seq": sequence},
+                     "changes": [{"kind": "session", "session": report}, *extra]}
+            with WRITE:
+                for connection in list(host.connections):
+                    try:
+                        connection.sendall(json.dumps(delta).encode() + b"\n")
+                    except OSError:
+                        continue
+
+        publish_result(100)
         wait(lambda: js("""return scrollY===0 &&
             Object.values(JSON.parse(localStorage.getItem('ox-phone-seen-results-v1') || '{}')).includes('short-result')"""))
+        # A result that arrives below the viewport is unread until the user scrolls to it.
+        report["detail"]["last_result"] = {"turn": "later-result", "completed_at": now + 2, "outcome": "completed"}
+        messages = [dict(report_items[-1], id=f"later-{i}", turn="later-result", text=f"Later reply {i}")
+                    for i in range(25)]
+        publish_result(101, [{"kind": "transcript", "thread": "disk-report",
+                              "timeline": {"items": messages, "detail": {"ready": True}}}])
+        wait(lambda: js("""return document.querySelector('#timeline').innerText.includes('Later reply 24') &&
+            scrollY===0 && !Object.values(JSON.parse(localStorage.getItem('ox-phone-seen-results-v1') || '{}')).includes('later-result')"""))
+        js("scrollTo(0, document.documentElement.scrollHeight)")
+        wait(lambda: js("""return Object.values(JSON.parse(
+            localStorage.getItem('ox-phone-seen-results-v1') || '{}')).includes('later-result')"""))
         del report["detail"]["last_result"]
         host.report_items = report_items
         js("location.reload()")
