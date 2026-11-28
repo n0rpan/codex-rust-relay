@@ -242,6 +242,19 @@ def worker_links(js, wait, state, source, restart, harness, source_env):
     wait(lambda: js("""const host=document.querySelector('#settings .phone-settings-host-open');
         return host?.href===new URL(arguments[0]).origin+'/' && host.target==='_blank' &&
             host.rel.includes('noopener') && document.getElementById('settings').innerText.includes('Pair this phone there');""", invite))
+    click("← Sessions")
+    js("""window.fixtureFetch=window.fetch;
+        window.fetch=(url,...options)=>String(url).endsWith('/api/settings')
+            ? Promise.reject(new TypeError('Host unavailable'))
+            : window.fixtureFetch(url,...options);""")
+    try:
+        js("document.getElementById('open-hosts').click()")
+        wait(lambda: js("""const host=document.querySelector('#settings .phone-settings-host-open');
+            return host?.href===new URL(arguments[0]).origin+'/' &&
+                document.getElementById('settings').innerText.includes('Saved address');""", invite))
+    finally:
+        js("window.fetch=window.fixtureFetch;delete window.fixtureFetch;")
+    click("Retry host list")
     click("Manage worker hosts")
     wait(lambda: js("return document.querySelector('#settings .back').textContent==='← Hosts'"))
     report = admin(state, {"type": "status"})

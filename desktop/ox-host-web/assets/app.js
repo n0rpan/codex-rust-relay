@@ -17,7 +17,7 @@ import { pairingCode, setupCamera } from "./pair-camera.js";
 import { ActivityLine } from "./activity.js";
 import * as wire from "./wire.js";
 import { SessionControls } from "./controls.js";
-import { setupSettings } from "./settings.js";
+import { forgetKnownHosts, setupSettings } from "./settings.js";
 import {
   scopeKey,
   Projection,
@@ -2923,6 +2923,7 @@ async function registerNotifications(explicit) {
 }
 $("notifications").onclick = () => registerNotifications(true);
 function pairingPage() {
+  if (!key) forgetKnownHosts();
   page("pair");
   net("Pair device");
   const scanned = Boolean(code);

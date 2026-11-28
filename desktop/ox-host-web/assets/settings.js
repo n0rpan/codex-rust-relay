@@ -165,6 +165,19 @@ function registeredHostOrigin(value) {
   return null;
 }
 
+const knownHostsKey = "ox-phone-known-hosts-v1";
+export function forgetKnownHosts() {
+  try { localStorage.removeItem(knownHostsKey); } catch {}
+}
+function knownHostAddresses() {
+  try {
+    const hosts = JSON.parse(localStorage.getItem(knownHostsKey) || "[]");
+    return hosts.filter((host) => typeof host.name === "string" && registeredHostOrigin(host.origin));
+  } catch {
+    return [];
+  }
+}
+
 export function setupSettings({ request, open, close, pushStatus, enablePush, login, hostName }) {
   const panel = node("section");
   panel.id = "settings";
@@ -1227,19 +1240,29 @@ export function setupSettings({ request, open, close, pushStatus, enablePush, lo
     current.append(node("h2", hostName()), node("p", "Current host"));
     body.append(current);
     status.textContent = "Loading linked hosts…";
-    const links = await readPage(id, { action: "worker_links" });
-    if (!links) {
-      if (id === pageId && !panel.hidden)
-        body.append(action("Retry host list", show, "quiet"));
-      return;
+    let peers;
+    let offline = false;
+    try {
+      const links = await request({ action: "worker_links" });
+      if (id !== pageId || panel.hidden) return;
+      peers = [
+        ...(links.hosts || []).map((host) => [host, "Linked for workers"]),
+        ...(links.available || []).map((host) => [host, "Worker link not enabled"]),
+      ];
+      try {
+        localStorage.setItem(knownHostsKey, JSON.stringify(peers
+          .map(([{ name, origin }]) => ({ name, origin }))
+          .filter((host) => registeredHostOrigin(host.origin))));
+      } catch {}
+    } catch (error) {
+      offline = true;
+      if (error.status === 403) forgetKnownHosts();
+      peers = knownHostAddresses().map((host) => [host, "Saved address"]);
     }
-    status.textContent = "";
-    const peers = [
-      ...(links.hosts || []).map((host) => [host, "Linked for workers"]),
-      ...(links.available || []).map((host) => [host, "Worker link not enabled"]),
-    ];
-    if (!peers.length) body.append(node("p", "No worker destinations are linked."));
-    else body.append(node("p", "Open another host to view its sessions. Pair this phone there if asked."));
+    if (id !== pageId || panel.hidden) return;
+    status.textContent = offline ? "Couldn’t refresh the host list." : "";
+    if (peers.length) body.append(node("p", "Open another host to view its sessions. Pair this phone there if asked."));
+    else if (!offline) body.append(node("p", "No worker destinations are linked."));
     for (const [host, state] of peers) {
       const card = node("div", undefined, "phone-settings-card");
       card.append(node("h2", host.name), node("p", state));
@@ -1254,7 +1277,9 @@ export function setupSettings({ request, open, close, pushStatus, enablePush, lo
       }
       body.append(card);
     }
-    body.append(action("Manage worker hosts", () => workerLinks(show, "← Hosts")));
+    body.append(offline
+      ? action("Retry host list", show, "quiet")
+      : action("Manage worker hosts", () => workerLinks(show, "← Hosts")));
   }
   async function workerLinks(back = remote, backLabel) {
     const show = () => workerLinks(back, backLabel);
