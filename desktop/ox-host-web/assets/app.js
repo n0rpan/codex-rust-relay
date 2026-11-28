@@ -173,6 +173,7 @@ const SEEN_RESULTS_KEY = "ox-phone-seen-results-v1";
 const RESULT_LABEL = { completed: "Turn done", failed: "Failed", stopped: "Stopped" };
 const RESULT_PREVIEW_COUNT = 4;
 const seenResults = new Map();
+let pendingVisibleResult = null;
 try {
   const saved = JSON.parse(localStorage.getItem(SEEN_RESULTS_KEY) || "{}");
   for (const [thread, turn] of Object.entries(saved))
@@ -185,6 +186,18 @@ function seeResult(thread, turn) {
   try {
     localStorage.setItem(SEEN_RESULTS_KEY, JSON.stringify(Object.fromEntries(seenResults)));
   } catch {}
+}
+
+function seeVisibleResult() {
+  if (!pendingVisibleResult || !detailLink?.ready || document.hidden || $("conversation").hidden)
+    return;
+  const { thread, turn, row } = pendingVisibleResult;
+  const bounds = row.getBoundingClientRect();
+  if (bounds.bottom > document.querySelector(".conversation-nav").getBoundingClientRect().bottom &&
+      bounds.top < Math.min(innerHeight, $("composer").getBoundingClientRect().top)) {
+    pendingVisibleResult = null;
+    seeResult(thread, turn);
+  }
 }
 
 const ACCENT_COLORS = ["cobalt", "amber", "emerald", "coral", "violet", "cyan"];
@@ -240,10 +253,14 @@ const phoneSettings = setupSettings({
   hostName: connectedHostName,
   open: () => page("settings"),
   close: home,
-  notifications: () => {
-    home();
-    $("notification-setup").open = true;
-    $("notification-summary").focus();
+  pushStatus: () => {
+    const blocked = pushBlockReason();
+    return { blocked, granted: !blocked && Notification.permission === "granted" };
+  },
+  enablePush: async () => {
+    const enabled = await notifications(key, true);
+    if (enabled) $("notification-banner").hidden = true;
+    return enabled;
   },
   login: async (runtime) => {
     return openPhoneTerminal(
@@ -795,6 +812,7 @@ function open(scope, id) {
   controls.reset();
   detailLink?.close();
   selected = { scope, id, revealLatest: Boolean(id), openingResult: Boolean(id) };
+  pendingVisibleResult = null;
   setComposerOwner(keyOf(scope, id), repaint, notice);
   pendingNew = null;
   visibleRows = 200;
@@ -1618,6 +1636,7 @@ const jumpLatest = (() => {
     );
   };
   addEventListener("scroll", sync, { passive: true });
+  addEventListener("scroll", seeVisibleResult, { passive: true });
   return {
     pinned: () => scrollY > 2 && gap() < 80,
     reset() {
@@ -1874,11 +1893,18 @@ function conversation() {
       }
     }
   }
+  pendingVisibleResult = null;
   if (id && detailLink?.ready && timeline?.detail?.ready && !document.hidden) {
     const result = sessionResult(s?.sessions.find((session) => session.id === id));
-    if (result && (selected.openingResult || pinnedBottom) &&
+    const thread = keyOf(scope, id);
+    if (result && !timeline.detail.active && seenResults.get(thread) !== result.turn &&
         (timeline.detail.last_finished === result.turn || tail?.turn === result.turn)) {
-      seeResult(keyOf(scope, id), result.turn);
+      const row = $("timeline").lastElementChild;
+      if (selected.openingResult) seeResult(thread, result.turn);
+      else if (row) {
+        pendingVisibleResult = { thread, turn: result.turn, row };
+        seeVisibleResult();
+      }
     }
     selected.openingResult = false;
   }
@@ -2832,42 +2858,40 @@ function setAlertsDismissed(on) {
     // Private windows may refuse storage; the banner then simply returns.
   }
 }
+function pushBlockReason() {
+  const supportsPush =
+    "serviceWorker" in navigator &&
+    "Notification" in window &&
+    "PushManager" in window;
+  if (ios && !standalone)
+    return "On iPhone, tap Share → Add to Home Screen in Safari. Turn on Open as Web App if shown. Open OX from its icon, scan a fresh pairing QR, then enable notifications there.";
+  if (!supportsPush)
+    return "This browser cannot receive session notifications. On iPhone, use the Home Screen app on iOS 16.4 or later.";
+  if (Notification.permission === "denied")
+    return ios
+      ? "Notifications are off. In iPhone Settings → Notifications, choose the name of this web app and turn on Allow Notifications. Then return to OX."
+      : "Allow notifications for this site in your browser settings, then return to OX.";
+  return null;
+}
 function notificationSetup(justPaired) {
   if (justPaired) {
     setAlertsDismissed(false);
     $("notification-setup").open = true;
   }
-  const supportsPush =
-    "serviceWorker" in navigator &&
-    "Notification" in window &&
-    "PushManager" in window;
-  if (ios && !standalone) {
-    notificationGuide(
-      "On iPhone, tap Share → Add to Home Screen in Safari. Turn on Open as Web App if shown. Open OX from its icon, scan a fresh pairing QR, then enable notifications there.",
-    );
-  } else if (!supportsPush) {
-    notificationGuide(
-      "This browser cannot receive session notifications. On iPhone, use the Home Screen app on iOS 16.4 or later.",
-    );
-  } else if (Notification.permission === "denied") {
-    notificationGuide(
-      ios
-        ? "Notifications are off. In iPhone Settings → Notifications, choose the name of this web app and turn on Allow Notifications. Then return to OX."
-        : "Allow notifications for this site in your browser settings, then return to OX.",
-    );
-  } else {
+  const blocked = pushBlockReason();
+  if (blocked) notificationGuide(blocked);
+  else {
     notificationGuide(
       "Get alerts when a session needs approval or an answer, finishes a turn, or fails. Tap Enable notifications, then Allow.",
       "Enable notifications",
     );
     if (Notification.permission === "granted") registerNotifications(false);
   }
-  // One-time banner until alerts are on or the user dismisses it; then it lives in the menu.
+  // One-time setup banner. Preferences are always in the Sessions menu.
   const granted =
     "Notification" in window && Notification.permission === "granted";
   const dismissed = alertsDismissed();
   $("notification-banner").hidden = granted || dismissed;
-  $("open-notifications").hidden = granted || !dismissed;
 }
 $("notification-dismiss").onclick = () => {
   setAlertsDismissed(true);
@@ -2875,9 +2899,7 @@ $("notification-dismiss").onclick = () => {
 };
 $("open-notifications").onclick = () => {
   closeActionMenus();
-  setAlertsDismissed(false);
-  notificationSetup(false);
-  $("notification-setup").open = true;
+  phoneSettings.openNotifications();
 };
 let registering = false;
 async function registerNotifications(explicit) {

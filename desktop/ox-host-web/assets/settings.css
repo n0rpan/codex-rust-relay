@@ -127,6 +127,64 @@
   outline: 2px solid var(--amber);
   outline-offset: 3px;
 }
+.phone-push-permission {
+  border-radius: 0.75rem;
+}
+.phone-push-permission button {
+  margin-top: 0.6rem;
+}
+.phone-notification-events {
+  display: grid;
+  gap: 0.35rem;
+  min-inline-size: 0;
+  margin: 0.35rem 0 0;
+  padding: 0;
+  border: 0;
+}
+.phone-notification-events legend {
+  padding: 0 0 0.35rem;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+.phone-notification-feedback {
+  min-height: 1.5em;
+}
+.phone-notification-switch {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+  text-align: start;
+  border: 1px solid var(--line);
+  border-radius: 0.65rem;
+  background: var(--panel);
+}
+.phone-notification-switch[aria-disabled="true"] {
+  cursor: progress;
+}
+.phone-notification-switch::after {
+  content: "";
+  flex: 0 0 2.35rem;
+  height: 1.4rem;
+  border: 1px solid var(--muted);
+  border-radius: 1rem;
+  background: radial-gradient(circle at 0.7rem center, var(--muted) 0.33rem, transparent 0.36rem);
+}
+.phone-notification-switch[aria-checked="true"]::after {
+  border-color: var(--accent);
+  background: radial-gradient(circle at 1.65rem center, var(--on-accent) 0.33rem, transparent 0.36rem) var(--accent);
+}
+@media (forced-colors: active) {
+  .phone-notification-switch[aria-checked]::after {
+    content: "Off";
+    background: none;
+    text-align: center;
+  }
+  .phone-notification-switch[aria-checked="true"]::after {
+    content: "On";
+  }
+}
 .phone-settings-actions,
 .phone-settings-confirm {
   display: flex;

@@ -910,6 +910,43 @@ def run(harness, screenshot=None):
             !document.querySelector('[data-thread-id=disk-report] .result-badge')"""))
         del report["detail"]["last_result"]
 
+        # A short reply can already be in view when the result arrives, with no scroll offset.
+        report_items = host.report_items
+        host.report_items = [dict(report_items[-1], turn="short-result", text="A short reply")]
+        js("document.querySelector('[data-thread-id=disk-report]').click()")
+        wait(lambda: js("""return !document.querySelector('#conversation').hidden &&
+            document.querySelector('#timeline').innerText.includes('A short reply') &&
+            scrollY===0"""))
+        report["detail"]["last_result"] = {"turn": "short-result", "completed_at": now + 1, "outcome": "completed"}
+        def publish_result(sequence, extra=()):
+            delta = {"type": "delta", "scope": host.scope, "cursor": {"epoch": "fixture", "seq": sequence},
+                     "changes": [{"kind": "session", "session": report}, *extra]}
+            with WRITE:
+                for connection in list(host.connections):
+                    try:
+                        connection.sendall(json.dumps(delta).encode() + b"\n")
+                    except OSError:
+                        continue
+
+        publish_result(100)
+        wait(lambda: js("""return scrollY===0 &&
+            Object.values(JSON.parse(localStorage.getItem('ox-phone-seen-results-v1') || '{}')).includes('short-result')"""))
+        # A result that arrives below the viewport is unread until the user scrolls to it.
+        report["detail"]["last_result"] = {"turn": "later-result", "completed_at": now + 2, "outcome": "completed"}
+        messages = [dict(report_items[-1], id=f"later-{i}", turn="later-result", text=f"Later reply {i}")
+                    for i in range(25)]
+        publish_result(101, [{"kind": "transcript", "thread": "disk-report",
+                              "timeline": {"items": messages, "detail": {"ready": True}}}])
+        wait(lambda: js("""return document.querySelector('#timeline').innerText.includes('Later reply 24') &&
+            scrollY===0 && !Object.values(JSON.parse(localStorage.getItem('ox-phone-seen-results-v1') || '{}')).includes('later-result')"""))
+        js("scrollTo(0, document.documentElement.scrollHeight)")
+        wait(lambda: js("""return Object.values(JSON.parse(
+            localStorage.getItem('ox-phone-seen-results-v1') || '{}')).includes('later-result')"""))
+        del report["detail"]["last_result"]
+        host.report_items = report_items
+        js("location.reload()")
+        wait(lambda: js("return !!document.querySelector('[data-thread-id=disk-report]')"))
+
         from notification_browser import check_notification_links
         check_notification_links(js, wait, host.scope)
         from operator_browser import check_terminal

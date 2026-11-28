@@ -30,6 +30,7 @@ enum Page {
     Accounts,
     Advanced,
     Behavior,
+    Notifications,
     Providers,
     Search,
     Favorites,
@@ -415,6 +416,7 @@ impl Preferences {
             | Page::Remote
             | Page::Accounts
             | Page::Behavior
+            | Page::Notifications
             | Page::Advanced
             | Page::Sessions => {
                 return String::new();
@@ -1211,6 +1213,7 @@ impl Preferences {
             (Page::Search, "Web search"),
             (Page::Favorites, "Starred models"),
             (Page::Behavior, "Appearance & input"),
+            (Page::Notifications, "Notifications"),
             (Page::Sessions, "Sessions"),
             (Page::Legacy, "Legacy Codex provider"),
             (Page::Advanced, "Advanced configuration"),
@@ -1263,6 +1266,7 @@ impl Preferences {
                 Page::Accounts => self.account_view(p, cx),
                 Page::Advanced => self.advanced_page(p, cx),
                 Page::Behavior => self.behavior_page(p, cx),
+                Page::Notifications => self.notification_page(p, cx),
                 Page::Sessions => self.sessions_page(p, cx),
                 Page::Providers => self.providers_view(p, cx),
                 Page::Credentials => self.credentials_view(p, cx),

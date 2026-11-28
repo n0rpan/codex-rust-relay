@@ -166,6 +166,7 @@ impl HostLink {
                                             thread,
                                             title,
                                             event,
+                                            goal_reached,
                                         } => emit(CatalogEvent::Notice(
                                             crate::app::notifications::Notice {
                                                 host_name: host_name.clone(),
@@ -174,6 +175,7 @@ impl HostLink {
                                                 thread,
                                                 title,
                                                 kind: event,
+                                                goal_reached,
                                             },
                                         ))?,
                                         Change::Sessions { sessions } => {

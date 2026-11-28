@@ -55,7 +55,7 @@ The same installer adds **OX Desktop** to your application launcher. It runs on 
 1. Install Tailscale on the computer and the phone and sign in to the same tailnet with MagicDNS and HTTPS enabled.
 2. On the computer, open **Settings → Remote access → Enable Tailscale Serve**, then **Pair a device**.
 3. On the phone, open the HTTPS address shown, add it to the Home Screen (iPhone: Safari → Share → Add to Home Screen), open it from the icon, tap **Scan pairing QR** and scan the computer's screen.
-4. Turn on **Session notifications** for approvals, questions and finished turns.
+4. Open **Settings → Notifications** on the phone to enable push and choose which session events send alerts.
 
 [Phone setup in detail](desktop/README.md#keep-sessions-running-and-pair-a-phone)
 

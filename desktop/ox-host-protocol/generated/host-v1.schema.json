@@ -745,6 +745,9 @@
             "event": {
               "$ref": "#/$defs/NotificationKind"
             },
+            "goal_reached": {
+              "type": "boolean"
+            },
             "kind": {
               "const": "notification",
               "type": "string"
