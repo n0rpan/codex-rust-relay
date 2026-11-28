@@ -422,6 +422,11 @@ impl Ledger {
         })
     }
 
+    pub(crate) fn source_status(&self, plan: &Plan) -> io::Result<Status> {
+        self.check_hosts(plan, self.data.host, plan.target_host)?;
+        Ok(self.require(plan)?.status())
+    }
+
     fn record_source(&mut self, plan: &Plan, phase: Phase) -> io::Result<Status> {
         self.check_hosts(plan, self.data.host, plan.target_host)?;
         if let Some(record) = self.record(plan)? {

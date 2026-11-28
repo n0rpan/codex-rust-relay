@@ -6941,7 +6941,7 @@ mod tests {
         #[test]
         fn a_staged_source_move_waits_for_the_native_release_before_commit() {
             use crate::{
-                move_bundle::Bundle,
+                move_bundle::{Bundle, Presentation},
                 move_ledger::{ArchivePin, Ledger, Status},
                 move_target::{Files, VerifiedTarget},
             };
@@ -6986,9 +6986,18 @@ mod tests {
                 Status::Preparing
             );
             assert!(engine.running[&scope].store.has_live_session(&lead));
+            let presentation = Presentation::from(
+                engine.running[&scope]
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|row| row.id == lead)
+                    .unwrap(),
+            );
             let bundle = Bundle::capture(
                 root.path(),
                 &plan,
+                presentation,
                 engine.move_source_timeline(&plan).unwrap(),
             )
             .unwrap();

@@ -3,7 +3,7 @@ use crate::{
     move_archive::{Archive, checksum},
     move_ledger::Plan,
 };
-use ox_desk_core::host_protocol::Timeline;
+use ox_desk_core::host_protocol::{SessionResult, SessionView, Timeline};
 use ox_host_service::checkout::Snapshot;
 use ox_host_web::move_manifest::{CHECKOUT, FileSpec, Manifest, PLAN, TRANSCRIPT};
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,25 @@ const MANIFEST: &str = "manifest.json";
 pub(crate) struct BundlePlan {
     pub(crate) plan: Plan,
     pub(crate) checkout_commit: String,
+    pub(crate) presentation: Presentation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Presentation {
+    pub(crate) title: String,
+    pub(crate) updated_at: i64,
+    pub(crate) last_result: Option<SessionResult>,
+}
+
+impl From<&SessionView> for Presentation {
+    fn from(session: &SessionView) -> Self {
+        Self {
+            title: session.title.chars().take(192).collect(),
+            updated_at: session.updated_at,
+            last_result: session.last_result(),
+        }
+    }
 }
 
 pub(crate) struct Bundle {
@@ -31,7 +50,12 @@ pub(crate) struct Bundle {
 }
 
 impl Bundle {
-    pub(crate) fn capture(staging: &Path, plan: &Plan, timeline: &Timeline) -> io::Result<Self> {
+    pub(crate) fn capture(
+        staging: &Path,
+        plan: &Plan,
+        presentation: Presentation,
+        timeline: &Timeline,
+    ) -> io::Result<Self> {
         let spool = staging.join(OUTGOING);
         match DirBuilder::new().mode(0o700).create(&spool) {
             Ok(()) => File::open(staging)?.sync_all()?,
@@ -84,6 +108,7 @@ impl Bundle {
         let plan = serde_json::to_vec(&BundlePlan {
             plan: plan.clone(),
             checkout_commit: snapshot.commit.clone(),
+            presentation,
         })?;
         let mut file = File::create_new(stage.path().join(PLAN))?;
         file.write_all(&plan)?;

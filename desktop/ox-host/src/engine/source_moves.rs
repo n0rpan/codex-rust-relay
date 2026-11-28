@@ -131,7 +131,7 @@ impl Engine {
     }
 
     pub(super) fn move_source_timeline(&self, plan: &Plan) -> io::Result<&Timeline> {
-        if self.source_moves.ledger.status(plan.id)? != Some(Status::Preparing) {
+        if self.source_moves.ledger.source_status(plan)? != Status::Preparing {
             return Err(io::Error::other("The session is not ready to move."));
         }
         if !self.move_source_quiescent(plan) {

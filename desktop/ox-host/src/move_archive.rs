@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn the_completed_move_retains_history_and_working_files_without_the_source() {
         use crate::{
-            move_bundle::Bundle,
+            move_bundle::{Bundle, Presentation},
             move_target::{Files, VerifiedTarget},
         };
         use ox_host_web::move_manifest::TRANSCRIPT;
@@ -268,11 +268,17 @@ mod tests {
         let mut source = Ledger::open(laptop.path(), plan.source.host).unwrap();
         let mut receiver = Ledger::open(studio.path(), plan.target_host).unwrap();
         source.prepare_source(plan).unwrap();
-        let original_manifest = Bundle::capture(laptop.path(), plan, &timeline)
-            .unwrap()
-            .manifest;
+        let presentation = Presentation {
+            title: "Review the release plan".into(),
+            updated_at: 42,
+            last_result: None,
+        };
+        let original_manifest =
+            Bundle::capture(laptop.path(), plan, presentation.clone(), &timeline)
+                .unwrap()
+                .manifest;
         std::fs::write(plan.source.scope.project.join("tracked"), "later edit").unwrap();
-        let bundle = Bundle::capture(laptop.path(), plan, &timeline).unwrap();
+        let bundle = Bundle::capture(laptop.path(), plan, presentation.clone(), &timeline).unwrap();
         assert_eq!(bundle.manifest, original_manifest);
         let manifest_sha256 = bundle.manifest.sha256().unwrap();
         let files = || Files {
@@ -319,6 +325,12 @@ mod tests {
         let receiver = Ledger::open(studio.path(), plan.target_host).unwrap();
         assert!(receiver.can_write(&plan.target_scope, "target-thread"));
         let target = VerifiedTarget::load(&jobs, plan).unwrap();
+        assert_eq!(
+            target
+                .presentation_for(&receiver, &plan.target_scope, "target-thread")
+                .unwrap(),
+            &presentation
+        );
         assert!(
             target
                 .history_for(&receiver, &plan.target_scope, "another-thread")

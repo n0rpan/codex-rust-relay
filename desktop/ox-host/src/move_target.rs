@@ -1,7 +1,7 @@
 //! Destination-owned checkout and transcript, verified before fencing the source.
 use crate::{
     move_archive::Archive,
-    move_bundle::{BundlePlan, verified_file},
+    move_bundle::{BundlePlan, Presentation, verified_file},
     move_ledger::{Ledger, Plan, Prepared, Stage},
 };
 use ox_desk_core::host_protocol::Scope;
@@ -169,6 +169,21 @@ impl VerifiedTarget {
         scope: &Scope,
         native: &str,
     ) -> io::Result<Archive> {
+        self.verify_owner(ledger, scope, native)?;
+        self.history()
+    }
+
+    pub(crate) fn presentation_for(
+        &self,
+        ledger: &Ledger,
+        scope: &Scope,
+        native: &str,
+    ) -> io::Result<&Presentation> {
+        self.verify_owner(ledger, scope, native)?;
+        Ok(&self.saved.bundle.presentation)
+    }
+
+    fn verify_owner(&self, ledger: &Ledger, scope: &Scope, native: &str) -> io::Result<()> {
         let plan = &self.saved.bundle.plan;
         let allowed = ledger.owner(plan.session)?.is_some_and(|owner| {
             owner.host == plan.target_host
@@ -185,7 +200,7 @@ impl VerifiedTarget {
                 "The move history belongs to another session or has not arrived.",
             ));
         }
-        self.history()
+        Ok(())
     }
 
     /// Call after reserving an idle native session in the verified checkout.
