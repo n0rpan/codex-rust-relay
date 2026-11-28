@@ -13,10 +13,35 @@ fn parse_port(endpoint: &str) -> Option<u16> {
     port.parse::<u16>().ok().filter(|port| *port != 0)
 }
 
+fn command(project: &Path, label: &str) -> Command {
+    let mut command = Command::new(super::ox());
+    command
+        .args(["browser", "--session", label])
+        .current_dir(project);
+    command
+}
+
+pub(crate) fn open(project: &Path, label: &str, url: &str) -> Result<(), String> {
+    let output = command(project, label)
+        .args(["open", url])
+        .output()
+        .map_err(|error| format!("Could not open the local browser. {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let error = String::from_utf8_lossy(&output.stderr);
+    Err(error
+        .lines()
+        .next()
+        .map(|line| line.strip_prefix("ox: ").unwrap_or(line))
+        .filter(|line| !line.is_empty())
+        .map(|line| line.chars().take(200).collect())
+        .unwrap_or_else(|| "Could not open the local browser.".into()))
+}
+
 pub(crate) fn preview_port(project: &Path, label: &str) -> Result<u16, String> {
-    let output = Command::new(super::ox())
-        .args(["browser", "--session", label, "preview"])
-        .current_dir(project)
+    let output = command(project, label)
+        .arg("preview")
         .output()
         .map_err(|error| format!("Could not find OX’s browser component: {error}"))?;
     match output.status.code() {
@@ -25,7 +50,9 @@ pub(crate) fn preview_port(project: &Path, label: &str) -> Result<u16, String> {
             .and_then(parse_port)
             .ok_or_else(|| "OX returned an invalid local browser address.".to_owned()),
         Some(2) => Err("Install the browser component with ox browser install.".into()),
-        Some(3) => Err("Open this session’s browser and try again.".into()),
+        Some(3) => {
+            Err("Enter your dev server’s URL or connect to a browser your agent started.".into())
+        }
         _ => Err("Could not find the local browser session.".into()),
     }
 }

@@ -17,8 +17,13 @@ const MAX_MESSAGE_BYTES: usize = 6 * 1024 * 1024;
 const MAX_FRAME_EDGE: u32 = 4096;
 
 pub(super) enum Update {
-    Frame(Arc<RenderImage>),
+    Frame(Frame),
     Ended(String),
+}
+
+pub(super) struct Frame {
+    pub image: Arc<RenderImage>,
+    pub jpeg: Arc<Vec<u8>>,
 }
 
 pub(super) type Latest = Arc<Mutex<Option<Update>>>;
@@ -31,11 +36,11 @@ struct StreamMessage<'a> {
     data: Option<&'a str>,
 }
 
-fn decode(data: &str) -> Result<Arc<RenderImage>, String> {
-    let bytes = STANDARD
+fn decode(data: &str) -> Result<Frame, String> {
+    let jpeg = STANDARD
         .decode(data)
         .map_err(|_| "Browser returned an invalid frame.")?;
-    let mut decoder = image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::Jpeg);
+    let mut decoder = image::ImageReader::with_format(Cursor::new(&jpeg), image::ImageFormat::Jpeg);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_FRAME_EDGE);
     limits.max_image_height = Some(MAX_FRAME_EDGE);
@@ -48,7 +53,10 @@ fn decode(data: &str) -> Result<Arc<RenderImage>, String> {
     for pixel in image.pixels_mut() {
         pixel.0.swap(0, 2);
     }
-    Ok(Arc::new(RenderImage::new(vec![image::Frame::new(image)])))
+    Ok(Frame {
+        image: Arc::new(RenderImage::new(vec![image::Frame::new(image)])),
+        jpeg: Arc::new(jpeg),
+    })
 }
 
 fn publish(wake: &flume::Sender<()>, latest: &Latest, update: Update) {
@@ -56,8 +64,25 @@ fn publish(wake: &flume::Sender<()>, latest: &Latest, update: Update) {
     let _ = wake.try_send(());
 }
 
-pub(super) fn run(project: &Path, label: &str, wake: &flume::Sender<()>, latest: &Latest) {
-    if let Err(error) = receive(project, label, wake, latest)
+pub(super) fn run(
+    project: &Path,
+    label: &str,
+    url: Option<&str>,
+    wake: &flume::Sender<()>,
+    latest: &Latest,
+) {
+    let result = url
+        .map_or(Ok(()), |url| {
+            crate::platform::browser::open(project, label, url)
+        })
+        .and_then(|()| {
+            if wake.is_disconnected() {
+                Ok(())
+            } else {
+                receive(project, label, wake, latest)
+            }
+        });
+    if let Err(error) = result
         && !wake.is_disconnected()
     {
         publish(wake, latest, Update::Ended(error));
@@ -136,7 +161,8 @@ fn receive(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Update, publish};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn a_delayed_reader_receives_only_the_latest_update() {

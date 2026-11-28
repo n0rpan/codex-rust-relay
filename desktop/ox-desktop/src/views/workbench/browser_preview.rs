@@ -1,11 +1,15 @@
-//! A local, read-only view of a browser the operator or agent already started.
+//! A local browser viewport with explicit launch and draft evidence.
 use super::Workbench;
 use crate::{
-    appearance::{LABEL_FONT, Palette},
+    appearance::Palette,
     kit::{button, col, row, small},
 };
 use gpui::{prelude::FluentBuilder, *};
-use ox_desk_core::store::{Connection, Store};
+use gpui_component::input::{Input, InputEvent, InputState};
+use ox_desk_core::{
+    runtime::Runtime,
+    store::{Connection, Store},
+};
 use sha2::{Digest, Sha256};
 use std::{
     path::PathBuf,
@@ -20,16 +24,23 @@ pub(super) struct BrowserPreview {
     owner: String,
     viewport: Entity<Viewport>,
     focus: FocusHandle,
+    _evidence: Subscription,
     pub(super) expanded: bool,
 }
 
 struct Viewport {
     project: PathBuf,
     label: String,
-    image: Option<Arc<RenderImage>>,
+    address: Entity<InputState>,
+    frame: Option<stream::Frame>,
+    screenshot_supported: bool,
+    capturing: bool,
     error: Option<String>,
     reader: Option<Task<()>>,
 }
+
+struct AddScreenshot(Arc<Vec<u8>>);
+impl EventEmitter<AddScreenshot> for Viewport {}
 
 fn session_label(route: &ox_desk_core::store::Route, thread: &str) -> String {
     let mut digest = Sha256::new();
@@ -39,7 +50,7 @@ fn session_label(route: &ox_desk_core::store::Route, thread: &str) -> String {
 }
 
 impl Viewport {
-    fn start(&mut self, window: &Window, cx: &mut Context<Self>) {
+    fn start(&mut self, url: Option<String>, window: &Window, cx: &mut Context<Self>) {
         if self.reader.is_some() {
             return;
         }
@@ -51,7 +62,7 @@ impl Viewport {
         let label = self.label.clone();
         let worker = std::thread::Builder::new()
             .name("ox-browser-viewport".into())
-            .spawn(move || stream::run(&project, &label, &wake, &worker_slot));
+            .spawn(move || stream::run(&project, &label, url.as_deref(), &wake, &worker_slot));
         if let Err(error) = worker {
             self.error = Some(format!("Could not start the viewport reader: {error}"));
             cx.notify();
@@ -68,13 +79,13 @@ impl Viewport {
                         .update_in(cx, |viewport, window, cx| {
                             match latest {
                                 stream::Update::Frame(next) => {
-                                    if let Some(old) = viewport.image.replace(next) {
-                                        let _ = window.drop_image(old);
+                                    if let Some(old) = viewport.frame.replace(next) {
+                                        let _ = window.drop_image(old.image);
                                     }
                                 }
                                 stream::Update::Ended(error) => {
-                                    if let Some(old) = viewport.image.take() {
-                                        let _ = window.drop_image(old);
+                                    if let Some(old) = viewport.frame.take() {
+                                        let _ = window.drop_image(old.image);
                                     }
                                     viewport.error = Some(error);
                                     viewport.reader = None;
@@ -95,11 +106,7 @@ impl Viewport {
 impl Render for Viewport {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::get(cx);
-        let open_command = format!(
-            "ox browser --session {} open http://127.0.0.1:3000",
-            self.label
-        );
-        if let Some(image) = &self.image {
+        if let Some(frame) = &self.frame {
             let panel = col()
                 .id("browser-preview-live")
                 .min_h_0()
@@ -116,11 +123,32 @@ impl Render for Viewport {
                         .min_h_0()
                         .flex_1()
                         .child(
-                            img(image.clone())
+                            img(frame.image.clone())
                                 .size_full()
                                 .object_fit(ObjectFit::Contain),
                         ),
-                );
+                )
+                .when(self.screenshot_supported, |panel| {
+                    panel.child(row().justify_end().child(button(
+                        p,
+                        "browser-preview-evidence",
+                        if self.capturing {
+                            "Adding screenshot…"
+                        } else {
+                            "Add screenshot"
+                        },
+                        true,
+                        !self.capturing,
+                        cx.listener(|s, _, _, cx| {
+                            if let Some(frame) = &s.frame
+                                && !s.capturing
+                            {
+                                cx.emit(AddScreenshot(frame.jpeg.clone()));
+                            }
+                        }),
+                    )))
+                })
+                .children(self.error.as_ref().map(|error| small(p, error.clone())));
             return crate::platform::layout_probe::mark_element(
                 panel,
                 &"browser-preview-live".into(),
@@ -134,6 +162,15 @@ impl Render for Viewport {
         } else {
             small(p, "Connecting to this session’s browser…")
         };
+        let address = self.address.read(cx).value();
+        let busy = self.reader.is_some();
+        let agent_url = if address.trim().is_empty() {
+            "http://127.0.0.1:3000"
+        } else {
+            address.trim()
+        };
+        let quoted = shlex::try_quote(agent_url).unwrap_or_else(|_| "http://127.0.0.1:3000".into());
+        let open_command = format!("ox browser --session {} open {quoted}", self.label);
         col()
             .min_h_0()
             .flex_1()
@@ -141,25 +178,45 @@ impl Render for Viewport {
             .gap_2()
             .child("Watch a local app")
             .child(tip)
-            .child(small(p, "In the project terminal, open your app with this command. Use your dev server’s port."))
-            .child(
-                div()
-                    .text_color(rgb(p.fg))
-                    .font_family(LABEL_FONT)
-                    .truncate()
-                    .child(open_command.clone()),
-            )
+            .child(small(p, "Dev server URL"))
+            .child(crate::platform::layout_probe::mark_element(
+                div().child(Input::new(&self.address).disabled(busy)),
+                &"browser-preview-url".into(),
+                &"Dev server URL".into(),
+                !busy,
+            ))
             .child(
                 row()
                     .flex_wrap()
                     .gap_2()
                     .child(button(
-                        p, "browser-preview-copy", "Copy open command", false, true,
-                        move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(open_command.clone())),
+                        p,
+                        "browser-preview-start",
+                        "Start Preview",
+                        true,
+                        !busy && !address.trim().is_empty(),
+                        cx.listener(|s, _, window, cx| {
+                            let address = s.address.read(cx).value();
+                            s.start(Some(address.trim().to_owned()), window, cx);
+                        }),
                     ))
                     .child(button(
-                        p, "browser-preview-retry", "Retry", false, self.reader.is_none(),
-                        cx.listener(|s, _, window, cx| s.start(window, cx)),
+                        p,
+                        "browser-preview-copy",
+                        "Copy agent command",
+                        false,
+                        true,
+                        move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(open_command.clone()))
+                        },
+                    ))
+                    .child(button(
+                        p,
+                        "browser-preview-retry",
+                        "Retry connection",
+                        false,
+                        !busy,
+                        cx.listener(|s, _, window, cx| s.start(None, window, cx)),
                     )),
             )
             .into_any_element()
@@ -169,10 +226,95 @@ impl Render for Viewport {
 impl Workbench {
     pub(super) fn clear_browser_preview(&mut self, window: Option<&mut Window>, cx: &mut App) {
         if let Some(preview) = self.browser_preview.take()
-            && let Some(frame) = preview.viewport.read(cx).image.clone()
+            && let Some(image) = preview
+                .viewport
+                .read(cx)
+                .frame
+                .as_ref()
+                .map(|frame| frame.image.clone())
         {
-            cx.drop_image(frame, window);
+            cx.drop_image(image, window);
         }
+    }
+
+    fn stage_browser_screenshot(
+        &mut self,
+        generation: EntityId,
+        bytes: Arc<Vec<u8>>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(owner) = self.browser_owner().map(str::to_owned) else {
+            return;
+        };
+        let Some(preview) = self
+            .browser_preview
+            .as_ref()
+            .filter(|preview| preview.viewport.entity_id() == generation && preview.owner == owner)
+        else {
+            return;
+        };
+        if !self
+            .store
+            .as_ref()
+            .is_some_and(|store| store.can_compose(Some(&owner)))
+        {
+            preview.viewport.update(cx, |viewport, cx| {
+                viewport.error =
+                    Some("Wait for the composer to be ready, then add the screenshot.".into());
+                cx.notify();
+            });
+            return;
+        }
+        preview.viewport.update(cx, |viewport, cx| {
+            viewport.capturing = true;
+            viewport.error = None;
+            cx.notify();
+        });
+        let draft = Some(owner.clone());
+        *self.image_work.entry(draft.clone()).or_default() += 1;
+        cx.notify();
+        let convert = cx.background_spawn(async move {
+            crate::platform::attachments::encode("image/jpeg", &bytes)
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            let image = convert.await;
+            let _ = view.update_in(cx, |s, window, cx| {
+                if let Some(count) = s.image_work.get_mut(&draft) {
+                    *count -= 1;
+                    if *count == 0 {
+                        s.image_work.remove(&draft);
+                    }
+                }
+                cx.notify();
+                let Some(preview) = s.browser_preview.as_ref().filter(|preview| {
+                    preview.viewport.entity_id() == generation
+                        && preview.owner == owner
+                        && s.browser_owner() == Some(owner.as_str())
+                }) else {
+                    return;
+                };
+                preview.viewport.update(cx, |viewport, cx| {
+                    viewport.capturing = false;
+                    cx.notify();
+                });
+                let Some(store) = s
+                    .store
+                    .as_mut()
+                    .filter(|store| store.can_compose(Some(&owner)))
+                else {
+                    return;
+                };
+                // The bounded viewport JPEG is already smaller than the local paste limit.
+                store.attach_image(Some(&owner), image);
+                if preview.expanded || s.pane_width < px(500. + WIDTH) {
+                    s.clear_browser_preview(Some(window), cx);
+                }
+                s.focus_editor_for = Some(Some(owner));
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn browser_owner(&self) -> Option<&str> {
@@ -203,23 +345,52 @@ impl Workbench {
         self.review.open = false;
         let project = self.project.clone();
         let label = session_label(&self.route, &owner);
+        let screenshot_supported = self.route.runtime != Runtime::Antigravity;
         let viewport = cx.new(|cx| {
+            let address =
+                cx.new(|cx| InputState::new(window, cx).placeholder("http://127.0.0.1:3000"));
+            cx.subscribe_in(
+                &address,
+                window,
+                |s: &mut Viewport, address, event, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        let address = address.read(cx).value().trim().to_owned();
+                        if !address.is_empty() {
+                            s.start(Some(address), window, cx);
+                        }
+                    } else if matches!(event, InputEvent::Change) {
+                        cx.notify();
+                    }
+                },
+            )
+            .detach();
             let mut view = Viewport {
                 project,
                 label,
-                image: None,
+                address,
+                frame: None,
+                screenshot_supported,
+                capturing: false,
                 error: None,
                 reader: None,
             };
-            view.start(window, cx);
+            view.start(None, window, cx);
             view
         });
+        let evidence = cx.subscribe_in(
+            &viewport,
+            window,
+            |s, view, event: &AddScreenshot, window, cx| {
+                s.stage_browser_screenshot(view.entity_id(), event.0.clone(), window, cx);
+            },
+        );
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
         self.browser_preview = Some(BrowserPreview {
             owner,
             viewport,
             focus,
+            _evidence: evidence,
             expanded: false,
         });
         cx.notify();
