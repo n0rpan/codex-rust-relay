@@ -101,10 +101,8 @@ impl MemoryAction {
             })?;
         }
         let entries = store.list_for_project(&project, host, Sensitivity::Private)?;
-        let count = entries.len();
         let entries: Vec<_> = entries
             .into_iter()
-            .take(100)
             .map(|entry| {
                 json!({
                     "text": entry.text, "scope": entry.scope.short_label(),
@@ -113,7 +111,7 @@ impl MemoryAction {
                 })
             })
             .collect();
-        Ok(json!({"entries": entries, "total": count}))
+        Ok(json!({"entries": entries}))
     }
 }
 

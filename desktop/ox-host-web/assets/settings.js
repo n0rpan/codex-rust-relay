@@ -1612,8 +1612,6 @@ export function setupSettings({ request, open, close, notifications, login }) {
         );
         list.append(card);
       }
-      if (value.total > value.entries.length)
-        list.append(node("p", `Showing ${value.entries.length} of ${value.total} saved memories.`));
     }
     const form = node("form");
     const input = textField(form, "Add a project preference", "memory");
