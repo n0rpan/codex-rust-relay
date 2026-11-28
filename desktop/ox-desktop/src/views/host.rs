@@ -1230,7 +1230,7 @@ impl Host {
             view,
             window,
             |host, owner, _: &crate::preferences::ContinueSetup, window, cx| {
-                if host.preferences.as_ref() == Some(&owner) {
+                if host.preferences.as_ref() == Some(owner) {
                     host.show_settings(window, cx);
                 }
             },
