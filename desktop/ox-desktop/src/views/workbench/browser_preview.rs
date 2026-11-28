@@ -36,6 +36,8 @@ struct Viewport {
     screenshot_supported: bool,
     capturing: bool,
     error: Option<String>,
+    needs_install: bool,
+    installing: Option<Task<()>>,
     reader: Option<Task<()>>,
 }
 
@@ -51,7 +53,7 @@ fn session_label(route: &ox_desk_core::store::Route, thread: &str) -> String {
 
 impl Viewport {
     fn start(&mut self, url: Option<String>, window: &Window, cx: &mut Context<Self>) {
-        if self.reader.is_some() {
+        if self.reader.is_some() || self.installing.is_some() {
             return;
         }
         self.error = None;
@@ -83,6 +85,10 @@ impl Viewport {
                                         let _ = window.drop_image(old.image);
                                     }
                                 }
+                                stream::Update::NeedsInstall => {
+                                    viewport.needs_install = true;
+                                    viewport.reader = None;
+                                }
                                 stream::Update::Ended(error) => {
                                     if let Some(old) = viewport.frame.take() {
                                         let _ = window.drop_image(old.image);
@@ -98,6 +104,31 @@ impl Viewport {
                     break;
                 }
             }
+        }));
+        cx.notify();
+    }
+
+    fn install(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if !self.needs_install || self.installing.is_some() {
+            return;
+        }
+        self.error = None;
+        let install = cx.background_spawn(async { crate::platform::browser::install() });
+        self.installing = Some(cx.spawn_in(window, async move |view, cx| {
+            let result = install.await;
+            let _ = view.update_in(cx, |viewport, window, cx| {
+                viewport.installing = None;
+                match result {
+                    Ok(()) => {
+                        viewport.needs_install = false;
+                        viewport.start(None, window, cx);
+                    }
+                    Err(error) => {
+                        viewport.error = Some(error);
+                        cx.notify();
+                    }
+                }
+            });
         }));
         cx.notify();
     }
@@ -173,6 +204,33 @@ impl Render for Viewport {
                 false,
             )
             .into_any_element();
+        }
+        if self.needs_install {
+            let installing = self.installing.is_some();
+            return col()
+                .min_h_0()
+                .flex_1()
+                .justify_center()
+                .gap_2()
+                .child("Set up Preview")
+                .child(small(
+                    p,
+                    "OX downloads agent-browser and uses Chrome or Chromium if available.",
+                ))
+                .children(self.error.as_ref().map(|error| small(p, error.clone())))
+                .child(row().child(button(
+                    p,
+                    "browser-preview-install",
+                    if installing {
+                        "Installing browser component…"
+                    } else {
+                        "Install browser component"
+                    },
+                    true,
+                    !installing,
+                    cx.listener(|s, _, window, cx| s.install(window, cx)),
+                )))
+                .into_any_element();
         }
         let tip = if let Some(error) = &self.error {
             small(p, error.clone())
@@ -389,6 +447,8 @@ impl Workbench {
                 screenshot_supported,
                 capturing: false,
                 error: None,
+                needs_install: false,
+                installing: None,
                 reader: None,
             };
             view.start(None, window, cx);

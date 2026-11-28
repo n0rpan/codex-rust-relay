@@ -1,5 +1,13 @@
 //! Typed companion operations for the local browser.
-use std::{path::Path, process::Command};
+use std::{
+    path::Path,
+    process::{Command, Output},
+};
+
+pub(crate) enum PreviewPort {
+    Ready(u16),
+    NeedsInstall,
+}
 
 fn parse_port(endpoint: &str) -> Option<u16> {
     let line = endpoint
@@ -29,17 +37,36 @@ pub(crate) fn open(project: &Path, label: &str, url: &str) -> Result<(), String>
     if output.status.success() {
         return Ok(());
     }
-    let error = String::from_utf8_lossy(&output.stderr);
-    Err(error
+    Err(command_error(output, "Could not open the local browser."))
+}
+
+pub(crate) fn install() -> Result<(), String> {
+    let output = Command::new(super::ox())
+        .args(["browser", "install"])
+        .env("PATH", super::child_path())
+        .output()
+        .map_err(|error| format!("Could not install the browser component. {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_error(
+            output,
+            "Could not install the browser component.",
+        ))
+    }
+}
+
+fn command_error(output: Output, fallback: &str) -> String {
+    String::from_utf8_lossy(&output.stderr)
         .lines()
         .next()
         .map(|line| line.strip_prefix("ox: ").unwrap_or(line))
         .filter(|line| !line.is_empty())
         .map(|line| line.chars().take(200).collect())
-        .unwrap_or_else(|| "Could not open the local browser.".into()))
+        .unwrap_or_else(|| fallback.into())
 }
 
-pub(crate) fn preview_port(project: &Path, label: &str) -> Result<u16, String> {
+pub(crate) fn preview_port(project: &Path, label: &str) -> Result<PreviewPort, String> {
     let output = command(project, label)
         .arg("preview")
         .output()
@@ -48,8 +75,9 @@ pub(crate) fn preview_port(project: &Path, label: &str) -> Result<u16, String> {
         Some(0) => std::str::from_utf8(&output.stdout)
             .ok()
             .and_then(parse_port)
+            .map(PreviewPort::Ready)
             .ok_or_else(|| "OX returned an invalid local browser address.".to_owned()),
-        Some(2) => Err("Install the browser component with ox browser install.".into()),
+        Some(2) => Ok(PreviewPort::NeedsInstall),
         Some(3) => {
             Err("Enter your dev server’s URL or connect to a browser your agent started.".into())
         }
