@@ -91,6 +91,15 @@ impl VerifiedTarget {
             && prepared.stage.digest == self.saved.manifest_sha256
     }
 
+    pub(crate) fn check_activation(&self, prepared: &Prepared) -> io::Result<()> {
+        if !self.matches_prepared(prepared) {
+            return Err(invalid("The destination files belong to another move."));
+        }
+        self.check_project()?;
+        self.history()?;
+        Ok(())
+    }
+
     /// Each move receives a fresh checkout in the destination state directory.
     /// The host actor serializes this step and reserves the scope in preflight.
     pub(crate) fn install(

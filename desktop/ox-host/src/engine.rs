@@ -43,6 +43,8 @@ pub(crate) enum Message {
     Outbound(Box<forwarding::Event>),
     WorkerResult(u64, Box<Result<ox_host_web::worker_result::Report, String>>),
     LinkedJob(Box<ox_host_web::linked_jobs::VerifiedJob>, Replier),
+    #[cfg(test)]
+    MoveReceive(Box<move_receive::Request>),
     Gateway {
         caller: Caller,
         request: Box<Gateway>,
@@ -369,6 +371,8 @@ mod linked;
 mod placement;
 use placement::HostQuery;
 mod mode_requests;
+#[cfg(test)]
+mod move_receive;
 mod notices;
 #[cfg(test)]
 mod source_moves;
@@ -624,6 +628,8 @@ impl Engine {
                     self.worker_results.insert(id, state);
                 }
                 Some(Message::LinkedJob(job, reply)) => self.linked_job(*job, reply)?,
+                #[cfg(test)]
+                Some(Message::MoveReceive(request)) => self.receive_move(*request),
                 Some(Message::Gateway {
                     caller,
                     request,
@@ -7144,6 +7150,14 @@ mod tests {
                     .store
                     .can_send(Some("studio-native"))
             );
+            let moved = receiver.running[&plan.target_scope]
+                .state
+                .sessions
+                .iter()
+                .find(|row| row.id == "studio-native")
+                .unwrap();
+            assert_eq!(moved.title, "Review the release plan");
+            assert_eq!(moved.detail["logical_session_id"], json!(plan.session));
             drop(receiver);
             drop(source);
             drop(bundle);

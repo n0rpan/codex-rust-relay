@@ -1,5 +1,5 @@
 //! Bind a destination runtime checkpoint to the authenticated staged archive.
-use super::{Engine, Scope, ScopeState};
+use super::{Change, Engine, Scope, ScopeState};
 use crate::{
     move_ledger::{Activated, Commit, Prepared},
     move_target::VerifiedTarget,
@@ -199,11 +199,40 @@ impl Engine {
         source: Uuid,
         commit: &Commit,
     ) -> io::Result<Activated> {
-        let activated = self.source_moves.ledger.activate_receiver(source, commit)?;
         let plan = &commit.prepared.plan;
+        let native = &commit.prepared.stage.native;
+        let target = VerifiedTarget::load(&self.state_dir, plan)?;
+        target.check_activation(&commit.prepared)?;
+        let activated = self.source_moves.ledger.activate_receiver(source, commit)?;
+        let row = target.catalog_row_for(&self.source_moves.ledger, &plan.target_scope, native)?;
+        let logical = &row.detail["logical_session_id"];
+        let session;
         if let Some(live) = self.running.get_mut(&plan.target_scope) {
             live.store
-                .enable_prepared_move_writer(&plan.id.to_string(), &commit.prepared.stage.native);
+                .enable_prepared_move_writer(&plan.id.to_string(), native);
+            session = &mut live.state;
+        } else {
+            session = self
+                .cold
+                .entry(plan.target_scope.clone())
+                .or_insert_with(|| ScopeState {
+                    scope: plan.target_scope.clone(),
+                    connection: "disconnected".into(),
+                    capabilities: Vec::new(),
+                    sessions: Vec::new(),
+                    asks: Vec::new(),
+                    transcripts: Default::default(),
+                    detail: serde_json::json!({}),
+                });
+        }
+        if !session
+            .sessions
+            .iter()
+            .any(|saved| saved.id == row.id && &saved.detail["logical_session_id"] == logical)
+        {
+            session.sessions.retain(|saved| saved.id != row.id);
+            session.sessions.push(row.clone());
+            self.broadcast(&plan.target_scope, vec![Change::Session { session: row }])?;
         }
         Ok(activated)
     }
