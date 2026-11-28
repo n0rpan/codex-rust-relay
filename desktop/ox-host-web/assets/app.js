@@ -173,6 +173,7 @@ const SEEN_RESULTS_KEY = "ox-phone-seen-results-v1";
 const RESULT_LABEL = { completed: "Turn done", failed: "Failed", stopped: "Stopped" };
 const RESULT_PREVIEW_COUNT = 4;
 const seenResults = new Map();
+let pendingVisibleResult = null;
 try {
   const saved = JSON.parse(localStorage.getItem(SEEN_RESULTS_KEY) || "{}");
   for (const [thread, turn] of Object.entries(saved))
@@ -185,6 +186,18 @@ function seeResult(thread, turn) {
   try {
     localStorage.setItem(SEEN_RESULTS_KEY, JSON.stringify(Object.fromEntries(seenResults)));
   } catch {}
+}
+
+function seeVisibleResult() {
+  if (!pendingVisibleResult || !detailLink?.ready || document.hidden || $("conversation").hidden)
+    return;
+  const { thread, turn, row } = pendingVisibleResult;
+  const bounds = row.getBoundingClientRect();
+  if (bounds.bottom > document.querySelector(".conversation-nav").getBoundingClientRect().bottom &&
+      bounds.top < Math.min(innerHeight, $("composer").getBoundingClientRect().top)) {
+    pendingVisibleResult = null;
+    seeResult(thread, turn);
+  }
 }
 
 const ACCENT_COLORS = ["cobalt", "amber", "emerald", "coral", "violet", "cyan"];
@@ -792,6 +805,7 @@ function open(scope, id) {
   controls.reset();
   detailLink?.close();
   selected = { scope, id, revealLatest: Boolean(id), openingResult: Boolean(id) };
+  pendingVisibleResult = null;
   setComposerOwner(keyOf(scope, id), repaint, notice);
   pendingNew = null;
   visibleRows = 200;
@@ -1615,6 +1629,7 @@ const jumpLatest = (() => {
     );
   };
   addEventListener("scroll", sync, { passive: true });
+  addEventListener("scroll", seeVisibleResult, { passive: true });
   return {
     pinned: () => scrollY > 2 && gap() < 80,
     reset() {
@@ -1867,16 +1882,18 @@ function conversation() {
       }
     }
   }
+  pendingVisibleResult = null;
   if (id && detailLink?.ready && timeline?.detail?.ready && !document.hidden) {
     const result = sessionResult(s?.sessions.find((session) => session.id === id));
     const thread = keyOf(scope, id);
     if (result && !timeline.detail.active && seenResults.get(thread) !== result.turn &&
         (timeline.detail.last_finished === result.turn || tail?.turn === result.turn)) {
-      const last = $("timeline").lastElementChild?.getBoundingClientRect();
-      const visible = last &&
-        last.bottom > document.querySelector(".conversation-nav").getBoundingClientRect().bottom &&
-        last.top < Math.min(innerHeight, $("composer").getBoundingClientRect().top);
-      if (selected.openingResult || visible) seeResult(thread, result.turn);
+      const row = $("timeline").lastElementChild;
+      if (selected.openingResult) seeResult(thread, result.turn);
+      else if (row) {
+        pendingVisibleResult = { thread, turn: result.turn, row };
+        seeVisibleResult();
+      }
     }
     selected.openingResult = false;
   }
