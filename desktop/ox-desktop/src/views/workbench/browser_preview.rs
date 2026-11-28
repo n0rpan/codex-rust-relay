@@ -341,7 +341,7 @@ impl Workbench {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::session_label;
     use ox_desk_core::store::Route;
 
     #[test]

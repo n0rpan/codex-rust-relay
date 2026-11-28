@@ -6,7 +6,6 @@ use std::{
     io::{Cursor, ErrorKind},
     net::{Ipv4Addr, SocketAddr, TcpStream},
     path::Path,
-    process::Command,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -23,35 +22,6 @@ pub(super) enum Update {
 }
 
 pub(super) type Latest = Arc<Mutex<Option<Update>>>;
-
-fn parse_port(endpoint: &str) -> Option<u16> {
-    let line = endpoint
-        .strip_suffix("\r\n")
-        .or_else(|| endpoint.strip_suffix('\n'))
-        .unwrap_or(endpoint);
-    let port = line.strip_prefix("http://127.0.0.1:")?;
-    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    port.parse::<u16>().ok().filter(|port| *port != 0)
-}
-
-fn locate(project: &Path, label: &str) -> Result<u16, String> {
-    let output = Command::new(crate::platform::ox())
-        .args(["browser", "--session", label, "preview"])
-        .current_dir(project)
-        .output()
-        .map_err(|error| format!("Could not find OX’s browser component: {error}"))?;
-    match output.status.code() {
-        Some(0) => std::str::from_utf8(&output.stdout)
-            .ok()
-            .and_then(parse_port)
-            .ok_or_else(|| "OX returned an invalid local browser address.".to_owned()),
-        Some(2) => Err("Install the browser component with ox browser install.".into()),
-        Some(3) => Err("Open this session’s browser and try again.".into()),
-        _ => Err("Could not find the local browser session.".into()),
-    }
-}
 
 #[derive(Deserialize)]
 struct StreamMessage<'a> {
@@ -100,7 +70,7 @@ fn receive(
     wake: &flume::Sender<()>,
     latest: &Latest,
 ) -> Result<(), String> {
-    let port = locate(project, label)?;
+    let port = crate::platform::browser::preview_port(project, label)?;
     if wake.is_disconnected() {
         return Ok(());
     }
@@ -167,23 +137,6 @@ fn receive(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn accepts_only_the_companion_loopback_origin() {
-        assert_eq!(parse_port("http://127.0.0.1:5678\n"), Some(5678));
-        for value in [
-            "http://127.0.0.1:0",
-            "http://127.0.0.1:+5678",
-            "http://127.0.0.1:5678/",
-            "http://127.0.0.1:5678\n\n",
-            "http://127.0.0.1:5678\nextra",
-            "http://127.0.0.1:5678@external.test",
-            "http://localhost:5678",
-            "https://127.0.0.1:5678",
-        ] {
-            assert!(parse_port(value).is_none(), "{value}");
-        }
-    }
 
     #[test]
     fn a_delayed_reader_receives_only_the_latest_update() {
