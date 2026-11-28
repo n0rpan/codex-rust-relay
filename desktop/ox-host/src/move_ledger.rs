@@ -287,6 +287,37 @@ impl Ledger {
             .max_by_key(|o| o.generation))
     }
 
+    /// Recover a moved session's logical ID from its current native writer.
+    pub(crate) fn source_identity(&self, scope: &Scope, native: &str) -> io::Result<(Uuid, Owner)> {
+        self.healthy()?;
+        if !self.can_start_turn(scope, native) {
+            return Err(io::Error::other("This session already has an active move."));
+        }
+        for record in self
+            .data
+            .moves
+            .values()
+            .filter(|record| self.local_native(record, scope, native))
+        {
+            if let Some(owner) = self.owner(record.plan.session)?
+                && owner.host == self.data.host
+                && &owner.scope == scope
+                && owner.native == native
+            {
+                return Ok((record.plan.session, owner));
+            }
+        }
+        Ok((
+            Uuid::new_v4(),
+            Owner {
+                host: self.data.host,
+                generation: 0,
+                scope: scope.clone(),
+                native: native.to_owned(),
+            },
+        ))
+    }
+
     /// Restore the destination's catalog from its durable ownership records.
     pub(crate) fn active_receivers(&self) -> io::Result<Vec<Prepared>> {
         self.healthy()?;
@@ -1099,10 +1130,14 @@ mod tests {
         let original = a.commit_source(&first).unwrap();
         b.activate_receiver(first.source.host, &original).unwrap();
 
+        let (session, source) = b
+            .source_identity(&first.target_scope, "studio-native")
+            .unwrap();
+        assert_eq!(session, first.session);
         let back = Plan {
             id: Uuid::new_v4(),
-            session: first.session,
-            source: b.owner(first.session).unwrap().unwrap(),
+            session,
+            source,
             target_host: first.source.host,
             target_scope: first.source.scope.clone(),
         };
@@ -1123,6 +1158,10 @@ mod tests {
         assert!(a.can_write(&first.source.scope, "laptop-native-2"));
         assert!(!a.can_write(&first.source.scope, "local"));
         assert!(!b.can_write(&first.target_scope, "studio-native"));
+        assert!(
+            b.source_identity(&first.target_scope, "studio-native")
+                .is_err()
+        );
         assert!(
             a.prepare_source(&Plan {
                 id: Uuid::new_v4(),

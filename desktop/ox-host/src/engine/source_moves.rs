@@ -92,7 +92,37 @@ impl Engine {
             .filter(|t| t.is_ready())
             .and_then(|t| t.active_turn())
             .ok_or_else(|| io::Error::other("The source session has no confirmed running turn."))?;
-        self.source_moves.ledger.queue_source(plan, turn)
+        self.queue_move_for_turn(plan, turn.to_owned())
+    }
+
+    /// Network preflight can complete after the accepted turn ended. Keep the
+    /// exact turn in that case and use its confirmed result, if it exists.
+    fn queue_move_for_turn(&mut self, plan: &Plan, turn: String) -> io::Result<Status> {
+        let live = self
+            .running
+            .get(&plan.source.scope)
+            .ok_or_else(|| io::Error::other("Open the source session first."))?;
+        let thread = &plan.source.native;
+        let active = live
+            .store
+            .transcript(thread)
+            .and_then(|view| view.active_turn());
+        let finished = live
+            .store
+            .last_result(thread)
+            .is_some_and(|result| result.turn == turn);
+        if active != Some(turn.as_str()) && !finished {
+            return Err(io::Error::other(
+                "The selected turn could not be confirmed. Check the session before moving it.",
+            ));
+        }
+        let status = self.source_moves.ledger.queue_source(plan, &turn)?;
+        if finished {
+            self.source_moves
+                .ledger
+                .observe_queued_result(plan, &turn)?;
+        }
+        Ok(status)
     }
 
     pub(super) fn stage_source_move(

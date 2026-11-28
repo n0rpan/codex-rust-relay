@@ -72,7 +72,7 @@ impl Bundle {
         let directory = spool.join(plan.id.to_string());
         match directory.symlink_metadata() {
             Ok(metadata) if metadata.is_dir() => {
-                let bundle = Self::open(directory, plan)?;
+                let bundle = Self::recover(staging, plan)?;
                 if bundle.manifest.transcript.sha256 != Archive::fingerprint(plan, timeline)? {
                     return Err(io::Error::other(
                         "The conversation changed after the move was prepared.",
@@ -159,6 +159,10 @@ impl Bundle {
 
     pub(crate) fn directory(&self) -> &Path {
         &self.directory
+    }
+
+    pub(crate) fn recover(staging: &Path, plan: &Plan) -> io::Result<Self> {
+        Self::open(staging.join(OUTGOING).join(plan.id.to_string()), plan)
     }
 }
 
