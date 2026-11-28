@@ -188,6 +188,15 @@ impl Store {
         match notice {
             Notification::Started(row) => self.observed_row(*row),
             Notification::Status { thread, status } => self.activity_status(&thread, status),
+            Notification::Goal {
+                thread,
+                turn,
+                complete,
+            } => {
+                if let Some(t) = self.transcripts.get_mut(&thread) {
+                    t.update_goal(turn, complete);
+                }
+            }
             Notification::Settings { thread, settings } => {
                 let pending_model=self.pending.values().any(|(_,p)|matches!(p,super::Pending::Options(owner,o) if owner==&thread && o.model==settings.model));
                 let mismatch = self

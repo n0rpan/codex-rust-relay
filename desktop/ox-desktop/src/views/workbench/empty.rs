@@ -3,7 +3,8 @@
 use super::Workbench;
 use crate::appearance::{Palette, Step};
 use crate::kit::{SPACE_L, col};
-use gpui::{prelude::FluentBuilder, *};
+use gpui::*;
+use ox_desk_core::runtime::Billing;
 
 /// Ask the host to open its folder picker, so a user with no thread can open a project.
 pub(in crate::views) struct OpenProject;
@@ -17,7 +18,20 @@ impl Workbench {
             .project
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .filter(|n| !n.is_empty());
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| self.project.display().to_string());
+        let billing = match &self.route.billing {
+            Billing::Subscription => format!("{} subscription", self.route.runtime.account()),
+            Billing::Api(alias) => format!("API · {alias}"),
+        };
+        let host = self
+            .link
+            .remote()
+            .map_or("This computer", |host| host.name.as_str());
+        let connection = format!(
+            "{project} · {} · {billing} · {host}",
+            self.route.runtime.name()
+        );
         let frame = self.mascot_frame;
         col()
             .flex_1()
@@ -47,15 +61,15 @@ impl Workbench {
                     .text_color(rgb(p.fg))
                     .child("What shall we work on?"),
             )
-            .when_some(project, |view, name| {
-                view.child(
-                    div()
-                        .mt(px(4.))
-                        .text_size(p.text(Step::Meta))
-                        .text_color(rgb(p.muted))
-                        .child(name),
-                )
-            })
+            .child(
+                div()
+                    .mt(px(6.))
+                    .max_w_full()
+                    .text_align(TextAlign::Center)
+                    .text_size(p.text(Step::Meta))
+                    .text_color(rgb(p.muted))
+                    .child(connection),
+            )
             .child(div().mt(px(24.)).w_full().child(dock))
             .child(
                 div()

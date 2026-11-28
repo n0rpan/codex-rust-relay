@@ -160,8 +160,6 @@ let cold = new Map(),
   handoffStamp = "",
   // Message and images sent from a composer whose Ack has not come back, by owner.
   unacked = new Map(),
-  // The last `restored_draft.message` applied per owner, so each host restore lands once.
-  restoredSeen = new Map(),
   foldedProjects = new Set(),
   starredProjects = new Map(),
   projectOrder = new Map(),
@@ -170,6 +168,41 @@ let cold = new Map(),
   pinnedThreads = new Map(),
   threadColors = new Map(),
   visibleRows = 200;
+
+// Store text only, under this host's origin and the exact composer owner.
+const DRAFT_KEY = "ox-phone-draft-v1:";
+function draftRecord(owner) {
+  if (drafts.has(owner)) return drafts.get(owner);
+  try {
+    const saved = key && JSON.parse(localStorage.getItem(DRAFT_KEY + owner));
+    if (typeof saved?.text === "string") return saved;
+  } catch {}
+  return { text: "" };
+}
+function draftText(owner) {
+  return draftRecord(owner).text;
+}
+function setDraftText(owner, text, restored = draftRecord(owner).restored) {
+  const record = { text, restored };
+  try {
+    if (key && (text.trim() || restored))
+      localStorage.setItem(DRAFT_KEY + owner, JSON.stringify(record));
+    else localStorage.removeItem(DRAFT_KEY + owner);
+    drafts.delete(owner);
+  } catch {
+    // The current page can still keep its draft if storage is disabled or full.
+    drafts.set(owner, record);
+  }
+}
+function clearDrafts() {
+  drafts.clear();
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const name = localStorage.key(i);
+      if (name?.startsWith(DRAFT_KEY)) localStorage.removeItem(name);
+    }
+  } catch {}
+}
 
 const SIDEBAR_META_KEY = "ox-phone-sidebar-v1";
 const SEEN_RESULTS_KEY = "ox-phone-seen-results-v1";
@@ -252,10 +285,14 @@ const phoneSettings = setupSettings({
   request: (operation) => settingsRequest(key, operation),
   open: () => page("settings"),
   close: home,
-  notifications: () => {
-    home();
-    $("notification-setup").open = true;
-    $("notification-summary").focus();
+  pushStatus: () => {
+    const blocked = pushBlockReason();
+    return { blocked, granted: !blocked && Notification.permission === "granted" };
+  },
+  enablePush: async () => {
+    const enabled = await notifications(key, true);
+    if (enabled) $("notification-banner").hidden = true;
+    return enabled;
   },
   login: async (runtime) => {
     return openPhoneTerminal(`${runtime}-login`);
@@ -270,15 +307,14 @@ function restoreHostDrafts(model) {
       const r = session.detail?.restored_draft;
       if (typeof r?.message !== "string" || typeof r.text !== "string") continue;
       const owner = keyOf(s.scope, session.id);
-      if (restoredSeen.get(owner) === r.message) continue;
-      restoredSeen.set(owner, r.message);
+      if (draftRecord(owner).restored === r.message) continue;
       // An Ack still on its way must not clear the restored text.
       const sent = unacked.get(owner);
       if (sent) sent.restored = true;
-      const current = drafts.get(owner) || "";
+      const current = draftText(owner);
       const text =
         !current || current === r.text ? r.text : `${r.text}\n${current}`;
-      drafts.set(owner, text);
+      setDraftText(owner, text, r.message);
       if (selected && keyOf(selected.scope, selected.id) === owner) {
         $("draft").value = text;
         syncDraftHeight();
@@ -353,8 +389,7 @@ class Link {
           global.scopes.clear();
           global.cursor = null;
           cold.clear();
-          drafts.clear();
-          restoredSeen.clear();
+          clearDrafts();
           timelineRows.clear();
           pickedProjects.clear();
           forgetComposer();
@@ -425,11 +460,11 @@ class Link {
         // Opened can land before or after the Ack. What is in the provisional
         // composer now is the user's own newer text unless it is still exactly the
         // message just sent (its Ack has not arrived to clear it).
-        const typed = drafts.get(old),
+        const typed = draftText(old),
           sent = unacked.get(old);
-        drafts.delete(old);
+        setDraftText(old, "");
         const fresh = keyOf(msg.scope, msg.thread);
-        if (typed?.trim() && typed !== sent?.content) drafts.set(fresh, typed);
+        if (typed.trim() && typed !== sent?.content) setDraftText(fresh, typed);
         moveImages(old, fresh, sent?.images);
         open(msg.scope, msg.thread);
       }
@@ -812,7 +847,7 @@ function open(scope, id) {
   jumpLatest.reset();
   $("asks").replaceChildren();
   $("timeline").replaceChildren();
-  $("draft").value = drafts.get(keyOf(scope, id)) || "";
+  $("draft").value = draftText(keyOf(scope, id));
   page("conversation");
   syncDraftHeight();
   notice();
@@ -2697,7 +2732,7 @@ $("worker-form").onsubmit = (e) => {
 $("draft").oninput = () => {
   mentionInput();
   if (selected)
-    drafts.set(keyOf(selected.scope, selected.id), $("draft").value);
+    setDraftText(keyOf(selected.scope, selected.id), $("draft").value);
   syncDraftHeight();
   updateComposerState();
 };
@@ -2759,7 +2794,7 @@ $("composer").onsubmit = (e) => {
       pendingNew = null;
       if (ok && !sentNow.restored) {
         clearImages(owner, images);
-        if (drafts.get(owner) === content) drafts.delete(owner);
+        if (draftText(owner) === content) setDraftText(owner, "");
         if (
           keyOf(selected?.scope || scope, selected?.id) === owner &&
           $("draft").value === content
@@ -2801,6 +2836,7 @@ $("pair-form").onsubmit = async (e) => {
     $("pair-link").value = "";
     code = null;
     key = await deviceKey();
+    clearDrafts();
     start(true);
   } catch (err) {
     if (err.status === 403) {
@@ -2833,42 +2869,40 @@ function setAlertsDismissed(on) {
     // Private windows may refuse storage; the banner then simply returns.
   }
 }
+function pushBlockReason() {
+  const supportsPush =
+    "serviceWorker" in navigator &&
+    "Notification" in window &&
+    "PushManager" in window;
+  if (ios && !standalone)
+    return "On iPhone, tap Share → Add to Home Screen in Safari. Turn on Open as Web App if shown. Open OX from its icon, scan a fresh pairing QR, then enable notifications there.";
+  if (!supportsPush)
+    return "This browser cannot receive session notifications. On iPhone, use the Home Screen app on iOS 16.4 or later.";
+  if (Notification.permission === "denied")
+    return ios
+      ? "Notifications are off. In iPhone Settings → Notifications, choose the name of this web app and turn on Allow Notifications. Then return to OX."
+      : "Allow notifications for this site in your browser settings, then return to OX.";
+  return null;
+}
 function notificationSetup(justPaired) {
   if (justPaired) {
     setAlertsDismissed(false);
     $("notification-setup").open = true;
   }
-  const supportsPush =
-    "serviceWorker" in navigator &&
-    "Notification" in window &&
-    "PushManager" in window;
-  if (ios && !standalone) {
-    notificationGuide(
-      "On iPhone, tap Share → Add to Home Screen in Safari. Turn on Open as Web App if shown. Open OX from its icon, scan a fresh pairing QR, then enable notifications there.",
-    );
-  } else if (!supportsPush) {
-    notificationGuide(
-      "This browser cannot receive session notifications. On iPhone, use the Home Screen app on iOS 16.4 or later.",
-    );
-  } else if (Notification.permission === "denied") {
-    notificationGuide(
-      ios
-        ? "Notifications are off. In iPhone Settings → Notifications, choose the name of this web app and turn on Allow Notifications. Then return to OX."
-        : "Allow notifications for this site in your browser settings, then return to OX.",
-    );
-  } else {
+  const blocked = pushBlockReason();
+  if (blocked) notificationGuide(blocked);
+  else {
     notificationGuide(
       "Get alerts when a session needs approval or an answer, finishes a turn, or fails. Tap Enable notifications, then Allow.",
       "Enable notifications",
     );
     if (Notification.permission === "granted") registerNotifications(false);
   }
-  // One-time banner until alerts are on or the user dismisses it; then it lives in the menu.
+  // One-time setup banner. Preferences are always in the Sessions menu.
   const granted =
     "Notification" in window && Notification.permission === "granted";
   const dismissed = alertsDismissed();
   $("notification-banner").hidden = granted || dismissed;
-  $("open-notifications").hidden = granted || !dismissed;
 }
 $("notification-dismiss").onclick = () => {
   setAlertsDismissed(true);
@@ -2876,9 +2910,7 @@ $("notification-dismiss").onclick = () => {
 };
 $("open-notifications").onclick = () => {
   closeActionMenus();
-  setAlertsDismissed(false);
-  notificationSetup(false);
-  $("notification-setup").open = true;
+  phoneSettings.openNotifications();
 };
 let registering = false;
 async function registerNotifications(explicit) {
@@ -2905,6 +2937,7 @@ function pairingPage() {
   page("pair");
   net("Pair device");
   const scanned = Boolean(code);
+  $("pair-install").hidden = !ios || standalone;
   $("step-scan").toggleAttribute("aria-current", !scanned);
   $("step-name").toggleAttribute("aria-current", scanned);
   $("scan-pair").hidden = scanned;
@@ -2959,6 +2992,7 @@ navigator.serviceWorker?.addEventListener("message", (e) => {
 });
 try {
   key = await deviceKey();
+  if (!key) clearDrafts();
   if (code || !key) pairingPage();
   else start();
 } catch {

@@ -18,11 +18,15 @@ const POLL_FOR: Duration = Duration::from_secs(600);
 
 /// Route for a fresh install, from local CLI state and any already-saved API model.
 pub(super) fn first_launch_route() -> Route {
-    platform::onboarding::initial_route(platform::onboarding::probe(Runtime::Codex), || {
-        crate::settings::load()
-            .ok()
-            .and_then(|s| s.models.first().cloned())
-    })
+    platform::onboarding::initial_route(
+        platform::onboarding::probe(Runtime::Codex),
+        platform::onboarding::probe(Runtime::Claude),
+        || {
+            crate::settings::load()
+                .ok()
+                .and_then(|s| s.models.first().cloned())
+        },
+    )
 }
 
 /// Secondary choices beside the main action of an onboarding card.

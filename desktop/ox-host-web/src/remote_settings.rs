@@ -31,6 +31,9 @@ enum DeviceAction {
     HostProfile {
         edit: Option<crate::host_profile::Edit>,
     },
+    PushPreferences {
+        change: Option<crate::push::PreferenceEdit>,
+    },
     Devices,
     PairDevice,
     InviteWorkerHost,
@@ -86,6 +89,11 @@ pub(super) async fn settings(
         if let Some(op) = &device_action {
             let data = match op {
                 DeviceAction::HostUpdate { .. } => None,
+                DeviceAction::PushPreferences { change } => Some(json!(
+                    state
+                        .push_preferences(&id, *change)
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                )),
                 DeviceAction::HostModePolicy { set } => Some(
                     json!({"policy":state.mode_policy(*set).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?}),
                 ),

@@ -4347,6 +4347,7 @@ mod tests {
                         thread: "t".into(),
                         title: "Title".into(),
                         event: ox_desk_core::host_protocol::NotificationKind::Finished,
+                        goal_reached: false,
                     },
                 ],
             )
