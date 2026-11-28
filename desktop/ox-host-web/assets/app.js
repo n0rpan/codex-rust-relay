@@ -13,7 +13,7 @@ import {
   mentionInput,
   forgetComposer,
 } from "./composer-tools.js";
-import { pairingCode, setupCamera } from "./pair-camera.js";
+import { pairingInvitation, setupCamera } from "./pair-camera.js";
 import { ActivityLine } from "./activity.js";
 import * as wire from "./wire.js";
 import { SessionControls } from "./controls.js";
@@ -130,8 +130,9 @@ function page(id) {
 }
 const hash = new URLSearchParams(location.hash.slice(1));
 const notificationTarget = new NotificationTarget();
-notificationTarget.request(hash.get("thread"));
 let code = hash.get("pair");
+let pairingTarget = code ? hash.get("thread") : null;
+notificationTarget.request(code ? null : hash.get("thread"));
 if (location.hash) history.replaceState(null, "", location.pathname);
 // Whether the host has an OX API provider: then every catalog alias is a route for both
 // runtimes, even when the first Hello (before discovery finished) listed none.
@@ -2742,8 +2743,9 @@ $("composer").onsubmit = (e) => {
   }
   repaint();
 };
-const closeCamera = setupCamera((secret) => {
-  code = secret;
+const closeCamera = setupCamera((invitation) => {
+  code = invitation.code;
+  pairingTarget = invitation.thread;
   $("pair-link").value = "";
   notice();
   pairingPage();
@@ -2759,17 +2761,22 @@ $("pair-form").onsubmit = async (e) => {
   e.preventDefault();
   try {
     closeCamera();
-    const secret = code ?? pairingCode($("pair-link").value, location.origin);
-    if (!/^[A-Za-z0-9_-]{43}$/.test(secret))
+    const invitation = code
+      ? { code, thread: pairingTarget }
+      : pairingInvitation($("pair-link").value, location.origin);
+    if (!/^[A-Za-z0-9_-]{43}$/.test(invitation.code))
       throw new Error("Request a fresh pairing QR in OX Desktop.");
-    await pair(secret, $("device-label").value);
+    await pair(invitation.code, $("device-label").value);
+    if (invitation.thread) notificationTarget.request(invitation.thread);
     $("pair-link").value = "";
     code = null;
+    pairingTarget = null;
     key = await deviceKey();
     start(true);
   } catch (err) {
     if (err.status === 403) {
       code = null;
+      pairingTarget = null;
       pairingPage();
       notice(
         "Pairing was refused. Get a fresh code in OX Desktop for this Tailscale account.",

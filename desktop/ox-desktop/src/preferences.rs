@@ -151,6 +151,19 @@ impl Preferences {
             self.goto(Page::Remote, cx);
         }
     }
+    pub(crate) fn open_session_on_phone(
+        &mut self,
+        scope: &ox_desk_core::host_protocol::Scope,
+        thread: &str,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_remote(cx);
+        if let Some(remote) = &self.remote {
+            remote.update(cx, |view, cx| view.set_session(scope, thread, title, cx));
+        }
+    }
+
     fn goto(&mut self, page: Page, cx: &mut Context<Self>) {
         let page = if page == Page::Remote && self.link.remote().is_some() {
             Page::Hosts

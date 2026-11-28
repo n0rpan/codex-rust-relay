@@ -13,6 +13,8 @@ pub mod host_updates;
 pub mod inventory;
 #[cfg(feature = "client")]
 pub mod paired_hosts;
+#[cfg(feature = "client")]
+pub mod phone_link;
 #[cfg(feature = "server")]
 mod push;
 pub mod serve;

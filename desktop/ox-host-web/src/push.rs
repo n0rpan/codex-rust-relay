@@ -553,13 +553,7 @@ fn notices(bytes: &[u8], cursor: Option<&Cursor>, asks: &mut ActiveAsks) -> io::
             .filter(|c| !c.is_control())
             .take(80)
             .collect::<String>();
-        let alias = match &scope.route.billing {
-            ox_desk_core::runtime::Billing::Subscription => None,
-            ox_desk_core::runtime::Billing::Api(a) => Some(a.as_str()),
-        };
-        let identity = serde_json::to_vec(&(&scope.project, scope.route.runtime, alias, &thread))?;
-        let hash = ring::digest::digest(&ring::digest::SHA256, &identity);
-        let thread = format!("{thread}~{}", B64.encode(hash.as_ref()));
+        let thread = crate::phone_link::session_target(&scope, &thread)?;
         payloads.push(Notice {
             ask,
             expires: Instant::now() + ttl,

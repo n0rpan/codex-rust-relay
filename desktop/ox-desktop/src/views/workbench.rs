@@ -162,6 +162,13 @@ impl EventEmitter<CatalogChanged> for Workbench {}
 pub(super) struct OpenThread(pub super::host::ParentLink);
 impl EventEmitter<OpenThread> for Workbench {}
 
+pub(super) struct OpenOnPhone {
+    pub scope: ox_desk_core::host_protocol::Scope,
+    pub thread: String,
+    pub title: String,
+}
+impl EventEmitter<OpenOnPhone> for Workbench {}
+
 #[derive(Default)]
 pub(super) struct Stats {
     pub(super) drains: u64,
@@ -1248,6 +1255,36 @@ impl Workbench {
                                         .flex_wrap()
                                         .min_w_0()
                                         .gap(px(SPACE_XS))
+                                        .when_some(
+                                            self.store
+                                                .as_ref()
+                                                .and_then(|store| store.selected())
+                                                .filter(|_| self.link.remote().is_none())
+                                                .map(str::to_owned),
+                                            |tools, thread| {
+                                                let title = title
+                                                    .clone()
+                                                    .unwrap_or_else(|| "this session".to_owned());
+                                                tools.child(crate::kit::button(
+                                                    p,
+                                                    "session-open-on-phone",
+                                                    "Open on phone",
+                                                    false,
+                                                    true,
+                                                    cx.listener(move |s, _, _, cx| {
+                                                        cx.emit(OpenOnPhone {
+                                                            scope:
+                                                                ox_desk_core::host_protocol::Scope {
+                                                                    project: s.project.clone(),
+                                                                    route: s.route.clone(),
+                                                                },
+                                                            thread: thread.clone(),
+                                                            title: title.clone(),
+                                                        })
+                                                    }),
+                                                ))
+                                            },
+                                        )
                                         .children(review_toggle)
                                         .children(terminal)
                                         .children(controls),
