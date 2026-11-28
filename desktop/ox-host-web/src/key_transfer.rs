@@ -184,10 +184,11 @@ fn execute(app: &App, device: &str, login: &str, action: KeyAction) -> Result<Va
                 }
                 ox::request(&bin, &path, request)
             };
-            let sent = review.send(export).map_err(|_| {
+            let review_host = review.host.name.clone();
+            let receipt = review.send(export).map_err(|_| {
                 "The destination did not confirm the transfer. Reopen the review to check its keys."
             })?;
-            Ok(json!({"sent":sent}))
+            Ok(json!({"sent":receipt.sent,"message":receipt.message(&review_host)}))
         }
     }
 }

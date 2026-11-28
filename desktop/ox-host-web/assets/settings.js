@@ -845,11 +845,8 @@ export function setupSettings({ request, open, close, notifications, login }) {
       if (id !== pageId || panel.hidden) return;
       credentials();
       status.textContent =
-        "Sent " +
-        result.sent +
-        (result.sent === 1 ? " key to " : " keys to ") +
-        review.host.name +
-        ".";
+        result.message ??
+        `Sent ${result.sent} ${result.sent === 1 ? "key" : "keys"} to ${review.host.name}.`;
     });
     const send = form.querySelector('button[type="submit"]');
     const selection = () => {
@@ -878,26 +875,15 @@ export function setupSettings({ request, open, close, notifications, login }) {
         node("p", key.scope),
         node(
           "p",
-          key.environment
-            ? "Environment key active"
-            : key.saved
-              ? "Saved key configured"
-              : key.configured
-                ? "Configured"
+          !key.configured && key.saved
+            ? "Saved · configure this endpoint to use the key"
+            : key.environment
+              ? "Environment key active"
+              : key.saved
+                ? "Saved key configured"
                 : "No key configured",
         ),
       );
-      const field = textField(
-        form,
-        key.saved ? "Replacement key" : "New key",
-        "secret",
-        "password",
-      );
-      field.autocomplete = "new-password";
-      field.maxLength = 8192;
-      field.required = true;
-      field.spellcheck = false;
-      field.setAttribute("autocapitalize", "none");
       const req = (value) => ({
         action: "edit_key",
         revision,
@@ -905,11 +891,24 @@ export function setupSettings({ request, open, close, notifications, login }) {
         scope: key.scope,
         value,
       });
-      submit(form, key.saved ? "Replace key" : "Save key", async () => {
-        const value = field.value;
-        field.value = "";
-        await save(req(value), credentials);
-      });
+      if (key.configured) {
+        const field = textField(
+          form,
+          key.saved ? "Replacement key" : "New key",
+          "secret",
+          "password",
+        );
+        field.autocomplete = "new-password";
+        field.maxLength = 8192;
+        field.required = true;
+        field.spellcheck = false;
+        field.setAttribute("autocapitalize", "none");
+        submit(form, key.saved ? "Replace key" : "Save key", async () => {
+          const value = field.value;
+          field.value = "";
+          await save(req(value), credentials);
+        });
+      }
       if (key.saved)
         form.append(
           confirmAction(

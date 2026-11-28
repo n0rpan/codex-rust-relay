@@ -1979,6 +1979,18 @@ fn default_models_url(base: &Url) -> Url {
     url
 }
 
+pub(crate) fn alibaba_chat_catalog_path(host: &str) -> Option<&'static str> {
+    Some(match host {
+        "coding-intl.dashscope.aliyuncs.com" => "/v1/models",
+        "dashscope.aliyuncs.com"
+        | "dashscope-intl.aliyuncs.com"
+        | "dashscope-us.aliyuncs.com"
+        | "cn-hongkong.dashscope.aliyuncs.com" => "/compatible-mode/v1/models",
+        host if host.ends_with(".maas.aliyuncs.com") => "/compatible-mode/v1/models",
+        _ => return None,
+    })
+}
+
 /// The Anthropic-compatible path has no catalog. Use the OpenAI-compatible
 /// catalog on the very same documented Model Studio origin and plan.
 fn alibaba_messages_catalog(base: &Url) -> Option<Url> {
@@ -1991,15 +2003,7 @@ fn alibaba_messages_catalog(base: &Url) -> Option<Url> {
     {
         return None;
     }
-    let path = match base.host_str()? {
-        "coding-intl.dashscope.aliyuncs.com" => "/v1/models",
-        "dashscope.aliyuncs.com"
-        | "dashscope-intl.aliyuncs.com"
-        | "dashscope-us.aliyuncs.com"
-        | "cn-hongkong.dashscope.aliyuncs.com" => "/compatible-mode/v1/models",
-        host if host.ends_with(".maas.aliyuncs.com") => "/compatible-mode/v1/models",
-        _ => return None,
-    };
+    let path = alibaba_chat_catalog_path(base.host_str()?)?;
     let mut catalog = base.clone();
     catalog.set_path(path);
     Some(catalog)

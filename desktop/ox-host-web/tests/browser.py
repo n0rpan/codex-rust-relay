@@ -848,6 +848,11 @@ def run(harness, screenshot=None):
             from key_copy import receiver
             copy_fixture = receiver(d, stack)
         source_env = dict(os.environ, **(copy_fixture[0] if copy_fixture else {}), DBUS_SESSION_BUS_ADDRESS="unix:path="+str(d/"no-session-bus"), SHELL="/bin/sh", GARDEN_TOKEN="fixture-env-token", HOME=str(isolated), CODEX_HOME=str(codex), CLAUDE_CONFIG_DIR=str(isolated/".claude"), XDG_STATE_HOME=str(isolated/"state"), XDG_CONFIG_HOME=str(isolated/"config"), OX_TEST_REMOTE_DIR=str(d))
+        # Provider catalogs may be requested after the synthetic cloud key is imported.
+        # Only the local fixtures and the paired destination should be reachable.
+        for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            source_env[var] = source_env[var.lower()] = "http://127.0.0.1:1"
+        source_env["NO_PROXY"] = source_env["no_proxy"] = "127.0.0.1,localhost,.fixture.ts.net"
         service = subprocess.Popen(
             [harness, "--exact", "fixture::browser_service", "--ignored"],
             env=source_env,
@@ -1251,11 +1256,15 @@ def run(harness, screenshot=None):
         assert canary not in json.dumps(remaining) and any(k["saved"] and k["name"]=="GARDEN_TOKEN" for k in remaining["credentials"])
         brave = {"name": "BRAVE_SEARCH_API_KEY", "scope": "https://api.search.brave.com/"}
         transfer = {"action": "import_keys", "revision": remaining["revisions"]["keys"],
-                    "keys": [dict(brave, value="fixture-transfer-brave")]}
+                    "keys": [dict(brave, value="fixture-transfer-brave"),
+                             {"name": "ALIBABA_API_KEY", "scope": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                              "value": "fixture-transfer-alibaba"}]}
         assert settings(transfer) == {"status": "applied"}
         assert settings(transfer)["status"] == "changed_on_disk"
         after_transfer = settings({"action": "read_rows"})
         assert "fixture-transfer-brave" not in json.dumps(after_transfer)
+        assert "fixture-transfer-alibaba" not in json.dumps(after_transfer)
+        assert "alibaba/qwen3.8-flash" in after_transfer["models"]
         assert "fixture-transfer-brave" in (codex / "ox-api-keys.json").read_text()
         if copy_fixture:
             from key_copy import exercise as copy_keys

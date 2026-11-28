@@ -1,4 +1,4 @@
-"""Pair a second service and transfer a single reviewed key using the web controls."""
+"""Pair a second service and transfer reviewed keys using the web controls."""
 from contextlib import ExitStack
 from pathlib import Path
 import json
@@ -110,10 +110,10 @@ def exercise(js, wait, invite, saved, receiver_state, source):
             .find(b => b.textContent.trim() === arguments[0] && b.getClientRects().length && !b.disabled);
             if (!btn) return false; btn.click(); return true;""", label))
 
-    def select_brave():
+    def select_keys():
         js("""for(const label of document.querySelectorAll('#settings label')) {
             const box=label.querySelector('input[type=checkbox]');
-            if(box) box.checked=label.textContent.includes('Brave Search ·');
+            if(box) box.checked=/Brave Search ·|ALIBABA_API_KEY/.test(label.textContent);
         } document.querySelector('#settings form').dispatchEvent(new Event('change',{bubbles:true}));""")
 
     js("""window.originalTransferFetch = window.fetch;
@@ -124,8 +124,8 @@ def exercise(js, wait, invite, saved, receiver_state, source):
             if (new URL(resource, location.href).pathname === '/api/settings') {
                 const operation = JSON.parse(JSON.parse(init.body).request);
                 if (operation.action === 'send_key_transfer') window.observedKeySend = true;
-                if (String(init?.body).includes('fixture-transfer-brave') ||
-                    (await response.clone().text()).includes('fixture-transfer-brave'))
+                if (/fixture-transfer-(brave|alibaba)/.test(String(init?.body)) ||
+                    /fixture-transfer-(brave|alibaba)/.test(await response.clone().text()))
                     window.transferExposedValue = true;
             }
             return response;
@@ -145,7 +145,7 @@ def exercise(js, wait, invite, saved, receiver_state, source):
     except AssertionError as exc:
         raise AssertionError(js("return document.querySelector('#settings').innerText")) from exc
     assert js("return document.querySelector('#settings').innerText.includes('incur charges')")
-    select_brave()
+    select_keys()
     # A key rotation between the review and send must leave the destination untouched.
     request_key = """const query=arguments[0]; return import('./device.js').then(async m=>
         m.settingsRequest(await m.deviceKey(),query))"""
@@ -159,10 +159,14 @@ def exercise(js, wait, invite, saved, receiver_state, source):
     assert not saved.exists()
     go("Refresh review")
     wait(lambda: js("return !!document.querySelector('#settings input[type=checkbox]')"))
-    select_brave()
+    select_keys()
     go("Send selected keys")
-    wait(lambda: js("return document.querySelector('#settings').innerText.includes('Sent 1 key to ')"))
+    wait(lambda: js("return document.querySelector('#settings').innerText.includes('Sent 2 keys to ')"))
+    assert js("return document.querySelector('#settings').innerText.includes('1 key still needs endpoint setup')")
+    config = saved.with_name("codeox.toml").read_text()
+    assert '[providers.alibaba]' in config and 'fixture-transfer-alibaba' not in config
     content = saved.read_text()
+    assert "fixture-transfer-alibaba" in content
     assert "fixture-transfer-brave" in content and "GARDEN_TOKEN" not in content
     assert not js("return [document.body.textContent,JSON.stringify(localStorage),JSON.stringify(sessionStorage)].some(t=>t.includes('fixture-transfer-brave'))")
     go("Copy keys to another host…")
@@ -188,7 +192,7 @@ def exercise(js, wait, invite, saved, receiver_state, source):
     web.unlink()
     assert js(request_key, review_query)["pairing"] == old
     assert js("window.fetch = window.originalTransferFetch; return window.observedKeySend && !window.transferExposedValue")
-    print("PASS web UI sends only Brave Search, rejects stale reviews and foreign-owned peers, and preserves existing desktop pairings", flush=True)
+    print("PASS web UI copies selected keys, configures Alibaba on the destination, rejects stale reviews and foreign-owned peers, and preserves desktop pairings", flush=True)
 
 
 def worker_links(js, wait, state, source, restart, harness, source_env):

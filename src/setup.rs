@@ -184,6 +184,49 @@ pub(crate) fn desktop_presets() -> Vec<(String, String)> {
     templates
 }
 
+/// Only seed routes whose credential name and endpoint identify a built-in service.
+pub(crate) fn transferred_provider(name: &str, scope: &str) -> Option<(&'static str, String)> {
+    let preset = PRESETS.iter().find(|preset| preset.env == name)?;
+    let url = reqwest::Url::parse(scope).ok()?;
+    let wire = match preset.url {
+        Some(expected) if scope == expected => preset.wire,
+        None if preset.id == "alibaba" && url.scheme() == "https" && url.port().is_none() => {
+            let catalog = crate::provider::alibaba_chat_catalog_path(url.host_str()?)?;
+            if url.as_str() != scope {
+                return None;
+            }
+            if url.path() == catalog.strip_suffix("/models")? {
+                WireKind::ChatCompletions
+            } else if url.path() == "/apps/anthropic/v1" {
+                WireKind::AnthropicMessages
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    let section = render_provider_section(&ProviderForm {
+        key: preset.id.into(),
+        name: Some(preset.name.into()),
+        base_url: scope.into(),
+        wire,
+        env_key: Some(preset.env.into()),
+        models_url: (preset.id == "opencode-go")
+            .then(|| "https://opencode.ai/inference/go/v1/models".into()),
+        anthropic_version: (preset.id == "anthropic").then(|| "2026-10-21".into()),
+        discovery: Some(true),
+        models: if preset.id == "alibaba" {
+            vec![ModelForm {
+                id: "qwen3.8-flash".into(),
+                ..ModelForm::default()
+            }]
+        } else {
+            Vec::new()
+        },
+    });
+    Some((preset.id, section))
+}
+
 pub(crate) fn guided_provider(home: &Path) -> Result<(), RelayError> {
     let mut prompt = Prompt {
         input: &mut std::io::stdin().lock(),
@@ -1799,7 +1842,7 @@ fn toml_string(value: &str) -> String {
     out
 }
 
-fn append_section(existing: &str, section: &str) -> String {
+pub(crate) fn append_section(existing: &str, section: &str) -> String {
     let mut out = String::with_capacity(existing.len() + section.len() + 2);
     out.push_str(existing);
     if !existing.is_empty() {

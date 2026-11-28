@@ -524,8 +524,12 @@ impl Render for Hosts {
                             if let Some(r) = s.review.take() {
                                 s.work(
                                     cx,
-                                    move || r.send(crate::settings::request),
-                                    |s, count, _| s.notice = format!("Sent {count} API keys."),
+                                    move || {
+                                        let host = r.host.name.clone();
+                                        r.send(crate::settings::request)
+                                            .map(|receipt| receipt.message(&host))
+                                    },
+                                    |s, message, _| s.notice = message,
                                 );
                             }
                         }),
