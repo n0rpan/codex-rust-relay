@@ -324,6 +324,8 @@ pub(crate) struct Engine {
     host_name: String,
     subscription_limits: ox_desk_core::usage::reported::ReportedLimits,
     ledger: Ledger,
+    #[cfg(test)]
+    source_moves: source_moves::SourceMoves,
     replay: Replay,
     tx: SyncSender<Message>,
     clients: BTreeMap<u64, ClientState>,
@@ -366,6 +368,8 @@ mod placement;
 use placement::HostQuery;
 mod mode_requests;
 mod notices;
+#[cfg(test)]
+mod source_moves;
 
 impl Drop for Engine {
     fn drop(&mut self) {
@@ -418,6 +422,8 @@ impl Engine {
             host_name: sysinfo::System::host_name().unwrap_or_else(|| host_id.to_string()),
             config,
             ledger,
+            #[cfg(test)]
+            source_moves: source_moves::SourceMoves::open(dir, host_id)?,
             replay: Replay::new(seq, nonce()?),
             tx,
             clients: Default::default(),
@@ -561,6 +567,8 @@ impl Engine {
                         self.reap_idle(now)?;
                     }
                     self.poll_forwarded(now)?;
+                    #[cfg(test)]
+                    self.advance_source_moves()?;
                     self.advance_flows()?;
                 }
                 Some(Message::Replace(binary, _reservation)) => {
@@ -615,7 +623,14 @@ impl Engine {
                     Gateway::Launch(_) if self.draining.is_some() => {
                         self.answer(reply, Err(crate::handover::REFUSAL.into()))?
                     }
-                    Gateway::Launch(start) => self.launch(caller, start, reply)?,
+                    Gateway::Launch(start) => {
+                        #[cfg(test)]
+                        if let Err(error) = self.check_move_launch(&caller) {
+                            self.answer(reply, Err(error.to_string()))?;
+                            continue;
+                        }
+                        self.launch(caller, start, reply)?;
+                    }
                     Gateway::Call(ParentCall::ListHosts) => self.list_hosts(&caller, reply)?,
                     Gateway::Call(call @ ParentCall::ReadThread { .. }) => {
                         self.read_thread(&caller, call, reply)?
@@ -959,6 +974,12 @@ impl Engine {
                 target_host,
                 window,
             } => {
+                #[cfg(test)]
+                if let Err(error) =
+                    self.check_source_move_action(&scope, &Action::StartHandoff(start.clone()))
+                {
+                    return self.answer(Replier::Client(id, key), Err(error.to_string()));
+                }
                 let result = self.export_handoff(id, &key, scope, start, target_host, window);
                 if let Err(error) = result {
                     self.answer(Replier::Client(id, key), Err(error.to_string()))?;
@@ -1031,6 +1052,12 @@ impl Engine {
                         id,
                         fail("Subscribe to the target scope before sending actions".into()),
                     );
+                }
+                #[cfg(test)]
+                if !self.running.contains_key(&scope)
+                    && let Err(error) = self.check_source_move_action(&scope, &action)
+                {
+                    return self.reply(id, fail(error.to_string()));
                 }
                 // Ending a thread on a route the host closed needs no process: nothing
                 // there is running, so reopening one only to tell it so would start a runtime
@@ -1453,6 +1480,8 @@ impl Engine {
         approval: Option<String>,
         approved_mode: Option<(ox_desk_core::modes::Level, Sender)>,
     ) -> io::Result<()> {
+        #[cfg(test)]
+        self.check_source_move_action(scope, &action)?;
         let live = self.running.get_mut(scope).expect("validated live scope");
         if let Action::AnswerAsk(ask, _) | Action::AnswerQuestions(ask, _) = &action
             && (approval.is_none() || live.tokens.get(ask) != approval.as_ref())
@@ -1791,6 +1820,11 @@ impl Engine {
     ) -> io::Result<()> {
         self.process_scope(scope, events, from_action)?;
         self.apply_notice_receipts(scope)?;
+        #[cfg(test)]
+        {
+            self.collect_source_move_releases(scope)?;
+            self.advance_source_moves()?;
+        }
         self.advance_flows()
     }
     fn process_scope(
@@ -3101,6 +3135,8 @@ impl Engine {
     /// A busy thread is refused unless `force` is set, so a stale window or remote client
     /// cannot kill a running turn and its workers by accident.
     fn end_thread(&mut self, scope: &Scope, thread: &str, force: bool) -> io::Result<()> {
+        #[cfg(test)]
+        self.check_source_move_action(scope, &Action::EndSession(thread.into()))?;
         if !self.running.contains_key(scope) {
             return Err(io::Error::other(
                 "This route is not open on the session host.",
@@ -3209,6 +3245,10 @@ impl Engine {
     /// app-server (or the idle Claude draft process). The saved sessions stay listed
     /// and the next subscriber or action reopens the route.
     fn reap_empty(&mut self, scope: &Scope) -> io::Result<()> {
+        #[cfg(test)]
+        if self.hold_move_source_scope(scope)? {
+            return Ok(());
+        }
         let Some(live) = self.running.get(scope) else {
             return Ok(());
         };
@@ -4444,6 +4484,128 @@ mod tests {
                 ..parent.clone()
             };
             (parent, worker)
+        }
+
+        fn move_plan(engine: &Engine, scope: &Scope, native: &str) -> crate::move_ledger::Plan {
+            crate::move_ledger::Plan {
+                id: uuid::Uuid::new_v4(),
+                session: uuid::Uuid::new_v4(),
+                source: crate::move_ledger::Owner {
+                    host: engine.host_id,
+                    generation: 0,
+                    scope: scope.clone(),
+                    native: native.into(),
+                },
+                target_host: uuid::Uuid::new_v4(),
+                target_scope: Scope {
+                    project: "/studio/project".into(),
+                    route: scope.route.clone(),
+                },
+            }
+        }
+
+        #[test]
+        fn queued_source_move_reserves_the_next_turn_until_the_exact_result_is_idle() {
+            use crate::move_ledger::Status;
+            let root = tempfile::tempdir().unwrap();
+            let (tx, _mailbox) = std::sync::mpsc::sync_channel(32);
+            let (scope, other_route) = scopes(root.path());
+            let mut engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            let (source, sent) = live(
+                &scope,
+                vec![view(&scope, "lead", "running", "default")],
+                &["lead"],
+                vec![],
+            );
+            engine.running.insert(scope.clone(), source);
+            let plan = move_plan(&engine, &scope, "lead");
+            assert_eq!(
+                engine.prepare_source_move(&plan, true).unwrap(),
+                Status::Queued
+            );
+            let send = || Action::SendText(Some("lead".into()), "existing turn".into());
+            assert!(engine.check_source_move_action(&scope, &send()).is_ok());
+            assert!(
+                engine
+                    .check_source_move_action(
+                        &scope,
+                        &Action::DraftEdit(Some("lead".into()), "existing turn".into()),
+                    )
+                    .is_ok()
+            );
+            assert!(
+                engine
+                    .check_source_move_action(&scope, &Action::Stop("lead".into()))
+                    .is_ok()
+            );
+            assert!(
+                engine
+                    .check_source_move_action(&scope, &Action::Terminal(Some("lead".into())))
+                    .is_err()
+            );
+
+            let update = |engine: &mut Engine, seq, active: Option<&str>, finished: &str| {
+                let mut row = view(
+                    &scope,
+                    "lead",
+                    if active.is_some() { "running" } else { "idle" },
+                    "default",
+                );
+                row.detail["last_result"] =
+                    json!({"turn":finished,"completed_at":1,"outcome":"completed"});
+                let events = vec![LinkEvent::Host(Box::new(Server::Delta {
+                    cursor: Cursor {
+                        epoch: "e".into(),
+                        seq,
+                    },
+                    scope: scope.clone(),
+                    changes: vec![
+                        Change::Session { session: row },
+                        Change::TimelineState {
+                            thread: "lead".into(),
+                            detail: json!({"active":active,"ready":true}),
+                        },
+                    ],
+                }))];
+                engine.process(&scope, events, false).unwrap();
+            };
+            update(&mut engine, 2, None, "other-turn");
+            assert_eq!(
+                engine.source_move_status(plan.id).unwrap(),
+                Some(Status::Queued)
+            );
+            assert_eq!(
+                engine.prepare_source_move(&plan, true).unwrap(),
+                Status::Queued
+            );
+            assert!(engine.act(0, "next", &scope, send(), None).is_err());
+            assert!(sent.lock().unwrap().is_empty());
+            update(&mut engine, 3, Some("native-busy"), "t1");
+            assert_eq!(
+                engine.source_move_status(plan.id).unwrap(),
+                Some(Status::Queued)
+            );
+            assert!(engine.check_source_move_action(&scope, &send()).is_err());
+            assert!(
+                engine
+                    .check_source_move_action(&other_route, &send())
+                    .is_ok()
+            );
+            update(&mut engine, 4, None, "t1");
+            assert_eq!(
+                engine.source_move_status(plan.id).unwrap(),
+                Some(Status::Preparing)
+            );
+            assert!(
+                engine
+                    .check_source_move_action(&scope, &Action::SelectThread("lead".into()))
+                    .is_err()
+            );
+            assert!(
+                engine
+                    .check_source_move_action(&scope, &Action::LoadOlder("lead".into()))
+                    .is_ok()
+            );
         }
         fn hosted(scope: &Scope) -> Caller {
             Caller::Hosted {
@@ -6759,6 +6921,63 @@ mod tests {
             let mut engine = Engine::open(config(root), root, tx).unwrap();
             engine.running.insert(scope.clone(), live);
             (scope, lead, engine, rx)
+        }
+
+        #[test]
+        fn a_staged_source_move_waits_for_the_native_release_before_commit() {
+            use crate::move_ledger::{Prepared, Stage, Status};
+            let root = tempfile::tempdir().unwrap();
+            let (scope, lead, mut engine, rx) = warm_claude(root.path());
+            let plan = move_plan(&engine, &scope, &lead);
+            assert_eq!(
+                engine.prepare_source_move(&plan, false).unwrap(),
+                Status::Preparing
+            );
+            assert!(engine.running[&scope].store.has_live_session(&lead));
+            let prepared = Prepared {
+                plan: plan.clone(),
+                stage: Stage {
+                    digest: [8; 32],
+                    native: "studio-native".into(),
+                },
+            };
+            assert!(
+                engine
+                    .stage_source_move(uuid::Uuid::new_v4(), &prepared)
+                    .is_err()
+            );
+            assert_eq!(
+                engine.source_move_status(plan.id).unwrap(),
+                Some(Status::Preparing)
+            );
+            assert_eq!(
+                engine
+                    .stage_source_move(plan.target_host, &prepared)
+                    .unwrap(),
+                Status::Fenced
+            );
+            assert_eq!(
+                engine.source_move_status(plan.id).unwrap(),
+                Some(Status::Fenced)
+            );
+            assert!(engine.running[&scope].store.has_live_session(&lead));
+            pump_engine(&mut engine, &scope, &rx, &|engine| {
+                engine.source_move_status(plan.id).unwrap() == Some(Status::Committed)
+            });
+            assert!(!engine.running[&scope].store.has_live_session(&lead));
+            drop(engine);
+
+            let (tx, _mailbox) = std::sync::mpsc::sync_channel(32);
+            let engine = Engine::open(config(root.path()), root.path(), tx).unwrap();
+            assert_eq!(
+                engine.source_move_status(plan.id).unwrap(),
+                Some(Status::Committed)
+            );
+            assert!(
+                engine
+                    .check_source_move_action(&scope, &Action::SelectThread(lead))
+                    .is_err()
+            );
         }
         /// Start one session worker from `lead` on the lead's own warm route and drive the
         /// host until its launch answers.

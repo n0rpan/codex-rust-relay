@@ -2,6 +2,7 @@
 //! The host actor validates peer proofs, stages files, and releases the native
 //! writer. This ledger binds those effects to the same move on every retry.
 use ox_desk_core::host_protocol::Scope;
+use ox_desk_core::store::MoveWriterRelease;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -470,6 +471,30 @@ impl Ledger {
         }
     }
 
+    /// Commit only a native release from the exact fenced thread and route.
+    /// After a restart, a durable Released record can retry commit directly.
+    pub(crate) fn accept_writer_release(
+        &mut self,
+        scope: &Scope,
+        release: MoveWriterRelease,
+    ) -> io::Result<Option<Commit>> {
+        let Some(plan) = self
+            .pending_sources()?
+            .into_iter()
+            .find_map(|(plan, phase)| {
+                (phase == Status::Fenced
+                    && plan.source.scope == *scope
+                    && plan.source.native == release.thread)
+                    .then_some(plan)
+            })
+        else {
+            return Ok(None);
+        };
+        release.result.map_err(io::Error::other)?;
+        self.writer_released(&plan)?;
+        self.commit_source(&plan).map(Some)
+    }
+
     pub(crate) fn commit_source(&mut self, plan: &Plan) -> io::Result<Commit> {
         self.check_hosts(plan, self.data.host, plan.target_host)?;
         let stage = match self.require(plan)? {
@@ -740,6 +765,55 @@ mod tests {
                 native: native.into(),
             },
         }
+    }
+
+    #[test]
+    fn a_native_release_cannot_commit_an_unrelated_or_failed_move() {
+        let laptop = tempfile::tempdir().unwrap();
+        let plan = plan(Uuid::new_v4(), Uuid::new_v4());
+        let mut source = Ledger::open(laptop.path(), plan.source.host).unwrap();
+        source.prepare_source(&plan).unwrap();
+        source
+            .fence_source(plan.target_host, &prepare(&plan, "studio"))
+            .unwrap();
+
+        let release = |thread: &str, result| MoveWriterRelease {
+            thread: thread.into(),
+            result,
+        };
+        assert!(
+            source
+                .accept_writer_release(&plan.source.scope, release("unrelated", Ok(())))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            source
+                .accept_writer_release(&plan.target_scope, release("local", Ok(())))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            source
+                .accept_writer_release(
+                    &plan.source.scope,
+                    release("local", Err("Native writer is still open".into()))
+                )
+                .is_err()
+        );
+        assert_eq!(source.status(plan.id).unwrap(), Some(Status::Fenced));
+        let committed = source
+            .accept_writer_release(&plan.source.scope, release("local", Ok(())))
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.prepared.plan, plan);
+        assert_eq!(source.status(plan.id).unwrap(), Some(Status::Committed));
+        assert!(
+            source
+                .accept_writer_release(&plan.source.scope, release("local", Ok(())))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
