@@ -371,6 +371,7 @@ class Link {
             $(id).replaceChildren();
           $("draft").value = "";
           syncDraftHeight();
+          phoneSettings.reset();
           pairingPage();
         }
       } else this.lost();
