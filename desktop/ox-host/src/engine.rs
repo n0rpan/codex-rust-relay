@@ -6983,7 +6983,7 @@ mod tests {
         fn a_codex_destination_issues_prepared_only_after_a_native_checkpoint() {
             use crate::{
                 move_bundle::{Bundle, Presentation, plan_digest},
-                move_ledger::{ArchivePin, Ledger, Status},
+                move_ledger::{ArchivePin, Ledger, Proposal, Status},
                 move_target::{Files, VerifiedTarget},
             };
             use ox_desk_core::codex::{
@@ -7000,15 +7000,32 @@ mod tests {
             };
             let (tx, _mailbox) = std::sync::mpsc::sync_channel(32);
             let source = Engine::open(config(laptop.path()), laptop.path(), tx).unwrap();
-            let mut plan = move_plan(&source, &scope, "laptop-native");
+            let proposed = move_plan(&source, &scope, "laptop-native");
             drop(source);
-            plan.target_host = receiver.host_id;
-            plan.target_scope.project = studio
-                .path()
-                .canonicalize()
-                .unwrap()
-                .join(plan.id.to_string())
-                .join("1");
+            let source_host = proposed.source.host;
+            let proposal = Proposal {
+                session: proposed.session,
+                source: proposed.source,
+                project_in_checkout: vec![],
+            };
+            let reserve = |proposal| {
+                VerifiedTarget::reserve_plan(
+                    studio.path(),
+                    &receiver.source_moves.ledger,
+                    source_host,
+                    receiver.host_id,
+                    proposed.id,
+                    proposal,
+                )
+            };
+            assert!(
+                reserve(Proposal {
+                    project_in_checkout: b"../another-project".to_vec(),
+                    ..proposal.clone()
+                })
+                .is_err()
+            );
+            let plan = reserve(proposal).unwrap();
             let timeline = Timeline {
                 detail: json!({"ready":true}),
                 items: vec![

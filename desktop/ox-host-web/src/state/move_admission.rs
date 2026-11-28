@@ -147,7 +147,7 @@ impl State {
         Ok(stored)
     }
 
-    fn check_move_peer(&self, device: &str, binding: &Binding) -> io::Result<()> {
+    pub(crate) fn check_move_peer(&self, device: &str, binding: &Binding) -> io::Result<()> {
         if !canonical_id(&binding.source)
             || !canonical_id(&binding.target)
             || binding.source == binding.target
@@ -159,12 +159,21 @@ impl State {
         }
         if !self
             .worker_grant(device)
-            .is_some_and(|grant| grant.source == binding.source)
+            .is_some_and(|grant| grant.may_accept_moves && grant.source == binding.source)
             || !self.host_id()?.eq_ignore_ascii_case(&binding.target)
         {
             return Err(denied());
         }
         Ok(())
+    }
+
+    /// Accept an offer only from the pairing that reserved its plan. The
+    /// importer checks the plan digest against the bytes in the archive.
+    pub(crate) fn admit_move_offer(&mut self, device: &str, manifest: &Binding) -> io::Result<()> {
+        let approved = self
+            .move_reservation(&manifest.transfer)?
+            .ok_or_else(denied)?;
+        self.admit_reserved_move(device, &approved.binding, manifest)
     }
 
     /// Called by the destination operator after approving this exact plan.
@@ -330,10 +339,25 @@ pub(super) mod tests {
         )
     }
 
+    pub(in crate::state) fn accept_moves(state: &mut State, device: &str, allow: bool) {
+        let before = state.worker_grant(device).unwrap().clone();
+        state
+            .edit_worker(
+                device,
+                &before,
+                before.may_launch,
+                before.ceiling,
+                None,
+                Some(allow),
+            )
+            .unwrap();
+    }
+
     #[test]
     fn queued_plan_stays_approved_across_restart_and_can_bind_only_one_manifest() {
         let (dir, mut state, plan) = fixture();
         let (device, _) = pair(&mut state, SOURCE);
+        accept_moves(&mut state, &device, true);
         state.reserve_move_plan(&device, &plan).unwrap();
         state.reserve_move_plan(&device, &plan).unwrap();
         drop(state);
@@ -378,6 +402,9 @@ pub(super) mod tests {
         let nonce = state.challenge(&device, Purpose::Worker).unwrap();
         let signature = sign(&key, &format!("{nonce}.{}", digest(&plan)));
         assert!(!state.prove_move_admission(&device, &nonce, &signature, &plan, &binding));
+        assert!(state.issue_move_admission(&device, &binding).is_err());
+        accept_moves(&mut state, &device, true);
+        assert!(state.check_move_admission(&device, &binding).is_err());
         state.issue_move_admission(&device, &binding).unwrap();
         let nonce = state.challenge(&device, Purpose::Worker).unwrap();
         let signature = sign(&key, &format!("{nonce}.{}", digest(&plan)));
@@ -392,6 +419,7 @@ pub(super) mod tests {
     fn retries_use_the_stored_pairing_destination_transfer_and_digest() {
         let (dir, mut state, binding) = fixture();
         let (device, _key) = pair(&mut state, SOURCE);
+        accept_moves(&mut state, &device, true);
         let different_source = "a77693d3-2f89-4cde-a3fc-92f080d4af1d";
         let (other, _key) = pair(&mut state, different_source);
         state.issue_move_admission(&device, &binding).unwrap();
@@ -447,8 +475,13 @@ pub(super) mod tests {
     fn revoked_admissions_and_replaced_links_cannot_reuse_old_grants() {
         let (dir, mut state, binding) = fixture();
         let (device, _key) = pair(&mut state, SOURCE);
+        accept_moves(&mut state, &device, true);
         state.issue_move_admission(&device, &binding).unwrap();
+        accept_moves(&mut state, &device, false);
+        assert!(state.check_move_admission(&device, &binding).is_err());
         let (replacement, _key) = pair(&mut state, SOURCE);
+        assert!(!state.worker_grant(&replacement).unwrap().may_accept_moves);
+        accept_moves(&mut state, &replacement, true);
         assert!(state.check_move_admission(&replacement, &binding).is_err());
         state.revoke(&device).unwrap();
         assert!(state.check_move_admission(&device, &binding).is_err());

@@ -53,6 +53,8 @@ enum DeviceAction {
         /// `None` leaves the link's memory-sync grant unchanged.
         #[serde(default)]
         may_sync_memory: Option<bool>,
+        #[serde(default)]
+        may_accept_moves: Option<bool>,
     },
     HostUpdate {
         command: crate::host_updates::Command,
@@ -165,6 +167,7 @@ pub(super) async fn settings(
                     may_launch,
                     ceiling,
                     may_sync_memory,
+                    may_accept_moves,
                 } => {
                     if !state.belongs_to_login(target, identity) {
                         return Err(DENY);
@@ -176,6 +179,7 @@ pub(super) async fn settings(
                             *may_launch,
                             *ceiling,
                             *may_sync_memory,
+                            *may_accept_moves,
                         ) {
                             Ok(()) => json!({"status":"applied"}),
                             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {

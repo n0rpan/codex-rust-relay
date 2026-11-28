@@ -2,7 +2,7 @@
 use crate::{
     move_archive::Archive,
     move_bundle::{BundlePlan, Presentation, plan_digest, verified_file},
-    move_ledger::{Ledger, Plan, Prepared, Stage},
+    move_ledger::{Ledger, Plan, Prepared, Proposal, Stage},
 };
 use ox_desk_core::{
     codex::history::ThreadRow,
@@ -15,8 +15,10 @@ use ox_host_service::checkout::receive_result;
 use ox_host_web::move_manifest::{CHECKOUT, Manifest, PLAN, TRANSCRIPT};
 use serde::{Deserialize, Serialize};
 use std::{
+    ffi::OsStr,
     fs::{self, File},
     io,
+    os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
 };
 use uuid::Uuid;
@@ -45,6 +47,41 @@ pub(crate) struct VerifiedTarget {
 }
 
 impl VerifiedTarget {
+    pub(crate) fn reserve_plan(
+        workspace: &Path,
+        ledger: &Ledger,
+        source: Uuid,
+        target: Uuid,
+        transfer: Uuid,
+        proposal: Proposal,
+    ) -> io::Result<Plan> {
+        let relative = Path::new(OsStr::from_bytes(&proposal.project_in_checkout));
+        if proposal.project_in_checkout.contains(&0)
+            || !relative
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+        {
+            return Err(invalid(
+                "The project must be inside its transferred checkout.",
+            ));
+        }
+        let project = workspace
+            .canonicalize()?
+            .join(transfer.to_string())
+            .join("1")
+            .join(relative);
+        let route = proposal.source.scope.route.clone();
+        let plan = Plan {
+            id: transfer,
+            session: proposal.session,
+            source: proposal.source,
+            target_host: target,
+            target_scope: Scope { project, route },
+        };
+        ledger.prepared_receiver(source, &plan)?;
+        Ok(plan)
+    }
+
     pub(crate) fn plan(&self) -> &Plan {
         &self.saved.bundle.plan
     }

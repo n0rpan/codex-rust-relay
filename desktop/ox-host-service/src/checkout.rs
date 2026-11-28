@@ -103,6 +103,17 @@ fn object(dir: &Path, name: &str) -> io::Result<String> {
     let id = line(run(git(dir).args(["rev-parse", "--verify", name]))?)?;
     Ok(oid(id.as_bytes())?.to_owned())
 }
+/// Canonical repository root and the project path captured inside it.
+pub fn project_location(project: &Path) -> io::Result<(PathBuf, PathBuf)> {
+    let root = git_path(project, &["rev-parse", "--show-toplevel"])?;
+    let relative = project
+        .canonicalize()?
+        .strip_prefix(&root)
+        .map_err(|_| io::Error::other("Project moved outside its repository"))?
+        .to_owned();
+    Ok((root, relative))
+}
+
 fn head(repo: &Path) -> io::Result<Option<String>> {
     let out = git(repo)
         .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
@@ -191,12 +202,7 @@ impl Snapshot {
         returning: Option<results::Inputs<'_>>,
     ) -> io::Result<Self> {
         submodules::check_depth(depth)?;
-        let root = git_path(project, &["rev-parse", "--show-toplevel"])?;
-        let relative = project
-            .canonicalize()?
-            .strip_prefix(&root)
-            .map_err(|_| io::Error::other("Project moved outside its repository"))?
-            .to_owned();
+        let (root, relative) = project_location(project)?;
         let base = head(&root)?;
         let index = git_path(
             &root,

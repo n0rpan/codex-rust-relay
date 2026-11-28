@@ -95,7 +95,7 @@ impl Hosts {
         self.work(cx, move || {
             match selected.as_ref() {
                 Some(host) => { host.settings(json!({"action":"edit_worker_link", "id":id, "before":before, "may_launch":may_launch, "ceiling":ceiling, "may_sync_memory":may_sync_memory}))?; },
-                None => { local(admin::Request::WorkerAccess { id, before, may_launch, ceiling, may_sync_memory: Some(may_sync_memory) })?; },
+                None => { local(admin::Request::WorkerAccess { id, before, may_launch, ceiling, may_sync_memory: Some(may_sync_memory), may_accept_moves: None })?; },
             }
             directory(selected.as_ref())
         }, |s, links, _| { s.links = Some(links); });

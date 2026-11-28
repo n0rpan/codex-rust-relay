@@ -44,7 +44,7 @@ impl Manifest {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Offer {
+pub struct Offer {
     pub source: String,
     pub target: String,
     pub transfer: String,
@@ -69,7 +69,7 @@ impl Offer {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Receipt {
+pub struct Receipt {
     pub transfer: String,
     pub manifest_sha256: [u8; 32],
 }
@@ -82,7 +82,8 @@ struct Saved {
 }
 
 #[derive(Debug)]
-pub(crate) struct StagedMove {
+pub struct StagedMove {
+    pub offer: Offer,
     pub receipt: Receipt,
     pub plan: PathBuf,
     pub transcript: PathBuf,
@@ -147,7 +148,7 @@ struct Activation<T> {
     commit: T,
 }
 
-pub(crate) struct VerifiedActivation<T> {
+pub struct VerifiedActivation<T> {
     state: Arc<Mutex<State>>,
     device: String,
     binding: Binding,
@@ -189,7 +190,7 @@ impl<T: serde::de::DeserializeOwned> VerifiedActivation<T> {
 
     /// Called on the destination actor. The same lock guards link and grant
     /// revocation. The actor checks its Prepared record before acquisition.
-    pub(crate) fn commit<R>(
+    pub fn commit<R>(
         self,
         activate: impl FnOnce(&str, &str, [u8; 32], T) -> io::Result<R>,
     ) -> io::Result<R> {
@@ -217,18 +218,16 @@ impl Upload {
         let binding = offer.binding()?;
         let (directory, expected_plan) = {
             let mut state = state.lock().unwrap();
-            if !state.prove_move_admission(
-                device,
-                &proof.nonce,
-                &proof.signature,
-                request,
-                &binding,
-            ) {
+            if !state.prove_worker(device, &proof.nonce, &proof.signature, request) {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "Session move is not approved on this host",
                 ));
             }
+            if state.expected_move_plan(device, &binding)?.is_some() {
+                state.admit_move_offer(device, &binding)?;
+            }
+            state.check_move_admission(device, &binding)?;
             (
                 state.dir.join(DIRECTORY),
                 state.expected_move_plan(device, &binding)?,
@@ -254,6 +253,7 @@ impl Upload {
     fn staged(&self, recovered: bool) -> StagedMove {
         let path = self.directory.join(&self.offer.transfer);
         StagedMove {
+            offer: self.offer.clone(),
             receipt: Receipt {
                 transfer: self.offer.transfer.clone(),
                 manifest_sha256: self.binding.digest(),
@@ -403,14 +403,17 @@ impl Upload {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Open {
-    request: String,
-    proof: Proof,
+    pub(crate) request: String,
+    pub(crate) proof: Proof,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "step", rename_all = "snake_case", deny_unknown_fields)]
 enum StageReply<T> {
     Upload,
+    Error {
+        message: String,
+    },
     Prepared {
         transfer: String,
         manifest_sha256: [u8; 32],
@@ -420,7 +423,7 @@ enum StageReply<T> {
 
 /// Serve a single transfer after the HTTP layer has verified the paired
 /// identity. This connection does not grant a move or activate the receiver.
-async fn stage_socket<T: Serialize + Send + 'static>(
+pub(crate) async fn stage_socket<T: Serialize + Send + 'static>(
     state: Arc<Mutex<State>>,
     device: &str,
     connection: &mut Connection<Message>,
@@ -442,7 +445,7 @@ async fn stage_socket<T: Serialize + Send + 'static>(
         .await
 }
 
-async fn send_files_for_prepare<T: serde::de::DeserializeOwned>(
+pub(crate) async fn send_files_for_prepare<T: serde::de::DeserializeOwned>(
     socket: &mut Connection<tokio_tungstenite::tungstenite::Message>,
     offer: &Offer,
     directory: &Path,
@@ -493,9 +496,19 @@ async fn send_files_for_prepare<T: serde::de::DeserializeOwned>(
         } if transfer == offer.transfer && manifest_sha256 == offer.manifest.sha256()? => {
             Ok(prepared)
         }
+        StageReply::Error { message } => Err(io::Error::other(message)),
         _ => Err(invalid(
             "The destination prepared a different session move.",
         )),
+    }
+}
+
+pub(crate) async fn send_error(connection: &Connection<Message>, error: &io::Error) {
+    let payload = StageReply::<()>::Error {
+        message: error.to_string(),
+    };
+    if let Ok(text) = serde_json::to_string(&payload) {
+        let _ = connection.send(Message::text(text)).await;
     }
 }
 
@@ -564,7 +577,7 @@ mod tests {
     use super::*;
     use crate::state::{
         Purpose, digest,
-        move_admission::tests::{SOURCE, TARGET, TRANSFER, fixture, pair, sign},
+        move_admission::tests::{SOURCE, TARGET, TRANSFER, accept_moves, fixture, pair, sign},
     };
     use p256::ecdsa::SigningKey;
 
@@ -584,6 +597,7 @@ mod tests {
         fn approved() -> Self {
             let (dir, mut state, _) = fixture();
             let (device, key) = pair(&mut state, SOURCE);
+            accept_moves(&mut state, &device, true);
             let spec = |bytes: &[u8]| FileSpec {
                 bytes: bytes.len() as u64,
                 sha256: Sha256::digest(bytes).into(),

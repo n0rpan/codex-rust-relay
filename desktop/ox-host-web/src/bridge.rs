@@ -455,6 +455,7 @@ mod tests {
         .unwrap();
         let app = App {
             jobs: None,
+            moves: None,
             state: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::state::State::load(dir.path()).unwrap(),
             )),
@@ -533,6 +534,7 @@ mod tests {
         .unwrap();
         let app = App {
             jobs: None,
+            moves: None,
             state: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::state::State::load(dir.path()).unwrap(),
             )),
@@ -626,6 +628,7 @@ mod tests {
         .unwrap();
         let app = App {
             jobs: None,
+            moves: None,
             state: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::state::State::load(dir.path()).unwrap(),
             )),
@@ -741,6 +744,7 @@ mod tests {
         .unwrap();
         let app = App {
             jobs: None,
+            moves: None,
             state: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::state::State::load(dir.path()).unwrap(),
             )),
@@ -822,6 +826,7 @@ mod tests {
         .unwrap();
         let app = App {
             jobs: None,
+            moves: None,
             state: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::state::State::load(dir.path()).unwrap(),
             )),
@@ -885,6 +890,7 @@ mod tests {
         .unwrap();
         let app = App {
             jobs: None,
+            moves: None,
             state: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::state::State::load(dir.path()).unwrap(),
             )),
@@ -974,6 +980,7 @@ mod tests {
         .unwrap();
         let app = App {
             jobs: None,
+            moves: None,
             state: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::state::State::load(dir.path()).unwrap(),
             )),

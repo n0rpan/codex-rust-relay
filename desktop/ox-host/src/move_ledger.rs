@@ -31,6 +31,16 @@ pub(crate) struct Plan {
     pub target_scope: Scope,
 }
 
+/// A source offers its current writer and project within the captured checkout.
+/// The destination derives its own absolute project path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Proposal {
+    pub session: Uuid,
+    pub source: Owner,
+    pub project_in_checkout: Vec<u8>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Stage {
@@ -528,7 +538,10 @@ impl Ledger {
                 }))
             }
             Some(_) => Err(io::Error::other("The destination move was cancelled.")),
-            None => Ok(None),
+            None => {
+                self.check_new(plan)?;
+                Ok(None)
+            }
         }
     }
 
