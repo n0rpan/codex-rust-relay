@@ -8,9 +8,17 @@ use gpui_component::{
     input::{InputEvent, TextareaState},
 };
 use ox_desk_core::actions::Action as DeskAction;
-use ox_desk_core::runtime::Access;
+use ox_desk_core::runtime::{Access, Runtime};
 
-pub(super) fn typed_launch(owner: &str, text: &str) -> Option<Result<DeskAction, String>> {
+fn native_command(runtime: Runtime, text: &str) -> bool {
+    runtime != Runtime::Antigravity && text.trim_start().starts_with('/')
+}
+
+pub(super) fn typed_launch(
+    owner: &str,
+    text: &str,
+    runtime: Runtime,
+) -> Option<Result<DeskAction, String>> {
     use ox_desk_core::modes::{Level, ModeRequest};
     let yolo = ModeRequest::Level(Level::Yolo);
     if let Some(result) = ox_desk_core::handoff::HandoffStart::parse_command(owner, text) {
@@ -18,6 +26,9 @@ pub(super) fn typed_launch(owner: &str, text: &str) -> Option<Result<DeskAction,
             start.yolo_confirmed = start.mode == yolo;
             DeskAction::StartHandoff(start)
         }));
+    }
+    if !runtime.supports_workers() {
+        return None;
     }
     ox_desk_core::origin::WorkerStart::parse_command(owner, text).map(|result| {
         result.map(|mut start| {
@@ -49,7 +60,9 @@ impl Workbench {
             self.open_model_picker(super::route_chip::Kind::Model, window, cx);
             return;
         }
-        if let Some(result) = owner.and_then(|id| typed_launch(id, store.draft(owner))) {
+        if let Some(result) =
+            owner.and_then(|id| typed_launch(id, store.draft(owner), self.route.runtime))
+        {
             match result {
                 Ok(action) => {
                     let remote =
@@ -66,7 +79,7 @@ impl Workbench {
             }
             return;
         }
-        let action = if store.draft(owner).trim_start().starts_with('/') {
+        let action = if native_command(self.route.runtime, store.draft(owner)) {
             if !store.has_command_schema() || store.commands_loading() {
                 self.pending_command = Some((id, store.draft(owner).to_owned()));
                 cx.notify();
@@ -109,6 +122,7 @@ impl Workbench {
         let model_controls = self.model_controls(width, cx);
         let selected = store.selected().map(str::to_owned);
         let key = selected.as_deref();
+        let antigravity = self.route.runtime == Runtime::Antigravity;
         let draft = store.draft(key);
         let busy = store.sending(key);
         let running = key
@@ -190,13 +204,15 @@ impl Workbench {
                 }
             });
         }
-        let is_command = draft.trim_start().starts_with('/');
+        let native_command = native_command(self.route.runtime, draft);
+        let is_command = native_command || draft.trim() == "/model";
         if self.focus_editor_for.as_ref() == Some(&selected) {
             self.focus_editor_for = None;
             editor.read(cx).focus_handle(cx).focus(window, cx);
         }
         let caps = store.command_caps(key);
-        let discovering = is_command && (!store.has_command_schema() || store.commands_loading());
+        let discovering =
+            native_command && (!store.has_command_schema() || store.commands_loading());
         let term = is_command
             && draft.trim() != "/model"
             && matches!(
@@ -212,7 +228,7 @@ impl Workbench {
             "Run command"
         } else if busy {
             "Sending…"
-        } else if running {
+        } else if running && !antigravity {
             "Steer"
         } else {
             "Send"
@@ -265,7 +281,10 @@ impl Workbench {
         }
         let owner = selected.clone();
         let view = cx.weak_entity();
-        let presets = Access::choices(self.route.runtime);
+        let presets = key
+            .and_then(|id| store.session_mark(id, "access_choices"))
+            .and_then(|choices| serde_json::from_value::<Vec<Access>>(choices.clone()).ok())
+            .unwrap_or_else(|| Access::choices(self.route.runtime).to_vec());
         // The grant menu (and its Revoke) follows the grant, not the current mode, so a
         // grant stays visible and revocable after the session drops back to Default.
         let grant_offer =
@@ -281,7 +300,7 @@ impl Workbench {
         )
         .tooltip(access_hint)
         .dropdown_menu_with_anchor(Anchor::BottomLeft, move |mut menu, _, _| {
-            for &preset in presets {
+            for &preset in &presets {
                 let id = owner.clone();
                 let view = view.clone();
                 menu = menu.item(
@@ -356,8 +375,7 @@ impl Workbench {
         // turn runs and nothing is typed it becomes ■ Stop, so nothing ever moves.
         let stops = running
             && selected.is_some()
-            && draft.trim().is_empty()
-            && store.draft_images(key).is_empty();
+            && (antigravity || (draft.trim().is_empty() && store.draft_images(key).is_empty()));
         let submit = if stops {
             let stop_owner = selected.clone();
             crate::kit::icon_button(
@@ -518,7 +536,7 @@ impl Workbench {
                             .gap(px(crate::kit::SPACE_XS))
                             // Chip text lines up with the textarea's text inset.
                             .pl(px(2.))
-                            .child(attach_button)
+                            .when(!antigravity, |r| r.child(attach_button))
                             .children(model_controls)
                             .child(access)
                             .when(effective.is_some_and(Access::bypasses_permissions), |r| {
@@ -543,11 +561,13 @@ fn default_permission(
     let start = match runtime {
         Runtime::Claude => behavior.claude_start,
         Runtime::Codex => behavior.codex_start,
+        Runtime::Antigravity => behavior.antigravity_start,
     };
     match (runtime, start) {
         (_, Some(mode)) => permission_value(mode),
         (Runtime::Claude, None) => "Claude Code default".to_owned(),
         (Runtime::Codex, None) => "Configured in Codex".to_owned(),
+        (Runtime::Antigravity, None) => "Antigravity default".to_owned(),
     }
 }
 

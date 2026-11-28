@@ -8,7 +8,7 @@ pub fn installer(
     runtime: ox_desk_core::runtime::Runtime,
     update: bool,
 ) -> Option<(String, Vec<OsString>)> {
-    if runtime == ox_desk_core::runtime::Runtime::Claude {
+    if runtime != ox_desk_core::runtime::Runtime::Codex {
         return None;
     }
     let path = child_path();
@@ -114,6 +114,8 @@ fn signed_in(runtime: ox_desk_core::runtime::Runtime) -> bool {
                     std::fs::read_to_string(p).is_ok_and(|t| t.contains("\"oauthAccount\""))
                 })
         }
+        // The Antigravity ACP process reports sign-in state through its public protocol.
+        Runtime::Antigravity => false,
     }
 }
 /// A fresh install uses Codex until the operator selects another runtime.

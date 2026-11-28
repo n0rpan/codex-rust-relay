@@ -96,11 +96,7 @@ impl HostPolicy {
         if matches!(request, ModeRequest::Level(level) if level < start) {
             return original;
         }
-        Resolved {
-            level: start,
-            access: start.preset(runtime),
-            decision: Decision::HostPolicy,
-        }
+        Resolved::new(start, runtime, Decision::HostPolicy)
     }
 }
 

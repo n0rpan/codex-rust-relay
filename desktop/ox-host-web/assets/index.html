@@ -313,6 +313,7 @@
           <select id="handoff-runtime">
             <option value="codex">Codex</option>
             <option value="claude">Claude Code</option>
+            <option value="antigravity">Antigravity</option>
           </select>
           <label for="handoff-route">Model</label>
           <select id="handoff-route"></select>
@@ -351,6 +352,11 @@
             </button>
           </div>
           <p id="composer-status" role="status" hidden></p>
+          <div id="antigravity-sign-in-required" class="native-live" hidden>
+            <p>Sign in to Antigravity with Google on the host to continue.</p>
+            <button id="antigravity-sign-in" type="button">Open sign-in on host</button>
+            <button id="antigravity-reconnect" type="button">Check connection</button>
+          </div>
           <div id="slash-choices" aria-label="Command suggestions" role="group" hidden></div>
           <label class="sr" for="draft">Message</label
           ><textarea

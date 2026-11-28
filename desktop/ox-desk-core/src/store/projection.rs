@@ -121,7 +121,8 @@ impl Store {
         if schema.methods.contains("fuzzyFileSearch") {
             caps.push("mention".into());
         }
-        if !self.is_session_scoped()
+        if !self.is_antigravity()
+            && !self.is_session_scoped()
             && schema
                 .models
                 .get(&self.options(id).model)
@@ -215,6 +216,12 @@ impl Store {
                     caps.push("model_options".into());
                 }
             }
+            if self.is_antigravity()
+                && self.can_send(Some(id))
+                && !self.command_caps(Some(id)).models.is_empty()
+            {
+                caps.push("model_options".into());
+            }
             if r.parent_thread_id.is_none() && self.can_change_access(id) {
                 caps.push("access".into());
             }
@@ -247,8 +254,11 @@ impl Store {
         };
         let detail = json!({"row":r,"worker":r.worker,"unread":r.unread,"order":r.activity_order.to_string(),"generated":r.generated_title,
             "owned":t.is_some(),"native_live":self.is_native_live(id).then(||self.native_app()),"changing":self.changing_options(id),"terminal":self.in_terminal(id),"sending":self.sending(Some(id)),
-            "route":self.thread_route(Some(id)),"options":t.map(|_|self.options(Some(id))),"access":self.applied_access(Some(id)),"resume_access":self.resume_access.get(id),"restored_draft":self.restored_drafts.get(id).map(|(message,text)|json!({"message":message,"text":text})),"command_caps":(self.is_session_scoped() && t.is_some()).then(||composer_schema(self.command_caps(Some(id))))});
+            "route":self.thread_route(Some(id)),"options":t.map(|_|self.options(Some(id))),"access":self.applied_access(Some(id)),"resume_access":self.resume_access.get(id),"restored_draft":self.restored_drafts.get(id).map(|(message,text)|json!({"message":message,"text":text})),"command_caps":((self.is_session_scoped() || self.is_antigravity()) && t.is_some()).then(||composer_schema(self.command_caps(Some(id))))});
         let mut detail = detail;
+        if self.is_antigravity() {
+            detail["access_choices"] = json!(self.antigravity_access_choices(id));
+        }
         let mut parent = r.parent_thread_id.clone();
         if let Some((nest, extra)) = self.host_annotations.get(id) {
             if let (Some(target), Some(fields)) = (detail.as_object_mut(), extra.as_object()) {

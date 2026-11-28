@@ -19,15 +19,16 @@ pub struct Key {
 }
 impl Key {
     pub(crate) fn row(row: &ThreadRow) -> Self {
-        let runtime = if row.id.starts_with("claude:") {
-            Runtime::Claude
-        } else {
-            Runtime::Codex
+        let runtime = match row.id.split_once(':').map(|(prefix, _)| prefix) {
+            Some("claude") => Runtime::Claude,
+            Some("antigravity") => Runtime::Antigravity,
+            _ => Runtime::Codex,
         };
-        let subscription = matches!(
-            row.model_provider.as_str(),
-            "openai" | crate::store::claude::SUBSCRIPTION_PROVIDER
-        );
+        let subscription = runtime == Runtime::Antigravity
+            || matches!(
+                row.model_provider.as_str(),
+                "openai" | crate::store::claude::SUBSCRIPTION_PROVIDER
+            );
         Self {
             project: row.cwd.clone(),
             runtime,

@@ -48,6 +48,7 @@ impl ThreadMetaKey {
         let runtime = match self.runtime {
             Runtime::Codex => "codex",
             Runtime::Claude => "claude",
+            Runtime::Antigravity => "antigravity",
         };
         serde_json::to_string(&(&self.project, runtime, &self.id)).unwrap_or_default()
     }
@@ -57,6 +58,7 @@ impl ThreadMetaKey {
         let runtime = match runtime.as_str() {
             "codex" => Runtime::Codex,
             "claude" => Runtime::Claude,
+            "antigravity" => Runtime::Antigravity,
             _ => return None,
         };
         Some(Self {
@@ -132,6 +134,7 @@ impl ThreadMeta {
                 .unwrap_or_else(|| match key.runtime {
                     Runtime::Codex => "openai".into(),
                     Runtime::Claude => "anthropic".into(),
+                    Runtime::Antigravity => "antigravity".into(),
                 }),
             cwd: key.project.clone(),
             model: self.cached_model.clone(),

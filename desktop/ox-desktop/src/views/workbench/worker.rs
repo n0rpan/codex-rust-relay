@@ -194,6 +194,7 @@ impl Workbench {
             return Some(panel.into_any_element());
         }
         if store.is_host_client()
+            && self.route.runtime.supports_workers()
             && store.origin(id).is_none()
             && store.draft(Some(id)).is_empty()
             && store

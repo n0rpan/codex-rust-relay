@@ -1,5 +1,5 @@
 use crate::transport::Packet;
-use ox_desk_core::host_protocol::{Cursor, Scope};
+use ox_desk_core::host_protocol::{Cursor, Scope, supports_route};
 use std::collections::VecDeque;
 
 pub(crate) struct Replay {
@@ -30,6 +30,7 @@ impl Replay {
         &'a self,
         scope: Option<&'a Scope>,
         cursor: &Cursor,
+        version: u32,
     ) -> Option<impl Iterator<Item = Packet> + 'a> {
         if cursor.epoch != self.cursor.epoch
             || cursor.seq < self.floor
@@ -41,7 +42,11 @@ impl Replay {
         Some(
             self.frames
                 .iter()
-                .filter(move |(i, s, _)| *i > seq && scope.is_none_or(|scope| scope == s))
+                .filter(move |(i, s, _)| {
+                    *i > seq
+                        && scope.is_none_or(|scope| scope == s)
+                        && supports_route(version, &s.route)
+                })
                 .map(|(_, _, p)| p.clone()),
         )
     }
@@ -69,7 +74,7 @@ mod tests {
         }
         assert_eq!(
             replay
-                .after(Some(&a), &start)
+                .after(Some(&a), &start, 1)
                 .unwrap()
                 .map(|b| b[0])
                 .collect::<Vec<_>>(),
@@ -82,14 +87,15 @@ mod tests {
                     &Cursor {
                         epoch: "boot-1".into(),
                         seq: 42
-                    }
+                    },
+                    1,
                 )
                 .unwrap()
                 .map(|b| b[0])
                 .collect::<Vec<_>>(),
             [30]
         );
-        assert_eq!(replay.after(None, &replay.cursor).unwrap().count(), 0);
+        assert_eq!(replay.after(None, &replay.cursor, 1).unwrap().count(), 0);
         assert!(
             replay
                 .after(
@@ -97,7 +103,8 @@ mod tests {
                     &Cursor {
                         epoch: "boot-2".into(),
                         seq: 40
-                    }
+                    },
+                    1,
                 )
                 .is_none()
         );
@@ -105,6 +112,31 @@ mod tests {
             replay.cursor.seq += 1;
             replay.append(a.clone(), vec![1].into());
         }
-        assert!(replay.after(None, &start).is_none());
+        assert!(replay.after(None, &start, 1).is_none());
+    }
+
+    #[test]
+    fn v1_replay_omits_antigravity_without_losing_later_frames() {
+        use ox_desk_core::runtime::Runtime;
+        let mut replay = Replay::new(0, "boot".into());
+        let start = replay.cursor.clone();
+        let codex = scope("/project");
+        let antigravity = Scope {
+            project: codex.project.clone(),
+            route: Runtime::Antigravity.route(None),
+        };
+        for (scope, marker) in [(antigravity, 1), (codex, 2)] {
+            replay.cursor.seq += 1;
+            replay.append(scope, vec![marker].into());
+        }
+        let markers = |version| {
+            replay
+                .after(None, &start, version)
+                .unwrap()
+                .map(|packet| packet[0])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(markers(1), [2]);
+        assert_eq!(markers(2), [1, 2]);
     }
 }

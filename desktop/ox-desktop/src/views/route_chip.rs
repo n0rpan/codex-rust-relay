@@ -72,7 +72,7 @@ pub(super) fn composer_entries(store: &Store, owner: Option<&str>) -> Vec<model_
                 // The session's own model: its bare id, never the API row of the same alias.
                 entry.id.clone_from(id);
                 entry.label = caps.model_display(id);
-                entry.note = format!("{} subscription", route.runtime.account());
+                entry.note = route.label();
                 entry.section = Some(format!("{} MODELS", route.runtime.name().to_uppercase()));
             } else {
                 entry.new_session = !store.same_model_route(id);
@@ -80,7 +80,7 @@ pub(super) fn composer_entries(store: &Store, owner: Option<&str>) -> Vec<model_
             entry
         })
         .collect();
-    for rt in [Runtime::Codex, Runtime::Claude] {
+    for rt in Runtime::ALL {
         let here = route.runtime == rt && subscription;
         let mut label = rt.name().to_owned();
         if here && !current.is_empty() {
@@ -89,13 +89,21 @@ pub(super) fn composer_entries(store: &Store, owner: Option<&str>) -> Vec<model_
         entries.push(model_picker::Entry {
             id: format!("{}{}", model_picker::PLAN_PREFIX, rt.executable()),
             label,
-            note: format!("{} subscription", rt.account()),
+            note: rt.route(None).label(),
             new_session: !here,
             current: here,
             ..Default::default()
         });
     }
     entries
+}
+
+fn native_route(id: &str) -> Option<Route> {
+    let executable = id.strip_prefix(model_picker::PLAN_PREFIX)?;
+    Runtime::ALL
+        .into_iter()
+        .find(|r| r.executable() == executable)
+        .map(|runtime| runtime.route(None))
 }
 fn choices(caps: &Capabilities, settings: &Options, kind: Kind) -> Vec<(String, Choice)> {
     match kind {
@@ -136,13 +144,7 @@ pub(super) fn model_choice(
     runtime: Runtime,
 ) -> (Option<Route>, String) {
     let current = &store.profile().route;
-    if let Some(name) = id.strip_prefix(model_picker::PLAN_PREFIX) {
-        let plan = if name == Runtime::Claude.executable() {
-            Runtime::Claude
-        } else {
-            Runtime::Codex
-        }
-        .route(None);
+    if let Some(plan) = native_route(id) {
         return ((&plan != current).then_some(plan), id.to_owned());
     }
     let alias = model_picker::bare(id).to_owned();
@@ -182,13 +184,8 @@ impl Workbench {
         let (new_route, id) = match self.store.as_ref() {
             Some(store) => model_choice(store, owner.as_deref(), &id, runtime),
             None => {
-                let route = match id.strip_prefix(model_picker::PLAN_PREFIX) {
-                    Some(name) if name == Runtime::Claude.executable() => {
-                        Runtime::Claude.route(None)
-                    }
-                    Some(_) => Runtime::Codex.route(None),
-                    None => runtime.route(Some(model_picker::bare(&id).to_owned())),
-                };
+                let route = native_route(&id)
+                    .unwrap_or_else(|| runtime.route(Some(model_picker::bare(&id).to_owned())));
                 (Some(route), id)
             }
         };
@@ -214,9 +211,8 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (runtime, model) = match id.strip_prefix(model_picker::PLAN_PREFIX) {
-            Some(name) if name == Runtime::Claude.executable() => (Runtime::Claude, None),
-            Some(_) => (Runtime::Codex, None),
+        let (runtime, model) = match native_route(id) {
+            Some(route) => (route.runtime, None),
             None => (
                 runtime.unwrap_or(self.route.runtime),
                 Some(model_picker::bare(id).to_owned()),
@@ -387,7 +383,7 @@ impl Workbench {
                 (_, true) => name.to_owned(),
                 (_, false) => format!("{name} · {value}"),
             };
-            if store.has_command_schema() {
+            if store.has_command_schema() || self.route.runtime == Runtime::Antigravity {
                 let caps = store.command_caps(owner);
                 if (kind == Kind::Speed && !caps.speed)
                     || (kind == Kind::Effort
@@ -588,5 +584,19 @@ mod tests {
                 "fixture-model"
             )
         );
+    }
+
+    #[test]
+    fn antigravity_picker_row_opens_the_native_account() {
+        let store = store(Route::CODEX_SUBSCRIPTION, &[]);
+        let route = Runtime::Antigravity.route(None);
+        let row = super::composer_entries(&store, None)
+            .into_iter()
+            .find(|e| e.id == "@plan:agy")
+            .unwrap();
+        assert!(row.new_session && !row.current);
+        assert_eq!(row.note, route.label());
+        let (selected, _) = model_choice(&store, None, &row.id, Runtime::Claude);
+        assert_eq!(selected, Some(route));
     }
 }

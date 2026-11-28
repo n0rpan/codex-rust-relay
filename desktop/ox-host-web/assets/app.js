@@ -51,11 +51,14 @@ const button = (text, fn) => {
   return b;
 };
 // Same wording as the desktop's Route::label (ox-desk-core runtime.rs).
+const subscriptionLabels = {
+  codex: "ChatGPT subscription",
+  claude: "Claude subscription",
+  antigravity: "Google Antigravity",
+};
 const routesLabel = (r) =>
   r.billing === "subscription"
-    ? r.runtime === "codex"
-      ? "ChatGPT subscription"
-      : "Claude subscription"
+    ? subscriptionLabels[r.runtime] ?? r.runtime
     : r.runtime.replace(/^./, (x) => x.toUpperCase()) + " · " + r.billing.api;
 // Desktop status words (views/host/discovery.rs route_status, views/host.rs).
 // Same wording as the desktop (ox-desk-core store/claude/native.rs); `app` is the host's
@@ -255,9 +258,7 @@ const phoneSettings = setupSettings({
     $("notification-summary").focus();
   },
   login: async (runtime) => {
-    return openPhoneTerminal(
-      runtime === "codex" ? "codex-login" : "claude-login",
-    );
+    return openPhoneTerminal(`${runtime}-login`);
   },
 });
 /** The host took a send and then lost it (a resume that failed after the Ack): its text
@@ -371,7 +372,7 @@ class Link {
   /** @param {Server} msg */
   receive(msg) {
     if (msg.type === "hello") {
-      if (msg.version !== 1) {
+      if (!wire.supports(msg.version)) {
         this.close();
         notice("This host requires a newer client.");
         return;
@@ -657,7 +658,7 @@ const ago = (seconds) => {
   if (s < 86400) return Math.floor(s / 3600) + "h";
   return Math.floor(s / 86400) + "d";
 };
-const kindLabels = { claude: "Claude", codex: "Codex", worker: "Worker" };
+const kindLabels = { claude: "Claude", codex: "Codex", antigravity: "Antigravity", worker: "Worker" };
 function refreshRunning() {
   globalLink?.listProcesses((ok, value) => {
     if (!ok) {
@@ -962,7 +963,7 @@ function catalog() {
       accent = threadColors.get(key) || projectColors.get(scope.project);
     const b = button("", () => open(scope, session.id));
     b.dataset.source =
-      session.parent || session.detail?.worker || session.detail?.origin
+      session.parent || session.detail?.worker || session.detail?.origin?.relation === "worker"
         ? "worker"
         : scope.route.billing !== "subscription"
           ? "api"
@@ -1652,6 +1653,9 @@ new IntersectionObserver(([entry]) => {
 // An absolute path such as /home/oscar/project is still an ordinary message.
 function composerCommand(content) {
   const text = content.trim();
+  if (selected?.scope.route.runtime === "antigravity") {
+    return localCommands.has(text) && text !== "/terminal" ? text : null;
+  }
   const name = text.split(/\s/, 1)[0];
   if (name.startsWith("/") && Object.hasOwn(controls.schema.session_commands ?? {}, name)) return text;
   return /^\/[^\s/]*(?:\s|$)/.test(text) ? text : null;
@@ -1718,6 +1722,7 @@ function updateComposerState() {
   );
   $("native-live-fork").hidden = !caps.includes("fork");
   $("native-live-fork").onclick = () => detailLink?.act({ fork_thread: id });
+  $("antigravity-sign-in-required").hidden = scope.route.runtime !== "antigravity" || s?.connection !== "sign_in_required";
   $("draft").disabled = nativeLive;
   const canSend = id
     ? caps.some((c) => c === "send" || c === "steer")
@@ -1907,7 +1912,7 @@ function conversation() {
   );
   $("older").hidden = !timeline?.detail?.older;
   $("older").onclick = () => detailLink.act({ load_older: id });
-  $("start-worker").hidden = !id || !caps.includes("open");
+  $("start-worker").hidden = !id || !caps.includes("open") || scope.route.runtime === "antigravity";
   $("continue-in").hidden = !id || !caps.includes("open");
   showAsks(asks);
   // The activity line only trusts a live link: a reconnect must not look like a finished turn.
@@ -1968,6 +1973,7 @@ function conversation() {
     caps.includes("stop") && (s?.asks || []).some((a) => a.thread === id);
   $("operator-session").hidden =
     !id ||
+    scope.route.runtime === "antigravity" ||
     !!row?.parent ||
     !!origin ||
     !(caps.includes("send") || awaitingApproval);
@@ -2170,9 +2176,11 @@ const bypassMode = (m) => m === "yolo" || m === "bypass_permissions";
 const provider = (route) =>
   route.billing?.api
     ? `the ${route.billing.api.split("/")[0]} API provider`
-    : route.runtime === "codex"
-      ? "OpenAI (ChatGPT subscription)"
-      : "Anthropic (Claude subscription)";
+    : ({
+        codex: "OpenAI (ChatGPT subscription)",
+        claude: "Anthropic (Claude subscription)",
+        antigravity: "Google",
+      })[route.runtime];
 function linkCard({ label, title, meta, tone = "", action }) {
   const card = el("article", "link-card " + tone);
   const body = el("div", "link-card-body");
@@ -2213,7 +2221,7 @@ function handoffMarks(row) {
         lowered: "lowered",
         operator: "chosen by you",
         host_policy: "set by the host policy",
-        capped: "capped below YOLO",
+        capped: origin.runtime === "antigravity" ? "adjusted to Antigravity’s supported modes" : "capped below YOLO",
       }[origin.decided] ?? "unknown";
     nodes.push(
       linkCard({
@@ -2309,7 +2317,7 @@ const handoffTarget = () => {
   const route = index === "" ? undefined : routes[+index];
   return route?.runtime === $("handoff-runtime").value ? route : undefined;
 };
-const runtimeName = (r) => (r === "codex" ? "ChatGPT/Codex" : "Claude");
+const runtimeName = (r) => ({ codex: "ChatGPT/Codex", claude: "Claude", antigravity: "Antigravity" })[r];
 function handoffNotice() {
   const target = handoffTarget(),
     source = selected?.scope?.route;
@@ -2321,13 +2329,24 @@ function handoffNotice() {
     line.textContent = `This handoff sends the carried conversation to ${provider(target)} (${routesLabel(target)}).`;
     line.hidden = false;
   } else line.hidden = true;
-  $("handoff-grant-row").hidden = $("handoff-mode").value !== "yolo";
   labelPermissions(
     $("handoff-mode"),
     $("handoff-runtime").value,
     $("handoff-permission-note"),
   );
+  $("handoff-grant-row").hidden = $("handoff-mode").value !== "yolo";
 }
+$("antigravity-sign-in").onclick = () => openPhoneTerminal("antigravity-login");
+$("antigravity-reconnect").onclick = () => {
+  if (selected) open(selected.scope, selected.id);
+};
+window.addEventListener("ox-native-login-finished", (event) => {
+  if (
+    event.detail?.preset === "antigravity-login" &&
+    !$("conversation").hidden &&
+    !$("antigravity-sign-in-required").hidden
+  ) $("antigravity-reconnect").click();
+});
 $("continue-in").onclick = () => {
   // Starts on the session's own runtime and route, as the desktop handoff sheet does.
   const from = selected?.scope?.route;
@@ -2621,10 +2640,20 @@ const permissionPresets = {
     classifier: ["Auto", "Let Claude Code’s classifier review tool actions before they run."],
     yolo: ["YOLO · bypass permissions", "Run Claude Code tools without permission prompts."],
   },
+  antigravity: {
+    read: ["Plan mode", "Let Antigravity explore and plan before making changes."],
+    write: ["Accept edits", "Let Antigravity apply edits without asking about each edit."],
+    yolo: ["YOLO", "Antigravity skips its standard permission prompts. Protected actions may still require review."],
+  },
 };
 function labelPermissions(select, runtime, note) {
   const table = permissionPresets[runtime] ?? permissionPresets.codex;
-  for (const o of select.options) if (table[o.value]) o.textContent = table[o.value][0];
+  for (const o of select.options) {
+    const mode = table[o.value];
+    o.hidden = o.disabled = o.value !== "inherit" && !mode;
+    if (mode) o.textContent = mode[0];
+  }
+  if (select.selectedOptions[0]?.disabled) select.value = "inherit";
   note.textContent =
     select.value === "inherit"
       ? "Uses this session's current permission mode."
