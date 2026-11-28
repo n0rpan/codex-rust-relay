@@ -158,8 +158,10 @@ mod tests {
 
     #[test]
     fn switching_off_preserves_selected_events_on_disk() {
-        let mut current = Settings::default();
-        current.enabled = false;
+        let mut current = Settings {
+            enabled: false,
+            ..Settings::default()
+        };
         current.set(NotificationKind::Question, false);
         let saved = serde_json::to_value(current).unwrap();
         assert_eq!(saved["events"], "off");
