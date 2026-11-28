@@ -7,6 +7,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read, Write};
+use std::net::Ipv6Addr;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -31,7 +32,7 @@ const DOWNLOAD_ENV: &[&str] = &[
 const USAGE: &str = "\
 Verify a local app with a shared browser session.
 
-Usage: ox browser [--session NAME] <command>
+Usage: ox browser [--session NAME] [--allow-host HOST] <command>
 
   install                         Install the browser component on this host
   open http://localhost:3000      Open your local app
@@ -44,6 +45,7 @@ Usage: ox browser [--session NAME] <command>
 
 Run commands from the same Git worktree or, outside Git, the same directory.
 Use --session NAME to keep two conversations in that worktree separate.
+For a trusted development host, pass --allow-host HOST before each command.
 Set OX_BROWSER_EXECUTABLE to use a specific Chromium executable.";
 
 pub(crate) fn print_usage() {
@@ -62,36 +64,31 @@ enum Action<'a> {
     Close,
 }
 
-fn parse(args: &[OsString]) -> Result<(&str, Action<'_>), RelayError> {
-    let (label, args) = if let [flag, name, rest @ ..] = args
-        && flag == "--session"
-    {
-        let name = name
-            .to_str()
-            .ok_or("Browser session names must be UTF-8.")?;
-        if name.is_empty()
-            || name.len() > 64
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-        {
-            return Err(
-                "Use a browser session name with 1–64 letters, digits, hyphens or underscores."
-                    .into(),
-            );
+struct Scope<'a> {
+    label: &'a str,
+    allowed_host: Option<String>,
+}
+
+fn parse(mut args: &[OsString]) -> Result<(Scope<'_>, Action<'_>), RelayError> {
+    let mut label = None;
+    let mut allowed_host = None;
+    while let [flag, value, rest @ ..] = args {
+        match flag.to_str() {
+            Some("--session") if label.is_none() => label = Some(session_label(value)?),
+            Some("--allow-host") if allowed_host.is_none() => allowed_host = Some(dev_host(value)?),
+            _ => break,
         }
-        (name, rest)
-    } else {
-        ("default", args)
-    };
+        args = rest;
+    }
 
     let action = match args {
         [] => Action::Help,
         [arg] if matches!(arg.to_str(), Some("-h" | "--help" | "help")) => Action::Help,
         [arg] if arg == "install" => Action::Install,
-        [arg, url] if arg == "open" => {
-            Action::Open(local_url(url.to_str().ok_or("The URL must be UTF-8.")?)?)
-        }
+        [arg, url] if arg == "open" => Action::Open(dev_url(
+            url.to_str().ok_or("The URL must be UTF-8.")?,
+            allowed_host.as_deref(),
+        )?),
         [arg] if arg == "snapshot" => Action::Snapshot { json: false },
         [arg, flag] if arg == "snapshot" && flag == "--json" => Action::Snapshot { json: true },
         [arg, reference, text] if arg == "fill" => Action::Fill(
@@ -108,7 +105,28 @@ fn parse(args: &[OsString]) -> Result<(&str, Action<'_>), RelayError> {
         [arg] if arg == "close" => Action::Close,
         _ => return Err("Invalid browser command or arguments. See ox browser --help.".into()),
     };
-    Ok((label, action))
+    Ok((
+        Scope {
+            label: label.unwrap_or("default"),
+            allowed_host,
+        },
+        action,
+    ))
+}
+
+fn session_label(value: &OsStr) -> Result<&str, RelayError> {
+    let name = value
+        .to_str()
+        .ok_or("Browser session names must be UTF-8.")?;
+    if !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Ok(name);
+    }
+    Err("Use a browser session name with 1–64 letters, digits, hyphens or underscores.".into())
 }
 
 fn element_ref(reference: &OsStr) -> Result<&OsStr, RelayError> {
@@ -123,19 +141,54 @@ fn element_ref(reference: &OsStr) -> Result<&OsStr, RelayError> {
     }
 }
 
-fn local_url(input: &str) -> Result<Url, RelayError> {
-    if let Ok(url) = Url::parse(input)
-        && matches!(url.scheme(), "http" | "https")
-        && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
-        && url.username().is_empty()
-        && url.password().is_none()
+fn dev_host(value: &OsStr) -> Result<String, RelayError> {
+    const INVALID: &str =
+        "Pass one hostname or IP address to --allow-host, without a scheme, port or wildcard.";
+    let value = value.to_str().ok_or(INVALID)?;
+    let ip = value
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(value);
+    if ip.parse::<Ipv6Addr>().is_ok() {
+        let url = Url::parse(&format!("http://[{ip}]/")).map_err(|_| INVALID)?;
+        return Ok(url.host_str().ok_or(INVALID)?.to_owned());
+    }
+    let host = value.to_ascii_lowercase();
+    if host
+        .strip_suffix('.')
+        .unwrap_or(&host)
+        .split('.')
+        .all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label.as_bytes()[0].is_ascii_alphanumeric()
+                && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+        && Url::parse(&format!("http://{host}/"))
+            .is_ok_and(|url| url.host_str() == Some(host.as_str()))
     {
+        return Ok(host);
+    }
+    Err(INVALID.into())
+}
+
+fn dev_url(input: &str, allowed_host: Option<&str>) -> Result<Url, RelayError> {
+    let invalid_url = "Enter an HTTP or HTTPS development URL without credentials, such as http://localhost:3000.";
+    let url = Url::parse(input).map_err(|_| invalid_url)?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(invalid_url.into());
+    }
+    let host = url.host_str().ok_or(invalid_url)?;
+    if LOCAL_HOSTS.split(',').any(|local| host == local) || Some(host) == allowed_host {
         return Ok(url);
     }
-    Err(
-        "Enter a local HTTP or HTTPS URL for your dev server, such as http://localhost:3000."
-            .into(),
-    )
+    Err("This URL is outside the browser session's scope. For a trusted development host, use --allow-host HOST before the command.".into())
 }
 
 struct Asset {
@@ -199,11 +252,16 @@ fn worktree_root(cwd: &Path) -> &Path {
         .unwrap_or(cwd)
 }
 
-fn session_name(worktree: &Path, label: &str) -> String {
+fn session_name(worktree: &Path, label: &str, allowed_host: Option<&str>) -> String {
     let mut sha = digest::Context::new(&digest::SHA256);
     sha.update(worktree.as_os_str().as_encoded_bytes());
     sha.update(b"\0");
     sha.update(label.as_bytes());
+    if let Some(host) = allowed_host {
+        // Keep existing loopback identities. An opt-in gets a separate profile.
+        sha.update(b"\0");
+        sha.update(host.as_bytes());
+    }
     format!("ox-{}", hex::encode(&sha.finish().as_ref()[..12]))
 }
 
@@ -291,7 +349,7 @@ fn private_executable(path: &Path) -> io::Result<bool> {
 fn socket_dir(root: &Path, create: bool) -> Result<Option<PathBuf>, RelayError> {
     // Keep the path below the Unix socket path limit, even in long home paths.
     let uid = user_id();
-    let namespace = session_name(root, VERSION);
+    let namespace = session_name(root, VERSION, None);
     let dir = Path::new("/tmp").join(format!("ox-browser-{uid}-{namespace}"));
     if create {
         match fs::DirBuilder::new().mode(0o700).create(&dir) {
@@ -393,7 +451,7 @@ async fn install_cli(root: &Path) -> Result<(), RelayError> {
 }
 
 pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
-    let (label, action) = parse(args)?;
+    let (scope, action) = parse(args)?;
     if matches!(action, Action::Help) {
         print_usage();
         return Ok(0);
@@ -440,7 +498,11 @@ pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
         return Err(message.into());
     }
     let cwd = env::current_dir()?.canonicalize()?;
-    let session = session_name(worktree_root(&cwd), label);
+    let session = session_name(
+        worktree_root(&cwd),
+        scope.label,
+        scope.allowed_host.as_deref(),
+    );
     let require_existing = !matches!(action, Action::Open(_));
     let sockets = socket_dir(&root, !require_existing)?;
     let Some(sockets) = sockets.filter(|dir| {
@@ -456,11 +518,15 @@ pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
     };
     let mut command = child_command(&root);
     command.env("AGENT_BROWSER_SOCKET_DIR", sockets);
+    let domains = match &scope.allowed_host {
+        Some(host) => format!("{LOCAL_HOSTS},{host}"),
+        None => LOCAL_HOSTS.to_owned(),
+    };
     command.args([
         "--session",
         &session,
         "--allowed-domains",
-        LOCAL_HOSTS,
+        &domains,
         "--idle-timeout",
         "10m",
         "--content-boundaries",
@@ -550,7 +616,7 @@ mod tests {
             "https://127.0.0.1:8443",
             "http://[::1]:8000",
         ] {
-            assert!(local_url(url).is_ok(), "{url}");
+            assert!(dev_url(url, None).is_ok(), "{url}");
         }
         for url in [
             "localhost:3000",
@@ -560,8 +626,63 @@ mod tests {
             "ftp://localhost/",
             "file:///tmp/page.html",
         ] {
-            assert!(local_url(url).is_err(), "{url}");
+            assert!(dev_url(url, None).is_err(), "{url}");
         }
+    }
+
+    #[test]
+    fn override_accepts_one_exact_development_host() {
+        let host = dev_host(OsStr::new("Devbox.Test")).unwrap();
+        assert_eq!(host, "devbox.test");
+        assert!(dev_url("http://devbox.test:3000", Some(&host)).is_ok());
+        assert!(dev_url("http://localhost:3000", Some(&host)).is_ok());
+        assert!(dev_url("http://sub.devbox.test", Some(&host)).is_err());
+        assert!(dev_url("http://user@devbox.test", Some(&host)).is_err());
+
+        let v4 = dev_host(OsStr::new("192.168.1.22")).unwrap();
+        assert!(dev_url("http://192.168.1.22:3000", Some(&v4)).is_ok());
+        let v6 = dev_host(OsStr::new("[fd00::abcd]")).unwrap();
+        assert!(dev_url("http://[fd00::abcd]:3000", Some(&v6)).is_ok());
+        assert_eq!(dev_host(OsStr::new("fd00::abcd")).unwrap(), v6);
+
+        for bad in [
+            "devbox.test,example.test",
+            "*.devbox.test",
+            "devbox.test:80",
+            "http://devbox.test",
+            "user@devbox.test",
+            "devbox.test/path",
+            "127.1",
+            "[fd00::abcd]:80",
+            " devbox.test",
+        ] {
+            assert!(dev_host(OsStr::new(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn scope_options_can_appear_in_either_order_once() {
+        let args = [
+            "--allow-host",
+            "Devbox.Test",
+            "--session",
+            "review",
+            "preview",
+        ]
+        .map(OsString::from);
+        let (scope, action) = parse(&args).unwrap();
+        assert_eq!(scope.label, "review");
+        assert_eq!(scope.allowed_host.as_deref(), Some("devbox.test"));
+        assert!(matches!(action, Action::Preview));
+        let duplicate = [
+            "--allow-host",
+            "first.test",
+            "--allow-host",
+            "second.test",
+            "preview",
+        ]
+        .map(OsString::from);
+        assert!(parse(&duplicate).is_err());
     }
 
     #[test]
@@ -578,12 +699,20 @@ mod tests {
         assert_eq!(worktree_root(&child), left);
         assert_eq!(worktree_root(&right), right);
         assert_ne!(
-            session_name(&left, "default"),
-            session_name(&right, "default"),
+            session_name(&left, "default", None),
+            session_name(&right, "default", None),
         );
         assert_ne!(
-            session_name(&left, "default"),
-            session_name(&left, "review"),
+            session_name(&left, "default", None),
+            session_name(&left, "review", None),
+        );
+        assert_ne!(
+            session_name(&left, "default", None),
+            session_name(&left, "default", Some("devbox.test")),
+        );
+        assert_ne!(
+            session_name(&left, "default", Some("devbox.test")),
+            session_name(&left, "default", Some("second.test")),
         );
     }
 
