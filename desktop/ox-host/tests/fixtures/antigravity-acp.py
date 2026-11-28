@@ -83,7 +83,7 @@ for line in sys.stdin:
             reply(key, sessionId=SESSION, configOptions=config_options())
     elif method == "session/load":
         assert params == {"cwd": os.getcwd(), "mcpServers": [], "sessionId": SESSION}, params
-        mode = "plan"
+        mode = "accept-edits"
         model = "fixture-gemini-b"
         chunk("user", saved_prompt.read_text(), "user-original")
         chunk("agent", FIRST_REPLY, "agent-original")
@@ -115,6 +115,7 @@ for line in sys.stdin:
             prompt_id, permission_id = key, "approve-second"
             ask(permission_id)
         elif text == "Continue after reopening":
+            assert mode == "plan", "the fixed host policy must be applied before the resumed prompt"
             chunk("agent", REOPEN_REPLY, "agent-continuation")
             reply(key, stopReason="end_turn")
         elif text in ("Start in explicit YOLO", "Follow up in explicit YOLO"):

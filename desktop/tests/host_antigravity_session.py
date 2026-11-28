@@ -173,18 +173,17 @@ def run(root, host, helper, log):
         target.until(lambda f: (t := timeline_detail(f, session)) and t["interrupted"] and t["active"] is None)
         assert snapshot(target, target_scope)["asks"] == [], "The cancelled turn left a permission request open"
 
+    (Path(env["OX_HOST_STATE_DIR"]) / "host-mode-policy.json").write_text(json.dumps("always_read"))
     with session_host(binary, root, env, log), closing(Client(env["OX_HOST_SOCKET"])) as target:
         state = snapshot(target, target_scope)
         assert any(row["id"] == session for row in state["sessions"]), state
-        target.act(target_scope, "reopen", {"select_thread": session})
-        target.until(lambda f: (t := timeline_detail(f, session)) and t["ready"])
-        timeline = snapshot(target, target_scope)["transcripts"][session]
-        assert texts(timeline, "assistant") == [FIRST_REPLY], timeline
-        assert len(texts(timeline, "user")) == 1, timeline
         target.act(target_scope, "continue", {"send_text": [session, "Continue after reopening"]})
         finished(target, session)
-        timeline = snapshot(target, target_scope)["transcripts"][session]
+        resumed = snapshot(target, target_scope)
+        timeline = resumed["transcripts"][session]
         assert texts(timeline, "assistant") == [FIRST_REPLY, REOPEN_REPLY], timeline
+        assert texts(timeline, "user") == [prompt_path.read_text(), "Continue after reopening"], timeline
+        assert next(row for row in resumed["sessions"] if row["id"] == session)["detail"]["access"] == "plan", resumed
 
     first = prompt_path.read_text()
     assert first.startswith("<ox-handoff>\n") and first.endswith("</ox-handoff>\n\n" + REQUEST), first
@@ -193,7 +192,7 @@ def run(root, host, helper, log):
     methods = [frame["method"] for frame in frames if "method" in frame]
     assert methods == ["initialize", "session/new", "session/set_config_option", "session/prompt",
                        "session/set_config_option", "session/prompt", "session/cancel", "initialize",
-                       "session/load", "session/prompt"], methods
+                       "session/load", "session/set_config_option", "session/prompt"], methods
     print("PASS: Google account handoff carries the plan and ACP streams, changes model, answers, cancels and reopens")
 
 

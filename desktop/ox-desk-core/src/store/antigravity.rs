@@ -260,7 +260,7 @@ impl Store {
                 "This Antigravity session was not saved for this project.",
             ));
         }
-        self.antigravity_spawn(Some(id.into()), None, None, false)?;
+        self.antigravity_spawn(Some(id.into()), None, self.host_start_access(id), false)?;
         self.mark_loading(id);
         Ok(())
     }
@@ -720,14 +720,13 @@ impl Store {
                 self.antigravity_request(generation, Pending::Open, method, params)?;
             }
             Pending::Open => {
-                let owner = get_owner(self);
                 let session = self
                     .agy_mut()
                     .sessions
                     .get_mut(&generation)
                     .expect("active session");
                 session.options.apply(&value);
-                if owner.is_none() {
+                if session.owner.is_none() {
                     let native = value["sessionId"]
                         .as_str()
                         .filter(|id| !id.trim().is_empty() && !id.chars().any(char::is_control))
@@ -735,19 +734,24 @@ impl Store {
                             io::Error::other("Antigravity returned no usable session ID.")
                         })?;
                     session.owner = Some(format!("{PREFIX}{native}"));
-                    if let Some(mode) = session.start_mode
-                        && mode != Access::Yolo
-                        && session.options.access() != Some(mode)
-                    {
-                        let (method, params) = session.options.set_access(native, mode)
-                            .ok_or_else(|| io::Error::other("Antigravity does not offer the requested starting mode. Update agy and retry."))?;
-                        return self.antigravity_request(
-                            generation,
-                            Pending::StartMode(mode),
-                            method,
-                            params,
-                        );
-                    }
+                }
+                if let Some(mode) = session.start_mode
+                    && mode != Access::Yolo
+                    && session.options.access() != Some(mode)
+                {
+                    let native = session
+                        .owner
+                        .as_deref()
+                        .and_then(native_id)
+                        .expect("known session");
+                    let (method, params) = session.options.set_access(native, mode)
+                        .ok_or_else(|| io::Error::other("Antigravity does not offer the requested starting mode. Update agy and retry."))?;
+                    return self.antigravity_request(
+                        generation,
+                        Pending::StartMode(mode),
+                        method,
+                        params,
+                    );
                 }
                 self.antigravity_ready(generation)?;
             }
