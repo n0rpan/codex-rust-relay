@@ -260,6 +260,7 @@ impl Engine {
                                 "waiting_for_operator" => wire::NotificationKind::Approval,
                                 _ => wire::NotificationKind::Failed,
                             },
+                            goal_reached: false,
                         }],
                     )?;
                 }

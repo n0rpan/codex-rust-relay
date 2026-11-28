@@ -176,13 +176,13 @@ def run(gui, codex, root, drop_probe=None, fleet_harness=None):
         def compose_chinese(keys, expected, confirm="space"):
             command("fcitx5-remote", "-s", "pinyin")
             command("fcitx5-remote", "-o")
-            wait_for("Pinyin activation", lambda: command("fcitx5-remote", "-n").strip() == b"pinyin")
+            wait_for("Pinyin activation", lambda: command("fcitx5-remote").strip() == b"2"
+                     and command("fcitx5-remote", "-n").strip() == b"pinyin")
             time.sleep(.4)
-            for letter in keys:
-                key(letter)
-                time.sleep(.075)
-            time.sleep(.3)
-            key(confirm)
+            # Keep one virtual keyboard for the whole composition. Replacing it
+            # between letters can restart Wayland keyboard focus mid-preedit.
+            strokes = [part for letter in keys for part in ("-k", letter, "-s", "75")]
+            command("wtype", *strokes, "-s", "300", "-k", confirm)
             time.sleep(.25)
             command("fcitx5-remote", "-c")
             time.sleep(.5)
@@ -211,8 +211,16 @@ def run(gui, codex, root, drop_probe=None, fleet_harness=None):
         for _ in range(7):
             key("Tab")
         key("Return")
-        time.sleep(.15)
-        for _ in range(4):
+        def alias_tab_steps():
+            controls = [c["id"] for c in stats().get("layout", []) if c["enabled"]]
+            if "Starred models" in controls and "add-favorite" in controls:
+                return controls.index("add-favorite") - controls.index("Starred models")
+            return None
+
+        # Each intervening button is a tab stop. The alias input takes the
+        # final stop before Add alias. Avoid copying text while its IME focus
+        # is being established.
+        for _ in range(wait_for("Starred models settings to load", alias_tab_steps)):
             key("Tab")
         compose_chinese("beijing","北京")
         key("comma", "ctrl")

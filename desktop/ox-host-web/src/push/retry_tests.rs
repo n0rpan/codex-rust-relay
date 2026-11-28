@@ -37,6 +37,19 @@ fn paired_phone() -> (tempfile::TempDir, App, String, Subscription) {
     state
         .set_origin(Some("https://test.tail.ts.net".into()), 0)
         .unwrap();
+    let (id, sub) = register_phone(&mut state);
+    let app = App {
+        jobs: None,
+        state: Arc::new(std::sync::Mutex::new(state)),
+        host: Arc::new(dir.path().join("unused.sock")),
+        slots: Arc::new(tokio::sync::Semaphore::new(1)),
+        inventory: Default::default(),
+        discovered: Default::default(),
+    };
+    (dir, app, id, sub)
+}
+
+fn register_phone(state: &mut crate::state::State) -> (String, Subscription) {
     let (sub, phone) = fixture();
     let invite = state.invite(Some("me".into()), false).unwrap();
     let code = invite.url.split_once("#pair=").unwrap().1;
@@ -53,22 +66,149 @@ fn paired_phone() -> (tempfile::TempDir, App, String, Subscription) {
         .unwrap();
     let id = state.identity("me", &cookie).unwrap();
     state.set_push(&id, Some(sub.clone())).unwrap();
-    let app = App {
-        jobs: None,
-        state: Arc::new(std::sync::Mutex::new(state)),
-        host: Arc::new(dir.path().join("unused.sock")),
-        slots: Arc::new(tokio::sync::Semaphore::new(1)),
-        inventory: Default::default(),
-        discovered: Default::default(),
-    };
-    (dir, app, id, sub)
+    (id, sub)
 }
 fn notice(payload: &[u8]) -> Notice {
     Notice {
         bytes: payload.to_owned(),
+        goal_bytes: None,
         expires: Instant::now() + Duration::from_secs(300),
+        event: Event::Session(NotificationKind::Finished),
         ask: None,
     }
+}
+
+#[test]
+fn preferences_survive_restart_and_apply_only_to_the_paired_device() {
+    let (dir, app, first, _) = paired_phone();
+    let second = {
+        let mut state = app.state.lock().unwrap();
+        let (second, _) = register_phone(&mut state);
+        let old = state.push_preferences(&first, None).unwrap();
+        assert!(old.subscribed);
+        assert_eq!(old.preferences, Preferences::default());
+        let finished = PreferenceEdit {
+            event: Preference::Finished,
+            value: false,
+        };
+        state.push_preferences(&first, Some(finished)).unwrap();
+        let master = |value| PreferenceEdit {
+            event: Preference::Enabled,
+            value,
+        };
+        state.push_preferences(&first, Some(master(false))).unwrap();
+        assert!(!state.allows_push(&first, Event::Session(NotificationKind::Approval)));
+        state.push_preferences(&first, Some(master(true))).unwrap();
+        second
+    };
+    let state = crate::state::State::load(dir.path()).unwrap();
+    assert!(state.allows_push(&first, Event::Session(NotificationKind::Approval)));
+    assert!(!state.allows_push(&first, Event::Session(NotificationKind::Finished)));
+    assert!(state.allows_push(&second, Event::Session(NotificationKind::Finished)));
+    assert!(!state.allows_push(&second, Event::GoalReached));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_goal_completion_delivers_the_receivers_preferred_event_once() {
+    let (_dir, app, id, _sub) = paired_phone();
+    let (tx, rx) = mpsc::channel(32);
+    let (log, mut attempts) = mpsc::unbounded_channel();
+    let sender = tokio::spawn(deliveries(
+        app.clone(),
+        rx,
+        async move |_: &Subscription, _: &SecretKey, bytes: &[u8], _: &str, _: Duration| {
+            let value: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            log.send(value["kind"].as_str().unwrap().to_owned())
+                .unwrap();
+            DeliveryResult::Done
+        },
+    ));
+    let turn = |seq, goal_reached| {
+        let frame = json!({"type":"delta","cursor":{"epoch":"epoch","seq":seq},
+            "scope":{"project":"/one","route":{"runtime":"codex","billing":"subscription"}},
+            "changes":[{"kind":"notification","thread":"thread","title":"session",
+                "event":"finished","goal_reached":goal_reached}]});
+        let Notices::Delta(_, mut notes) = notices(
+            &serde_json::to_vec(&frame).unwrap(),
+            None,
+            &mut ActiveAsks::default(),
+        )
+        .unwrap() else {
+            panic!("expected delta")
+        };
+        assert_eq!(notes.len(), 1);
+        notes.pop().unwrap()
+    };
+    tx.send(turn(1, true)).await.unwrap();
+    assert_eq!(attempts.recv().await.unwrap(), "finished");
+    app.state
+        .lock()
+        .unwrap()
+        .push_preferences(
+            &id,
+            Some(PreferenceEdit {
+                event: Preference::GoalReached,
+                value: true,
+            }),
+        )
+        .unwrap();
+    tx.send(turn(2, true)).await.unwrap();
+    assert_eq!(attempts.recv().await.unwrap(), "goal_reached");
+    tx.send(turn(3, false)).await.unwrap();
+    assert_eq!(attempts.recv().await.unwrap(), "finished");
+    drop(tx);
+    sender.await.unwrap();
+    assert!(attempts.try_recv().is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn muted_events_skip_new_deliveries_and_pending_retries() {
+    let (_dir, app, id, _sub) = paired_phone();
+    let (tx, rx) = mpsc::channel(32);
+    let (log, mut attempts) = mpsc::unbounded_channel();
+    let sender = tokio::spawn(deliveries(
+        app.clone(),
+        rx,
+        async move |_: &Subscription, _: &SecretKey, bytes: &[u8], _: &str, _: Duration| {
+            log.send(bytes.to_owned()).unwrap();
+            DeliveryResult::Retry(Duration::ZERO)
+        },
+    ));
+    tx.send(notice(b"before")).await.unwrap();
+    assert_eq!(attempts.recv().await.unwrap(), b"before");
+    {
+        let mut state = app.state.lock().unwrap();
+        state
+            .push_preferences(
+                &id,
+                Some(PreferenceEdit {
+                    event: Preference::Finished,
+                    value: false,
+                }),
+            )
+            .unwrap();
+    }
+    tx.send(notice(b"muted")).await.unwrap();
+    let mut approved = notice(b"approved");
+    approved.event = Event::Session(NotificationKind::Approval);
+    tx.send(approved).await.unwrap();
+    assert_eq!(attempts.recv().await.unwrap(), b"approved");
+    app.state
+        .lock()
+        .unwrap()
+        .push_preferences(
+            &id,
+            Some(PreferenceEdit {
+                event: Preference::Enabled,
+                value: false,
+            }),
+        )
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(12)).await;
+    tokio::task::yield_now().await;
+    assert!(attempts.try_recv().is_err());
+    drop(tx);
+    sender.await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]

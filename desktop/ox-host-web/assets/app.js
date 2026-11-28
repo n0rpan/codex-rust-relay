@@ -252,10 +252,14 @@ const phoneSettings = setupSettings({
   request: (operation) => settingsRequest(key, operation),
   open: () => page("settings"),
   close: home,
-  notifications: () => {
-    home();
-    $("notification-setup").open = true;
-    $("notification-summary").focus();
+  pushStatus: () => {
+    const blocked = pushBlockReason();
+    return { blocked, granted: !blocked && Notification.permission === "granted" };
+  },
+  enablePush: async () => {
+    const enabled = await notifications(key, true);
+    if (enabled) $("notification-banner").hidden = true;
+    return enabled;
   },
   login: async (runtime) => {
     return openPhoneTerminal(`${runtime}-login`);
@@ -2827,42 +2831,40 @@ function setAlertsDismissed(on) {
     // Private windows may refuse storage; the banner then simply returns.
   }
 }
+function pushBlockReason() {
+  const supportsPush =
+    "serviceWorker" in navigator &&
+    "Notification" in window &&
+    "PushManager" in window;
+  if (ios && !standalone)
+    return "On iPhone, tap Share → Add to Home Screen in Safari. Turn on Open as Web App if shown. Open OX from its icon, scan a fresh pairing QR, then enable notifications there.";
+  if (!supportsPush)
+    return "This browser cannot receive session notifications. On iPhone, use the Home Screen app on iOS 16.4 or later.";
+  if (Notification.permission === "denied")
+    return ios
+      ? "Notifications are off. In iPhone Settings → Notifications, choose the name of this web app and turn on Allow Notifications. Then return to OX."
+      : "Allow notifications for this site in your browser settings, then return to OX.";
+  return null;
+}
 function notificationSetup(justPaired) {
   if (justPaired) {
     setAlertsDismissed(false);
     $("notification-setup").open = true;
   }
-  const supportsPush =
-    "serviceWorker" in navigator &&
-    "Notification" in window &&
-    "PushManager" in window;
-  if (ios && !standalone) {
-    notificationGuide(
-      "On iPhone, tap Share → Add to Home Screen in Safari. Turn on Open as Web App if shown. Open OX from its icon, scan a fresh pairing QR, then enable notifications there.",
-    );
-  } else if (!supportsPush) {
-    notificationGuide(
-      "This browser cannot receive session notifications. On iPhone, use the Home Screen app on iOS 16.4 or later.",
-    );
-  } else if (Notification.permission === "denied") {
-    notificationGuide(
-      ios
-        ? "Notifications are off. In iPhone Settings → Notifications, choose the name of this web app and turn on Allow Notifications. Then return to OX."
-        : "Allow notifications for this site in your browser settings, then return to OX.",
-    );
-  } else {
+  const blocked = pushBlockReason();
+  if (blocked) notificationGuide(blocked);
+  else {
     notificationGuide(
       "Get alerts when a session needs approval or an answer, finishes a turn, or fails. Tap Enable notifications, then Allow.",
       "Enable notifications",
     );
     if (Notification.permission === "granted") registerNotifications(false);
   }
-  // One-time banner until alerts are on or the user dismisses it; then it lives in the menu.
+  // One-time setup banner. Preferences are always in the Sessions menu.
   const granted =
     "Notification" in window && Notification.permission === "granted";
   const dismissed = alertsDismissed();
   $("notification-banner").hidden = granted || dismissed;
-  $("open-notifications").hidden = granted || !dismissed;
 }
 $("notification-dismiss").onclick = () => {
   setAlertsDismissed(true);
@@ -2870,9 +2872,7 @@ $("notification-dismiss").onclick = () => {
 };
 $("open-notifications").onclick = () => {
   closeActionMenus();
-  setAlertsDismissed(false);
-  notificationSetup(false);
-  $("notification-setup").open = true;
+  phoneSettings.openNotifications();
 };
 let registering = false;
 async function registerNotifications(explicit) {
