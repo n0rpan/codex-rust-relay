@@ -132,13 +132,13 @@ impl Workbench {
         })
     }
 
-    pub(super) fn move_source_fenced(&self) -> bool {
+    pub(super) fn move_source_reserved(&self) -> bool {
         self.showing_move()
             && self
                 .move_preview
                 .attempt
                 .as_ref()
-                .is_some_and(Attempt::fenced)
+                .is_some_and(|attempt| attempt.fenced() || matches!(attempt.phase, Phase::Staging))
     }
 
     pub(super) fn move_preview_button(
@@ -195,11 +195,11 @@ impl Workbench {
                     ),
                 ),
                 Phase::Staging => (
-                    format!("Preparing the session on {target}"),
-                    format!("OX is transferring the checkout and conversation. Keep {source} on."),
+                    format!("Preparing {target}"),
+                    format!("Copying the conversation and working files. Keep {source} on."),
                 ),
                 Phase::Releasing => (
-                    format!("Releasing the session on {source}"),
+                    format!("Closing on {source}"),
                     format!(
                         "The source is read-only while {target} takes over. Keep both hosts on."
                     ),
@@ -235,7 +235,7 @@ impl Workbench {
                 .child(status_title(p, heading))
                 .child(small(p, explanation));
             match &attempt.phase {
-                Phase::Waiting => {
+                Phase::Waiting | Phase::Staging => {
                     panel = panel.child(
                         toolbar_button(
                             p,
@@ -244,7 +244,7 @@ impl Workbench {
                             true,
                             cx.listener(|s, _, _, cx| {
                                 if let Some(attempt) = &s.move_preview.attempt
-                                    && matches!(attempt.phase, Phase::Waiting)
+                                    && matches!(attempt.phase, Phase::Waiting | Phase::Staging)
                                 {
                                     s.move_preview = Preview::default();
                                     cx.notify();

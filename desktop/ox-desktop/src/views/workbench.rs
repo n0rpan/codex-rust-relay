@@ -1119,23 +1119,23 @@ impl Workbench {
             self.finish_pending_row_action(window, cx);
         }
         #[cfg(test)]
-        let (move_button, move_panel, source_fenced) = (
+        let (move_button, move_panel, source_reserved) = (
             self.move_preview_button(p, cx),
             self.move_preview_panel(p, cx),
-            self.move_source_fenced(),
+            self.move_source_reserved(),
         );
         #[cfg(not(test))]
-        let source_fenced = false;
-        let controls = (!source_fenced).then(|| self.thread_menu(cx)).flatten();
-        let start_worker = (!source_fenced)
+        let source_reserved = false;
+        let controls = (!source_reserved).then(|| self.thread_menu(cx)).flatten();
+        let start_worker = (!source_reserved)
             .then(|| self.start_worker_button(p, cx))
             .flatten();
         let review_toggle = self.review_toggle(cx);
         let inline_request = self.pane_width < px(825.);
-        let asks = (!source_fenced)
+        let asks = (!source_reserved)
             .then(|| self.ask_sheet(inline_request, window, cx))
             .flatten();
-        let launch = (!source_fenced)
+        let launch = (!source_reserved)
             .then(|| self.launch_sheet(window.viewport_size().height * 0.6, cx))
             .flatten();
         let usage = self.usage_bar(cx);
@@ -1150,7 +1150,7 @@ impl Workbench {
             self.pane_width
         };
         let composer = self.composer(detail_width, window, cx);
-        let terminal = (status == "Connected" && !source_fenced).then(|| {
+        let terminal = (status == "Connected" && !source_reserved).then(|| {
             let project = self.project.clone();
             crate::kit::icon(
                 p,
@@ -1363,7 +1363,7 @@ impl Workbench {
                                 .w_full()
                                 .max_w(px(if ready { 680. } else { 760. }))
                                 .gap(px(SPACE_S))
-                                .children(activity_status.filter(|_| !source_fenced))
+                                .children(activity_status.filter(|_| !source_reserved))
                                 .children(self.workers_line(p, cx))
                                 .when_some(self.worker_update.as_deref(), |line, update| {
                                     line.child(crate::platform::layout_probe::mark_element(
@@ -1380,7 +1380,7 @@ impl Workbench {
                                     dock
                                 })
                                 .children(inline_sheet)
-                                .when(!source_fenced, |dock| dock.child(composer))
+                                .when(!source_reserved, |dock| dock.child(composer))
                                 .children(usage);
                             let dock = row().w_full().justify_center().child(dock);
                             if ready {
