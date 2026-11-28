@@ -2823,6 +2823,7 @@ $("pair-form").onsubmit = async (e) => {
     if (!/^[A-Za-z0-9_-]{43}$/.test(secret))
       throw new Error("Request a fresh pairing QR in OX Desktop.");
     await pair(secret, $("device-label").value);
+    forgetKnownHosts();
     $("pair-link").value = "";
     code = null;
     key = await deviceKey();
