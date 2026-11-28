@@ -1400,6 +1400,11 @@ impl Engine {
                 .ok()
                 .flatten();
             store.restore_ended(&saved.id, &saved.title, saved.updated_at, access);
+            if let Ok(attachment) =
+                serde_json::from_value(saved.detail["memory_attachment"].clone())
+            {
+                store.remember_memory_attachment(&saved.id, attachment);
+            }
         }
         let mut state = store.host_snapshot(scope);
         restore(&mut state.sessions, &recovered);
@@ -3804,6 +3809,7 @@ fn restore_row(row: &mut wire::SessionView, saved: &wire::SessionView) {
         "origin",
         "worker_notice",
         "last_result",
+        "memory_attachment",
     ] {
         if row.detail[key].is_null() && !saved.detail[key].is_null() {
             row.detail[key] = saved.detail[key].clone();
