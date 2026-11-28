@@ -411,6 +411,28 @@ pub struct ReviewRow {
     pub selected: bool,
     pub available: bool,
 }
+pub struct KeyTransferReceipt {
+    pub sent: usize,
+    needs_setup: Option<usize>,
+}
+
+impl KeyTransferReceipt {
+    pub fn message(&self, host: &str) -> String {
+        let sent = self.sent;
+        let keys = if sent == 1 { "key" } else { "keys" };
+        let mut message = format!("Sent {sent} {keys} to {host}.");
+        match self.needs_setup {
+            Some(0) => {}
+            Some(1) => message.push_str(" 1 key still needs endpoint setup on the destination."),
+            Some(count) => message.push_str(&format!(
+                " {count} keys still need endpoint setup on the destination."
+            )),
+            None => message.push_str(" Check provider setup on the destination."),
+        }
+        message
+    }
+}
+
 pub struct KeyReview {
     pub host: SavedHost,
     pub rows: Vec<ReviewRow>,
@@ -450,7 +472,7 @@ impl KeyReview {
                     .iter()
                     .any(|d| d.name == r.name && d.scope == r.scope && d.configured)
                 {
-                    status.push_str(" · configure this endpoint on the host to use the key");
+                    status.push_str(" · the destination may need endpoint setup");
                 }
                 let selection = KeySelection {
                     name: r.name,
@@ -477,7 +499,7 @@ impl KeyReview {
     pub fn send(
         self,
         export: impl FnOnce(protocol::Request) -> Result<Vec<TransferredKey>, String>,
-    ) -> io::Result<usize> {
+    ) -> io::Result<KeyTransferReceipt> {
         let selected: Vec<_> = self
             .rows
             .into_iter()
@@ -490,7 +512,7 @@ impl KeyReview {
         }
         let keys: Vec<TransferredKey> = export(protocol::Request::ExportKeys {
             revision: self.source,
-            selected,
+            selected: selected.clone(),
         })
         .map_err(io::Error::other)?;
         let action = serde_json::to_value(protocol::Request::ImportKeys {
@@ -498,7 +520,27 @@ impl KeyReview {
             keys,
         })?;
         match serde_json::from_value(self.host.settings(action)?)? {
-            protocol::model::Outcome::Applied => Ok(count),
+            protocol::model::Outcome::Applied => {
+                let needs_setup = self
+                    .host
+                    .settings(json!({"action":"read_rows"}))
+                    .ok()
+                    .and_then(|rows| serde_json::from_value::<Snapshot>(rows).ok())
+                    .map(|rows| {
+                        selected
+                            .iter()
+                            .filter(|key| {
+                                !rows.credentials.iter().any(|row| {
+                                    row.name == key.name && row.scope == key.scope && row.configured
+                                })
+                            })
+                            .count()
+                    });
+                Ok(KeyTransferReceipt {
+                    sent: count,
+                    needs_setup,
+                })
+            }
             protocol::model::Outcome::ChangedOnDisk { .. } => Err(io::Error::other(
                 "The server’s keys changed. Review the transfer again.",
             )),

@@ -1,4 +1,4 @@
-//! Export by reviewed provider destination. Import as one revision-checked write.
+//! Export by reviewed provider destination. Import under the destination settings lock.
 use super::*;
 use crate::settings_protocol::{KeySelection, TransferredKey, model::Outcome};
 
@@ -70,16 +70,19 @@ pub(super) fn import(
         return Err("Select at least one credential.".into());
     }
     let mut saved = SavedKeys::load(home)?;
-    let config = home
-        .join(REGISTRY)
-        .try_exists()?
-        .then(|| CodeoxConfig::load(&home.join(REGISTRY)))
+    let registry = document(home, REGISTRY)?;
+    let had_registry = !registry.revision.is_empty();
+    let config = had_registry
+        .then(|| CodeoxConfig::load_from_str(&registry.text))
         .transpose()?;
-    let legacy = if config.is_none() {
-        legacy::key_destination(home)?
-    } else {
+    let legacy = if had_registry {
         None
+    } else {
+        legacy::key_destination(home)?
     };
+    // Creating a registry would supersede a selected legacy provider.
+    let can_add_providers = had_registry || legacy::projection(home)?.is_none();
+    let mut updated = registry.text.clone();
     let mut names = BTreeSet::new();
     for key in keys {
         validate(&key.selection, key.value.expose())?;
@@ -96,6 +99,21 @@ pub(super) fn import(
         if !names.insert(key.selection.name.clone()) {
             return Err("Choose one provider endpoint per credential name.".into());
         }
+        if can_add_providers
+            && let Some((id, section)) = setup::transferred_provider(name, scope)
+            && !config.as_ref().is_some_and(|cfg| {
+                cfg.env_refs().contains(name.as_str()) || cfg.vendors.iter().any(|v| v.key == id)
+            })
+        {
+            let candidate = setup::append_section(&updated, &section);
+            if candidate.len() as u64 <= MAX_CONFIG_BYTES
+                && CodeoxConfig::load_from_str(&candidate)
+                    .and_then(|config| setup::check_alias_collisions(&config))
+                    .is_ok()
+            {
+                updated = candidate;
+            }
+        }
         saved.insert_scoped(
             &key.selection.name,
             &key.selection.scope,
@@ -106,6 +124,11 @@ pub(super) fn import(
     if encoded.len() as u64 > MAX_CONFIG_BYTES {
         return Err("The credential store would exceed its size limit.".into());
     }
+    // Save credentials first. If the registry write fails, the scoped keys
+    // are already safely stored and a retry can finish setting up the providers.
     setup::write_config_atomic(&SavedKeys::path(home), &encoded)?;
+    if updated != registry.text {
+        setup::write_config_atomic(&home.join(REGISTRY), &updated)?;
+    }
     Ok(Outcome::Applied)
 }

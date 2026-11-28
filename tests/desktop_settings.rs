@@ -694,3 +694,80 @@ fn transfer_reviews_scoped_provider_and_brave_keys_and_commits_a_batch_once() {
     );
     assert!(server.request(json!({"action":"export_keys","revision":snapshot["revisions"]["keys"],"selected":[{"name":"DEMO_KEY","scope":brave["scope"]}]})).is_err());
 }
+
+#[test]
+fn imported_presets_register_on_first_use_and_keep_custom_keys_scoped() {
+    let host = Fixture::new();
+    let initial = row_read(&host);
+    assert!(initial["api_provider"].is_null());
+    let keys = json!([
+        {"name":"OPENCODE_API_KEY","scope":"https://opencode.ai/inference/go/openai/v1","value":"fixture-go"},
+        {"name":"ALIBABA_API_KEY","scope":"https://fixture.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1","value":"fixture-cloud"},
+        {"name":"OPENAI_API_KEY","scope":"http://127.0.0.1:8000/v1","value":"fixture-custom"}
+    ]);
+    assert_eq!(
+        host.request(
+            json!({"action":"import_keys", "revision":initial["revisions"]["keys"], "keys":keys})
+        )
+        .unwrap(),
+        json!({"status":"applied"})
+    );
+
+    let after = row_read(&host);
+    let credentials = after["credentials"].as_array().unwrap();
+    assert_eq!(credentials.len(), 3);
+    for key in credentials {
+        assert_eq!(key["saved"], true);
+        assert_eq!(key["configured"], key["name"] != "OPENAI_API_KEY");
+    }
+    assert_eq!(after["models"], json!(["alibaba/qwen3.8-flash"]));
+    let path = host.0.join("codeox.toml");
+    let registry = fs::read_to_string(&path).unwrap();
+    assert!(registry.contains("https://opencode.ai/inference/go/v1/models"));
+    assert!(!registry.contains("fixture-"));
+
+    // Replacing a key uses the host's existing definition, including edits.
+    let customized = registry.replace("OpenCode Go", "My OpenCode");
+    fs::write(&path, &customized).unwrap();
+    assert_eq!(
+        host.request(json!({"action":"import_keys", "revision":after["revisions"]["keys"], "keys":[
+            {"name":"OPENCODE_API_KEY","scope":"https://opencode.ai/inference/go/openai/v1","value":"fixture-new"}
+        ]})).unwrap(),
+        json!({"status":"applied"})
+    );
+    assert_eq!(fs::read_to_string(path).unwrap(), customized);
+}
+
+#[test]
+fn importing_a_preset_does_not_replace_a_legacy_provider_or_an_occupied_id() {
+    let key = json!({"name":"OPENAI_API_KEY","scope":"https://api.openai.com/v1","value":"fixture-openai"});
+    let legacy = Fixture::new();
+    fs::write(
+        legacy.0.join("config.toml"),
+        "model_provider='private'\nmodel='local-model'\n[model_providers.private]\nbase_url='https://example.org/v1'\nenv_key='PRIVATE_KEY'\nwire_api='responses'\n",
+    ).unwrap();
+    let occupied = Fixture::new();
+    let registry = "[providers.openai]\nbase_url='https://example.org/v1'\nenv_key='PRIVATE_KEY'\n";
+    fs::write(occupied.0.join("codeox.toml"), registry).unwrap();
+    for host in [&legacy, &occupied] {
+        let initial = row_read(host);
+        host.request(
+            json!({"action":"import_keys", "revision":initial["revisions"]["keys"], "keys":[key]}),
+        )
+        .unwrap();
+        let after = row_read(host);
+        let imported = after["credentials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "OPENAI_API_KEY")
+            .unwrap();
+        assert_eq!(imported["saved"], true);
+        assert_eq!(imported["configured"], false);
+    }
+    assert!(!legacy.0.join("codeox.toml").exists());
+    assert_eq!(
+        fs::read_to_string(occupied.0.join("codeox.toml")).unwrap(),
+        registry
+    );
+}

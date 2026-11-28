@@ -936,7 +936,8 @@ impl Preferences {
         for (i, k) in self.keys.iter().enumerate() {
             let c = &k.credential;
             let status = match (c.configured, c.environment, c.saved) {
-                (false, _, _) => "Inactive destination",
+                (false, _, true) => "Saved · configure this endpoint to use the key",
+                (false, _, false) => "Inactive destination",
                 (_, true, true) => "Environment key overrides saved key",
                 (_, true, false) => "Using environment key",
                 (_, false, true) => "Saved locally",
