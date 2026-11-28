@@ -107,10 +107,18 @@ enum Control {
 }
 
 pub(crate) trait Frames: Send {
+    fn request_upload(&mut self) -> impl Future<Output = io::Result<()>> + Send {
+        async { Ok(()) }
+    }
+
     fn next(&mut self) -> impl Future<Output = io::Result<Chunk>> + Send;
 }
 
 impl Frames for Connection<Message> {
+    async fn request_upload(&mut self) -> io::Result<()> {
+        self.send(Message::text(r#"{"step":"upload"}"#)).await
+    }
+
     async fn next(&mut self) -> io::Result<Chunk> {
         match Connection::next(self).await? {
             Message::Binary(bytes) => Ok(Chunk::Bytes(bytes)),
@@ -262,7 +270,11 @@ impl Upload {
     ) -> io::Result<PreparedReply<T>> {
         let staged = match self.existing().await? {
             Some(staged) => staged,
-            None => self.receive(frames).await?,
+            None => {
+                self.check()?;
+                frames.request_upload().await?;
+                self.receive(frames).await?
+            }
         };
         self.check()?;
         let prepared = tokio::task::spawn_blocking(move || prepare(staged)).await??;
@@ -315,6 +327,42 @@ impl Upload {
         )?;
         Ok(stage)
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Open {
+    request: String,
+    proof: Proof,
+}
+
+#[derive(Serialize)]
+struct StageReply<T> {
+    step: &'static str,
+    prepared: T,
+}
+
+/// Serve a single transfer after the HTTP layer has verified the paired
+/// identity. This connection does not grant a move or activate the receiver.
+async fn stage_socket<T: Serialize + Send + 'static>(
+    state: Arc<Mutex<State>>,
+    device: &str,
+    connection: &mut Connection<Message>,
+    prepare: impl FnOnce(StagedMove) -> io::Result<T> + Send + 'static,
+) -> io::Result<()> {
+    let Message::Text(text) = timeout(IDLE, Connection::next(connection)).await?? else {
+        return Err(invalid("Expected a signed session move offer"));
+    };
+    let open: Open = serde_json::from_str(&text)?;
+    let upload = Upload::open(state, device, &open.request, &open.proof)?;
+    let prepared = upload.prepare_with(connection, prepare).await?;
+    let reply = StageReply {
+        step: "prepared",
+        prepared: prepared.prepared,
+    };
+    connection
+        .send(Message::text(serde_json::to_string(&reply)?))
+        .await
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -585,6 +633,83 @@ mod tests {
             serde_json::to_value(result).unwrap(),
             serde_json::json!({"prepared":{"native":"imported-on-destination"}})
         );
+    }
+
+    #[tokio::test]
+    async fn signed_websocket_stage_retries_without_sending_the_files_again() {
+        use axum::{Router, extract::WebSocketUpgrade, routing::get};
+        use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+        let f = Fixture::approved();
+        let state = f.state.clone();
+        let device = f.device.clone();
+        let app = Router::new().route(
+            "/",
+            get(move |ws: WebSocketUpgrade| async move {
+                ws.max_message_size(CHUNK).max_frame_size(CHUNK).on_upgrade(
+                    move |socket| async move {
+                        let mut connection = Connection::open(socket);
+                        stage_socket(state, &device, &mut connection, |staged| {
+                            assert_eq!(fs::read(staged.transcript)?, T);
+                            assert_eq!(fs::read(staged.checkout)?, C);
+                            Ok(serde_json::json!({
+                                "transfer": staged.receipt.transfer,
+                                "has_working_checkout": true,
+                            }))
+                        })
+                        .await
+                        .unwrap();
+                    },
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let running = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for first_upload in [true, false] {
+            let (socket, _) = connect_async(format!("ws://{address}")).await.unwrap();
+            let mut socket = Connection::open(socket);
+            let request = serde_json::to_string(&f.offer).unwrap();
+            let nonce = f
+                .state
+                .lock()
+                .unwrap()
+                .challenge(&f.device, Purpose::Worker)
+                .unwrap();
+            let signature = sign(&f.key, &format!("{nonce}.{}", digest(&request)));
+            socket
+                .send(ClientMessage::text(
+                    serde_json::json!({
+                        "request": request,
+                        "proof": {"nonce": nonce, "signature": signature},
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            let mut reply = socket.next().await.unwrap();
+            if first_upload {
+                assert_eq!(reply.to_text().unwrap(), r#"{"step":"upload"}"#);
+                for bytes in [P, T, C] {
+                    socket
+                        .send(ClientMessage::Binary(Bytes::from_static(bytes)))
+                        .await
+                        .unwrap();
+                }
+                socket
+                    .send(ClientMessage::text(r#"{"step":"finish"}"#))
+                    .await
+                    .unwrap();
+                reply = socket.next().await.unwrap();
+            }
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(reply.to_text().unwrap()).unwrap(),
+                serde_json::json!({"step":"prepared","prepared":{"transfer":TRANSFER,"has_working_checkout":true}})
+            );
+        }
+        running.abort();
     }
 
     #[tokio::test]
