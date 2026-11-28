@@ -8,6 +8,10 @@ mod executable;
 mod handover;
 mod identity;
 mod lease;
+#[cfg(test)]
+mod move_archive;
+#[cfg(test)]
+mod move_ledger;
 mod pairing;
 mod policy;
 mod projects;
