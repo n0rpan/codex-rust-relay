@@ -112,7 +112,24 @@ impl Render for Viewport {
                 .min_h_0()
                 .flex_1()
                 .gap_2()
-                .child(small(p, "Live · View only"))
+                .child(
+                    row()
+                        .flex_wrap()
+                        .justify_between()
+                        .gap_x_2()
+                        .child(small(p, "Live · View only"))
+                        .child(button(
+                            p,
+                            "browser-preview-copy-agent",
+                            "Copy agent command",
+                            false,
+                            true,
+                            cx.listener(|s, _, _, cx| {
+                                let command = format!("ox browser --session {} snapshot", s.label);
+                                cx.write_to_clipboard(ClipboardItem::new_string(command));
+                            }),
+                        )),
+                )
                 .child(
                     col()
                         .bg(rgb(p.nav))
