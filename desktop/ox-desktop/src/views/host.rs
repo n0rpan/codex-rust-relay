@@ -13,12 +13,17 @@ use super::running::Running;
 use super::workbench::{CatalogChanged, Workbench};
 use crate::kit::{DropdownMenu, SPACE_M, SPACE_S, SPACE_XS};
 use crate::{
-    activity, appearance::Palette, col, kit::button, platform, row, settings, small,
-    workspace_state::LastWorkspace,
+    activity,
+    appearance::Palette,
+    col,
+    kit::button,
+    platform, row, settings, small,
+    workspace_state::{LastWorkspace, SeenResults},
 };
 use gpui::{prelude::FluentBuilder, *};
 use gpui_component::FocusTrapElement;
 use ox_desk_core::actions::Action as DeskAction;
+use ox_desk_core::host_protocol::SessionOutcome;
 use ox_desk_core::runtime::{Billing, Runtime};
 use ox_desk_core::store::{Connection, Route, ThreadRow};
 use std::{ops::Range, path::PathBuf, time::Instant};
@@ -52,17 +57,22 @@ enum CatalogEntry {
         running: usize,
         waiting: usize,
     },
-    /// A day group header: its root-thread count and whether it is folded.
+    /// A day group header: its thread count and whether it is folded.
     Day {
         day: Option<chrono::NaiveDate>,
         count: usize,
         folded: bool,
     },
+    JustFinished,
+    ViewFinished,
+    NoRunning,
     Thread {
         loc: Location,
         timestamp: i64,
         ordinal: usize,
         depth: usize,
+        result: Option<SessionOutcome>,
+        in_finished_shelf: bool,
     },
 }
 
@@ -177,6 +187,7 @@ pub struct Host {
     favorite_models: Vec<String>,
     catalog_versions: Vec<(usize, u64)>,
     catalog: Vec<CatalogEntry>,
+    seen_results: SeenResults,
     fleet_tree: crate::app::fleet::tree::Tree,
     discovery: Discovery,
     running: Entity<Running>,
@@ -315,6 +326,10 @@ impl Host {
             favorite_models: vec![],
             catalog_versions: vec![],
             catalog: vec![],
+            seen_results: crate::workspace_state::read_preference(
+                &link.state_file(SeenResults::FILE_NAME),
+            )
+            .unwrap_or_default(),
             fleet_tree: Default::default(),
             discovery: Discovery::default(),
             running: cx.new(|_| Running::new(link)),
@@ -1140,6 +1155,21 @@ impl Host {
             cx.notify();
         })
         .detach();
+        cx.subscribe(pane, |s, _, event: &super::transcript::ResultViewed, cx| {
+            if s.seen_results
+                .record(&event.scope, &event.thread, &event.result)
+            {
+                crate::workspace_state::remember_seen_result(
+                    s.link.state_file(SeenResults::FILE_NAME),
+                    event.scope.clone(),
+                    event.thread.clone(),
+                    event.result.clone(),
+                );
+                s.discovery.revision += 1;
+                cx.notify();
+            }
+        })
+        .detach();
         cx.subscribe_in(
             pane,
             window,
@@ -1335,7 +1365,6 @@ impl Host {
             None => "Filter threads".to_owned(),
         };
         let filter = self.filter.clone();
-        let grouping = self.sidebar.grouping;
         let host = cx.weak_entity();
         crate::kit::icon(
             p,
@@ -1362,42 +1391,52 @@ impl Host {
                     },
                 ));
             }
-            let host_folders = host.clone();
-            let host_timeline = host.clone();
-            let host_new_sec = host.clone();
-            menu = menu
-                .separator()
-                .label("Group by")
-                .item(
-                    crate::kit::menu_item("Project folders")
-                        .checked(grouping == GroupingMode::Folders)
-                        .on_click(move |_, _, cx| {
-                            let _ = host_folders.update(cx, |s, cx| {
-                                s.sidebar.grouping = GroupingMode::Folders;
-                                s.save_sidebar(cx);
-                            });
-                        }),
-                )
-                .item(
-                    crate::kit::menu_item("Timeline (by day)")
-                        .checked(grouping == GroupingMode::Timeline)
-                        .on_click(move |_, _, cx| {
-                            let _ = host_timeline.update(cx, |s, cx| {
-                                s.sidebar.grouping = GroupingMode::Timeline;
-                                s.save_sidebar(cx);
-                            });
-                        }),
-                )
-                .separator()
+            let host = host.clone();
+            menu.separator()
                 .item(
                     crate::kit::menu_item("New section…").on_click(move |_, window, cx| {
-                        let _ = host_new_sec.update(cx, |s, cx| {
-                            s.begin_new_section(None, window, cx);
-                        });
+                        let _ = host.update(cx, |s, cx| s.begin_new_section(None, window, cx));
                     }),
-                );
-            menu
+                )
         })
+    }
+    fn grouping_control(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+        row()
+            .p(px(2.))
+            .gap(px(2.))
+            .rounded(px(crate::kit::CONTROL_RADIUS))
+            .bg(rgb(p.surface()))
+            .children(
+                [
+                    ("threads-recent", "Recent", GroupingMode::Timeline),
+                    ("threads-folders", "Folders", GroupingMode::Folders),
+                ]
+                .into_iter()
+                .map(|(id, label, grouping)| {
+                    let selected = self.sidebar.grouping == grouping;
+                    crate::kit::toolbar_button(
+                        p,
+                        id,
+                        label,
+                        true,
+                        cx.listener(move |s, _, _, cx| {
+                            if s.sidebar.grouping != grouping {
+                                s.sidebar.grouping = grouping;
+                                s.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                s.save_sidebar(cx);
+                            }
+                        }),
+                    )
+                    .h(px(crate::kit::CHIP_HEIGHT))
+                    .flex_1()
+                    .toggled(selected)
+                    .when(selected, |b| {
+                        b.bg(rgb(p.hover))
+                            .text_color(rgb(p.fg))
+                            .font_weight(FontWeight::MEDIUM)
+                    })
+                }),
+            )
     }
     pub(super) fn save_sidebar(&mut self, cx: &mut Context<Self>) {
         self.discovery.revision += 1;
@@ -1785,8 +1824,20 @@ impl Host {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.activate_sidebar_row(project, scope, row, false, window, cx);
+    }
+
+    fn activate_sidebar_row(
+        &mut self,
+        project: PathBuf,
+        scope: Scope,
+        row: ThreadRow,
+        reveal_result: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.with_project_dir(project, false, window, cx, move |s, project, window, cx| {
-            s.activate_row_then(project, scope, row, None, window, cx);
+            s.activate_row_then(project, scope, row, None, reveal_result, window, cx);
         });
     }
 
@@ -1800,7 +1851,7 @@ impl Host {
         cx: &mut Context<Self>,
     ) {
         self.with_project_dir(project, false, window, cx, move |s, project, window, cx| {
-            s.activate_row_then(project, scope, row, Some(action), window, cx);
+            s.activate_row_then(project, scope, row, Some(action), false, window, cx);
         });
     }
 
@@ -1815,12 +1866,14 @@ impl Host {
             self.save_sidebar(cx);
         }
     }
+    #[allow(clippy::too_many_arguments)]
     fn activate_row_then(
         &mut self,
         project: PathBuf,
         scope: Scope,
         row: ThreadRow,
         action: Option<super::workbench::DeferredRowAction>,
+        reveal_result: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1830,6 +1883,9 @@ impl Host {
         let (route, _) = self.project_row_state(&project, &row, scope, cx);
         if let Some(route) = route {
             self.open_catalog(project, row, route, window, cx);
+            if reveal_result {
+                self.panes[self.active].read(cx).reveal_latest_result(&id);
+            }
             if let Some(action) = action {
                 self.panes[self.active]
                     .update(cx, |p, cx| p.queue_row_action(id, action, window, cx));
@@ -1942,7 +1998,21 @@ impl Host {
             _ => return,
         };
         if let Some((index, (row, project, scope))) = target {
-            self.activate_row(project.to_owned(), scope, row.clone(), window, cx);
+            let reveal_result = matches!(
+                self.catalog[index],
+                CatalogEntry::Thread {
+                    result: Some(_),
+                    ..
+                }
+            );
+            self.activate_sidebar_row(
+                project.to_owned(),
+                scope,
+                row.clone(),
+                reveal_result,
+                window,
+                cx,
+            );
             self.list_scroll
                 .scroll_to_item(self.fleet_tree.rows.len() + index, ScrollStrategy::Nearest);
         } else if matches!(event.keystroke.key.as_str(), "up" | "k")
@@ -2457,18 +2527,66 @@ impl Host {
         let entries: Vec<CatalogEntry> =
             self.catalog.get(range.clone()).unwrap_or_default().to_vec();
         for entry in entries {
-            let (depth, timestamp) = match &entry {
+            let (depth, timestamp, result, in_finished_shelf) = match &entry {
                 CatalogEntry::Thread {
                     ordinal,
                     depth,
                     timestamp,
+                    result,
+                    in_finished_shelf,
                     ..
                 } => {
                     if self.stats {
                         measured += 1;
                         self.furthest_row = self.furthest_row.max(*ordinal + 1);
                     }
-                    (*depth, *timestamp)
+                    (*depth, *timestamp, *result, *in_finished_shelf)
+                }
+                CatalogEntry::JustFinished | CatalogEntry::NoRunning => {
+                    let (id, label) = if matches!(entry, CatalogEntry::JustFinished) {
+                        ("just-finished", "Just finished")
+                    } else {
+                        ("no-running-sessions", "No running sessions")
+                    };
+                    rows.push(
+                        crate::platform::layout_probe::mark_element(
+                            row()
+                                .w(width)
+                                .h(px(crate::kit::ROW_HEIGHT))
+                                .px(px(crate::kit::GUTTER))
+                                .text_size(p.text(Step::Meta))
+                                .text_color(rgb(p.quiet()))
+                                .child(label),
+                            &id.into(),
+                            &label.into(),
+                            true,
+                        )
+                        .into_any_element(),
+                    );
+                    continue;
+                }
+                CatalogEntry::ViewFinished => {
+                    rows.push(
+                        row()
+                            .w(width)
+                            .h(px(crate::kit::ROW_HEIGHT))
+                            .px(px(crate::kit::GUTTER))
+                            .child(crate::kit::toolbar_button(
+                                p,
+                                "view-finished",
+                                "View finished",
+                                true,
+                                cx.listener(|s, _, window, cx| {
+                                    let value = s.filter.read(cx).value().to_string();
+                                    let next = select_status_filter(&value, "is:finished");
+                                    s.filter
+                                        .update(cx, |field, cx| field.set_value(next, window, cx));
+                                    s.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                }),
+                            ))
+                            .into_any_element(),
+                    );
+                    continue;
                 }
                 CatalogEntry::Pinned {
                     count,
@@ -2832,21 +2950,24 @@ impl Host {
                 .trees
                 .get(&(project.to_path_buf(), t.id.clone()))
                 .cloned();
-            // A worker whose parent is hidden by the current filter keeps a
-            // readable return reference; opening it shows the full parent link.
+            // A worker shown on its own keeps a readable parent reference.
             let parent_hint = self
                 .workers
                 .read(cx)
                 .parents
                 .get(&(project.to_path_buf(), t.id.clone()))
                 .map(|link| {
-                    link.title.clone().unwrap_or_else(|| {
-                        link.project
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned()
-                    })
+                    link.title.as_ref().map_or_else(
+                        || {
+                            let parent_project = link
+                                .project
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy();
+                            format!("Worker · Lead project {parent_project}")
+                        },
+                        |title| format!("Worker for {title}"),
+                    )
                 });
             let row = t.clone();
             let project = project.to_owned();
@@ -2907,7 +3028,9 @@ impl Host {
                 status
             };
             let fold_key = (project.clone(), t.id.clone());
-            let folded = tree.as_ref().is_some_and(|tree| tree.children > 0)
+            let folders = self.sidebar.grouping == GroupingMode::Folders && !in_finished_shelf;
+            let folded = folders
+                && tree.as_ref().is_some_and(|tree| tree.children > 0)
                 && self.discovery.collapsed.contains(&fold_key);
             // A folded parent speaks for the children that need attention.
             let status = match tree.as_ref() {
@@ -2915,7 +3038,7 @@ impl Host {
                 Some(tree) if folded && tree.running > 0 => status.or(Some("Running")),
                 _ => status,
             };
-            let cartridge = if depth > 0 || t.worker {
+            let cartridge = if depth > 0 || t.worker || t.parent_thread_id.is_some() {
                 activity::Cartridge::Worker
             } else if api {
                 activity::Cartridge::Api
@@ -2929,9 +3052,7 @@ impl Host {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
-            let show_project_tag = pinned
-                || thread_section.is_some()
-                || self.sidebar.grouping == GroupingMode::Timeline;
+            let show_project_tag = pinned || thread_section.is_some() || !folders;
             let model = crate::kit::ListRow {
                 cartridge,
                 title: display_title,
@@ -2939,7 +3060,7 @@ impl Host {
                     let mut route = if depth == 0
                         && let Some(hint) = parent_hint
                     {
-                        format!("↳ {hint} · {badge}")
+                        format!("{hint} · {project_name} · {badge}")
                     } else if !t.worker && t.parent_thread_id.is_some() {
                         format!("Subagent · {badge}")
                     } else {
@@ -2963,6 +3084,17 @@ impl Host {
                 },
                 age: age(now.timestamp(), timestamp),
                 status: status.or(unread.then_some("Unread")),
+                result: result.map(|outcome| {
+                    if in_finished_shelf {
+                        match outcome {
+                            SessionOutcome::Completed => "Completed",
+                            SessionOutcome::Failed => "Failed",
+                            SessionOutcome::Stopped => "Stopped",
+                        }
+                    } else {
+                        "New result"
+                    }
+                }),
                 selected: active_project == project
                     && scope.matches(&active_route)
                     && active_selected.as_deref() == Some(t.id.as_str()),
@@ -2974,42 +3106,45 @@ impl Host {
             };
             // The disclosure is a sibling of the row in the gutter, so it folds without
             // selecting and the row keeps the sidebar keyline.
-            let disclosure = tree.as_ref().filter(|tree| tree.children > 0).map(|tree| {
-                let glyph = if folded { "▸" } else { "▾" };
-                let label = format!(
-                    "{} {} worker{}",
-                    if folded { "Show" } else { "Hide" },
-                    tree.children,
-                    if tree.children == 1 { "" } else { "s" }
-                );
-                gpui::div()
-                    .id(SharedString::from(format!(
-                        "fold-{}-{}-{}",
-                        fold_key.0.display(),
-                        scope.api,
-                        fold_key.1
-                    )))
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .w(px(crate::kit::GUTTER))
-                    .h(px(crate::kit::ROW_HEIGHT))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .text_size(p.text(Step::Label))
-                    .text_color(rgb(p.quiet()))
-                    .hover(move |d| d.text_color(rgb(p.fg)))
-                    .child(glyph)
-                    .tooltip(move |window, cx| {
-                        gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx)
-                    })
-                    .on_click(cx.listener(move |s, _, _, cx| {
-                        s.discovery.toggle(fold_key.0.clone(), fold_key.1.clone());
-                        cx.notify();
-                    }))
-            });
+            let disclosure = tree
+                .as_ref()
+                .filter(|tree| folders && tree.children > 0)
+                .map(|tree| {
+                    let glyph = if folded { "▸" } else { "▾" };
+                    let label = format!(
+                        "{} {} worker{}",
+                        if folded { "Show" } else { "Hide" },
+                        tree.children,
+                        if tree.children == 1 { "" } else { "s" }
+                    );
+                    gpui::div()
+                        .id(SharedString::from(format!(
+                            "fold-{}-{}-{}",
+                            fold_key.0.display(),
+                            scope.api,
+                            fold_key.1
+                        )))
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .w(px(crate::kit::GUTTER))
+                        .h(px(crate::kit::ROW_HEIGHT))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .text_size(p.text(Step::Label))
+                        .text_color(rgb(p.quiet()))
+                        .hover(move |d| d.text_color(rgb(p.fg)))
+                        .child(glyph)
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx)
+                        })
+                        .on_click(cx.listener(move |s, _, _, cx| {
+                            s.discovery.toggle(fold_key.0.clone(), fold_key.1.clone());
+                            cx.notify();
+                        }))
+                });
             let native_live = match status {
                 Some("Live in Codex") => Some("Live in Codex"),
                 Some("Live in Claude Code") => Some("Live in Claude Code"),
@@ -3060,7 +3195,14 @@ impl Host {
                         Some(menu_builder),
                         cx.listener(move |s, _, window, cx| {
                             window.focus(&s.list_focus, cx);
-                            s.activate_row(project.clone(), scope, row.clone(), window, cx);
+                            s.activate_sidebar_row(
+                                project.clone(),
+                                scope,
+                                row.clone(),
+                                result.is_some(),
+                                window,
+                                cx,
+                            );
                         }),
                     ))
                     .children(disclosure)
@@ -3442,6 +3584,12 @@ impl Host {
                         true,
                     ),
                 ),
+            )
+            .child(
+                div()
+                    .pt(px(SPACE_XS))
+                    .px(gutter)
+                    .child(self.grouping_control(p, cx)),
             )
             .when_some(section_editor, |sidebar, input| {
                 sidebar.child(
