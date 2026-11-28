@@ -78,7 +78,7 @@ impl Relay {
         command.args(args);
         crate::exempt_loopback_proxy(&mut command);
         eprintln!(
-            "ox: API workers enabled. Ask for the ox model list or name an API model to delegate to."
+            "ox: Workers and OX Memory enabled. Ask for a second opinion or save a project preference."
         );
         tokio::select! {
             result = crate::native::launch(command) => result,
@@ -389,7 +389,7 @@ impl Service {
     }
 
     async fn save_memory(&self, req: SaveMemory) -> Result<Value, String> {
-        let secrets = self.app().await.ok().map(|app| Arc::clone(&app.secrets));
+        let secrets = self.worker_secrets().await.unwrap_or_default();
         let cwd = self.cwd.clone();
         tokio::task::spawn_blocking(move || {
             let store = ox_memory::MemoryStore::open_default().map_err(|e| e.to_string())?;
@@ -411,17 +411,12 @@ impl Service {
                 .text
                 .as_deref()
                 .ok_or_else(|| "Provide text to save a memory.".to_string())?;
-            let (text, tags) = if let Some(secrets) = secrets.as_deref() {
-                let text = crate::upstream::redact(raw_text, secrets).into_owned();
-                let tags = req
-                    .tags
-                    .iter()
-                    .map(|t| crate::upstream::redact(t, secrets).into_owned())
-                    .collect();
-                (text, tags)
-            } else {
-                (raw_text.to_string(), req.tags)
-            };
+            let text = crate::upstream::redact(raw_text, &secrets).into_owned();
+            let tags = req
+                .tags
+                .iter()
+                .map(|t| crate::upstream::redact(t, &secrets).into_owned())
+                .collect();
             let project = ox_memory::canonical_project_id(&cwd);
             let scope = match req.scope.as_deref().unwrap_or("project") {
                 "global" => ox_memory::Scope::Global,
@@ -499,7 +494,7 @@ struct Delegate {
 impl Service {
     /// A subscription launch can use host-owned jobs and memory without an API registry.
     async fn configured_app(&self) -> Result<Option<&App>, String> {
-        if self.app.get().is_none()
+        if !matches!(self.app.get(), Some(Ok(_)))
             && !CodeoxConfig::path(&self.home)
                 .try_exists()
                 .map_err(|error| error.to_string())?
@@ -521,8 +516,7 @@ impl Service {
         self.app
             .get_or_init(|| async {
                 let result = async {
-                    let path = CodeoxConfig::path(&self.home);
-                    let config = CodeoxConfig::load(&path)?;
+                    let config = CodeoxConfig::load(&CodeoxConfig::path(&self.home))?;
                     let keys = SavedKeys::for_config(&self.home, &config)?;
                     App::codeox(
                         config,
@@ -1738,6 +1732,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(saved["action"], "created");
+        assert!(service.worker_secrets().await.unwrap().is_empty());
+        assert_eq!(
+            service.list_models(ListModels::default()).await.unwrap()["models"],
+            json!([])
+        );
         let id = saved["id"].as_str().unwrap().to_owned();
 
         let recalled = service
