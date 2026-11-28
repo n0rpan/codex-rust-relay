@@ -103,12 +103,26 @@ impl Library {
                 match result {
                     Ok((host, entries)) => {
                         s.host = host;
-                        s.entries = entries;
                         if reset {
                             s.editing = None;
                             s.text
                                 .update(cx, |input, cx| input.set_value("", window, cx));
+                        } else if let Some(editing) = &s.editing {
+                            match entries.iter().find(|entry| entry.id == editing.id) {
+                                Some(latest) if latest.seq != editing.seq => {
+                                    if latest.text != editing.text {
+                                        s.error = Some(format!(
+                                            "This memory changed. Your draft is still here. Saved version: {}",
+                                            latest.text
+                                        ));
+                                    }
+                                    s.editing = Some(latest.clone());
+                                }
+                                None => s.error = Some("This memory was removed. Your draft is still here and can be copied before you cancel.".into()),
+                                _ => {}
+                            }
                         }
+                        s.entries = entries;
                     }
                     Err(error) => s.error = Some(error.to_string()),
                 }
