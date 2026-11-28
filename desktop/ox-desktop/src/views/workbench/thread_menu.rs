@@ -155,7 +155,6 @@ impl Workbench {
                 let unnamed = id.clone();
                 let end = view.clone();
                 let ended = id.clone();
-                let worker = view.clone();
                 let handoff = view.clone();
                 menu.when(edit_metadata, |menu| menu.item(
                     crate::kit::menu_item("Rename thread").on_click(move |_, window, cx| {
@@ -213,11 +212,6 @@ impl Workbench {
                                 cx.notify();
                             }
                         });
-                    }),
-                ))
-                .when(can_launch, |menu| menu.item(
-                    crate::kit::menu_item("Start worker…").on_click(move |_, _, cx| {
-                        let _ = worker.update(cx, |s, cx| s.request_launch(LaunchKind::Worker, cx));
                     }),
                 ))
                 .when(can_launch, |menu| menu.item(

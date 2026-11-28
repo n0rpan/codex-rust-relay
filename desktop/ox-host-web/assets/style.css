@@ -176,6 +176,9 @@ header[data-sky]:before {
 }
 #location {
   font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 #network {
   margin-left: auto;
@@ -429,6 +432,24 @@ h1 {
 }
 #conversation h1 {
   margin: 0.25rem 0 0.55rem;
+}
+.conversation-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.conversation-heading h1 {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+#start-worker {
+  flex: 0 0 auto;
+  padding-inline: 0.55rem;
+  font-size: 0.82rem;
+}
+#worker-heading:focus {
+  outline: none;
 }
 #timeline {
   display: flex;
@@ -1586,6 +1607,24 @@ main:has(#conversation:not([hidden])) {
   background: var(--panel);
   border-top: 2px solid var(--line-strong);
   box-shadow: none;
+}
+#worker-form:not([hidden]) {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: 0;
+}
+.worker-sheet-body {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 16px;
+}
+.worker-sheet-actions {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 0.45rem 16px max(0.45rem, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--line);
 }
 .sheet-title {
   margin: 0 0 8px;

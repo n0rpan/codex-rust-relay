@@ -151,7 +151,21 @@ function fields(parent, specs, base = {}, isNew = false) {
   return { inputs, changes };
 }
 
-export function setupSettings({ request, open, close, notifications, login }) {
+function registeredHostOrigin(value) {
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol === "https:" &&
+      url.hostname.endsWith(".ts.net") &&
+      url.origin === value &&
+      url.origin !== location.origin
+    )
+      return url;
+  } catch {}
+  return null;
+}
+
+export function setupSettings({ request, open, close, notifications, login, hostName }) {
   const panel = node("section");
   panel.id = "settings";
   panel.hidden = true;
@@ -237,7 +251,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
     e.preventDefault();
     installPrompt = e;
   });
-  function screen(title, back = menu) {
+  function screen(title, back = menu, backLabel) {
     pageId++;
     clearTimeout(inviteTimer);
     clearInterval(pendingTimer);
@@ -248,7 +262,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
     heading.tabIndex = -1;
     panel.replaceChildren(
       button(
-        back === close
+        backLabel ?? (back === close
           ? "← Sessions"
           : back === remote
             ? "← Remote access"
@@ -258,7 +272,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
               ? "← Destinations"
             : back === providers
             ? "← Providers"
-            : "← Settings",
+              : "← Settings"),
         back,
         "back",
       ),
@@ -1199,8 +1213,45 @@ export function setupSettings({ request, open, close, notifications, login }) {
     }
     show(initial);
   }
-  async function workerLinks() {
-    const id = screen("Worker host links", remote);
+  async function hosts(back = close, backLabel) {
+    const show = () => hosts(back, backLabel);
+    const id = screen("Hosts", back, backLabel);
+    const current = node("div", undefined, "phone-settings-card");
+    current.append(node("h2", hostName()), node("p", "Current host"));
+    body.append(current);
+    status.textContent = "Loading linked hosts…";
+    const links = await readPage(id, { action: "worker_links" });
+    if (!links) {
+      if (id === pageId && !panel.hidden)
+        body.append(action("Retry host list", show, "quiet"));
+      return;
+    }
+    status.textContent = "";
+    const peers = [
+      ...(links.hosts || []).map((host) => [host, "Linked for workers"]),
+      ...(links.available || []).map((host) => [host, "Worker link not enabled"]),
+    ];
+    if (!peers.length) body.append(node("p", "No worker destinations are linked."));
+    else body.append(node("p", "Open another host to view its sessions. Pair this phone there if asked."));
+    for (const [host, state] of peers) {
+      const card = node("div", undefined, "phone-settings-card");
+      card.append(node("h2", host.name), node("p", state));
+      const origin = registeredHostOrigin(host.origin);
+      if (origin) {
+        const address = node("p", origin.host, "phone-settings-host-address");
+        const link = node("a", `Open ${host.name}`, "phone-settings-host-open");
+        link.href = origin.href;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        card.append(address, link);
+      }
+      body.append(card);
+    }
+    body.append(action("Manage worker hosts", () => workerLinks(show, "← Hosts")));
+  }
+  async function workerLinks(back = remote, backLabel) {
+    const show = () => workerLinks(back, backLabel);
+    const id = screen("Worker host links", back, backLabel);
     const outbound = await readPage(id, {action: "worker_links"});
     if (!outbound) return;
     const form = node("form", undefined, "phone-settings-card");
@@ -1209,7 +1260,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
     for (const host of outbound.available || []) {
       form.append(action("Link " + host.name, async () => {
         await request({action: "link_paired_host", host: host.id});
-        if (pageId === id && !panel.hidden) await workerLinks();
+        if (pageId === id && !panel.hidden) await show();
       }));
     }
     const address = textField(form, "Worker invitation or host URL", "worker_address");
@@ -1220,7 +1271,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
     submit(form, "Link worker host", async () => {
       await request({action: "add_worker_link", address: address.value.trim(), code: code.value.trim()});
       address.value = code.value = "";
-      if (pageId === id && !panel.hidden) await workerLinks();
+      if (pageId === id && !panel.hidden) await show();
     });
     body.append(form);
     const waiting = node("div", undefined, "phone-settings-card");
@@ -1242,7 +1293,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
           waiting.append(
             action(`${host.name} · ${host.origin}`, async () => {
               await request({ action: "add_worker_link_window", origin: host.origin });
-              if (pageId === id && !panel.hidden) await workerLinks();
+              if (pageId === id && !panel.hidden) await show();
             }, "primary"),
           );
         }
@@ -1254,7 +1305,7 @@ export function setupSettings({ request, open, close, notifications, login }) {
       card.append(node("h2", host.name), node("p", host.origin), action("Remove outgoing link", async () => {
         const result = await request({action: "remove_worker_link", host: host.id});
         if (pageId !== id || panel.hidden) return;
-        await workerLinks();
+        await show();
         if (!result.revoked) status.textContent = "Removed here. Revoke the incoming link on the other host when it is reachable.";
       }));
       body.append(card);
@@ -1285,11 +1336,11 @@ export function setupSettings({ request, open, close, notifications, login }) {
       card.append(allowed, limit, synced);
       submit(card, "Save worker access", async () => {
         await request({action: "edit_worker_link", id: device.id, before: device.worker, may_launch: allow.checked, ceiling: ceiling.value, may_sync_memory: sync.checked});
-        if (pageId === id && !panel.hidden) { await workerLinks(); status.textContent = "Saved on this host."; }
+        if (pageId === id && !panel.hidden) { await show(); status.textContent = "Saved on this host."; }
       });
       body.append(card, action("Revoke " + device.label, async () => {
         await request({action: "revoke_device", id: device.id});
-        if (pageId === id && !panel.hidden) await workerLinks();
+        if (pageId === id && !panel.hidden) await show();
       }));
     }
   }
@@ -1592,6 +1643,10 @@ export function setupSettings({ request, open, close, notifications, login }) {
     );
   }
   return {
+    openHosts(back, backLabel) {
+      open();
+      return hosts(back, backLabel);
+    },
     reset() {
       pageId++;
       clearTimeout(inviteTimer);
