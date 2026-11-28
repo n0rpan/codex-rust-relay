@@ -107,6 +107,11 @@ pub(crate) struct StagedMove {
     pub recovered: bool,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct PreparedReply<T> {
+    prepared: T,
+}
+
 pub(crate) enum Chunk {
     Bytes(Bytes),
     Finish,
@@ -200,7 +205,7 @@ impl Upload {
     }
 
     /// Verify previously published files before recovering a lost receipt.
-    pub(crate) async fn existing(&self) -> io::Result<Option<StagedMove>> {
+    async fn existing(&self) -> io::Result<Option<StagedMove>> {
         self.check()?;
         let root = self.directory.clone();
         let path = root.join(&self.offer.transfer);
@@ -228,7 +233,7 @@ impl Upload {
 
     /// The three declared payloads arrive in manifest order. Only a Finish
     /// after their exact lengths and hashes allows the stage to be published.
-    pub(crate) async fn receive(&self, frames: &mut impl Frames) -> io::Result<StagedMove> {
+    async fn receive(&self, frames: &mut impl Frames) -> io::Result<StagedMove> {
         let mut changes = self.state.lock().unwrap().changed.subscribe();
         self.check()?;
         let stage = self.stage(frames);
@@ -263,6 +268,23 @@ impl Upload {
         self.existing()
             .await?
             .ok_or_else(|| invalid("Staged session move disappeared"))
+    }
+
+    /// The destination actor validates and imports the local files before an
+    /// actor preparation can be reported. A retry still needs that decision.
+    pub(crate) async fn prepare_with<T: Send + 'static>(
+        &self,
+        frames: &mut impl Frames,
+        prepare: impl FnOnce(StagedMove) -> io::Result<T> + Send + 'static,
+    ) -> io::Result<PreparedReply<T>> {
+        let staged = match self.existing().await? {
+            Some(staged) => staged,
+            None => self.receive(frames).await?,
+        };
+        self.check()?;
+        let prepared = tokio::task::spawn_blocking(move || prepare(staged)).await??;
+        self.check()?;
+        Ok(PreparedReply { prepared })
     }
 
     async fn stage(&self, frames: &mut impl Frames) -> io::Result<tempfile::TempDir> {
@@ -537,6 +559,65 @@ mod tests {
             fs::read_dir(f.dir.path().join(DIRECTORY)).unwrap().count(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn a_staged_receipt_cannot_stand_in_for_the_receiving_actors_preparation() {
+        #[derive(Debug, Serialize)]
+        struct ActorPreparation {
+            native: String,
+        }
+
+        let f = Fixture::approved();
+        let upload = f.open(&f.offer).unwrap();
+        let mut payload = chunks().into_iter();
+        let mut frames = TestFrames(|| Ok(payload.next().unwrap()));
+        let rejected = upload
+            .prepare_with(&mut frames, |staged| -> io::Result<ActorPreparation> {
+                assert!(!staged.recovered);
+                assert_eq!(fs::read(staged.plan)?, P);
+                Err(invalid("Destination actor rejected the checkout"))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            rejected.to_string(),
+            "Destination actor rejected the checkout"
+        );
+        assert!(upload.existing().await.unwrap().is_some());
+
+        let retry = f.open(&f.offer).unwrap();
+        let mut no_upload = TestFrames(|| panic!("a staged retry does not need the files again"));
+        let result = retry
+            .prepare_with(&mut no_upload, |staged| {
+                assert!(staged.recovered);
+                assert_eq!(fs::read(staged.checkout)?, C);
+                Ok(ActorPreparation {
+                    native: "imported-on-destination".into(),
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            serde_json::json!({"prepared":{"native":"imported-on-destination"}})
+        );
+    }
+
+    #[tokio::test]
+    async fn revocation_during_import_withholds_the_actors_reply() {
+        let f = Fixture::approved();
+        let upload = f.open(&f.offer).unwrap();
+        let mut payload = chunks().into_iter();
+        let mut frames = TestFrames(|| Ok(payload.next().unwrap()));
+        let state = f.state.clone();
+        let result = upload
+            .prepare_with(&mut frames, move |_| {
+                state.lock().unwrap().revoke_move_admission(TRANSFER)?;
+                Ok("actor prepared")
+            })
+            .await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[tokio::test]
