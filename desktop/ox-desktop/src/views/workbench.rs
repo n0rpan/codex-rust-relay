@@ -96,11 +96,13 @@ pub struct Workbench {
     pub(super) link: HostLink,
     workers: Entity<super::host::WorkerIndex>,
     pub(super) pending_local_command: Option<super::terminal_review::Pending>,
+    worker_results_open: Option<String>,
     pub(super) enter_sends: bool,
     review: review::ReviewPane,
     pub(super) review_width: u32,
     pub(super) pane_width: Pixels,
     pub(super) host_caption: Option<String>,
+    pub(super) worker_update: Option<String>,
     resizing_review: bool,
     pub(super) route_models: Entity<Vec<String>>,
     pub(super) model_picker: Option<super::route_chip::Picker>,
@@ -284,6 +286,7 @@ impl Workbench {
             handoff_pending: None,
             link,
             workers,
+            worker_results_open: None,
             enter_sends: cx
                 .global::<crate::preferences::behavior::Active>()
                 .enter_sends,
@@ -292,6 +295,7 @@ impl Workbench {
             review_width: 360,
             pane_width: window.viewport_size().width,
             host_caption: None,
+            worker_update: None,
             resizing_review: false,
             model_picker: None,
             route_models,
@@ -966,6 +970,9 @@ impl Workbench {
         if !front {
             self.focus_editor_for = None;
         }
+        if front && !self.front {
+            self.refresh_worker_hosts();
+        }
         self.front = front;
         if let Some(store) = &mut self.store {
             store.set_front(front);
@@ -986,6 +993,9 @@ impl Workbench {
     ) {
         if !front {
             self.focus_editor_for = None;
+        }
+        if front && !self.front {
+            self.refresh_worker_hosts();
         }
         self.front = front;
         if let Some(store) = &mut self.store {
@@ -1116,6 +1126,7 @@ impl Workbench {
             self.finish_pending_row_action(window, cx);
         }
         let controls = self.thread_menu(cx);
+        let start_worker = self.start_worker_button(p, cx);
         let review_toggle = self.review_toggle(cx);
         let inline_request = self.pane_width < px(825.);
         let asks = self.ask_sheet(inline_request, window, cx);
@@ -1235,7 +1246,7 @@ impl Workbench {
                                                 }
                                             };
                                             let label = SharedString::from(format!(
-                                                "{host} · {} · {route}",
+                                                "Runs on {host} · {} · {route}",
                                                 self.route.runtime.name()
                                             ));
                                             view.child(crate::platform::layout_probe::mark_element(
@@ -1307,6 +1318,7 @@ impl Workbench {
                                         )
                                         .children(review_toggle)
                                         .children(terminal)
+                                        .children(start_worker)
                                         .children(controls),
                                 ),
                         )
@@ -1389,6 +1401,14 @@ impl Workbench {
                                 .gap(px(SPACE_S))
                                 .children(activity_status)
                                 .children(self.workers_line(p, cx))
+                                .when_some(self.worker_update.as_deref(), |line, update| {
+                                    line.child(crate::platform::layout_probe::mark_element(
+                                        crate::small(p, update.to_owned()).truncate(),
+                                        &"worker-update".into(),
+                                        &update.into(),
+                                        false,
+                                    ))
+                                })
                                 .children(launch)
                                 .children(inline_sheet)
                                 .child(composer)

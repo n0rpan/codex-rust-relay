@@ -205,6 +205,21 @@ impl Preferences {
         self.scroll.set_offset(point(px(0.), px(0.)));
         cx.notify();
     }
+    pub(crate) fn worker_hosts(
+        link: platform::HostLink,
+        project: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let source = link.remote().cloned();
+        let mut view = Self::new(link, project, window, cx);
+        view.prefer_providers = true;
+        view.goto(Page::Hosts, cx);
+        view.hosts
+            .update(cx, |hosts, cx| hosts.open_worker_links(source, cx));
+        view
+    }
+
     fn report(&mut self, result: Result<(), String>, success: &str, cx: &mut Context<Self>) {
         match result {
             Ok(()) => {
