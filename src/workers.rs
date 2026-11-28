@@ -54,7 +54,7 @@ impl Relay {
             return Ok(None);
         }
         let path = CodeoxConfig::path(home);
-        if !path.try_exists()? {
+        if !crate::host_lifetime::hosted() && !path.try_exists()? {
             return Ok(None);
         }
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -272,7 +272,7 @@ struct Service {
     tools: Tools,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ListModels {
     #[serde(default)]
@@ -308,10 +308,21 @@ struct SaveMemory {
 }
 
 fn memory_sensitivity_ceiling() -> ox_memory::Sensitivity {
-    std::env::var("OX_MEMORY_MAX_SENSITIVITY")
-        .ok()
-        .and_then(|v| ox_memory::Sensitivity::parse(&v).ok())
-        .unwrap_or(ox_memory::Sensitivity::LocalOnly)
+    let local_only = std::env::var("OX_MEMORY_ALLOW_LOCAL_ONLY").ok();
+    let cap = std::env::var("OX_MEMORY_MAX_SENSITIVITY").ok();
+    recall_ceiling(local_only.as_deref(), cap.as_deref())
+}
+
+fn recall_ceiling(local_only: Option<&str>, cap: Option<&str>) -> ox_memory::Sensitivity {
+    use ox_memory::Sensitivity;
+
+    let assumed = if local_only.is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes")) {
+        Sensitivity::LocalOnly
+    } else {
+        Sensitivity::Private
+    };
+    cap.and_then(|v| Sensitivity::parse(v).ok())
+        .map_or(assumed, |cap| assumed.min(cap))
 }
 
 impl Service {
@@ -486,11 +497,32 @@ struct Delegate {
 }
 
 impl Service {
+    /// A subscription launch can use host-owned jobs and memory without an API registry.
+    async fn configured_app(&self) -> Result<Option<&App>, String> {
+        if self.app.get().is_none()
+            && !CodeoxConfig::path(&self.home)
+                .try_exists()
+                .map_err(|error| error.to_string())?
+        {
+            return Ok(None);
+        }
+        self.app().await.map(Some)
+    }
+
+    async fn worker_secrets(&self) -> Result<Arc<Vec<String>>, String> {
+        Ok(self
+            .configured_app()
+            .await?
+            .map(|app| Arc::clone(&app.secrets))
+            .unwrap_or_default())
+    }
+
     async fn app(&self) -> Result<&App, String> {
         self.app
             .get_or_init(|| async {
                 let result = async {
-                    let config = CodeoxConfig::load(&CodeoxConfig::path(&self.home))?;
+                    let path = CodeoxConfig::path(&self.home);
+                    let config = CodeoxConfig::load(&path)?;
                     let keys = SavedKeys::for_config(&self.home, &config)?;
                     App::codeox(
                         config,
@@ -669,9 +701,9 @@ impl Service {
                         let request: jobs::Steer =
                             serde_json::from_value(params["arguments"].clone())
                                 .map_err(|_| "Provide a worker job ID and message.".to_string())?;
-                        let app = self.app().await.map_err(|e| e.to_string())?;
+                        let secrets = self.worker_secrets().await?;
                         if !self.jobs.lock().unwrap().has(request.job_id) {
-                            let text = crate::upstream::redact(&request.text, &app.secrets);
+                            let text = crate::upstream::redact(&request.text, &secrets);
                             return self
                                 .host_call(
                                     json!({"op":"steer","job_id":request.job_id,"text":text}),
@@ -679,7 +711,7 @@ impl Service {
                                 )
                                 .await;
                         }
-                        let received = self.jobs.lock().unwrap().steer(request, &app.secrets)?;
+                        let received = self.jobs.lock().unwrap().steer(request, &secrets)?;
                         tokio::time::timeout(Duration::from_secs(30), received)
                             .await
                             .map_err(|_| "Timed out waiting for the worker's acknowledgement.")?
@@ -700,11 +732,11 @@ impl Service {
                         if self.jobs.lock().unwrap().has(request.job_id) {
                             return Err("This worker runs without the OX session host and has no requests to answer: it declines approvals itself.".to_string());
                         }
-                        let app = self.app().await.map_err(|e| e.to_string())?;
+                        let secrets = self.worker_secrets().await?;
                         let answers = request.answers.map(|answers| {
                             answers
                                 .iter()
-                                .map(|a| crate::upstream::redact(a, &app.secrets).into_owned())
+                                .map(|a| crate::upstream::redact(a, &secrets).into_owned())
                                 .collect::<Vec<_>>()
                         });
                         self.host_call(
@@ -814,20 +846,26 @@ impl Service {
         if !remote && let Some(model) = &request.subscription_model {
             self.check_subscription_model(model).await?;
         }
-        let app = self.app().await?;
-        if !remote
-            && let Some(model) = &request.model
-            && let Mode::Codeox {
+        let secrets = if !remote && let Some(model) = &request.model {
+            let app = self.configured_app().await?.ok_or(
+                "No API provider is configured on this host. Use a subscription worker or configure an API provider in OX Settings.",
+            )?;
+            if let Mode::Codeox {
                 vendors, routes, ..
             } = &app.mode
-        {
-            crate::resolve_model(vendors, routes, model)
-                .map_err(|(_, error)| crate::upstream::redact(&error, &app.secrets).into_owned())?;
-        }
+            {
+                crate::resolve_model(vendors, routes, model).map_err(|(_, error)| {
+                    crate::upstream::redact(&error, &app.secrets).into_owned()
+                })?;
+            }
+            Arc::clone(&app.secrets)
+        } else {
+            self.worker_secrets().await?
+        };
         // A running session host owns the worker, so it outlives this helper and
         // its approvals reach the human clients. Without one, run it here as before.
         if let Some(host) = host {
-            let start = request.host_start(&app.secrets);
+            let start = request.host_start(&secrets);
             let caller = self.caller(thread);
             let unbound = caller["session"].is_null();
             let reply = host
@@ -839,12 +877,12 @@ impl Service {
                     None,
                 )
                 .await
-                .map_err(|e| crate::upstream::redact(&e, &app.secrets).into_owned())?;
+                .map_err(|e| crate::upstream::redact(&e, &secrets).into_owned())?;
             if unbound {
                 self.unbound
                     .store(true, std::sync::atomic::Ordering::Release);
             }
-            let mut reply = redact_value(reply, &app.secrets);
+            let mut reply = redact_value(reply, &secrets);
             reply["approvals"] = json!(
                 "This worker is owned by the OX session host. Its approvals and questions appear in OX Desktop and on paired phones. When ox_worker_status lists requests with parent_may_answer, you may answer them with answer_ox_worker; otherwise tell the user where to answer."
             );
@@ -856,7 +894,7 @@ impl Service {
         self.jobs
             .lock()
             .unwrap()
-            .start(request, &self.home, &self.cwd, Arc::clone(&app.secrets))
+            .start(request, &self.home, &self.cwd, secrets)
     }
 
     /// Refuse a subscription model the account's picker does not offer, before
@@ -938,7 +976,7 @@ impl Service {
     }
 
     async fn host_call(&self, call: Value, thread: Option<&str>) -> Result<Value, String> {
-        let app = self.app().await?;
+        let secrets = self.worker_secrets().await?;
         let host = crate::host_lifetime::HostLink::find(&self.cwd, self.host_policy)?
             .ok_or("Unknown worker job in this ox launch.")?;
         let reply = host
@@ -950,8 +988,8 @@ impl Service {
                 Some(call),
             )
             .await
-            .map_err(|e| crate::upstream::redact(&e, &app.secrets).into_owned())?;
-        Ok(redact_value(reply, &app.secrets))
+            .map_err(|e| crate::upstream::redact(&e, &secrets).into_owned())?;
+        Ok(redact_value(reply, &secrets))
     }
 
     /// Read this session's handoff sources through the session host, which
@@ -1005,10 +1043,10 @@ impl Service {
         // star order, so agents see the preferred choices on the first page.
         let favorites = crate::picker::read_favorites(&self.home).unwrap_or_default();
         let rank = |alias: &str| favorites.iter().position(|f| f == alias);
-        let app = self.app().await?;
+        let app = self.configured_app().await?;
         let contexts: std::collections::HashMap<String, u64> =
-            app.model_contexts().into_iter().collect();
-        let mut catalog = app.launch_models();
+            app.into_iter().flat_map(App::model_contexts).collect();
+        let mut catalog = app.map(App::launch_models).unwrap_or_default();
         catalog.sort_by_key(|(alias, _)| rank(alias).unwrap_or(usize::MAX));
         for (alias, provider) in catalog {
             if !alias.to_lowercase().contains(&query) && !provider.to_lowercase().contains(&query) {
@@ -1101,7 +1139,9 @@ impl Service {
             .slots
             .try_acquire()
             .map_err(|_| "All ox workers are busy. Wait for one to finish.")?;
-        let app = self.app().await?;
+        let app = self.configured_app().await?.ok_or(
+            "No API provider is configured. Use start_ox_worker for a subscription worker, or configure an API provider in OX Settings.",
+        )?;
         let task = crate::upstream::redact(task, &app.secrets);
         let payload = json!({
             "model": model,
@@ -1637,6 +1677,16 @@ mod tests {
         assert_eq!(session_hint(&args(&[]), ClientKind::Codex), None);
     }
 
+    #[test]
+    fn recall_defaults_to_private_and_requires_local_inference_opt_in() {
+        use ox_memory::Sensitivity::*;
+
+        assert_eq!(recall_ceiling(None, None), Private);
+        assert_eq!(recall_ceiling(None, Some("local_only")), Private);
+        assert_eq!(recall_ceiling(Some("1"), None), LocalOnly);
+        assert_eq!(recall_ceiling(Some("1"), Some("public")), Public);
+    }
+
     #[tokio::test]
     async fn memory_mcp_tools_save_recall_and_forget() {
         let dir = tempfile::tempdir().unwrap();
@@ -1661,6 +1711,9 @@ mod tests {
             tools: Tools::All,
         };
 
+        assert!(service.worker_secrets().await.unwrap().is_empty());
+        let models = service.list_models(ListModels::default()).await.unwrap();
+        assert_eq!(models["models"], json!([]));
         let listed = tools();
         let names: Vec<&str> = listed["tools"]
             .as_array()
