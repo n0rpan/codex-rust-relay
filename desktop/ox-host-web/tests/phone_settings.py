@@ -87,14 +87,17 @@ def exercise(js, wait):
     js("window.fixtureAccountButton=document.querySelector('#settings button'); window.dispatchEvent(new CustomEvent('ox-native-login-finished'))")
     wait(lambda: js("return !fixtureAccountButton.isConnected && [...document.querySelectorAll('#settings button')].some(b=>b.textContent==='Sign in with Claude')"))
     wait(lambda: js("return !!document.querySelector('#settings [name=worker_approvals]')"))
+    assert js("return [...document.querySelectorAll('#settings button')].some(b=>b.disabled && b.textContent==='Sign in with Google')")
+    assert js("return document.querySelector('#settings [name=antigravity_start]').value===''")
     assert js("return document.querySelector('#settings [name=claude_start]').value===''")
     fill("worker_approvals", "operator")
     fill("claude_start", "auto")
+    fill("antigravity_start", "plan")
     go("Save agent settings")
     saved()
     agents = settings({"action": "read_behavior"})["behavior"]
     assert agents["worker_approvals"] == "operator" and agents["claude_start"] == "auto", agents
-    assert agents["codex_start"] is None and agents["font_size"] == 18, agents
+    assert agents["codex_start"] is None and agents["font_size"] == 18 and agents["antigravity_start"] == "plan", agents
     go("← Settings")
     go("Remote access")
     go("Host mode policy")

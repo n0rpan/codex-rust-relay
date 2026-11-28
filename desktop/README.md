@@ -80,6 +80,12 @@ The permission menu offers Claude’s Default, Auto, Plan, Accept edits, and **Y
 
 Type `/` for commands available from the installed client. Claude Code supplies its built-in commands and project skills when the session starts. For example, use `/goal` or `/effort` when your installed version advertises them. Choose a model beside the message box or type `/model sonnet`. Model changes on the current subscription or within the same configured API provider keep the conversation and session ID. Use `/terminal` to continue an idle session in the stock terminal, on the same route and in the same directory. OX reads stock’s session journals to display history. It stores API alias associations in its own desktop state directory. When an older journal has no recorded alias, select its original alias to resume.
 
+## Antigravity sessions
+
+Install the official Antigravity CLI 1.5.15 or later on the host and sign in with `agy acp --login`. Select **Antigravity** in the route picker to start a session on your Google account. The composer uses the models and modes reported by Antigravity. Choose **YOLO** before launch to use Antigravity's process-wide approval bypass. Use **Stop** to cancel a turn and the request badge to answer an approval. Select a saved session in the sidebar to load its history through ACP. [Antigravity CLI setup](https://antigravity.google/docs/cli/acp/)
+
+To continue a Codex or Claude Code plan, choose **Continue in… → Antigravity** or send `/handoff antigravity --mode plan Review this approach`. OX carries the latest visible plan with the selected source messages. The source and target are linked in the sidebar. [Handoff details](../docs/configuration.md#continue-a-session-in-another-runtime-route-or-model)
+
 ## Codex commands
 
 Type `/` in the desktop or phone composer to see commands for the installed Codex and the selected route. Use `/goal <objective>` to set a goal, `/goal` to view it, and `/goal pause`, `/goal resume`, or `/goal clear` to manage it. Use `/speed` to see service tiers offered by the active model. Selecting a tier applies it to subsequent turns in that thread. The menu also offers session actions such as `/new`, `/resume`, and `/compact`. Use `/model` or the model selector beside the message box to change the model. On the phone, a terminal-only command can be opened in the native session terminal when the paired device has terminal access.

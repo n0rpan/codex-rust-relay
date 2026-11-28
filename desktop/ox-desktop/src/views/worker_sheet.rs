@@ -105,6 +105,9 @@ pub(super) fn permission_note(request: ModeRequest, runtime: Runtime) -> String 
         ModeRequest::Inherit => {
             "Uses the session's own permission mode and cannot exceed it.".into()
         }
+        ModeRequest::Level(Level::Yolo) if runtime == Runtime::Antigravity => {
+            "Antigravity skips its standard permission prompts. Protected actions may still require review.".into()
+        }
         ModeRequest::Level(Level::Yolo) => {
             format!(
                 "{} runs with no review of its actions. Only choose it for work you trust.",
@@ -112,7 +115,7 @@ pub(super) fn permission_note(request: ModeRequest, runtime: Runtime) -> String 
             )
         }
         ModeRequest::Level(level) => {
-            format!("The worker cannot go above {}.", level.label(runtime))
+            format!("The new session cannot go above {}.", level.label(runtime))
         }
     }
 }
@@ -197,7 +200,7 @@ fn permission_label(request: ModeRequest, runtime: Runtime) -> String {
 
 /// "Claude subscription", with the runtime's default model when this session's runtime reports it.
 fn subscription_label(runtime: Runtime, default: Option<String>) -> String {
-    let account = format!("{} subscription", runtime.account());
+    let account = runtime.route(None).label();
     match default {
         Some(name) => format!("{account} · {name}"),
         None => account,
@@ -216,7 +219,9 @@ impl Workbench {
     ) -> Option<gpui_component::button::Button> {
         let store = self.store.as_ref()?;
         let owner = store.selected()?;
-        (store.state() == &Connection::Ready && !store.in_terminal(owner)).then(|| {
+        (store.state() == &Connection::Ready
+            && !store.in_terminal(owner)
+            && store.profile().route.runtime.supports_workers()).then(|| {
             crate::kit::toolbar_button(
                 p,
                 "start-worker",
@@ -257,6 +262,9 @@ impl Workbench {
         }
         // The sheet starts from the route this session is on, not the window's route.
         let route = store.thread_route(Some(&owner));
+        if kind == LaunchKind::Worker && !route.runtime.supports_workers() {
+            return;
+        }
         let choice = Choice::new(owner, &route);
         let launch = match kind {
             LaunchKind::Worker => {
@@ -317,12 +325,25 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         self.set_launch_runtime(runtime, cx);
-        self.set_launch_choice(|c| c.model = model, cx);
+        self.set_launch_choice(|c| c.model = model.filter(|_| runtime.supports_api()), cx);
     }
 
     pub(super) fn set_launch_runtime(&mut self, runtime: Runtime, cx: &mut Context<Self>) {
         self.launch_picker = None;
-        self.set_launch_choice(|c| c.runtime = runtime, cx);
+        self.set_launch_choice(
+            |c| {
+                c.runtime = runtime;
+                if !runtime.supports_api() {
+                    c.model = None;
+                }
+                if let ModeRequest::Level(level) = c.permission
+                    && level != level.for_runtime(runtime)
+                {
+                    c.permission = ModeRequest::Inherit;
+                }
+            },
+            cx,
+        );
         if let Some(Launch::Worker(draft)) = self.launch.as_mut()
             && !mode_allowed(runtime, draft.mode)
         {
@@ -353,6 +374,9 @@ impl Workbench {
 
     pub(super) fn toggle_launch_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(launch) = &self.launch else { return };
+        if !launch.choice().runtime.supports_api() {
+            return;
+        }
         let kind = launch.kind();
         if self
             .launch_picker
@@ -461,7 +485,11 @@ impl Workbench {
         for (id, runtime) in [
             ("launch-runtime-codex", Runtime::Codex),
             ("launch-runtime-claude", Runtime::Claude),
+            ("launch-runtime-antigravity", Runtime::Antigravity),
         ] {
+            if !runtime.supports_workers() && !matches!(&self.launch, Some(Launch::Handoff(_))) {
+                continue;
+            }
             chips = chips.child(button(
                 p,
                 id,
@@ -496,18 +524,16 @@ impl Workbench {
                 let id = caps.default_model()?.to_owned();
                 Some(caps.model_display(&id))
             });
-        let chips = row()
-            .gap_2()
-            .flex_wrap()
-            .child(button(
-                p,
-                "launch-subscription",
-                subscription_label(choice.runtime, default),
-                choice.model.is_none(),
-                subscription_ok,
-                cx.listener(|s, _, _, cx| s.choose_launch_model(None, cx)),
-            ))
-            .child(button(
+        let mut chips = row().gap_2().flex_wrap().child(button(
+            p,
+            "launch-subscription",
+            subscription_label(choice.runtime, default),
+            choice.model.is_none(),
+            subscription_ok,
+            cx.listener(|s, _, _, cx| s.choose_launch_model(None, cx)),
+        ));
+        if choice.runtime.supports_api() {
+            chips = chips.child(button(
                 p,
                 "launch-model",
                 model_label,
@@ -515,6 +541,7 @@ impl Workbench {
                 true,
                 cx.listener(|s, _, window, cx| s.toggle_launch_picker(window, cx)),
             ));
+        }
         field(p, "Model", chips)
     }
 
@@ -529,6 +556,9 @@ impl Workbench {
             cx.listener(|s, _, _, cx| s.set_launch_permission(ModeRequest::Inherit, cx)),
         ));
         for (i, level) in Level::ALL.into_iter().enumerate() {
+            if level != level.for_runtime(runtime) {
+                continue;
+            }
             let request = ModeRequest::Level(level);
             chips = chips.child(button(
                 p,
@@ -718,6 +748,13 @@ impl Workbench {
             Launch::Worker(_) => {}
             Launch::Handoff(draft) => {
                 body = body.child(field(p, "Request", Textarea::new(&draft.request)));
+                let route = choice.runtime.route(choice.model.clone());
+                if let Some(notice) = self.store.as_ref().and_then(|store| {
+                    let source = store.thread_route(Some(&choice.owner));
+                    ox_desk_core::handoff::provider_notice(&source, &route)
+                }) {
+                    body = body.child(small(p, notice));
+                }
             }
         }
         if let Some(error) = &choice.error {

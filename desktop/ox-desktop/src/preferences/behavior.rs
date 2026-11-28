@@ -25,6 +25,10 @@ fn start_choices(runtime: Runtime, b: Behavior) -> Vec<(&'static str, Behavior)>
             codex_start: start,
             ..b
         },
+        Runtime::Antigravity => Behavior {
+            antigravity_start: start,
+            ..b
+        },
     };
     std::iter::once(("Same as terminal", with(None)))
         .chain(Access::choices(runtime).iter().map(|&mode| {
@@ -178,11 +182,18 @@ impl Preferences {
                 p,
                 cx,
             ))
+            .child(self.preference_choices(
+                "New Antigravity sessions",
+                &start_choices(Runtime::Antigravity, b),
+                b,
+                p,
+                cx,
+            ))
             .child(
                 div()
                     .text_size(p.text(Step::Meta))
                     .text_color(rgb(p.muted))
-                    .child("Same as terminal starts a new session the way `claude` or `codex` starts in your terminal, using your own Claude Code and Codex settings. A mode you pick in the composer still applies to that one session."),
+                    .child("Same as terminal uses the agent’s own permissions. A mode you pick in the composer applies to that one session."),
             )
             .child(self.preference_choices(
                 "Worker requests",
