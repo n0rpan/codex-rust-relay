@@ -5,7 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 const source = readFileSync(new URL("../assets/model.js", import.meta.url), "utf8");
-const { catalogTree, sessionParent, scopeKey } = await import(
+const { catalogTree, recentDays, sessionParent, scopeKey } = await import(
   "data:text/javascript;base64," + Buffer.from(source).toString("base64")
 );
 
@@ -27,6 +27,36 @@ const worker = (parentScope, parentId, extra = {}) => ({
     parent: { project: parentScope.project, scope: parentScope, session: parentId },
   },
   ...extra,
+});
+
+test("recent days sort an active worker separately from its parent and group dates locally", () => {
+  const now = new Date(2026, 2, 9, 0, 15);
+  const dated = (project, id, date, parent = null) => {
+    const row = entry(project, id, {}, parent);
+    row.session.updated_at = date ? date.getTime() / 1000 : 0;
+    return row;
+  };
+  const parent = dated("/work/app", "parent", new Date(2026, 2, 8, 0, 30));
+  const child = dated("/work/app", "child", new Date(2026, 2, 9, 0, 10), "parent");
+  const other = dated("/work/other", "other", new Date(2026, 2, 8, 23, 55));
+  const earlier = new Date(2025, 9, 20, 23, 55);
+  const older = dated("/work/other", "older", earlier);
+  const saved = dated("/work/app", "saved", null);
+  const dates = new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric" });
+  const groups = recentDays([saved, parent, older, child, other], now);
+  assert.deepEqual(groups.map(({ label, entries }) => [label, entries.map((row) => row.session.id)]), [
+    ["Today", ["child"]],
+    ["Yesterday", ["other", "parent"]],
+    [dates.format(earlier), ["older"]],
+    ["Date unknown", ["saved"]],
+  ]);
+});
+
+test("recent activity ties have the same order after catalog rows arrive in a different order", () => {
+  const a = entry("/work/app", "session");
+  const b = entry("/work/other", "session");
+  a.session.updated_at = b.session.updated_at = 1_800_000_000;
+  assert.deepEqual(recentDays([a, b]), recentDays([b, a]));
 });
 
 test("a worker nests under its recorded parent in another project and route", () => {

@@ -369,7 +369,7 @@ pub struct ListRow {
     pub pinned: bool,
     /// Optional custom arcade colour stripe on the left edge.
     pub accent: Option<AccentColor>,
-    /// Short project tag shown when a row lives in Pinned or a cross-project user section.
+    /// Short project tag for rows outside their project folder.
     pub project_tag: Option<String>,
 }
 impl Default for ListRow {
@@ -532,6 +532,7 @@ impl ListRow {
             .rounded(px(CONTROL_RADIUS))
             .when(self.selected, |b| b.bg(rgb(p.surface())))
             .child(track)
+            .accessibility_label(name.clone())
             .tooltip(hint)
             .on_click(click);
         let button = crate::platform::layout_probe::mark(button, &id, &name, true);
