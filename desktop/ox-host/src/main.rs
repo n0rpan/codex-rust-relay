@@ -8,13 +8,9 @@ mod executable;
 mod handover;
 mod identity;
 mod lease;
-#[cfg(test)]
 mod move_archive;
-#[cfg(test)]
 mod move_bundle;
-#[cfg(test)]
 mod move_ledger;
-#[cfg(test)]
 mod move_target;
 mod pairing;
 mod policy;
@@ -140,6 +136,7 @@ fn run(paths: Paths) -> io::Result<()> {
         }
     });
     let web_paths = paths.clone();
+    let moves = engine.move_receiver();
     thread::spawn(move || {
         let dispatch = std::sync::Arc::new(move |job| {
             let (reply, response) = mpsc::sync_channel(1);
@@ -152,9 +149,12 @@ fn run(paths: Paths) -> io::Result<()> {
                 .recv()
                 .map_err(|_| "The target worker engine stopped.".to_owned())?
         });
-        if let Err(e) =
-            ox_host_web::run_with_jobs(web_paths.state_dir, web_paths.socket, Some(dispatch))
-        {
+        if let Err(e) = ox_host_web::run_with_receivers(
+            web_paths.state_dir,
+            web_paths.socket,
+            Some(dispatch),
+            Some(moves),
+        ) {
             ox_host_service::errlog::record(&format!("OX remote service: {e}"));
         }
     });

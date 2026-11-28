@@ -44,6 +44,12 @@ impl SourceMoves {
         }
         Ok(())
     }
+
+    pub(super) fn retry_refused_release(&mut self, id: Uuid) {
+        if matches!(self.releases.get(&id), Some(ReleaseAttempt::Refused(_))) {
+            self.releases.remove(&id);
+        }
+    }
 }
 
 enum Effect<'a> {
@@ -149,12 +155,7 @@ impl Engine {
             .ledger
             .fence_source(authenticated_target, prepared)?;
         if phase == Status::Fenced {
-            if matches!(
-                self.source_moves.releases.get(&plan.id),
-                Some(ReleaseAttempt::Refused(_))
-            ) {
-                self.source_moves.releases.remove(&plan.id);
-            }
+            self.source_moves.retry_refused_release(plan.id);
             self.begin_move_writer_release(plan);
         }
         Ok(phase)
@@ -319,6 +320,7 @@ impl Engine {
             Ok(()) => ReleaseAttempt::Awaiting(generation),
             Err(error) => {
                 eprintln!("ox host: could not release move {}: {error}", plan.id);
+                self.move_send.errors.insert(plan.id, error.to_string());
                 ReleaseAttempt::Refused(generation)
             }
         };
@@ -353,6 +355,7 @@ impl Engine {
                     "ox host: native release for move {} was not confirmed: {error}",
                     plan.id
                 );
+                self.move_send.errors.insert(plan.id, error.clone());
                 continue;
             }
             self.source_moves

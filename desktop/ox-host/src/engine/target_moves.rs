@@ -1,5 +1,5 @@
 //! Bind a destination runtime checkpoint to the authenticated staged archive.
-use super::{Change, Engine, Scope, ScopeState};
+use super::{Action, Change, Engine, Scope, ScopeState};
 use crate::{
     move_ledger::{Activated, Commit, Prepared},
     move_target::VerifiedTarget,
@@ -14,7 +14,15 @@ use uuid::Uuid;
 
 #[derive(Default)]
 pub(super) struct TargetMoves {
+    warming: HashMap<Uuid, Warming>,
     pending: HashMap<Uuid, Pending>,
+}
+
+struct Warming {
+    destination: VerifiedTarget,
+    source: Uuid,
+    access: Option<Access>,
+    reply: Sender<io::Result<Prepared>>,
 }
 
 struct Pending {
@@ -25,6 +33,47 @@ struct Pending {
 }
 
 impl Engine {
+    /// Load the destination's saved page into the same timeline as new turns.
+    pub(super) fn load_moved_history(
+        &mut self,
+        scope: &Scope,
+        thread: &str,
+        older: bool,
+    ) -> io::Result<bool> {
+        let Some(live) = self.running.get(scope) else {
+            return Ok(false);
+        };
+        let cursor = match (live.store.moved_history_cursor(thread), older) {
+            (None, false) => None,
+            (Some(Some(cursor)), true) => {
+                if live
+                    .store
+                    .transcript(thread)
+                    .is_some_and(|t| t.has_older() || t.is_loading())
+                {
+                    return Ok(false);
+                }
+                Some(cursor)
+            }
+            _ => return Ok(false),
+        };
+        let ledger = &self.source_moves.ledger;
+        let Some(owned) = ledger.active_receivers()?.into_iter().find(|prepared| {
+            &prepared.plan.target_scope == scope && prepared.stage.native == thread
+        }) else {
+            return Ok(false);
+        };
+        let (items, previous) = VerifiedTarget::load(&self.state_dir, &owned.plan)?
+            .history_for(ledger, scope, thread)?
+            .previous(cursor, 128)?;
+        self.running
+            .get_mut(scope)
+            .expect("live scope")
+            .store
+            .show_moved_history(thread, items, previous);
+        Ok(true)
+    }
+
     pub(super) fn read_moved_history(
         &self,
         scope: &Scope,
@@ -113,10 +162,34 @@ impl Engine {
             .running
             .get_mut(scope)
             .ok_or_else(|| io::Error::other("Open the selected target checkout."))?;
+        if live.store.state() == &Connection::Connecting {
+            if self
+                .target_moves
+                .warming
+                .get(&plan.id)
+                .is_some_and(|waiting| {
+                    waiting.destination.plan() != plan || waiting.source != source
+                })
+            {
+                return Err(io::Error::other(
+                    "A different destination reservation is still pending.",
+                ));
+            }
+            self.target_moves.warming.insert(
+                plan.id,
+                Warming {
+                    destination: target,
+                    source,
+                    access,
+                    reply,
+                },
+            );
+            return Ok(());
+        }
         if live.store.state() != &Connection::Ready {
             return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "Waiting for the target runtime.",
+                io::ErrorKind::NotConnected,
+                "Open the destination’s runtime and billing route, then try the move again.",
             ));
         }
         let id = plan.id;
@@ -155,6 +228,32 @@ impl Engine {
     }
 
     pub(super) fn collect_target_move_preparations(&mut self, scope: &Scope) {
+        if self
+            .running
+            .get(scope)
+            .is_some_and(|live| live.store.state() != &Connection::Connecting)
+        {
+            let warmed: Vec<_> = self
+                .target_moves
+                .warming
+                .iter()
+                .filter_map(|(id, request)| {
+                    (&request.destination.plan().target_scope == scope).then_some(*id)
+                })
+                .collect();
+            for id in warmed {
+                if let Some(request) = self.target_moves.warming.remove(&id)
+                    && let Err(error) = self.prepare_move_target(
+                        request.source,
+                        request.destination,
+                        request.access,
+                        request.reply.clone(),
+                    )
+                {
+                    let _ = request.reply.send(Err(error));
+                }
+            }
+        }
         let Some(live) = self.running.get_mut(scope) else {
             return;
         };
@@ -235,5 +334,58 @@ impl Engine {
             self.broadcast(&plan.target_scope, vec![Change::Session { session: row }])?;
         }
         Ok(activated)
+    }
+
+    pub(super) fn moved_claude_input(
+        &self,
+        scope: &Scope,
+        action: &Action,
+    ) -> io::Result<Option<(Uuid, String, String)>> {
+        if scope.route.runtime != ox_desk_core::runtime::Runtime::Claude {
+            return Ok(None);
+        }
+        let live = &self.running[scope];
+        let (thread, text, has_images) = match action {
+            Action::SendText(Some(thread), text) => (thread, text.as_str(), false),
+            Action::SendImages(Some(thread), text, images) => {
+                (thread, text.as_str(), !images.is_empty())
+            }
+            Action::Submit(Some(thread)) => (
+                thread,
+                live.store.draft(Some(thread)),
+                !live.store.draft_images(Some(thread)).is_empty(),
+            ),
+            _ => return Ok(None),
+        };
+        if live.store.has_live_session(thread) {
+            return Ok(None);
+        }
+        let Some(prepared) = self
+            .source_moves
+            .ledger
+            .active_receivers()?
+            .into_iter()
+            .find(|move_| &move_.plan.target_scope == scope && &move_.stage.native == thread)
+        else {
+            return Ok(None);
+        };
+        let plan = &prepared.plan;
+        match live.store.prepare_claude_move_writer(&plan.id.to_string()) {
+            Ok(native) if native == *thread => {}
+            Ok(_) => return Err(io::Error::other("The reserved Claude writer changed.")),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        if has_images {
+            return Err(io::Error::other(
+                "Remove the attachment before submitting to Claude Code",
+            ));
+        }
+        if text.trim().is_empty() {
+            return Err(io::Error::other("Enter a message"));
+        }
+        let target = VerifiedTarget::load(&self.state_dir, plan)?;
+        let text = target.claude_request(&self.source_moves.ledger, scope, thread, text)?;
+        Ok(Some((plan.id, thread.clone(), text)))
     }
 }

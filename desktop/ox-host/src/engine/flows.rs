@@ -1017,7 +1017,6 @@ impl Engine {
             limit,
             ancestor: None,
         };
-        #[cfg(test)]
         match self.read_moved_history(&scope, &owner, host.as_deref(), session.as_deref()) {
             Ok(Some((source, items))) => {
                 return self.answer(

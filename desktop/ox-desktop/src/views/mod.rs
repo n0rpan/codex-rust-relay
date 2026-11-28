@@ -2,9 +2,8 @@ mod ask_sheet;
 mod compose;
 mod handoff_sheet;
 pub mod host;
-#[cfg(test)]
-mod move_preview;
 mod onboarding;
+mod session_move;
 mod terminal_review;
 mod transcript;
 pub mod workbench;

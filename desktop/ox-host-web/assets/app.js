@@ -395,6 +395,7 @@ class Link {
         $("location").textContent = connectedHostName();
       }
       this.placement = msg.capabilities.includes("worker_placement");
+      this.sessionMoves = msg.capabilities.includes("session_moves");
       this.codexSubscriptionWorkers = msg.capabilities.includes("worker_codex_subscription");
       const liveCatalog =
         !this.scope && msg.capabilities.includes("live_catalog");
@@ -457,7 +458,12 @@ class Link {
     if (msg.type === "worker_reply") {
       if (this.inventoryRequest === msg.id) {
         this.inventoryRequest = null;
-        if (this === detailLink && !$("worker-form").hidden) showWorkerHosts(msg.result, msg.error);
+        if (this === detailLink) {
+          this.hostInventory = msg.result?.hosts || [];
+          this.hostInventoryError = msg.error || msg.result?.warning;
+          if (!$("worker-form").hidden) showWorkerHosts(msg.result, msg.error);
+          repaint();
+        }
         return;
       }
       if (workerSubmission === msg.id) {
@@ -1863,10 +1869,22 @@ function conversation() {
     thread: id,
     source: connectedHostName(),
     ready: Boolean(detailLink?.ready),
-    supported: Boolean(id && caps.includes("move_session")),
+    supported: Boolean(id && (caps.includes("move_session") ||
+      (detailLink?.sessionMoves && ["codex", "claude"].includes(scope.route.runtime) &&
+        row?.detail?.owned && caps.includes("open")))),
     running: caps.includes("stop"),
     move: row?.detail?.move,
-    targets: row?.detail?.move_destinations,
+    targets: detailLink?.hostInventory
+      ? moveDestinations(detailLink.hostInventory, scope.route)
+      : row?.detail?.move_destinations,
+    loadingTargets: Boolean(detailLink?.inventoryRequest),
+    targetError: detailLink?.hostInventoryError,
+    loadTargets: () => requestWorkerHosts(true),
+    manageHosts: (back) => phoneSettings.openHosts(() => {
+      page("conversation");
+      repaint();
+      back();
+    }, "← Move session"),
     act: (action, reply) => detailLink?.act(action, null, reply),
     notice,
   });
@@ -2413,11 +2431,23 @@ let workerSeed = null;
 let workerSubmission = null;
 let workerHosts = [];
 let workerProjectRule = null;
-function requestWorkerHosts() {
+function requestWorkerHosts(forMove = false) {
   if (!detailLink?.ready || !detailLink.placement || detailLink.inventoryRequest ||
-      $("worker-form").hidden || $("conversation").hidden) return;
+      (!forMove && $("worker-form").hidden) || $("conversation").hidden) return;
   detailLink.inventoryRequest = crypto.randomUUID();
   detailLink.send({type:"worker_hosts", id:detailLink.inventoryRequest, project:detailLink.scope.project});
+  if (forMove) repaint();
+}
+function moveDestinations(inventory, route) {
+  return inventory.filter((row) => !row.parent_host).map((row) => {
+    let unavailable = "";
+    if (row.status !== "online") unavailable = workerHostUnavailable(row);
+    else if (!row.supports_session_moves) unavailable = "OX update needed";
+    else if (!row.grant?.may_accept_moves) unavailable = "Accept session moves is off";
+    else if (!row.routes?.some((choice) => routesLabel(choice) === routesLabel(route)))
+      unavailable = "Runtime or account unavailable";
+    return {id: row.host.id, name: row.host.name, unavailable, detail: routesLabel(route)};
+  });
 }
 function workerHostUnavailable(row) {
   if (row.status !== "online")

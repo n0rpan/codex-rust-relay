@@ -111,6 +111,7 @@ pub struct Store {
     move_writer_releases: Vec<MoveWriterRelease>,
     move_writer_preparations: Vec<MoveWriterPreparation>,
     prepared_move_writers: HashMap<String, String>,
+    moved_history: HashMap<String, moves::History>,
     terminal_threads: HashSet<String>,
     /// Threads whose live process this client ended. Cleared lazily: a thread
     /// that is live again is not reported as ended.
@@ -245,6 +246,7 @@ impl Store {
             move_writer_releases: Vec::new(),
             move_writer_preparations: Vec::new(),
             prepared_move_writers: HashMap::new(),
+            moved_history: HashMap::new(),
             terminal_threads: Default::default(),
             ended_threads: Default::default(),
             resume_sends: Default::default(),
@@ -345,6 +347,7 @@ impl Store {
         self.child_threads = std::mem::take(&mut previous.child_threads);
         self.terminal_threads = std::mem::take(&mut previous.terminal_threads);
         self.moving_threads = std::mem::take(&mut previous.moving_threads);
+        self.moved_history = std::mem::take(&mut previous.moved_history);
         self.ended_threads = previous.ended_threads.clone();
         self.resume_access = std::mem::take(&mut previous.resume_access);
         self.resume_models = std::mem::take(&mut previous.resume_models);

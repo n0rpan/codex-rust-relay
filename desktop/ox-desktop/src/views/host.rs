@@ -360,19 +360,6 @@ impl Host {
             while let Ok(sample) = requests.recv_async().await {
                 // Input runs outside the Host update: a click handler updates Host itself.
                 if let Some(input) = &sample.input {
-                    #[cfg(test)]
-                    if let platform::probe::Input::MovePreview(phase) = input {
-                        let result = this.update_in(cx, |s, _, cx| {
-                            s.panes[s.active].update(cx, |p, cx| p.move_preview_progress(phase, cx))
-                        });
-                        let reply = match result {
-                            Ok(Ok(())) => serde_json::json!({"ok": true}),
-                            Ok(Err(error)) => serde_json::json!({"error": error}),
-                            Err(error) => serde_json::json!({"error": error.to_string()}),
-                        };
-                        let _ = sample.reply.send(reply.to_string());
-                        continue;
-                    }
                     let reply = cx
                         .update(|window, cx| Self::probe_input(input, window, cx))
                         .unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"));
@@ -428,10 +415,6 @@ impl Host {
             Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput,
         };
         let result = match input {
-            #[cfg(test)]
-            platform::probe::Input::MovePreview(_) => {
-                Err("Move preview input requires a workbench".into())
-            }
             platform::probe::Input::Press(query) => {
                 platform::layout_probe::find(query).map(|(target, position)| {
                     let click = move |window: &mut Window, cx: &mut App| {

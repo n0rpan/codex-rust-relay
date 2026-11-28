@@ -15,7 +15,12 @@ use axum::{
 pub use move_staging::{Offer, StagedMove, VerifiedActivation};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{io, path::Path, sync::Arc, time::Duration};
+use std::{
+    io,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +43,43 @@ pub enum Incoming {
     Reserve(Reservation),
     Prepare(StagedMove),
     Activate(VerifiedActivation<Value>),
+    Cancel(VerifiedCancellation),
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cancellation {
+    pub source: String,
+    pub target: String,
+    pub transfer: String,
+    pub cancelled_plan: String,
+}
+
+impl Cancellation {
+    fn binding(&self) -> Binding {
+        Binding::for_plan(
+            &self.source,
+            &self.target,
+            &self.transfer,
+            self.cancelled_plan.as_bytes(),
+        )
+    }
+}
+
+pub struct VerifiedCancellation {
+    state: Arc<Mutex<crate::state::State>>,
+    device: String,
+    request: Cancellation,
+}
+
+impl VerifiedCancellation {
+    pub fn cancel<R>(self, apply: impl FnOnce(&Cancellation) -> io::Result<R>) -> io::Result<R> {
+        let mut state = self.state.lock().unwrap();
+        state.check_move_reservation(&self.device, &self.request.binding())?;
+        let result = apply(&self.request)?;
+        state.revoke_move_admission(&self.request.transfer)?;
+        Ok(result)
+    }
 }
 
 pub type Receiver = Arc<dyn Fn(Incoming) -> io::Result<Value> + Send + Sync>;
@@ -151,6 +193,47 @@ pub(crate) async fn activate(
     Ok(reply(result))
 }
 
+pub(crate) async fn cancel(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(open): Json<Envelope>,
+) -> Result<Json<Value>, StatusCode> {
+    let device = paired_identity(&app, &headers)?;
+    let receiver = app.moves.ok_or(StatusCode::NOT_FOUND)?;
+    let request: Cancellation =
+        serde_json::from_str(&open.request).map_err(|_| StatusCode::BAD_REQUEST)?;
+    {
+        let mut state = app.state.lock().unwrap();
+        if !state.prove_worker(
+            &device,
+            &open.proof.nonce,
+            &open.proof.signature,
+            &open.request,
+        ) || state
+            .check_move_reservation(&device, &request.binding())
+            .is_err()
+        {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+    let slot = app
+        .slots
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+    let verified = VerifiedCancellation {
+        state: app.state,
+        device,
+        request,
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        receiver(Incoming::Cancel(verified))
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(reply(result))
+}
+
 fn reply(result: io::Result<Value>) -> Json<Value> {
     Json(match result {
         Ok(receipt) => json!({"receipt": receipt}),
@@ -189,6 +272,10 @@ impl Sender<'_> {
             "move-activate",
             serde_json::to_string(&json!({"offer": offer, "commit": commit}))?,
         )
+    }
+
+    pub fn cancel(&self, request: &Cancellation) -> io::Result<Value> {
+        self.control("move-cancel", serde_json::to_string(request)?)
     }
 
     fn control(&self, path: &str, request: String) -> io::Result<Value> {

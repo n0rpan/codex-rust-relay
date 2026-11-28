@@ -298,7 +298,6 @@ impl Engine {
     }
 
     fn deliver_worker_notice(&mut self, n: &Notice) -> io::Result<bool> {
-        #[cfg(test)]
         if !self.can_deliver_move_worker_notice(&n.scope, &n.session)? {
             return Ok(false);
         }

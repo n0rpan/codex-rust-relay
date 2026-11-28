@@ -43,9 +43,7 @@ pub(crate) enum Message {
     Outbound(Box<forwarding::Event>),
     WorkerResult(u64, Box<Result<ox_host_web::worker_result::Report, String>>),
     LinkedJob(Box<ox_host_web::linked_jobs::VerifiedJob>, Replier),
-    #[cfg(test)]
     MoveReceive(Box<move_receive::Request>),
-    #[cfg(test)]
     MoveSend(Box<move_send::Outcome>),
     Gateway {
         caller: Caller,
@@ -328,11 +326,8 @@ pub(crate) struct Engine {
     host_name: String,
     subscription_limits: ox_desk_core::usage::reported::ReportedLimits,
     ledger: Ledger,
-    #[cfg(test)]
     source_moves: source_moves::SourceMoves,
-    #[cfg(test)]
     move_send: move_send::Outgoing,
-    #[cfg(test)]
     target_moves: target_moves::TargetMoves,
     replay: Replay,
     tx: SyncSender<Message>,
@@ -375,14 +370,10 @@ mod linked;
 mod placement;
 use placement::HostQuery;
 mod mode_requests;
-#[cfg(test)]
 mod move_receive;
-#[cfg(test)]
 mod move_send;
 mod notices;
-#[cfg(test)]
 mod source_moves;
-#[cfg(test)]
 mod target_moves;
 
 impl Drop for Engine {
@@ -436,11 +427,8 @@ impl Engine {
             host_name: sysinfo::System::host_name().unwrap_or_else(|| host_id.to_string()),
             config,
             ledger,
-            #[cfg(test)]
             source_moves: source_moves::SourceMoves::open(dir, host_id)?,
-            #[cfg(test)]
             move_send: move_send::Outgoing::default(),
-            #[cfg(test)]
             target_moves: target_moves::TargetMoves::default(),
             replay: Replay::new(seq, nonce()?),
             tx,
@@ -474,9 +462,11 @@ impl Engine {
             last_mode_policy: HostPolicy::read(dir).ok(),
             schema_reader: Default::default(),
         };
-        #[cfg(test)]
         let engine = engine.recover_move_targets()?;
         Ok(engine)
+    }
+    pub(crate) fn move_receiver(&self) -> ox_host_web::move_transport::Receiver {
+        move_receive::receiver(self.state_dir.clone(), self.host_id, self.tx.clone())
     }
     pub(crate) fn serve(&mut self, rx: Receiver<Message>) -> io::Result<()> {
         self.recover_worker_results();
@@ -588,7 +578,6 @@ impl Engine {
                         self.reap_idle(now)?;
                     }
                     self.poll_forwarded(now)?;
-                    #[cfg(test)]
                     {
                         self.advance_source_moves()?;
                         self.drive_move_transfers()?;
@@ -639,9 +628,7 @@ impl Engine {
                     self.worker_results.insert(id, state);
                 }
                 Some(Message::LinkedJob(job, reply)) => self.linked_job(*job, reply)?,
-                #[cfg(test)]
                 Some(Message::MoveReceive(request)) => self.receive_move(*request),
-                #[cfg(test)]
                 Some(Message::MoveSend(outcome)) => self.move_outcome(*outcome)?,
                 Some(Message::Gateway {
                     caller,
@@ -652,7 +639,6 @@ impl Engine {
                         self.answer(reply, Err(crate::handover::REFUSAL.into()))?
                     }
                     Gateway::Launch(start) => {
-                        #[cfg(test)]
                         if let Err(error) = self.check_move_launch(&caller) {
                             self.answer(reply, Err(error.to_string()))?;
                             continue;
@@ -830,6 +816,7 @@ impl Engine {
                 capabilities.push("worker_codex_subscription".into());
                 capabilities.push("worker_placement".into());
                 capabilities.push("remote_handoff".into());
+                capabilities.push("session_moves".into());
                 capabilities.push("handoff_history".into());
                 capabilities.push("linked_read_workers".into());
                 capabilities.push("linked_write_workers".into());
@@ -1002,7 +989,6 @@ impl Engine {
                 target_host,
                 window,
             } => {
-                #[cfg(test)]
                 if let Err(error) =
                     self.check_source_move_action(&scope, &Action::StartHandoff(start.clone()))
                 {
@@ -1081,7 +1067,6 @@ impl Engine {
                         fail("Subscribe to the target scope before sending actions".into()),
                     );
                 }
-                #[cfg(test)]
                 let action = match action {
                     Action::MoveSession(start) if approval.is_none() => {
                         if self.draining.is_some() || self.update_reserved() {
@@ -1104,7 +1089,6 @@ impl Engine {
                     }
                     other => other,
                 };
-                #[cfg(test)]
                 if !self.running.contains_key(&scope)
                     && let Err(error) = self.check_source_move_action(&scope, &action)
                 {
@@ -1531,8 +1515,22 @@ impl Engine {
         approval: Option<String>,
         approved_mode: Option<(ox_desk_core::modes::Level, Sender)>,
     ) -> io::Result<()> {
-        #[cfg(test)]
         self.check_source_move_action(scope, &action)?;
+        match &action {
+            Action::LoadOlder(thread) if self.load_moved_history(scope, thread, true)? => {
+                return Ok(());
+            }
+            Action::SelectThread(thread)
+            | Action::SendText(Some(thread), _)
+            | Action::SendImages(Some(thread), _, _)
+            | Action::Submit(Some(thread)) => {
+                self.load_moved_history(scope, thread, false)?;
+            }
+            Action::OpenCatalogRow(row) => {
+                self.load_moved_history(scope, &row.id, false)?;
+            }
+            _ => (),
+        }
         let live = self.running.get_mut(scope).expect("validated live scope");
         if let Action::AnswerAsk(ask, _) | Action::AnswerQuestions(ask, _) = &action
             && (approval.is_none() || live.tokens.get(ask) != approval.as_ref())
@@ -1764,6 +1762,7 @@ impl Engine {
         let sender = approved_mode
             .as_ref()
             .map_or_else(|| self.sender(id), |(_, sender)| sender.clone());
+        let first_moved_input = self.moved_claude_input(scope, &action)?;
         let live = self.running.get_mut(scope).expect("validated live scope");
         let mut fork_restore = None;
         if may_open {
@@ -1825,7 +1824,18 @@ impl Engine {
                 }
             }
         }
-        let sent = live.store.dispatch_as(action, sender);
+        let sent = if let Some((move_id, native, request)) = first_moved_input {
+            live.store.start_claude_move_turn(
+                &move_id.to_string(),
+                &native,
+                request,
+                Some(Level::Read.preset(scope.route.runtime)),
+            )?;
+            live.store.edit(Some(&native), String::new());
+            Ok(ox_desk_core::actions::Effect::Applied)
+        } else {
+            live.store.dispatch_as(action, sender)
+        };
         if let Some(before) = fork_restore {
             live.store.set_host_start(before);
         }
@@ -1871,7 +1881,6 @@ impl Engine {
     ) -> io::Result<()> {
         self.process_scope(scope, events, from_action)?;
         self.apply_notice_receipts(scope)?;
-        #[cfg(test)]
         {
             self.collect_source_move_releases(scope)?;
             self.collect_target_move_preparations(scope);
@@ -1892,7 +1901,6 @@ impl Engine {
         for event in events {
             let previous = live.store.asks().len();
             live.store.apply(event);
-            #[cfg(test)]
             self.source_moves
                 .observe_native_results(scope, &live.store)?;
             if let Some(report) = live.store.usage.worker_report.take() {
@@ -2271,6 +2279,7 @@ impl Engine {
                     | Change::Transcript { .. }
             )
         });
+        self.annotate_move_changes(scope, &mut changes)?;
         self.broadcast(scope, changes)?;
         if let Some((id, frame)) = handoff {
             self.reply(id, frame)?;
@@ -3191,7 +3200,6 @@ impl Engine {
     /// A busy thread is refused unless `force` is set, so a stale window or remote client
     /// cannot kill a running turn and its workers by accident.
     fn end_thread(&mut self, scope: &Scope, thread: &str, force: bool) -> io::Result<()> {
-        #[cfg(test)]
         self.check_source_move_action(scope, &Action::EndSession(thread.into()))?;
         if !self.running.contains_key(scope) {
             return Err(io::Error::other(
@@ -3301,7 +3309,6 @@ impl Engine {
     /// app-server (or the idle Claude draft process). The saved sessions stay listed
     /// and the next subscriber or action reopens the route.
     fn reap_empty(&mut self, scope: &Scope) -> io::Result<()> {
-        #[cfg(test)]
         if self.hold_move_source_scope(scope)? {
             return Ok(());
         }
@@ -3505,6 +3512,7 @@ fn catalog_row(view: &wire::SessionView) -> wire::SessionView {
         "worker_notice",
         "last_result",
         "logical_session_id",
+        "move",
     ]
     .into_iter()
     .filter_map(|k| Some((k.to_owned(), view.detail.get(k)?.clone())))
@@ -7372,11 +7380,21 @@ mod tests {
                 .unwrap();
             assert!(continued.contains("lead first turn"));
             assert!(continued.ends_with("Continue on Studio"));
-            let live = receiver.running.get_mut(&plan.target_scope).unwrap();
-            assert!(!live.store.has_live_session(native));
-            live.store
-                .start_claude_move_turn(&plan.id.to_string(), native, continued, None)
+            assert!(
+                !receiver.running[&plan.target_scope]
+                    .store
+                    .has_live_session(native)
+            );
+            receiver
+                .act(
+                    0,
+                    "first-on-destination",
+                    &plan.target_scope,
+                    Action::SendText(Some(native.clone()), "Continue on Studio".into()),
+                    None,
+                )
                 .unwrap();
+            let live = receiver.running.get_mut(&plan.target_scope).unwrap();
             assert!(live.store.has_live_session(native));
             assert!(
                 live.store

@@ -609,6 +609,10 @@ fn start_listener(app: App, origin: String, listener: TcpListener) -> Listener {
             "/api/move-activate",
             post(crate::move_transport::activate).layer(DefaultBodyLimit::max(256 * 1024)),
         )
+        .route(
+            "/api/move-cancel",
+            post(crate::move_transport::cancel).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
         .route("/api/push", post(subscribe))
         .route("/api/weather", post(weather::weather))
         .route("/api/operator", get(operator::upgrade))
@@ -1306,7 +1310,7 @@ mod tests {
     async fn signed_move_routes_require_destination_permission_and_an_exact_reservation() {
         use crate::{
             move_manifest::{CHECKOUT, FileSpec, Manifest, PLAN, TRANSCRIPT},
-            move_transport::{Incoming, Offer, Reservation},
+            move_transport::{Cancellation, Incoming, Offer, Reservation},
             state::move_staging::send_files_for_prepare,
             worker_checkout::connection::Connection,
         };
@@ -1344,6 +1348,11 @@ mod tests {
                     ));
                 }
                 Ok(json!({"ready": true}))
+            }),
+            Incoming::Cancel(cancellation) => cancellation.cancel(|_| {
+                Err::<serde_json::Value, _>(io::Error::other(
+                    "The destination already accepted the move.",
+                ))
             }),
         });
         let live = live::start_with_moves(Some(receiver)).await;
@@ -1462,6 +1471,28 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&body).unwrap(),
             json!({"receipt": {"ready": true}})
+        );
+        let cancelled = serde_json::to_string(&Cancellation {
+            source: SOURCE.into(),
+            target: TARGET.into(),
+            transfer: TRANSFER.into(),
+            cancelled_plan: PLAN_JSON.into(),
+        })
+        .unwrap();
+        let cancelled = signed_move(&live, &device, &cancelled);
+        let (_, mut response) = send(live.addr, post("/api/move-cancel", &cancelled), true).await;
+        body.clear();
+        response.read_to_string(&mut body).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            json!({"error": "The destination already accepted the move."})
+        );
+        let retry = signed_move(&live, &device, &commit);
+        assert_eq!(
+            send(live.addr, post("/api/move-activate", &retry), true)
+                .await
+                .0,
+            200
         );
     }
 

@@ -495,6 +495,30 @@ impl Ledger {
             .map(|record| record.plan.clone()))
     }
 
+    pub(crate) fn source_move_at(
+        &self,
+        scope: &Scope,
+        native: &str,
+    ) -> io::Result<Option<(Plan, Status, Option<Stage>)>> {
+        self.healthy()?;
+        let found = self
+            .data
+            .moves
+            .values()
+            .filter(|record| {
+                let source = &record.plan.source;
+                source.host == self.data.host && &source.scope == scope && source.native == native
+            })
+            .max_by_key(|record| record.phase.status() != Status::Cancelled);
+        Ok(found.map(|record| {
+            (
+                record.plan.clone(),
+                record.phase.status(),
+                record.phase.stage().cloned(),
+            )
+        }))
+    }
+
     fn record_source(&mut self, plan: &Plan, phase: Phase) -> io::Result<Status> {
         self.check_hosts(plan, self.data.host, plan.target_host)?;
         if let Some(record) = self.record(plan)? {

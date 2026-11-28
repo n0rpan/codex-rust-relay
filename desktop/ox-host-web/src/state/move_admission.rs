@@ -176,6 +176,17 @@ impl State {
         self.admit_reserved_move(device, &approved.binding, manifest)
     }
 
+    pub(crate) fn check_move_reservation(&self, device: &str, plan: &Binding) -> io::Result<()> {
+        self.check_move_peer(device, plan)?;
+        if self
+            .move_reservation(&plan.transfer)?
+            .is_some_and(|saved| saved.device == device && saved.binding == *plan)
+        {
+            return Ok(());
+        }
+        Err(denied())
+    }
+
     /// Called by the destination operator after approving this exact plan.
     /// The authenticated worker registration identifies the sender and cannot issue a grant.
     pub(crate) fn issue_move_admission(

@@ -110,8 +110,7 @@ pub struct Workbench {
     thread_edit: Option<thread_menu::ThreadEdit>,
     pub(super) launch_request: Option<super::worker_sheet::LaunchKind>,
     pub(super) launch: Option<super::worker_sheet::Launch>,
-    #[cfg(test)]
-    pub(super) move_preview: super::move_preview::Preview,
+    pub(super) move_picker: Option<super::session_move::Picker>,
     pub(super) launch_picker: Option<(
         super::worker_sheet::LaunchKind,
         Entity<super::model_picker::ModelPicker>,
@@ -295,8 +294,7 @@ impl Workbench {
             picker_dismissed: None,
             launch_request: None,
             launch: None,
-            #[cfg(test)]
-            move_preview: super::move_preview::Preview::default(),
+            move_picker: None,
             launch_picker: None,
             front,
             query: String::new(),
@@ -1118,14 +1116,9 @@ impl Workbench {
         if self.pending_row_action.is_some() {
             self.finish_pending_row_action(window, cx);
         }
-        #[cfg(test)]
-        let (move_button, move_panel, source_reserved) = (
-            self.move_preview_button(p, cx),
-            self.move_preview_panel(p, cx),
-            self.move_source_reserved(),
-        );
-        #[cfg(not(test))]
-        let source_reserved = false;
+        let move_button = self.live_move_button(p, cx);
+        let move_panel = self.live_move_panel(p, cx);
+        let source_reserved = self.live_move_locked();
         let controls = (!source_reserved).then(|| self.thread_menu(cx)).flatten();
         let start_worker = (!source_reserved)
             .then(|| self.start_worker_button(p, cx))
@@ -1276,11 +1269,7 @@ impl Workbench {
                                         .min_w_0()
                                         .gap(px(SPACE_XS))
                                         .children(start_worker)
-                                        .map(|actions| {
-                                            #[cfg(test)]
-                                            let actions = actions.children(move_button);
-                                            actions
-                                        })
+                                        .children(move_button)
                                         .children(review_toggle)
                                         .children(terminal)
                                         .children(controls),
@@ -1374,11 +1363,7 @@ impl Workbench {
                                     ))
                                 })
                                 .children(launch)
-                                .map(|dock| {
-                                    #[cfg(test)]
-                                    let dock = dock.children(move_panel);
-                                    dock
-                                })
+                                .children(move_panel)
                                 .children(inline_sheet)
                                 .when(!source_reserved, |dock| dock.child(composer))
                                 .children(usage);

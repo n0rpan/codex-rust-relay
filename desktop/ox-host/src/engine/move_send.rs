@@ -1,5 +1,5 @@
 //! Source-side validation at the boundary of the connected destination host.
-use super::{Engine, Message, Scope, Server};
+use super::{Change, Engine, Message, Scope, Server};
 use crate::{
     move_bundle::{Bundle, Presentation},
     move_ledger::{Activated, ArchivePin, Commit, Plan, Prepared, Proposal, Status},
@@ -12,9 +12,10 @@ use ox_desk_core::{
 use ox_host_service::checkout::project_location;
 use ox_host_web::{
     move_manifest::Manifest,
-    move_transport::{Offer, Reservation, Sender},
+    move_transport::{Cancellation, Offer, Reservation, Sender},
     paired_hosts::SavedHost,
 };
+use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -46,6 +47,104 @@ pub(crate) enum Outcome {
 }
 
 impl Engine {
+    pub(super) fn annotate_move_changes(
+        &mut self,
+        scope: &Scope,
+        changes: &mut [Change],
+    ) -> io::Result<()> {
+        if !scope.route.runtime.supports_session_moves() {
+            return Ok(());
+        }
+        for change in changes {
+            let rows = match change {
+                Change::Session { session } => std::slice::from_mut(session),
+                Change::Sessions { sessions } => sessions.as_mut_slice(),
+                _ => continue,
+            };
+            for row in rows {
+                if let Some(progress) = self.move_progress(scope, &row.id)? {
+                    attach_move_progress(row, progress);
+                } else if row.detail["owned"] == true
+                    && row
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "open")
+                {
+                    row.capabilities.push("move_session".into());
+                } else {
+                    continue;
+                }
+                if let Some(live) = self.running.get_mut(scope)
+                    && let Some(saved) = live
+                        .state
+                        .sessions
+                        .iter_mut()
+                        .find(|saved| saved.id == row.id)
+                {
+                    saved.clone_from(row);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn move_progress(&self, scope: &Scope, native: &str) -> io::Result<Option<Value>> {
+        let Some((plan, status, stage)) = self.source_moves.ledger.source_move_at(scope, native)?
+        else {
+            return Ok(None);
+        };
+        let error = self.move_send.errors.get(&plan.id);
+        let phase = match status {
+            Status::Queued if self.source_moves.ledger.queued_result_seen(&plan)? => {
+                "waiting_for_workers"
+            }
+            Status::Queued => "waiting",
+            Status::Preparing if error.is_some() => "failed",
+            Status::Preparing => "preparing",
+            Status::Fenced if error.is_none() => "closing",
+            Status::Fenced | Status::Released | Status::Committed => "checking",
+            Status::Confirmed => "ready",
+            Status::Cancelled => "cancelled",
+            Status::Prepared | Status::Active => return Ok(None),
+        };
+        let destination = linked_host(&self.state_dir, plan.target_host).ok();
+        let name = destination
+            .as_ref()
+            .map_or("Connected host", |host| host.name.as_str());
+        let origin = destination.as_ref().map(|host| host.origin.as_str());
+        let receipt = stage.filter(|_| status == Status::Confirmed).map(
+            |stage| json!({"operation":plan.id, "host":plan.target_host, "thread":stage.native, "scope":plan.target_scope}),
+        );
+        Ok(Some(
+            json!({"id":plan.id, "destination":{"id":plan.target_host, "name":name, "origin":origin},
+            "phase":phase, "message":error, "receipt":receipt}),
+        ))
+    }
+
+    fn publish_move_progress(&mut self, scope: &Scope, native: &str) -> io::Result<()> {
+        let Some(progress) = self.move_progress(scope, native)? else {
+            return Ok(());
+        };
+        let state = self
+            .running
+            .get_mut(scope)
+            .map(|live| &mut live.state)
+            .or_else(|| self.cold.get_mut(scope));
+        let Some(row) =
+            state.and_then(|state| state.sessions.iter_mut().find(|row| row.id == native))
+        else {
+            return Ok(());
+        };
+        if row.detail["move"] == progress {
+            return Ok(());
+        }
+        attach_move_progress(row, progress);
+        let change = Change::Session {
+            session: row.clone(),
+        };
+        self.broadcast(scope, vec![change])
+    }
+
     pub(super) fn start_move(
         &mut self,
         client: u64,
@@ -53,6 +152,11 @@ impl Engine {
         scope: Scope,
         action: MoveSession,
     ) -> io::Result<()> {
+        if !scope.route.runtime.supports_session_moves() {
+            return Err(io::Error::other(
+                "This runtime does not support session moves.",
+            ));
+        }
         let operation = parse_id(&action.operation)?;
         let destination = parse_id(&action.destination)?;
         if self.host_id == destination || self.move_send.reserving.contains_key(&operation) {
@@ -156,21 +260,50 @@ impl Engine {
             .filter(|plan| &plan.source.scope == scope)
             .ok_or_else(|| io::Error::other("This move belongs to another session."))?;
         if matches!(command, Action::CancelMove(_)) {
-            self.source_moves.ledger.cancel_source(&plan)?;
+            let cancelled = self.source_moves.ledger.cancel_source(&plan)?;
+            let state = self.state_dir.clone();
+            thread::spawn(move || {
+                let result = (|| {
+                    let plan = &cancelled.plan;
+                    let destination = linked_host(&state, plan.target_host)?;
+                    Sender {
+                        destination: &destination,
+                    }
+                    .cancel(&Cancellation {
+                        source: plan.source.host.to_string(),
+                        target: plan.target_host.to_string(),
+                        transfer: plan.id.to_string(),
+                        cancelled_plan: serde_json::to_string(plan)?,
+                    })
+                })();
+                if let Err(error) = result {
+                    ox_host_service::errlog::record(&format!(
+                        "move cancellation could not reach the destination: {error}"
+                    ));
+                }
+            });
         }
         self.move_send.errors.remove(&id);
+        if matches!(command, Action::CheckMove(_)) {
+            self.source_moves.retry_refused_release(id);
+            self.advance_source_moves()?;
+        }
+        self.publish_move_progress(scope, &plan.source.native)?;
         self.drive_move_transfers()
     }
 
     pub(super) fn move_outcome(&mut self, outcome: Outcome) -> io::Result<()> {
-        let (id, result) = match outcome {
+        let (plan, result) = match outcome {
             Outcome::Reserved(id, result) => {
                 let Some(request) = self.move_send.reserving.remove(&id) else {
                     return Ok(());
                 };
-                let result = result.and_then(|plan| match request.turn {
-                    Some(turn) => self.queue_move_for_turn(&plan, turn),
-                    None => self.prepare_source_move(&plan, false),
+                let result = result.and_then(|plan| {
+                    match request.turn {
+                        Some(turn) => self.queue_move_for_turn(&plan, turn)?,
+                        None => self.prepare_source_move(&plan, false)?,
+                    };
+                    self.publish_move_progress(&plan.source.scope, &plan.source.native)
                 });
                 let frame = match result {
                     Ok(_) => Server::Ack { id: request.key },
@@ -192,22 +325,25 @@ impl Engine {
                     self.stage_source_move(plan.target_host, &prepared)
                         .map(|_| ())
                 });
-                (plan.id, result)
+                (plan, result)
             }
-            Outcome::Activated(plan, result) => (
-                plan.id,
-                result.and_then(|receipt| self.confirm_move(plan.target_host, &receipt)),
-            ),
+            Outcome::Activated(plan, result) => {
+                let result =
+                    result.and_then(|receipt| self.confirm_move(plan.target_host, &receipt));
+                (plan, result)
+            }
         };
-        self.move_send.transferring.remove(&id);
+        self.move_send.transferring.remove(&plan.id);
         if let Err(error) = result {
-            self.move_send.errors.insert(id, error.to_string());
+            self.move_send.errors.insert(plan.id, error.to_string());
         }
+        self.publish_move_progress(&plan.source.scope, &plan.source.native)?;
         self.drive_move_transfers()
     }
 
     pub(super) fn drive_move_transfers(&mut self) -> io::Result<()> {
         for (plan, phase) in self.source_moves.ledger.pending_sources()? {
+            self.publish_move_progress(&plan.source.scope, &plan.source.native)?;
             if self.move_send.transferring.contains(&plan.id)
                 || self.move_send.errors.contains_key(&plan.id)
             {
@@ -218,6 +354,20 @@ impl Engine {
                     let Ok(timeline) = self.move_source_timeline(&plan) else {
                         continue;
                     };
+                    if timeline.detail["older"] == true {
+                        if self.load_moved_history(&plan.source.scope, &plan.source.native, true)? {
+                            self.process_scope(&plan.source.scope, vec![], true)?;
+                            continue;
+                        }
+                        let live = self
+                            .running
+                            .get_mut(&plan.source.scope)
+                            .expect("move timeline has a live scope");
+                        if let Err(error) = live.store.load_older(&plan.source.native) {
+                            self.move_send.errors.insert(plan.id, error.to_string());
+                        }
+                        continue;
+                    }
                     let Some(row) = self.running[&plan.source.scope]
                         .state
                         .sessions
@@ -258,6 +408,13 @@ impl Engine {
             });
         }
         Ok(())
+    }
+}
+
+fn attach_move_progress(row: &mut ox_desk_core::host_protocol::SessionView, progress: Value) {
+    row.detail["move"] = progress;
+    if !row.capabilities.iter().any(|value| value == "move_session") {
+        row.capabilities.push("move_session".into());
     }
 }
 

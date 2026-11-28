@@ -1,11 +1,13 @@
 //! Connect signed incoming moves with the destination's single host actor.
 use super::{Engine, Message};
 use crate::{
-    move_ledger::{Activated, Commit, Ledger, Plan, Prepared, Proposal},
+    move_ledger::{Activated, Cancelled, Commit, Ledger, Plan, Prepared, Proposal},
     move_target::{Files, VerifiedTarget},
 };
 use ox_desk_core::modes::Level;
-use ox_host_web::move_transport::{Incoming, Receiver, Reservation, VerifiedActivation};
+use ox_host_web::move_transport::{
+    Incoming, Receiver, Reservation, VerifiedActivation, VerifiedCancellation,
+};
 use serde_json::Value;
 use std::{
     io,
@@ -26,6 +28,7 @@ pub(crate) enum Request {
         reply: Sender<io::Result<Prepared>>,
     },
     Activate(VerifiedActivation<Value>, Sender<io::Result<Activated>>),
+    Cancel(VerifiedCancellation, Sender<io::Result<()>>),
 }
 
 pub(crate) fn receiver(state: PathBuf, host: Uuid, actor: SyncSender<Message>) -> Receiver {
@@ -75,6 +78,10 @@ pub(crate) fn receiver(state: PathBuf, host: Uuid, actor: SyncSender<Message>) -
         Incoming::Activate(activation) => {
             let activated = call(&actor, |reply| Request::Activate(activation, reply))?;
             Ok(serde_json::to_value(activated)?)
+        }
+        Incoming::Cancel(cancellation) => {
+            call(&actor, |reply| Request::Cancel(cancellation, reply))?;
+            Ok(serde_json::json!({"cancelled": true}))
         }
     })
 }
@@ -199,6 +206,24 @@ impl Engine {
                 });
                 let _ = reply.send(result);
             }
+            Request::Cancel(cancellation, reply) => {
+                let result = cancellation.cancel(|request| {
+                    let cancelled = Cancelled {
+                        plan: serde_json::from_str(&request.cancelled_plan)?,
+                    };
+                    if cancelled.plan.id != id(&request.transfer)?
+                        || cancelled.plan.target_host != id(&request.target)?
+                    {
+                        return Err(io::Error::other(
+                            "The cancellation differs from the signed move.",
+                        ));
+                    }
+                    self.source_moves
+                        .ledger
+                        .cancel_receiver(id(&request.source)?, &cancelled)
+                });
+                let _ = reply.send(result);
+            }
         }
     }
 
@@ -207,6 +232,11 @@ impl Engine {
             return Err(io::Error::other(crate::handover::REFUSAL));
         }
         let proposal: Proposal = serde_json::from_str(&request.proposal)?;
+        if !proposal.source.scope.route.runtime.supports_session_moves() {
+            return Err(io::Error::other(
+                "This runtime does not support session moves.",
+            ));
+        }
         let plan = VerifiedTarget::reserve_plan(
             &self.state_dir,
             &self.source_moves.ledger,

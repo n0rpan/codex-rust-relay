@@ -207,15 +207,3 @@ fn paired_fleet_window() {
     args.push(std::env::var_os("OX_TEST_PROJECT").unwrap());
     run(args.into_iter());
 }
-
-#[cfg(all(test, target_os = "linux"))]
-#[::core::prelude::v1::test]
-#[ignore = "launches the test-only native move window in a private Xvfb fixture"]
-fn move_preview_window() {
-    assert!(std::env::var_os("OX_TEST_MOVE_PREVIEW").is_some());
-    run([
-        "--desk-stats".into(),
-        std::env::var_os("OX_TEST_PROJECT").expect("isolated fixture checkout"),
-    ]
-    .into_iter());
-}

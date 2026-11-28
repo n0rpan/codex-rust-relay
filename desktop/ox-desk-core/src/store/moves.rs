@@ -3,6 +3,7 @@ use super::{Call, Connection, Pending, Store};
 use crate::{
     changed::Changed,
     codex::{commands::UnsubscribeStatus, history::ResumedThread, reply::Reply},
+    host_protocol::TimelineItem,
     runtime::{Access, Billing},
 };
 use serde_json::Value;
@@ -48,7 +49,33 @@ pub(super) struct CodexRelease {
     closed: bool,
 }
 
+pub(super) struct History {
+    pub(super) items: Vec<TimelineItem>,
+    pub(super) previous: Option<usize>,
+}
+
 impl Store {
+    /// `Some(None)` means the full archive is already visible.
+    pub fn moved_history_cursor(&self, thread: &str) -> Option<Option<usize>> {
+        self.moved_history
+            .get(thread)
+            .map(|history| history.previous)
+    }
+
+    pub fn show_moved_history(
+        &mut self,
+        thread: &str,
+        mut items: Vec<TimelineItem>,
+        previous: Option<usize>,
+    ) {
+        if let Some(mut history) = self.moved_history.remove(thread) {
+            items.append(&mut history.items);
+        }
+        self.moved_history
+            .insert(thread.into(), History { items, previous });
+        self.changed.replace_transcript(thread);
+    }
+
     /// Reserve a Codex thread in the chosen target checkout and checkpoint the
     /// transferred context. No inference turn starts during this reservation.
     pub fn prepare_codex_move_writer(
