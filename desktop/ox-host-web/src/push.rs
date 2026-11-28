@@ -22,6 +22,95 @@ use tokio::{
 use url::Url;
 use web_push_native::{Auth, WebPushBuilder};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct Preferences {
+    enabled: bool,
+    approval: bool,
+    question: bool,
+    finished: bool,
+    goal_reached: bool,
+    failed: bool,
+}
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            approval: true,
+            question: true,
+            finished: true,
+            goal_reached: false,
+            failed: true,
+        }
+    }
+}
+impl Preferences {
+    pub(crate) fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub(crate) fn set(&mut self, change: PreferenceEdit) {
+        let value = match change.event {
+            Preference::Enabled => &mut self.enabled,
+            Preference::Approval => &mut self.approval,
+            Preference::Question => &mut self.question,
+            Preference::Finished => &mut self.finished,
+            Preference::GoalReached => &mut self.goal_reached,
+            Preference::Failed => &mut self.failed,
+        };
+        *value = change.value;
+    }
+
+    pub(crate) fn allows(&self, event: Event) -> bool {
+        self.enabled
+            && match event {
+                Event::Session(NotificationKind::Approval) => self.approval,
+                Event::Session(NotificationKind::Question) => self.question,
+                Event::Session(NotificationKind::Finished) => self.finished,
+                Event::Session(NotificationKind::Failed) => self.failed,
+                Event::GoalReached => self.goal_reached,
+            }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Event {
+    Session(NotificationKind),
+    GoalReached,
+}
+impl Serialize for Event {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Session(kind) => kind.serialize(serializer),
+            Self::GoalReached => serializer.serialize_str("goal_reached"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Preference {
+    Enabled,
+    Approval,
+    Question,
+    Finished,
+    GoalReached,
+    Failed,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreferenceEdit {
+    pub event: Preference,
+    pub value: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct PreferenceState {
+    pub preferences: Preferences,
+    pub subscribed: bool,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Subscription {
@@ -82,7 +171,7 @@ impl Subscription {
 struct Payload<'a> {
     thread: &'a str,
     title: &'a str,
-    kind: NotificationKind,
+    kind: Event,
 }
 fn public_ip(ip: IpAddr) -> bool {
     match ip {
@@ -219,7 +308,9 @@ async fn post(
 
 struct Notice {
     bytes: Vec<u8>,
+    goal_bytes: Option<Vec<u8>>,
     expires: Instant,
+    event: Event,
     // Closing the sender cancels every device's queued or in-flight copy.
     ask: Option<watch::Receiver<()>>,
 }
@@ -228,6 +319,7 @@ struct Delivery {
     device: String,
     subscription: Subscription,
     notice: Arc<Notice>,
+    event: Event,
     attempts: u32,
 }
 
@@ -253,19 +345,27 @@ impl Delivery {
         if ttl.is_zero() {
             return DeliveryResult::Done;
         }
+        let payload = if self.event == Event::GoalReached {
+            self.notice
+                .goal_bytes
+                .as_ref()
+                .expect("selected goal payload")
+        } else {
+            &self.notice.bytes
+        };
         let post = tokio::time::timeout(
             Duration::from_secs(7).min(ttl),
-            transport(&self.subscription, &key, &self.notice.bytes, &contact, ttl),
+            transport(&self.subscription, &key, payload, &contact, ttl),
         );
         tokio::pin!(post);
         loop {
-            if !app
-                .state
-                .lock()
-                .unwrap()
-                .is_subscribed(&self.device, &self.subscription)
             {
-                return DeliveryResult::Done;
+                let state = app.state.lock().unwrap();
+                if !state.is_subscribed(&self.device, &self.subscription)
+                    || !state.allows_push(&self.device, self.event)
+                {
+                    return DeliveryResult::Done;
+                }
             }
             tokio::select! {biased;
                 _ = async {
@@ -309,11 +409,19 @@ async fn deliveries(
                 notice = rx.recv() => {
                     let Some(notice) = notice else { return };
                     let notice = Arc::new(notice);
-                    let subscribers = app.state.lock().unwrap().subscriptions();
+                    let state = app.state.lock().unwrap();
+                    let subscribers = state.subscriptions();
                     cooldowns.retain(|endpoint, (since, delay)| since.elapsed() < *delay
                         && subscribers.iter().any(|(_, sub)| sub.endpoint == *endpoint));
                     for (device, subscription) in subscribers {
-                        fresh.push_back(Delivery { device, subscription, notice: notice.clone(), attempts: 0 });
+                        let event = if notice.goal_bytes.is_some() && state.allows_push(&device, Event::GoalReached) {
+                            Event::GoalReached
+                        } else if state.allows_push(&device, notice.event) {
+                            notice.event
+                        } else {
+                            continue;
+                        };
+                        fresh.push_back(Delivery { device, subscription, notice: notice.clone(), event, attempts: 0 });
                     }
                 }
                 _ = async { tokio::time::sleep_until(next.unwrap()).await }, if next.is_some() => {}
@@ -518,7 +626,7 @@ fn notices(bytes: &[u8], cursor: Option<&Cursor>, asks: &mut ActiveAsks) -> io::
     let mut notifications: Vec<_> = changes
         .into_iter()
         .filter(|change| change.kind == "notification")
-        .filter_map(|c| Some((c.thread?, c.title?, c.event?)))
+        .filter_map(|c| Some((c.thread?, c.title?, c.event?, c.goal_reached)))
         .collect();
     // A draft has no native thread yet. Address its live ask so a stale tap
     // cannot select a later draft on the same project and route.
@@ -526,10 +634,10 @@ fn notices(bytes: &[u8], cursor: Option<&Cursor>, asks: &mut ActiveAsks) -> io::
         new_asks
             .iter()
             .filter(|(id, _, _)| id.starts_with("ask:ox-yolo-"))
-            .map(|(id, kind, _)| (id.clone(), "New OX session".into(), *kind)),
+            .map(|(id, kind, _)| (id.clone(), "New OX session".into(), *kind, false)),
     );
     let mut payloads = Vec::new();
-    for (thread, title, kind) in notifications {
+    for (thread, title, kind, goal_reached) in notifications {
         let ask = if matches!(
             kind,
             NotificationKind::Approval | NotificationKind::Question
@@ -557,14 +665,22 @@ fn notices(bytes: &[u8], cursor: Option<&Cursor>, asks: &mut ActiveAsks) -> io::
         let identity = serde_json::to_vec(&(&scope.project, scope.route.runtime, alias, &thread))?;
         let hash = ring::digest::digest(&ring::digest::SHA256, &identity);
         let thread = format!("{thread}~{}", B64.encode(hash.as_ref()));
-        payloads.push(Notice {
-            ask,
-            expires: Instant::now() + ttl,
-            bytes: serde_json::to_vec(&Payload {
+        let event = Event::Session(kind);
+        let payload = |kind| {
+            serde_json::to_vec(&Payload {
                 thread: &thread,
                 title: &title,
                 kind,
-            })?,
+            })
+        };
+        payloads.push(Notice {
+            ask,
+            expires: Instant::now() + ttl,
+            event,
+            bytes: payload(event)?,
+            goal_bytes: (goal_reached && kind == NotificationKind::Finished)
+                .then(|| payload(Event::GoalReached))
+                .transpose()?,
         });
     }
     Ok(Notices::Delta(c, payloads))
@@ -602,6 +718,8 @@ struct NoticeChange {
     thread: Option<String>,
     title: Option<String>,
     event: Option<NotificationKind>,
+    #[serde(default)]
+    goal_reached: bool,
     #[serde(default)]
     asks: Vec<NoticeAsk>,
 }
@@ -817,6 +935,7 @@ mod tests {
                         thread: "thread-1".into(),
                         title: "Fix login\u{7}".into(),
                         event: kind,
+                        goal_reached: false,
                     },
                 ],
             };

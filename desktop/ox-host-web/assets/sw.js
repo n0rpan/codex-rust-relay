@@ -65,6 +65,7 @@ self.addEventListener("fetch", (event) => {
 });
 const labels = {
   finished: "Turn finished",
+  goal_reached: "Goal reached",
   failed: "Turn failed",
   approval: "Needs you · approval",
   question: "Needs you · question",
