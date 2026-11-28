@@ -1,5 +1,5 @@
 // Frames stay in this document. Only a verified same-host invitation reaches the pairing form.
-export function pairingCode(text, origin) {
+export function pairingInvitation(text, origin) {
   let url;
   try {
     url = new URL(text);
@@ -8,17 +8,19 @@ export function pairingCode(text, origin) {
   }
   const params = new URLSearchParams(url.hash.slice(1));
   const code = params.get("pair");
+  const thread = params.get("thread");
   if (
     url.origin !== origin ||
     url.pathname !== "/" ||
     url.username ||
     url.password ||
     url.search ||
-    params.size !== 1 ||
-    !/^[A-Za-z0-9_-]{43}$/.test(code ?? "")
+    (thread === null ? params.size !== 1 : params.size !== 2) ||
+    !/^[A-Za-z0-9_-]{43}$/.test(code ?? "") ||
+    (thread !== null && (thread.length > 1024 || !/^.+~[A-Za-z0-9_-]{43}$/.test(thread)))
   )
     throw new Error("Scan a fresh OX pairing code for this laptop.");
-  return code;
+  return { code, thread };
 }
 
 export function setupCamera(accept) {
@@ -86,16 +88,16 @@ export function setupCamera(accept) {
           const frame = context.getImageData(0, 0, canvas.width, canvas.height);
           const result = window.jsQR(frame.data, frame.width, frame.height);
           if (result) {
-            let secret;
+            let invitation;
             try {
-              secret = pairingCode(result.data, location.origin);
+              invitation = pairingInvitation(result.data, location.origin);
             } catch {
               status.textContent =
                 "That code is for something else. Scan the pairing QR from this laptop.";
             }
-            if (secret) {
+            if (invitation) {
               stop();
-              accept(secret);
+              accept(invitation);
               return;
             }
           }

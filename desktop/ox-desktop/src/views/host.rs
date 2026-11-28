@@ -1085,6 +1085,24 @@ impl Host {
         cx.subscribe_in(
             pane,
             window,
+            |s, _, event: &super::workbench::OpenOnPhone, window, cx| {
+                s.show_remote(window, cx);
+                if let Some(view) = &s.preferences {
+                    view.update(cx, |view, cx| {
+                        view.open_session_on_phone(
+                            &event.scope,
+                            &event.thread,
+                            event.title.clone(),
+                            cx,
+                        )
+                    });
+                }
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            pane,
+            window,
             |s, owner, event: &super::onboarding::SwitchRoute, window, cx| {
                 let project = owner.read(cx).project.clone();
                 let route = match &event.0 {

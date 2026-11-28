@@ -148,6 +148,19 @@ impl Preferences {
         view
     }
 
+    pub(crate) fn open_session_on_phone(
+        &mut self,
+        scope: &ox_desk_core::host_protocol::Scope,
+        thread: &str,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_remote(cx);
+        if let Some(remote) = &self.remote {
+            remote.update(cx, |view, cx| view.set_session(scope, thread, title, cx));
+        }
+    }
+
     /// Show the Remote access page (the sidebar's phone control).
     pub fn open_remote(&mut self, cx: &mut Context<Self>) {
         // Stay here when the first load lands, instead of jumping to Accounts.

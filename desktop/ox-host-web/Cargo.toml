@@ -7,8 +7,8 @@ publish = false
 [features]
 default = []
 fixture-transport = ["client", "dep:rustls"]
-client = ["dep:tempfile", "dep:getrandom", "dep:secret-service", "dep:zbus", "dep:ox-desk-core", "dep:flume", "dep:security-framework", "dep:base64", "dep:p256", "dep:reqwest", "dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:sha2", "reqwest/json", "tokio/rt-multi-thread"]
-server = ["client", "tokio/fs", "dep:flume", "dep:httpdate", "dep:axum", "dep:base64", "dep:ox-desk-core", "dep:p256", "dep:qrcode", "dep:reqwest", "dep:ring", "dep:tempfile", "dep:tokio", "dep:web-push-native"]
+client = ["dep:qrcode", "dep:tempfile", "dep:getrandom", "dep:secret-service", "dep:zbus", "dep:ox-desk-core", "dep:flume", "dep:security-framework", "dep:base64", "dep:p256", "dep:reqwest", "dep:tokio", "dep:tokio-tungstenite", "dep:futures-util", "dep:sha2", "reqwest/json", "tokio/rt-multi-thread"]
+server = ["client", "tokio/fs", "dep:flume", "dep:httpdate", "dep:axum", "dep:base64", "dep:ox-desk-core", "dep:p256", "dep:reqwest", "dep:ring", "dep:tempfile", "dep:tokio", "dep:web-push-native"]
 
 [dependencies]
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
