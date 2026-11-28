@@ -6982,7 +6982,7 @@ mod tests {
         #[test]
         fn a_codex_destination_issues_prepared_only_after_a_native_checkpoint() {
             use crate::{
-                move_bundle::{Bundle, Presentation},
+                move_bundle::{Bundle, Presentation, plan_digest},
                 move_ledger::{ArchivePin, Ledger, Status},
                 move_target::{Files, VerifiedTarget},
             };
@@ -7040,6 +7040,7 @@ mod tests {
                     directory: bundle.directory(),
                     manifest: &bundle.manifest,
                     manifest_sha256: manifest,
+                    expected_plan: Some(plan_digest(&plan).unwrap()),
                 },
             )
             .unwrap();
@@ -7155,7 +7156,7 @@ mod tests {
         #[test]
         fn a_staged_source_move_waits_for_the_native_release_before_commit() {
             use crate::{
-                move_bundle::{Bundle, Presentation},
+                move_bundle::{Bundle, Presentation, plan_digest},
                 move_ledger::{ArchivePin, Ledger, Status},
                 move_target::{Files, VerifiedTarget},
             };
@@ -7204,6 +7205,7 @@ mod tests {
                     directory: bundle.directory(),
                     manifest: &bundle.manifest,
                     manifest_sha256: archive.manifest,
+                    expected_plan: Some(plan_digest(&plan).unwrap()),
                 },
             )
             .unwrap();

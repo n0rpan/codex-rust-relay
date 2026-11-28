@@ -173,3 +173,7 @@ pub(crate) fn verified_file(path: &Path, spec: &FileSpec) -> io::Result<File> {
     file.rewind()?;
     Ok(file)
 }
+
+pub(crate) fn plan_digest(plan: &Plan) -> io::Result<[u8; 32]> {
+    Ok(Sha256::digest(serde_json::to_vec(plan)?).into())
+}

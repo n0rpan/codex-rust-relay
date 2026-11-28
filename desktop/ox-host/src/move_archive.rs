@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn the_completed_move_retains_history_and_working_files_without_the_source() {
         use crate::{
-            move_bundle::{Bundle, Presentation},
+            move_bundle::{Bundle, Presentation, plan_digest},
             move_target::{Files, VerifiedTarget},
         };
         use ox_host_web::move_manifest::TRANSCRIPT;
@@ -301,7 +301,11 @@ mod tests {
             directory: bundle.directory(),
             manifest: &bundle.manifest,
             manifest_sha256,
+            expected_plan: Some(plan_digest(plan).unwrap()),
         };
+        let mut other_plan = files();
+        other_plan.expected_plan = Some([0; 32]);
+        assert!(VerifiedTarget::install(&jobs, &receiver, plan.source.host, other_plan).is_err());
         let transcript = bundle.directory().join(TRANSCRIPT);
         let transcript_bytes = std::fs::read(&transcript).unwrap();
         std::fs::write(&transcript, b"changed during upload").unwrap();

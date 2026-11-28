@@ -87,6 +87,7 @@ pub(crate) struct StagedMove {
     pub plan: PathBuf,
     pub transcript: PathBuf,
     pub checkout: PathBuf,
+    pub expected_plan: Option<[u8; 32]>,
     pub recovered: bool,
 }
 
@@ -136,6 +137,7 @@ pub(crate) struct Upload {
     offer: Offer,
     device: String,
     directory: PathBuf,
+    expected_plan: Option<[u8; 32]>,
 }
 
 #[derive(Deserialize)]
@@ -213,7 +215,7 @@ impl Upload {
     ) -> io::Result<Self> {
         let offer: Offer = serde_json::from_str(request)?;
         let binding = offer.binding()?;
-        let directory = {
+        let (directory, expected_plan) = {
             let mut state = state.lock().unwrap();
             if !state.prove_move_admission(
                 device,
@@ -227,7 +229,10 @@ impl Upload {
                     "Session move is not approved on this host",
                 ));
             }
-            state.dir.join(DIRECTORY)
+            (
+                state.dir.join(DIRECTORY),
+                state.expected_move_plan(device, &binding)?,
+            )
         };
         Ok(Self {
             state,
@@ -235,6 +240,7 @@ impl Upload {
             offer,
             device: device.into(),
             directory,
+            expected_plan,
         })
     }
 
@@ -255,6 +261,7 @@ impl Upload {
             plan: path.join(PLAN),
             transcript: path.join(TRANSCRIPT),
             checkout: path.join(CHECKOUT),
+            expected_plan: self.expected_plan,
             recovered,
         }
     }
@@ -591,8 +598,10 @@ mod tests {
                     checkout: spec(C),
                 },
             };
+            let plan = Binding::for_plan(SOURCE, TARGET, TRANSFER, P);
+            state.reserve_move_plan(&device, &plan).unwrap();
             state
-                .issue_move_admission(&device, &offer.binding().unwrap())
+                .admit_reserved_move(&device, &plan, &offer.binding().unwrap())
                 .unwrap();
             Self {
                 dir,
@@ -777,6 +786,7 @@ mod tests {
                     move |socket| async move {
                         let mut connection = Connection::open(socket);
                         stage_socket(state, &device, &mut connection, |staged| {
+                            assert_eq!(staged.expected_plan, Some(Sha256::digest(P).into()));
                             assert_eq!(fs::read(staged.transcript)?, T);
                             assert_eq!(fs::read(staged.checkout)?, C);
                             Ok(serde_json::json!({

@@ -27,6 +27,12 @@ impl Binding {
     pub(super) fn digest(&self) -> [u8; 32] {
         self.plan_digest
     }
+
+    fn same_transfer(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.target == other.target
+            && self.transfer == other.transfer
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,6 +58,12 @@ fn admission_name(transfer: &str) -> io::Result<String> {
     Ok(format!("move-admission-{transfer}.json"))
 }
 
+fn reservation_name(transfer: &str) -> io::Result<String> {
+    canonical_id(transfer)
+        .then(|| format!("move-reservation-{transfer}.json"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid move transfer ID"))
+}
+
 fn denied() -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
@@ -60,6 +72,67 @@ fn denied() -> io::Error {
 }
 
 impl State {
+    fn move_reservation(&self, transfer: &str) -> io::Result<Option<Admission>> {
+        let stored: Option<Admission> = read_registry(&self.dir.join(reservation_name(transfer)?))?;
+        if stored
+            .as_ref()
+            .is_some_and(|saved| saved.binding.transfer != transfer)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Move reservation is stored under the wrong ID",
+            ));
+        }
+        Ok(stored)
+    }
+
+    /// Record the operator-approved plan before acknowledging the queued move.
+    /// It remains available while the current turn runs and across restarts.
+    pub(crate) fn reserve_move_plan(&mut self, device: &str, plan: &Binding) -> io::Result<()> {
+        self.check_move_peer(device, plan)?;
+        if let Some(saved) = self.move_reservation(&plan.transfer)? {
+            return if !saved.revoked && saved.device == device && saved.binding == *plan {
+                Ok(())
+            } else {
+                Err(denied())
+            };
+        }
+        if self.move_admission(&plan.transfer)?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "This move ID is already in use",
+            ));
+        }
+        write_registry(
+            &self.dir,
+            &reservation_name(&plan.transfer)?,
+            &Admission {
+                device: device.into(),
+                binding: plan.clone(),
+                revoked: false,
+            },
+        )
+    }
+
+    /// Bind the first final manifest to the approved immutable plan.
+    pub(crate) fn admit_reserved_move(
+        &mut self,
+        device: &str,
+        plan: &Binding,
+        manifest: &Binding,
+    ) -> io::Result<()> {
+        if !plan.same_transfer(manifest)
+            || !self
+                .move_reservation(&plan.transfer)?
+                .is_some_and(|reserved| {
+                    !reserved.revoked && reserved.device == device && reserved.binding == *plan
+                })
+        {
+            return Err(denied());
+        }
+        self.issue_move_admission(device, manifest)
+    }
+
     fn move_admission(&self, transfer: &str) -> io::Result<Option<Admission>> {
         let stored: Option<Admission> = read_registry(&self.dir.join(admission_name(transfer)?))?;
         if stored
@@ -102,6 +175,12 @@ impl State {
         binding: &Binding,
     ) -> io::Result<()> {
         self.check_move_peer(device, binding)?;
+        if self
+            .move_reservation(&binding.transfer)?
+            .is_some_and(|reserved| reserved.revoked || reserved.device != device)
+        {
+            return Err(denied());
+        }
         if let Some(saved) = self.move_admission(&binding.transfer)? {
             if saved.revoked {
                 return Err(denied());
@@ -143,14 +222,40 @@ impl State {
     /// cannot acquire a destination writer after its last successful request.
     pub(crate) fn check_move_admission(&self, device: &str, binding: &Binding) -> io::Result<()> {
         self.check_move_peer(device, binding)?;
+        self.expected_move_plan(device, binding)?;
         self.move_admission(&binding.transfer)?
             .filter(|saved| !saved.revoked && saved.device == device && saved.binding == *binding)
             .ok_or_else(denied)
             .map(|_| ())
     }
 
+    pub(super) fn expected_move_plan(
+        &self,
+        device: &str,
+        manifest: &Binding,
+    ) -> io::Result<Option<[u8; 32]>> {
+        match self.move_reservation(&manifest.transfer)? {
+            Some(reserved)
+                if !reserved.revoked
+                    && reserved.device == device
+                    && reserved.binding.same_transfer(manifest) =>
+            {
+                Ok(Some(reserved.binding.digest()))
+            }
+            Some(_) => Err(denied()),
+            None => Ok(None),
+        }
+    }
+
     /// Retain the original binding so a revoked transfer ID cannot be reused.
     pub(crate) fn revoke_move_admission(&mut self, transfer: &str) -> io::Result<()> {
+        if let Some(mut reserved) = self.move_reservation(transfer)?
+            && !reserved.revoked
+        {
+            reserved.revoked = true;
+            write_registry(&self.dir, &reservation_name(transfer)?, &reserved)?;
+            self.signal();
+        }
         if let Some(mut saved) = self.move_admission(transfer)?
             && !saved.revoked
         {
@@ -223,6 +328,45 @@ pub(super) mod tests {
             state,
             Binding::for_plan(SOURCE, TARGET, TRANSFER, PLAN),
         )
+    }
+
+    #[test]
+    fn queued_plan_stays_approved_across_restart_and_can_bind_only_one_manifest() {
+        let (dir, mut state, plan) = fixture();
+        let (device, _) = pair(&mut state, SOURCE);
+        state.reserve_move_plan(&device, &plan).unwrap();
+        state.reserve_move_plan(&device, &plan).unwrap();
+        drop(state);
+
+        let mut state = State::load(dir.path()).unwrap();
+        let manifest = Binding::for_plan(SOURCE, TARGET, TRANSFER, b"final manifest");
+        let other_plan = Binding::for_plan(SOURCE, TARGET, TRANSFER, b"changed plan");
+        assert!(
+            state
+                .admit_reserved_move(&device, &other_plan, &manifest)
+                .is_err()
+        );
+        assert!(state.check_move_admission(&device, &manifest).is_err());
+        state
+            .admit_reserved_move(&device, &plan, &manifest)
+            .unwrap();
+        state
+            .admit_reserved_move(&device, &plan, &manifest)
+            .unwrap();
+        state.check_move_admission(&device, &manifest).unwrap();
+        let other_manifest = Binding::for_plan(SOURCE, TARGET, TRANSFER, b"other files");
+        assert!(
+            state
+                .admit_reserved_move(&device, &plan, &other_manifest)
+                .is_err()
+        );
+        state.revoke_move_admission(TRANSFER).unwrap();
+        assert!(
+            state
+                .admit_reserved_move(&device, &plan, &manifest)
+                .is_err()
+        );
+        assert!(state.check_move_admission(&device, &manifest).is_err());
     }
 
     #[test]

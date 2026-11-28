@@ -1,7 +1,7 @@
 //! Destination-owned checkout and transcript, verified before fencing the source.
 use crate::{
     move_archive::Archive,
-    move_bundle::{BundlePlan, Presentation, verified_file},
+    move_bundle::{BundlePlan, Presentation, plan_digest, verified_file},
     move_ledger::{Ledger, Plan, Prepared, Stage},
 };
 use ox_desk_core::{
@@ -27,6 +27,7 @@ pub(crate) struct Files<'a> {
     pub(crate) directory: &'a Path,
     pub(crate) manifest: &'a Manifest,
     pub(crate) manifest_sha256: [u8; 32],
+    pub(crate) expected_plan: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +70,11 @@ impl VerifiedTarget {
             &files.manifest.plan,
         )?)?;
         let plan = &bundle.plan;
+        if let Some(expected) = files.expected_plan
+            && plan_digest(plan)? != expected
+        {
+            return Err(invalid("The source changed the approved session move."));
+        }
         let prepared = ledger.prepared_receiver(authenticated_source, plan)?;
         if prepared
             .as_ref()
