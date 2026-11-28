@@ -476,6 +476,7 @@ impl Engine {
     }
     pub(crate) fn serve(&mut self, rx: Receiver<Message>) -> io::Result<()> {
         self.recover_worker_results();
+        self.advance_source_moves()?;
         self.drive_move_transfers()?;
         // Mailbox messages served in a row while a timer was already overdue.
         let mut overdue_streak = 0u32;

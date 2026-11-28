@@ -112,6 +112,7 @@ impl Engine {
         };
         let error = self.move_send.errors.get(&plan.id);
         let phase = match status {
+            Status::Queued if error.is_some() => "failed",
             Status::Queued if self.source_moves.ledger.queued_result_seen(&plan)? => {
                 "waiting_for_workers"
             }
@@ -341,10 +342,15 @@ impl Engine {
         }
         self.move_send.errors.remove(&id);
         self.move_send.reopening.remove(&id);
-        if matches!(command, Action::RetryMove(_))
-            && self.source_moves.ledger.source_status(&plan)? == Status::Preparing
-        {
-            self.ensure(scope, None)?;
+        if matches!(command, Action::RetryMove(_)) {
+            let ledger = &self.source_moves.ledger;
+            let status = ledger.source_status(&plan)?;
+            if status == Status::Preparing
+                || (status == Status::Queued && ledger.queued_result_seen(&plan)?)
+            {
+                self.ensure(scope, None)?;
+                self.advance_source_moves()?;
+            }
         }
         if matches!(command, Action::CheckMove(_)) {
             self.source_moves.retry_refused_release(id);
@@ -434,13 +440,8 @@ impl Engine {
             }
             let work = match phase {
                 Status::Preparing => {
-                    match self.reopen_source_move_history(&plan) {
-                        Ok(true) => {}
-                        Ok(false) => continue,
-                        Err(error) => {
-                            self.move_send.errors.insert(plan.id, error.to_string());
-                            continue;
-                        }
+                    if !self.restore_source_move_history(&plan) {
+                        continue;
                     }
                     // A client can send to a moved session without opening its
                     // timeline first. Carry the existing archive on every hop.
@@ -509,6 +510,19 @@ impl Engine {
             });
         }
         Ok(())
+    }
+
+    pub(super) fn restore_source_move_history(&mut self, plan: &Plan) -> bool {
+        if self.move_send.errors.contains_key(&plan.id) {
+            return false;
+        }
+        match self.reopen_source_move_history(plan) {
+            Ok(ready) => ready,
+            Err(error) => {
+                self.move_send.errors.insert(plan.id, error.to_string());
+                false
+            }
+        }
     }
 
     fn reopen_source_move_history(&mut self, plan: &Plan) -> io::Result<bool> {

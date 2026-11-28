@@ -302,9 +302,18 @@ impl Engine {
                             .ledger
                             .observe_queued_result(&plan, &result.turn)?;
                     }
-                    if self.source_moves.ledger.queued_result_seen(&plan)?
-                        && self.move_source_quiescent(&plan)
-                    {
+                    if !self.source_moves.ledger.queued_result_seen(&plan)? {
+                        continue;
+                    }
+                    let history_ready = self
+                        .running
+                        .get(scope)
+                        .and_then(|live| live.store.transcript(thread))
+                        .is_some_and(|view| view.is_ready());
+                    if !history_ready && !self.restore_source_move_history(&plan) {
+                        continue;
+                    }
+                    if self.move_source_quiescent(&plan) {
                         self.source_moves.ledger.start_queued(&plan)?;
                     }
                 }

@@ -1395,7 +1395,10 @@ mod tests {
         let cancelled = source.cancel_source(&plan).unwrap();
         assert_eq!(source.cancel_source(&plan).unwrap(), cancelled);
         let mut source = Ledger::open(laptop.path(), plan.source.host).unwrap();
-        assert_eq!(source.pending_cancellations().unwrap(), [cancelled.clone()]);
+        assert_eq!(
+            source.pending_cancellations().unwrap().as_slice(),
+            std::slice::from_ref(&cancelled)
+        );
         assert!(source.can_write(&plan.source.scope, "local"));
         assert!(
             source
