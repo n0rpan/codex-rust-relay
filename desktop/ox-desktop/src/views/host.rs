@@ -202,7 +202,7 @@ pub struct Host {
     _probe: Option<platform::probe::Socket>,
     message: Option<String>,
     /// Set when first-run onboarding opened Providers: models known then; a newly saved one becomes the route.
-    provider_onboarding: Option<Vec<String>>,
+    provider_onboarding: Option<(EntityId, Vec<String>)>,
 }
 const MIN_THREAD_WIDTH: f32 = 600.;
 const DIVIDER_WIDTH: f32 = 5.;
@@ -768,23 +768,7 @@ impl Host {
                             });
                         }
                         s.native_account = native_account;
-                        if s.provider_onboarding.is_some() && s.preferences.is_none() {
-                            let before = s.provider_onboarding.take().unwrap_or_default();
-                            if let Some(model) = s
-                                .models
-                                .read(cx)
-                                .iter()
-                                .find(|m| !before.contains(m))
-                                .cloned()
-                            {
-                                let owner = s.panes[s.active].clone();
-                                let (project, route) = {
-                                    let o = owner.read(cx);
-                                    (o.project.clone(), o.api_route(model))
-                                };
-                                s.open(project, route, window, cx);
-                            }
-                        }
+                        s.finish_provider_onboarding(false, window, cx);
                     }
                     Err(error) => s.message = Some(error),
                 }
@@ -792,16 +776,49 @@ impl Host {
                     cx.notify();
                 }
             });
-            if let Ok(found) = discovered.await {
-                let _ = this.update(cx, |s, cx| {
+            let found = discovered.await;
+            let _ = this.update_in(cx, |s, window, cx| {
+                if let Ok(found) = found {
                     let merged = ox_desk_core::ports::ox::merge_catalog(s.models.read(cx), found);
                     if &merged != s.models.read(cx) {
                         s.models.write(cx, merged);
                         cx.notify();
                     }
-                });
-            }
+                }
+                s.finish_provider_onboarding(true, window, cx);
+            });
         })
+    }
+    fn finish_provider_onboarding(
+        &mut self,
+        catalog_finished: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preferences.is_some() {
+            return;
+        }
+        let Some((started_from, before)) = &self.provider_onboarding else {
+            return;
+        };
+        let owner = &self.panes[self.active];
+        if owner.entity_id() != *started_from {
+            self.provider_onboarding = None;
+            return;
+        }
+        let model = self
+            .models
+            .read(cx)
+            .iter()
+            .find(|model| !before.contains(model))
+            .cloned();
+        if catalog_finished || model.is_some() {
+            self.provider_onboarding = None;
+        }
+        if let Some(model) = model {
+            let pane = owner.read(cx);
+            self.open(pane.project.clone(), pane.api_route(model), window, cx);
+        }
     }
     fn compact(&self, window: &Window) -> bool {
         needs_drawer(window.viewport_size().width, self.sidebar_width)
@@ -1075,7 +1092,8 @@ impl Host {
                     None => match s.models.read(cx).first() {
                         Some(model) => owner.read(cx).api_route(model.clone()),
                         None => {
-                            s.provider_onboarding = Some(s.models.read(cx).clone());
+                            s.provider_onboarding =
+                                Some((owner.entity_id(), s.models.read(cx).clone()));
                             return s.open_providers(owner, window, cx);
                         }
                     },
@@ -1088,7 +1106,7 @@ impl Host {
             pane,
             window,
             |s, owner, _: &super::onboarding::ConfigureProvider, window, cx| {
-                s.provider_onboarding = Some(s.models.read(cx).clone());
+                s.provider_onboarding = Some((owner.entity_id(), s.models.read(cx).clone()));
                 s.open_providers(owner, window, cx);
             },
         )
