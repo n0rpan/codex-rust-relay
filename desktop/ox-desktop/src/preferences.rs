@@ -144,6 +144,21 @@ impl Preferences {
         view
     }
 
+    pub(crate) fn worker_hosts(
+        link: platform::HostLink,
+        project: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let source = link.remote().cloned();
+        let mut view = Self::new(link, project, window, cx);
+        view.prefer_providers = true;
+        view.goto(Page::Hosts, cx);
+        view.hosts
+            .update(cx, |hosts, cx| hosts.open_worker_links(source, cx));
+        view
+    }
+
     /// Show the Remote access page (the sidebar's phone control).
     pub fn open_remote(&mut self, cx: &mut Context<Self>) {
         // Stay here when the first load lands, instead of jumping to Accounts.

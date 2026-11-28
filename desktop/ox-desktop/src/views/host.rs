@@ -1179,6 +1179,25 @@ impl Host {
             },
         )
         .detach();
+        cx.subscribe_in(
+            pane,
+            window,
+            |s, owner, _: &super::worker_sheet::OpenWorkerHosts, window, cx| {
+                let project = owner.read(cx).project.clone();
+                s.before_settings = window.focused(cx);
+                owner.update(cx, |p, cx| p.set_front(false, cx));
+                s.preferences = Some(cx.new(|cx| {
+                    crate::preferences::Preferences::worker_hosts(
+                        s.link.clone(),
+                        project,
+                        window,
+                        cx,
+                    )
+                }));
+                cx.notify();
+            },
+        )
+        .detach();
         cx.subscribe(pane, |s, _, _: &CatalogChanged, cx| {
             s.refresh_palette_search(cx);
             cx.notify();
@@ -2545,6 +2564,12 @@ impl Host {
         let active = self.panes[self.active].read(cx);
         let active_project = active.project.clone();
         let active_route = active.route.clone();
+        let execution_host = active
+            .host_caption
+            .as_deref()
+            .or_else(|| self.link.remote().map(|host| host.name.as_str()))
+            .unwrap_or("This computer")
+            .to_owned();
         let active_selected = active
             .store
             .as_ref()
@@ -3111,6 +3136,9 @@ impl Host {
                     if let Some(update) = worker_notice {
                         route = format!("{update} · {route}");
                     }
+                    if t.worker {
+                        route = format!("Worker on {execution_host} · {route}");
+                    }
                     route
                 },
                 age: age(now.timestamp(), timestamp),
@@ -3132,8 +3160,12 @@ impl Host {
                 depth,
                 pinned,
                 accent: effective_accent,
-                project_tag: (show_project_tag && depth == 0 && !project_name.is_empty())
-                    .then_some(project_name),
+                project_tag: if t.worker {
+                    Some(execution_host.clone())
+                } else {
+                    (show_project_tag && depth == 0 && !project_name.is_empty())
+                        .then_some(project_name)
+                },
             };
             // The disclosure is a sibling of the row in the gutter, so it folds without
             // selecting and the row keeps the sidebar keyline.
@@ -3354,10 +3386,22 @@ impl Host {
             }
         }
         let pane = self.panes[self.active].read(cx);
-        if pane.pane_width != pane_width || pane.host_caption != host_caption {
+        let worker_update = pane
+            .store
+            .as_ref()
+            .and_then(|store| {
+                self.discovery
+                    .worker_notice(&pane.project, &pane.route, store.selected()?)
+            })
+            .map(str::to_owned);
+        if pane.pane_width != pane_width
+            || pane.host_caption != host_caption
+            || pane.worker_update != worker_update
+        {
             self.panes[self.active].update(cx, |pane, cx| {
                 pane.pane_width = pane_width;
                 pane.host_caption = host_caption;
+                pane.worker_update = worker_update;
                 cx.notify();
             });
         }
