@@ -150,6 +150,7 @@ pub(crate) struct VerifiedActivation<T> {
     device: String,
     binding: Binding,
     source: String,
+    transfer: String,
     commit: T,
 }
 
@@ -179,6 +180,7 @@ impl<T: serde::de::DeserializeOwned> VerifiedActivation<T> {
             binding,
             device: device.into(),
             source: offer.source,
+            transfer: offer.transfer,
             commit,
         })
     }
@@ -187,11 +189,16 @@ impl<T: serde::de::DeserializeOwned> VerifiedActivation<T> {
     /// revocation. The actor checks its Prepared record before acquisition.
     pub(crate) fn commit<R>(
         self,
-        activate: impl FnOnce(&str, [u8; 32], T) -> io::Result<R>,
+        activate: impl FnOnce(&str, &str, [u8; 32], T) -> io::Result<R>,
     ) -> io::Result<R> {
         let state = self.state.lock().unwrap();
         state.check_move_admission(&self.device, &self.binding)?;
-        activate(&self.source, self.binding.digest(), self.commit)
+        activate(
+            &self.source,
+            &self.transfer,
+            self.binding.digest(),
+            self.commit,
+        )
     }
 }
 
@@ -393,10 +400,15 @@ struct Open {
     proof: Proof,
 }
 
-#[derive(Serialize)]
-struct StageReply<T> {
-    step: &'static str,
-    prepared: T,
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "step", rename_all = "snake_case", deny_unknown_fields)]
+enum StageReply<T> {
+    Upload,
+    Prepared {
+        transfer: String,
+        manifest_sha256: [u8; 32],
+        prepared: T,
+    },
 }
 
 /// Serve a single transfer after the HTTP layer has verified the paired
@@ -413,13 +425,71 @@ async fn stage_socket<T: Serialize + Send + 'static>(
     let open: Open = serde_json::from_str(&text)?;
     let upload = Upload::open(state, device, &open.request, &open.proof)?;
     let prepared = upload.prepare_with(connection, prepare).await?;
-    let reply = StageReply {
-        step: "prepared",
+    let reply = StageReply::Prepared {
+        transfer: upload.offer.transfer.clone(),
+        manifest_sha256: upload.binding.digest(),
         prepared: prepared.prepared,
     };
     connection
         .send(Message::text(serde_json::to_string(&reply)?))
         .await
+}
+
+async fn send_files_for_prepare<T: serde::de::DeserializeOwned>(
+    socket: &mut Connection<tokio_tungstenite::tungstenite::Message>,
+    offer: &Offer,
+    directory: &Path,
+) -> io::Result<T> {
+    use tokio::io::AsyncReadExt;
+    use tokio_tungstenite::tungstenite::Message as Frame;
+
+    async fn reply<T: serde::de::DeserializeOwned>(
+        socket: &mut Connection<tokio_tungstenite::tungstenite::Message>,
+    ) -> io::Result<StageReply<T>> {
+        let Frame::Text(text) = socket.next().await? else {
+            return Err(invalid("Expected a session move reply"));
+        };
+        Ok(serde_json::from_str(&text)?)
+    }
+    let mut state = reply(socket).await?;
+    if matches!(state, StageReply::Upload) {
+        let mut buffer = vec![0; CHUNK];
+        for (name, spec) in offer.manifest.files() {
+            let mut file = tokio::fs::File::open(directory.join(name)).await?;
+            let mut remaining = spec.bytes;
+            let mut hash = Sha256::new();
+            while remaining > 0 {
+                let len = remaining.min(CHUNK as u64) as usize;
+                file.read_exact(&mut buffer[..len]).await?;
+                hash.update(&buffer[..len]);
+                socket
+                    .send(Frame::Binary(Bytes::copy_from_slice(&buffer[..len])))
+                    .await?;
+                remaining -= len as u64;
+            }
+            if file.read(&mut buffer[..1]).await? != 0
+                || <[u8; 32]>::from(hash.finalize()) != spec.sha256
+            {
+                return Err(invalid(
+                    "The source files changed while sending the session.",
+                ));
+            }
+        }
+        socket.send(Frame::text(r#"{"step":"finish"}"#)).await?;
+        state = reply(socket).await?;
+    }
+    match state {
+        StageReply::Prepared {
+            transfer,
+            manifest_sha256,
+            prepared,
+        } if transfer == offer.transfer && manifest_sha256 == offer.manifest.sha256()? => {
+            Ok(prepared)
+        }
+        _ => Err(invalid(
+            "The destination prepared a different session move.",
+        )),
+    }
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -725,6 +795,10 @@ mod tests {
             .unwrap();
         let address = listener.local_addr().unwrap();
         let running = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let sender_files = tempfile::tempdir().unwrap();
+        for (name, bytes) in [(PLAN, P), (TRANSCRIPT, T), (CHECKOUT, C)] {
+            fs::write(sender_files.path().join(name), bytes).unwrap();
+        }
         for first_upload in [true, false] {
             let (socket, _) = connect_async(format!("ws://{address}")).await.unwrap();
             let mut socket = Connection::open(socket);
@@ -734,31 +808,25 @@ mod tests {
                 .send(ClientMessage::text(
                     serde_json::json!({
                         "request": request,
-                    "proof": {"nonce": proof.nonce, "signature": proof.signature},
+                        "proof": {"nonce": proof.nonce, "signature": proof.signature},
                     })
                     .to_string(),
                 ))
                 .await
                 .unwrap();
-            let mut reply = socket.next().await.unwrap();
-            if first_upload {
-                assert_eq!(reply.to_text().unwrap(), r#"{"step":"upload"}"#);
-                for bytes in [P, T, C] {
-                    socket
-                        .send(ClientMessage::Binary(Bytes::from_static(bytes)))
-                        .await
-                        .unwrap();
-                }
-                socket
-                    .send(ClientMessage::text(r#"{"step":"finish"}"#))
+            let reply: serde_json::Value =
+                send_files_for_prepare(&mut socket, &f.offer, sender_files.path())
                     .await
                     .unwrap();
-                reply = socket.next().await.unwrap();
-            }
             assert_eq!(
-                serde_json::from_str::<serde_json::Value>(reply.to_text().unwrap()).unwrap(),
-                serde_json::json!({"step":"prepared","prepared":{"transfer":TRANSFER,"has_working_checkout":true}})
+                reply,
+                serde_json::json!({"transfer":TRANSFER,"has_working_checkout":true})
             );
+            if first_upload {
+                for name in [PLAN, TRANSCRIPT, CHECKOUT] {
+                    fs::remove_file(sender_files.path().join(name)).unwrap();
+                }
+            }
         }
         running.abort();
     }
@@ -775,8 +843,9 @@ mod tests {
         assert!(open(&f.proof(&make_request("different operation"))).is_err());
         let accepted = open(&f.proof(&request)).unwrap();
         let checked = accepted
-            .commit(|source, digest, commit| {
+            .commit(|source, transfer, digest, commit| {
                 assert_eq!(source, SOURCE);
+                assert_eq!(transfer, TRANSFER);
                 assert_eq!(digest, f.offer.manifest.sha256().unwrap());
                 Ok(commit)
             })
@@ -789,7 +858,8 @@ mod tests {
             .unwrap()
             .revoke_move_admission(TRANSFER)
             .unwrap();
-        let rejected = accepted.commit::<()>(|_, _, _| panic!("revocation must stop activation"));
+        let rejected =
+            accepted.commit::<()>(|_, _, _, _| panic!("revocation must stop activation"));
         assert_eq!(
             rejected.unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
