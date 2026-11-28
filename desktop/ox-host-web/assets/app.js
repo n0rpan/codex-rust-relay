@@ -17,7 +17,7 @@ import { pairingInvitation, setupCamera } from "./pair-camera.js";
 import { ActivityLine } from "./activity.js";
 import * as wire from "./wire.js";
 import { SessionControls } from "./controls.js";
-import { setupSettings } from "./settings.js";
+import { forgetKnownHosts, setupSettings } from "./settings.js";
 import {
   scopeKey,
   Projection,
@@ -86,8 +86,9 @@ const actualModel = (session) =>
   session?.detail?.worker_marks?.actual_model ??
   null;
 function notice(s = "") {
-  $("message").hidden = !s;
-  $("message").textContent = s;
+  const target = $("worker-sheet").open ? $("worker-message") : $("message");
+  target.hidden = !s;
+  target.textContent = s;
 }
 function closeActionMenus(except) {
   for (const menu of document.querySelectorAll(".action-menu[open]")) {
@@ -107,6 +108,7 @@ document.addEventListener("keydown", (event) => {
   }
 });
 function page(id) {
+  if (id !== "conversation") $("worker-sheet").close();
   if (id !== "catalog" && id !== "pair") notificationTarget.request(null);
   if (id !== "settings") phoneSettings?.reset?.();
   if (id !== "running") stopRunning();
@@ -128,7 +130,7 @@ function page(id) {
     window.scrollTo({ top: 0, behavior: "instant" });
   }
   if (id !== "pair" && !$("camera-panel").hidden) closeCamera();
-  $("location").textContent = location.hostname.split(".")[0];
+  $("location").textContent = connectedHostName();
   $("location").title = location.host;
 }
 const hash = new URLSearchParams(location.hash.slice(1));
@@ -277,6 +279,9 @@ function saveSidebarMeta() {
 loadSidebarMeta();
 const global = new Projection(true);
 const controls = new SessionControls();
+function connectedHostName() {
+  return globalLink?.hostName || location.hostname.split(".")[0];
+}
 const activityLine = new ActivityLine(
   $("activity"),
   $("activity-sprite"),
@@ -284,6 +289,7 @@ const activityLine = new ActivityLine(
 );
 const phoneSettings = setupSettings({
   request: (operation) => settingsRequest(key, operation),
+  hostName: connectedHostName,
   open: () => page("settings"),
   close: home,
   pushStatus: () => {
@@ -425,6 +431,8 @@ class Link {
       if (!this.scope) {
         routes = msg.routes;
         projects = msg.projects;
+        this.hostName = msg.host?.name?.trim();
+        $("location").textContent = connectedHostName();
       }
       this.placement = msg.capabilities.includes("worker_placement");
       this.codexSubscriptionWorkers = msg.capabilities.includes("worker_codex_subscription");
@@ -496,7 +504,7 @@ class Link {
         workerSubmission = null;
         $("worker-submit").disabled = false;
         if (!msg.error) {
-          $("worker-form").hidden = true;
+          closeWorkerForm();
           $("worker-task").value = "";
         }
       }
@@ -843,7 +851,7 @@ function home() {
   repaint();
 }
 function open(scope, id) {
-  $("worker-form").hidden = true;
+  closeWorkerForm();
   controls.reset();
   detailLink?.close();
   selected = { scope, id, revealLatest: Boolean(id), openingResult: Boolean(id) };
@@ -1056,7 +1064,7 @@ function catalog() {
         el(
           "div",
           "worker-outcome",
-          `Worker #${worker.job_id} · ${worker.status.replaceAll("_", " ")}${worker.host ? " on " + worker.host : ""}`,
+          `Worker #${worker.job_id}${worker.host ? " on " + worker.host : ""} · ${worker.status.replaceAll("_", " ")}`,
         ),
       );
     (resultSection || frag).append(b);
@@ -1912,6 +1920,7 @@ function conversation() {
   const worker = origin && origin.relation !== "handoff";
   $("context").textContent =
     (worker ? "checkout " + leaf(scope.project) : leaf(scope.project)) +
+    " · " + connectedHostName() +
     " · " +
     routesLabel(row?.detail?.route || scope.route) +
     (worker
@@ -1930,6 +1939,8 @@ function conversation() {
       link.className = "context-link";
       link.title = parent.project;
       $("context").append(document.createTextNode(" · "), link);
+    } else if (origin.linked) {
+      $("context").append(document.createTextNode(" · Lead on another host"));
     }
   }
   const memory = row?.detail?.memory_attachment;
@@ -1964,6 +1975,7 @@ function conversation() {
   $("older").hidden = !timeline?.detail?.older;
   $("older").onclick = () => detailLink.act({ load_older: id });
   $("start-worker").hidden = !id || !caps.includes("open") || scope.route.runtime === "antigravity";
+  $("start-worker").disabled = !detailLink?.ready;
   $("continue-in").hidden = !id || !caps.includes("open");
   showAsks(asks);
   // The activity line only trusts a live link: a reconnect must not look like a finished turn.
@@ -2523,12 +2535,27 @@ let workerSubmission = null;
 let workerHosts = [];
 let workerProjectRule = null;
 function requestWorkerHosts() {
-  if (!detailLink?.ready || !detailLink.placement || detailLink.inventoryRequest || $("worker-form").hidden) return;
+  if (!detailLink?.ready || !detailLink.placement || detailLink.inventoryRequest ||
+      $("worker-form").hidden || $("conversation").hidden) return;
   detailLink.inventoryRequest = crypto.randomUUID();
   detailLink.send({type:"worker_hosts", id:detailLink.inventoryRequest, project:detailLink.scope.project});
 }
+function workerHostUnavailable(row) {
+  if (row.status !== "online")
+    return {
+      unavailable: "offline or unreachable",
+      needs_update: "OX update needed",
+      access_denied: "worker link denied",
+      busy: "temporarily unavailable",
+    }[row.status] || "unavailable";
+  if (!row.parent_host && row.grant?.may_launch === false) return "worker launches disabled";
+  if (!row.parent_host && row.has_project === false) return "checkout needed";
+  return "";
+}
 function showWorkerHosts(result, error) {
-  $("worker-inventory-note").textContent = error || result?.warning || result?.placement_error || "";
+  const message = error || result?.warning || result?.placement_error;
+  const note = $("worker-inventory-note");
+  note.textContent = message || "";
   if (!result?.hosts) {
     workerHosts = [];
     showWorkerLimits();
@@ -2536,13 +2563,22 @@ function showWorkerHosts(result, error) {
   }
   workerHosts = result.hosts;
   workerProjectRule = result.project_placement;
+  if (!message) {
+    const peers = workerHosts.filter((row) => !row.parent_host);
+    if (!peers.length)
+      note.textContent = "No worker hosts are linked. You can still run a worker here.";
+    else if (peers.every(workerHostUnavailable))
+      note.textContent = "Linked hosts are unavailable for this project right now. You can still run a worker here.";
+  }
   const select = $("worker-host"), previous = select.value;
   const options = workerHosts.map(row => {
-    const name = row.parent_host ? "Same as parent" : row.paired_name || row.host.name;
+    const name = row.paired_name || row.host.name || connectedHostName();
+    const unavailable = workerHostUnavailable(row);
     const r = row.host.resources;
-    const info = r ? `load ${r.load_one_minute.toFixed(1)} · ${(r.available_memory / 1e9).toFixed(1)} GB free` : row.status;
+    const info = row.parent_host ? "this session’s host" : unavailable ||
+      (r ? `load ${r.load_one_minute.toFixed(1)} · ${(r.available_memory / 1e9).toFixed(1)} GB free` : "online");
     const opt = new Option(name + " · " + info, row.parent_host ? "parent" : row.host.id);
-    opt.disabled = row.status !== "online";
+    opt.disabled = Boolean(unavailable);
     return opt;
   });
   if (result.project_placement) {
@@ -2563,7 +2599,7 @@ function showWorkerHosts(result, error) {
 function workerRoutes() {
   const host = $("worker-host").value;
   if (!detailLink?.placement || host === "parent") return null;
-  return workerHosts.filter(r => r.status === "online" && (host === "auto" || host === "project" || r.host.id === host)).flatMap(r => r.routes || []);
+  return workerHosts.filter(r => !workerHostUnavailable(r) && (host === "auto" || host === "project" || r.host.id === host)).flatMap(r => r.routes || []);
 }
 $("worker-host").onchange = () => {
   const auto = $("worker-host").value === "auto";
@@ -2586,7 +2622,7 @@ function showWorkerLimits() {
       const selected = selector === "auto" || (selector === "parent" ? row.parent_host
         : selector.startsWith("label:") ? row.host.labels?.some(s => s.toLowerCase() === selector.slice(6))
         : [row.host.id, row.host.name, row.paired_name].some(s => s?.toLowerCase() === selector));
-      if (!selected || row.status !== "online" || (rule?.os && rule.os.toLowerCase() !== row.host.resources?.os?.toLowerCase())) continue;
+      if (!selected || workerHostUnavailable(row) || (rule?.os && rule.os.toLowerCase() !== row.host.resources?.os?.toLowerCase())) continue;
       if (!row.routes?.some(r => r.runtime === runtime && r.billing === "subscription")) continue;
       const windows = row.host.subscription_limits?.[runtime];
       if (!Array.isArray(windows)) continue;
@@ -2621,7 +2657,7 @@ function fillWorkerModels() {
     "",
   );
   const host = $("worker-host").value;
-  const hostOffers = workerHosts.filter(row => row.status === "online" && (host === "auto" || host === "project" ||
+  const hostOffers = workerHosts.filter(row => !workerHostUnavailable(row) && (host === "auto" || host === "project" ||
     (host === "parent" && row.parent_host) || host === row.host.id));
   subscription.disabled = workerHosts.length ? !hostOffers.some(row =>
     (runtime !== "codex" || row.codex_subscription_workers) && row.routes?.some(r => r.runtime === runtime && r.billing === "subscription"))
@@ -2725,14 +2761,29 @@ $("worker-runtime").onchange = () => {
   renderWorkerPermission();
 };
 $("worker-permission").onchange = renderWorkerPermission;
+$("open-hosts").onclick = () => phoneSettings.openHosts();
+$("worker-open-hosts").onclick = () => phoneSettings.openHosts(() => {
+  page("conversation");
+  if ($("worker-form").hidden) return;
+  $("worker-sheet").showModal();
+  $("worker-open-hosts").focus();
+  requestWorkerHosts();
+  repaint();
+}, "← Start worker");
 $("start-worker").onclick = () => {
+  if (!$("worker-form").hidden) {
+    $("worker-sheet").showModal();
+    $("worker-heading").focus();
+    return;
+  }
   // Start from the parent session's route, as the desktop sheet does.
   workerSubmission = null;
   $("worker-model-free").value = "";
   $("worker-submit").disabled = false;
   workerHosts = [];
+  workerProjectRule = null;
   $("worker-placement").hidden = !detailLink?.placement;
-  $("worker-host").replaceChildren(new Option("Same as parent","parent"));
+  $("worker-host").replaceChildren(new Option(`${connectedHostName()} · this session’s host`, "parent"));
   $("worker-needs").hidden = $("worker-needs").disabled = true;
   for (const id of ["worker-memory","worker-cpus","worker-os"]) $(id).value = "";
   $("worker-gpu").checked = false;
@@ -2746,11 +2797,25 @@ $("start-worker").onclick = () => {
   renderWorkerMode();
   renderWorkerPermission();
   $("worker-form").hidden = false;
+  $("worker-sheet").showModal();
   requestWorkerHosts();
-  $("worker-task").focus();
+  $("worker-heading").focus();
   loadModelChoices();
 };
-$("worker-cancel").onclick = () => ($("worker-form").hidden = true);
+function closeWorkerForm() {
+  const sheet = $("worker-sheet");
+  const restoreFocus = sheet.open;
+  sheet.close();
+  $("worker-form").hidden = true;
+  $("worker-message").hidden = true;
+  $("worker-message").textContent = "";
+  if (restoreFocus) $("start-worker").focus({ preventScroll: true });
+}
+$("worker-sheet").oncancel = (event) => {
+  event.preventDefault();
+  closeWorkerForm();
+};
+$("worker-cancel").onclick = closeWorkerForm;
 $("worker-form").onsubmit = (e) => {
   e.preventDefault();
   if (!selected?.id) return;
@@ -2761,6 +2826,10 @@ $("worker-form").onsubmit = (e) => {
   }
   const runtime = $("worker-runtime").value,
     permission = $("worker-permission").value;
+  if (detailLink?.placement && $("worker-host").selectedOptions[0]?.disabled) {
+    notice("Choose an available host for this worker.");
+    return;
+  }
   // No model chosen means the runtime's subscription, which must be configured.
   if (
     !workerModelValue() && $("worker-model").options[0]?.disabled
@@ -2921,6 +2990,7 @@ $("pair-form").onsubmit = async (e) => {
     pairingTarget = null;
     key = await deviceKey();
     clearDrafts();
+    forgetKnownHosts();
     start(true);
   } catch (err) {
     if (err.status === 403) {
@@ -3019,6 +3089,7 @@ async function registerNotifications(explicit) {
 }
 $("notifications").onclick = () => registerNotifications(true);
 function pairingPage() {
+  if (!key) forgetKnownHosts();
   page("pair");
   net("Pair device");
   const scanned = Boolean(code);
