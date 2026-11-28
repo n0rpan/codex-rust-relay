@@ -1379,6 +1379,11 @@ impl Engine {
                 .ok()
                 .flatten();
             store.restore_ended(&saved.id, &saved.title, saved.updated_at, access);
+            if let Ok(attachment) =
+                serde_json::from_value(saved.detail["memory_attachment"].clone())
+            {
+                store.remember_memory_attachment(&saved.id, attachment);
+            }
         }
         let mut state = store.host_snapshot(scope);
         restore(&mut state.sessions, &recovered);

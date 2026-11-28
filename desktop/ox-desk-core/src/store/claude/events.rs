@@ -410,11 +410,7 @@ impl Store {
                             .push(crate::store::WorkerNoticeReceipt::Accepted(notice));
                     }
                     if let Some((_, attachment)) = attachment {
-                        self.transcripts
-                            .entry(owner.into())
-                            .or_default()
-                            .memory_attachment = Some(attachment);
-                        self.changed.mark(Changed::THREADS);
+                        self.remember_memory_attachment(owner, attachment);
                     }
                 }
                 rebase_agents(owner, &display, &mut item, |child, tool, status| {

@@ -167,6 +167,12 @@ impl Store {
         }
     }
 
+    /// Record an acknowledged startup brief or restore its saved metadata without opening a thread.
+    pub fn remember_memory_attachment(&mut self, id: &str, attachment: crate::memory::Attachment) {
+        self.memory_attachments.insert(id.to_owned(), attachment);
+        self.changed.mark(Changed::THREADS);
+    }
+
     pub fn new_session(&mut self) {
         if self.remote().is_some() {
             if let Err(e) = self.dispatch_remote(crate::actions::Action::NewDraft) {
@@ -920,14 +926,11 @@ impl Store {
                     self.worker_notice_receipts
                         .push(WorkerNoticeReceipt::Accepted(id));
                 }
-                let t = self
-                    .transcripts
-                    .get_mut(s.owner.as_deref().unwrap())
-                    .unwrap();
+                let id = s.owner.as_deref().unwrap();
                 if let Some(attachment) = s.memory_attachment {
-                    t.memory_attachment = Some(attachment);
-                    self.changed.mark(Changed::THREADS);
+                    self.remember_memory_attachment(id, attachment);
                 }
+                let t = self.transcripts.get_mut(id).unwrap();
                 if turn.status == "inProgress" && t.last_finished.as_ref() != Some(&turn.id) {
                     t.active_turn = Some(turn.id);
                 }
