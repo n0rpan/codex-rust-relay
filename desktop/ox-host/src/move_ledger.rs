@@ -485,6 +485,16 @@ impl Ledger {
         Ok(self.require(plan)?.status())
     }
 
+    pub(crate) fn source_plan(&self, id: Uuid) -> io::Result<Option<Plan>> {
+        self.healthy()?;
+        Ok(self
+            .data
+            .moves
+            .get(&id)
+            .filter(|record| record.plan.source.host == self.data.host)
+            .map(|record| record.plan.clone()))
+    }
+
     fn record_source(&mut self, plan: &Plan, phase: Phase) -> io::Result<Status> {
         self.check_hosts(plan, self.data.host, plan.target_host)?;
         if let Some(record) = self.record(plan)? {

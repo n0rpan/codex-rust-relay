@@ -45,6 +45,8 @@ pub(crate) enum Message {
     LinkedJob(Box<ox_host_web::linked_jobs::VerifiedJob>, Replier),
     #[cfg(test)]
     MoveReceive(Box<move_receive::Request>),
+    #[cfg(test)]
+    MoveSend(Box<move_send::Outcome>),
     Gateway {
         caller: Caller,
         request: Box<Gateway>,
@@ -329,6 +331,8 @@ pub(crate) struct Engine {
     #[cfg(test)]
     source_moves: source_moves::SourceMoves,
     #[cfg(test)]
+    move_send: move_send::Outgoing,
+    #[cfg(test)]
     target_moves: target_moves::TargetMoves,
     replay: Replay,
     tx: SyncSender<Message>,
@@ -373,6 +377,8 @@ use placement::HostQuery;
 mod mode_requests;
 #[cfg(test)]
 mod move_receive;
+#[cfg(test)]
+mod move_send;
 mod notices;
 #[cfg(test)]
 mod source_moves;
@@ -432,6 +438,8 @@ impl Engine {
             ledger,
             #[cfg(test)]
             source_moves: source_moves::SourceMoves::open(dir, host_id)?,
+            #[cfg(test)]
+            move_send: move_send::Outgoing::default(),
             #[cfg(test)]
             target_moves: target_moves::TargetMoves::default(),
             replay: Replay::new(seq, nonce()?),
@@ -581,7 +589,10 @@ impl Engine {
                     }
                     self.poll_forwarded(now)?;
                     #[cfg(test)]
-                    self.advance_source_moves()?;
+                    {
+                        self.advance_source_moves()?;
+                        self.drive_move_transfers()?;
+                    }
                     self.advance_flows()?;
                 }
                 Some(Message::Replace(binary, _reservation)) => {
@@ -630,6 +641,8 @@ impl Engine {
                 Some(Message::LinkedJob(job, reply)) => self.linked_job(*job, reply)?,
                 #[cfg(test)]
                 Some(Message::MoveReceive(request)) => self.receive_move(*request),
+                #[cfg(test)]
+                Some(Message::MoveSend(outcome)) => self.move_outcome(*outcome)?,
                 Some(Message::Gateway {
                     caller,
                     request,
@@ -1068,6 +1081,29 @@ impl Engine {
                         fail("Subscribe to the target scope before sending actions".into()),
                     );
                 }
+                #[cfg(test)]
+                let action = match action {
+                    Action::MoveSession(start) if approval.is_none() => {
+                        if self.draining.is_some() || self.update_reserved() {
+                            return self.reply(id, fail(crate::handover::REFUSAL.into()));
+                        }
+                        return match self.start_move(id, key.clone(), scope, start) {
+                            Ok(()) => Ok(()),
+                            Err(error) => self.reply(id, fail(error.to_string())),
+                        };
+                    }
+                    command @ (Action::CancelMove(_)
+                    | Action::CheckMove(_)
+                    | Action::RetryMove(_))
+                        if approval.is_none() =>
+                    {
+                        return match self.move_command(&scope, &command) {
+                            Ok(()) => self.reply(id, Server::Ack { id: key }),
+                            Err(error) => self.reply(id, fail(error.to_string())),
+                        };
+                    }
+                    other => other,
+                };
                 #[cfg(test)]
                 if !self.running.contains_key(&scope)
                     && let Err(error) = self.check_source_move_action(&scope, &action)
@@ -1840,6 +1876,7 @@ impl Engine {
             self.collect_source_move_releases(scope)?;
             self.collect_target_move_preparations(scope);
             self.advance_source_moves()?;
+            self.drive_move_transfers()?;
         }
         self.advance_flows()
     }

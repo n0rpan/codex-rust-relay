@@ -343,6 +343,16 @@ impl Access {
                     }
                     Action::StartWorker(start) => approval.is_none() && start.validate().is_ok(),
                     Action::StartHandoff(start) => approval.is_none() && start.validate().is_ok(),
+                    Action::MoveSession(start) => {
+                        approval.is_none()
+                            && !start.thread.is_empty()
+                            && start.thread.len() <= 256
+                            && crate::paired_hosts::valid_id(&start.destination)
+                            && crate::paired_hosts::valid_id(&start.operation)
+                    }
+                    Action::CancelMove(id) | Action::CheckMove(id) | Action::RetryMove(id) => {
+                        approval.is_none() && crate::paired_hosts::valid_id(id)
+                    }
                     Action::YoloGrant(id, _) => {
                         approval.is_none() && !id.is_empty() && id.len() <= 512
                     }

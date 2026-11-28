@@ -97,7 +97,7 @@ impl Engine {
 
     /// Network preflight can complete after the accepted turn ended. Keep the
     /// exact turn in that case and use its confirmed result, if it exists.
-    fn queue_move_for_turn(&mut self, plan: &Plan, turn: String) -> io::Result<Status> {
+    pub(super) fn queue_move_for_turn(&mut self, plan: &Plan, turn: String) -> io::Result<Status> {
         let live = self
             .running
             .get(&plan.source.scope)
