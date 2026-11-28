@@ -1,4 +1,5 @@
 //! Local agent-browser transport. Receives viewport frames without sending browser input.
+use crate::platform::browser::{self, PreviewPort};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use gpui::RenderImage;
 use serde::Deserialize;
@@ -18,6 +19,7 @@ const MAX_FRAME_EDGE: u32 = 4096;
 
 pub(super) enum Update {
     Frame(Frame),
+    NeedsInstall,
     Ended(String),
 }
 
@@ -71,17 +73,21 @@ pub(super) fn run(
     wake: &flume::Sender<()>,
     latest: &Latest,
 ) {
-    let result = url
-        .map_or(Ok(()), |url| {
-            crate::platform::browser::open(project, label, url)
-        })
-        .and_then(|()| {
-            if wake.is_disconnected() {
+    let result = (|| {
+        if let Some(url) = url {
+            browser::open(project, label, url)?;
+        }
+        if wake.is_disconnected() {
+            return Ok(());
+        }
+        match browser::preview_port(project, label)? {
+            PreviewPort::Ready(port) => receive(port, wake, latest),
+            PreviewPort::NeedsInstall => {
+                publish(wake, latest, Update::NeedsInstall);
                 Ok(())
-            } else {
-                receive(project, label, wake, latest)
             }
-        });
+        }
+    })();
     if let Err(error) = result
         && !wake.is_disconnected()
     {
@@ -89,13 +95,7 @@ pub(super) fn run(
     }
 }
 
-fn receive(
-    project: &Path,
-    label: &str,
-    wake: &flume::Sender<()>,
-    latest: &Latest,
-) -> Result<(), String> {
-    let port = crate::platform::browser::preview_port(project, label)?;
+fn receive(port: u16, wake: &flume::Sender<()>, latest: &Latest) -> Result<(), String> {
     if wake.is_disconnected() {
         return Ok(());
     }
