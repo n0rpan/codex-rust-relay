@@ -12,6 +12,8 @@ mod lease;
 mod move_archive;
 #[cfg(test)]
 mod move_ledger;
+#[cfg(test)]
+mod move_target;
 mod pairing;
 mod policy;
 mod projects;

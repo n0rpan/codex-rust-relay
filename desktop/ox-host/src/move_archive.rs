@@ -14,7 +14,7 @@ struct Header {
     items: usize,
 }
 
-struct Archive {
+pub(crate) struct Archive {
     file: BufReader<File>,
     offsets: Vec<u64>,
 }
@@ -54,7 +54,7 @@ impl Archive {
     }
 
     /// Verify the staged bytes and their binding before making the archive readable.
-    fn open(mut file: File, header: &Header, digest: [u8; 32]) -> io::Result<Self> {
+    pub(crate) fn open(mut file: File, plan: &Plan, digest: [u8; 32]) -> io::Result<Self> {
         if checksum(&mut file)? != digest {
             return Err(io::Error::other(
                 "The moved history failed its integrity check.",
@@ -64,7 +64,8 @@ impl Archive {
         let mut file = BufReader::new(file);
         let mut line = String::new();
         file.read_line(&mut line)?;
-        if serde_json::from_str::<Header>(&line)? != *header {
+        let header = serde_json::from_str::<Header>(&line)?;
+        if &header.plan != plan {
             return Err(io::Error::other("The history belongs to a different move."));
         }
         let mut position = line.len() as u64;
@@ -86,7 +87,7 @@ impl Archive {
     }
 
     /// Return up to `count` items before a zero-based exclusive cursor.
-    fn previous(
+    pub(crate) fn previous(
         &mut self,
         before: Option<usize>,
         count: usize,
@@ -111,7 +112,7 @@ impl Archive {
     }
 }
 
-fn checksum(file: &mut File) -> io::Result<[u8; 32]> {
+pub(crate) fn checksum(file: &mut File) -> io::Result<[u8; 32]> {
     file.rewind()?;
     let mut digest = Sha256::new();
     let mut buffer = [0; 64 * 1024];
@@ -127,7 +128,7 @@ fn checksum(file: &mut File) -> io::Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::move_ledger::{Ledger, Owner, Prepared, Stage};
+    use crate::move_ledger::{Ledger, Owner};
     use ox_desk_core::host_protocol::Scope;
     use ox_desk_core::runtime::Route;
     use serde_json::json;
@@ -179,7 +180,7 @@ mod tests {
         let (header, timeline) = fixture();
         let mut file = tempfile::tempfile().unwrap();
         let digest = Archive::write(&mut file, &header, &timeline).unwrap();
-        let mut archive = Archive::open(file, &header, digest).unwrap();
+        let mut archive = Archive::open(file, &header.plan, digest).unwrap();
         let (last, before) = archive.previous(None, 4).unwrap();
         assert_eq!(last, timeline.items[2..]);
         let (first, before) = archive.previous(before, 4).unwrap();
@@ -195,14 +196,15 @@ mod tests {
         assert!(Archive::write(&mut file, &header, &timeline).is_err());
         timeline.detail["older"] = false.into();
         let digest = Archive::write(&mut file, &header, &timeline).unwrap();
-        assert!(Archive::open(file.try_clone().unwrap(), &header, [0; 32]).is_err());
+        assert!(Archive::open(file.try_clone().unwrap(), &header.plan, [0; 32]).is_err());
         header.plan.target_host = Uuid::new_v4();
-        assert!(Archive::open(file, &header, digest).is_err());
+        assert!(Archive::open(file, &header.plan, digest).is_err());
     }
 
     #[test]
     fn the_completed_move_retains_history_and_working_files_without_the_source() {
-        use ox_host_service::checkout::{Snapshot, receive_result};
+        use crate::move_target::{BundlePlan, Files, VerifiedTarget};
+        use ox_host_service::checkout::Snapshot;
         let (mut header, timeline) = fixture();
         let laptop = tempfile::tempdir().unwrap();
         let studio = tempfile::tempdir().unwrap();
@@ -235,12 +237,19 @@ mod tests {
         std::fs::write(project.join("tracked"), "working edit").unwrap();
         std::fs::write(project.join("scratch"), "untracked input").unwrap();
         header.plan.source.scope.project = project;
+        let jobs = studio.path().join("moves");
+        std::fs::create_dir(&jobs).unwrap();
+        let checkout = jobs
+            .canonicalize()
+            .unwrap()
+            .join(header.plan.id.to_string())
+            .join("1");
+        header.plan.target_scope.project = checkout.clone();
         let plan = &header.plan;
         let mut source = Ledger::open(laptop.path(), plan.source.host).unwrap();
         let mut receiver = Ledger::open(studio.path(), plan.target_host).unwrap();
         source.prepare_source(plan).unwrap();
         let original = laptop.path().join("history");
-        let copy = studio.path().join("history");
         let mut file = File::options()
             .read(true)
             .write(true)
@@ -248,27 +257,48 @@ mod tests {
             .open(&original)
             .unwrap();
         let digest = Archive::write(&mut file, &header, &timeline).unwrap();
-        std::fs::copy(original, &copy).unwrap();
-        Archive::open(File::open(&copy).unwrap(), &header, digest).unwrap();
         let snapshot = Snapshot::capture(laptop.path(), &plan.source.scope.project, &[]).unwrap();
+        let snapshot_file = laptop.path().join("snapshot");
+        snapshot.retain_archive(&snapshot_file).unwrap();
         let checkout_digest = checksum(&mut snapshot.open().unwrap()).unwrap();
-        let jobs = studio.path().join("moves");
-        std::fs::create_dir(&jobs).unwrap();
-        let checkout =
-            receive_result(&jobs, 1, snapshot.open().unwrap(), &snapshot.commit).unwrap();
         let mut bundle_digest = Sha256::new();
         bundle_digest.update(digest);
         bundle_digest.update(checkout_digest);
-        let staged = Prepared {
+        let manifest_sha256 = bundle_digest.finalize().into();
+        let bundle = BundlePlan {
             plan: plan.clone(),
-            stage: Stage {
-                digest: bundle_digest.finalize().into(),
-                native: "target-thread".into(),
-            },
+            checkout_commit: snapshot.commit.clone(),
         };
-        receiver
-            .prepare_receiver(plan.source.host, &staged)
+        let files = |transcript_sha256| Files {
+            transcript: &original,
+            transcript_sha256,
+            checkout: &snapshot_file,
+            checkout_sha256: checkout_digest,
+            manifest_sha256,
+        };
+        assert!(
+            VerifiedTarget::install(
+                &jobs,
+                &receiver,
+                plan.source.host,
+                bundle.clone(),
+                files([0; 32])
+            )
+            .is_err()
+        );
+        assert!(!checkout.exists());
+        let target = VerifiedTarget::install(
+            &jobs,
+            &receiver,
+            plan.source.host,
+            bundle.clone(),
+            files(digest),
+        )
+        .unwrap();
+        let staged = target
+            .prepare(&mut receiver, plan.source.host, "target-thread".into())
             .unwrap();
+        assert!(!receiver.can_write(&plan.target_scope, "target-thread"));
         source.fence_source(plan.target_host, &staged).unwrap();
         source.writer_released(plan).unwrap();
         let proof = source.commit_source(plan).unwrap();
@@ -283,7 +313,10 @@ mod tests {
 
         let receiver = Ledger::open(studio.path(), plan.target_host).unwrap();
         assert!(receiver.can_write(&plan.target_scope, "target-thread"));
-        let mut archive = Archive::open(File::open(&copy).unwrap(), &header, digest).unwrap();
+        let target =
+            VerifiedTarget::install(&jobs, &receiver, plan.source.host, bundle, files(digest))
+                .unwrap();
+        let mut archive = target.history().unwrap();
         assert_eq!(
             archive.previous(None, timeline.items.len()).unwrap(),
             (timeline.items, None)
