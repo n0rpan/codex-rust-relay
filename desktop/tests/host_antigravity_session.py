@@ -171,7 +171,10 @@ def run(root, host, helper, log):
         assert second_ask["id"] != first_ask["id"] and second_ask["thread"] == session, second_ask
         target.act(target_scope, "cancel", {"stop": session})
         target.until(lambda f: (t := timeline_detail(f, session)) and t["interrupted"] and t["active"] is None)
-        assert snapshot(target, target_scope)["asks"] == [], "The cancelled turn left a permission request open"
+        stopped = snapshot(target, target_scope)
+        assert stopped["asks"] == [], "The cancelled turn left a permission request open"
+        stopped_result = next(row for row in stopped["sessions"] if row["id"] == session)["detail"]["last_result"]
+        assert stopped_result["outcome"] == "stopped", stopped_result
 
     (Path(env["OX_HOST_STATE_DIR"]) / "host-mode-policy.json").write_text(json.dumps("always_read"))
     with session_host(binary, root, env, log), closing(Client(env["OX_HOST_SOCKET"])) as target:
@@ -183,7 +186,10 @@ def run(root, host, helper, log):
         timeline = resumed["transcripts"][session]
         assert texts(timeline, "assistant") == [FIRST_REPLY, REOPEN_REPLY], timeline
         assert texts(timeline, "user") == [prompt_path.read_text(), "Continue after reopening"], timeline
-        assert next(row for row in resumed["sessions"] if row["id"] == session)["detail"]["access"] == "plan", resumed
+        detail = next(row for row in resumed["sessions"] if row["id"] == session)["detail"]
+        assert detail["access"] == "plan", detail
+        assert detail["last_result"]["outcome"] == "completed", detail
+        assert detail["last_result"]["turn"] != stopped_result["turn"], detail
 
     first = prompt_path.read_text()
     assert first.startswith("<ox-handoff>\n") and first.endswith("</ox-handoff>\n\n" + REQUEST), first

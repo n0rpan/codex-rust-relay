@@ -3454,6 +3454,7 @@ fn catalog_row(view: &wire::SessionView) -> wire::SessionView {
         "worker_marks",
         "worker_model",
         "worker_notice",
+        "last_result",
     ]
     .into_iter()
     .filter_map(|k| Some((k.to_owned(), view.detail.get(k)?.clone())))
@@ -3797,7 +3798,13 @@ fn restore_row(row: &mut wire::SessionView, saved: &wire::SessionView) {
     }
     row.detail["owned"] = true.into();
     row.detail["recovered"] = true.into();
-    for key in ["resume_access", "worker_marks", "origin", "worker_notice"] {
+    for key in [
+        "resume_access",
+        "worker_marks",
+        "origin",
+        "worker_notice",
+        "last_result",
+    ] {
         if row.detail[key].is_null() && !saved.detail[key].is_null() {
             row.detail[key] = saved.detail[key].clone();
         }
@@ -4305,6 +4312,7 @@ mod tests {
         let legacy = client(1, Some(None), false);
         let watcher = client(2, None, true);
         let scoped = client(3, Some(Some(scope.clone())), false);
+        let result = json!({"turn":"turn-1","completed_at":1,"outcome":"completed"});
         let session = wire::SessionView {
             id: "t".into(),
             title: "Title".into(),
@@ -4312,7 +4320,7 @@ mod tests {
             status: "idle".into(),
             updated_at: 1,
             capabilities: vec![],
-            detail: json!({"owned": true, "row": true}),
+            detail: json!({"owned": true, "row": true, "last_result": result}),
         };
         let transcript = Change::Transcript {
             thread: "t".into(),
@@ -4370,10 +4378,11 @@ mod tests {
                     .all(|c| !matches!(c, Change::Transcript { .. })),
                 "{frames:?}"
             );
-            assert!(matches!(
-                frames[0].as_slice(),
-                [Change::Sessions { .. }, Change::Notification { .. }]
-            ));
+            let [Change::Sessions { sessions }, Change::Notification { .. }] = frames[0].as_slice()
+            else {
+                panic!("unexpected catalog changes: {frames:?}");
+            };
+            assert_eq!(sessions[0].detail["last_result"], result);
         }
         let scoped = decode(scoped);
         assert_eq!(scoped.len(), 1);

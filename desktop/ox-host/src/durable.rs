@@ -1,4 +1,4 @@
-use ox_desk_core::host_protocol::{Scope, ScopeState, SessionView};
+use ox_desk_core::host_protocol::{Scope, ScopeState, SessionResult, SessionView};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
@@ -151,6 +151,8 @@ pub(crate) struct SavedSession {
     /// starts it the same way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     access: Option<ox_desk_core::runtime::Access>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_result: Option<SessionResult>,
 }
 impl SavedScope {
     pub(crate) fn from_state(s: &ScopeState) -> Self {
@@ -180,6 +182,7 @@ impl SavedScope {
                     origin: serde_json::from_value(r.detail["origin"].clone()).ok(),
                     marks: serde_json::from_value(r.detail["worker_marks"].clone()).ok(),
                     access: access("access").or_else(|| access("resume_access")),
+                    last_result: r.last_result(),
                 }
             })
             .collect();
@@ -214,23 +217,35 @@ impl SavedScope {
             sessions: self
                 .sessions
                 .iter()
-                .map(|s| SessionView {
-                    id: s.id.clone(),
-                    title: s.title.clone(),
-                    parent: s.parent.clone(),
-                    updated_at: s.updated_at,
-                    status: if s.active { "interrupted" } else { "idle" }.into(),
-                    // No process is open, so the thread shows Ended and a send reopens it.
-                    capabilities: {
-                        let mut caps = vec!["open".into(), "send".into(), "ended".into()];
-                        // Images stay attachable to a thread a send reopens.
-                        if self.scope.route.runtime == ox_desk_core::runtime::Runtime::Codex {
-                            caps.push("attach_image".into());
-                        }
-                        caps
-                    },
-                    detail: serde_json::json!({"owned":true,"recovered":true,"worker":s.origin.is_some(),
-                        "origin":s.origin,"worker_marks":s.marks,"resume_access":s.access}),
+                .map(|s| {
+                    let mut detail = serde_json::json!({
+                        "owned": true,
+                        "recovered": true,
+                        "worker": s.origin.is_some(),
+                        "origin": s.origin,
+                        "worker_marks": s.marks,
+                        "resume_access": s.access,
+                    });
+                    if let Some(result) = &s.last_result {
+                        detail["last_result"] = serde_json::json!(result);
+                    }
+                    SessionView {
+                        id: s.id.clone(),
+                        title: s.title.clone(),
+                        parent: s.parent.clone(),
+                        updated_at: s.updated_at,
+                        status: if s.active { "interrupted" } else { "idle" }.into(),
+                        // No process is open, so the thread shows Ended and a send reopens it.
+                        capabilities: {
+                            let mut caps = vec!["open".into(), "send".into(), "ended".into()];
+                            // Images stay attachable to a thread a send reopens.
+                            if self.scope.route.runtime == ox_desk_core::runtime::Runtime::Codex {
+                                caps.push("attach_image".into());
+                            }
+                            caps
+                        },
+                        detail,
+                    }
                 })
                 .collect(),
         }
@@ -620,7 +635,7 @@ mod tests {
 
     use super::*;
     use ox_desk_core::{
-        host_protocol::{AskView, Timeline, TimelineItem},
+        host_protocol::{AskView, SessionOutcome, Timeline, TimelineItem},
         modes::Level,
         origin::{Origin, ParentRef, Relation, WorkerMode},
         runtime::{RequestId, Route, Runtime},
@@ -670,6 +685,11 @@ mod tests {
             origin,
             marks: None,
             access: None,
+            last_result: Some(SessionResult {
+                turn: format!("{id}-turn"),
+                completed_at: 41,
+                outcome: SessionOutcome::Completed,
+            }),
         };
         let saved = |scope: &Scope, sessions| SavedScope {
             scope: scope.clone(),
@@ -772,6 +792,17 @@ mod tests {
             project: "/test".into(),
             route: Route::CODEX_SUBSCRIPTION,
         };
+        let result = SessionResult {
+            turn: "previous-turn".into(),
+            completed_at: 2,
+            outcome: SessionOutcome::Completed,
+        };
+        let old: SavedSession = serde_json::from_value(serde_json::json!({
+            "id": "old", "title": "Before result metadata", "parent": null,
+            "updated_at": 1, "active": false,
+        }))
+        .unwrap();
+        assert!(old.last_result.is_none());
         let row = SessionView {
             id: "worker".into(),
             title: "inspect tests".into(),
@@ -779,7 +810,7 @@ mod tests {
             status: "running".into(),
             updated_at: 3,
             capabilities: vec!["stop".into()],
-            detail: serde_json::json!({"owned":true,"authorization":"live-token"}),
+            detail: serde_json::json!({"owned":true,"authorization":"live-token","last_result":result}),
         };
         let ask = AskView {
             command: None,
@@ -826,6 +857,7 @@ mod tests {
         assert!(db.data.reserved > 42);
         let restored = db.data.scopes[0].recover();
         assert_eq!(restored.sessions[0].status, "interrupted");
+        assert_eq!(restored.sessions[0].last_result(), Some(result));
         assert_eq!(restored.sessions[0].parent.as_deref(), Some("parent"));
         // A recovered row has no process: it shows Ended and a send reopens it, and a Codex
         // thread keeps accepting image attachments for that send.

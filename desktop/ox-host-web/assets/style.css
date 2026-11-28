@@ -1200,8 +1200,21 @@ main:has(#conversation:not([hidden])) {
 .status {
   flex-shrink: 0;
 }
-.session[data-passive="true"] .status {
+.session[data-passive="true"] .status:not(.result-badge) {
   display: none;
+}
+.result-badge {
+  flex-shrink: 0;
+  color: var(--accent);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+.just-finished {
+  padding-bottom: 0.35rem;
+}
+.just-finished > button:not(.session) {
+  margin-top: 0.45rem;
+  color: var(--accent);
 }
 .user {
   border: none;

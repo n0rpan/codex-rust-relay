@@ -443,6 +443,28 @@ pub struct SessionView {
     pub capabilities: Vec<String>,
     pub detail: Value,
 }
+impl SessionView {
+    pub fn last_result(&self) -> Option<SessionResult> {
+        serde_json::from_value(self.detail["last_result"].clone()).ok()
+    }
+}
+
+/// The last terminal turn observed live by the session host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionResult {
+    pub turn: String,
+    pub completed_at: i64,
+    pub outcome: SessionOutcome,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOutcome {
+    Completed,
+    Failed,
+    Stopped,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AskView {

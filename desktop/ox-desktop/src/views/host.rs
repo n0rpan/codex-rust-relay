@@ -13,12 +13,17 @@ use super::running::Running;
 use super::workbench::{CatalogChanged, Workbench};
 use crate::kit::{DropdownMenu, SPACE_M, SPACE_S, SPACE_XS};
 use crate::{
-    activity, appearance::Palette, col, kit::button, platform, row, settings, small,
-    workspace_state::LastWorkspace,
+    activity,
+    appearance::Palette,
+    col,
+    kit::button,
+    platform, row, settings, small,
+    workspace_state::{LastWorkspace, SeenResults},
 };
 use gpui::{prelude::FluentBuilder, *};
 use gpui_component::FocusTrapElement;
 use ox_desk_core::actions::Action as DeskAction;
+use ox_desk_core::host_protocol::SessionOutcome;
 use ox_desk_core::runtime::{Billing, Runtime};
 use ox_desk_core::store::{Connection, Route, ThreadRow};
 use std::{ops::Range, path::PathBuf, time::Instant};
@@ -58,11 +63,16 @@ enum CatalogEntry {
         count: usize,
         folded: bool,
     },
+    JustFinished,
+    ViewFinished,
+    NoRunning,
     Thread {
         loc: Location,
         timestamp: i64,
         ordinal: usize,
         depth: usize,
+        result: Option<SessionOutcome>,
+        in_finished_shelf: bool,
     },
 }
 
@@ -177,6 +187,7 @@ pub struct Host {
     favorite_models: Vec<String>,
     catalog_versions: Vec<(usize, u64)>,
     catalog: Vec<CatalogEntry>,
+    seen_results: SeenResults,
     fleet_tree: crate::app::fleet::tree::Tree,
     discovery: Discovery,
     running: Entity<Running>,
@@ -315,6 +326,10 @@ impl Host {
             favorite_models: vec![],
             catalog_versions: vec![],
             catalog: vec![],
+            seen_results: crate::workspace_state::read_preference(
+                &link.state_file(SeenResults::FILE_NAME),
+            )
+            .unwrap_or_default(),
             fleet_tree: Default::default(),
             discovery: Discovery::default(),
             running: cx.new(|_| Running::new(link)),
@@ -1151,6 +1166,21 @@ impl Host {
             cx.notify();
         })
         .detach();
+        cx.subscribe(pane, |s, _, event: &super::transcript::ResultViewed, cx| {
+            if s.seen_results
+                .record(&event.scope, &event.thread, &event.result)
+            {
+                crate::workspace_state::remember_seen_result(
+                    s.link.state_file(SeenResults::FILE_NAME),
+                    event.scope.clone(),
+                    event.thread.clone(),
+                    event.result.clone(),
+                );
+                s.discovery.revision += 1;
+                cx.notify();
+            }
+        })
+        .detach();
         cx.subscribe_in(
             pane,
             window,
@@ -1805,8 +1835,20 @@ impl Host {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.activate_sidebar_row(project, scope, row, false, window, cx);
+    }
+
+    fn activate_sidebar_row(
+        &mut self,
+        project: PathBuf,
+        scope: Scope,
+        row: ThreadRow,
+        reveal_result: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.with_project_dir(project, false, window, cx, move |s, project, window, cx| {
-            s.activate_row_then(project, scope, row, None, window, cx);
+            s.activate_row_then(project, scope, row, None, reveal_result, window, cx);
         });
     }
 
@@ -1820,7 +1862,7 @@ impl Host {
         cx: &mut Context<Self>,
     ) {
         self.with_project_dir(project, false, window, cx, move |s, project, window, cx| {
-            s.activate_row_then(project, scope, row, Some(action), window, cx);
+            s.activate_row_then(project, scope, row, Some(action), false, window, cx);
         });
     }
 
@@ -1835,12 +1877,14 @@ impl Host {
             self.save_sidebar(cx);
         }
     }
+    #[allow(clippy::too_many_arguments)]
     fn activate_row_then(
         &mut self,
         project: PathBuf,
         scope: Scope,
         row: ThreadRow,
         action: Option<super::workbench::DeferredRowAction>,
+        reveal_result: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1850,6 +1894,9 @@ impl Host {
         let (route, _) = self.project_row_state(&project, &row, scope, cx);
         if let Some(route) = route {
             self.open_catalog(project, row, route, window, cx);
+            if reveal_result {
+                self.panes[self.active].read(cx).reveal_latest_result(&id);
+            }
             if let Some(action) = action {
                 self.panes[self.active]
                     .update(cx, |p, cx| p.queue_row_action(id, action, window, cx));
@@ -1962,7 +2009,21 @@ impl Host {
             _ => return,
         };
         if let Some((index, (row, project, scope))) = target {
-            self.activate_row(project.to_owned(), scope, row.clone(), window, cx);
+            let reveal_result = matches!(
+                self.catalog[index],
+                CatalogEntry::Thread {
+                    result: Some(_),
+                    ..
+                }
+            );
+            self.activate_sidebar_row(
+                project.to_owned(),
+                scope,
+                row.clone(),
+                reveal_result,
+                window,
+                cx,
+            );
             self.list_scroll
                 .scroll_to_item(self.fleet_tree.rows.len() + index, ScrollStrategy::Nearest);
         } else if matches!(event.keystroke.key.as_str(), "up" | "k")
@@ -2477,18 +2538,66 @@ impl Host {
         let entries: Vec<CatalogEntry> =
             self.catalog.get(range.clone()).unwrap_or_default().to_vec();
         for entry in entries {
-            let (depth, timestamp) = match &entry {
+            let (depth, timestamp, result, in_finished_shelf) = match &entry {
                 CatalogEntry::Thread {
                     ordinal,
                     depth,
                     timestamp,
+                    result,
+                    in_finished_shelf,
                     ..
                 } => {
                     if self.stats {
                         measured += 1;
                         self.furthest_row = self.furthest_row.max(*ordinal + 1);
                     }
-                    (*depth, *timestamp)
+                    (*depth, *timestamp, *result, *in_finished_shelf)
+                }
+                CatalogEntry::JustFinished | CatalogEntry::NoRunning => {
+                    let (id, label) = if matches!(entry, CatalogEntry::JustFinished) {
+                        ("just-finished", "Just finished")
+                    } else {
+                        ("no-running-sessions", "No running sessions")
+                    };
+                    rows.push(
+                        crate::platform::layout_probe::mark_element(
+                            row()
+                                .w(width)
+                                .h(px(crate::kit::ROW_HEIGHT))
+                                .px(px(crate::kit::GUTTER))
+                                .text_size(p.text(Step::Meta))
+                                .text_color(rgb(p.quiet()))
+                                .child(label),
+                            &id.into(),
+                            &label.into(),
+                            true,
+                        )
+                        .into_any_element(),
+                    );
+                    continue;
+                }
+                CatalogEntry::ViewFinished => {
+                    rows.push(
+                        row()
+                            .w(width)
+                            .h(px(crate::kit::ROW_HEIGHT))
+                            .px(px(crate::kit::GUTTER))
+                            .child(crate::kit::toolbar_button(
+                                p,
+                                "view-finished",
+                                "View finished",
+                                true,
+                                cx.listener(|s, _, window, cx| {
+                                    let value = s.filter.read(cx).value().to_string();
+                                    let next = select_status_filter(&value, "is:finished");
+                                    s.filter
+                                        .update(cx, |field, cx| field.set_value(next, window, cx));
+                                    s.list_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                }),
+                            ))
+                            .into_any_element(),
+                    );
+                    continue;
                 }
                 CatalogEntry::Pinned {
                     count,
@@ -2930,7 +3039,7 @@ impl Host {
                 status
             };
             let fold_key = (project.clone(), t.id.clone());
-            let folders = self.sidebar.grouping == GroupingMode::Folders;
+            let folders = self.sidebar.grouping == GroupingMode::Folders && !in_finished_shelf;
             let folded = folders
                 && tree.as_ref().is_some_and(|tree| tree.children > 0)
                 && self.discovery.collapsed.contains(&fold_key);
@@ -2988,6 +3097,17 @@ impl Host {
                 },
                 age: age(now.timestamp(), timestamp),
                 status: status.or(unread.then_some("Unread")),
+                result: result.map(|outcome| {
+                    if in_finished_shelf {
+                        match outcome {
+                            SessionOutcome::Completed => "Completed",
+                            SessionOutcome::Failed => "Failed",
+                            SessionOutcome::Stopped => "Stopped",
+                        }
+                    } else {
+                        "New result"
+                    }
+                }),
                 selected: active_project == project
                     && scope.matches(&active_route)
                     && active_selected.as_deref() == Some(t.id.as_str()),
@@ -3088,7 +3208,14 @@ impl Host {
                         Some(menu_builder),
                         cx.listener(move |s, _, window, cx| {
                             window.focus(&s.list_focus, cx);
-                            s.activate_row(project.clone(), scope, row.clone(), window, cx);
+                            s.activate_sidebar_row(
+                                project.clone(),
+                                scope,
+                                row.clone(),
+                                result.is_some(),
+                                window,
+                                cx,
+                            );
                         }),
                     ))
                     .children(disclosure)

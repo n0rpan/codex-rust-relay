@@ -362,6 +362,7 @@ pub struct ListRow {
     pub route: String,
     pub age: String,
     pub status: Option<&'static str>,
+    pub result: Option<&'static str>,
     pub selected: bool,
     /// Nesting under a parent session; indents the content by one step per level.
     pub depth: usize,
@@ -380,6 +381,7 @@ impl Default for ListRow {
             route: String::new(),
             age: String::new(),
             status: None,
+            result: None,
             selected: false,
             depth: 0,
             pinned: false,
@@ -394,6 +396,7 @@ impl ListRow {
         for part in self
             .status
             .into_iter()
+            .chain(self.result)
             .chain(Some(self.age.as_str()))
             .filter(|s| !s.is_empty())
         {
@@ -427,6 +430,45 @@ impl ListRow {
         };
         let stripe_color = self.accent.map(|c| p.thread_accent(c));
         let indent = self.depth.min(4) as f32 * SPACE_M;
+        let has_result = self.result.is_some();
+        let stacked_result = has_result && p.text_base <= 18;
+        let result_color = if self.result == Some("Failed") {
+            p.error
+        } else {
+            p.accent
+        };
+        let title = gpui::div()
+            .truncate()
+            .text_size(p.text(Step::Ui))
+            .text_color(rgb(if self.selected { p.fg } else { p.muted }))
+            .when(self.selected, |d| d.font_weight(gpui::FontWeight::MEDIUM))
+            .child(self.title);
+        let title = if let Some(result) = self.result.filter(|_| stacked_result) {
+            let mut detail = result.to_owned();
+            for part in self
+                .project_tag
+                .as_deref()
+                .into_iter()
+                .chain(Some(self.age.as_str()))
+            {
+                if !part.is_empty() {
+                    detail.push_str(" · ");
+                    detail.push_str(part);
+                }
+            }
+            crate::col()
+                .child(title.line_height(p.text(Step::Ui) + px(1.)))
+                .child(
+                    gpui::div()
+                        .truncate()
+                        .text_size(p.text(Step::Label))
+                        .line_height(p.text(Step::Label) + px(1.))
+                        .text_color(rgb(result_color))
+                        .child(detail),
+                )
+        } else {
+            title
+        };
         let track = row()
             .relative()
             .w_full()
@@ -464,16 +506,16 @@ impl ListRow {
                 self.cartridge,
                 self.selected || running,
             ))
-            .child(
-                gpui::div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(p.text(Step::Ui))
-                    .text_color(rgb(if self.selected { p.fg } else { p.muted }))
-                    .when(self.selected, |d| d.font_weight(gpui::FontWeight::MEDIUM))
-                    .child(self.title),
-            )
+            .child(title.flex_1().min_w_0())
+            .when_some(self.result.filter(|_| !stacked_result), |d, result| {
+                d.child(
+                    gpui::div()
+                        .flex_shrink_0()
+                        .text_size(p.text(Step::Label))
+                        .text_color(rgb(result_color))
+                        .child(result),
+                )
+            })
             .when(self.pinned, |d| {
                 d.child(
                     gpui::div()
@@ -484,7 +526,7 @@ impl ListRow {
                         .child("★"),
                 )
             })
-            .when_some(self.project_tag, |d, tag| {
+            .when_some(self.project_tag.filter(|_| !has_result), |d, tag| {
                 d.child(
                     gpui::div()
                         .flex_shrink_0()
@@ -509,7 +551,7 @@ impl ListRow {
                         .bg(rgb(color)),
                 )
             })
-            .when(!self.age.is_empty(), |d| {
+            .when(!has_result && !self.age.is_empty(), |d| {
                 d.child(
                     gpui::div()
                         .flex_shrink_0()

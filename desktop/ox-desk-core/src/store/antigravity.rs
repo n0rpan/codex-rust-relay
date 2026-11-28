@@ -14,6 +14,7 @@ use crate::{
         item::{Content, Item},
     },
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -76,6 +77,7 @@ enum Pending {
 #[derive(Default)]
 struct Stream {
     turn: u64,
+    turn_floor: u64,
     serial: u64,
     chunk: Option<(Chunk, String)>,
     user: String,
@@ -96,6 +98,23 @@ fn native_id(id: &str) -> Option<&str> {
 /// OX only indexes metadata for sessions it creates. History and account data
 /// stay with Antigravity and are accessed via ACP.
 pub fn saved_rows(index: &Path) -> io::Result<Vec<ThreadRow>> {
+    Ok(saved_sessions(index)?
+        .into_iter()
+        .map(|saved| saved.row)
+        .collect())
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedSession {
+    #[serde(flatten)]
+    row: ThreadRow,
+    /// Replay can omit a cancelled turn. Reserve its number so the next live
+    /// result still has a new identity in the host and clients.
+    #[serde(default)]
+    turn_floor: u64,
+}
+
+fn saved_sessions(index: &Path) -> io::Result<Vec<SavedSession>> {
     match File::open(index) {
         Ok(file) => serde_json::from_reader(file).map_err(io::Error::other),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(vec![]),
@@ -103,12 +122,19 @@ pub fn saved_rows(index: &Path) -> io::Result<Vec<ThreadRow>> {
     }
 }
 
-fn save_row(index: &Path, row: &ThreadRow) -> io::Result<()> {
-    crate::state_file::update_preference_at(index, Vec::<ThreadRow>::new, |mut rows| {
-        if let Some(saved) = rows.iter_mut().find(|r| r.id == row.id && r.cwd == row.cwd) {
-            *saved = row.clone();
+fn save_row(index: &Path, row: &ThreadRow, turn: u64) -> io::Result<()> {
+    crate::state_file::update_preference_at(index, Vec::<SavedSession>::new, |mut rows| {
+        if let Some(saved) = rows
+            .iter_mut()
+            .find(|r| r.row.id == row.id && r.row.cwd == row.cwd)
+        {
+            saved.row = row.clone();
+            saved.turn_floor = saved.turn_floor.max(turn);
         } else {
-            rows.push(row.clone());
+            rows.push(SavedSession {
+                row: row.clone(),
+                turn_floor: turn,
+            });
         }
         rows
     })
@@ -252,22 +278,23 @@ impl Store {
         if self.antigravity_has_live(id) {
             return Ok(());
         }
-        let valid = saved_rows(&self.agy().index)?
-            .iter()
-            .any(|r| r.id == id && r.cwd == self.profile.project && r.model_provider == PROVIDER);
-        if !valid || native_id(id).is_none() {
-            return Err(io::Error::other(
-                "This Antigravity session was not saved for this project.",
-            ));
-        }
-        self.antigravity_spawn(Some(id.into()), None, self.host_start_access(id), false)?;
+        let saved = saved_sessions(&self.agy().index)?
+            .into_iter()
+            .find(|saved| {
+                let row = &saved.row;
+                row.id == id && row.cwd == self.profile.project && row.model_provider == PROVIDER
+            });
+        let saved = saved.filter(|_| native_id(id).is_some()).ok_or_else(|| {
+            io::Error::other("This Antigravity session was not saved for this project.")
+        })?;
+        self.antigravity_spawn(Some(saved), None, self.host_start_access(id), false)?;
         self.mark_loading(id);
         Ok(())
     }
 
     fn antigravity_spawn(
         &mut self,
-        owner: Option<String>,
+        saved: Option<SavedSession>,
         first_prompt: Option<String>,
         start_mode: Option<Access>,
         handoff: bool,
@@ -284,6 +311,8 @@ impl Store {
         let first_context = first_prompt
             .as_ref()
             .and_then(|_| self.first_turn_context());
+        let (owner, turn_floor) =
+            saved.map_or((None, 0), |saved| (Some(saved.row.id), saved.turn_floor));
         let mut session = Session {
             link,
             owner,
@@ -294,7 +323,10 @@ impl Store {
             first_context,
             pending: None,
             options: SessionOptions::default(),
-            stream: Stream::default(),
+            stream: Stream {
+                turn_floor,
+                ..Stream::default()
+            },
         };
         session.request(
             generation,
@@ -382,11 +414,17 @@ impl Store {
         }
         prompt.push(json!({"type":"text","text":&text}));
         let params = json!({"sessionId": native_id(&id), "prompt":prompt});
+        let number = session
+            .stream
+            .turn
+            .max(session.stream.turn_floor)
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("Antigravity session turn numbers are exhausted."))?;
         session.request(seq, Pending::Prompt(text.clone()), "session/prompt", params)?;
-        session.stream.turn += 1;
+        session.stream.turn = number;
         session.stream.chunk = None;
         session.stream.tools.clear();
-        let turn = session.stream.turn.to_string();
+        let turn = number.to_string();
         let transcript = self.transcripts.entry(id.clone()).or_default();
         transcript.error = None;
         transcript.apply_activity(Activity {
@@ -400,6 +438,7 @@ impl Store {
             if let Err(e) = save_row(
                 &self.agy().index,
                 self.catalog.get(&id).expect("updated row"),
+                number,
             ) {
                 self.post_notice(format!("Could not save Antigravity session metadata: {e}"));
             }
@@ -929,7 +968,7 @@ impl Store {
                 if let Some(row) = self.catalog.get_mut(&id) {
                     row.name = name;
                     let row = row.clone();
-                    if let Err(e) = save_row(&self.agy().index, &row) {
+                    if let Err(e) = save_row(&self.agy().index, &row, 0) {
                         self.post_notice(format!(
                             "Could not save Antigravity session metadata: {e}"
                         ));
